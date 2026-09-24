@@ -24,7 +24,8 @@ import pytest
 class _FakeCacheServerCfg:
     url: str = "https://cache.example"
     token: str = "t"
-    batch_size: int = 2
+    # object, not int: the config loader keeps a bad TOML value as it is.
+    batch_size: object = 2
 
 
 @dataclass
@@ -42,10 +43,15 @@ class _FakeClient:
     reject_token = False  # with caps=None: stats() got 401/403, not a network error
 
     def __init__(self, url: str, token: str, force: bool = False, batch_size: int = 100) -> None:
+        from fw_context_mcp.cache_client import _SERVER_MAX_BATCH
+
         self.force = force
         self.put_failures = 0
         self.auth_rejected = _FakeClient.caps is None and _FakeClient.reject_token
         self.calls = 0
+        self.put_sizes: list[int] = []
+        # The same limit as the real client: the CLI must read it from here.
+        self.batch_size = max(1, min(batch_size, _SERVER_MAX_BATCH))
         _FakeClient.instances.append(self)
 
     def stats(self) -> dict | None:
@@ -56,6 +62,7 @@ class _FakeClient:
             self.put_failures += 1
             return 0
         self.calls += 1
+        self.put_sizes.append(len(entries))
         n = 0
         for e in entries:
             if e["hash"] not in self.server or self.force:
@@ -94,10 +101,17 @@ def push(monkeypatch, tmp_path: Path):
     _FakeClient.reject_token = False
 
     monkeypatch.setattr(cache_client_mod, "CacheClient", _FakeClient)
-    monkeypatch.setattr(config_mod, "load", lambda project_root=None: _FakeCfg())
     monkeypatch.setattr(utils_mod, "resolve_project_root", lambda arg: tmp_path)
 
-    def _run(local: list[str], *, overwrite: bool = False) -> int:
+    def _run(
+        local: list[str],
+        *,
+        overwrite: bool = False,
+        batch: int | None = None,
+        config_batch_size: object = 2,
+    ) -> int:
+        cfg = _FakeCfg(cache_server=_FakeCacheServerCfg(batch_size=config_batch_size))
+        monkeypatch.setattr(config_mod, "load", lambda project_root=None: cfg)
         db_path = tmp_path / "llm_cache.db"
         db_path.unlink(missing_ok=True)
         _local_db(db_path, local).close()
@@ -106,7 +120,7 @@ def push(monkeypatch, tmp_path: Path):
         )
         from fw_context_mcp.cli._cache import cmd_cache_push
 
-        return cmd_cache_push(SimpleNamespace(project=None, batch=None, overwrite=overwrite))
+        return cmd_cache_push(SimpleNamespace(project=None, batch=batch, overwrite=overwrite))
 
     return _run
 
@@ -173,6 +187,51 @@ def test_a_write_refused_midway_is_an_error_not_already_on_server(push, capsys):
 
     err = capsys.readouterr().err
     assert "did not accept the write after 2/4 entries (2 inserted)" in err
+
+
+def test_a_batch_larger_than_the_server_takes_is_one_request_per_step(push, capsys):
+    """The CLI stepped by the requested size, and the client by the limited one.
+
+    ``--batch 5000`` thus gave one ``batch_put`` of 2500 entries, which the
+    client sent as three requests.  A failure in the third request lost the
+    count of the first two, and the client sent the rest after a 403.
+    """
+    local = [f"h{i}" for i in range(2500)]
+
+    assert push(local, batch=5000) == 0
+
+    assert _FakeClient.instances[0].put_sizes == [1000, 1000, 500]
+    assert "[2500/2500] inserted 500" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("bad", [0, -5, "100", True])
+def test_a_bad_config_batch_size_is_an_error(push, capsys, bad):
+    """-5 gave an empty loop and "Done: 0 inserted, N already on" with exit 0.
+
+    0 gave a ValueError from ``range()`` and a traceback.
+    """
+    assert push(["a", "b"], config_batch_size=bad) == 1
+
+    captured = capsys.readouterr()
+    assert "batch_size must be a positive integer" in captured.err
+    assert "Done" not in captured.out
+    assert _FakeClient.instances == [], "no request may start"
+
+
+@pytest.mark.parametrize("text", ["0", "-5", "x"])
+def test_the_batch_option_refuses_a_value_below_one(text):
+    import argparse
+
+    from fw_context_mcp.cli import _positive_int
+
+    with pytest.raises(argparse.ArgumentTypeError):
+        _positive_int(text)
+
+
+def test_the_batch_option_takes_a_positive_value():
+    from fw_context_mcp.cli import _positive_int
+
+    assert _positive_int("5000") == 5000
 
 
 # ── The real CacheClient, against a mock transport ──────────────────────────

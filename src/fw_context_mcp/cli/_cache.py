@@ -154,6 +154,17 @@ def cmd_cache_push(args: argparse.Namespace) -> int:
 
         overwrite = bool(getattr(args, "overwrite", False))
         batch_size = args.batch or cs.batch_size
+        # argparse refuses a --batch below 1, but the config value comes here
+        # as it is: the config loader keeps a bad value and does not fail,
+        # thus a bad [cache_server] section does not stop other commands.  A
+        # negative step gave an empty loop and a false "Done", and 0 gave a
+        # ValueError from range().
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+            print(
+                f"error: [cache_server] batch_size must be a positive integer, not {batch_size!r}",
+                file=sys.stderr,
+            )
+            return 1
         cc = CacheClient(url=cs.url, token=cs.token, force=overwrite, batch_size=batch_size)
         try:
             caps = cc.stats()
@@ -179,8 +190,13 @@ def cmd_cache_push(args: argparse.Namespace) -> int:
 
             verb = "written" if overwrite else "inserted"
             written = 0
-            for i in range(0, total, batch_size):
-                chunk = rows[i : i + batch_size]
+            # The step is the size that the client uses, not the requested
+            # one: the client limits it to what the server takes.  With a
+            # larger step one batch_put sent more than one request, and the
+            # progress and error counts no longer agreed with the requests.
+            step = cc.batch_size
+            for i in range(0, total, step):
+                chunk = rows[i : i + step]
                 entries = [
                     {"hash": r[0], "summary": r[1], "inputs": r[2], "outputs": r[3], "model": r[4]} for r in chunk
                 ]

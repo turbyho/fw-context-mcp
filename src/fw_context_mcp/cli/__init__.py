@@ -32,6 +32,23 @@ from .. import __version__
 log = logging.getLogger(__name__)
 
 
+def _positive_int(text: str) -> int:
+    """Parse an integer of 1 or more, for argparse ``type=``.
+
+    WHY: ``type=int`` accepts 0 and negative numbers.  ``cache push --batch
+    -5`` then gave an empty loop and the false result "Done: 0 inserted, N
+    already on" with exit 0.  argparse shows the ``ArgumentTypeError`` text
+    as a usage error.
+    """
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not an integer") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"{value} is less than 1")
+    return value
+
+
 class VerboseFormatter(logging.Formatter):
     """Structured output with phase headers for ``--verbose`` mode.
 
@@ -395,7 +412,10 @@ def main() -> None:
         "push", help="Upload local cache entries that the remote server does not have yet"
     )
     p_cache_push.add_argument("--project", metavar="DIR", help="Project root for remote config (default: cwd)")
-    p_cache_push.add_argument("--batch", type=int, metavar="N", help="Batch size (default: from config, 100)")
+    p_cache_push.add_argument(
+        "--batch", type=_positive_int, metavar="N",
+        help="Number of entries in one request, 1 or more; a value above 1000 gives 1000 (default: from config, 100)",
+    )
     p_cache_push.add_argument(
         "--overwrite",
         action="store_true",
