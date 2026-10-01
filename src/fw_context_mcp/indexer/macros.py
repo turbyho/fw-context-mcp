@@ -171,6 +171,10 @@ def _sanitize_flags(cmd: list[str]) -> list[str]:
     )
     keep_no_value = (  # flags that are self-contained (no next-arg)
         "-std=", "-fmacro-prefix-map=",
+        # The flags that _driver_query adds.  Without them this preprocessor
+        # reads the host headers and the host macros again, and the expanded
+        # values disagree with the parse of the same unit.
+        "-nostdinc", "-undef", "-fshort-wchar", "-funsigned-char", "-fsigned-char",
     )
     drop_with_value = ("-o", "-MF", "-MT", "-MQ")
     drop_no_value = ("-c",)  # flags that take no argument — just drop

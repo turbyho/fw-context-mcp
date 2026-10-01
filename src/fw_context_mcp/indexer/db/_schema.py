@@ -92,7 +92,15 @@ __all__ = [
 #      list moved to `macros.params`.  Before it the two were one string —
 #      one macro of an SDK read `( expr ) do { … }` — and neither could be
 #      read out of it.
-CURRENT_ROW_FORMAT = "fw-context-rows/3"
+# /4 — a build with a GCC compiler is parsed with the system headers and
+#      the predefined macros that its own driver gives.  Before it, a target
+#      that libclang has no backend for (xtensa) was parsed as the HOST: 252
+#      of 757 files of an ESP32 index came from /usr/include, and
+#      `#if __XTENSA__` read as false.  An AVR build had the same fault, and
+#      an ARM build saw `__GNUC__` 4, thus a header that requires GCC 6.3
+#      stopped with `#error`.  `macros.expanded_value` comes from the same
+#      flags, and it was empty for every ESP32 macro.
+CURRENT_ROW_FORMAT = "fw-context-rows/4"
 
 # The config-hash format that was current when CURRENT_ROW_FORMAT last moved.
 #
@@ -107,7 +115,7 @@ CURRENT_ROW_FORMAT = "fw-context-rows/3"
 # the build, thus a plain `fw-context index` writes every file and every
 # body again.  The two must therefore move together, and
 # `test_row_format_invalidation.py` fails when only one of them does.
-ROW_FORMAT_PAIRED_WITH = "fw-context-cc/5"
+ROW_FORMAT_PAIRED_WITH = "fw-context-cc/6"
 
 
 def _row_format_number(value: str) -> int | None:
@@ -152,6 +160,11 @@ _ROW_FORMAT_FAULTS: tuple[tuple[int, str], ...] = (
         "begins and ends on one line has no body, no macro is marked "
         "function-like, no instance links to its template, and the value "
         "of a macro holds its parameter list glued to its replacement text"),
+    (3, "a build with a GCC compiler was parsed with guessed toolchain "
+        "headers and the macros of clang: an ESP32 or AVR index holds host "
+        "headers from /usr/include and takes the #if branches of the host, "
+        "an ARM index saw __GNUC__ 4, and the expanded value of a macro can "
+        "be empty"),
 )
 
 

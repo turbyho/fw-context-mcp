@@ -391,7 +391,13 @@ def run(
     # Parse compile_commands.json to discover translation units.  Must
     # happen before config_hash computation so the manifest can be built
     # from the actual TU list.
-    all_units = list(parse_compile_commands(compile_commands))
+    # The allowlist of the compilers that the driver query may run comes from
+    # local.toml or the global config (never the committed config.toml); see
+    # _driver_query.
+    from ..config import load as _load_config
+
+    query_driver = _load_config(project_root=project_root).index.query_driver
+    all_units = list(parse_compile_commands(compile_commands, query_driver, project_root))
 
     # libclang reads a translation unit as C or C++.  Given an assembly
     # unit, it parses that unit as C and gets no cursor and one error

@@ -3,9 +3,10 @@
 WHY: compile_commands.json emitted by build tools contains GCC-specific flags
 that libclang (clang's C API) does not understand.  Passing them directly
 causes ``TranslationUnitLoadError`` or silent incorrect parsing.  This module
-strips unsupported flags, resolves relative include paths, detects target
-triples from compiler names, and injects GCC cross-compiler system include
-paths so libclang can find ``stdint.h`` and friends.
+strips unsupported flags, resolves relative include paths, and asks the GCC
+driver of the build for its system include directories and its predefined
+macros (see ``_driver_query``).  Without a GCC driver it detects the target
+triple from the compiler name.
 """
 
 from __future__ import annotations
@@ -13,10 +14,24 @@ from __future__ import annotations
 import json
 import re
 import shlex
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from fw_context_mcp.config.settings import DEFAULT_QUERY_DRIVER
+from fw_context_mcp.indexer._driver_query import (
+    DriverInfo,
+    driver_allowed,
+    inside_project,
+    is_gcc_driver_name,
+    known_compilers,
+    libclang_args,
+    predefine_flags,
+    query_gcc_driver,
+    resolve_compiler,
+    warn_inside_project,
+    warn_not_allowed,
+)
 from fw_context_mcp.utils import CPP_SOURCE_EXTENSIONS, TU_EXTENSIONS
 
 # Flags libclang does not support — drop silently
@@ -167,8 +182,9 @@ def _detect_target_triple(
     3. Fallback: infer from ``-march=`` flags (``-march=rv32*`` → riscv,
        ``-march=armv*-m*`` → arm-none-eabi).
 
-    Returns None when the target cannot be determined or is not supported
-    by the installed libclang (e.g. xtensa, msp430, avr).
+    Returns None when the target cannot be determined or is not in
+    ``_SUPPORTED_TARGET_PREFIXES`` (e.g. xtensa).  Used when the GCC
+    driver does not answer; ``_driver_query`` probes libclang instead.
     """
     triple: str | None = None
 
@@ -219,10 +235,11 @@ def _detect_target_triple(
         return None
 
     # Only inject --target for triples the installed libclang actually supports.
-    # Unsupported targets (xtensa, msp430, avr, etc.) cause
-    # TranslationUnitLoadError — libclang parses them fine as host target.
+    # An unsupported target (xtensa) causes TranslationUnitLoadError.
+    # A triple can be the bare architecture: `avr-g++` gives `avr`, which
+    # the prefix `avr-` does not match, thus the bare name counts too.
     for prefix in _SUPPORTED_TARGET_PREFIXES:
-        if triple.startswith(prefix):
+        if triple.startswith(prefix) or triple == prefix.rstrip("-"):
             return triple
     return None
 
@@ -434,14 +451,20 @@ def _safe_iterdir(path: Path) -> list[Path]:
 
 
 def _gcc_system_includes(compiler: Path, triple: str) -> list[str]:
-    """Return -isystem flags for a GCC cross-compiler's built-in headers.
+    """Return -isystem flags for a GCC cross-compiler's built-in headers, from its layout.
 
-    WHY: when ``--target=arm-none-eabi`` is injected, libclang switches to
-    that target's header search path.  But the GCC toolchain's built-in
-    headers (``stdint.h``, ``stddef.h``, newlib, libstdc++) are not in
-    clang's internal resource directory.  Without these ``-isystem`` flags,
-    libclang fails to find fundamental headers — every ``#include <stdint.h>``
-    becomes a fatal error and the entire TU parse fails.
+    WHY this is only the fallback: it GUESSES the directories from the
+    layout of the toolchain, and the guess is not the search order of GCC
+    (libstdc++ comes after the C library here, and before it in GCC).
+    ``_driver_query`` asks the driver instead.  This guess stays for a
+    compiler that the query may not run (outside ``[index] query_driver``)
+    or that does not answer, because it reads directories and runs nothing.
+
+    WHY at all: when ``--target=arm-none-eabi`` is injected, libclang
+    switches to that target's header search path, but the GCC toolchain's
+    built-in headers (``stdint.h``, ``stddef.h``, newlib, libstdc++) are not
+    in clang's internal resource directory.  Without these ``-isystem``
+    flags every ``#include <stdint.h>`` is a fatal error.
 
     *triple* is the GNU target triple (e.g. ``arm-none-eabi``) detected
     by :func:`_detect_target_triple`.  Only include directories matching
@@ -484,15 +507,86 @@ def _gcc_system_includes(compiler: Path, triple: str) -> list[str]:
     return result
 
 
-def parse(path: Path) -> Iterator[CompilationUnit]:
+def _clang_args_for_unit(
+    raw_args: list[str],
+    cwd: Path,
+    file: Path,
+    compiler: Path | None,
+    known: dict[str, Path],
+    query_driver: Sequence[str],
+    project_root: Path | None,
+) -> list[str]:
+    """Build the libclang flags of one unit, from the GCC driver when it answers.
+
+    WHY the driver: see ``_driver_query``.  A GCC driver gives the system
+    directories in its own order and the macros of its own target.  The
+    earlier code guessed both from the layout of the toolchain, and a
+    target that libclang has no backend for got the headers of the host.
+
+    When the query may not run the compiler, or the driver does not answer,
+    the flags are the earlier ones: the flags of ``compile_commands.json``,
+    a target from the compiler name, and the guessed toolchain directories.
+    """
+    driver = _driver_for_unit(raw_args, cwd, file, compiler, known, query_driver, project_root)
+    if driver is not None:
+        return libclang_args(driver, normalize_args(raw_args, cwd, str(file), None))
+    clang_args = normalize_args(raw_args, cwd, str(file), compiler)
+    if compiler is not None:
+        # Pass raw_args so -mcpu=/-march= heuristics can augment compiler-name detection.
+        triple = _detect_target_triple(compiler, raw_args)
+        if triple is not None:
+            clang_args = clang_args + _gcc_system_includes(compiler, triple)
+    return clang_args
+
+
+def _driver_for_unit(
+    raw_args: list[str],
+    cwd: Path,
+    file: Path,
+    compiler: Path | None,
+    known: dict[str, Path],
+    query_driver: Sequence[str],
+    project_root: Path | None,
+) -> DriverInfo | None:
+    if compiler is None or not is_gcc_driver_name(compiler):
+        return None
+    resolved = resolve_compiler(str(compiler), cwd, known)
+    if resolved is None:
+        return None
+    if project_root is not None and inside_project(resolved, project_root):
+        warn_inside_project(resolved)
+        return None
+    if not driver_allowed(resolved, query_driver, project_root):
+        warn_not_allowed(resolved)
+        return None
+    expanded: list[str] = []
+    for token in raw_args:
+        expanded.extend(expand_response_file(token, cwd) if token.startswith("@") else [token])
+    language = _detect_language(file, expanded)
+    return query_gcc_driver(resolved, language, predefine_flags(expanded, cwd, project_root))
+
+
+def parse(
+    path: Path,
+    query_driver: Sequence[str] = DEFAULT_QUERY_DRIVER,
+    project_root: Path | None = None,
+) -> Iterator[CompilationUnit]:
     """Yield one CompilationUnit per entry in compile_commands.json.
 
     WHY iterator: compile_commands.json for large firmware projects (mbed-os,
     Zephyr) contains thousands of entries.  Yielding one at a time avoids
     loading the entire structure into memory at once — only the current
     TU is materialized.
+
+    *query_driver* holds the path globs of the compilers that the query may
+    run (``[index] query_driver``).  A caller with a project configuration
+    must pass it; the default is the default of that setting.  A compiler
+    inside *project_root* never runs, see ``driver_allowed``.
     """
     entries = json.loads(path.read_text(encoding="utf-8-sig"))
+    # One build can name a compiler with its directory in some entries and
+    # without it in others; see known_compilers().
+    known = known_compilers(entries)
     for entry in entries:
         file = Path(entry["file"])
         cwd = Path(entry.get("directory", path.parent))
@@ -510,16 +604,7 @@ def parse(path: Path) -> Iterator[CompilationUnit]:
             compiler = Path(raw_args[0])
             raw_args = raw_args[1:]
 
-        clang_args = normalize_args(raw_args, cwd, str(file), compiler)
-
-        # For GCC cross-compilers inject system include paths so libclang
-        # finds stdint.h and friends when --target is active.
-        # Pass raw_args so -mcpu=/-march= heuristics can augment compiler-name detection.
-        if compiler is not None:
-            triple = _detect_target_triple(compiler, raw_args)
-            if triple is not None:
-                clang_args = clang_args + _gcc_system_includes(compiler, triple)
-
+        clang_args = _clang_args_for_unit(raw_args, cwd, file, compiler, known, query_driver, project_root)
         lang = _detect_language(file, clang_args)
 
         yield CompilationUnit(

@@ -65,6 +65,14 @@ class TestInferTarget:
     def test_riscv_compiler_name(self):
         assert _detect_target_triple(Path("riscv32-unknown-elf-gcc"), []) == "riscv32-unknown-elf"
 
+    def test_a_bare_architecture_triple_is_supported(self):
+        """`avr-g++` gives `avr`, which the prefix `avr-` did not match."""
+        assert _detect_target_triple(Path("avr-g++"), []) == "avr"
+        assert _detect_target_triple(Path("msp430-gcc"), []) == "msp430"
+
+    def test_a_target_without_a_backend_gives_none(self):
+        assert _detect_target_triple(Path("xtensa-esp32-elf-gcc"), []) is None
+
 
 class TestExpandResponseFile:
     def test_expands_valid_file(self, tmpdir):
@@ -202,6 +210,8 @@ class TestNormalizeArgs:
 
 
 class TestGccSystemIncludes:
+    """The fallback for a compiler that the driver query may not run."""
+
     def test_no_lib_gcc_returns_empty(self, tmpdir):
         """If lib/gcc does not exist, return empty without crash."""
         bin_dir = tmpdir / "bin"
@@ -217,6 +227,20 @@ class TestGccSystemIncludes:
         assert len(result) >= 4  # gcc include, include-fixed, libc, c++
         assert all(r.startswith("-isystem") for r in result[::2])
         assert any("include-fixed" in r for r in result)
+
+    def test_a_compiler_outside_the_allowlist_keeps_the_guessed_directories(self, fake_arm_gcc_toolchain, tmpdir):
+        """No regression for a toolchain that the query may not run."""
+        toolchain, compiler = fake_arm_gcc_toolchain
+        (tmpdir / "main.c").write_text("int x;\n")
+        cc = tmpdir / "cc.json"
+        cc.write_text(json.dumps([{
+            "directory": str(tmpdir), "file": "main.c",
+            "arguments": [str(compiler), "-mcpu=cortex-m4", "-c", "main.c"],
+        }]))
+        unit = next(parse(Path(cc), []))
+        assert "--target=arm-none-eabi" in unit.clang_args
+        assert any("include-fixed" in a for a in unit.clang_args)
+        assert "-nostdinc" not in unit.clang_args
 
 
 class TestParse:

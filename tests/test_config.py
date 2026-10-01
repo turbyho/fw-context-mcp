@@ -202,6 +202,69 @@ model = "my-local-model"
         assert cfg.llm.model == "my-local-model"
 
 
+class TestQueryDriverTrust:
+    """``[index] query_driver`` selects the compilers that the indexer runs.
+
+    A committed config must not set it, or a repository could allow the
+    compiler script it commits.
+    """
+
+    def _project(self, tmpdir, monkeypatch, committed: str, local: str = "") -> Path:
+        fake_home = tmpdir / "fake-home"
+        fake_home.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+        proj_dir = Path(tmpdir / "project")
+        (proj_dir / ".fw-context").mkdir(parents=True)
+        (proj_dir / ".fw-context" / "config.toml").write_text(committed)
+        if local:
+            (proj_dir / ".fw-context" / "local.toml").write_text(local)
+        return proj_dir
+
+    def test_the_default_allowlist_applies_without_a_setting(self):
+        from fw_context_mcp.config.settings import DEFAULT_QUERY_DRIVER
+
+        assert Config().index.query_driver == list(DEFAULT_QUERY_DRIVER)
+
+    def test_the_committed_config_cannot_set_it(self, tmpdir, monkeypatch, capsys):
+        from fw_context_mcp.config.settings import DEFAULT_QUERY_DRIVER
+
+        proj = self._project(tmpdir, monkeypatch, '[index]\nquery_driver = ["**"]\nvendor_paths = ["x"]\n')
+        cfg = load(proj)
+        assert cfg.index.query_driver == list(DEFAULT_QUERY_DRIVER)
+        assert cfg.index.vendor_paths == ["x"], "the other [index] keys of the committed config stay"
+        assert "query_driver" in capsys.readouterr().err
+
+    def test_local_toml_can_set_it(self, tmpdir, monkeypatch):
+        """The operator decided: local.toml is the developer's own file."""
+        proj = self._project(tmpdir, monkeypatch, "[index]\n", '[index]\nquery_driver = ["~/tools/**"]\n')
+        assert load(proj).index.query_driver == ["~/tools/**"]
+
+    def test_a_variant_cannot_set_it(self, tmpdir, monkeypatch):
+        from fw_context_mcp.config.settings import DEFAULT_QUERY_DRIVER
+
+        committed = '[[build.variants]]\nname = "a"\nquery_driver = ["**"]\n'
+        cfg = load(self._project(tmpdir, monkeypatch, committed))
+        assert cfg.index.query_driver == list(DEFAULT_QUERY_DRIVER)
+        assert all("query_driver" not in v.index_overrides for v in cfg.build.variants)
+
+    def test_a_malformed_build_table_does_not_crash_the_trust_check(self, tmp_path):
+        """``build = "x"`` is a typo; the check must leave it to the rest of the loader."""
+        from fw_context_mcp.config.settings import _drop_committed_trust_keys
+
+        data = {"build": "x", "index": {"query_driver": ["**"]}}
+        _drop_committed_trust_keys(data, tmp_path / "local.toml")
+        assert data == {"build": "x", "index": {}}
+
+    def test_the_global_config_can_set_it(self, tmpdir, monkeypatch):
+        import fw_context_mcp.config.settings as settings
+
+        proj = self._project(tmpdir, monkeypatch, "[index]\n")
+        global_cfg = Path(tmpdir) / "global.toml"
+        global_cfg.write_text('[index]\nquery_driver = ["~/tools/**"]\n')
+        monkeypatch.setattr(settings, "_GLOBAL_CONFIG_PATH", global_cfg)
+        assert load(proj).index.query_driver == ["~/tools/**"]
+
+
 class TestVendorProjectPaths:
     def test_vendor_paths_parsing(self):
         cfg = _from_dict({"index": {"vendor_paths": ["third_party", "generated"]}})

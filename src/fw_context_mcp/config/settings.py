@@ -452,6 +452,21 @@ def _apply_embed_prompt_defaults(llm_cfg: LLMConfig) -> None:
             llm_cfg.embed_doc_prompt = ""
 
 
+#: The default of ``[index] query_driver``: the toolchain managers that
+#: install a compiler outside the project (PlatformIO, Arduino, ESP-IDF,
+#: nRF Connect, the Zephyr SDK) and the system directories.
+DEFAULT_QUERY_DRIVER: tuple[str, ...] = (
+    "~/.platformio/packages/**",
+    "~/.arduino15/packages/**",
+    "~/.espressif/**",
+    "~/ncs/toolchains/**",
+    "~/zephyr-sdk*/**",
+    "/opt/**",
+    "/usr/bin/*",
+    "/usr/local/bin/*",
+)
+
+
 @dataclass
 class IndexConfig:
     """Index storage and scoping configuration.
@@ -485,6 +500,17 @@ class IndexConfig:
         max_symbol_body_lines: Maximum number of source lines stored per
             function/method body in the index.  Bodies longer than this are
             truncated.  Default 1000.
+        query_driver: Path globs of the GCC compilers that fw-context may run
+            to ask for their system headers and predefined macros, as clangd
+            ``--query-driver`` does.  ``*`` matches one path component, ``**``
+            any number, ``~`` is the home directory.  A compiler outside the
+            list is not run, and its units keep the flags of
+            ``compile_commands.json``.  WHY a list: the query runs the binary
+            that ``compile_commands.json`` names, and a repository can commit
+            that file.  A value replaces the default ``DEFAULT_QUERY_DRIVER``.
+            Set it in ``.fw-context/local.toml`` of the project (or in the
+            global config); the committed ``config.toml`` cannot set it (see
+            ``_drop_committed_trust_keys``).
     """
 
     db_dir: Path = field(default_factory=lambda: Path.home() / ".fw-context" / "index")
@@ -499,6 +525,7 @@ class IndexConfig:
     rerank_top_k: int = 50
     min_dense_count: int = 3
     max_symbol_body_lines: int = 1000
+    query_driver: list[str] = field(default_factory=lambda: list(DEFAULT_QUERY_DRIVER))
     purge_max_missing_percent: int = 20
     """Abort the automatic ghost-file purge when more than this percent of
     indexed files are missing from disk — guards against an offline network
@@ -843,6 +870,7 @@ _INDEX_FIELDS: list[tuple[str, str, str]] = [
     ("rerank_top_k", "rerank_top_k", "int(50)"),
     ("min_dense_count", "min_dense_count", "int(3)"),
     ("max_symbol_body_lines", "max_symbol_body_lines", "int(1000)"),
+    ("query_driver", "query_driver", "list"),
     ("purge_max_missing_percent", "purge_max_missing_percent", "int(20)"),
 ]
 
@@ -1092,6 +1120,46 @@ def _validate_config_safety(proj_data: dict, proj_path: Path) -> None:
         log.warning(msg)
         print(f"⚠ {msg}", file=sys.stderr)
 
+def _drop_committed_trust_keys(proj_data: dict, proj_path: Path) -> None:
+    """Remove ``[index] query_driver`` from the committed project config.
+
+    WHY remove and not warn, as ``_validate_config_safety`` does: the key is
+    the allowlist of the binaries that the indexer runs without a build.  A
+    repository that could set it could also allow the compiler script it
+    commits, thus the allowlist would protect nothing.
+
+    The key is read from the global config and from ``local.toml``, the
+    per-developer file of the project.  The operator decided that
+    ``local.toml`` counts as the developer's own file.  Note: only a
+    convention keeps that file out of git, thus a repository that commits a
+    ``local.toml`` can still set the key.  A ``[[build.variants]]`` table is
+    cleaned too, because a variant carries ``[index]`` keys as overrides.
+    """
+    tables: list[dict] = []
+    index = proj_data.get("index")
+    if isinstance(index, dict):
+        tables.append(index)
+    # A malformed file (``build = "x"``) must not crash load(): the other
+    # layers of the config still apply, as for any other typo.
+    build = proj_data.get("build")
+    variants = build.get("variants") if isinstance(build, dict) else None
+    if isinstance(variants, list):
+        tables.extend(v for v in variants if isinstance(v, dict))
+    found = False
+    for table in tables:
+        if "query_driver" in table:
+            del table["query_driver"]
+            found = True
+    if found:
+        msg = (
+            f"SECURITY: query_driver in {proj_path} (committed) is ignored. It selects the "
+            f"compilers that fw-context runs, thus only .fw-context/local.toml or "
+            f"~/.fw-context/config.toml can set it."
+        )
+        log.warning(msg)
+        print(f"⚠ {msg}", file=sys.stderr)
+
+
 def _is_loopback_url(url: str) -> bool:
     """True if *url*'s host is a loopback address.
 
@@ -1203,6 +1271,7 @@ def load(project_root: Path | None = None) -> Config:
         # from global and project config coexist.
         try:
             proj_data = _read_toml_if_present(proj_path)
+            _drop_committed_trust_keys(proj_data, proj_path)
             data = _deep_merge(data, proj_data)
             # Security: validate committed config doesn't contain dangerous settings.
             # pre_build, command, and non-loopback ollama_url in committed config.toml

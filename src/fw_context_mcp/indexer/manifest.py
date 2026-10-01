@@ -1037,7 +1037,10 @@ def compute_config_hash(
         # an instance to its template.  Each of the three held a constant
         # before, thus no answer over them could be right.  ``macros.value``
         # also lost the parameter list it used to carry — that text is now
-        # ``macros.params``.
+        # ``macros.params``.  /6 marks a fourth change: a build with a GCC
+        # compiler is parsed with the system headers and the macros of its
+        # own driver (``_driver_query``).  Before it, an ESP32 or AVR build
+        # was parsed with the headers and the #if branches of the host.
         #
         # WHY the format version belongs in THIS hash: a new config_hash
         # leaves no row for the build, thus a plain `fw-context index` writes
@@ -1048,7 +1051,7 @@ def compute_config_hash(
         #
         # Every existing index therefore gets one final reindex, which is
         # intended.
-        "_format": "fw-context-cc/5",
+        "_format": "fw-context-cc/6",
         "project_root": str(project_root),
         # WHY only these two: config_hash answers "could the same source text
         # compile to something different now?"  Macros flip #ifdef, and the

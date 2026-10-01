@@ -120,6 +120,11 @@ and multi-image builds](build.md).
 | `index_refs` | `true` | project | Build the cross-reference and call graph data. This key is on by default, and it enables tools such as `find_callers`, `find_call_path`, and `find_dead_code`. Set this key to `false`, or pass `--no-refs`, for faster indexing on very large projects. |
 | `index_embeddings` | `true` | project | Generate vector embeddings during indexing. An Ollama `embed_model` requires Ollama; a sentence-transformers or `ft://` model runs locally. The embeddings power semantic search and hybrid FTS5+vector re-ranking. Disable this key with `false`, or with `--no-embeddings`. |
 | `max_symbol_body_lines` | `1000` | project | The maximum number of lines of one symbol body. The index stores at most this number of lines, and `get_source` and `get_symbol_context` return at most this number. A body that a cap cut carries `_source_truncated`. |
+| `query_driver` | see below | local, global | Path globs of the GCC compilers that fw-context can run to get their system include directories and predefined macros, as clangd `--query-driver` does. `*` matches one path component, `**` matches any number of components, and `~` is the home directory. fw-context does not run a compiler outside the list, or a compiler inside the project directory: its units keep the flags of `compile_commands.json` and the guessed toolchain directories, and a warning names the compiler. A value replaces the default. Set this key in `.fw-context/local.toml`. fw-context ignores it in the committed `config.toml`, because a repository could then allow a script that it commits. Do not commit a `local.toml` that sets it. |
+
+The default of `query_driver` is `["~/.platformio/packages/**", "~/.arduino15/packages/**", "~/.espressif/**", "~/ncs/toolchains/**", "~/zephyr-sdk*/**", "/opt/**", "/usr/bin/*", "/usr/local/bin/*"]`. To add a toolchain in another directory, repeat the default and add a glob, for example `"~/tools/gcc-arm-none-eabi-*/bin/*"`.
+
+WHY the query: a GCC cross compiler adds its system headers and its target macros on its own, and `compile_commands.json` does not hold them. Without the query, a target that libclang has no backend for (xtensa, ESP32) was parsed with the headers of the host, and `#if __XTENSA__` read as false.
 
 ### `[llm]` — Ollama
 
