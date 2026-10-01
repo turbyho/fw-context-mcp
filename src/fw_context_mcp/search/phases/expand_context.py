@@ -83,6 +83,13 @@ class ExpandContextPhase(Phase):
         results = ctx.final_results
         seeds = results[: self.SEEDS]
 
+        # A neighbor goes after the seeds.  When the seeds fill the limit,
+        # no neighbor can go in, thus the call-graph query is not necessary.
+        # The cut is for an input longer than the limit: when adaptive fusion
+        # fails, the uncut embedding rows come here.
+        if len(seeds) >= ctx.limit:
+            return ctx.evolve(final_results=results[: ctx.limit])
+
         # Collect seed USRs (skip seeds missing a USR — they can't
         # participate in call-graph queries)
         seed_usrs: list[str] = []
@@ -114,9 +121,10 @@ class ExpandContextPhase(Phase):
 
         # Mixed strategy: original seeds + new neighbors + remaining results.
         # Neighbors appear at positions 11-15 (after seeds, before tail).
-        remaining_budget = max(0, ctx.limit - len(seeds) - len(neighbors))
-        remaining = results[self.SEEDS:][:remaining_budget]
-        final = list(seeds) + neighbors + list(remaining)
+        # The cut applies to the whole list, not only to the tail: with a
+        # limit below SEEDS + MAX_NEIGHBORS, the seeds and the neighbors
+        # alone are more than the limit.
+        final = (list(seeds) + neighbors + list(results[self.SEEDS:]))[: ctx.limit]
         return ctx.evolve(final_results=final)
 
 
