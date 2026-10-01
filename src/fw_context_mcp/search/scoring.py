@@ -1,7 +1,7 @@
 """Scoring functions shared across search phases.
 
 Why centralised scoring?
-    ``SEARCH_CODE``, ``SMART_SEARCH``, and any future search tools must
+    ``SMART_SEARCH`` and any future search pipelines must
     apply the same scoring rules (stem matching, kind weighting, project
     bonus).  Centralising prevents drift — a scoring change in one tool
     automatically applies everywhere.

@@ -1,17 +1,11 @@
 """Shared fallback search strategies — canonical implementations.
 
-Why shared fallbacks?
-    Two layers need the same fallback logic:
-
-    1. The MCP handler layer (``_search_fallbacks.py``) — called directly
-       by ``search_code`` when the primary FTS5 search returns zero results.
-    2. The search pipeline layer (``search_fallbacks.py``) — phases like
-       ``NameTokensFallbackPhase`` that run inside the pipeline when
-       ``fts5_results`` is empty.
-
-    Duplicating the fallback implementations would risk divergence — a
-    fix in one layer would not apply to the other.  This module provides
-    a single canonical implementation for each fallback strategy.
+Who uses these fallbacks?
+    The MCP tool ``search_code`` (``mcp/handlers/search.py`` and
+    ``_search_fallbacks.py``) calls them when its primary FTS5 search
+    returns zero results.  Four pipeline phases also called them until
+    2026-10-01.  Only the ``SEARCH_CODE`` pipeline used those phases, and
+    no tool used that pipeline, thus the phases were removed.
 
 Why an ordered chain of fallbacks?
     Each fallback is progressively broader — from precise (name_tokens LIKE)
@@ -19,9 +13,6 @@ Why an ordered chain of fallbacks?
     the chain.  This ensures the most precise match is used while still
     covering edge cases where FTS5 failed entirely (e.g. the query uses
     a term not in the FTS5 tokeniser's dictionary).
-
-Used by both the MCP handler layer (:mod:`fw_context_mcp.mcp.handlers._search_fallbacks`)
-and the search pipeline layer (:mod:`fw_context_mcp.search.phases.search_fallbacks`).
 
 Each fallback strategy receives a database connection, query, config hash, limit,
 optional kind/project_only filters, and a *root* path for producing absolute file
@@ -45,7 +36,7 @@ from fw_context_mcp.utils import abs_path, is_db_exception, macro_signature
 
 # The last argument is the offset of the page.  It is positional, because
 # one table drives every strategy with the same call; it has a default,
-# because the pipeline layer does not page and calls without it.
+# thus a caller that does not page can call without it.
 FallbackFunc = Callable[
     [sqlite3.Connection, str, str, int, str | None, bool, Path, int],
     tuple[list[dict[str, Any]], str] | None,
@@ -61,7 +52,9 @@ def _symbol_row_to_dict(r: sqlite3.Row, root: Path, **extra) -> dict[str, Any]:
     """Convert a symbol ``sqlite3.Row`` (or plain dict) to a dict for MCP tool output.
 
     Why accept both Row and dict?
-        Phase code produces dicts (via ``dict(r)``); tests pass plain dicts.
+        The callers (the strategies in this module and
+        ``mcp/handlers/_lookup.py``) read rows from SQLite; tests pass
+        plain dicts.
         Accepting both avoids an extra conversion step in callers.
 
     Why conditional fields?
@@ -521,8 +514,8 @@ _SEARCH_CODE_FALLBACKS: list[FallbackFunc] = [
 # The same chain with the counter of each step beside it.  A paged caller
 # needs both: the count decides WHICH step owns the answer, because an
 # empty page of a step that did match means "past the end" and not "try
-# the next step".  The pipeline layer does not page and uses the list
-# above alone.
+# the next step".  The search_code handler runs this table, not the list
+# above.
 _SEARCH_CODE_STEPS: list[tuple[FallbackFunc, CountFunc]] = [
     (_search_code_name_tokens, count_name_tokens),
     (_search_code_docstring, count_docstring),

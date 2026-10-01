@@ -8,7 +8,7 @@ Why a separate ``phases/`` package?
     with a mock context without loading any other phase's dependencies.
 
 Why explicit ``__all__``?
-    The ``phases`` package exposes 14 classes.  Without ``__all__``,
+    The ``phases`` package exposes 11 classes.  Without ``__all__``,
     ``from fw_context_mcp.search.phases import *`` would only import
     what's explicitly listed in ``__init__.py``.  The explicit list
     makes the public API unambiguous.
@@ -24,26 +24,16 @@ from fw_context_mcp.search.phases.fts5_search import FTS5SearchPhase
 from fw_context_mcp.search.phases.llm_query import LLMQueryPhase
 from fw_context_mcp.search.phases.refine import RefinePhase
 from fw_context_mcp.search.phases.rough_search import RoughSearchPhase
-from fw_context_mcp.search.phases.search_fallbacks import (
-    DocstringFallbackPhase,
-    IndividualTermsFallbackPhase,
-    MacrosFtsFallbackPhase,
-    NameTokensFallbackPhase,
-)
 from fw_context_mcp.search.phases.translate import TranslatePhase
 
 __all__ = [
     "AdaptiveFusionPhase",
     "DeduplicatePhase",
-    "DocstringFallbackPhase",
     "EmbeddingPhase",
     "ExpandContextPhase",
     "FTS5SearchPhase",
     "FormatPhase",
-    "IndividualTermsFallbackPhase",
     "LLMQueryPhase",
-    "MacrosFtsFallbackPhase",
-    "NameTokensFallbackPhase",
     "Phase",
     "RefinePhase",
     "RoughSearchPhase",

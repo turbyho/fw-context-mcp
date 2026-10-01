@@ -40,12 +40,12 @@ class DeduplicatePhase(Phase):
         In SMART_SEARCH, ``AdaptiveFusionPhase`` runs first and populates
         ``final_results`` — deduplication is then redundant (the fusion
         phase already picked one source).  This phase only activates
-        when no earlier phase produced final results (e.g. embedding-only
-        pipelines or SEARCH_CODE fallback paths).
+        when no earlier phase produced final results.
 
-    Only runs when ``final_results`` is still empty — i.e.
-    ``AdaptiveFusionPhase`` did not produce output (e.g. no embeddings
-    available).
+    Only runs when ``final_results`` is still empty.  In SMART_SEARCH that
+    is when ``AdaptiveFusionPhase`` failed: when FTS5 or embedding gave
+    rows, fusion sets ``final_results``, and when neither did, this phase
+    has nothing to merge.
     """
 
     name = "deduplicate"  #: Phase identifier used in pipeline configuration.

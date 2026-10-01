@@ -16,7 +16,6 @@ import pytest
 from fw_context_mcp.search.context import PipelineContext
 from fw_context_mcp.search.phases.base import Phase
 from fw_context_mcp.search.pipeline import (
-    SEARCH_CODE,
     PipelineConfig,
     PipelineRunner,
     _build_registry,
@@ -99,7 +98,7 @@ class TestRegistry:
     """Tests for _build_registry() — lazy phase registration."""
 
     def test_registry_contains_all_expected_phases(self) -> None:
-        """All 14 phase names must be present."""
+        """All 10 phase names must be present."""
         registry = _build_registry()
         expected = {
             "translate",
@@ -112,10 +111,6 @@ class TestRegistry:
             "deduplicate",
             "expand_context",
             "format",
-            "name_tokens_fallback",
-            "docstring_fallback",
-            "individual_terms_fallback",
-            "macros_fts_fallback",
         }
         assert set(registry.keys()) == expected
 
@@ -145,21 +140,6 @@ class TestPipelineConfig:
     def test_custom_phases(self) -> None:
         cfg = PipelineConfig(phases=["translate", "format"])
         assert cfg.phases == ["translate", "format"]
-
-    def test_search_code_predefined(self) -> None:
-        """SEARCH_CODE contains the expected fallback chain."""
-        assert isinstance(SEARCH_CODE, PipelineConfig)
-        phases = SEARCH_CODE.phases
-        assert "rough_search" in phases
-        assert "fts5_search" in phases
-        assert "name_tokens_fallback" in phases
-        assert "docstring_fallback" in phases
-        assert "individual_terms_fallback" in phases
-        assert "macros_fts_fallback" in phases
-        assert "deduplicate" in phases
-        assert "format" in phases
-        # order matters — fallbacks must be before deduplicate
-        assert phases.index("name_tokens_fallback") < phases.index("deduplicate")
 
     def test_smart_search_has_translate_first(self) -> None:
         cfg = _build_smart_search()

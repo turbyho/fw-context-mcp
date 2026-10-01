@@ -70,7 +70,7 @@ class FTS5SearchPhase(Phase):
         """Execute all generated (or rough) queries via FTS5 and merge results.
 
         Falls back to ``rough_queries`` when no ``generated_queries`` exist
-        (e.g. SEARCH_CODE pipeline with no LLM phase).
+        (e.g. when the LLM query phase did not run or failed).
         """
         queries = ctx.generated_queries if ctx.generated_queries else ctx.rough_queries
         # Overfetch: multiply by 6 to account for noise — FTS5 returns

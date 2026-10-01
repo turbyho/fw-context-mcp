@@ -3,21 +3,21 @@
 Why a pipeline with configurable phases?
     Different search modes need different phase combinations:
 
-    - ``SEARCH_CODE``: fast FTS5 symbol search without the chat model
-      (the comment at ``SEARCH_CODE`` gives the use of the embedding model)
     - ``SMART_SEARCH``: full pipeline (translate → rough → LLM → FTS5 →
       refine → embedding → fusion → deduplicate → expand → format)
     - ``SEMANTIC_SEARCH``: embedding-only similarity search
 
     A composable pipeline lets each mode pick its phases without code
     duplication.  New search modes add a new ``PipelineConfig`` without
-    touching the runner.
+    touching the runner.  The MCP tool search_code uses no pipeline: it
+    has its own fallback steps in ``mcp/handlers/search.py``.
 
 Why lazy registry?
     Phase classes import heavy dependencies (sentence-transformers,
     sqlite-vec, Ollama client).  Loading all phases at import time would
-    make every search slow, even the simple ``SEARCH_CODE`` path.  The
-    lazy registry defers imports until ``PipelineRunner.run()`` is called.
+    make each import of this module slow, also for a caller that runs no
+    pipeline.  The lazy registry defers imports until the first
+    ``PipelineRunner`` is created.
 
 Why continue on phase failure?
     A single phase fail (e.g. Ollama timeout during refinement) should
@@ -51,10 +51,10 @@ def _build_registry() -> dict[str, Phase]:
 
     Why lazy?
         Phase imports pull in sentence-transformers (~200 MB), sqlite-vec
-        (~5 MB native library), and Ollama client.  A simple FTS5 search
-        should not pay these import costs.  The registry is built on first
-        ``PipelineRunner.run()`` call, deferring heavy imports to when
-        they're actually needed.
+        (~5 MB native library), and Ollama client.  A caller that runs no
+        pipeline should not pay these import costs.  The constructor of
+        ``PipelineRunner`` builds the registry, deferring heavy imports to
+        when they're actually needed.
 
     Why double-checked locking?
         Multiple concurrent tool calls may trigger ``_build_registry``
@@ -79,12 +79,6 @@ def _build_registry() -> dict[str, Phase]:
         from fw_context_mcp.search.phases.llm_query import LLMQueryPhase
         from fw_context_mcp.search.phases.refine import RefinePhase
         from fw_context_mcp.search.phases.rough_search import RoughSearchPhase
-        from fw_context_mcp.search.phases.search_fallbacks import (
-            DocstringFallbackPhase,
-            IndividualTermsFallbackPhase,
-            MacrosFtsFallbackPhase,
-            NameTokensFallbackPhase,
-        )
         from fw_context_mcp.search.phases.translate import TranslatePhase
 
         for cls in [
@@ -98,10 +92,6 @@ def _build_registry() -> dict[str, Phase]:
             DeduplicatePhase,
             ExpandContextPhase,
             FormatPhase,
-            NameTokensFallbackPhase,
-            DocstringFallbackPhase,
-            IndividualTermsFallbackPhase,
-            MacrosFtsFallbackPhase,
         ]:
             instance = cls()  # type: ignore[abstract]  # runtime check below
             if not hasattr(instance, 'run') or not callable(instance.run):
@@ -130,35 +120,15 @@ class PipelineConfig:
     Each element can be either a phase name string (looked up in the registry)
     or a pre-configured ``Phase`` instance (for custom parameters).
 
-    Use the predefined constants ``SEARCH_CODE`` and ``SMART_SEARCH``
-    for standard configurations, or build a custom one.
+    Use ``SMART_SEARCH`` (``_build_smart_search()``) or
+    ``_build_semantic_search()`` for the standard configurations, or build
+    a custom one.
     """
 
     phases: list = field(default_factory=list)
 
 
 # Predefined pipelines
-
-# SEARCH_CODE: fast FTS5 symbol search with progressive fallbacks.
-# No phase calls the chat model.  When `llm.enabled` is true,
-# RoughSearchPhase calls the embedding model for its samples.  With 5 or
-# more samples, fts5_search uses the terms of the sample names.  With
-# fewer samples, fts5_search uses the words of the query.
-# The MCP tool search_code does not use this pipeline: it has its own
-# fallback steps in mcp/handlers/search.py.
-# Each fallback only executes when the previous phase found nothing.
-SEARCH_CODE = PipelineConfig(
-    phases=[
-        "rough_search",
-        "fts5_search",
-        "name_tokens_fallback",
-        "docstring_fallback",
-        "individual_terms_fallback",
-        "macros_fts_fallback",
-        "deduplicate",
-        "format",
-    ],
-)
 
 
 def _build_smart_search() -> PipelineConfig:
@@ -167,8 +137,8 @@ def _build_smart_search() -> PipelineConfig:
     Why lazy?
         SMART_SEARCH pulls in ``EmbeddingPhase`` which imports sqlite-vec.
         Building the config at module load time would make every import of
-        ``search`` pay the native-library cost, even for callers that only
-        use ``SEARCH_CODE``.
+        ``search`` pay the native-library cost, even for callers that run
+        no pipeline.
     """
     from fw_context_mcp.search.phases.embedding import EmbeddingPhase
 

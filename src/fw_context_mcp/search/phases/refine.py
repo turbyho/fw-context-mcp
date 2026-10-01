@@ -65,9 +65,9 @@ class RefinePhase(Phase):
         """Only run when LLM is enabled, we have generated queries, and no Ollama warning.
 
         Why check generated_queries?
-            SEARCH_CODE pipelines never run LLMQueryPhase, so there are no
-            generated_queries to refine.  This check skips refinement for
-            the fast FTS5-only path.
+            When LLMQueryPhase did not run or gave nothing, there are no
+            generated_queries to refine.  This check skips refinement in
+            that case.
 
         Why check ollama_warning?
             If Phase 2 already failed, Phase 3 would fail the same way.

@@ -1,8 +1,8 @@
 """Search pipeline — composable phases for code search.
 
 Why a pipeline architecture?
-    The search system must support multiple search modes (quick FTS5 search,
-    full semantic+lexical smart search, semantic-only search) that share
+    The search system must support multiple search modes (full
+    semantic+lexical smart search, semantic-only search) that share
     overlapping phases.  A composable pipeline lets each mode assemble the
     phases it needs without duplicating logic.
 
@@ -13,18 +13,22 @@ Why a pipeline architecture?
 Why lazy module-level constants?
     ``SMART_SEARCH`` imports ``EmbeddingPhase`` which pulls in ``sqlite-vec``
     and sentence-transformers.  These are heavy dependencies not needed
-    for simple ``SEARCH_CODE`` queries.  Using ``__getattr__`` defers the
-    import until ``SMART_SEARCH`` is actually accessed.
+    by a caller that only imports the package or uses ``PipelineConfig``.
+    (A ``PipelineRunner`` loads all phases when it is created.)
+    Using ``__getattr__`` defers the import until ``SMART_SEARCH`` is
+    actually accessed.
 
 Provides:
 - PipelineContext: immutable-ish state object flowing through phases
 - PipelineRunner: executes a configured sequence of phases
 - PipelineConfig: which phases to run, their parameters
-- Predefined pipelines: SEARCH_CODE (quick search), SMART_SEARCH (full pipeline)
+- Predefined pipeline: SMART_SEARCH (full pipeline)
+
+The MCP tool search_code uses no pipeline: it has its own fallback steps
+in ``mcp/handlers/search.py``.
 """
 
 from fw_context_mcp.search.pipeline import (
-    SEARCH_CODE,
     PipelineConfig,
     PipelineRunner,
     _build_smart_search,
@@ -40,7 +44,6 @@ def __getattr__(name):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
-    "SEARCH_CODE",
     "SMART_SEARCH",
     "PipelineConfig",
     "PipelineRunner",
