@@ -131,6 +131,7 @@ FALLBACK = [{"warning": "fallback", "_method": "search_code_fallback"}]
 
 def _run_handler(
     db_path: Path, embedder: object, threshold: float = 0.5, config: object | None = None,
+    limit: int = 20,
 ) -> tuple[list[dict], mock.MagicMock]:
     """Call the semantic_search handler with the index, the LLM and the fallback replaced."""
     from fw_context_mcp.config.settings import Config
@@ -148,8 +149,32 @@ def _run_handler(
         mock.patch.object(PipelineContext, "create", return_value=_context(db_path)),
         mock.patch("fw_context_mcp.search.phases.embedding.get_embedder", return_value=embedder),
     ):
-        results = asyncio.run(handler.semantic_search("q", threshold=threshold))
+        results = asyncio.run(handler.semantic_search("q", threshold=threshold, limit=limit))
     return results, fallback
+
+
+@pytest.mark.parametrize("path", sorted(SEEDERS))
+def test_the_handler_gives_no_more_than_the_limit(populated_db, db_path, path):
+    """PipelineContext.create lifts a limit below 5 to 5 for smart_search.
+
+    semantic_search accepts a limit of 1 and more, thus the handler must
+    cut to the limit that the caller gave.
+    """
+    SEEDERS[path](populated_db)
+
+    results, fallback = _run_handler(db_path, _FakeEmbedder(), limit=2)
+
+    fallback.assert_not_called()
+    assert [r["name"] for r in results] == ["near", "middle"]
+
+
+def test_the_relevance_floor_keeps_the_limit(populated_db, db_path):
+    _seed_vec0(populated_db)
+
+    results, _ = _run_handler(db_path, _WeakEmbedder(), limit=1)
+
+    assert len(results) == 1
+    assert len(results[0]["_results"]) == 1
 
 
 @pytest.mark.parametrize("path", sorted(SEEDERS))
@@ -231,6 +256,20 @@ def test_the_floor_reads_the_best_score_and_not_the_reranked_first(populated_db,
     assert results[0]["name"] == "near"
     assert sorted(r["name"] for r in results[1:]) == ["far", "middle"]
     assert all("warning" not in r for r in results)
+
+
+def test_the_cut_to_the_limit_comes_after_the_reranker(populated_db, db_path):
+    """The reranker chooses from the whole set, then the handler cuts to the limit."""
+    from fw_context_mcp.config.settings import Config
+
+    _seed_vec0(populated_db)
+    config = Config()
+    config.llm.reranker_model = "stand-in"
+
+    with mock.patch("fw_context_mcp.search.reranker.get_reranker", return_value=_ReversingReranker()):
+        results, _ = _run_handler(db_path, _FakeEmbedder(), config=config, limit=1)
+
+    assert [r["name"] for r in results] == ["far"]
 
 
 class _FailingEmbedder:

@@ -619,8 +619,7 @@ async def semantic_search(
         threshold: Minimum cosine similarity (0.0-1.0). Default 0.60.
             The tool applies it to the raw cosine similarity, before the
             source boost.
-        limit: Maximum number of results (default 20, max 100).  The
-            embedding search holds it at 5 or more.
+        limit: Maximum number of results (default 20, max 100).
 
     Returns:
         list of dicts, each with: name, qualified_name, kind, file, line,
@@ -775,6 +774,14 @@ async def semantic_search(
                     )
             except (RuntimeError, ValueError) as e:
                 log.warning("Reranker failed, returning unranked results: %s", e)
+
+        # PipelineContext.create lifts a limit below 5 to 5, because the
+        # re-rank steps of smart_search need a set to choose from.  This
+        # tool accepts a limit of 1 and more, thus cut to it here, after the
+        # reranker had the larger set.  The floor reads ``matched``, the
+        # whole set: it asks if the index has a relevant match at all, also
+        # when the reranker and the cut drop that match.
+        results = results[:limit]
 
         # Relevance floor: when the best cosine-similarity score is below
         # 0.68, the results are likely unrelated to the query. Embedding
