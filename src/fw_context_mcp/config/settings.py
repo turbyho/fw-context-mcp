@@ -1120,6 +1120,28 @@ def _validate_config_safety(proj_data: dict, proj_path: Path) -> None:
         log.warning(msg)
         print(f"⚠ {msg}", file=sys.stderr)
 
+def _drop_malformed_sections(layer: dict, path: Path) -> None:
+    """Remove a known section that is not a table from one config file, and warn.
+
+    WHY at the entry point: every reader of a section assumes a table.  A
+    typo such as ``build = "x"`` (a string where ``[build]`` belongs) made
+    ``_build_variants`` raise AttributeError, which left ``load()`` and took
+    down every tool, and ``_apply_section`` read ``key in "x"`` as a
+    substring test.  A typo in a key name only gives a warning, and a typo
+    in a section must do the same.  The other sections of the file and the
+    other files still apply.
+    """
+    for name in sorted(_KNOWN_SECTIONS):
+        if name in layer and not isinstance(layer[name], dict):
+            msg = (
+                f"{path}: '{name}' must be a table ([{name}]), not a "
+                f"{type(layer[name]).__name__}; fw-context ignores it."
+            )
+            log.warning(msg)
+            print(f"⚠ {msg}", file=sys.stderr)
+            del layer[name]
+
+
 def _drop_committed_trust_keys(proj_data: dict, proj_path: Path) -> None:
     """Remove ``[index] query_driver`` from the committed project config.
 
@@ -1260,6 +1282,7 @@ def load(project_root: Path | None = None) -> Config:
     # creates it from template if missing).
     try:
         data = tomllib.loads(global_path.read_text(encoding="utf-8"))
+        _drop_malformed_sections(data, global_path)
     except (OSError, ValueError):
         log.exception("Failed to parse %s — using defaults", global_path)
 
@@ -1271,6 +1294,7 @@ def load(project_root: Path | None = None) -> Config:
         # from global and project config coexist.
         try:
             proj_data = _read_toml_if_present(proj_path)
+            _drop_malformed_sections(proj_data, proj_path)
             _drop_committed_trust_keys(proj_data, proj_path)
             data = _deep_merge(data, proj_data)
             # Security: validate committed config doesn't contain dangerous settings.
@@ -1286,6 +1310,7 @@ def load(project_root: Path | None = None) -> Config:
         # This is the last merge — local.toml values have highest precedence.
         try:
             local_data = _read_toml_if_present(local_path)
+            _drop_malformed_sections(local_data, local_path)
             data = _deep_merge(data, local_data)
         except (OSError, ValueError):
             log.exception("Failed to parse %s — ignoring local config", local_path)

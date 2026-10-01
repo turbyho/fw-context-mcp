@@ -265,6 +265,46 @@ class TestQueryDriverTrust:
         assert load(proj).index.query_driver == ["~/tools/**"]
 
 
+class TestMalformedSection:
+    """A section that is not a table is a typo, and a typo must not crash load().
+
+    ``build = "x"`` made ``_build_variants`` raise AttributeError out of
+    ``load()``, which took down every MCP tool.
+    """
+
+    def _load(self, tmpdir, monkeypatch, *, committed: str = "", local: str = "", global_text: str = ""):
+        import fw_context_mcp.config.settings as settings
+
+        fake_home = tmpdir / "fake-home"
+        fake_home.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+        global_cfg = Path(tmpdir) / "global.toml"
+        global_cfg.write_text(global_text)
+        monkeypatch.setattr(settings, "_GLOBAL_CONFIG_PATH", global_cfg)
+        proj_dir = Path(tmpdir / "project")
+        (proj_dir / ".fw-context").mkdir(parents=True)
+        (proj_dir / ".fw-context" / "config.toml").write_text(committed)
+        (proj_dir / ".fw-context" / "local.toml").write_text(local)
+        return load(proj_dir)
+
+    @pytest.mark.parametrize("layer", ["committed", "local", "global_text"])
+    @pytest.mark.parametrize("bad", ['build = "x"', "build = []", "index = 3", 'llm = "x"', 'cache_server = "x"'])
+    def test_a_section_that_is_not_a_table_is_ignored(self, tmpdir, monkeypatch, capsys, layer, bad):
+        good = '[project]\nname = "kept"\n'
+        files = {"committed": "", "local": "", "global_text": ""}
+        files[layer] = bad + "\n" + good
+        cfg = self._load(tmpdir, monkeypatch, **files)
+        assert cfg.project.name == "kept", "the other sections of the file still apply"
+        assert "must be a table" in capsys.readouterr().err
+
+    def test_a_string_section_is_not_read_as_a_substring(self, tmpdir, monkeypatch):
+        """``_apply_section`` tested ``key in section``; on a string that is a substring test."""
+        from fw_context_mcp.config.settings import DEFAULT_QUERY_DRIVER
+
+        cfg = self._load(tmpdir, monkeypatch, local='index = "query_driver"\n')
+        assert cfg.index.query_driver == list(DEFAULT_QUERY_DRIVER)
+
+
 class TestVendorProjectPaths:
     def test_vendor_paths_parsing(self):
         cfg = _from_dict({"index": {"vendor_paths": ["third_party", "generated"]}})
