@@ -1,0 +1,35 @@
+# Tests on macOS and Windows.
+#
+# The project must support Linux and macOS, and Windows where it can.  This
+# workflow is prepared but not yet part of every push: it runs only when it
+# is started by hand (Actions > Test (macOS, Windows) > Run workflow).  When
+# the suite passes on both hosts, add `push` and `pull_request` to `on`, or
+# move the matrix into test.yml.
+name: Test (macOS, Windows)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -e ".[dev]"
+      - run: ruff check src/
+      - run: mypy src/
+      # Unpack the bundled clang compiler headers, as `fw-context init` does
+      # on a user host.
+      - run: fw-context doctor --fix --only clang-resource
+        continue-on-error: true
+      - run: pytest tests/ -q -m "not ollama and not libclang and not slow and not system"
