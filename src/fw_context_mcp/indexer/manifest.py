@@ -1079,10 +1079,14 @@ def compute_config_hash(
     # (db_dir), never ~/.fw-context/index.  db_dir is None only on the no-I/O
     # path (compute_structural_hash) — skip the artifact there so no stray
     # file escapes test isolation (FW_CONTEXT_INDEX_DIR).
+    #
+    # db_dir is the database directory of the project, which already holds
+    # the project id, and the manifest of the same hash goes there too.  The
+    # artifact went to `db_dir / project_id` before, where no cleanup looks:
+    # see `_embedding._cleanup_orphaned_cc_artifacts`, which removes those.
     if db_dir is not None:
-        cc_dir = db_dir / project_id
-        cc_dir.mkdir(parents=True, exist_ok=True)
-        out_path = cc_dir / f"compile_commands.{config_hash}.json"
+        db_dir.mkdir(parents=True, exist_ok=True)
+        out_path = db_dir / f"compile_commands.{config_hash}.json"
         try:
             out_path.write_text(canonical_json, encoding="utf-8")
         except OSError:

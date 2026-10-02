@@ -1453,7 +1453,7 @@ def _cleanup_old_for_pair(
     """Delete older builds of one ``(variant, image)`` pair, keeping *keep_hash*.
 
     Returns the list of deleted ``config_hash`` values.  Also removes the
-    debug artifacts ``<db_dir>/<project_id>/compile_commands.<hash>.json``
+    debug artifacts ``<db_dir>/compile_commands.<hash>.json``
     so no orphaned files survive retention.
     """
     old_rows = conn.execute(
@@ -1477,11 +1477,14 @@ def _cleanup_old_for_pair(
     # the most recently modified manifest in the directory.
     from .manifest import _manifest_path
 
-    cc_dir = db_dir / project_id
+    # db_dir is the database directory of the project, where
+    # `manifest.compute_config_hash` writes the artifact.  It holds the
+    # project id already, and `db_dir / project_id` named a directory that
+    # the writer used by mistake.
     for old_ch in deleted:
         for artifact in (
             _manifest_path(db_dir, old_ch),
-            cc_dir / f"compile_commands.{old_ch}.json",
+            db_dir / f"compile_commands.{old_ch}.json",
         ):
             try:
                 artifact.unlink(missing_ok=True)

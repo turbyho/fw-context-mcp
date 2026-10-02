@@ -215,8 +215,47 @@ def _cleanup_orphaned_cc_artifacts(db_path: Path, project_id: str) -> int:
             except OSError:
                 pass
 
+    deleted += _remove_nested_cc_artifacts(cc_dir / project_id)
+
     if deleted:
         log.info("Cleaned up %d orphaned compile_commands artifacts in %s", deleted, cc_dir)
+    return deleted
+
+
+def _remove_nested_cc_artifacts(nested: Path) -> int:
+    """Remove the artifacts in *nested*, and the directory when it is then empty.
+
+    ``compute_config_hash`` wrote ``compile_commands.<hash>.json`` to
+    ``<project db dir>/<project_id>/`` until 2026-10, one directory too deep,
+    and no cleanup looked there.  Measured on one machine: 39 such files.
+    The writer now writes next to the manifest, and nothing reads the nested
+    directory, thus each artifact there is stale, also the one of an active
+    build.  A file that is not an artifact stays, and so does its directory.
+    """
+    if not nested.is_dir():
+        return 0
+    deleted = 0
+    for f in nested.iterdir():
+        name = f.name
+        hash_part = name[len("compile_commands."):-len(".json")]
+        if not (
+            f.is_file()
+            and name.startswith("compile_commands.")
+            and name.endswith(".json")
+            and len(hash_part) == 64
+            and all(c in "0123456789abcdef" for c in hash_part)
+        ):
+            continue
+        try:
+            f.unlink()
+            deleted += 1
+        except OSError:
+            log.debug("could not remove %s", f, exc_info=True)
+    try:
+        nested.rmdir()
+    except OSError as exc:
+        # Usually not empty: a file that is not an artifact stays.
+        log.debug("kept %s: %s", nested, exc)
     return deleted
 
 
