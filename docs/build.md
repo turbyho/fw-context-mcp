@@ -461,6 +461,13 @@ clean = false
 `idf_path` is optional when `idf.py` is on `$PATH`.  Set it here for
 non-standard installations.
 
+fw-context reads the linker scripts from the link of the application in
+`build/build.ninja`. `build/project_description.json` names the ELF of the
+application. The link names each script with `-T` and no directory, and
+the `-L` options give the directories that hold the scripts. When
+fw-context cannot read a link input, the index keeps the memory map that
+it has.
+
 ### 9. IAR EWARM with pre-build hook
 
 ```toml

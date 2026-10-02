@@ -15,9 +15,12 @@ When the build records nothing, the answer is an empty list.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from . import _link_command
 
 log = logging.getLogger(__name__)
 
@@ -85,14 +88,20 @@ def from_ninja(build_dir: Path) -> list[Path]:
     knowledge of paths.
 
     A path in a ninja file is relative to the build directory.  The result
-    holds only files that exist, in the order the file names them, with
-    duplicates removed.
+    is in the order the file names them, with duplicates removed.
 
-    ESP-IDF passes about ten scripts and Zephyr passes two, thus the return
-    type is a list.  Zephyr's two are the final script and the pre-pass
-    script, and measurement on three images found them identical in
-    symbols, lines, and regions — so reading both and keeping the first
-    name costs nothing.
+    A name that looks like a path and is not a file gives an empty list,
+    which means "not known".  Measured on an ESP-IDF build: `-T memory.ld`
+    is a name that ld finds through `-L`, not in the build directory.  A
+    list of the other scripts would be the memory map of another link.  An
+    ESP-IDF build reads its link through `ninja_link`, which knows `-L`.
+    Measured on the 22 other `build.ninja` files of this machine (Zephyr,
+    NCS): each name resolves, thus they keep their scripts.
+
+    Zephyr passes two scripts, thus the return type is a list.  They are the
+    final script and the pre-pass script, and measurement on three images
+    found them identical in symbols, lines, and regions — so reading both
+    and keeping the first name costs nothing.
     """
     ninja = build_dir / "build.ninja"
     try:
@@ -107,9 +116,15 @@ def from_ninja(build_dir: Path) -> list[Path]:
     seen: set[Path] = set()
     for match in _DASH_T.finditer(text):
         raw = match.group(1)
-        # A ninja variable such as `-T$script` names nothing this side can
-        # resolve, so skip it rather than build a path from the literal.
-        if "$" in raw or not _looks_like_a_path(raw):
+        # A ninja variable such as `-T$script` names a script that this side
+        # cannot resolve, thus the link is not known.  The `$` of a ninja
+        # escape (`$$`, `$ `, `$:`) is not a variable.
+        if _NINJA_VARIABLE.search(raw.replace("$$", "")):
+            log.info("linker script: %s names %r, a ninja variable, thus the link is not known", ninja, raw)
+            return []
+        # A token with no suffix and no separator is the tail of a longer
+        # flag, such as `-Target=x`, and no script.
+        if not _looks_like_a_path(raw):
             continue
         candidate = Path(raw)
         if not candidate.is_absolute():
@@ -117,12 +132,236 @@ def from_ninja(build_dir: Path) -> list[Path]:
         try:
             resolved = candidate.resolve()
         except OSError:
-            continue
-        if resolved in seen or not resolved.is_file():
+            resolved = None
+        if resolved is None or not resolved.is_file():
+            log.info("linker script: %s names %r, which is not a file, thus the link is not known", ninja, raw)
+            return []
+        if resolved in seen:
             continue
         seen.add(resolved)
         found.append(resolved)
     return found
+
+
+# ── The link edge of a ninja file ──────────────────────────────────────────
+
+# The variables of a CMake link edge that hold arguments of the compiler
+# driver, in the order of the CMake link rule:
+#   `$FLAGS $LINK_FLAGS $in -o $TARGET_FILE $LINK_PATH $LINK_LIBRARIES`.
+# `$in` holds the object files.  `PRE_LINK` and `POST_BUILD` hold shell
+# commands, which are no arguments of the link.
+_LINK_VARIABLES = ("FLAGS", "LINK_FLAGS", "LINK_PATH", "LINK_LIBRARIES")
+
+# A reference to a ninja variable, `$name` or `${name}`.  The escapes `$$`,
+# `$ `, `$:` and `$` at the end of a line are handled before.
+_NINJA_VARIABLE = re.compile(r"\$\{[A-Za-z0-9_.-]+\}|\$[A-Za-z0-9_-]+")
+
+# Marks a reference to a ninja variable in a value, and a literal dollar sign,
+# while the value goes through `shlex`.  Neither character is in a command.
+_VARIABLE_MARK = "\x00"
+_DOLLAR_MARK = "\x01"
+
+
+@dataclass
+class _NinjaEdge:
+    """One `build` statement: its outputs, its rule and its variables."""
+
+    outputs: list[str]
+    rule: str
+    variables: dict[str, str] = field(default_factory=dict)
+
+
+def ninja_link(build_dir: Path, target: str | None = None) -> LinkRecord | None:
+    """Return the link of the executable *target* in `build_dir/build.ninja`, or None.
+
+    CMake writes one `build` statement for each executable, with a rule
+    whose name holds `EXECUTABLE_LINKER`, and the arguments of the compiler
+    driver in its variables.  The edge of *target* (a path relative to the
+    build directory, as the statement names it) is the link.  With no
+    *target*, the only executable edge is the link.  ninja runs the command
+    in the build directory, thus a relative path is relative to it.
+
+    The arguments go to `_link_command`, which finds a script that `-T`
+    names with no directory in the `-L` directories.  Measured on the
+    ESP-IDF fixture (v5.2.5): nine `-T` names with no directory in
+    `LINK_FLAGS`, and the directories in `LINK_PATH`.
+
+    None ("not known") when the file or the edge is missing, when more than
+    one executable edge can be the link, when an argument holds a ninja
+    variable and can be a link input, or when `_link_command` cannot read
+    the link.
+    """
+    edges = [edge for edge in _ninja_edges(build_dir) if "EXECUTABLE_LINKER" in edge.rule]
+    if target is not None:
+        wanted = os.path.normpath(target)
+        exact = [edge for edge in edges if wanted in (os.path.normpath(out) for out in edge.outputs)]
+        # With CMAKE_RUNTIME_OUTPUT_DIRECTORY the edge names `bin/app.elf`
+        # and ESP-IDF names `app.elf`.  The file name decides, when it is
+        # the name of only one edge.
+        edges = exact or [
+            edge for edge in edges
+            if os.path.basename(wanted) in (os.path.basename(out) for out in edge.outputs)
+        ]
+    if len(edges) != 1:
+        log.info(
+            "linker script: %s has %d executable link(s) for %r, thus the link is not known",
+            build_dir / "build.ninja", len(edges), target,
+        )
+        return None
+    edge = edges[0]
+    raw_flags: list[str] = []
+    linkflags: list[str | None] = []
+    for name in _link_variable_order(build_dir, edge.rule):
+        for token in _ninja_value_tokens(edge.variables.get(name, "")):
+            raw_flags.append(token.replace(_VARIABLE_MARK, "$X"))
+            linkflags.append(None if _VARIABLE_MARK in token else token)
+    lost = _link_command._lost_link_input(raw_flags, linkflags)
+    if lost:
+        log.info("linker script: the link of %s cannot be read: %s", edge.outputs[0], lost)
+        return None
+    # The words come from a shell split already, see `_ninja_value_tokens`.
+    scripts = _link_command.resolve_link_scripts(linkflags, [], build_dir, unquote=False)
+    if scripts is None:
+        return None
+    return LinkRecord(scripts=scripts, defsyms=_link_command.defsyms_from_flags(linkflags))
+
+
+def _ninja_edges(build_dir: Path) -> list[_NinjaEdge]:
+    """Return the `build` statements of `build_dir/build.ninja`, or [] when it cannot be read."""
+    lines = _ninja_lines(build_dir / "build.ninja")
+    edges: list[_NinjaEdge] = []
+    current: _NinjaEdge | None = None
+    for line in lines:
+        if line.startswith((" ", "\t")):
+            if current is not None:
+                name, equals, value = line.strip().partition("=")
+                if equals:
+                    current.variables[name.strip()] = value.strip()
+            continue
+        current = None
+        if line.startswith("build "):
+            outputs, rule = _ninja_build_header(line[len("build "):])
+            if rule:
+                current = _NinjaEdge(outputs=outputs, rule=rule)
+                edges.append(current)
+    return edges
+
+
+def _ninja_lines(path: Path) -> list[str]:
+    """Return the lines of the ninja file *path*, with each continuation joined.
+
+    A line that ends with an odd number of `$` continues on the next line,
+    and ninja removes the leading white space of that line.
+    """
+    try:
+        if path.stat().st_size > _MAX_NINJA_BYTES:
+            log.debug("%s is too large to scan", path)
+            return []
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    lines: list[str] = []
+    pending = ""
+    for raw in text.split("\n"):
+        line = raw.rstrip("\r")
+        if pending:
+            line = line.lstrip(" \t")
+        dollars = len(line) - len(line.rstrip("$"))
+        if dollars % 2:
+            pending += line[:-1]
+            continue
+        lines.append(pending + line)
+        pending = ""
+    if pending:
+        lines.append(pending)
+    return lines
+
+
+def _ninja_build_header(text: str) -> tuple[list[str], str]:
+    """Return the outputs and the rule of the header of one `build` statement.
+
+    *text* is `out1 out2: rule in1 in2 | deps`.  `$ ` is a space in a path,
+    `$:` a colon, and `$$` a dollar sign.  An unescaped `:` ends the outputs.
+    """
+    outputs: list[str] = []
+    word = ""
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "$" and index + 1 < len(text) and text[index + 1] in " :$":
+            word += text[index + 1]
+            index += 2
+            continue
+        if char == ":":
+            if word:
+                outputs.append(word)
+            rest = text[index + 1:].split()
+            return outputs, rest[0] if rest else ""
+        if char == " ":
+            if word:
+                outputs.append(word)
+            word = ""
+        else:
+            word += char
+        index += 1
+    return outputs, ""
+
+
+def _link_variable_order(build_dir: Path, rule: str) -> list[str]:
+    """Return the link variables in the order that the command of *rule* names them.
+
+    The rule is in `build.ninja` or in a file that it includes
+    (`CMakeFiles/rules.ninja`).  A rule that is not found gives the order of
+    the CMake link rule, `_LINK_VARIABLES`.
+
+    A rule with a response file names some variables in `rspfile_content`
+    and the file as `@$RSP_FILE` in its command.  CMake does that when the
+    command line is too long, which is the normal case for ESP-IDF on
+    Windows.  The content takes the place of `$RSP_FILE`, thus those
+    variables keep their position in the link.
+    """
+    files = [build_dir / "build.ninja"]
+    for line in _ninja_lines(files[0]):
+        if line.startswith("include "):
+            files.append(build_dir / line[len("include "):].strip())
+    for path in files:
+        found: dict[str, str] | None = None
+        for line in _ninja_lines(path):
+            if not line.startswith((" ", "\t")):
+                if found is not None:
+                    break
+                if line.strip() == f"rule {rule}":
+                    found = {}
+                continue
+            name, equals, value = line.strip().partition("=")
+            if found is not None and equals:
+                found[name.strip()] = value.strip()
+        if found is not None and "command" in found:
+            # str.replace, not re.sub: the content can hold a backslash.
+            command = found["command"]
+            for reference in ("${RSP_FILE}", "$RSP_FILE"):
+                command = command.replace(reference, found.get("rspfile_content", ""))
+            named = re.findall(r"\$\{?([A-Za-z0-9_]+)\}?", command)
+            order = [name for name in dict.fromkeys(named) if name in _LINK_VARIABLES]
+            return order or list(_LINK_VARIABLES)
+    return list(_LINK_VARIABLES)
+
+
+def _ninja_value_tokens(value: str) -> list[str]:
+    """Return the shell words of the value of one ninja variable.
+
+    The escapes go first: `$$` is a dollar sign, `$ ` a space and `$:` a
+    colon.  A reference to a ninja variable stays as `_VARIABLE_MARK` in its
+    word, so that the caller can tell a word that did not expand.  A value
+    that the shell cannot split gives one word with the mark.  The split
+    follows the rules of the host, see `_link_command.shell_words`.
+    """
+    text = value.replace("$$", _DOLLAR_MARK).replace("$ ", " ").replace("$:", ":")
+    text = _NINJA_VARIABLE.sub(_VARIABLE_MARK, text)
+    words = _link_command.shell_words(text)
+    if words is None:
+        return [_VARIABLE_MARK]
+    return [word.replace(_DOLLAR_MARK, "$") for word in words]
 
 
 def output_dirs_from_units(

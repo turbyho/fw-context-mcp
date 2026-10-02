@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -23,6 +24,64 @@ if TYPE_CHECKING:
     from ..build import BuildConfig
 
 log = logging.getLogger(__name__)
+
+
+def _app_elf(build_dir: Path) -> str | None:
+    """Return the ELF of the application that ``project_description.json`` names, or None.
+
+    ESP-IDF writes the file in each build directory.  None when the file is
+    missing or has no ``app_elf`` string.
+    """
+    try:
+        description = json.loads((build_dir / "project_description.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    app_elf = description.get("app_elf") if isinstance(description, dict) else None
+    return app_elf if isinstance(app_elf, str) and app_elf else None
+
+
+# A unit of an ESP-IDF build compiles in a directory of the build directory,
+# such as `build/esp-idf/esp_system`.  The walk up from it stops after this
+# many levels, which is far deeper than any measured layout.
+_MAX_BUILD_DIR_DEPTH = 12
+
+
+def _build_dir_of(compile_commands: Path, units: list | None) -> Path | None:
+    """Return the build directory that *compile_commands* comes from, or None.
+
+    The directory of *compile_commands* when it holds ``build.ninja``.  Else
+    the first directory above the ``directory`` of a unit that holds
+    ``build.ninja`` and a ``compile_commands.json`` with the content of
+    *compile_commands*.  WHY the content: ``build()`` copies the database,
+    and a build directory whose database changed after the copy has
+    another link.  The build directory can be ``build/`` or an isolated
+    one in ``.fw-context/autobuild/``, thus a fixed name would be a guess.
+    """
+    if (compile_commands.parent / "build.ninja").is_file():
+        return compile_commands.parent
+    try:
+        content = compile_commands.read_bytes()
+    except OSError:
+        return None
+    checked: set[Path] = set()
+    for unit in units or []:
+        directory = getattr(unit, "directory", None)
+        if not directory:
+            continue
+        for candidate in [Path(directory), *Path(directory).parents][:_MAX_BUILD_DIR_DEPTH]:
+            if candidate in checked:
+                break
+            checked.add(candidate)
+            if not (candidate / "build.ninja").is_file():
+                continue
+            try:
+                same = (candidate / "compile_commands.json").read_bytes() == content
+            except OSError:
+                same = False
+            if same:
+                return candidate
+            break
+    return None
 
 
 class ESPIDFBuildSystem:
@@ -223,15 +282,50 @@ class ESPIDFBuildSystem:
         variant: str = "",
         units: list | None = None,
     ) -> list[Path]:
-        """Return the scripts that `build/build.ninja` names with `-T`.
+        """Return the scripts of the link of the application, see ``get_link_record``.
 
         ESP-IDF does not use one script.  It passes about ten — the ROM
         symbol files of the chip, `memory.ld`, and `sections.ld` — so the
         caller reads them all and each one adds what it holds.
         """
+        record = self.get_link_record(
+            project_root, compile_commands=compile_commands, variant=variant, units=units,
+        )
+        return record.scripts if record is not None else []
+
+    def get_link_record(
+        self,
+        project_root: Path,
+        *,
+        compile_commands: Path | None = None,
+        variant: str = "",
+        units: list | None = None,
+    ) -> _linker.LinkRecord | None:
+        """Return the link of the application from the build directory, or None.
+
+        The build directory holds ``compile_commands.json``, ``build.ninja``
+        and ``project_description.json``.  The last one names the ELF of the
+        application (``app_elf``), and ``_linker.ninja_link`` reads the link
+        edge of that ELF.  Measured on the ESP-IDF fixture (v5.2.5): the
+        edge passes nine ``-T`` names with no directory, which ld finds in
+        the ``-L`` directories of ``LINK_PATH``.  ``from_ninja`` does not
+        know ``-L``, and found none of them.
+
+        Without ``project_description.json`` the only executable edge of
+        the file is the link.  None ("not known") when the build directory
+        is not known or the link cannot be read.
+
+        ``fw-context index --build`` indexes the copy that ``build()``
+        publishes in ``.fw-context/build/``, where no ``build.ninja`` is.
+        See ``_build_dir_of`` for how the build directory is found then.
+        """
         if compile_commands is None:
-            return []
-        return _linker.from_ninja(compile_commands.parent)
+            return None
+        build_dir = _build_dir_of(compile_commands, units)
+        if build_dir is None:
+            log.info("linker script: no build.ninja belongs to %s", compile_commands)
+            return None
+        return _linker.ninja_link(build_dir, _app_elf(build_dir))
 
     def get_build_dir_patterns(self, project_root: Path) -> list[str]:
         """Return build-output directory patterns for staleness filtering."""
