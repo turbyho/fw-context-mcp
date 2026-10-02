@@ -745,6 +745,19 @@ def cmd_init(args: argparse.Namespace) -> int:
         if not build_ok:
             print(f"  [build] compile_commands.json not generated: {cc_err}")
 
+    # ── 6b. Allow the toolchains of the build ──
+    # WHY here and without a flag: the GCC driver query runs only an
+    # allowed compiler, and a user does not know the list exists.  The
+    # compilers are known once compile_commands.json is there.
+    if not args.dry_run:
+        from ..indexer._allowlist import allow_project_toolchains
+
+        try:
+            for glob in allow_project_toolchains(project_root):
+                print(f"  [query-driver] added {glob} to .fw-context/toolchains.toml")
+        except (OSError, ValueError) as error:
+            print(f"  [query-driver] cannot add the toolchains of the build: {error}")
+
     # ── 7. AI tool registration (unless quick) ──
     ok = False
     all_warnings: list[str] = []

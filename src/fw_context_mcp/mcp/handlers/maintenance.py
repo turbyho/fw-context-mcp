@@ -2195,6 +2195,10 @@ def _reindex_match_tus(
     # list(), not the iterator parse_cc returns: the header fallback below
     # walks the units a second time, and a generator is empty by then.
     # The same allowlist as the index run, thus the same flags for the unit.
+    if project_root:
+        from ...indexer._allowlist import ensure_project_toolchains
+
+        ensure_project_toolchains(project_root, cc_path)
     query_driver = load_config(project_root=project_root).index.query_driver if project_root else DEFAULT_QUERY_DRIVER
     units = list(parse_cc(cc_path, query_driver, project_root))
     matching = [u for u in units if Path(u.file).resolve() == target]

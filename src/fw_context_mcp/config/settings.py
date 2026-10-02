@@ -560,6 +560,21 @@ class IndexConfig:
     min_dense_count: int = 3
     max_symbol_body_lines: int = 1000
     query_driver: list[str] = field(default_factory=lambda: list(DEFAULT_QUERY_DRIVER))
+    query_driver_extra: list[str] = field(default_factory=list)
+    """Globs ADDED to ``query_driver`` (it does not replace the default).
+    ``fw-context init``, ``doctor`` and each index run write the compilers
+    of the project to ``.fw-context/toolchains.toml`` under this key; after
+    the load, ``query_driver`` holds both lists.  The lists of the global
+    config, of ``local.toml`` and of ``toolchains.toml`` are all added: a
+    developer who adds a glob to ``local.toml`` keeps the global ones.  WHY
+    a key of its own: a written copy of the default list would freeze it,
+    and a later release with more default entries would not reach the
+    project."""
+    query_driver_auto: bool = True
+    """Let fw-context add the compilers of the build to ``toolchains.toml``,
+    and use that file.  ``false`` stops both: the allowlist is then only
+    what the developer wrote, for example ``query_driver = []`` to run no
+    compiler at all."""
     purge_max_missing_percent: int = 20
     """Abort the automatic ghost-file purge when more than this percent of
     indexed files are missing from disk — guards against an offline network
@@ -905,6 +920,8 @@ _INDEX_FIELDS: list[tuple[str, str, str]] = [
     ("min_dense_count", "min_dense_count", "int(3)"),
     ("max_symbol_body_lines", "max_symbol_body_lines", "int(1000)"),
     ("query_driver", "query_driver", "list"),
+    ("query_driver_extra", "query_driver_extra", "list"),
+    ("query_driver_auto", "query_driver_auto", "bool"),
     ("purge_max_missing_percent", "purge_max_missing_percent", "int(20)"),
 ]
 
@@ -1176,19 +1193,71 @@ def _drop_malformed_sections(layer: dict, path: Path) -> None:
             del layer[name]
 
 
-def _drop_committed_trust_keys(proj_data: dict, proj_path: Path) -> None:
-    """Remove ``[index] query_driver`` from the committed project config.
+#: The file in which fw-context keeps the toolchains of a project (written by
+#: ``indexer/_allowlist.py``).  A file of its own and not ``local.toml``:
+#: the automatic write must not touch the comments and keys of the
+#: developer, and a syntax error there must not cost them.
+TOOLCHAINS_FILE_NAME = "toolchains.toml"
 
-    WHY remove and not warn, as ``_validate_config_safety`` does: the key is
+
+def _index_value(layer: dict, key: str) -> object:
+    """Give ``[index] <key>`` of one config layer, or None."""
+    index = layer.get("index")
+    return index.get(key) if isinstance(index, dict) else None
+
+
+def _string_list(value: object) -> list[str]:
+    """Give the strings of a list value (a string alone counts as one); ignore any other type."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, str)]
+    return []
+
+
+def toolchains_path(project_root: Path) -> Path:
+    """Give the path of the toolchain allowlist file of *project_root*."""
+    return project_root / _PROJECT_CONFIG_DIR / TOOLCHAINS_FILE_NAME
+
+
+def read_toolchain_globs(project_root: Path) -> list[str]:
+    """Give the ``[index] query_driver_extra`` globs of ``toolchains.toml``, or [].
+
+    A link is refused: a repository could commit ``.fw-context/toolchains.toml``
+    as a link to a file of its choice, and the allowlist must come from this
+    machine.  A file that does not parse gives [] and a warning.
+    """
+    path = toolchains_path(project_root)
+    try:
+        if path.is_symlink() or path.parent.is_symlink():
+            log.warning("%s is a link; fw-context ignores it", path)
+            return []
+        if not path.is_file():
+            return []
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        log.warning("Cannot read %s: %s", path, error)
+        return []
+    return _string_list(_index_value(data, "query_driver_extra"))
+
+
+def _drop_committed_trust_keys(proj_data: dict, proj_path: Path) -> None:
+    """Remove ``[index] query_driver``, ``query_driver_extra`` and ``query_driver_auto`` from the committed config.
+
+    WHY remove and not warn, as ``_validate_config_safety`` does: the keys are
     the allowlist of the binaries that the indexer runs without a build.  A
     repository that could set it could also allow the compiler script it
     commits, thus the allowlist would protect nothing.
 
-    The key is read from the global config and from ``local.toml``, the
-    per-developer file of the project.  The operator decided that
+    ``query_driver_auto`` too: a committed ``true`` would cancel a
+    ``false`` of the global config.
+
+    The keys are read from the global config, from ``local.toml``, the
+    per-developer file of the project, and (``query_driver_extra`` only)
+    from ``toolchains.toml``, which fw-context writes.  The operator decided that
     ``local.toml`` counts as the developer's own file.  Note: only a
-    convention keeps that file out of git, thus a repository that commits a
-    ``local.toml`` can still set the key.  A ``[[build.variants]]`` table is
+    convention keeps those files out of git, thus a repository that commits a
+    ``local.toml`` or a ``toolchains.toml`` can still set the keys.  A ``[[build.variants]]`` table is
     cleaned too, because a variant carries ``[index]`` keys as overrides.
     """
     tables: list[dict] = []
@@ -1203,12 +1272,13 @@ def _drop_committed_trust_keys(proj_data: dict, proj_path: Path) -> None:
         tables.extend(v for v in variants if isinstance(v, dict))
     found = False
     for table in tables:
-        if "query_driver" in table:
-            del table["query_driver"]
-            found = True
+        for key in ("query_driver", "query_driver_extra", "query_driver_auto"):
+            if key in table:
+                del table[key]
+                found = True
     if found:
         msg = (
-            f"SECURITY: query_driver in {proj_path} (committed) is ignored. It selects the "
+            f"SECURITY: query_driver(_extra, _auto) in {proj_path} (committed) is ignored. It selects the "
             f"compilers that fw-context runs, thus only .fw-context/local.toml or "
             f"~/.fw-context/config.toml can set it."
         )
@@ -1240,7 +1310,15 @@ def _is_loopback_url(url: str) -> bool:
 # Why mtime instead of inotify?  Simplicity — the MCP server is short-lived
 # (one session), config files change rarely, and mtime comparison costs ~0.
 # An inotify watcher would need threads and cleanup logic for no real benefit.
-_config_cache: OrderedDict[tuple, tuple[tuple[float | None, ...], Config]] = OrderedDict()
+#
+# The toolchains.toml file of a project is not in the key, because it is not
+# a layer of the merge.  Its stamp (``_file_stamp``) is kept beside the mtime
+# signature instead and compared for equality, thus a file that appears,
+# changes or goes away all reload.  The stamp does not follow a link, because
+# read_toolchain_globs refuses a link and reads nothing through it.
+_config_cache: OrderedDict[
+    tuple, tuple[tuple[float | None, ...], tuple[int, int] | None, Config]
+] = OrderedDict()
 _CONFIG_CACHE_MAX = 50
 
 
@@ -1268,6 +1346,17 @@ def _mtime_signature(paths: tuple[Path | None, ...]) -> tuple[float | None, ...]
     return tuple(signature)
 
 
+def _file_stamp(path: Path | None) -> tuple[int, int] | None:
+    """Give ``(mtime_ns, size)`` of *path* without following a link, or None when it is missing."""
+    if path is None:
+        return None
+    try:
+        info = path.lstat()
+    except OSError:
+        return None
+    return (info.st_mtime_ns, info.st_size)
+
+
 def load(project_root: Path | None = None) -> Config:
     """Load merged config for the given project root.
 
@@ -1280,7 +1369,9 @@ def load(project_root: Path | None = None) -> Config:
     a broken config file must not prevent the MCP tools from loading.
 
     Results are cached per (global_path, proj_path, local_path) tuple and
-    invalidated when any source file's mtime changes.
+    invalidated when any source file's mtime changes, or when the stamp of
+    ``.fw-context/toolchains.toml`` changes (the file appears, changes or
+    goes away).
 
     **Why deep merge?**  Shallow merge loses nested keys —
     ``config.toml`` sets ``[llm] embed_model = "foo"``, ``local.toml`` sets
@@ -1294,6 +1385,9 @@ def load(project_root: Path | None = None) -> Config:
     Log loudly, continue with defaults.
     """
     data: dict = {}
+    # The query_driver_extra list of each trusted layer.  WHY not the merged
+    # value: the deep merge replaces a list, and the key must add.
+    extra_layers: list[object] = []
 
     global_path = _ensure_global_config()
     proj_path = local_path = None
@@ -1306,10 +1400,11 @@ def load(project_root: Path | None = None) -> Config:
     # dataclass construction are cheap (sub-ms), but resolve_embed_model
     # runs subprocess checks (ollama list, nvidia-smi) that cost ~200 ms.
     cache_key = (global_path, proj_path, local_path)
+    toolchains_stamp = _file_stamp(toolchains_path(project_root) if project_root is not None else None)
     if cache_key in _config_cache:
-        cached_sig, cached_cfg = _config_cache[cache_key]
+        cached_sig, cached_stamp, cached_cfg = _config_cache[cache_key]
         # Check if any source file changed, appeared, or went away.
-        if _mtime_signature(cache_key) == cached_sig:
+        if _mtime_signature(cache_key) == cached_sig and cached_stamp == toolchains_stamp:
             return cached_cfg
 
     # Phase 1: load global config (always present — _ensure_global_config
@@ -1317,6 +1412,7 @@ def load(project_root: Path | None = None) -> Config:
     try:
         data = tomllib.loads(global_path.read_text(encoding="utf-8"))
         _drop_malformed_sections(data, global_path)
+        extra_layers.append(_index_value(data, "query_driver_extra"))
     except (OSError, ValueError):
         log.exception("Failed to parse %s — using defaults", global_path)
 
@@ -1345,6 +1441,7 @@ def load(project_root: Path | None = None) -> Config:
         try:
             local_data = _read_toml_if_present(local_path)
             _drop_malformed_sections(local_data, local_path)
+            extra_layers.append(_index_value(local_data, "query_driver_extra"))
             data = _deep_merge(data, local_data)
         except (OSError, ValueError):
             log.exception("Failed to parse %s — ignoring local config", local_path)
@@ -1376,6 +1473,18 @@ def load(project_root: Path | None = None) -> Config:
             )
 
     cfg = _from_dict(data)
+    # The effective allowlist: query_driver (the default or a replacement)
+    # plus the globs that are added to it.  The toolchains.toml globs come
+    # last, from a file that only fw-context writes (indexer/_allowlist.py).
+    cfg.index.query_driver_extra = list(dict.fromkeys(
+        item for layer in extra_layers for item in _string_list(layer)
+    ))
+    toolchain_globs: list[str] = []
+    if project_root is not None and cfg.index.query_driver_auto:
+        toolchain_globs = read_toolchain_globs(project_root)
+    cfg.index.query_driver = list(dict.fromkeys(
+        [*cfg.index.query_driver, *cfg.index.query_driver_extra, *toolchain_globs],
+    ))
     from ..llm.auto_model import resolve_embed_model
     resolve_embed_model(cfg.llm)
     cfg.index.db_dir = cfg.index.db_dir.expanduser().resolve()
@@ -1394,7 +1503,7 @@ def load(project_root: Path | None = None) -> Config:
     # Cache with current mtime
     if len(_config_cache) >= _CONFIG_CACHE_MAX:
         _config_cache.popitem(last=False)
-    _config_cache[cache_key] = (_mtime_signature(cache_key), cfg)
+    _config_cache[cache_key] = (_mtime_signature(cache_key), toolchains_stamp, cfg)
 
     return cfg
 

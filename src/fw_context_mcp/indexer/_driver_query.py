@@ -234,7 +234,7 @@ def known_compilers(entries: Iterable[Mapping[str, object]]) -> dict[str, Path]:
     """
     found: dict[str, Path] = {}
     for entry in entries:
-        token = _first_token(entry)
+        token = compiler_token(entry)
         if token and ("/" in token or "\\" in token):
             found.setdefault(Path(token).name, Path(token))
     return found
@@ -633,8 +633,11 @@ def warn_not_allowed(compiler: Path) -> None:
     log.warning(
         "The compiler %s is not in [index] query_driver, thus fw-context does not run it "
         "to ask for its system headers; the parse uses the flags of compile_commands.json "
-        "and the guessed toolchain directories. Add a glob for it to query_driver if you "
-        "trust it.",
+        "and the guessed toolchain directories. fw-context adds the compilers of a build to "
+        ".fw-context/toolchains.toml at init, doctor and each index run, unless it refused "
+        "this one (a warning gives the reason) or [index] query_driver_auto is false. If you "
+        "trust it, add a glob for it to "
+        "[index] query_driver_extra in .fw-context/local.toml.",
         compiler,
     )
 
@@ -674,11 +677,29 @@ def _log_proxy_once(triple: str, proxy: str) -> None:
     log.info("libclang has no backend for %s; the parse uses %s, which has the same type sizes", triple, proxy)
 
 
-def _first_token(entry: Mapping[str, object]) -> str:
+#: The first word of a ``command`` field when it needs no shell parsing: a
+#: word with no quote and no backslash, or one quoted word with no
+#: backslash.  The separators are those of ``shlex`` in POSIX mode.
+_SIMPLE_FIRST_WORD = re.compile(r"""[ \t\r\n]*(?:"([^"\\]*)"|'([^']*)'|([^ \t\r\n"'\\]+))(?:[ \t\r\n]|\Z)""")
+
+
+def compiler_token(entry: Mapping[str, object]) -> str:
+    """Give the first word of an entry (the compiler), or "" when the entry names none.
+
+    WHY not always ``shlex.split``: a ``command`` field of a large build
+    holds hundreds of flags, and the split of the whole line costs more than
+    the rest of the work on the entry.  Only the first word is necessary.
+    The regex gives the same word as ``shlex`` for the simple forms; a form
+    with an escape or a joined quote goes to ``shlex``, which can raise
+    ``ValueError`` on an unclosed quote.
+    """
     arguments = entry.get("arguments")
     if isinstance(arguments, list) and arguments:
         return str(arguments[0])
     command = entry.get("command")
-    if isinstance(command, str) and command.strip():
-        return shlex.split(command)[0]
-    return ""
+    if not isinstance(command, str) or not command.strip():
+        return ""
+    simple = _SIMPLE_FIRST_WORD.match(command)
+    if simple:
+        return next(group for group in simple.groups() if group is not None)
+    return shlex.split(command)[0]
