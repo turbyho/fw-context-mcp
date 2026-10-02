@@ -554,20 +554,89 @@ _REGION = re.compile(
     re.IGNORECASE,
 )
 
+# The start of a region: its name, the optional attributes, and the colon.
+# A region continues until the next line that starts a region, because the
+# manual puts no newline in the grammar of a region.  The ESP32 `memory.ld`
+# of the Arduino framework writes `len =` on the line after `org =`.
+_REGION_START = re.compile(rf"^\s*{_NAME}\s*(?:\([^)]*\))?\s*:")
+
+# The manual lets `INCLUDE` appear inside `MEMORY`.  It is a statement of
+# its own, thus it ends the region before it and starts no region.
+_INCLUDE_LINE = re.compile(r"^\s*INCLUDE\b")
+
+# An expression that ends with one of these continues on the next line, and
+# a line that starts with one of these continues the line before it.
+_OPEN_TAIL = re.compile(r"[-+*/%&|^~<>(,=]\s*$")
+_CONTINUED_HEAD = re.compile(r"^\s*[-+*/%&|^<>)]")
+
+
+def _continues(definition: str, line: str) -> bool:
+    """Say if *line* is a part of the region in *definition*.
+
+    A definition that does not match the grammar yet is incomplete, thus the
+    next line belongs to it.  A complete definition takes a line only when
+    the expression is open at the joint: the definition ends with an
+    operator, or the line starts with one.
+
+    The second rule comes from measurement.  A Zephyr template writes a
+    macro call such as `LINKER_DT_REGIONS()` on its own line after the last
+    region, and a reader that joins every line gives that region the length
+    `RAM_SIZE LINKER_DT_REGIONS()`.
+    """
+    if not line.strip():
+        return True
+    if _REGION.match(definition) is None:
+        return True
+    return bool(_OPEN_TAIL.search(definition) or _CONTINUED_HEAD.match(line))
+
+
+def _region_definitions(body: str) -> Iterator[tuple[int, str]]:
+    """Yield each region definition of *body* with the offset of its line.
+
+    A definition is the line that starts a region, and the lines after it
+    that `_continues` accepts.  The next start or an `INCLUDE` ends it too.
+    The lines are joined with one space, thus an expression that continues
+    on the next line stays one expression.  A line that is not in a
+    definition is yielded alone, so that the caller can count it when it
+    holds a colon.
+    """
+    lines = body.split("\n")
+    index = 0
+    while index < len(lines):
+        raw = lines[index]
+        if not _REGION_START.match(raw) or _INCLUDE_LINE.match(raw):
+            yield index, raw
+            index += 1
+            continue
+        definition = raw.strip()
+        stop = index + 1
+        while (
+            stop < len(lines)
+            and not _REGION_START.match(lines[stop])
+            and not _INCLUDE_LINE.match(lines[stop])
+            and _continues(definition, lines[stop])
+        ):
+            if lines[stop].strip():
+                definition = f"{definition} {lines[stop].strip()}"
+            stop += 1
+        yield index, definition
+        index = stop
+
 
 def parse_regions(body: str, first_line: int, report: Report) -> list[MemoryRegion]:
     """Read the regions of one `MEMORY` block body.
 
     *first_line* is the line of the first character of *body*, so that each
-    region gets the line of the file and not of the block.
+    region gets the line of the file and not of the block.  A region that
+    continues on more lines gets the line of its name.
 
-    A line that holds a colon and does not match the grammar is counted as
-    `unparsed memory region`.  Refusing and counting is the rule of this
-    module: a region the reader invents would put a wrong address in front
-    of a user.
+    A definition that holds a colon and does not match the grammar is
+    counted once as `unparsed memory region`.  Refusing and counting is the
+    rule of this module: a region the reader invents would put a wrong
+    address in front of a user.
     """
     regions: list[MemoryRegion] = []
-    for offset, raw in enumerate(body.split("\n")):
+    for offset, raw in _region_definitions(body):
         line = first_line + offset
         match = _REGION.match(raw)
         if match is None:

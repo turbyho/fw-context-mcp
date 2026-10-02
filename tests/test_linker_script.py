@@ -268,6 +268,82 @@ class TestMemoryBlocks:
         assert parse_regions("   ", 1, report) == []
         assert not report.refused
 
+    # The manual defines a region as a sequence of tokens and puts no
+    # newline in its grammar, thus a region can continue on the next line.
+    # The ESP32 `memory.ld` of the Arduino framework writes three regions in
+    # that form, and `dram0_0_seg` is the primary RAM of the chip.
+
+    def test_the_length_on_the_next_line(self):
+        report = Report()
+        body = ("  dram0_0_seg (RW) : org = 0x3FFB0000 + 0xdb5c,\n"
+                "                     len = 0x2c200 - 0xdb5c\n")
+        regions = parse_regions(body, 1, report)
+        assert not report.refused
+        assert len(regions) == 1
+        assert regions[0].name == "dram0_0_seg"
+        assert regions[0].attributes == "RW"
+        assert regions[0].origin_value == 0x3FFBDB5C
+        assert regions[0].length_value == 0x1E6A4
+
+    def test_the_origin_and_the_length_on_their_own_lines(self):
+        body = "RAM (rwx) :\n  ORIGIN = 0x20000000,\n  LENGTH = 64K\n"
+        regions = parse_regions(body, 1, Report())
+        assert [(r.name, r.origin_value, r.length_value) for r in regions] == [
+            ("RAM", 0x20000000, 64 * 1024),
+        ]
+
+    def test_a_split_region_between_two_single_line_regions(self):
+        body = ("FLASH (rx) : ORIGIN = 0, LENGTH = 16\n"
+                "RAM (rw) : ORIGIN = 0x100,\n"
+                "           LENGTH = 32\n"
+                "RTC (rw) : ORIGIN = 0x200, LENGTH = 8\n")
+        regions = parse_regions(body, 1, Report())
+        assert [(r.name, r.origin_value, r.length_value) for r in regions] == [
+            ("FLASH", 0, 16), ("RAM", 0x100, 32), ("RTC", 0x200, 8),
+        ]
+
+    def test_a_split_region_gets_the_line_of_its_name(self):
+        body = "\nA : ORIGIN = 0,\n  LENGTH = 1\nB : ORIGIN = 1, LENGTH = 1"
+        regions = parse_regions(body, 20, Report())
+        assert [(r.name, r.line) for r in regions] == [("A", 21), ("B", 23)]
+
+    def test_a_length_that_continues_on_the_next_line(self):
+        # The region matches after its first line already.  The next line
+        # continues the length expression, and a reader that stops early
+        # gives a wrong length.
+        body = "RAM : ORIGIN = 0, LENGTH = 0x100\n  + 0x20\n"
+        regions = parse_regions(body, 1, Report())
+        assert regions[0].length == "0x100 + 0x20"
+        assert regions[0].length_value == 0x120
+
+    def test_a_line_after_a_complete_region_is_not_its_length(self):
+        # Measured on the Zephyr templates: a macro call on its own line
+        # after the last region.  It must not become part of the length.
+        report = Report()
+        body = "RAM (rw) : ORIGIN = RAM_ADDR, LENGTH = RAM_SIZE\nLINKER_DT_REGIONS()\n"
+        regions = parse_regions(body, 1, report)
+        assert [(r.name, r.length) for r in regions] == [("RAM", "RAM_SIZE")]
+        assert not report.refused
+
+    def test_an_open_operator_joins_the_next_line(self):
+        body = "RAM : ORIGIN = 0, LENGTH = 0x100 +\n  0x20\n"
+        regions = parse_regions(body, 1, Report())
+        assert regions[0].length_value == 0x120
+
+    def test_a_split_region_that_does_not_parse_is_counted_once(self):
+        report = Report()
+        assert parse_regions("RAM :\n  SOMETHING\n  ELSE\n", 1, report) == []
+        assert report.refused["unparsed memory region"] == 1
+
+    def test_an_include_is_not_part_of_the_region_before_it(self):
+        # The manual lets INCLUDE appear inside MEMORY.  It is a statement
+        # of its own and not a continuation of the region before it.
+        report = Report()
+        body = "RAM : ORIGIN = 0, LENGTH = 4\nINCLUDE more_regions.ld\n"
+        regions = parse_regions(body, 1, report)
+        assert [(r.name, r.length_value) for r in regions] == [("RAM", 4)]
+        assert not report.refused
+
 
 class TestEvaluateConstant:
     """Constant arithmetic gets a number, anything else stays text."""
