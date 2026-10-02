@@ -30,6 +30,7 @@ import signal
 import socket
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 from collections import OrderedDict
@@ -957,12 +958,18 @@ def owner_is_dead(token: str) -> bool:
     A process that runs and belongs to a different user (EPERM) is alive.
     A PID that is too large for ``pid_t`` (OverflowError) names no process,
     but it did not come from this code, thus the file stays.
+
+    On Windows, signal 0 of ``os.kill`` is ``CTRL_C_EVENT``: the call sends
+    Ctrl+C to the process group of the PID and tests nothing.  The probe
+    there is ``_windows_process_is_gone``.
     """
     pid_text, sep, tag = token.partition("@")
     # isascii first: isdigit() also accepts digits such as "²", which int()
     # refuses with a ValueError.
     if not sep or not (pid_text.isascii() and pid_text.isdigit()) or tag != _owner_tag():
         return False
+    if _ON_WINDOWS:
+        return _windows_process_is_gone(int(pid_text))
     try:
         os.kill(int(pid_text), 0)
     except ProcessLookupError:
@@ -970,6 +977,56 @@ def owner_is_dead(token: str) -> bool:
     except (OSError, OverflowError):
         return False
     return False
+
+
+_ON_WINDOWS = os.name == "nt"
+
+# Windows API values for the liveness probe, from the Win32 documentation.
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_ERROR_INVALID_PARAMETER = 87
+_STILL_ACTIVE = 259
+
+
+def _windows_process_is_gone(pid: int) -> bool:
+    """Say if no process with *pid* runs, on Windows.
+
+    ``OpenProcess`` fails with ``ERROR_INVALID_PARAMETER`` for a PID that no
+    process has.  Another failure, such as access denied, is a process that
+    runs.  An open process whose exit code is ``STILL_ACTIVE`` runs.
+
+    On another platform the answer is False: the file then stays, which
+    costs disk space only.  The type checker reads the platform test and
+    does not check the Windows calls on another platform.
+
+    PID 0 and a PID that a DWORD cannot hold give False too, as an
+    ``OverflowError`` does on POSIX.  ctypes would cut a large PID to 32
+    bits and probe another process, and PID 0 is the idle process, for
+    which ``OpenProcess`` also fails with ``ERROR_INVALID_PARAMETER``.
+    The argument and result types are declared, so that a handle keeps
+    its full width.
+    """
+    if sys.platform != "win32" or not 0 < pid < 2**32:
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return ctypes.get_last_error() == _ERROR_INVALID_PARAMETER
+    try:
+        code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return False
+        return code.value != _STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def cc_staging_path(project_root: Path) -> Path:
