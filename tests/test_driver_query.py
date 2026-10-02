@@ -35,6 +35,9 @@ from fw_context_mcp.indexer._driver_query import (
     resolve_compiler,
 )
 
+#: The real function; the autouse fixture replaces the module attribute.
+_REAL_CLANG_RESOURCE_INCLUDE = _driver_query.clang_resource_include
+
 XTENSA_MACROS = """\
 #define __XTENSA__ 1
 #define __XTENSA_EL__ 1
@@ -56,13 +59,21 @@ XTENSA_MACROS = """\
 
 
 @pytest.fixture(autouse=True)
-def _clear_caches():
-    """The answers are kept per process; a test must not see the answer of another."""
+def _clear_caches(monkeypatch):
+    """The answers are kept per process; a test must not see the answer of another.
+
+    The tests also run as if no clang were installed, thus the result does
+    not depend on the machine.  ``TestClangResourceDir`` sets one.
+    """
+    # The real function: a test can replace the module attribute, and the
+    # replacement is still in place when this teardown runs.
+    supports = _driver_query.libclang_supports
     clear_query_cache()
-    _driver_query.libclang_supports.cache_clear()
+    supports.cache_clear()
+    monkeypatch.setattr(_driver_query, "clang_resource_include", lambda: None)
     yield
     clear_query_cache()
-    _driver_query.libclang_supports.cache_clear()
+    supports.cache_clear()
 
 
 def _stub_driver(directory: Path, name: str, *, macros: str = XTENSA_MACROS,
@@ -144,6 +155,26 @@ class TestAllowlist:
         """``fnmatch`` would let ``/usr/bin/*`` match this path."""
         assert not driver_allowed(Path("/usr/bin/../../home/x/proj/evil-gcc"), ["/usr/bin/*"])
 
+    def test_a_case_insensitive_host_ignores_case(self, monkeypatch) -> None:
+        """macOS and Windows ignore case, thus /Opt/X is /opt/x there."""
+        monkeypatch.setattr(_driver_query, "_CASE_INSENSITIVE_FS", True)
+        assert driver_allowed(Path("/OPT/sdk/bin/arm-none-eabi-gcc"), ["/opt/**"])
+        assert not driver_allowed(Path("/Proj/tools/x-gcc"), ["/**"], project_root=Path("/proj"))
+        monkeypatch.setattr(_driver_query, "_CASE_INSENSITIVE_FS", False)
+        assert not driver_allowed(Path("/OPT/sdk/bin/arm-none-eabi-gcc"), ["/opt/**"])
+
+    @pytest.mark.parametrize("platform, expected", [
+        ("linux", "~/.arduino15/packages/**"),
+        ("darwin", "~/Library/Arduino15/packages/**"),
+        ("win32", "~/AppData/Local/Arduino15/packages/**"),
+    ])
+    def test_each_host_has_its_own_default(self, platform, expected) -> None:
+        from fw_context_mcp.config.settings import _default_query_driver
+
+        defaults = _default_query_driver(platform)
+        assert expected in defaults
+        assert "~/.platformio/packages/**" in defaults
+
     def test_the_home_directory_expands(self) -> None:
         home_tool = Path.home() / ".platformio" / "packages" / "tc" / "bin" / "gcc"
         assert driver_allowed(home_tool, ["~/.platformio/packages/**"])
@@ -213,6 +244,10 @@ class TestReadTheDriverAnswer:
         names = {name for name, _ in parse_defines(XTENSA_MACROS)}
         assert "__STDC_HOSTED__" not in names
         assert not any(name.startswith("__has_include") for name in names)
+
+    def test_a_clang_builtin_macro_is_not_redefined(self) -> None:
+        """xtensa GCC 13 defines __FLT_EVAL_METHOD__, a builtin of clang even under -undef."""
+        assert parse_defines("#define __FLT_EVAL_METHOD__ 0\n#define __FLT_DIG__ 6\n") == [("__FLT_DIG__", "6")]
 
     def test_the_macros_of_unparsable_types_are_left_out(self) -> None:
         """libstdc++ switches to _Float32 and bf16 literals on them, and libclang 18 fails."""
@@ -315,12 +350,78 @@ class TestLibclangArgs:
         assert "-mcpu=cortex-m4" in args
         assert "-D__GNUC__=12" in args, "clang reports __GNUC__ 4; the real GCC version must win"
 
+    def test_sized_deallocation_follows_the_gcc_dialect(self, monkeypatch) -> None:
+        """libstdc++ of GCC 13 calls the sized delete; clang 18 needs the flag for it."""
+        monkeypatch.setattr(_driver_query, "libclang_supports", lambda triple: True)
+        cxx = DriverInfo(triple="arm-none-eabi", include_dirs=(), macros=(("__cpp_sized_deallocation", "201309L"),))
+        c = DriverInfo(triple="arm-none-eabi", include_dirs=(), macros=())
+        assert "-fsized-deallocation" in libclang_args(cxx, [])
+        assert "-fsized-deallocation" not in libclang_args(c, [])
+
     def test_no_proxy_parses_for_the_host_with_the_driver_headers(self, monkeypatch) -> None:
         monkeypatch.setattr(_driver_query, "libclang_supports", lambda triple: False)
         info = DriverInfo(triple="tiny-elf", include_dirs=("/tc/inc",), macros=(("__SIZEOF_INT__", "2"),))
         args = libclang_args(info, [])
         assert not any(a.startswith("--target") for a in args)
         assert args[-2:] == ["-isystem", "/tc/inc"]
+
+
+class TestClangResourceDir:
+    """The GCC internal headers (arm_acle.h of ARM GCC 12) do not parse in libclang.
+
+    Measured on one STM32 build: 2574 errors from them, 0 with clang's own.
+    """
+
+    ARM_DIRS = (
+        "/tc/arm-none-eabi/include/c++/12.3.1",
+        "/tc/lib/gcc/arm-none-eabi/12.3.1/include",
+        "/tc/lib/gcc/arm-none-eabi/12.3.1/include-fixed",
+        "/tc/arm-none-eabi/include",
+    )
+
+    def _arm(self, macros=(("__ARM_ARCH", "7"),)) -> DriverInfo:
+        return DriverInfo(triple="arm-none-eabi", include_dirs=self.ARM_DIRS, macros=macros)
+
+    def test_the_gcc_internal_directory_is_replaced_in_place(self, monkeypatch) -> None:
+        monkeypatch.setattr(_driver_query, "libclang_supports", lambda triple: True)
+        monkeypatch.setattr(_driver_query, "clang_resource_include", lambda: "/clang/include")
+        args = libclang_args(self._arm(), [])
+        isystem = [a for i, a in enumerate(args) if i and args[i - 1] == "-isystem"]
+        assert isystem == [
+            "/tc/arm-none-eabi/include/c++/12.3.1",
+            "/clang/include",
+            "/tc/lib/gcc/arm-none-eabi/12.3.1/include-fixed",
+            "/tc/arm-none-eabi/include",
+        ]
+        # The GCC directory stays, searched last: it holds stdfix.h and gcov.h, which clang has not.
+        assert args[-2:] == ["-idirafter", "/tc/lib/gcc/arm-none-eabi/12.3.1/include"]
+
+    def test_an_arm_target_gets_the_acle_macro_that_clangs_header_needs(self, monkeypatch) -> None:
+        monkeypatch.setattr(_driver_query, "libclang_supports", lambda triple: True)
+        monkeypatch.setattr(_driver_query, "clang_resource_include", lambda: "/clang/include")
+        assert "-D__ARM_ACLE=200" in libclang_args(self._arm(), [])
+
+    def test_a_gcc_acle_macro_is_not_overridden(self, monkeypatch) -> None:
+        monkeypatch.setattr(_driver_query, "libclang_supports", lambda triple: True)
+        monkeypatch.setattr(_driver_query, "clang_resource_include", lambda: "/clang/include")
+        args = libclang_args(self._arm((("__ARM_ARCH", "8"), ("__ARM_ACLE", "201"))), [])
+        assert "-D__ARM_ACLE=201" in args and "-D__ARM_ACLE=200" not in args
+
+    def test_the_real_lookup_gives_the_headers_of_the_libclang_version(self) -> None:
+        """The driver path uses the same lookup as `doctor`, and nothing else."""
+        from fw_context_mcp.indexer._clang_resource import find_resource_include
+
+        found = find_resource_include()
+        expected = str(found.include) if found is not None else None
+        assert _REAL_CLANG_RESOURCE_INCLUDE() == expected
+        if expected is not None:
+            assert (Path(expected) / "stddef.h").is_file()
+
+    def test_without_clang_the_gcc_directories_stay(self, monkeypatch) -> None:
+        monkeypatch.setattr(_driver_query, "libclang_supports", lambda triple: True)
+        args = libclang_args(self._arm(), [])
+        assert "/tc/lib/gcc/arm-none-eabi/12.3.1/include" in args
+        assert "-D__ARM_ACLE=200" not in args, "GCC's own arm_acle.h does not need it"
 
 
 class TestQueryTheDriver:

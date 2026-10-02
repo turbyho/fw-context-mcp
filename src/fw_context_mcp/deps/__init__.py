@@ -208,6 +208,7 @@ def run_fixes(
 def _recheck(name: str, project_root: str | Path | None = None) -> DepCheckResult:
     """Re-run a single check by name after a successful fix."""
     from ._checks import (
+        check_clang_resource,
         check_db_integrity,
         check_disk_space,
         check_libclang_python,
@@ -239,6 +240,7 @@ def _recheck(name: str, project_root: str | Path | None = None) -> DepCheckResul
         "sqlite-vec": check_sqlite_vec,
         "libclang-python": check_libclang_python,
         "libclang-so": check_libclang_so,
+        "clang-resource": check_clang_resource,
         "watchfiles": check_watchfiles,
         "tomli-w": check_tomli_w,
         "ollama": lambda: check_ollama_running(cfg.llm) if cfg else DepCheckResult("ollama", "skipped", "no config"),

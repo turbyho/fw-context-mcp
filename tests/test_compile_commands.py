@@ -143,6 +143,10 @@ class TestNormalizeArgs:
             )
             assert not any(a.startswith("-mfp16-format") for a in result)
 
+    def test_drops_the_gcc_shrink_wrap_flag(self):
+        """ESP-IDF with GCC 13: clang rejected it in every unit."""
+        assert "-fno-shrink-wrap" not in normalize_args(["-fno-shrink-wrap", "-O2"], Path.cwd())
+
     def test_a_flag_that_changes_meaning_is_kept(self):
         """The strip list must stay narrow — these decide what compiles."""
         result = normalize_args(

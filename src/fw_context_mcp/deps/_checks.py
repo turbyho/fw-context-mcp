@@ -22,6 +22,7 @@ from typing import Any
 
 from . import DepCheckResult
 from ._instructions import (
+    clang_resource_instructions,
     db_integrity_instructions,
     disk_space_instructions,
     get_platform_info,
@@ -297,6 +298,60 @@ def check_libclang_so() -> DepCheckResult:
         fix_cmd=libclang_so_instructions(platform_ctx),
         instructions=libclang_so_instructions(platform_ctx),
         critical=True,
+    )
+
+
+def check_clang_resource() -> DepCheckResult:
+    """Verify that the clang compiler headers of the libclang major version are there.
+
+    WHY a check of its own: the libclang wheel has no compiler headers.
+    Without them a GCC build parses with the headers of GCC, and some of
+    those do not parse in libclang (2574 errors from ``arm_acle.h`` in one
+    STM32 build).  Not critical: the index works, with those errors.
+    """
+    from ..indexer._clang_resource import (
+        bundled_source,
+        find_resource_include,
+        libclang_major,
+        managed_include,
+    )
+
+    major = libclang_major()
+    if major is None:
+        return DepCheckResult(
+            name="clang-resource", status="skipped",
+            message="the libclang version is not known", critical=False,
+        )
+    # unpack=False: a check reports and does not change the machine.
+    found = find_resource_include(major, unpack=False)
+    shipped = managed_include(major)
+    if found is not None and found.source.startswith("managed") and shipped is not None and found.include != shipped:
+        return DepCheckResult(
+            name="clang-resource",
+            status="degraded",
+            message=(
+                f"the headers that ship with this fw-context are not unpacked yet; "
+                f"the parse uses {found.include}, from another fw-context version"
+            ),
+            fix_cmd="fw-context doctor --fix --only clang-resource",
+            instructions="Run `fw-context doctor --fix` to unpack the headers that ship with this version.",
+            critical=False,
+        )
+    if found is not None:
+        return DepCheckResult(
+            name="clang-resource", status="ok",
+            message=f"clang {major} headers: {found.include} ({found.source})", critical=False,
+        )
+    return DepCheckResult(
+        name="clang-resource",
+        status="degraded",
+        message=(
+            f"no clang {major} compiler headers; a GCC build parses with the headers of GCC, "
+            f"and some of them do not parse in libclang"
+        ),
+        fix_cmd="fw-context doctor --fix --only clang-resource" if bundled_source(major) else None,
+        instructions=clang_resource_instructions(get_platform_info(), major, bundled=bundled_source(major) is not None),
+        critical=False,
     )
 
 
@@ -579,6 +634,7 @@ CHECK_ORDER: list[tuple[str, Any]] = [
     ("sqlite-vec", check_sqlite_vec),
     ("libclang-python", check_libclang_python),
     ("libclang-so", check_libclang_so),
+    ("clang-resource", check_clang_resource),
     ("watchfiles", check_watchfiles),
     ("tomli-w", check_tomli_w),
     ("ollama", check_ollama_running),

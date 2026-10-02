@@ -72,6 +72,8 @@ _DROP_FLAGS = frozenset({
     "-fno-printf-return-value",
     "-fstrict-volatile-bitfields",
     "-fno-tree-switch-conversion",
+    # ESP-IDF with GCC 13: every one of 833 units gave "unknown argument".
+    "-fno-shrink-wrap",
 })
 
 # GCC-only warning flags that take a level suffix (=1, =2) — drop any token

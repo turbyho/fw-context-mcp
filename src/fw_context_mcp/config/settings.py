@@ -452,19 +452,53 @@ def _apply_embed_prompt_defaults(llm_cfg: LLMConfig) -> None:
             llm_cfg.embed_doc_prompt = ""
 
 
-#: The default of ``[index] query_driver``: the toolchain managers that
-#: install a compiler outside the project (PlatformIO, Arduino, ESP-IDF,
-#: nRF Connect, the Zephyr SDK) and the system directories.
-DEFAULT_QUERY_DRIVER: tuple[str, ...] = (
-    "~/.platformio/packages/**",
-    "~/.arduino15/packages/**",
-    "~/.espressif/**",
-    "~/ncs/toolchains/**",
-    "~/zephyr-sdk*/**",
-    "/opt/**",
-    "/usr/bin/*",
-    "/usr/local/bin/*",
-)
+def _default_query_driver(platform: str) -> tuple[str, ...]:
+    """Give the default of ``[index] query_driver`` for *platform* (``sys.platform``).
+
+    The globs cover the toolchain managers that install a compiler outside
+    the project (PlatformIO, Arduino, ESP-IDF, nRF Connect, the Zephyr SDK)
+    and the system directories of each host.  WHY per host: the same tool
+    installs in another place on each system — the Arduino packages are in
+    ``~/.arduino15`` on Linux, ``~/Library/Arduino15`` on macOS and
+    ``~/AppData/Local/Arduino15`` on Windows.
+    """
+    common = (
+        "~/.platformio/packages/**",
+        "~/.espressif/**",
+        "~/zephyr-sdk*/**",
+    )
+    if platform == "darwin":
+        return common + (
+            "~/Library/Arduino15/packages/**",
+            "~/ncs/toolchains/**",
+            "/opt/**",                          # Homebrew (Apple silicon), MacPorts, nRF Connect
+            "/usr/local/bin/*",                 # Homebrew (Intel)
+            "/usr/local/Cellar/**",
+            "/Applications/ArmGNUToolchain/**",  # the Arm GNU Toolchain package
+            "/Applications/STM32CubeIDE.app/**",
+            "/usr/bin/*",
+        )
+    if platform == "win32":
+        return common + (
+            "~/AppData/Local/Arduino15/packages/**",
+            "C:/ncs/toolchains/**",
+            "C:/Espressif/**",                   # the ESP-IDF installer for Windows
+            "C:/ST/**",                          # STM32CubeIDE
+            "C:/Program Files*/Arm GNU Toolchain*/**",
+            "C:/Program Files*/GNU Arm Embedded Toolchain/**",
+            "C:/msys64/*/bin/*",
+        )
+    return common + (
+        "~/.arduino15/packages/**",
+        "~/ncs/toolchains/**",
+        "/opt/**",
+        "/usr/bin/*",
+        "/usr/local/bin/*",
+    )
+
+
+#: The default of ``[index] query_driver`` on this host.
+DEFAULT_QUERY_DRIVER: tuple[str, ...] = _default_query_driver(sys.platform)
 
 
 @dataclass

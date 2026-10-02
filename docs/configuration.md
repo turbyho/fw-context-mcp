@@ -122,7 +122,15 @@ and multi-image builds](build.md).
 | `max_symbol_body_lines` | `1000` | project | The maximum number of lines of one symbol body. The index stores at most this number of lines, and `get_source` and `get_symbol_context` return at most this number. A body that a cap cut carries `_source_truncated`. |
 | `query_driver` | see below | local, global | Path globs of the GCC compilers that fw-context can run to get their system include directories and predefined macros, as clangd `--query-driver` does. `*` matches one path component, `**` matches any number of components, and `~` is the home directory. fw-context does not run a compiler outside the list, or a compiler inside the project directory: its units keep the flags of `compile_commands.json` and the guessed toolchain directories, and a warning names the compiler. A value replaces the default. Set this key in `.fw-context/local.toml`. fw-context ignores it in the committed `config.toml`, because a repository could then allow a script that it commits. Do not commit a `local.toml` that sets it. |
 
-The default of `query_driver` is `["~/.platformio/packages/**", "~/.arduino15/packages/**", "~/.espressif/**", "~/ncs/toolchains/**", "~/zephyr-sdk*/**", "/opt/**", "/usr/bin/*", "/usr/local/bin/*"]`. To add a toolchain in another directory, repeat the default and add a glob, for example `"~/tools/gcc-arm-none-eabi-*/bin/*"`.
+The default of `query_driver` depends on the host. On all hosts it holds `~/.platformio/packages/**`, `~/.espressif/**` and `~/zephyr-sdk*/**`. In addition:
+
+- Linux: `~/.arduino15/packages/**`, `~/ncs/toolchains/**`, `/opt/**`, `/usr/bin/*`, `/usr/local/bin/*`.
+- macOS: `~/Library/Arduino15/packages/**`, `~/ncs/toolchains/**`, `/opt/**` (Homebrew on Apple silicon, MacPorts), `/usr/local/bin/*`, `/usr/local/Cellar/**`, `/Applications/ArmGNUToolchain/**`, `/Applications/STM32CubeIDE.app/**`, `/usr/bin/*`.
+- Windows: `~/AppData/Local/Arduino15/packages/**`, `C:/ncs/toolchains/**`, `C:/Espressif/**`, `C:/ST/**`, `C:/Program Files*/Arm GNU Toolchain*/**`, `C:/Program Files*/GNU Arm Embedded Toolchain/**`, `C:/msys64/*/bin/*`.
+
+On macOS and Windows the match ignores case, as the file system does. To add a toolchain in another directory, repeat the default and add a glob, for example `"~/tools/gcc-arm-none-eabi-*/bin/*"`.
+
+The parse also needs the clang compiler headers (`stddef.h`, `arm_acle.h`) of the same major version as libclang, because the libclang wheel does not include them. fw-context ships these headers for the libclang version that it pins, and unpacks them to `~/.fw-context/clang-resource/<version>-<hash>/` at the first parse (one directory for each archive, thus two installations of fw-context do not share one copy), or when `fw-context doctor --fix`, `fw-context init` or `make install` runs. This needs no network and no administrator rights, and works on Linux, macOS and Windows. `fw-context doctor` reports the state as the `clang-resource` check.
 
 WHY the query: a GCC cross compiler adds its system headers and its target macros on its own, and `compile_commands.json` does not hold them. Without the query, a target that libclang has no backend for (xtensa, ESP32) was parsed with the headers of the host, and `#if __XTENSA__` read as false.
 

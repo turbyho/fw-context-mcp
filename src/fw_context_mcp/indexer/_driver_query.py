@@ -48,6 +48,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -55,6 +56,10 @@ from functools import cache, lru_cache
 from pathlib import Path
 
 log = logging.getLogger(__name__)
+
+#: macOS (APFS, HFS+) and Windows (NTFS) ignore the case of a path by
+#: default, thus the allowlist and the project check must ignore it too.
+_CASE_INSENSITIVE_FS = sys.platform in ("darwin", "win32")
 
 #: Time limit for one driver call.  A driver that runs the preprocessor on
 #: an empty input answers in milliseconds; a hang must not stop the index.
@@ -79,6 +84,7 @@ _PREDEFINE_F_FLAGS = frozenset({
     "-fno-signed-char", "-fno-unsigned-char", "-fno-inline",
     "-funsafe-math-optimizations", "-fno-unsafe-math-optimizations",
     "-fassociative-math", "-fno-associative-math", "-freciprocal-math", "-fno-reciprocal-math",
+    "-fsized-deallocation", "-fno-sized-deallocation",
     "-fshort-enums", "-fno-short-enums", "-fexceptions", "-fno-exceptions",
     "-frtti", "-fno-rtti", "-fpic", "-fPIC", "-fpie", "-fPIE", "-fno-pic", "-fno-pie",
     "-fopenmp", "-ffast-math", "-fno-fast-math", "-ffinite-math-only", "-fno-math-errno",
@@ -92,11 +98,13 @@ _PREDEFINE_F_PREFIXES = ("-fsanitize=",)
 _PATH_WITH_VALUE = frozenset({"--sysroot", "-isysroot"})
 
 #: Macros that clang defines itself, also under ``-undef``.  A ``-D`` for
-#: one of them redefines a builtin and gives nothing.
+#: one of them redefines a builtin and gives nothing but an error:
+#: ``__FLT_EVAL_METHOD__`` of xtensa GCC 13 gave "redefining builtin macro"
+#: in 213 units of one ESP-IDF build.
 _CLANG_OWNED_MACROS = (
     "__STDC", "__cplusplus", "__STDCPP", "__has_include",
     "__FILE__", "__LINE__", "__DATE__", "__TIME__", "__TIMESTAMP__",
-    "__COUNTER__", "__BASE_FILE__", "__INCLUDE_LEVEL__",
+    "__COUNTER__", "__BASE_FILE__", "__INCLUDE_LEVEL__", "__FLT_EVAL_METHOD__",
 )
 
 #: Macro families that announce a type libclang 18 does not parse on the
@@ -108,6 +116,17 @@ _UNPARSABLE_TYPE_MACROS = (
     "__FLT16_", "__FLT32_", "__FLT64_", "__FLT128_", "__FLT32X_", "__FLT64X_", "__FLT128X_",
     "__BFLT16_", "__SIZEOF_FLOAT80__", "__SIZEOF_FLOAT128__",
 )
+
+#: The internal include directory of GCC: ``.../lib/gcc/<triple>/<version>/include``.
+#: ``include-fixed`` is not matched, because it holds fixed C library headers.
+_GCC_INTERNAL_INCLUDE = re.compile(r"[/\\]lib[/\\]gcc[/\\][^/\\]+[/\\][^/\\]+[/\\]include$")
+
+#: The ACLE level that clang 18 predefines for an AArch32 target.  clang's
+#: ``arm_acle.h`` only tests that the macro is defined, thus the value of
+#: AArch64 (202420 in clang 22) gives the same header.
+#: The ``arm_acle.h`` of clang stops with ``#error`` without it, and GCC 12
+#: does not define it.
+_CLANG_ARM_ACLE = "200"
 
 _DEFINE_LINE = re.compile(r"^#define (?P<name>[A-Za-z_]\w*)(?P<params>\([^)]*\))?(?: (?P<value>.*))?$")
 
@@ -148,6 +167,7 @@ def _glob_regex(pattern: str) -> re.Pattern[str]:
     """
     not_separator = "[^/\\\\]" if os.sep == "\\" else "[^/]"
     expanded = os.path.normpath(os.path.expanduser(pattern))
+    flags = re.IGNORECASE if _CASE_INSENSITIVE_FS else 0
     parts: list[str] = []
     i = 0
     while i < len(expanded):
@@ -163,7 +183,7 @@ def _glob_regex(pattern: str) -> re.Pattern[str]:
         else:
             parts.append(re.escape(expanded[i]))
             i += 1
-    return re.compile("".join(parts) + r"\Z")
+    return re.compile("".join(parts) + r"\Z", flags)
 
 
 def driver_allowed(compiler: Path, patterns: Sequence[str], project_root: Path | None = None) -> bool:
@@ -188,14 +208,20 @@ def inside_project(path: Path | str, project_root: Path) -> bool:
     """Say if *path* is inside *project_root*, by its normalized path or by its real path.
 
     The real path counts too, thus a link from an allowed directory into
-    the project is inside it.
+    the project is inside it.  On macOS and Windows the file system ignores
+    case, thus ``/Users/x/Proj`` and ``/users/x/proj`` are one directory.
     """
-    root = Path(os.path.realpath(project_root))
+    root = _fs_key(os.path.realpath(project_root)).rstrip(os.sep)
     normal = os.path.normpath(str(path))
-    for candidate in (Path(normal), Path(os.path.realpath(normal))):
-        if candidate == root or root in candidate.parents:
+    for candidate in (normal, os.path.realpath(normal)):
+        key = _fs_key(candidate)
+        if key == root or key.startswith(root + os.sep):
             return True
     return False
+
+
+def _fs_key(path: str) -> str:
+    return path.casefold() if _CASE_INSENSITIVE_FS else path
 
 
 def known_compilers(entries: Iterable[Mapping[str, object]]) -> dict[str, Path]:
@@ -457,6 +483,60 @@ def libclang_supports(triple: str) -> bool:
     return True
 
 
+def clang_resource_include() -> str | None:
+    """Give the clang compiler headers of the libclang version, or None (see ``_clang_resource``).
+
+    WHY: the libclang wheel has no resource directory, thus the compiler
+    headers came from the internal include directory of GCC, whose
+    intrinsic headers are written for GCC builtins: the ``arm_acle.h`` of
+    ARM GCC 12 gave 2574 errors in one STM32 build.  The headers must be
+    of the libclang major version: newer ones use types that libclang does
+    not know.  The lookup runs on each call (no cache), thus a long MCP
+    process does not keep a directory that an upgrade removed.
+    """
+    from fw_context_mcp.indexer._clang_resource import find_resource_include, libclang_major
+
+    found = find_resource_include()
+    if found is None:
+        _warn_no_resource(libclang_major())
+        return None
+    return str(found.include)
+
+
+def _system_dirs(info: DriverInfo) -> tuple[list[str], list[str]]:
+    """Give the system directories of *info*, with the GCC internal one replaced by clang's.
+
+    Returns the directories and the replaced GCC directories.  A replaced
+    directory goes to ``-idirafter`` (searched last), because it also holds
+    headers that clang has not: ``stdfix.h`` and ``gcov.h`` of GCC 12 and
+    8.4.  Measured: the ``-idirafter`` changed no error count on STM32,
+    ESP32, ESP-IDF and PlatformIO builds.  Without a clang resource
+    directory, the directories stay as the driver gives them.
+    """
+    resource = clang_resource_include()
+    if resource is None:
+        return list(info.include_dirs), []
+    dirs: list[str] = []
+    replaced: list[str] = []
+    for directory in info.include_dirs:
+        if _GCC_INTERNAL_INCLUDE.search(directory):
+            dirs.append(resource)
+            replaced.append(directory)
+        else:
+            dirs.append(directory)
+    return dirs, replaced
+
+
+@cache
+def _warn_no_resource(major: int | None) -> None:
+    log.warning(
+        "No clang %s compiler headers are installed, thus a GCC build parses with the "
+        "compiler headers of GCC, and some of them do not parse in libclang (arm_acle.h). "
+        "Run `fw-context doctor --fix` to install them.",
+        major if major is not None else "(unknown version)",
+    )
+
+
 def proxy_target(info: DriverInfo) -> tuple[str, list[str]] | None:
     """Choose a target that libclang supports and that has the type sizes of *info*.
 
@@ -504,7 +584,10 @@ def libclang_args(info: DriverInfo, args: Sequence[str]) -> list[str]:
       and the declarations after that point never reach the AST.  A header
       of a newer GCC can give that many errors in libclang.
     - The ``-isystem`` directories come last and in the driver order, thus
-      an ``-I`` of the unit is searched first, as GCC does.
+      an ``-I`` of the unit is searched first, as GCC does.  The internal
+      include directory of GCC is replaced with the one of clang when a
+      clang is installed (see ``clang_resource_include``), at the same
+      place in the order, as the clang driver does with a GCC toolchain.
     """
     model: list[str] = []
     if libclang_supports(info.triple):
@@ -524,11 +607,23 @@ def libclang_args(info: DriverInfo, args: Sequence[str]) -> list[str]:
     result += ["-nostdinc", "-undef", *model, "-ferror-limit=0"]
     if info.macro("__SIZEOF_WCHAR_T__") == "2":
         result.append("-fshort-wchar")
+    if info.macro("__cpp_sized_deallocation") is not None:
+        # GCC turns sized deallocation on from C++14, and libstdc++ then
+        # calls the sized operator delete.  clang 18 has it off by default,
+        # and each such call was an error ("selects non-usual deallocation
+        # function"): 55 in one ESP-IDF build with GCC 13.
+        result.append("-fsized-deallocation")
     result.append("-funsigned-char" if info.macro("__CHAR_UNSIGNED__") is not None else "-fsigned-char")
     result += [f"-D{name}={value}" for name, value in info.macros]
+    dirs, replaced = _system_dirs(info)
+    if replaced and info.macro("__ARM_ARCH") is not None and info.macro("__ARM_ACLE") is None:
+        # clang's arm_acle.h needs the macro that clang itself predefines.
+        result.append(f"-D__ARM_ACLE={_CLANG_ARM_ACLE}")
     result += unit_args
-    for directory in info.include_dirs:
+    for directory in dirs:
         result += ["-isystem", directory]
+    for directory in replaced:
+        result += ["-idirafter", directory]
     return result
 
 

@@ -28,8 +28,20 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     failures that prevent operation.
     """
     from ..deps import exit_code, format_results, run_fixes, run_full_check
+    from ..deps._checks import CHECK_ORDER
 
-    results = run_full_check(project_root=args.project)
+    # --only runs a subset.  WHY: `make install` must install the clang
+    # headers without `--fix` pulling the multi-GB Ollama models.
+    subset: set[str] | None = None
+    if getattr(args, "only", None):
+        subset = {name.strip() for name in args.only.split(",") if name.strip()}
+        unknown = subset - {name for name, _ in CHECK_ORDER}
+        if unknown:
+            known = ", ".join(name for name, _ in CHECK_ORDER)
+            print(f"fw-context doctor: unknown check(s): {', '.join(sorted(unknown))}. Known: {known}")
+            return 2
+
+    results = run_full_check(project_root=args.project, subset=subset)
 
     if args.fix:
         results = run_fixes(results, project_root=args.project)

@@ -1,0 +1,19 @@
+{
+  "major": 18,
+  "clang_version": "18.1.8",
+  "archive": "clang-18-include.tar.xz",
+  "archive_sha256": "fea791910fb604841f1cf64512bde3ea615834eb5a46a25a9fa14e872b3c3b64",
+  "files": 237,
+  "debian": {
+    "suite": "trixie",
+    "package": "libclang-common-18-dev",
+    "version": "1:18.1.8-18+b1",
+    "filename": "pool/main/l/llvm-toolchain-18/libclang-common-18-dev_18.1.8-18+b1_amd64.deb",
+    "sha256": "ca27d5915b97ef559eb6b3f9b025f9b162cd89e76e96c9ae3b0c3b90ff15d766",
+    "signing_key_fingerprint": "04B54C3CDCA79751B16BC6B5225629DF75B188BD"
+  },
+  "license": {
+    "name": "Apache-2.0 WITH LLVM-exception",
+    "source": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-18.1.8/clang/LICENSE.TXT"
+  }
+}

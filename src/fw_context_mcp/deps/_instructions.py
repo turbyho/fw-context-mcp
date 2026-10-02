@@ -153,6 +153,44 @@ def libclang_so_instructions(ctx: dict) -> str:
     return "Install libclang (system package) and clang Python bindings (pip install libclang)"
 
 
+def clang_resource_instructions(ctx: dict, major: int, *, bundled: bool = True) -> str:
+    """How to get the clang compiler headers of the libclang major version.
+
+    WHY the bundled copy first: fw-context ships the headers of the libclang
+    version it pins, thus the fix needs no network and no administrator
+    rights, on Linux, macOS and Windows.  A package of the system is the
+    other way (for a libclang version without a bundled archive), and its
+    name differs on each system.
+    """
+    system = ctx.get("system", sys.platform)
+    pkg = ctx.get("pkg_manager", "unknown")
+    lines = []
+    if bundled:
+        lines.append(
+            f"Run `fw-context doctor --fix` to unpack the clang {major} headers that ship with "
+            f"fw-context to ~/.fw-context/clang-resource/ (no network, no admin rights)."
+        )
+    else:
+        lines.append(
+            f"This fw-context ships no clang {major} headers: libclang {major} is not the version "
+            f"it pins. Reinstall fw-context, or install clang {major}."
+        )
+    lines.append("Or install clang " + str(major) + " with the package manager:")
+    if system == "darwin":
+        lines.append(f"  brew install llvm@{major}")
+    elif system == "win32":
+        lines.append(f"  the LLVM {major} installer from https://github.com/llvm/llvm-project/releases")
+    elif pkg == "apt":
+        lines.append(f"  sudo apt install libclang-common-{major}-dev")
+    elif pkg == "pacman":
+        lines.append(f"  sudo pacman -S clang{major}")
+    elif pkg == "dnf":
+        lines.append(f"  sudo dnf install clang{major}")
+    else:
+        lines.append(f"  the clang {major} package of your distribution")
+    return "\n".join(lines)
+
+
 def ollama_instructions(ctx: dict) -> str:
     """How to install Ollama."""
     system = ctx.get("system", sys.platform)

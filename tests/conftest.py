@@ -149,15 +149,21 @@ def _isolate_index_dir():
     make the ``project="<name>"`` selector fail — which is how it was
     found.
 
-    Both variables are inherited by any subprocess a test spawns, thus a
+    A third store came later: ``FW_CONTEXT_CLANG_RESOURCE_DIR``, where the
+    bundled clang headers are unpacked.  Without it a test that runs
+    ``doctor --fix`` or a parse wrote ``~/.fw-context/clang-resource`` of
+    the operator.
+
+    All variables are inherited by any subprocess a test spawns, thus a
     CLI invocation stays isolated too.  The temp dir is removed at session
     end.
     """
-    names = ("FW_CONTEXT_INDEX_DIR", "FW_CONTEXT_PROJECTS_DB")
+    names = ("FW_CONTEXT_INDEX_DIR", "FW_CONTEXT_PROJECTS_DB", "FW_CONTEXT_CLANG_RESOURCE_DIR")
     prev = {name: os.environ.get(name) for name in names}
     with tempfile.TemporaryDirectory(prefix="fw-context-index-") as d:
         os.environ["FW_CONTEXT_INDEX_DIR"] = d
         os.environ["FW_CONTEXT_PROJECTS_DB"] = str(Path(d) / "projects.db")
+        os.environ["FW_CONTEXT_CLANG_RESOURCE_DIR"] = str(Path(d) / "clang-resource")
         try:
             yield d
         finally:

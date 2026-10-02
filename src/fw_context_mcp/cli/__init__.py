@@ -491,6 +491,10 @@ def main() -> None:
     p_doctor.add_argument("--fix", action="store_true", help="Attempt auto-repair of fixable issues")
     p_doctor.add_argument("--json", action="store_true", help="Machine-readable JSON output")
     p_doctor.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
+    p_doctor.add_argument(
+        "--only", metavar="NAMES",
+        help="Run only these checks (comma-separated names, e.g. clang-resource)",
+    )
     p_doctor.set_defaults(func=cmd_doctor)
 
     args = parser.parse_args()

@@ -299,6 +299,25 @@ def fix_sqlite_ext(_result, _project_root=None) -> tuple[bool, str]:
         "or install pysqlite3 as a workaround."
     )
 
+def fix_clang_resource(_result, _project_root=None) -> tuple[bool, str]:
+    """Unpack the clang compiler headers that ship with fw-context.
+
+    WHY the bundled archive and not the package manager: it needs no network
+    and no administrator rights, and works the same on Linux, macOS and
+    Windows.  Its SHA-256 is checked against ``SOURCE.json``.
+    """
+    from ..indexer._clang_resource import InstallError, install_managed, libclang_major
+
+    major = libclang_major()
+    if major is None:
+        return False, "the libclang version is not known"
+    try:
+        include = install_managed(major)
+    except InstallError as error:
+        return False, str(error)
+    return True, f"clang {major} headers installed in {include}"
+
+
 def _extract_model_name(result, default_url: str) -> str:
     """Extract model name from fix_cmd like 'ollama pull <model>'."""
     if result.fix_cmd and result.fix_cmd.startswith("ollama pull "):
@@ -319,6 +338,7 @@ FIXABLE: dict[str, Any] = {
     "chat-model": fix_chat_model,
     "embed-model": fix_embed_model,
     "sqlite-ext": fix_sqlite_ext,
+    "clang-resource": fix_clang_resource,
 }
 
 
