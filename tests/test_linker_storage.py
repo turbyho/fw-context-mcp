@@ -11,6 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from fw_context_mcp.indexer.db import (
+    get_memory_regions,
     insert_symbols_batch,
     open_db,
     transaction,
@@ -187,6 +188,51 @@ class TestWhatItStores:
         finally:
             conn.close()
         assert (result.files, result.symbols) == (0, 0)
+
+    def test_no_script_removes_the_rows_of_an_earlier_run(self, tmp_path):
+        # config_hash comes from the compile flags only.  A later run that
+        # names no script keeps the hash, and it must not keep the old map.
+        conn = _db(tmp_path)
+        try:
+            with transaction(conn):
+                store_scripts(conn, "ch", [_script(tmp_path)], tmp_path)
+            with transaction(conn):
+                store_scripts(conn, "ch", [], tmp_path)
+            regions = get_memory_regions(conn, "ch")
+            rows = _rows(conn)
+            entry = conn.execute(
+                "SELECT entry_point FROM build_configs WHERE config_hash='ch'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert regions == []
+        assert rows == {}
+        assert not entry
+
+    def test_the_defsym_values_reach_the_memory_map(self, tmp_path):
+        # The shape of the STM32 Arduino core: the sizes come only from the
+        # `--defsym` options of the link command.
+        script = _script(tmp_path, (
+            "MEMORY\n{\n"
+            "  RAM (xrw) : ORIGIN = 0x20000000, LENGTH = LD_MAX_DATA_SIZE\n"
+            "  FLASH (rx) : ORIGIN = 0x8000000, LENGTH = LD_MAX_SIZE\n"
+            "}\n"
+        ))
+        conn = _db(tmp_path)
+        try:
+            with transaction(conn):
+                result = store_scripts(
+                    conn, "ch", [script], tmp_path,
+                    defsyms={"LD_MAX_SIZE": "1048576", "LD_MAX_DATA_SIZE": "98304"},
+                )
+            regions = {
+                region["name"]: (region["origin_value"], region["length_value"])
+                for region in get_memory_regions(conn, "ch")
+            }
+        finally:
+            conn.close()
+        assert result.defsym_values == 2
+        assert regions == {"RAM": (0x20000000, 98304), "FLASH": (0x08000000, 1048576)}
 
 
 class TestWhatItLeavesAlone:

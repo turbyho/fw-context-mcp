@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+from ._linker import LinkRecord
 from .protocol import BuildSystem
 
 log = logging.getLogger(__name__)
@@ -98,6 +99,64 @@ def linker_scripts(
         log.debug("get_linker_scripts failed for %r", builder, exc_info=True)
         return []
     return [Path(item) for item in found or []]
+
+
+def link_record(
+    builder: BuildSystem | None,
+    project_root: Path,
+    *,
+    compile_commands: Path | None = None,
+    variant: str = "",
+    units: list | None = None,
+) -> LinkRecord | None:
+    """Return what *builder* knows about the link of this build, or None.
+
+    None means "the backend does not know", and the pass then keeps the
+    rows of an earlier run.  A record with no script means "the link names
+    no script", and the pass removes them.  `get_linker_scripts` cannot
+    give that difference: its empty list means both.  Measured on a Zephyr
+    sysbuild project, the copy of the database in `.fw-context/build/` has
+    no `build.ninja` next to it, and an empty list there is "do not know".
+
+    ``get_link_record`` is an OPTIONAL method with the arguments of
+    ``get_linker_scripts``.  It is not on the ``BuildSystem`` protocol, for
+    the same reason that ``build_multi`` is not: only a backend that records
+    the link command has the answer, and a protocol method would make each
+    backend write an empty one.  It also gives the ``--defsym`` definitions,
+    because a linker script can use a name that only the link command
+    defines.
+
+    A backend without the method answers through ``get_linker_scripts``: a
+    non-empty list is a record, and an empty list is None.  A backend that
+    raises, or that answers with a wrong type, gives None.
+    """
+    if builder is None:
+        return None
+    probe = getattr(builder, "get_link_record", None)
+    if probe is None:
+        scripts = linker_scripts(
+            builder, project_root,
+            compile_commands=compile_commands, variant=variant, units=units,
+        )
+        return LinkRecord(scripts=scripts) if scripts else None
+    try:
+        found = probe(
+            project_root,
+            compile_commands=compile_commands,
+            variant=variant,
+            units=units,
+        )
+    except (AttributeError, TypeError, ValueError, RuntimeError, OSError):
+        log.debug("get_link_record failed for %r", builder, exc_info=True)
+        return None
+    if found is None or not isinstance(found, LinkRecord) or not isinstance(found.defsyms, dict):
+        return None
+    if not all(isinstance(path, Path) for path in found.scripts) or not all(
+        isinstance(name, str) and (expression is None or isinstance(expression, str))
+        for name, expression in found.defsyms.items()
+    ):
+        return None
+    return found
 
 
 class BuildSystemRegistry:

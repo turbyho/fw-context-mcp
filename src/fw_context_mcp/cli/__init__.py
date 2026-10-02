@@ -452,7 +452,7 @@ def main() -> None:
     p_db_delete.add_argument("--all", action="store_true", help="Delete the entire index (all builds)")
     p_db_delete.set_defaults(func=cmd_db_delete)
 
-    p_db_cleanup = p_db_sub.add_parser("cleanup", help="Remove orphaned compile_commands artifacts")
+    p_db_cleanup = p_db_sub.add_parser("cleanup", help="Remove orphaned per-build artifacts")
     p_db_cleanup.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
     p_db_cleanup.set_defaults(func=cmd_db_cleanup)
 

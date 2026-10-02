@@ -384,7 +384,7 @@ def cmd_db_delete(args: argparse.Namespace) -> int:
 
 
 def cmd_db_cleanup(args: argparse.Namespace) -> int:
-    """Remove orphaned compile_commands artifacts."""
+    """Remove orphaned per-build artifacts: compile_commands and linker pass state files."""
     from ..config import derive_project_id
     from ..config import load as load_config
     from ..indexer.runner import _cleanup_orphaned_cc_artifacts
@@ -397,7 +397,7 @@ def cmd_db_cleanup(args: argparse.Namespace) -> int:
 
     deleted = _cleanup_orphaned_cc_artifacts(db_path, project_id)
     if deleted:
-        print(f"Cleaned up {deleted} orphaned compile_commands artifact(s).")
+        print(f"Cleaned up {deleted} orphaned per-build artifact(s).")
     else:
         print("No orphaned artifacts found.")
     return 0

@@ -1475,6 +1475,9 @@ def _cleanup_old_for_pair(
     # one file per dialect change, 52 MB of it on the Mbed project, for the life of
     # the project.  It also made load(db_dir) ambiguous, since that form picks
     # the most recently modified manifest in the directory.
+    # The state file of the linker script pass describes the rows of one
+    # build too, and nothing reads it once that build is gone.
+    from ._linker_pass import state_path
     from .manifest import _manifest_path
 
     # db_dir is the database directory of the project, where
@@ -1485,6 +1488,7 @@ def _cleanup_old_for_pair(
         for artifact in (
             _manifest_path(db_dir, old_ch),
             db_dir / f"compile_commands.{old_ch}.json",
+            state_path(db_dir, old_ch),
         ):
             try:
                 artifact.unlink(missing_ok=True)

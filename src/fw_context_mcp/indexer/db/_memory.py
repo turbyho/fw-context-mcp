@@ -14,7 +14,9 @@ WHY the raw text travels with the number: an mbed script writes
 which mixes decimal and hexadecimal.  The text is always what the file says.
 The number is filled in only when the expression is constant arithmetic and
 is NULL for an expression that names a symbol, because the index does not
-evaluate a symbol.
+evaluate a symbol.  One kind of name is a constant: a name that the link
+command defines with `--defsym`, which the STM32 Arduino core uses for the
+size of the flash and the RAM.  See `linker_script.apply_defsyms`.
 """
 
 import sqlite3

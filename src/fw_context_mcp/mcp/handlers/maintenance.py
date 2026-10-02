@@ -315,8 +315,10 @@ def list_variants(
         file_path, line}).  `origin` and `length` are the expression the
         script writes; `origin_value` and `length_value` are numbers, and
         they are None for an expression that names a symbol such as
-        `ORIGIN(RAM) + LENGTH(RAM)`.  Empty for a build whose system
-        records no linker script — see the note below.
+        `ORIGIN(RAM) + LENGTH(RAM)`.  A name that the link command defines
+        with `--defsym` counts as a number: `LENGTH = LD_MAX_DATA_SIZE`
+        gets `length_value` 98304 on the STM32 Arduino core.  Empty for a
+        build whose system records no linker script — see the note below.
 
         THIS is where a per-build memory map lives, not in the `images`
         list of ``get_active_build``: that list holds one entry per image
@@ -553,8 +555,10 @@ def get_active_build(
         `0xefe00` and a Zephyr script writes `((673792) - 0xe6)`.
         ``origin_value`` and ``length_value`` hold the number, and both are
         None for an expression that names a symbol, such as
-        `ORIGIN(RAM) + LENGTH(RAM)`.  The end of a region is
-        ``origin_value + length_value``.
+        `ORIGIN(RAM) + LENGTH(RAM)`.  A name that the link command defines
+        with ``--defsym`` counts as a number: the STM32 Arduino core writes
+        `LENGTH = LD_MAX_DATA_SIZE` and gets ``length_value`` 98304.  The
+        end of a region is ``origin_value + length_value``.
 
         ``memory`` and ``entry_point`` describe ONE build.  For a
         multi-variant project they follow ``config_hash``, which is the
@@ -566,10 +570,12 @@ def get_active_build(
         Use ``list_variants`` for the map of every build.
 
         ``memory`` is empty for a build system that records no linker
-        script.  A PlatformIO project is the measured case: SCons writes no
-        ninja file and no link command the index can read, and the map file
-        never names the script.  An empty list means "not recorded", never
-        "no memory".
+        script, such as Keil or IAR.  A PlatformIO project records its link
+        only in ``fw-context index --build``: SCons writes no file with the
+        link command, thus the build asks ``pio run -t envdump``.  An empty
+        list for PlatformIO means that no build recorded the link yet, and
+        ``fw-context index --build`` is the step.  An empty list means "not
+        recorded", never "no memory".
 
         ``defines`` (dict — the `-D` flags of that build) and
         ``defines_varying`` (int).  ``defines`` holds only the names that

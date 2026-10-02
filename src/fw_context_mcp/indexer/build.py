@@ -158,6 +158,13 @@ class BuildConfig:
     # None means the canonical path — see utils.cc_output_path.
     cc_output: Path | None = None
 
+    # ── Name of the variant this config builds ──
+    # build_variant_config sets this, and no user configuration does.  A
+    # backend that records a property of its build next to the database, as
+    # the PlatformIO backend records its link, needs it: every variant builds
+    # before the first one is indexed.  "" is the build with no variants.
+    variant_name: str = ""
+
     # ── Toolchain (shared by Keil, IAR, Makefile) ──
     toolchain_path: str | None = None  # path to toolchain bin directory
     toolchain_prefix: str | None = None  # e.g. "arm-none-eabi-"
@@ -292,6 +299,7 @@ def build_variant_config(base: BuildConfig, variant: BuildVariant) -> BuildConfi
 
     # Explicit variant fields (board/build_dir) are scalar overrides; env is
     # a dict merge.  images/default_* are not part of the effective build.
+    cfg.variant_name = variant.name
     if variant.board is not None:
         cfg.board = variant.board
     if variant.build_dir is not None:
@@ -597,6 +605,11 @@ def _generate_into(root: Path, cfg: BuildConfig) -> Path:
             raise RuntimeError("compile_commands.json was not generated")
         cc_path = cc_output_path(root, cfg)
         shutil.copy2(native_cc, cc_path)
+        # A custom command records no link.  The PlatformIO backend keys its
+        # record by the hash of the database, and a change of the link alone
+        # keeps that hash, thus an old record would describe another link.
+        from .builders._platformio_link import forget, sidecar_path
+        forget(sidecar_path(cc_path.parent))
         return cc_path
 
     # Detect or validate

@@ -313,7 +313,8 @@ class TestTheBackends:
     def test_mbed_with_no_output_at_all(self, tmp_path):
         assert MbedOSBuildSystem().get_linker_scripts(tmp_path) == []
 
-    def test_platformio_answers_nothing(self, tmp_path):
-        # SCons records no link command the index can read, and the map file
-        # never names the script.  Measured on the STM32 project and on the ESP32 project.
+    def test_platformio_without_a_recorded_link(self, tmp_path):
+        # SCons writes no file with the link command.  Only a build records
+        # it, see test_platformio_link.py, thus with no build there is no
+        # answer.
         assert PlatformIOBuildSystem().get_linker_scripts(tmp_path) == []

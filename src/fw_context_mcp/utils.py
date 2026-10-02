@@ -62,6 +62,7 @@ __all__ = [
     "MTIME_TOLERANCE_S",
     "SAFE_EXCEPT",
     "TU_EXTENSIONS",
+    "BuildTimeoutError",
     "abs_path",
     "atomic_copy",
     "autobuild_dir",
@@ -69,6 +70,7 @@ __all__ = [
     "build_env",
     "cc_output_path",
     "cc_staging_path",
+    "clear_dead_temporaries",
     "compute_content_hash",
     "compute_source_hash",
     "fmt_count",
@@ -90,6 +92,7 @@ __all__ = [
     "run_in_process_group",
     "staging_owner",
     "stop_process_group",
+    "temporary_owner",
     "truncate_path_middle",
 ]
 
@@ -628,6 +631,16 @@ def build_cfg_env(build_cfg: BuildConfig | None, env: dict[str, str] | None = No
     return merged_env
 
 
+class BuildTimeoutError(RuntimeError):
+    """A build command ran longer than its timeout.
+
+    A subclass of the ``RuntimeError`` that ``run_build_command`` raises for
+    every failure, thus each caller that catches that error stays correct.
+    A caller that tries again after a failure needs the difference: a
+    command that hung once can hang again, each time for the whole timeout.
+    """
+
+
 def run_build_command(
     cmd: list[str],
     cwd: Path,
@@ -675,7 +688,8 @@ def run_build_command(
         CompletedProcess with captured stdout/stderr.
 
     Raises:
-        RuntimeError: On non-zero exit or timeout.
+        RuntimeError: On non-zero exit.  BuildTimeoutError (a RuntimeError)
+            on timeout.
     """
     if timeout is None:
         timeout = build_cfg.timeout if build_cfg is not None else 7200
@@ -697,7 +711,7 @@ def run_build_command(
         # Quote what the build managed to say.  A timeout with no output
         # gives the reader nothing to act on, and the last lines usually
         # name the step that hung.
-        raise RuntimeError(
+        raise BuildTimeoutError(
             f"Build command timed out after {timeout}s: "
             f"{description or ' '.join(cmd)}"
             f"{_quote_stream('stdout', _as_text(e.stdout))}"
@@ -1056,14 +1070,46 @@ def staging_owner(path: Path) -> str | None:
     and digits.  The host name in the token holds dots too, thus the token
     is found by its form, ``<digits>@<tag>``, after a dot or at the start.
     """
-    prefix = f".{CC_OUTPUT_REL.stem}."
-    suffix = CC_OUTPUT_REL.suffix
+    return temporary_owner(path, CC_OUTPUT_REL.stem, CC_OUTPUT_REL.suffix)
+
+
+def temporary_owner(path: Path, stem: str, suffix: str) -> str | None:
+    """Return the owner token in the name of a temporary file, or None.
+
+    The name of a temporary file of ``<stem><suffix>`` is
+    ``.<stem>.[<name>.]<token><suffix>``, as :func:`atomic_copy` and the
+    other atomic writers make it with :func:`owner_token`.
+    """
+    prefix = f".{stem}."
     name = path.name
     if not name.startswith(prefix) or not name.endswith(suffix):
         return None
     middle = name.removeprefix(prefix).removesuffix(suffix)
     match = _OWNER_TOKEN_AT_END.search(middle)
     return match.group(1) if match else None
+
+
+def clear_dead_temporaries(directory: Path, stem: str, suffix: str) -> int:
+    """Remove the temporary files of ``<stem><suffix>`` whose owner stopped.
+
+    An atomic write that a signal (SIGKILL) stops leaves its temporary file
+    behind, and no later write uses that name again, because the name holds
+    the owner token.  A file of a process that still runs stays: it writes
+    the file.  A file whose owner this process cannot see stays too, see
+    :func:`owner_is_dead`.  Best-effort: a file that cannot be deleted costs
+    disk space only.  Returns the number of removed files.
+    """
+    removed = 0
+    for candidate in directory.glob(f".{stem}.*{suffix}"):
+        token = temporary_owner(candidate, stem, suffix)
+        if token is None or not owner_is_dead(token):
+            continue
+        try:
+            candidate.unlink(missing_ok=True)
+            removed += 1
+        except OSError as exc:
+            log.debug("Cannot remove the dead temporary file %s: %s", candidate, exc)
+    return removed
 
 
 # The owner token at the end of the middle part of a staging name.  The tag

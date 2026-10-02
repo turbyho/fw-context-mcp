@@ -7,7 +7,7 @@ collected after the embedding phase completes, freeing memory for subsequent
 analysis phases.
 
 Handles embedding model key generation, body chunking/truncation,
-orphaned compile_commands artifact cleanup, and the main embedding
+orphaned per-build artifact cleanup, and the main embedding
 build phase.
 """
 
@@ -170,12 +170,16 @@ def _fmt_dur(seconds: float) -> str:
 
 
 def _cleanup_orphaned_cc_artifacts(db_path: Path, project_id: str) -> int:
-    """Delete ``compile_commands.<hash>.json`` files that don't match any active build_config.
+    """Delete the per-build files that don't match any active build_config.
 
-    These files are written by :func:`compute_config_hash` as debug artifacts
-    and can become orphaned when ``fw-context index`` is interrupted before
-    the end-of-run cleanup.  Call this at the START of a new index run so
-    orphans from a previous crashed run are cleaned up immediately.
+    ``compile_commands.<hash>.json`` files are written by
+    :func:`compute_config_hash` as debug artifacts and can become orphaned
+    when ``fw-context index`` is interrupted before the end-of-run cleanup.
+    ``linker_pass.<hash>.json`` files are the state of the linker script
+    pass (``_linker_pass.state_path``).  A build that ``fw-context db
+    delete`` removes, and a database that ``reset_index`` deletes, leave
+    theirs.  Call this at the START of a new index run so orphans from a
+    previous crashed run are cleaned up immediately.
 
     Returns the number of deleted files.
     """
@@ -195,18 +199,29 @@ def _cleanup_orphaned_cc_artifacts(db_path: Path, project_id: str) -> int:
         except SAFE_EXCEPT as e:
             if is_fatal(e):
                 raise
-            pass  # non-fatal — continue  # DB may be corrupt or schema not yet initialized
+            # A database that exists and cannot be read gives no list of the
+            # active builds.  An empty list would delete the file of every
+            # build, and the state of the linker script pass is more than a
+            # debug artifact: a later "not known" run needs its paths.
+            log.debug("Cannot read the builds of %s, thus only the nested artifacts are removed: %s", db_path, e)
+            return _remove_nested_cc_artifacts(cc_dir / project_id)
 
     deleted = 0
     for f in cc_dir.iterdir():
         if not f.is_file():
             continue
         name = f.name
-        if not name.startswith("compile_commands.") or not name.endswith(".json"):
+        if not name.endswith(".json"):
             continue
-        # Extract hash from filename: compile_commands.<64-char-hex>.json
-        hash_part = name[len("compile_commands."): -len(".json")]
-        if len(hash_part) != 64 or not all(c in "0123456789abcdef" for c in hash_part):
+        if name.startswith("compile_commands."):
+            # Extract hash from filename: compile_commands.<64-char-hex>.json
+            hash_part = name[len("compile_commands."): -len(".json")]
+            if len(hash_part) != 64 or not all(c in "0123456789abcdef" for c in hash_part):
+                continue
+        elif name.startswith("linker_pass."):
+            # Every such name is a state file: no other code writes one.
+            hash_part = name[len("linker_pass."): -len(".json")]
+        else:
             continue
         if hash_part not in active_hashes:
             try:
@@ -218,7 +233,7 @@ def _cleanup_orphaned_cc_artifacts(db_path: Path, project_id: str) -> int:
     deleted += _remove_nested_cc_artifacts(cc_dir / project_id)
 
     if deleted:
-        log.info("Cleaned up %d orphaned compile_commands artifacts in %s", deleted, cc_dir)
+        log.info("Cleaned up %d orphaned per-build artifacts in %s", deleted, cc_dir)
     return deleted
 
 

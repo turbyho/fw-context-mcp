@@ -21,7 +21,8 @@ goes to the log.
 **The reader does not evaluate an expression that holds a symbol.**
 `ORIGIN(RAM) + LENGTH(RAM)` stays raw text.  Constant arithmetic gets a
 number as well, because a reader cannot use `((673792) - 0xe6)` and can use
-`673562`.  See `evaluate_constant`.
+`673562`.  See `evaluate_constant`.  One kind of name counts as a constant:
+a name that the link command defines with `--defsym`, see `apply_defsyms`.
 
 Grammar reference — the GNU ld manual, sections "Simple Assignments",
 "PROVIDE", "MEMORY", and "Linker Script Format".  Two rules come from
@@ -35,7 +36,7 @@ import logging
 import re
 import sqlite3
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -126,7 +127,14 @@ class Report:
 
 @dataclass
 class LinkerScript:
-    """Everything the reader got from one script file."""
+    """Everything the reader got from one script file.
+
+    Attributes:
+        assigned: Every name that a plain assignment (no `PROVIDE`) gives,
+            the repeated assignments included.  `symbols` keeps the first
+            assignment of each name only, and `apply_defsyms` must also
+            know a plain assignment that follows a `PROVIDE` of the name.
+    """
 
     path: Path
     entry: str | None = None
@@ -134,6 +142,7 @@ class LinkerScript:
     symbols: list[LinkerSymbol] = field(default_factory=list)
     regions: list[MemoryRegion] = field(default_factory=list)
     report: Report = field(default_factory=Report)
+    assigned: set[str] = field(default_factory=set)
 
 
 # ── Constant arithmetic ────────────────────────────────────────────────────
@@ -159,12 +168,36 @@ _BINARY_OPS: dict[type, str] = {
 _UNARY_OPS = (ast.UAdd, ast.USub, ast.Invert)
 
 
-def evaluate_constant(expression: str) -> int | None:
+def _scaled_suffix(match: re.Match[str]) -> str:
+    """Return the value of one `<number><K|M|G>` as a decimal literal.
+
+    The ld manual: "an integer beginning with 0 is octal".  Thus `010K` is
+    8 KiB, not 10 KiB.  A leading zero with a digit that is not octal, such
+    as `09K`, is not a number for ld, and the text stays as it is, so that
+    the parse of the expression fails and the value is None.
+    """
+    digits = match.group(1)
+    scale = _SUFFIX_SCALE[match.group(2).upper()]
+    if len(digits) > 1 and digits.startswith("0"):
+        if any(digit in "89" for digit in digits):
+            return match.group(0)
+        return str(int(digits, 8) * scale)
+    return str(int(digits) * scale)
+
+
+def evaluate_constant(
+    expression: str, names: Mapping[str, int] | None = None
+) -> int | None:
     """Return the value of *expression*, or None when it is not constant.
 
     Constant means integers and arithmetic, and nothing else.  A name, a
     call such as `ORIGIN(RAM)`, or the location counter `.` makes the
     result None, and the caller keeps the raw text.
+
+    *names* holds values that the link command gives, from `--defsym`.  A
+    name in *names* is a constant, because `ld` defines it before it reads
+    the script.  The STM32 Arduino core writes `LENGTH = LD_MAX_DATA_SIZE`
+    and passes `--defsym=LD_MAX_DATA_SIZE=98304`.
 
     The function never calls `eval`.  It parses the expression with `ast`
     and walks the tree, thus an unexpected construct returns None instead
@@ -173,23 +206,22 @@ def evaluate_constant(expression: str) -> int | None:
     ld divides integers.  Python `/` gives a float, so the walk maps
     division to floor division.  A division by zero returns None.
     """
-    prepared = _SUFFIX_RE.sub(
-        lambda m: str(int(m.group(1)) * _SUFFIX_SCALE[m.group(2).upper()]),
-        expression,
-    )
+    prepared = _SUFFIX_RE.sub(_scaled_suffix, expression)
     try:
         tree = ast.parse(prepared.strip(), mode="eval")
     except (SyntaxError, ValueError, MemoryError, RecursionError):
         return None
     try:
-        return _walk_constant(tree.body)
+        return _walk_constant(tree.body, names or {})
     except (TypeError, ValueError, ZeroDivisionError, OverflowError,
             RecursionError):
         return None
 
 
-def _walk_constant(node: ast.expr) -> int | None:
+def _walk_constant(node: ast.expr, names: Mapping[str, int]) -> int | None:
     """Return the value of one node of a constant expression, or None."""
+    if isinstance(node, ast.Name):
+        return names.get(node.id)
     if isinstance(node, ast.Constant):
         # A bool is an int in Python.  Reject it, because ld has no bool
         # literal and a True here would come from a construct the reader
@@ -198,7 +230,7 @@ def _walk_constant(node: ast.expr) -> int | None:
             return None
         return node.value
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, _UNARY_OPS):
-        operand = _walk_constant(node.operand)
+        operand = _walk_constant(node.operand, names)
         if operand is None:
             return None
         if isinstance(node.op, ast.USub):
@@ -207,8 +239,8 @@ def _walk_constant(node: ast.expr) -> int | None:
             return ~operand
         return operand
     if isinstance(node, ast.BinOp):
-        left = _walk_constant(node.left)
-        right = _walk_constant(node.right)
+        left = _walk_constant(node.left, names)
+        right = _walk_constant(node.right, names)
         if left is None or right is None:
             return None
         if isinstance(node.op, ast.Div | ast.FloorDiv):
@@ -695,6 +727,8 @@ def parse(path: Path) -> LinkerScript | None:
         found = find_assignment(statement)
         if found is None:
             continue
+        if not found.provide:
+            script.assigned.add(found.name)
         if found.name in seen:
             # A script can assign one name more than once, and the last
             # assignment wins at link time.  The index keeps the first,
@@ -714,6 +748,66 @@ def parse(path: Path) -> LinkerScript | None:
             hidden=found.hidden,
         ))
     return script
+
+
+# ── Values from the link command ───────────────────────────────────────────
+
+
+def apply_defsyms(scripts: list[LinkerScript], defsyms: Mapping[str, str | None]) -> int:
+    """Give a value to each expression of *scripts* that the `--defsym` names complete.
+
+    *defsyms* maps a name to its expression, in the order of the link
+    command.  None is a name with no known expression: the link command
+    defines it two times with different expressions, see
+    `_platformio_link.defsyms_from_flags`.  Such a name gives no value.
+    Returns how many region values the names gave.  Only the regions count:
+    the index stores the expression of a symbol, not its value, thus a
+    symbol value would be a number that no reader sees.
+
+    A name that a script assigns without `PROVIDE` is not used, also when
+    the assignment follows a `PROVIDE` of the name.  The script and the
+    option then both define the name, and which one `ld` keeps depends on
+    the order in which it reads them.  This function does not model that
+    order, thus the expression keeps no value.
+
+    A `PROVIDE` form is different: the manual says that it defines the name
+    only when nothing else defines it, thus `--defsym` wins.  The function
+    removes such a symbol from its script.  The script does not define the
+    name in this link, and a stored row would show the expression of the
+    script next to a memory map that uses the value of the option.  That is
+    true for every name of the option, also for one with no constant value,
+    such as `--defsym=_heap_end=_end_of_bss`: ld defines the name all the
+    same.
+
+    An expression of a `--defsym` can use the names before it.
+    """
+    assigned = set().union(*(script.assigned for script in scripts))
+    defined: set[str] = set()
+    values: dict[str, int] = {}
+    for name, expression in defsyms.items():
+        if name in assigned:
+            log.debug("--defsym %s is also assigned in a linker script, thus it is not used", name)
+            continue
+        defined.add(name)
+        value = evaluate_constant(expression, values) if expression is not None else None
+        if value is not None:
+            values[name] = value
+
+    completed = 0
+    for script in scripts:
+        if values:
+            for region in script.regions:
+                if region.origin_value is None:
+                    region.origin_value = evaluate_constant(region.origin, values)
+                    completed += region.origin_value is not None
+                if region.length_value is None:
+                    region.length_value = evaluate_constant(region.length, values)
+                    completed += region.length_value is not None
+        script.symbols = [
+            symbol for symbol in script.symbols
+            if not (symbol.provide and symbol.name in defined)
+        ]
+    return completed
 
 
 # ── Storage ────────────────────────────────────────────────────────────────
@@ -748,6 +842,8 @@ class LinkerResult:
             First and not last, so the script of the real link wins — the
             Zephyr backend puts it in front of the pre-pass script.
         regions: How many memory regions the pass stored.
+        defsym_values: How many region values the `--defsym` names of the
+            link command gave, see `apply_defsyms`.
         paths: The database paths of the scripts, for the coverage purge.
         report: What the reader refused.
     """
@@ -757,6 +853,7 @@ class LinkerResult:
     skipped_defined: int = 0
     entry: str = ""
     regions: int = 0
+    defsym_values: int = 0
     paths: set[str] = field(default_factory=set)
     report: Report = field(default_factory=Report)
 
@@ -828,8 +925,24 @@ def store_scripts(
     project_root: Path,
     vendor_patterns: list[str] | None = None,
     project_patterns: list[str] | None = None,
+    defsyms: Mapping[str, str | None] | None = None,
+    parsed: list[LinkerScript] | None = None,
 ) -> LinkerResult:
     """Read every script of the build and store what it defines.
+
+    *parsed* holds the scripts of *paths* when the caller read them already,
+    to find out if the pass must run at all.  The function changes them:
+    `apply_defsyms` fills values and removes symbols.
+
+    *defsyms* holds the `--defsym` definitions of the link command.  The
+    pass reads every script before it uses them, because `apply_defsyms`
+    must know the names that any script of the build assigns.
+
+    An empty *paths* is not a no-op.  It removes the symbols, the memory
+    map and the entry point that an earlier run wrote for *config_hash*.
+    The hash depends on the compile flags only, thus a change of the link,
+    or a run that could not read it, keeps the hash.  Without this removal
+    `get_active_build` gives the old map as the map of the current build.
 
     Call this AFTER the C and C++ units and BEFORE the assembly pass:
 
@@ -846,8 +959,6 @@ def store_scripts(
     line a user follows is the line of the real link.
     """
     result = LinkerResult()
-    if not paths:
-        return result
 
     from fw_context_mcp.indexer.db import (
         insert_symbols_batch,
@@ -862,12 +973,17 @@ def store_scripts(
 
     _clear_previous_pass(conn, config_hash)
 
+    if parsed is None:
+        scripts = [script for script in (parse(path) for path in paths) if script is not None]
+    else:
+        scripts = parsed
+    if defsyms:
+        result.defsym_values = apply_defsyms(scripts, defsyms)
+
     stored_names: set[str] = set()
     regions: list[dict] = []
-    for path in paths:
-        script = parse(path)
-        if script is None:
-            continue
+    for script in scripts:
+        path = script.path
         result.files += 1
         result.report.refused.update(script.report.refused)
         # The FIRST script that names an entry point wins, the same rule the

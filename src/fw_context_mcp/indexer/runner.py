@@ -224,6 +224,7 @@ def _store_linker_scripts(
     units: list,
     vendor_patterns: list[str],
     project_patterns: list[str],
+    force: bool = False,
 ):
     """Read the linker scripts of this build and store what they define.
 
@@ -247,39 +248,95 @@ def _store_linker_scripts(
     freestanding NCS application reads as a plain CMake project by its
     markers alone.
 
-    A build that names no script gets a log line and nothing else.  Reading
-    a script the build did not name would be a guess, and a wrong memory
-    map is worse than none — see ``builders._linker``.
+    The backend answers in one of three ways, see ``_linker_pass``: it does
+    not know the link (the rows of an earlier run stay), the link names no
+    script (the rows go, because an old map is a wrong map), or the link
+    names scripts.  Reading a script the build did not name would be a
+    guess, and a wrong memory map is worse than none — see
+    ``builders._linker``.
+
+    A run whose inputs did not change since the last full run stores
+    nothing, because each store removes the embeddings of the `ld:` rows.
+    *force* (``fw-context index --force``) always stores.  That run is the
+    documented repair of an old index, and it computes every embedding
+    again anyway, thus the skip would save nothing there.
     """
+    from . import _linker_pass
     from .build import detect_build_system
-    from .builders import linker_scripts, registry
-    from .linker_script import store_scripts
+    from .builders import link_record, registry
 
     key = build_system or detect_build_system(project_root)
     builder_cls = registry.get(key) if key else None
-    scripts = linker_scripts(
+    record = link_record(
         builder_cls() if builder_cls else None,
         project_root,
         compile_commands=compile_commands,
         variant=variant,
         units=units,
     )
-    if not scripts:
-        log.info("linker script: none found for this build")
+    state_file = _linker_pass.state_path(db_dir, config_hash)
+    state = _linker_pass.read_state(state_file)
+
+    if record is None:
+        log.info("linker script: this build does not state its link, thus the stored rows stay")
+        # The coverage purge needs the paths of the scripts that the rows
+        # came from, or it removes those rows as files no unit covers.
+        if state is not None and _linker_pass.rows_match(conn, config_hash, state):
+            return _linker_pass.result_from_state(state)
         return None
+
+    if not record.scripts:
+        log.info("linker script: the link of this build names no script")
+        with write_lock(db_dir, timeout=120.0):
+            with transaction(conn, checkpoint=False):
+                _linker_pass.store(conn, config_hash, [], project_root, [], [], {})
+        _linker_pass.remove_state(state_file)
+        return None
+
+    scripts = _linker_pass.parse_scripts(record)
+    fingerprint = _linker_pass.fingerprint(
+        conn, config_hash, scripts, project_root,
+        vendor_patterns, project_patterns, record.defsyms,
+    )
+    if (
+        not force
+        and fingerprint is not None
+        and state is not None
+        and state.fingerprint == fingerprint
+        and _linker_pass.rows_match(conn, config_hash, state)
+    ):
+        log.info(
+            "linker script: %d file(s) unchanged since the last run, thus not stored again",
+            state.files,
+        )
+        return _linker_pass.result_from_state(state)
 
     with write_lock(db_dir, timeout=120.0):
         with transaction(conn, checkpoint=False):
-            result = store_scripts(
+            result = _linker_pass.store(
                 conn, config_hash, scripts, project_root,
-                vendor_patterns, project_patterns,
+                vendor_patterns, project_patterns, record.defsyms,
             )
+    # After the commit, so that a stop before it gives a full run next time.
+    # With no fingerprint the state gets "", which no digest matches: the
+    # next run cannot skip, and a "not known" run still gets the paths for
+    # the coverage purge, which without them deletes the rows of the scripts.
+    _linker_pass.write_state(state_file, _linker_pass.PassState(
+        fingerprint=fingerprint or "",
+        files=result.files,
+        symbols=result.symbols,
+        regions=result.regions,
+        entry=result.entry,
+        paths=sorted(result.paths),
+    ))
     log.info(
-        "linker script: %d file(s) -> %d symbol(s), %d region(s), entry %s%s",
+        "linker script: %d file(s) -> %d symbol(s), %d region(s), entry %s%s%s",
         result.files, result.symbols, result.regions,
         result.entry or "(none)",
         f", {result.skipped_defined} name(s) already defined"
         if result.skipped_defined else "",
+        f", {result.defsym_values} value(s) from --defsym"
+        if result.defsym_values else "",
     )
     # A refusal nobody can see looks exactly like a script that held nothing
     # worth indexing.
@@ -808,6 +865,7 @@ def run(
         units=all_units,
         vendor_patterns=vendor_patterns,
         project_patterns=project_patterns_list,
+        force=force,
     )
 
     asm = None

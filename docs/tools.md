@@ -203,7 +203,7 @@ fw-context db list                   # list all builds
 fw-context db stats <hash>           # show statistics for a build
 fw-context db delete <hash>          # delete a specific build
 fw-context db delete --all           # delete the entire index
-fw-context db cleanup                # remove orphaned compile_commands artifacts
+fw-context db cleanup                # remove orphaned per-build artifacts
 ```
 
 #### `fw-context db list`

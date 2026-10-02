@@ -332,6 +332,18 @@ clean = false              # incremental build is faster
 `fw-context index --build` runs `pio run --target compiledb`. fw-context
 configures dependency tracking (`-MMD`) automatically.
 
+The build also runs `pio run --target envdump`. This target compiles
+nothing. It prints the SCons environment, and fw-context reads the link
+options from it: the linker scripts (`-T`, `--default-script`) and the
+`--defsym` values. SCons writes no file that holds the link command, thus
+this step is the only source of the memory map and of the linker-script
+symbols of a PlatformIO build. fw-context records the result in
+`.fw-context/build/platformio_link.json`.
+
+Each `pio run` also runs the `extra_scripts` of the project, thus the
+`envdump` step runs them one more time. An index run without `--build`
+reads the record of the last build and does not run `pio`.
+
 ### 2. Zephyr (nRF52840)
 
 ```toml

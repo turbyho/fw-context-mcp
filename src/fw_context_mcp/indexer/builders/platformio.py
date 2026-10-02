@@ -8,9 +8,10 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from fw_context_mcp.utils import cc_output_path, run_build_command
+from fw_context_mcp.utils import CC_OUTPUT_REL, BuildTimeoutError, cc_output_path, run_build_command
 
-from . import registry
+from . import _link_command, _platformio_link, registry
+from ._linker import LinkRecord
 from .protocol import BuildIssue
 
 if TYPE_CHECKING:
@@ -56,6 +57,15 @@ def _libdeps_dir(project_root: Path) -> str:
     except (ValueError, OSError):
         return default
     return str(rel) if str(rel) != "." else default
+
+
+def _first_line(exc: RuntimeError) -> str:
+    """Return the first line of the message of a failed ``pio`` run.
+
+    The lines after it quote the output, and the output of ``envdump``
+    holds the whole ``ENV`` of the process, which can hold a token.
+    """
+    return str(exc).split("\n", 1)[0]
 
 
 class PlatformIOBuildSystem:
@@ -136,6 +146,8 @@ class PlatformIOBuildSystem:
         shutil.copy2(native_cc, cc_path)
         log.info("Copied %s → %s", native_cc, cc_path)
 
+        self._record_link(project_root, cfg, pio_prefix, build_env, cc_path)
+
         # ── Full build for .d file generation ──
         # compiledb only writes compile_commands.json — GCC may not have
         # run.  A full pio run compiles and emits .d files that the indexer
@@ -153,6 +165,176 @@ class PlatformIOBuildSystem:
             )
 
         return cc_path
+
+    def _record_link(
+        self,
+        project_root: Path,
+        cfg: BuildConfig,
+        pio_prefix: list[str],
+        build_env: dict[str, str] | None,
+        cc_path: Path,
+    ) -> None:
+        """Record the link inputs of each environment for *cc_path*.
+
+        The sidecar is in the fw-context build directory.  Its entry holds
+        the build variant and the hash of *cc_path*, which can be the staging
+        file of this build.  The rename of the staging file keeps the
+        content, thus the hash stays correct for the published database.
+
+        ``pio run -t envdump`` prints the SCons environment and compiles
+        nothing.  It gets the same Python, project and ``PLATFORMIO_BUILD_DIR``
+        as ``compiledb``, thus ``BUILD_DIR`` in the dump is the directory of
+        the object files that *cc_path* names.  ``PLATFORMIO_NO_ANSI`` keeps
+        colour sequences out of the dump: ``PLATFORMIO_FORCE_ANSI`` in the
+        environment of the user puts one at the start of each line.
+
+        A failure removes the entry of this build and does not stop the
+        build.  A change of the link alone keeps the hash of the database,
+        thus an old entry would give the old link to the new build.
+        """
+        target = _platformio_link.sidecar_path((project_root / CC_OUTPUT_REL).parent)
+        envs = self._dump_links(project_root, cfg, pio_prefix, {**(build_env or {}), "PLATFORMIO_NO_ANSI": "true"})
+        for name, link in sorted((envs or {}).items()):
+            if link.unknown:
+                log.info("PlatformIO environment %s: the link cannot be read: %s", name, link.unknown)
+        try:
+            _platformio_link.record_link(target, cfg.variant_name, cc_path, envs)
+        except OSError as exc:
+            # The database of this build cannot be read for its hash.  The
+            # build stops later on the same file, and this step must not
+            # stop it first.
+            log.warning("Cannot record the link inputs for %s: %s", cc_path, exc)
+            _platformio_link.forget(target)
+            return
+        if envs is not None:
+            log.info("Recorded the link inputs of %d PlatformIO environment(s) in %s", len(envs), target)
+
+    def _dump_links(
+        self,
+        project_root: Path,
+        cfg: BuildConfig,
+        pio_prefix: list[str],
+        dump_env: dict[str, str],
+    ) -> dict[str, _platformio_link.EnvLink] | None:
+        """Return the link inputs of each environment from ``envdump``, or None.
+
+        One ``pio run --target envdump`` dumps every environment.  When it
+        fails, the dump of each environment is asked for again with ``-e``,
+        but only for a project with more than one environment, and not after
+        a timeout, which could repeat once per environment.  WHY: the
+        exit code of the first run is the exit code of the worst
+        environment, and its output can then hold a dict that an
+        ``extra_script`` printed before the failure.  A separate run gives
+        each environment its own exit code.  An environment that fails
+        stays in the result as unknown, see ``EnvLink.unknown``.
+        """
+        cmd = pio_prefix + ["run", "--project-dir", str(project_root), "--target", "envdump"]
+        log.info("platformio link inputs: %s", " ".join(cmd))
+        try:
+            result = run_build_command(
+                cmd, cwd=project_root, description="pio run --target envdump", build_cfg=cfg, env=dump_env,
+            )
+        except BuildTimeoutError as exc:
+            # A dump that hung would hang again for each environment.
+            log.warning("pio run --target envdump failed, thus the index gets no memory map: %s", _first_line(exc))
+            return None
+        except RuntimeError as exc:
+            log.warning("pio run --target envdump failed: %s", _first_line(exc))
+            return self._dump_each_link(project_root, cfg, pio_prefix, dump_env)
+        envs = _platformio_link.parse_envdump(result.stdout or "")
+        if not envs:
+            log.warning("pio run --target envdump gave no environment, thus the index gets no memory map")
+            return None
+        return envs
+
+    def _dump_each_link(
+        self,
+        project_root: Path,
+        cfg: BuildConfig,
+        pio_prefix: list[str],
+        dump_env: dict[str, str],
+    ) -> dict[str, _platformio_link.EnvLink] | None:
+        """Return the link inputs from one ``envdump`` run per environment, or None.
+
+        None when the project has fewer than two environments, or when
+        ``pio project config`` cannot name them.  With one environment, the
+        run that failed was the run of that environment.
+        """
+        config_cmd = pio_prefix + ["project", "config", "--project-dir", str(project_root), "--json-output"]
+        try:
+            config = run_build_command(
+                config_cmd, cwd=project_root, description="pio project config", build_cfg=cfg, env=dump_env,
+            )
+        except RuntimeError as exc:
+            log.warning("pio project config failed, thus the index gets no memory map: %s", _first_line(exc))
+            return None
+        names = _platformio_link.run_environments(config.stdout or "")
+        if not names or len(names) < 2:
+            log.warning("pio run --target envdump failed, thus the index gets no memory map")
+            return None
+        envs: dict[str, _platformio_link.EnvLink] = {}
+        for position, name in enumerate(names):
+            cmd = pio_prefix + [
+                "run", "--project-dir", str(project_root), "--environment", name, "--target", "envdump",
+            ]
+            try:
+                result = run_build_command(
+                    cmd, cwd=project_root, description=f"pio run -e {name} --target envdump",
+                    build_cfg=cfg, env=dump_env,
+                )
+            except BuildTimeoutError as exc:
+                # The next environments could hang the same way, each for
+                # the whole timeout.  They stay in the result as unknown.
+                log.warning("pio run -e %s --target envdump failed, thus no more are run: %s", name, _first_line(exc))
+                for rest in names[position:]:
+                    envs[rest] = _platformio_link.EnvLink(unknown="pio run --target envdump timed out")
+                break
+            except RuntimeError as exc:
+                log.warning("pio run -e %s --target envdump failed: %s", name, _first_line(exc))
+                envs[name] = _platformio_link.EnvLink(unknown="pio run --target envdump failed for this environment")
+                continue
+            envs[name] = _platformio_link.parse_envdump(result.stdout or "").get(
+                name, _platformio_link.EnvLink(unknown="the dump holds no dict of this environment"),
+            )
+        return envs
+
+    def get_link_record(
+        self,
+        project_root: Path,
+        *,
+        compile_commands: Path | None = None,
+        variant: str = "",
+        units: list | None = None,
+    ) -> LinkRecord | None:
+        """Return the link of the environment that the index holds, or None.
+
+        None means "not known": no build of this database and variant
+        recorded its link, the units do not name exactly one environment,
+        the link of that environment cannot be read (``EnvLink.unknown``),
+        or a script that the link names is not on disk.  The index then
+        keeps the memory map it has, see ``builders.link_record``.
+
+        The sidecar is in the fw-context build directory, where ``build()``
+        writes it, and not next to *compile_commands*.  A database that the
+        user gives explicitly, such as the ``compile_commands.json`` that
+        PlatformIO writes in the project root, has the same content and thus
+        the same hash, but another directory.
+        """
+        envs = _platformio_link.read_link(
+            _platformio_link.sidecar_path((project_root / CC_OUTPUT_REL).parent),
+            variant,
+            compile_commands,
+        )
+        if not envs:
+            return None
+        name = _platformio_link.select_env(envs, units, project_root)
+        if name is None:
+            return None
+        link = envs[name]
+        scripts = _platformio_link.resolve_scripts(link, project_root)
+        if scripts is None:
+            return None
+        return LinkRecord(scripts=scripts, defsyms=_link_command.defsyms_from_flags(link.linkflags))
 
     def background_build_safe(self, cfg: BuildConfig) -> bool:
         """Safe — ``PLATFORMIO_BUILD_DIR`` keeps the object files apart.
@@ -200,24 +382,29 @@ class PlatformIOBuildSystem:
         variant: str = "",
         units: list | None = None,
     ) -> list[Path]:
-        """Return nothing: PlatformIO records no reachable link command.
+        """Return the linker scripts that the link of the indexed environment reads.
 
-        SCons runs the link and writes no ninja file, no `link.txt`, and no
-        response file that the index can read.  The map file does not name
-        the script either: measured on the STM32 project, `firmware.map` holds the
-        resolved `Memory Configuration` and the assignments, but never the
-        file name of the script.
+        SCons writes no file that records the link command.  ``build()``
+        records the ``LINKFLAGS`` and ``LIBPATH`` of each environment from
+        ``pio run -t envdump`` instead, see ``_platformio_link``.  Measured
+        on an STM32 and an ESP32 project: a forced relink printed a link
+        line whose options are those tokens.  The STM32 project gives two
+        scripts, an ``INSERT`` script and the script of the variant, and the
+        ESP32 project gives nine.
 
-        Measured on the STM32 project, whose `ldscript.ld` comes from the
-        framework variant, and on the ESP32 project: neither names its
-        script anywhere the index
-        can find.  A search of the include directories would find a
-        candidate, and a candidate is a guess.
-
-        The map file is a possible source of the memory map by itself, and
-        `plans/vector_normalization.md` keeps that as separate work.
+        The answer is empty when ``get_link_record`` has no record: no build
+        of this database and variant recorded its link, the units do not
+        name exactly one environment, the link of that environment cannot
+        be read, or a script of the link is not on disk.  A search of the
+        framework directories would find a candidate,
+        and a candidate is a guess.  The index pass asks ``get_link_record``,
+        which also tells "not known" from "no script" and gives the
+        ``--defsym`` values.
         """
-        return []
+        record = self.get_link_record(
+            project_root, compile_commands=compile_commands, variant=variant, units=units,
+        )
+        return record.scripts if record is not None else []
 
     def get_build_dir_patterns(self, project_root: Path) -> list[str]:
         """Return the directory PlatformIO writes its build output into.

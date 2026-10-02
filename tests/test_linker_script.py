@@ -18,6 +18,7 @@ from pathlib import Path
 
 from fw_context_mcp.indexer.linker_script import (
     Report,
+    apply_defsyms,
     evaluate_constant,
     find_assignment,
     find_memory_blocks,
@@ -508,3 +509,132 @@ class TestReport:
         report = Report()
         report.refused["unparsed memory region"] += 2
         assert report.summary() == "2 unparsed memory region"
+
+
+class TestApplyDefsyms:
+    """`--defsym` names of the link command complete the expressions.
+
+    Measured on the STM32 project: the MEMORY block writes
+    `LENGTH = LD_MAX_DATA_SIZE`, the link command passes
+    `--defsym=LD_MAX_DATA_SIZE=98304`, and `firmware.map` shows
+    `RAM 0x20000000 0x00018000`.
+    """
+
+    SCRIPT = (
+        "MEMORY\n{\n"
+        "  RAM (xrw) : ORIGIN = 0x20000000, LENGTH = LD_MAX_DATA_SIZE\n"
+        "  FLASH (rx) : ORIGIN = 0x8000000 + LD_FLASH_OFFSET,"
+        " LENGTH = LD_MAX_SIZE - LD_FLASH_OFFSET\n"
+        "}\n"
+        "_estack = ORIGIN(RAM) + LENGTH(RAM);\n"
+        "_Min_Heap_Size = LD_HEAP;\n"
+    )
+    DEFSYMS = {
+        "LD_MAX_SIZE": "1048576",
+        "LD_MAX_DATA_SIZE": "98304",
+        "LD_FLASH_OFFSET": "0x0",
+    }
+
+    def test_the_regions_get_their_values(self, tmp_path):
+        script = _parse(tmp_path, self.SCRIPT)
+        assert apply_defsyms([script], self.DEFSYMS) == 3
+        values = {r.name: (r.origin_value, r.length_value) for r in script.regions}
+        assert values == {"RAM": (0x20000000, 0x18000), "FLASH": (0x08000000, 0x100000)}
+
+    def test_a_call_stays_without_a_value(self, tmp_path):
+        script = _parse(tmp_path, self.SCRIPT)
+        apply_defsyms([script], self.DEFSYMS)
+        estack = next(s for s in script.symbols if s.name == "_estack")
+        assert estack.value is None
+
+    def test_only_region_values_count(self, tmp_path):
+        # The index stores the expression of a symbol, not its value, thus
+        # a symbol value is no value a reader sees.
+        script = _parse(tmp_path, self.SCRIPT)
+        assert apply_defsyms([script], {"LD_HEAP": "0x200"}) == 0
+
+    def test_a_plain_assignment_after_a_provide_blocks_the_option(self, tmp_path):
+        # ld gives 0x3000 for `--defsym SZ=0x2000` with this script.
+        script = _parse(
+            tmp_path,
+            "PROVIDE(SZ = 0x1000);\nSZ = 0x3000;\nMEMORY { RAM : ORIGIN = 0, LENGTH = SZ }\n",
+        )
+        assert apply_defsyms([script], {"SZ": "0x2000"}) == 0
+        assert script.regions[0].length_value is None
+
+    def test_a_name_the_script_assigns_is_not_used(self, tmp_path):
+        # The script and the option both define the name.  Which one ld
+        # keeps depends on the order it reads them in.
+        script = _parse(tmp_path, "LD_MAX = 0x10;\nMEMORY { RAM : ORIGIN = 0, LENGTH = LD_MAX }\n")
+        assert apply_defsyms([script], {"LD_MAX": "0x20"}) == 0
+        assert script.regions[0].length_value is None
+
+    def test_a_name_another_script_assigns_is_not_used(self, tmp_path):
+        first = _parse(tmp_path, "MEMORY { RAM : ORIGIN = 0, LENGTH = LD_MAX }\n")
+        other = tmp_path / "other.ld"
+        other.write_text("LD_MAX = 0x10;\n", encoding="utf-8")
+        second = parse(other)
+        assert second is not None
+        assert apply_defsyms([first, second], {"LD_MAX": "0x20"}) == 0
+
+    def test_a_provide_does_not_block_the_option(self, tmp_path):
+        # PROVIDE defines the name only when nothing else does.
+        script = _parse(
+            tmp_path, "PROVIDE(LD_MAX = 0x10);\nMEMORY { RAM : ORIGIN = 0, LENGTH = LD_MAX }\n"
+        )
+        apply_defsyms([script], {"LD_MAX": "0x20"})
+        assert script.regions[0].length_value == 0x20
+
+    def test_a_provide_that_the_option_replaces_is_not_a_definition(self, tmp_path):
+        # --defsym defines the name, thus the PROVIDE does not.  A stored row
+        # would show `0x1000` next to a map that uses 0x2000.
+        script = _parse(
+            tmp_path, "PROVIDE(SZ = 0x1000);\nX = 1;\nMEMORY { RAM : ORIGIN = 0, LENGTH = SZ }\n"
+        )
+        apply_defsyms([script], {"SZ": "0x2000"})
+        assert [s.name for s in script.symbols] == ["X"]
+        assert script.regions[0].length_value == 0x2000
+
+    def test_an_option_with_no_constant_value_also_replaces_a_provide(self, tmp_path):
+        # `--defsym=_heap_end=_end_of_bss` defines the name for ld as well.
+        # The value is not a number, and the PROVIDE still defines nothing.
+        script = _parse(tmp_path, "PROVIDE(_heap_end = 0x20001000);\nX = 1;\n")
+        assert apply_defsyms([script], {"_heap_end": "_end_of_bss"}) == 0
+        assert [s.name for s in script.symbols] == ["X"]
+
+    def test_an_option_with_two_expressions_replaces_a_provide(self, tmp_path):
+        # None is a name that the link command defines with two different
+        # expressions: it has no value here, and ld still defines it.
+        script = _parse(
+            tmp_path, "PROVIDE(SZ = 0x1000);\nX = 1;\nMEMORY { RAM : ORIGIN = 0, LENGTH = SZ }\n"
+        )
+        assert apply_defsyms([script], {"SZ": None}) == 0
+        assert [s.name for s in script.symbols] == ["X"]
+        assert script.regions[0].length_value is None
+
+    def test_an_option_after_a_name_with_no_value(self, tmp_path):
+        script = _parse(tmp_path, "MEMORY { RAM : ORIGIN = 0, LENGTH = B }\n")
+        apply_defsyms([script], {"A": None, "B": "A * 2"})
+        assert script.regions[0].length_value is None
+
+    def test_an_option_uses_the_options_before_it(self, tmp_path):
+        script = _parse(tmp_path, "MEMORY { RAM : ORIGIN = 0, LENGTH = B }\n")
+        apply_defsyms([script], {"A": "0x10", "B": "A * 2"})
+        assert script.regions[0].length_value == 0x20
+
+    def test_a_value_the_script_already_has_is_kept(self, tmp_path):
+        script = _parse(tmp_path, "MEMORY { RAM : ORIGIN = 0, LENGTH = 4 }\n")
+        assert apply_defsyms([script], {"X": "1"}) == 0
+        assert script.regions[0].length_value == 4
+
+    def test_an_octal_number_with_a_suffix(self):
+        # The ld manual: "an integer beginning with 0 is octal".
+        assert evaluate_constant("010K") == 8 * 1024
+        assert evaluate_constant("09K") is None
+        assert evaluate_constant("0K") == 0
+        assert evaluate_constant("10K") == 10 * 1024
+
+    def test_evaluate_constant_takes_names(self):
+        assert evaluate_constant("A + 1", {"A": 1}) == 2
+        assert evaluate_constant("A + 1") is None
+        assert evaluate_constant("B + 1", {"A": 1}) is None

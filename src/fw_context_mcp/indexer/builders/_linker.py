@@ -16,9 +16,31 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
 
 log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class LinkRecord:
+    """What the build states about its link.
+
+    A backend gives a record only when it KNOWS the link of the build.  An
+    empty *scripts* then means that the link names no script, and the pass
+    removes an old memory map.  A backend that does not know the link gives
+    no record, and the pass keeps the rows it has, see `indexer._linker_pass`.
+
+    Attributes:
+        scripts: The linker scripts, in the order that `ld` reads them.
+        defsyms: The `--defsym` definitions, name to expression, in the
+            order of the link command.  None is a name that the command
+            defines with no known expression, see
+            `linker_script.apply_defsyms`.
+    """
+
+    scripts: list[Path] = field(default_factory=list)
+    defsyms: dict[str, str | None] = field(default_factory=dict)
 
 # The linker takes its script with `-T <path>`, and a ninja file records the
 # whole link command.  Measured on the Zephyr project, every image:
