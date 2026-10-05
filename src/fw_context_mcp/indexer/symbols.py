@@ -2244,7 +2244,11 @@ def _init_list_element_field(
       (``.cb.cb = f``).  An array field gives the type of its element
       (see ``_field_type_spelling``).
 
-    An element that is neither of the two keeps the old reading.
+    * An element that names no field assigns to no VARIABLE.  The old
+      reading took the first variable or field access in the VALUE as the
+      field: ``{ &obj.handler }`` wrote ``obj = handler``, and
+      ``{ tn<N> }`` would write ``N = tn``.  Such an element now gives no
+      field.
     """
     if _holds_nested_list(element):
         return (None, "", "", None)
@@ -2259,8 +2263,7 @@ def _init_list_element_field(
             ref = designators[last].referenced
             if ref is not None and ref.kind == cx.CursorKind.FIELD_DECL:
                 return (ref.get_usr(), ref.spelling, _field_type_spelling(ref), _storage_type(ref.type))
-    usr, name = _extract_lhs_field(element)
-    return (usr, name, "", None)
+    return (None, "", "", None)
 
 
 def _handle_fn_ptr_cases(cursor: cx.Cursor, cur_fn: str | None,
