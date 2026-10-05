@@ -40,6 +40,7 @@ from ...utils import (
     compute_source_hash,
 )
 from .context import _quick_open_readonly, get_executor
+from .paging import holds_past_end_info
 
 log = logging.getLogger(__name__)
 
@@ -892,6 +893,10 @@ def _with_stale_recovery(
         paths = collect_result_paths(safe_rows, root)
         if paths:
             return safe_rows, _stale_files(db_conn, cfg_hash, paths, root), 0, []
+        if holds_past_end_info(safe_rows):
+            # A page after the last row: the answer exists, see
+            # holds_past_end_info.
+            return safe_rows, [], 0, []
         # An empty search result is the case the caller most easily reads as
         # "does not exist".
         dirty, new_sources = diagnose_empty_result(db_conn, cfg_hash, root)
@@ -1118,7 +1123,9 @@ def with_stale_annotation(
         paths = collect_result_paths(result, root)
         if paths:
             return result, _stale_files(conn, cfg_hash, paths, root), 0, []
-        if not diagnose_empty:
+        # A page after the last row names no file, and it is no empty
+        # answer either: see holds_past_end_info.
+        if not diagnose_empty or holds_past_end_info(result):
             return result, [], 0, []
         dirty, new_sources = diagnose_empty_result(conn, cfg_hash, root)
         return result, [], dirty, new_sources

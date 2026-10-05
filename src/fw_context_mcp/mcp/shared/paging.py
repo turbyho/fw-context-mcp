@@ -27,6 +27,8 @@ another.
 
 from __future__ import annotations
 
+import re
+
 
 def page_notice(
     total: int,
@@ -86,6 +88,27 @@ def past_end_info(thing: str, offset: int, total: int) -> dict:
     back and does not conclude that nothing matched.
     """
     return {"info": f"No {thing} at offset {offset}; the answer holds {total}."}
+
+
+# The text of every past-end row: the one of ``past_end_info``, and the
+# older ones that the first paged tools write inline in the same words.
+_PAST_END = re.compile(r"^No .+ at offset \d+; the answer holds \d+\.$")
+
+
+def holds_past_end_info(result: object) -> bool:
+    """Tell if *result* holds the row of a page after the last row.
+
+    WHY: an answer that names no file reads as an empty answer to the
+    staleness check, which then scans the whole index and adds "an empty
+    result is not proof of absence".  A page after the end is not empty:
+    the answer exists, and the row gives its size.  The check must leave
+    such an answer alone.
+    """
+    records = result if isinstance(result, list) else [result]
+    return any(
+        isinstance(r, dict) and isinstance(r.get("info"), str) and _PAST_END.match(r["info"])
+        for r in records
+    )
 
 
 def clamp_offset(offset: int | None) -> int:

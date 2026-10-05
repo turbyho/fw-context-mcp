@@ -115,6 +115,36 @@ class TestPageNotice:
             "lookup_symbol('uart', offset=50) reads the next page."
         )
 
+    def test_a_past_end_row_is_known_in_every_wording(self):
+        """The new helper and the inline rows of the first paged tools share one shape."""
+        from fw_context_mcp.mcp.shared.paging import holds_past_end_info, past_end_info
+
+        assert holds_past_end_info([past_end_info("slot", 9, 3), {"coverage": "…"}])
+        assert holds_past_end_info([{"info": "No caller of 'probe' at offset 60; the answer holds 12."}])
+        assert not holds_past_end_info([{"info": "No callers found for 'probe'."}])
+        assert not holds_past_end_info([])
+
+    def test_a_page_past_the_end_is_not_diagnosed_as_an_empty_answer(self, tmp_path):
+        """The diagnosis scans the whole index and says "an empty result is no proof".
+
+        A page after the end is not empty: the answer exists.  The scan
+        would cost time and the message would contradict the row.
+        """
+        from unittest import mock
+
+        from fw_context_mcp.mcp.shared import stale
+        from fw_context_mcp.mcp.shared.paging import past_end_info
+
+        class _Executor:
+            def execute_sync(self, fn, config_hash):
+                return fn(None, config_hash)
+
+        row = past_end_info("caller", 60, 12)
+        with mock.patch.object(stale, "diagnose_empty_result") as diagnose:
+            result = stale.with_stale_annotation(tmp_path, _Executor(), lambda c, h: [row], "h")
+        diagnose.assert_not_called()
+        assert result == [row]
+
     def test_a_page_past_the_end_names_the_size_of_the_answer(self):
         from fw_context_mcp.mcp.shared.paging import past_end_info
 
