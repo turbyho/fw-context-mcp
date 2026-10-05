@@ -1098,8 +1098,8 @@ dict holds a `warning` and a `hint`.
 Requires `[llm] enabled = true`, embeddings in the index, and, for an
 Ollama embedding model, a running Ollama server. A sentence-transformers or
 `ft://` model embeds the query locally and needs no Ollama. When one of
-them is missing, or the embedding model fails,
-this tool runs ONE plain FTS5 symbol search (the first step of
+them is missing, when the embedding model fails, or when no match is above
+`threshold`, this tool runs ONE plain FTS5 symbol search (the first step of
 `search_code`, with no kind filter, no relaxation, and no paging). A
 leading dict holds a `warning` with the reason, and each symbol holds
 `_method: "search_code_fallback"`. When the lexical search also finds
