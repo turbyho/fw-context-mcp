@@ -31,9 +31,7 @@ from typing import Annotated
 from pydantic import Field
 
 from ...indexer.db import (
-    get_class_members as query_class_members,
-)
-from ...indexer.db import (
+    count_template_instances,
     get_direct_bases,
     get_direct_bases_batch,
     get_direct_derived,
@@ -41,9 +39,13 @@ from ...indexer.db import (
     get_overrides_for_method,
 )
 from ...indexer.db import (
+    get_class_members as query_class_members,
+)
+from ...indexer.db import (
     get_template_instances as query_template_instances,
 )
 from ...utils import abs_path
+from ..shared.paging import clamp_offset, page_hint, page_notice, past_end_info
 from ._base import BaseHandler
 from .source import _lookup_definition
 
@@ -379,6 +381,7 @@ def get_template_instances(
     template_name: Annotated[str, Field(description="Template name to find instantiations for. E.g. 'Callback' or 'mbed::Callback'.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum results (default 50, max 200).", ge=1)] = 50,
+    offset: Annotated[int, Field(description="Skip this many instances. Reads the next page of a template with many instances.", ge=0)] = 0,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
@@ -411,24 +414,31 @@ def get_template_instances(
             E.g. ``'Callback'`` or ``'mbed::Callback'``.
         project_root: Project root. Auto-detected if omitted.
         limit: Maximum results (default 50, max 200).
+        offset: Skip this many instances.  Reads the next page; the page
+            notice names the offset to use.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
         image: Sysbuild image within the variant. Required when the
             variant holds several: each image is a separate program.
 
     Returns:
-        list[dict] with one element wrapping the template declaration:
+        list[dict]: the page notice ``{total, offset, shown, more, hint}``
+        for the instances, then one element wrapping the template
+        declaration:
         {name, qualified_name, kind, file, line, is_definition,
         signature, instances (list of dicts, each with name,
-        qualified_name, kind, file, line, signature, is_definition),
-        instance_count (int — the number returned, capped by ``limit``)}
+        qualified_name, kind, file, line, signature, is_definition — one
+        page of them), instance_count (int — all instances, as ``total``)}
+
+        A page after the last instance gives one ``info`` dict that names
+        the total.
 
         A dict with ``error`` means that the name was not found, is not a
         template, or the query failed — check that key first.  When a file
         of the answer changed after the last index run, a ``warning`` dict
         comes first.
     """
-    limit = max(0, min(limit, 200))  # clamp
+    limit = max(1, min(limit, 200))  # clamp; a zero page could not advance
     try:
         db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)
     except RuntimeError as e:
@@ -447,9 +457,18 @@ def get_template_instances(
             return [{"error": f"'{template_name}' is not a template (kind: {row['kind']}, is_template: false)."}]
 
         template_usr = row["usr"]
-        instances = query_template_instances(conn, config_hash, template_usr, limit=limit)
+        skip = clamp_offset(offset)
+        instances = query_template_instances(conn, config_hash, template_usr, limit=limit, offset=skip)
+        total = count_template_instances(conn, config_hash, template_usr)
+        if skip and not instances and total:
+            return [past_end_info("instance", skip, total)]
 
         result: list[dict] = [
+            page_notice(
+                total, skip, len(instances),
+                hint=page_hint("get_template_instances", template_name,
+                               next_offset=skip + len(instances)),
+            ),
             {
                 "name": row["name"],
                 "qualified_name": row["qualified_name"],
@@ -470,8 +489,8 @@ def get_template_instances(
                     }
                     for i in instances
                 ],
-                "instance_count": len(instances),
-            }
+                "instance_count": total,
+            },
         ]
         return result
 

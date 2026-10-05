@@ -63,10 +63,13 @@ def test_the_four_tools_call_the_helper():
 
     from fw_context_mcp.mcp.handlers import callgraph
 
-    for tool in (callgraph.find_all_callers_recursive, callgraph.find_callees_recursive,
-                 callgraph.find_hotspots, callgraph.find_dead_code):
+    for tool in (callgraph.find_hotspots, callgraph.find_dead_code):
         source = inspect.getsource(tool)
         assert "_with_absolute_file(rows, db.root)" in source, tool.__name__
+    # The two recursive tools build their page in one shared helper.
+    for tool in (callgraph.find_all_callers_recursive, callgraph.find_callees_recursive):
+        assert "_recursive_page(" in inspect.getsource(tool), tool.__name__
+    assert "_with_absolute_file(rows, root)" in inspect.getsource(callgraph._recursive_page)
 
 
 def test_the_documents_name_the_field_that_the_tools_return():

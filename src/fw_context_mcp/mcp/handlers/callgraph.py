@@ -59,7 +59,9 @@ from ...indexer import db as index_db
 from ...indexer.compile_commands import compile_directory
 from ...indexer.db import (
     count_fp_assignments,
+    count_indirect_call_site_matches,
     count_indirect_call_sites,
+    count_indirect_target_matches,
     count_refs,
     find_macro_refs,
     find_refs_with_candidates,
@@ -78,7 +80,7 @@ from ...utils import abs_path
 from ...utils import escape_like as _escape_like
 from ...utils import format_number_ranges as _as_ranges
 from ...utils import macro_signature as _macro_signature
-from ..shared.paging import clamp_offset, page_notice
+from ..shared.paging import clamp_offset, page_hint, page_notice, past_end_info
 from ._base import BaseHandler, DbContext
 from .source import _lookup_definition
 
@@ -697,6 +699,7 @@ def find_indirect_call_sites(
     name: Annotated[str, Field(description="Name of the function pointer field or variable to find call sites of. E.g. 'onData' finds all calls through Driver::onData.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root directory. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum results (default 50, max 200).", ge=1)] = 50,
+    offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a long answer.", ge=0)] = 0,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
@@ -727,6 +730,8 @@ def find_indirect_call_sites(
             by its exact name.
         project_root: Project root directory. Auto-detected if omitted.
         limit: Maximum results (default 50, max 200).
+        offset: Skip this many results. Reads the next page; the page
+            notice names the offset to use.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
         image: Sysbuild image within the variant. Required when the
@@ -737,6 +742,12 @@ def find_indirect_call_sites(
         expression, e.g. ``"driver.onData"``), target_usr, target_name,
         fn_ptr_type (the function pointer type signature), caller
         (enclosing function name), caller_kind.
+
+        The page notice ``{total, offset, shown, more, hint}`` comes
+        before the rows of the answer.  ``total`` counts every row of the whole answer.  When
+        ``more`` is true, the ``hint`` names the call that reads the next
+        page.  A page after the last row gives one ``info`` dict that
+        names the total.
 
         Never empty: one dict with ``error`` (cannot resolve) or ``info``
         (no results) replaces the results.  Check both keys first.
@@ -760,12 +771,18 @@ def find_indirect_call_sites(
                 "to populate the table (added in Phase 2)."
             )}]
 
-        clamped_limit = max(0, min(limit, 200))
-        rows = query_indirect_call_sites(conn, config_hash, name, limit=clamped_limit)
+        clamped_limit = max(1, min(limit, 200))
+        skip = clamp_offset(offset)
+        rows = query_indirect_call_sites(
+            conn, config_hash, name, limit=clamped_limit, offset=skip,
+        )
+        total = count_indirect_call_site_matches(conn, config_hash, name)
         if not rows:
+            if skip and total:
+                return [past_end_info("indirect call site", skip, total)]
             return [{"info": f"No indirect call sites found for '{name}'."}]
 
-        return [
+        sites = [
             {
                 "file": abs_path(root, r["from_file"]),
                 "line": r["from_line"],
@@ -778,6 +795,11 @@ def find_indirect_call_sites(
             }
             for r in rows
         ]
+        notice = page_notice(
+            total, skip, len(sites),
+            hint=page_hint("find_indirect_call_sites", name, next_offset=skip + len(sites)),
+        )
+        return [notice, *sites]
 
     return db.execute_scoped(_query)
 
@@ -787,6 +809,7 @@ def find_indirect_targets(
         "E.g. 'onData' — returns functions assigned to Driver::onData.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum results (default 50, max 200).", ge=1)] = 50,
+    offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a long answer.", ge=0)] = 0,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
@@ -819,6 +842,8 @@ def find_indirect_targets(
             an assignment of a function whose name holds *name*.
         project_root: Project root directory. Auto-detected if omitted.
         limit: Maximum results (default 50, max 200).
+        offset: Skip this many results. Reads the next page; the page
+            notice names the offset to use.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
         image: Sysbuild image within the variant. Required when the
@@ -838,6 +863,12 @@ def find_indirect_targets(
         class hierarchy>"`` marks a call site that a fallback found, not
         the field's USR.  Read both before you act on ``call_file`` and
         ``call_line``.
+
+        The page notice ``{total, offset, shown, more, hint}`` comes
+        before the rows of the answer.  ``total`` counts every row of the whole answer.  When
+        ``more`` is true, the ``hint`` names the call that reads the next
+        page.  A page after the last row gives one ``info`` dict that
+        names the total.
 
         Never empty: one dict with ``error`` (cannot resolve) or ``info``
         (no results) replaces the results.  Check both keys first.
@@ -860,12 +891,19 @@ def find_indirect_targets(
                 "'fw-context index' to populate the table (added in Phase 3)."
             )}]
 
-        clamped_limit = max(0, min(limit, 200))
-        rows = query_indirect_targets(conn, config_hash, name, limit=clamped_limit)
+        clamped_limit = max(1, min(limit, 200))
+        skip = clamp_offset(offset)
+        rows = query_indirect_targets(conn, config_hash, name, limit=clamped_limit, offset=skip)
+        total = count_indirect_target_matches(conn, config_hash, name)
         if not rows:
+            if skip and total:
+                return [past_end_info("assignment", skip, total)]
             return [{"info": f"No functions assigned to '{name}'."}]
 
-        results: list[dict] = []
+        results: list[dict] = [page_notice(
+            total, skip, len(rows),
+            hint=page_hint("find_indirect_targets", name, next_offset=skip + len(rows)),
+        )]
         for r in rows:
             call_expr_text: str | None = str(r["call_expr_text"]) if r["call_expr_text"] else None
             entry: dict = {
@@ -1102,6 +1140,7 @@ def find_all_callers_recursive(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     max_depth: Annotated[int, Field(description="Maximum BFS depth for transitive search (default 5).", ge=1)] = 5,
     limit: Annotated[int, Field(description="Maximum results (default 50).", ge=1)] = 50,
+    offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a deep call tree.", ge=0)] = 0,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
@@ -1140,6 +1179,8 @@ def find_all_callers_recursive(
         project_root: Project root. Auto-detected if omitted.
         max_depth: Maximum BFS depth for transitive search (default 5).
         limit: Maximum results (default 50).
+        offset: Skip this many results. Reads the next page of a deep
+            call tree; the page notice names the offset to use.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
         image: Sysbuild image within the variant. Required when the
@@ -1161,6 +1202,12 @@ def find_all_callers_recursive(
         symbol that it calls.  Give the full qualified name to ask about
         one symbol only.
 
+        The page notice ``{total, offset, shown, more, hint}`` comes
+        before the rows of the answer.  ``total``
+        counts every row of the whole answer.  When ``more`` is true, the
+        ``hint`` names the call that reads the next page.  A page after
+        the last row gives one ``info`` dict that names the total.
+
         Never empty: one dict with ``error`` (cannot resolve) or ``info``
         (no results) replaces the results.  Check both keys first.
     """
@@ -1173,14 +1220,49 @@ def find_all_callers_recursive(
         # Runs under the executor lock on the single shared connection;
         # must not open its own connection.  Timeout is enforced by
         # _wrap_tool (300 s + interrupt), not here.
-        if _lookup_definition(conn, config_hash, name, preferred_kinds=None) is None:
-            return [{"error": f"Symbol not found: {name}"}]
-        rows = index_db.find_all_callers_recursive(conn, config_hash, name, max_depth=max_depth, limit=limit)
-        if not rows:
-            return [{"info": f"No callers found for '{name}'."}]
-        return _with_absolute_file(rows, db.root)
+        return _recursive_page(
+            conn, config_hash, db.root, "find_all_callers_recursive", "callers",
+            name, max_depth, limit, offset,
+        )
 
     return db.execute_scoped(_query)
+
+
+_DEFAULT_RECURSIVE_DEPTH = 5
+# The default max_depth of trace_data_flow; a hint repeats any other value.
+_DEFAULT_TRACE_DEPTH = 8
+
+
+def _recursive_page(
+    conn, config_hash: str, root: Path, tool: str, direction: str,
+    name: str, max_depth: int, limit: int, offset: int,
+) -> list[dict]:
+    """One page of ``find_all_callers_recursive`` or ``find_callees_recursive``.
+
+    The ambiguity ``warning`` row, when the name matches several symbols,
+    stays first, and the page notice comes after it, as in
+    ``find_callers``.  The hint repeats ``max_depth`` when it is not the
+    default, because a different depth is a different answer.
+    """
+    if _lookup_definition(conn, config_hash, name, preferred_kinds=None) is None:
+        return [{"error": f"Symbol not found: {name}"}]
+    skip = clamp_offset(offset)
+    rows, total = index_db.walk_recursive(
+        conn, config_hash, name, direction=direction,
+        max_depth=max_depth, limit=limit, offset=skip,
+    )
+    if not rows:
+        if skip and total:
+            return [past_end_info(direction[:-1], skip, total)]
+        return [{"info": f"No {direction} found for '{name}'."}]
+    lead = 1 if "warning" in rows[0] else 0
+    shown = len(rows) - lead
+    depth = {} if max_depth == _DEFAULT_RECURSIVE_DEPTH else {"max_depth": max_depth}
+    rows.insert(lead, page_notice(
+        total, skip, shown,
+        hint=page_hint(tool, name, **depth, next_offset=skip + shown),
+    ))
+    return _with_absolute_file(rows, root)
 
 # ── moved from server.py ──
 def find_callees_recursive(
@@ -1188,6 +1270,7 @@ def find_callees_recursive(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     max_depth: Annotated[int, Field(description="Maximum BFS depth for transitive search (default 5).", ge=1)] = 5,
     limit: Annotated[int, Field(description="Maximum results (default 50).", ge=1)] = 50,
+    offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a deep call tree.", ge=0)] = 0,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
@@ -1224,6 +1307,8 @@ def find_callees_recursive(
         project_root: Project root. Auto-detected if omitted.
         max_depth: Maximum BFS depth for transitive search (default 5).
         limit: Maximum results (default 50).
+        offset: Skip this many results. Reads the next page of a deep
+            call tree; the page notice names the offset to use.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
         image: Sysbuild image within the variant. Required when the
@@ -1244,6 +1329,12 @@ def find_callees_recursive(
         ``target_qualified_name``, which tells the symbol that calls it.
         Give the full qualified name to ask about one symbol only.
 
+        The page notice ``{total, offset, shown, more, hint}`` comes
+        before the rows of the answer.  ``total``
+        counts every row of the whole answer.  When ``more`` is true, the
+        ``hint`` names the call that reads the next page.  A page after
+        the last row gives one ``info`` dict that names the total.
+
         Never empty: one dict with ``error`` (cannot resolve) or ``info``
         (no results) replaces the results.  Check both keys first.
     """
@@ -1256,12 +1347,10 @@ def find_callees_recursive(
         # Runs under the executor lock on the single shared connection;
         # must not open its own connection.  Timeout is enforced by
         # _wrap_tool (300 s + interrupt), not here.
-        if _lookup_definition(conn, config_hash, name, preferred_kinds=None) is None:
-            return [{"error": f"Symbol not found: {name}"}]
-        rows = index_db.find_callees_recursive(conn, config_hash, name, max_depth=max_depth, limit=limit)
-        if not rows:
-            return [{"info": f"No callees found for '{name}'."}]
-        return _with_absolute_file(rows, db.root)
+        return _recursive_page(
+            conn, config_hash, db.root, "find_callees_recursive", "callees",
+            name, max_depth, limit, offset,
+        )
 
     return db.execute_scoped(_query)
 
@@ -1401,7 +1490,8 @@ def find_dead_code(
 def find_wrapper_callers(
     class_name: Annotated[str, Field(description="Driver class name to find wrappers for. E.g. 'UART_DRIVER' or 'hal::UART_DRIVER'.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    limit: Annotated[int, Field(description="Maximum call sites into the driver that are read and grouped (default 50, max 50).", ge=1)] = 50,
+    limit: Annotated[int, Field(description="Maximum wrapper classes on one page (default 20, max 100).", ge=1)] = 20,
+    offset: Annotated[int, Field(description="Skip this many wrapper classes. Reads the next page.", ge=0)] = 0,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
@@ -1426,10 +1516,12 @@ def find_wrapper_callers(
         class_name: Driver class name to find wrappers for.
             E.g. ``'UART_DRIVER'`` or ``'hal::UART_DRIVER'``.
         project_root: Project root. Auto-detected if omitted.
-        limit: Maximum call sites into the driver (``call`` and
-            ``indirect`` references) that are read and grouped (default 50,
-            max 50).  The answer holds no page notice, thus a driver with
-            more call sites gives a partial grouping.
+        limit: Maximum wrapper classes on one page (default 20, max 100).
+            Each class comes with all of its methods and calls into the
+            driver (``call`` and ``indirect`` references), thus a class is
+            never split over two pages.
+        offset: Skip this many wrapper classes.  Reads the next page; the
+            page notice names the offset to use.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
         image: Sysbuild image within the variant. Required when the
@@ -1446,10 +1538,15 @@ def find_wrapper_callers(
         The path sits on the method, not on the class, because one wrapper
         class often spans several files.
 
+        The page notice ``{total, offset, shown, more, hint}`` comes
+        before the rows of the answer: ``total`` counts every wrapper class.  A page after the last
+        class gives one ``info`` dict that names the total.
+
         Never empty: one dict with ``error`` (cannot resolve) or ``info``
         (no results) replaces the results.  Check both keys first.
     """
-    limit = max(0, min(limit, 50))  # clamp
+    limit = max(1, min(limit, 100))  # clamp
+    skip = clamp_offset(offset)
     db, err = _refs_guard(project_root, variant=variant, image=image)
     if err:
         return err
@@ -1478,9 +1575,8 @@ def find_wrapper_callers(
                WHERE s.config_hash = ?
                  AND s.kind = 'method'
                  AND s.qualified_name LIKE ?
-               ORDER BY s.name
-               LIMIT ?""",
-            (config_hash, f"{class_name}::%", max(limit * 10, 500)),
+               ORDER BY s.name, s.usr""",
+            (config_hash, f"{class_name}::%"),
         ).fetchall()
 
         if not driver_methods:
@@ -1491,9 +1587,8 @@ def find_wrapper_callers(
                    WHERE s.config_hash = ?
                      AND s.kind = 'method'
                      AND s.qualified_name LIKE ? ESCAPE '\\'
-                   ORDER BY s.name
-                   LIMIT ?""",
-                (config_hash, f"%{esc_name}::%", max(limit * 10, 500)),
+                   ORDER BY s.name, s.usr""",
+                (config_hash, f"%{esc_name}::%"),
             ).fetchall()
 
         if not driver_methods and "::" in class_name:
@@ -1504,9 +1599,8 @@ def find_wrapper_callers(
                    WHERE s.config_hash = ?
                      AND s.kind = 'method'
                      AND s.qualified_name LIKE ? ESCAPE '\\'
-                   ORDER BY s.name
-                   LIMIT ?""",
-                (config_hash, f"{short_name}::%", max(limit * 10, 500)),
+                   ORDER BY s.name, s.usr""",
+                (config_hash, f"{short_name}::%"),
             ).fetchall()
 
         if not driver_methods:
@@ -1514,7 +1608,12 @@ def find_wrapper_callers(
 
         driver_usr_map = {r["usr"]: r for r in driver_methods}
 
-        # Find all callers of those methods
+        # Find all callers of those methods.  WHY no LIMIT: the page is a
+        # slice of the wrapper CLASSES, not of the call sites.  A cut of the
+        # call sites before the grouping split one class over two pages,
+        # and its method_count then counted only the part on one page.
+        # The order ends at the refs rowid: two calls on one line tie on
+        # caller, file and line.
         placeholders = ",".join("?" * len(driver_usr_map))
         rows = conn.execute(
             f"""SELECT r.from_usr, r.to_usr, r.from_file, r.from_line, r.ref_kind,
@@ -1527,9 +1626,8 @@ def find_wrapper_callers(
                 WHERE r.config_hash = ?
                   AND r.to_usr IN ({placeholders})
                   AND r.ref_kind IN ('call', 'indirect')
-                ORDER BY caller.qualified_name, r.from_line
-                LIMIT ?""",
-            (config_hash, *driver_usr_map.keys(), limit),
+                ORDER BY caller.qualified_name, r.from_file, r.from_line, r.rowid""",
+            (config_hash, *driver_usr_map.keys()),
         ).fetchall()
 
         if not rows:
@@ -1573,9 +1671,18 @@ def find_wrapper_callers(
                     "line": r["from_line"],
                 })
 
-        # Flatten for output
-        result = []
-        for wc in sorted(wrapped.keys()):
+        # Flatten for output.  The class name is the key of ``wrapped``,
+        # thus the sort is a total order, and a page is a slice of it.
+        classes = sorted(wrapped.keys())
+        total = len(classes)
+        page = classes[skip:skip + limit]
+        if not page:
+            return [past_end_info("wrapper class", skip, total)]
+        result: list[dict] = [page_notice(
+            total, skip, len(page),
+            hint=page_hint("find_wrapper_callers", class_name, next_offset=skip + len(page)),
+        )]
+        for wc in page:
             entry = wrapped[wc]
             result.append({
                 "wrapper_class": wc,
@@ -1593,6 +1700,7 @@ def trace_data_flow(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     max_depth: Annotated[int, Field(description="Maximum call path depth (default 8, max 20).", ge=1)] = 8,
     limit: Annotated[int, Field(description="Maximum source functions to trace (default 15, max 15).", ge=1)] = 15,
+    offset: Annotated[int, Field(description="Skip this many source functions. Reads the next page.", ge=0)] = 0,
     timeout_ms: Annotated[int, Field(description="Maximum total execution time in "
         "milliseconds (default 30000).", ge=1)] = 30000,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
@@ -1625,15 +1733,20 @@ def trace_data_flow(
         project_root: Project root. Auto-detected if omitted.
         max_depth: Maximum call path depth (default 8, max 20).
         limit: Maximum source functions to trace (default 15, max 15).
+        offset: Skip this many source functions.  Reads the next page;
+            the page notice names the offset to use.
         timeout_ms: Maximum total execution time in milliseconds
-            (default 30000). Clamped to 1000–300000.
+            (default 30000). Clamped to 1000–300000.  The budget is for
+            one page.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
         image: Sysbuild image within the variant. Required when the
             variant holds several: each image is a separate program.
 
     Returns:
-        list of dicts with a leading ``_summary`` entry:
+        The page notice ``{total, offset, shown, more, hint}`` comes
+        before the rows of the answer: ``total`` counts every source function that matches.  Then
+        a ``_summary`` entry for this page:
         {_summary (str), _type (str), _target (str)}, followed by source
         entries each with: source_name, source_qualified_name, source_kind,
         source_file (absolute), source_line, caller_count, reachable
@@ -1646,13 +1759,17 @@ def trace_data_flow(
         A source entry with ``timed_out: True`` means that the time budget
         ran out before the search for that source began.  Its
         ``reachable: False`` thus means "not checked", not "proved
-        unreachable".
+        unreachable".  Such a source counts as shown, thus the hint goes
+        past it.  To check it, call again with the same ``offset``: each
+        page gets the whole time budget.
 
-        Never empty: one dict with ``error`` or ``info`` replaces an empty
-        result.  Check both keys first.
+        A page after the last source function gives one ``info`` dict
+        that names the total.  Never empty: one dict with ``error`` or
+        ``info`` replaces an empty result.  Check both keys first.
     """
     max_depth = max(1, min(max_depth, 20))  # clamp
-    limit = max(0, min(limit, 15))  # clamp
+    limit = max(1, min(limit, 15))  # clamp
+    skip = clamp_offset(offset)
     timeout_ms = max(1000, min(timeout_ms, 300000))  # clamp 1s–5min
     db, err = _refs_guard(project_root, variant=variant, image=image)
     if err:
@@ -1676,23 +1793,33 @@ def trace_data_flow(
             return [{"info": f"Target symbol '{to_symbol}' not found."}]
 
         # Find functions mentioning type_name in their signature (ranked by
-        # caller count so the most "active" data handlers are shown first)
+        # caller count so the most "active" data handlers are shown first).
+        # WHY ``s.usr`` ends the order: most functions have one or two
+        # callers, thus the count ties all the time.  The page and its
+        # count share one WHERE.
+        match = """s.config_hash = ?
+                 AND s.is_definition = 1
+                 AND s.signature LIKE ? ESCAPE '\\'"""
+        match_params = (config_hash, f"%{_escape_like(type_name)}%")
+        total = int(conn.execute(
+            f"SELECT COUNT(*) FROM symbols s WHERE {match}", match_params,
+        ).fetchone()[0])
         sources = conn.execute(
-            """SELECT s.name, s.qualified_name, s.kind, s.file_path, s.line,
+            f"""SELECT s.name, s.qualified_name, s.kind, s.file_path, s.line,
                       s.signature, s.usr,
                       (SELECT COUNT(*) FROM refs r
                        WHERE r.to_usr = s.usr AND r.config_hash = s.config_hash
                          AND r.ref_kind IN ('call', 'indirect')) AS caller_count
                FROM symbols s
-               WHERE s.config_hash = ?
-                 AND s.is_definition = 1
-                 AND s.signature LIKE ? ESCAPE '\\'
-               ORDER BY caller_count DESC
-               LIMIT ?""",
-            (config_hash, f"%{_escape_like(type_name)}%", limit),
+               WHERE {match}
+               ORDER BY caller_count DESC, s.usr
+               LIMIT ? OFFSET ?""",
+            (*match_params, limit, skip),
         ).fetchall()
 
         if not sources:
+            if skip and total:
+                return [past_end_info("source function", skip, total)]
             return [{"info": f"No functions found with '{type_name}' in their signature."}]
 
         # For each source function, attempt call-path BFS to the target.
@@ -1743,11 +1870,20 @@ def trace_data_flow(
 
         num_reachable = sum(1 for r in results if r.get("reachable"))
         num_timed_out = sum(1 for r in results if r.get("timed_out"))
-        summary = f"{num_reachable}/{len(results)} source functions reach '{to_symbol}' within depth {max_depth}"
+        summary = (
+            f"{num_reachable}/{len(results)} source functions on this page reach "
+            f"'{to_symbol}' within depth {max_depth}"
+        )
         if num_timed_out:
             summary += f" ({num_timed_out} timed out)"
 
+        depth = {} if max_depth == _DEFAULT_TRACE_DEPTH else {"max_depth": max_depth}
         return [
+            page_notice(
+                total, skip, len(results),
+                hint=page_hint("trace_data_flow", type_name, to_symbol, **depth,
+                               next_offset=skip + len(results)),
+            ),
             {
                 "_summary": summary,
                 "_type": type_name,
@@ -2018,43 +2154,56 @@ def _build_directory(conn, config_hash: str):
     return compile_directory(path) or path.parent
 
 
-def _slots_within_limit(
-    slots: list[dict], trailers: list[dict], limit: int
+def _slot_key(slot: dict) -> tuple:
+    """The order of the slots of every source, the build rows included.
+
+    Slots are numbered inside their own table, so the table leads the
+    order: two tables both start at zero.  Name, file and line come after
+    the slot, because one slot can give two rows (two definitions of one
+    handler name), and a page walk needs an order with no tie between two
+    different rows.
+    """
+    return (
+        str(slot.get("source") or ""), str(slot.get("table_name") or ""),
+        str(slot.get("table_file") or ""), int(slot.get("slot") or 0),
+        str(slot.get("name") or ""), str(slot.get("file") or ""), int(slot.get("line") or 0),
+    )
+
+
+def _slots_page(
+    slots: list[dict], trailers: list[dict], limit: int, offset: int, *, unhandled_only: bool,
 ) -> list[dict]:
-    """Cut *slots* to *limit*, keep every *trailer*, and say what was cut.
+    """One page of *slots*, after the page notice, with every *trailer* after it.
 
     A generated table on its own can be longer than the default: 290
     entries plus the assembly exceptions measured 301 rows.  A silent cut
     would let a part of a table read as a whole one, and a reader counting
-    serviced interrupts would be wrong with no way to notice.  The notice
-    is a trailing dict, which is how this tool already reports ``info``
-    and ``error``.
+    serviced interrupts would be wrong with no way to notice.  The page
+    notice gives the count of every slot and the call for the next page,
+    as the other paged tools do.
 
-    A trailer is not a slot, and the limit does not apply to it.
+    A trailer is not a slot, and the page does not apply to it.
     ``coverage`` and ``interrupts`` describe the WHOLE table, and they used
     to be appended to the slots, so the cut took them first — measured on
     the nRF54L application: 573 generated slots plus 11 assembly ones
     against a default limit of 400, and the two lines that summarize 290
     interrupts were exactly the two the reader never saw.  The longer the
-    table, the more the summary is the answer, so it sits outside the cut.
-
-    ``truncated`` comes before the other trailers because it is about the
-    slots above it, not about the table.
+    table, the more the summary is the answer, so it is on every page.
     """
-    if len(slots) <= limit:
-        return slots + trailers
-    return [
-        *slots[:limit],
-        {"truncated": (
-            f"{len(slots) - limit} of {len(slots)} slots are not shown. "
-            f"Raise limit (max 1000), or narrow with unhandled_only."
-        )},
-        *trailers,
-    ]
+    total = len(slots)
+    page = sorted(slots, key=_slot_key)[offset:offset + limit]
+    if not page:
+        return [past_end_info("slot", offset, total), *trailers]
+    flag = {"unhandled_only": True} if unhandled_only else {}
+    notice = page_notice(
+        total, offset, len(page),
+        hint=page_hint("get_vector_table", **flag, next_offset=offset + len(page)),
+    )
+    return [notice, *page, *trailers]
 
 
 def _vector_rows(
-    conn, config_hash: str, *, unhandled_only: bool, limit: int
+    conn, config_hash: str, *, unhandled_only: bool, limit: int, offset: int = 0,
 ) -> list[dict]:
     """Assemble the answer of ``get_vector_table`` for one build config.
 
@@ -2082,8 +2231,8 @@ def _vector_rows(
     recorded = read_isr_registrations(build_dir) if build_dir else None
 
     # A trailer describes the whole table rather than one slot, so it is
-    # kept apart: the limit applies to slots only, and a long table must
-    # not lose its summary.  See _slots_within_limit.
+    # kept apart: the page applies to slots only, and a long table must
+    # not lose its summary.  See _slots_page.
     trailers: list[dict] = []
 
     if not unhandled_only:
@@ -2141,13 +2290,16 @@ def _vector_rows(
             "comes from the build artifact instead."
         )})
 
-    return _slots_within_limit(slots, trailers, limit)
+    if not slots:
+        return trailers
+    return _slots_page(slots, trailers, limit, offset, unhandled_only=unhandled_only)
 
 
 def get_vector_table(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     unhandled_only: Annotated[bool, Field(description="Return only the slots with status 'unhandled' (an alias of a default handler, nothing installed at run time).")] = False,
     limit: Annotated[int, Field(description="Maximum slots (default 400, max 1000).", ge=1)] = 400,
+    offset: Annotated[int, Field(description="Skip this many slots. Reads the next page of a long table.", ge=0)] = 0,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
@@ -2301,13 +2453,17 @@ def get_vector_table(
         project_root: Project root. Auto-detected if omitted.
         unhandled_only: When True, return only the ``"unhandled"`` slots.
         limit: Maximum slots (default 400, max 1000).
+        offset: Skip this many slots.  Reads the next page; the page
+            notice names the offset to use.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
         image: Sysbuild image within the variant. Required when the
             variant holds several: each image is a separate program.
 
     Returns:
-        list of dicts sorted by source, then table, then slot.  Each holds:
+        The page notice ``{total, offset, shown, more, hint}`` comes
+        before the rows of the answer: ``total`` counts every slot of every table.  Then a list
+        of slot dicts sorted by source, then table, then slot.  Each holds:
         slot (int), name, file, line, source (``"assembly"``, ``"c"`` or
         ``"build"``),
         status (``"c"``, ``"assembly"``, ``"unhandled"``, ``"runtime"``,
@@ -2324,12 +2480,13 @@ def get_vector_table(
         ``coverage`` follows the slots for each table that has unnamed
         elements, and a dict with ``interrupts`` says which are connected
         and which are not — the latter in both modes.  Neither is subject
-        to ``limit``: they describe the whole table, and the longest table
-        is where they matter most.  When more slots exist than ``limit``,
-        a dict with ``truncated`` sits between the slots and those two,
-        saying how many slots are not shown.
+        to the page: they describe the whole table, the longest table is
+        where they matter most, and they come after the slots of each
+        page.  A page after the last slot gives one ``info`` dict that
+        names the total, and then those two.
     """
-    limit = max(0, min(limit, 1000))
+    limit = max(1, min(limit, 1000))
+    skip = clamp_offset(offset)
     db, err = _refs_guard(project_root, variant=variant, image=image)
     if err:
         return err
@@ -2340,7 +2497,7 @@ def get_vector_table(
         # must not open its own connection.  Timeout is enforced by
         # _wrap_tool (300 s + interrupt), not here.
         return _absolute_vector_paths(_vector_rows(
-            conn, config_hash, unhandled_only=unhandled_only, limit=limit,
+            conn, config_hash, unhandled_only=unhandled_only, limit=limit, offset=skip,
         ), db.root)
 
     return db.execute_scoped(_query)

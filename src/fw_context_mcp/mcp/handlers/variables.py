@@ -30,6 +30,13 @@ from typing import Annotated
 from pydantic import Field
 
 from ...utils import abs_path
+from ..shared.paging import (
+    clamp_offset,
+    holds_past_end_info,
+    page_hint,
+    page_notice,
+    past_end_info,
+)
 from ..shared.stale import (
     _stale_files,
     annotate_stale,
@@ -54,6 +61,8 @@ def find_variables(
         "'varglobal', 'varlocal', 'field', legacy 'variable', or None for all.")] = None,
     limit: Annotated[int, Field(description="Maximum results "
         "(default 20, max 100).", ge=1)] = 20,
+    offset: Annotated[int, Field(description="Skip this many variables. "
+        "Reads the next page of a name that many variables share.", ge=0)] = 0,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
@@ -68,8 +77,8 @@ def find_variables(
     functions that read or write the variable — the same ``ref_kind``
     values as ``find_references`` (``"call"``, ``"ref"``, ``"member"``).
     The list is capped at 30 per variable, and holds only references of
-    the selected build.  Only definitions are returned, globals first, then
-    by name.
+    the selected build; ``references_total`` gives the whole count.  Only
+    definitions are returned, globals first, then by name.
 
     Use when you need to understand shared state, find who modifies a
     global variable, trace side effects, or distinguish important globals
@@ -96,6 +105,8 @@ def find_variables(
             ``"variable"`` is also accepted, for an index made before the
             kind was split.
         limit: Maximum results (default 20, max 100).
+        offset: Skip this many variables.  Reads the next page; the page
+            notice names the offset to use.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
         image: Sysbuild image within the variant. Required when the
@@ -111,7 +122,16 @@ def find_variables(
         ``"<file scope>"`` for varglobal), enclosing_class (str — class
         or struct name for fields and static members, empty otherwise),
         references (list[dict] — ``function``, ``file``, ``line``,
-        ``ref_kind``).
+        ``ref_kind``; at most 30), references_total (int — every
+        reference of the variable).  When the list is cut,
+        ``references_hint`` names the ``find_references`` call that
+        lists them all.
+
+        The page notice ``{total, offset, shown, more, hint}`` comes
+        before the rows of the answer.  ``total`` counts every variable that matches.  When
+        ``more`` is true, the ``hint`` names the call that reads the next
+        page.  A page after the last variable gives one ``info`` dict that
+        names the total.
 
         No match gives ``[]``.  One dict with ``error`` means the query
         failed — check that key first.
@@ -122,7 +142,8 @@ def find_variables(
         return [{"error": "Variable name must be non-empty."}]
     if kind is not None and kind not in _VALID_KINDS:
         return [{"error": f"Invalid kind: {kind!r}. Expected 'varglobal', 'varlocal', 'field', 'variable', or None."}]
-    limit = max(0, min(limit, 100))
+    limit = max(1, min(limit, 100))
+    skip = clamp_offset(offset)
 
     try:
         db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)
@@ -143,21 +164,29 @@ def find_variables(
             params.append(kind)
         else:
             params.extend(_VAR_KINDS)
-        params.append(limit)
 
-        rows = c.execute(
-            f"""SELECT s.* FROM symbols s
-                WHERE s.config_hash = ?
+        # One WHERE for the page and its count, thus ``total`` can never
+        # describe a different answer than the rows.
+        match = f"""s.config_hash = ?
                   AND (s.name LIKE ? ESCAPE '\\' OR s.qualified_name LIKE ? ESCAPE '\\')
                   {kind_filter}
-                  AND s.is_definition = 1
+                  AND s.is_definition = 1"""
+        total = int(c.execute(f"SELECT COUNT(*) FROM symbols s WHERE {match}", params).fetchone()[0])
+        # WHY ``s.usr`` ends the order: short names such as ``i``, ``ret``
+        # and ``err`` tie on kind and name in every function, and SQLite
+        # may give tied rows in any order.  ``usr`` is unique in one build.
+        rows = c.execute(
+            f"""SELECT s.* FROM symbols s
+                WHERE {match}
                 ORDER BY CASE s.kind WHEN 'varglobal' THEN 0 ELSE 1 END,
-                         s.name
-                LIMIT ?""",
-            params,
+                         s.name, s.usr
+                LIMIT ? OFFSET ?""",
+            (*params, limit, skip),
         ).fetchall()
 
         if not rows:
+            if skip and total:
+                return [past_end_info("variable", skip, total)]
             return []
 
         rows_list = [dict(r) for r in rows]
@@ -177,29 +206,37 @@ def find_variables(
         # Batch refs lookups
         var_usrs = {r["usr"] for r in rows_list if r.get("usr")}
         refs_map: dict[str, list[dict]] = {}
+        ref_totals: dict[str, int] = {}
         if var_usrs:
             placeholders = ",".join("?" * len(var_usrs))
             # The cap is per variable (ROW_NUMBER over to_usr): one cap over
             # all variables gave a later variable no reference at all.
+            # ``ref_total`` counts every reference of the variable, thus the
+            # result can say that the cap cut the list.  The order ends at
+            # the refs rowid, as in find_references: two references on one
+            # line tie on file and line.
             ref_rows = c.execute(
                 f"""SELECT * FROM (
                         SELECT r.to_usr, r.from_file, r.from_line, r.ref_kind,
                                r.from_usr, c.name AS caller_name,
                                c.qualified_name AS caller_qname, c.kind AS caller_kind,
                                ROW_NUMBER() OVER (
-                                   PARTITION BY r.to_usr ORDER BY r.from_file, r.from_line
-                               ) AS rn
+                                   PARTITION BY r.to_usr
+                                   ORDER BY r.from_file, r.from_line, r.rowid
+                               ) AS rn,
+                               COUNT(*) OVER (PARTITION BY r.to_usr) AS ref_total
                         FROM refs r
                         LEFT JOIN symbols c ON c.config_hash = r.config_hash
                             AND c.usr = r.from_usr AND c.is_definition = 1
                         WHERE r.config_hash = ? AND r.to_usr IN ({placeholders})
                     )
                     WHERE rn <= ?
-                    ORDER BY from_file, from_line""",
+                    ORDER BY from_file, from_line, rn""",
                 (config_hash, *var_usrs, _REFS_PER_VARIABLE),
             ).fetchall()
             for ref in ref_rows:
                 rdict = dict(ref)
+                ref_totals[rdict["to_usr"]] = int(rdict["ref_total"])
                 refs_map.setdefault(rdict["to_usr"], []).append({
                     "function": rdict.get("caller_qname") or rdict.get("caller_name") or "<unknown>",
                     "file": abs_path(root, rdict["from_file"]),
@@ -224,9 +261,10 @@ def find_variables(
 
             var_usr = row["usr"]
             references = refs_map.get(var_usr, [])
-            results.append({
+            qualified_name = row["qualified_name"] or row["name"]
+            entry = {
                 "name": row["name"],
-                "qualified_name": row["qualified_name"] or row["name"],
+                "qualified_name": qualified_name,
                 "kind": row["kind"],
                 "file": abs_path(root, row["file_path"]),
                 "line": row["line"],
@@ -234,9 +272,24 @@ def find_variables(
                 "enclosing_function": enclosing_function,
                 "enclosing_class": enclosing_class,
                 "references": references,
-            })
+                "references_total": ref_totals.get(var_usr, 0),
+            }
+            if entry["references_total"] > len(references):
+                # find_references pages the whole list; this tool shows the
+                # pattern of the first references only.  WHY no count in
+                # the text: two static variables of one name in two files
+                # share the qualified name, and find_references then answers
+                # for both of them.
+                entry["references_hint"] = (
+                    f"find_references('{qualified_name}') pages every reference."
+                )
+            results.append(entry)
 
-        return results
+        hint = page_hint(
+            "find_variables", name, **({"kind": kind} if kind else {}),
+            next_offset=skip + len(results),
+        )
+        return [page_notice(total, skip, len(results), hint=hint), *results]
 
     def _query(conn, config_hash):
         # Runs under the executor lock on the single shared connection;
@@ -246,6 +299,10 @@ def find_variables(
         file_paths = collect_result_paths(results, root)
         if file_paths:
             return results, _stale_files(conn, config_hash, file_paths, root), 0, []
+        if holds_past_end_info(results):
+            # The answer exists and is shorter than the offset: no empty
+            # answer to diagnose.
+            return results, [], 0, []
         # No variable found: diagnose the whole index instead, so an empty
         # answer over a changed tree does not read as proof of absence.
         dirty, new_sources = diagnose_empty_result(conn, config_hash, root)

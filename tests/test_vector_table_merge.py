@@ -479,50 +479,72 @@ class TestTheLimitIsVisible:
 
     @staticmethod
     def _rows(count):
-        return [{"slot": index, "name": f"h{index}"} for index in range(count)]
+        return [{"source": "assembly", "slot": index, "name": f"h{index}"} for index in range(count)]
 
-    def test_nothing_is_added_when_everything_fits(self):
-        from fw_context_mcp.mcp.handlers.callgraph import _slots_within_limit
+    def test_a_page_that_holds_everything_says_so(self):
+        from fw_context_mcp.mcp.handlers.callgraph import _slots_page
 
         rows = self._rows(5)
-        assert _slots_within_limit(rows, [], 5) == rows
-        assert _slots_within_limit(rows, [], 9) == rows
+        out = _slots_page(rows, [], 9, 0, unhandled_only=False)
+        assert out[0] == {"total": 5, "offset": 0, "shown": 5, "more": False}
+        assert out[1:] == rows
 
     def test_the_cut_is_reported_with_both_counts(self):
-        from fw_context_mcp.mcp.handlers.callgraph import _slots_within_limit
+        from fw_context_mcp.mcp.handlers.callgraph import _slots_page
 
-        out = _slots_within_limit(self._rows(301), [], 300)
-        assert len(out) == 301
-        assert out[:300] == self._rows(301)[:300]
-        assert "1 of 301 slots are not shown" in out[-1]["truncated"]
+        out = _slots_page(self._rows(301), [], 300, 0, unhandled_only=False)
+        assert out[0]["total"] == 301
+        assert out[0]["shown"] == 300
+        assert out[0]["hint"] == "get_vector_table(offset=300) reads the next page."
+        assert out[1:] == self._rows(301)[:300]
 
-    def test_a_limit_of_zero_still_says_what_was_hidden(self):
-        from fw_context_mcp.mcp.handlers.callgraph import _slots_within_limit
+    def test_the_hint_keeps_the_filter(self):
+        from fw_context_mcp.mcp.handlers.callgraph import _slots_page
 
-        out = _slots_within_limit(self._rows(7), [], 0)
-        assert out == [{"truncated": (
-            "7 of 7 slots are not shown. "
-            "Raise limit (max 1000), or narrow with unhandled_only."
-        )}]
+        out = _slots_page(self._rows(7), [], 2, 0, unhandled_only=True)
+        assert out[0]["hint"] == "get_vector_table(unhandled_only=True, offset=2) reads the next page."
 
-    def test_a_trailer_is_not_subject_to_the_limit(self):
+    def test_the_pages_walk_whole_and_once(self):
+        from fw_context_mcp.mcp.handlers.callgraph import _slots_page
+        from tests._paging import assert_whole_and_once, walk_pages
+
+        rows = self._rows(23)
+        seen, total = walk_pages(
+            lambda offset: _slots_page(rows, [{"coverage": "…"}], 5, offset, unhandled_only=False),
+            lambda r: r["slot"],
+            is_answer=lambda r: "slot" in r,
+        )
+        assert total == 23
+        assert_whole_and_once(seen, total)
+
+    def test_a_trailer_is_not_subject_to_the_page(self):
         """What describes the whole table survives a cut of the slots.
 
         Measured on the nRF54L application: 584 rows against a default
         limit of 400, and the two lines summarizing 290 interrupts were
         the two that were cut.
         """
-        from fw_context_mcp.mcp.handlers.callgraph import _slots_within_limit
+        from fw_context_mcp.mcp.handlers.callgraph import _slots_page
 
         trailers = [{"coverage": "…"}, {"interrupts": "…"}]
-        out = _slots_within_limit(self._rows(7), trailers, 2)
-        assert out[:2] == self._rows(7)[:2]
-        assert "5 of 7 slots are not shown" in out[2]["truncated"]
+        out = _slots_page(self._rows(7), trailers, 2, 0, unhandled_only=False)
+        assert out[1:3] == self._rows(7)[:2]
         assert out[3:] == trailers
-        # And with room to spare the trailers still come last.
-        assert _slots_within_limit(self._rows(2), trailers, 9) == [
-            *self._rows(2), *trailers,
+        # Each page carries them, the last one too.
+        assert _slots_page(self._rows(7), trailers, 2, 6, unhandled_only=False)[-2:] == trailers
+        # A page after the end names the total and keeps them.
+        assert _slots_page(self._rows(7), trailers, 2, 50, unhandled_only=False) == [
+            {"info": "No slot at offset 50; the answer holds 7."}, *trailers,
         ]
+
+    def test_rows_of_one_slot_have_a_fixed_order(self):
+        """Two definitions of one handler name give two rows for one slot."""
+        from fw_context_mcp.mcp.handlers.callgraph import _slots_page
+
+        a = {"source": "c", "slot": 3, "name": "h", "file": "src/b.c", "line": 9}
+        b = {"source": "c", "slot": 3, "name": "h", "file": "src/a.c", "line": 4}
+        assert _slots_page([a, b], [], 9, 0, unhandled_only=False)[1:] == [b, a]
+        assert _slots_page([b, a], [], 9, 0, unhandled_only=False)[1:] == [b, a]
 
     def test_the_default_limit_holds_a_measured_table(self):
         """290 generated entries plus a 92-slot assembly table must fit."""

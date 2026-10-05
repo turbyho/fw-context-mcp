@@ -105,8 +105,12 @@ def test_an_underscore_is_no_wildcard(db):
 
 
 def test_the_fn_ptr_type_note_reaches_the_answer(db, tmp_path):
+    from tests._paging import answers
+
     with _handler_db(tmp_path):
-        rows = _without_stale_warning(callgraph.find_indirect_targets(name="onData", project_root=str(tmp_path)))
+        rows = answers(_without_stale_warning(
+            callgraph.find_indirect_targets(name="onData", project_root=str(tmp_path))
+        ))
 
     assert len(rows) == 1, rows
     assert rows[0]["call_line"] == 77
@@ -130,7 +134,8 @@ def test_the_ambiguity_warning_takes_no_path_slot(db, tmp_path):
             type_name="SensorData", to_symbol="uart_send", project_root=str(tmp_path),
         ))
 
-    entry = rows[1]
+    # Found by its key: the page notice and the _summary row come before it.
+    entry = next(r for r in rows if "source_name" in r)
     assert entry["reachable"] is True
     assert [p["chain"] for p in entry["paths"]] == [f"pack → uart_send#{i}" for i in range(3)]
     assert entry["warning"] == "'uart_send' matches 2 symbols"

@@ -442,12 +442,13 @@ class TestTheAnswerSurvives:
         try:
             rows = _vector_rows(conn, CONFIG, unhandled_only=False, limit=2)
             keys = [next(iter(row)) if len(row) == 1 else "slot" for row in rows]
-            assert "truncated" in keys
             assert "coverage" in keys
             assert "interrupts" in keys
-            # The cut still happened, and the notice comes before the
-            # lines that describe the whole table.
-            assert keys.index("truncated") < keys.index("coverage")
+            # The cut still happened: the page notice leads and says so.
+            assert rows[0]["more"] is True
+            assert rows[0]["shown"] == 2
+            # The notice, the slots of the page, then the trailers.
+            assert keys.index("coverage") == rows[0]["shown"] + 1
         finally:
             conn.close()
 

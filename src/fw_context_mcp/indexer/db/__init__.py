@@ -38,11 +38,14 @@ __all__ = [
     "count_dead_code",
     "count_fp_assignments",
     "count_hotspots",
+    "count_indirect_call_site_matches",
     "count_indirect_call_sites",
+    "count_indirect_target_matches",
     "count_llm_analysis",
     "count_macros",
     "count_pending_analysis",
     "count_refs",
+    "count_template_instances",
     "delete_build_data",
     "delete_fp_assignments_for_files",
     "delete_indirect_call_sites_for_files",
@@ -124,6 +127,7 @@ __all__ = [
     "upsert_file",
     "upsert_llm_analysis_batch",
     "upsert_project",
+    "walk_recursive",
     "write_lock",
 ]
 
@@ -140,6 +144,7 @@ from ._callgraph import (
     get_function_address_arrays,
     get_table_coverage,
     get_vector_table,
+    walk_recursive,
 )
 from ._connection import (
     DatabaseCorruptionError,
@@ -179,6 +184,7 @@ from ._fts import (
     rebuild_macros_fts,
 )
 from ._inheritance import (
+    count_template_instances,
     delete_inheritance_for_file,
     delete_overrides_for_file,
     get_class_members,
@@ -220,7 +226,9 @@ from ._projects import (
 )
 from ._refs import (
     count_fp_assignments,
+    count_indirect_call_site_matches,
     count_indirect_call_sites,
+    count_indirect_target_matches,
     count_refs,
     delete_fp_assignments_for_files,
     delete_indirect_call_sites_for_files,

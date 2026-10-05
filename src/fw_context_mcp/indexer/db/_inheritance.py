@@ -18,6 +18,7 @@ inheritance edges are updated, not the entire class hierarchy.
 import sqlite3
 
 __all__ = [
+    "count_template_instances",
     "delete_inheritance_for_file",
     "delete_overrides_for_file",
     "get_class_members",
@@ -273,18 +274,32 @@ def get_template_instances(
     config_hash: str,
     template_usr: str,
     limit: int = 50,
+    offset: int = 0,
 ) -> list[sqlite3.Row]:
-    """Return all instantiated symbols for a given template USR.
+    """Return one page of the instantiated symbols for a given template USR.
 
     Each row is a full symbol row for an instantiation whose ``template_usr``
     matches the given template.
+
+    WHY the order ends at ``usr``: an implicit instantiation often has the
+    file and line of the template itself, thus many rows tie on
+    ``file_path, line``.  ``usr`` is unique within one build, thus two
+    pages never overlap or skip.
     """
     return conn.execute(
         """SELECT name, qualified_name, kind, file_path, line, col AS column,
                   signature, is_definition, parent_usr
            FROM symbols
            WHERE config_hash = ? AND template_usr = ?
-           ORDER BY file_path, line
-           LIMIT ?""",
-        (config_hash, template_usr, limit),
+           ORDER BY file_path, line, usr
+           LIMIT ? OFFSET ?""",
+        (config_hash, template_usr, limit, offset),
     ).fetchall()
+
+
+def count_template_instances(conn: sqlite3.Connection, config_hash: str, template_usr: str) -> int:
+    """Count the instantiations of one template, on every page of ``get_template_instances``."""
+    return int(conn.execute(
+        "SELECT COUNT(*) FROM symbols WHERE config_hash = ? AND template_usr = ?",
+        (config_hash, template_usr),
+    ).fetchone()[0])

@@ -511,7 +511,9 @@ class TestFindVariablesHandler:
         # test project has no registry entry for the daemon start.
         with mock.patch.object(BaseHandler, "resolve_db_context", return_value=db_ctx), \
                 mock.patch("fw_context_mcp.mcp.background._ensure_daemon_running"):
-            return [r for r in find_variables(name=name, project_root=str(tmp_path)) if "warning" not in r]
+            # The variables only: the stale warning and the page notice are
+            # rows of their own.
+            return [r for r in find_variables(name=name, project_root=str(tmp_path)) if "name" in r]
 
     def test_references_and_parents_come_from_the_selected_build_only(self, tmp_path):
         conn, chash = _setup_project_db(tmp_path)
@@ -553,3 +555,69 @@ class TestFindVariablesHandler:
 
         assert len(results["g_a"]["references"]) == 30
         assert len(results["g_b"]["references"]) == 1
+
+    def _page(self, tmp_path, conn, name: str, offset: int, limit: int) -> list[dict]:
+        """One page of find_variables, with every row it gives (the notice included)."""
+        from unittest import mock
+
+        from fw_context_mcp.mcp.handlers._base import BaseHandler, DbContext
+        from fw_context_mcp.mcp.handlers.variables import find_variables
+        from fw_context_mcp.mcp.shared.executor import SyncQueryExecutor
+
+        db_path = tmp_path / "test.db"
+        db_ctx = DbContext(
+            db_path=db_path,
+            executor=SyncQueryExecutor(str(db_path.resolve()), db_path),
+            config_hash="hash-deadbeef", project_id="proj-001", root=tmp_path, cfg=None,
+        )
+        with mock.patch.object(BaseHandler, "resolve_db_context", return_value=db_ctx), \
+                mock.patch("fw_context_mcp.mcp.background._ensure_daemon_running"):
+            rows = find_variables(name=name, project_root=str(tmp_path), limit=limit, offset=offset)
+        return [r for r in rows if "warning" not in r]
+
+    def test_variables_of_one_name_walk_whole_and_once(self, tmp_path):
+        """Seven locals named ``i`` tie on kind and name; ``usr`` breaks the tie."""
+        from tests._paging import assert_whole_and_once, walk_pages
+
+        conn, chash = _setup_project_db(tmp_path)
+        with transaction(conn):
+            fid = upsert_file(conn, chash, "src/a.c", "c")
+            for n in range(7):
+                _insert_symbol(conn, chash, fid, "src/a.c", usr=f"c:@F@f{n}", name=f"f{n}",
+                               kind="function")
+                _insert_symbol(conn, chash, fid, "src/a.c", usr=f"c:a.c@F@f{n}@i", name="i",
+                               kind="varlocal", parent_usr=f"c:@F@f{n}", line=10 + n)
+        conn.commit()
+        conn.close()
+
+        seen, total = walk_pages(
+            lambda offset: self._page(tmp_path, conn, "i", offset, limit=3),
+            lambda r: (r["enclosing_function"], r["line"]),
+        )
+
+        assert total == 7
+        assert_whole_and_once(seen, total)
+        rows = self._page(tmp_path, conn, "i", 0, limit=3)
+        assert rows[0]["hint"] == "find_variables('i', offset=3) reads the next page."
+        assert self._page(tmp_path, conn, "i", 40, limit=3) == [
+            {"info": "No variable at offset 40; the answer holds 7."}
+        ]
+
+    def test_a_cut_reference_list_names_the_whole_count(self, tmp_path):
+        """The cap of 30 used to cut silently: 150 references read as 30."""
+        conn, chash = _setup_project_db(tmp_path)
+        with transaction(conn):
+            fid = upsert_file(conn, chash, "src/a.c", "c")
+            _insert_symbol(conn, chash, fid, "src/a.c", usr="c:@F@f", name="f", kind="function")
+            _insert_symbol(conn, chash, fid, "src/a.c", usr="c:@g_a", name="g_a", kind="varglobal")
+            _insert_symbol(conn, chash, fid, "src/a.c", usr="c:@g_b", name="g_b", kind="varglobal")
+            insert_refs_batch(conn, [
+                (chash, "c:@g_a", "src/a.c", line, "c:@F@f", "ref", None) for line in range(1, 151)
+            ] + [(chash, "c:@g_b", "src/z.c", 1, "c:@F@f", "ref", None)])
+
+        results = {r["name"]: r for r in self._run(tmp_path, conn, "g_")}
+
+        assert results["g_a"]["references_total"] == 150
+        assert results["g_a"]["references_hint"] == "find_references('g_a') pages every reference."
+        assert results["g_b"]["references_total"] == 1
+        assert "references_hint" not in results["g_b"]

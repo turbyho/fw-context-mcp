@@ -776,8 +776,10 @@ def run_tests_for_project(proj: dict, results: CheckResults) -> None:
                   sym["driver_class"], project_root=root)
         if wr is not None:
             results.check("find_wrapper_callers → returns list", isinstance(wr, list))
-            if wr and isinstance(wr[0], dict):
-                results.check("find_wrapper_callers → has wrapper_class", "wrapper_class" in wr[0])
+            if wr and isinstance(wr[0], dict) and "error" not in wr[0] and "info" not in wr[0]:
+                # Found by its key: the page notice comes before the classes.
+                results.check("find_wrapper_callers → has wrapper_class",
+                              any("wrapper_class" in r for r in wr))
 
         wr_err = find_wrapper_callers("___nonexistent___", project_root=root)
         results.check("find_wrapper_callers nonexistent → error",

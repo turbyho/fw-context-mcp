@@ -88,6 +88,7 @@ __all__ = [
     "find_dead_code",
     "find_hotspots",
     "get_vector_table",
+    "walk_recursive",
 ]
 
 # ---------------------------------------------------------------------------
@@ -138,7 +139,7 @@ def _matched_total(
 
 
 def _rows_with_targets(
-    rows: list[sqlite3.Row],
+    rows: list[sqlite3.Row] | list[dict],
     name: str,
     target_usrs: list[str],
     target_names: list[str],
@@ -680,50 +681,105 @@ def find_all_callers_recursive(
     declared in a header but defined in assembly.  Falling back to
     s_any ensures the caller still appears in results.
     """
-    target_usrs, target_names = _resolve_target_usrs(conn, config_hash, name)
-    if not target_usrs:
-        return []
+    rows, _total = walk_recursive(
+        conn, config_hash, name, direction="callers", max_depth=max_depth, limit=limit,
+    )
+    return rows
 
-    # Build extended refs: real refs + synthetic weak-alias edges.
-    # When someone calls decl_usr (alias), they also effectively call def_usr.
+
+# The SQL of each direction of walk_recursive.  ``edge`` selects the start
+# rows: the callers of a target are the ``from_usr`` of the refs that point
+# TO it, the callees of a source are the ``to_usr`` of the refs FROM it.
+# ``alias`` is the synthetic weak-alias edge: a call of decl_usr is also a
+# call of def_usr (callers), and what def_usr calls, decl_usr also reaches
+# (callees).
+_WALK_SQL: dict[str, dict[str, str]] = {
+    "callers": {
+        "alias": "SELECT r.from_usr, ap.def_usr FROM refs r "
+                 "JOIN alias_pairs ap ON r.to_usr = ap.decl_usr",
+        "start": "SELECT from_usr, 1, to_usr FROM extended_refs WHERE to_usr IN ({placeholders})",
+        "step": "SELECT er.from_usr, w.depth + 1, w.target FROM extended_refs er "
+                "JOIN walk w ON er.to_usr = w.usr WHERE w.depth < ?",
+    },
+    "callees": {
+        "alias": "SELECT ap.decl_usr, r.to_usr FROM refs r "
+                 "JOIN alias_pairs ap ON r.from_usr = ap.def_usr",
+        "start": "SELECT to_usr, 1, from_usr FROM extended_refs WHERE from_usr IN ({placeholders})",
+        "step": "SELECT er.to_usr, w.depth + 1, w.target FROM extended_refs er "
+                "JOIN walk w ON er.from_usr = w.usr WHERE w.depth < ?",
+    },
+}
+
+
+# The order of a page of walk_recursive.  It ends at ``usr, target``, the
+# key of ``dedup``, thus it is a total order (see walk_recursive).
+_WALK_ORDER = "d.depth, COALESCE(s_def.name, s_any.name), d.usr, d.target"
+
+
+def walk_recursive(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    name: str,
+    *,
+    direction: str,
+    max_depth: int = 5,
+    limit: int = 50,
+    offset: int = 0,
+) -> tuple[list[dict], int]:
+    """Give one page of the transitive callers or callees of *name*, and the total.
+
+    *direction* is ``"callers"`` or ``"callees"``.  The rows have the shape
+    of ``find_all_callers_recursive`` and ``find_callees_recursive``, with
+    the ambiguity ``warning`` row first when *name* matches more than one
+    symbol.  The total counts the rows of the whole answer, not the page,
+    and does not count that ``warning`` row.
+
+    WHY the order ends at ``usr, target``: depth and name tie often (two
+    static functions of one name, overloads, one caller of two same-name
+    targets), and SQLite may give tied rows in any order.  ``dedup`` holds
+    one row per ``(usr, target)``, thus the order is total and two pages of
+    one walk never overlap or skip.
+
+    WHY ``COUNT(*) OVER ()``: the recursive walk is the expensive part, and
+    a second query only to count would run it again.  The window counts
+    the rows after the WHERE and before the LIMIT, thus it is the total of
+    the answer.  A page after the last row has no row to carry the count,
+    and only that case runs a second, one-row query.
+    """
+    sql = _WALK_SQL[direction]
+    usrs, names = _resolve_target_usrs(conn, config_hash, name)
+    if not usrs:
+        return [], 0
+
     alias_pairs = _get_alias_pairs(conn, config_hash)
-    alias_cte, alias_params = _build_alias_temp_table(conn, alias_pairs)
+    alias_cte, _alias_params = _build_alias_temp_table(conn, alias_pairs)
+    edge_kinds = "ref_kind IN ('call', 'indirect', 'implicit_construct', 'dispatch')"
     alias_join = (
-        """UNION ALL
-        SELECT r.from_usr, ap.def_usr
-        FROM refs r
-        JOIN alias_pairs ap ON r.to_usr = ap.decl_usr
-        WHERE r.config_hash = ?
-          AND r.ref_kind IN ('call', 'indirect', 'implicit_construct', 'dispatch')"""
+        f"UNION ALL {sql['alias']} WHERE r.config_hash = ? AND r.{edge_kinds}"
         if alias_cte
         else ""
     )
-    placeholders = ",".join("?" * len(target_usrs))
+    placeholders = ",".join("?" * len(usrs))
 
-    # The target USR travels with each row of the recursion.  A caller that
+    # The target USR travels with each row of the recursion.  A row that
     # reaches two same-name targets is thus reported one time for each, and
     # the row can say which target it belongs to.  With a single target the
-    # column holds one value, so GROUP BY usr, target groups exactly as the
-    # earlier GROUP BY usr did.
+    # column holds one value, so GROUP BY usr, target groups exactly as a
+    # GROUP BY usr would.
     query = f"""WITH {alias_cte}
         extended_refs(from_usr, to_usr) AS (
             SELECT from_usr, to_usr FROM refs
-            WHERE config_hash = ? AND ref_kind IN ('call', 'indirect', 'implicit_construct', 'dispatch')
+            WHERE config_hash = ? AND {edge_kinds}
             {alias_join}
         ),
-        callers(usr, depth, target) AS (
-            SELECT from_usr, 1, to_usr
-            FROM extended_refs
-            WHERE to_usr IN ({placeholders})
+        walk(usr, depth, target) AS (
+            {sql['start'].format(placeholders=placeholders)}
             UNION
-            SELECT er.from_usr, c.depth + 1, c.target
-            FROM extended_refs er
-            JOIN callers c ON er.to_usr = c.usr
-            WHERE c.depth < ?
+            {sql['step']}
         ),
         dedup AS (
             SELECT usr, target, MIN(depth) AS depth
-            FROM callers
+            FROM walk
             GROUP BY usr, target
         )
         SELECT COALESCE(s_def.name, s_any.name, '?') AS name,
@@ -732,27 +788,38 @@ def find_all_callers_recursive(
                COALESCE(s_def.file_path, s_any.file_path) AS file_path,
                COALESCE(s_def.signature, s_any.signature) AS signature,
                d.depth,
-               d.target
+               d.target,
+               COUNT(*) OVER () AS walk_total
         FROM dedup d
         LEFT JOIN symbols s_def ON s_def.usr = d.usr AND s_def.config_hash = ?
                                    AND s_def.is_definition = 1
         LEFT JOIN symbols s_any ON s_any.usr = d.usr AND s_any.config_hash = ?
         WHERE COALESCE(s_def.name, s_any.name) IS NOT NULL
-        ORDER BY d.depth, COALESCE(s_def.name, s_any.name)
-        LIMIT ?"""
+        ORDER BY {_WALK_ORDER}
+        LIMIT ? OFFSET ?"""
 
-    params: list[object] = [config_hash]
-    if alias_cte:
-        params.append(config_hash)
-    params.extend(target_usrs)
-    params.extend([max_depth, config_hash, config_hash, limit])
+    def _run(page_limit: int, page_offset: int) -> list[sqlite3.Row]:
+        params: list[object] = [config_hash]
+        if alias_cte:
+            params.append(config_hash)
+        params.extend(usrs)
+        params.extend([max_depth, config_hash, config_hash, page_limit, page_offset])
+        return conn.execute(query, params).fetchall()
 
-    rows = conn.execute(query, params).fetchall()
-
-    return _rows_with_targets(
-        rows, name, target_usrs, target_names, "callers",
-        _matched_total(conn, config_hash, name, target_usrs),
+    raw = _run(limit, offset)
+    if raw:
+        total = int(raw[0]["walk_total"])
+    elif offset:
+        probe = _run(1, 0)
+        total = int(probe[0]["walk_total"]) if probe else 0
+    else:
+        total = 0
+    page = [{k: r[k] for k in r.keys() if k != "walk_total"} for r in raw]
+    rows = _rows_with_targets(
+        page, name, usrs, names, direction,
+        _matched_total(conn, config_hash, name, usrs),
     )
+    return rows, total
 
 
 def find_callees_recursive(
@@ -779,78 +846,10 @@ def find_callees_recursive(
     edges) → recursive callees CTE → dedup with MIN(depth) → join symbols
     for metadata.
     """
-    source_usrs, source_names = _resolve_target_usrs(conn, config_hash, name)
-    if not source_usrs:
-        return []
-
-    # Build extended refs: real refs + synthetic weak-alias edges.
-    # When decl_usr is an alias for def_usr, anything def_usr calls should
-    # also be reachable from decl_usr.
-    alias_pairs = _get_alias_pairs(conn, config_hash)
-    alias_cte, alias_params = _build_alias_temp_table(conn, alias_pairs)
-    alias_join = (
-        """UNION ALL
-        SELECT ap.decl_usr, r.to_usr
-        FROM refs r
-        JOIN alias_pairs ap ON r.from_usr = ap.def_usr
-        WHERE r.config_hash = ?
-          AND r.ref_kind IN ('call', 'indirect', 'implicit_construct', 'dispatch')"""
-        if alias_cte
-        else ""
+    rows, _total = walk_recursive(
+        conn, config_hash, name, direction="callees", max_depth=max_depth, limit=limit,
     )
-    placeholders = ",".join("?" * len(source_usrs))
-
-    # The source USR travels with each row of the recursion, for the same
-    # reason as in find_all_callers_recursive: a callee that two same-name
-    # sources reach must say which source reached it.
-    query = f"""WITH {alias_cte}
-        extended_refs(from_usr, to_usr) AS (
-            SELECT from_usr, to_usr FROM refs
-            WHERE config_hash = ? AND ref_kind IN ('call', 'indirect', 'implicit_construct', 'dispatch')
-            {alias_join}
-        ),
-        callees(usr, depth, target) AS (
-            SELECT to_usr, 1, from_usr
-            FROM extended_refs
-            WHERE from_usr IN ({placeholders})
-            UNION
-            SELECT er.to_usr, c.depth + 1, c.target
-            FROM extended_refs er
-            JOIN callees c ON er.from_usr = c.usr
-            WHERE c.depth < ?
-        ),
-        dedup AS (
-            SELECT usr, target, MIN(depth) AS depth
-            FROM callees
-            GROUP BY usr, target
-        )
-        SELECT COALESCE(s_def.name, s_any.name, '?') AS name,
-               COALESCE(s_def.qualified_name, s_any.qualified_name) AS qualified_name,
-               COALESCE(s_def.kind, s_any.kind) AS kind,
-               COALESCE(s_def.file_path, s_any.file_path) AS file_path,
-               COALESCE(s_def.signature, s_any.signature) AS signature,
-               d.depth,
-               d.target
-        FROM dedup d
-        LEFT JOIN symbols s_def ON s_def.usr = d.usr AND s_def.config_hash = ?
-                                   AND s_def.is_definition = 1
-        LEFT JOIN symbols s_any ON s_any.usr = d.usr AND s_any.config_hash = ?
-        WHERE COALESCE(s_def.name, s_any.name) IS NOT NULL
-        ORDER BY d.depth, COALESCE(s_def.name, s_any.name)
-        LIMIT ?"""
-
-    params: list[object] = [config_hash]
-    if alias_cte:
-        params.append(config_hash)
-    params.extend(source_usrs)
-    params.extend([max_depth, config_hash, config_hash, limit])
-
-    rows = conn.execute(query, params).fetchall()
-
-    return _rows_with_targets(
-        rows, name, source_usrs, source_names, "callees",
-        _matched_total(conn, config_hash, name, source_usrs),
-    )
+    return rows
 
 
 def count_dead_code(

@@ -68,7 +68,9 @@ log = logging.getLogger(__name__)
 
 __all__ = [
     "count_fp_assignments",
+    "count_indirect_call_site_matches",
     "count_indirect_call_sites",
+    "count_indirect_target_matches",
     "count_refs",
     "delete_fp_assignments_for_files",
     "delete_indirect_call_sites_for_files",
@@ -198,11 +200,48 @@ def delete_indirect_call_sites_for_files(
     _delete_by_from_file(conn, "indirect_call_sites", config_hash, from_files)
 
 
+# The rows of find_indirect_call_sites, and of its count.  One string for
+# the two, thus ``total`` can never describe a different answer than the
+# rows.  The ``id`` primary key ends the order, because two calls on one
+# line, or the calls of one macro, tie on file and line.
+_CALL_SITE_MATCH = """ics.config_hash = ?
+             AND (
+                 -- Match via indexed symbols (covers FIELD_DECL, VAR_DECL)
+                 ics.target_usr IN (
+                     SELECT usr FROM symbols
+                     WHERE config_hash = ?
+                       AND (name = ? OR qualified_name = ? OR qualified_name LIKE ? ESCAPE '\\')
+                 )
+                 OR
+                 -- Fallback: direct name match (covers PARM_DECL which are
+                 -- not in the symbols table)
+                 ics.target_name = ?
+             )"""
+_CALL_SITE_ORDER = "ics.from_file, ics.from_line, ics.id"
+
+
+def _call_site_params(config_hash: str, name: str) -> tuple[str, ...]:
+    """The parameters of ``_CALL_SITE_MATCH``, in its order."""
+    esc_name = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return (config_hash, config_hash, name, name, f"%::{esc_name}", name)
+
+
+def count_indirect_call_site_matches(
+    conn: sqlite3.Connection, config_hash: str, name: str,
+) -> int:
+    """Count the rows that ``find_indirect_call_sites`` gives for *name*, on every page."""
+    return int(conn.execute(
+        f"SELECT COUNT(*) FROM indirect_call_sites ics WHERE {_CALL_SITE_MATCH}",
+        _call_site_params(config_hash, name),
+    ).fetchone()[0])
+
+
 def find_indirect_call_sites(
     conn: sqlite3.Connection,
     config_hash: str,
     name: str,
     limit: int = 50,
+    offset: int = 0,
 ) -> list[sqlite3.Row]:
     """Find indirect call sites for a function pointer field or variable.
 
@@ -219,11 +258,12 @@ def find_indirect_call_sites(
     Why this split: a single ``indirect_call_sites.target_usr IN (SELECT...)``
     query would miss PARM_DECL targets.  The ``target_name`` fallback
     ensures parameter-based function pointer calls are found.
+
+    *offset* skips that many rows of the answer; the order is total (see
+    ``_CALL_SITE_ORDER``), thus two pages never overlap or skip.
     """
-    esc_name = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    suffix_pattern = f"%::{esc_name}"
     return conn.execute(
-        """SELECT ics.*,
+        f"""SELECT ics.*,
                   caller.name            AS caller_name,
                   caller.qualified_name  AS caller_qname,
                   caller.kind            AS caller_kind,
@@ -232,22 +272,10 @@ def find_indirect_call_sites(
            FROM indirect_call_sites ics
            LEFT JOIN symbols caller
              ON caller.config_hash = ics.config_hash AND caller.usr = ics.from_usr
-           WHERE ics.config_hash = ?
-             AND (
-                 -- Match via indexed symbols (covers FIELD_DECL, VAR_DECL)
-                 ics.target_usr IN (
-                     SELECT usr FROM symbols
-                     WHERE config_hash = ?
-                       AND (name = ? OR qualified_name = ? OR qualified_name LIKE ? ESCAPE '\\')
-                 )
-                 OR
-                 -- Fallback: direct name match (covers PARM_DECL which are
-                 -- not in the symbols table)
-                 ics.target_name = ?
-             )
-           ORDER BY ics.from_file, ics.from_line
-           LIMIT ?""",
-        (config_hash, config_hash, name, name, suffix_pattern, name, limit),
+           WHERE {_CALL_SITE_MATCH}
+           ORDER BY {_CALL_SITE_ORDER}
+           LIMIT ? OFFSET ?""",
+        (*_call_site_params(config_hash, name), limit, offset),
     ).fetchall()
 
 
@@ -300,11 +328,66 @@ def delete_fp_assignments_for_files(
 
 
 
+# The rows of find_indirect_targets, and of its count, as for the call
+# sites above.  The join gives one row for each assignment and call site,
+# thus one assignment that reaches many call sites, or an init list with
+# several assignments on one line, ties on file and line.  The two
+# primary keys end the order; ``ics.id`` is NULL for an assignment with no
+# call site, and SQLite sorts NULL first, which is a fixed place too.
+_TARGET_FROM = """FROM fp_assignments fpa
+           LEFT JOIN indirect_call_sites ics
+             ON ics.target_usr = fpa.lhs_usr
+            AND ics.config_hash = fpa.config_hash"""
+_TARGET_MATCH = """fpa.config_hash = ?
+             AND (
+                 -- Match via indexed symbols (covers FIELD_DECL, VAR_DECL)
+                 fpa.lhs_usr IN (
+                     SELECT usr FROM symbols
+                     WHERE config_hash = ?
+                       AND (name = ? OR qualified_name = ? OR qualified_name LIKE ? ESCAPE ?)
+                 )
+                 OR
+                 -- Fallback: direct name match (covers PARM_DECL which are
+                 -- not in the symbols table)
+                 fpa.lhs_name = ?
+                 OR
+                 -- Fallback: target function name (covers callback wrapper
+                 -- assignments where neither lhs_usr nor lhs_name match the
+                 -- searched field name)
+                 fpa.rhs_name = ?
+                 OR fpa.rhs_name LIKE ? ESCAPE '\\'
+             )"""
+_TARGET_ORDER = "fpa.from_file, fpa.from_line, fpa.id, ics.id"
+
+
+def _target_params(config_hash: str, name: str) -> tuple[str, ...]:
+    """The parameters of ``_TARGET_MATCH``, in its order."""
+    esc_name = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return (config_hash, config_hash, name, name, f"%::{esc_name}", "\\", name, name,
+            f"%{esc_name}%")
+
+
+def count_indirect_target_matches(
+    conn: sqlite3.Connection, config_hash: str, name: str,
+) -> int:
+    """Count the rows that ``find_indirect_targets`` gives for *name*, on every page.
+
+    The fallbacks of that function fill the call site of a row and never
+    add or remove a row, thus the count of the join is the count of the
+    answer.
+    """
+    return int(conn.execute(
+        f"SELECT COUNT(*) {_TARGET_FROM} WHERE {_TARGET_MATCH}",
+        _target_params(config_hash, name),
+    ).fetchone()[0])
+
+
 def find_indirect_targets(
     conn: sqlite3.Connection,
     config_hash: str,
     name: str,
     limit: int = 50,
+    offset: int = 0,
 ) -> list[dict[str, object]]:
     """Find functions assigned to a function pointer field/variable/parameter.
 
@@ -340,11 +423,14 @@ def find_indirect_targets(
     callback pattern.  No single strategy works for all patterns because
     the indexer captures different levels of detail depending on whether
     libclang can resolve the template parameters at parse time.
+
+    *offset* skips that many rows of the answer; the order is total (see
+    ``_TARGET_ORDER``).  The fallback lookups below each take the first
+    row of an ORDER BY that ends at a unique column, thus one row gets the
+    same call site on every call.
     """
-    esc_name = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    suffix_pattern = f"%::{esc_name}"
     rows = conn.execute(
-        """SELECT fpa.rhs_usr, fpa.rhs_name, fpa.fn_ptr_type, fpa.method,
+        f"""SELECT fpa.rhs_usr, fpa.rhs_name, fpa.fn_ptr_type, fpa.method,
                   fpa.lhs_usr, fpa.lhs_name,
                   fpa.from_file AS assign_file, fpa.from_line AS assign_line,
                   fpa.from_usr AS assign_from_usr,
@@ -354,39 +440,17 @@ def find_indirect_targets(
                   caller_sym.name AS assign_caller,
                   caller_sym.file_path AS caller_file,
                   caller_sym.is_project AS caller_is_project
-           FROM fp_assignments fpa
-           LEFT JOIN indirect_call_sites ics
-             ON ics.target_usr = fpa.lhs_usr
-            AND ics.config_hash = fpa.config_hash
+           {_TARGET_FROM}
            LEFT JOIN symbols rhs_sym
              ON rhs_sym.usr = fpa.rhs_usr
             AND rhs_sym.config_hash = fpa.config_hash
            LEFT JOIN symbols caller_sym
              ON caller_sym.usr = fpa.from_usr
             AND caller_sym.config_hash = fpa.config_hash
-           WHERE fpa.config_hash = ?
-             AND (
-                 -- Match via indexed symbols (covers FIELD_DECL, VAR_DECL)
-                 fpa.lhs_usr IN (
-                     SELECT usr FROM symbols
-                     WHERE config_hash = ?
-                       AND (name = ? OR qualified_name = ? OR qualified_name LIKE ? ESCAPE ?)
-                 )
-                 OR
-                 -- Fallback: direct name match (covers PARM_DECL which are
-                 -- not in the symbols table)
-                 fpa.lhs_name = ?
-                 OR
-                 -- Fallback: target function name (covers callback wrapper
-                 -- assignments where neither lhs_usr nor lhs_name match the
-                 -- searched field name)
-                 fpa.rhs_name = ?
-                 OR fpa.rhs_name LIKE ? ESCAPE '\\'
-             )
-           ORDER BY fpa.from_file, fpa.from_line
-           LIMIT ?""",
-         (config_hash, config_hash, name, name, suffix_pattern, "\\", name, name,
-          f"%{esc_name}%", limit),
+           WHERE {_TARGET_MATCH}
+           ORDER BY {_TARGET_ORDER}
+           LIMIT ? OFFSET ?""",
+        (*_target_params(config_hash, name), limit, offset),
     ).fetchall()
 
     # ── Type-based fallback (Phase 3b): when call_file IS NULL, trace the
@@ -430,7 +494,7 @@ def find_indirect_targets(
                            WHERE config_hash = ? AND parent_usr = ?
                              AND kind = 'field'
                              AND signature != ''
-                           LIMIT 20""",
+                           ORDER BY line, usr LIMIT 20""",
                         (config_hash, parent_usr_val),
                     ).fetchall()
                     for fr in field_rows:
@@ -455,7 +519,7 @@ def find_indirect_targets(
                    WHERE config_hash = ? AND kind IN ('class', 'struct')
                      AND (qualified_name = ? OR qualified_name LIKE ? ESCAPE '\\'
                           OR name = ?)
-                   ORDER BY is_definition DESC LIMIT 1""",
+                   ORDER BY is_definition DESC, usr LIMIT 1""",
                 (config_hash, candidate_type, f"%::{esc_ct}", candidate_type),
             ).fetchone()
             if not class_row:
@@ -478,7 +542,7 @@ def find_indirect_targets(
                              AND kind IN ('method', 'function')
                              AND is_definition = 1
                              AND (name = 'handler' OR name LIKE '%handler%')
-                           LIMIT 1""",
+                           ORDER BY file_path, line, usr LIMIT 1""",
                         (config_hash, cur),
                     ).fetchone()
                     if h:
@@ -519,7 +583,7 @@ def find_indirect_targets(
                        FROM indirect_call_sites
                        WHERE config_hash = ?
                          AND fn_ptr_type = ?
-                       LIMIT 1""",
+                       ORDER BY from_file, from_line, id LIMIT 1""",
                     (config_hash, fpa_fn_ptr_type.strip()),
                 ).fetchone()
                 if ics_row:
