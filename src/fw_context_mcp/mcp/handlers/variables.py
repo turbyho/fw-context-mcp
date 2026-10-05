@@ -45,28 +45,30 @@ _VAR_KINDS = ("varglobal", "varlocal", "variable", "field")
 
 
 def find_variables(
-    name: Annotated[str, Field(description="Variable name or prefix to search. "
-        "Uses LIKE match (e.g. 'g_' finds g_debug_level, g_state).", min_length=1)],
+    name: Annotated[str, Field(description="Variable name or part of it. "
+        "Substring match on name and qualified name (e.g. 'g_' finds g_debug_level, g_state).", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. "
         "Auto-detected if omitted.")] = None,
     kind: Annotated[str | None, Field(description="Filter by kind: "
-        "'varglobal', 'varlocal', 'field', or None for all.")] = None,
+        "'varglobal', 'varlocal', 'field', legacy 'variable', or None for all.")] = None,
     limit: Annotated[int, Field(description="Maximum results "
         "(default 20, max 100).", ge=1)] = 20,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
-    """Find C/C++ variables by name or prefix and trace who reads or
+    """Find C/C++ variables by name or part of it and trace who reads or
     writes them through the call graph.  libclang-powered: splits
     variables into global (``varglobal`` — file/namespace/class-scope)
     and local (``varlocal`` — inside a function body).
 
     Each result includes a type signature (``bool timeSet``,
     ``const IPAddress modbus_ip``), the enclosing function for locals
-    (``"<file scope>"`` for globals), and a ``references`` list showing
-    every function that reads or writes the variable — the same
-    ``ref_kind`` values as ``find_references`` (``"call"``, ``"ref"``,
-    ``"member"``).
+    (``"<file scope>"`` for globals), and a ``references`` list of the
+    functions that read or write the variable — the same ``ref_kind``
+    values as ``find_references`` (``"call"``, ``"ref"``, ``"member"``).
+    The list is capped: max 30 per variable, and max 100 over all results,
+    thus a later result can show fewer than it has.  Only definitions are
+    returned, globals first, then by name.
 
     Use when you need to understand shared state, find who modifies a
     global variable, trace side effects, or distinguish important globals
@@ -85,8 +87,8 @@ def find_variables(
     Read-only. No side effects.
 
     Args:
-        name: Variable name or prefix to search. Uses LIKE match
-            (e.g. ``g_`` finds ``g_debug_level``, ``g_state``).
+        name: Variable name or part of it. Substring match on name and
+            qualified name (e.g. ``g_`` finds ``g_debug_level``, ``g_state``).
         project_root: Project root directory. Auto-detected if omitted.
         kind: Optional kind filter — ``"varglobal"``, ``"varlocal"``,
             ``"field"``, or ``None`` (all). Default ``None``.  The legacy
@@ -106,18 +108,19 @@ def find_variables(
         line (int), signature (str — e.g. ``"const IPAddress modbus_ip"``),
         enclosing_function (str — function name for varlocal,
         ``"<file scope>"`` for varglobal), enclosing_class (str — class
-        name for static members, empty otherwise),
+        or struct name for fields and static members, empty otherwise),
         references (list[dict] — ``function``, ``file``, ``line``,
         ``ref_kind``).
 
         No match gives ``[]``.  One dict with ``error`` means the query
         failed — check that key first.
-        A ``warning`` key marks a partial result.
+        A ``warning`` dict that comes first means that indexed files
+        changed after the last index run: the results can be out of date.
     """
     if not name.strip():
         return [{"error": "Variable name must be non-empty."}]
     if kind is not None and kind not in _VALID_KINDS:
-        return [{"error": f"Invalid kind: {kind!r}. Expected 'varglobal', 'varlocal', 'field', or None."}]
+        return [{"error": f"Invalid kind: {kind!r}. Expected 'varglobal', 'varlocal', 'field', 'variable', or None."}]
     limit = max(0, min(limit, 100))
 
     try:

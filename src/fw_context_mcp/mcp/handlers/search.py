@@ -3,8 +3,8 @@
 Provides the search tools exposed through the MCP interface:
 
 - ``search_code`` — lexical symbol-name search with progressive relaxation;
-  searches symbol names, signatures, and docstrings via FTS5 with six
-  fallback strategies when the primary query returns nothing.
+  searches symbol names, signatures, and docstrings via FTS5, with five
+  relaxation steps after the primary query when a step returns nothing.
 - ``search_bodies`` — full-text search over the stored text of every
   definition, callables and types alike.  Project code sorts before vendor
   code.
@@ -20,15 +20,16 @@ Provides the search tools exposed through the MCP interface:
   ``._lookup``); synchronous — only local DB queries.
 
 Also exports shared fallback utilities from ``._search_fallbacks`` for
-use by other modules that need to run search-fallback chains independently
-(e.g. ``semantic_search`` falls back to ``search_code`` on embedding
-failure).
+use by other modules that need to run search-fallback chains independently.
+``semantic_search`` does not use them: its lexical fallback is
+``shared.fallback._fallback_to_search_code``.
 
-Architecture: every search handler delegates to ``_with_search_context``
-which resolves the project root, verifies index existence, and wraps the
-actual query in ``_with_stale_recovery`` — a retry-on-stale-index
-decorator that triggers per-file reparsing when compile-commands
-mismatches cause stale-symbol errors.
+Architecture: ``search_code``, ``search_bodies`` and ``search_content``
+delegate to ``_with_search_context``, which verifies that the index exists,
+resolves the build, and runs the query once inside ``_with_stale_recovery``.
+That wrapper does not retry and does not reparse: when a file that the
+answer names changed on disk, it starts the watcher daemon and prepends a
+``warning`` record to the answer.
 """
 
 from __future__ import annotations
@@ -116,9 +117,8 @@ def _with_search_context(root: Path, tool_name: str, do_search, variant: str = "
     1. Locate the SQLite index database file from the project root.
     2. Verify the index exists — fail early with a clear message if not.
     3. Resolve ``(variant, image)`` to ONE build, fail-closed.
-    4. Run the actual search inside ``_with_stale_recovery``, which catches
-       stale-index errors and retries once after triggering per-file
-       re-parsing behind the scenes.
+    4. Run the actual search once inside ``_with_stale_recovery``, which
+       adds a stale ``warning`` record to the answer when needed.
 
     This wrapper eliminates five repeated lines from every search function
     and ensures consistent error formatting. The ``tool_name`` parameter
@@ -131,12 +131,13 @@ def _with_search_context(root: Path, tool_name: str, do_search, variant: str = "
     answering with several builds, and it is gone with the merging it
     served.
 
-    Why stale-recovery is used: the compile-commands database can change
-    between index runs (files added, removed, re-ordered). When a query
-    hits a symbol whose source position is outdated, the stale error
-    propagates as an empty or partial result. ``_with_stale_recovery``
-    detects this, triggers ``reindex_file_impl`` on the affected file, and
-    re-runs ``do_search`` — transparent to the caller.
+    Why stale-recovery is used: a source file can change after the last
+    index run, and the indexed positions of its symbols are then outdated.
+    ``_with_stale_recovery`` compares the mtime of every file that the
+    answer names with the index.  When one changed, or when the answer is
+    empty and indexed files changed, it starts the watcher daemon and
+    prepends a ``warning`` record.  It does not re-run ``do_search``: the
+    answer comes from the index as it is.
 
     Args:
         root: Resolved project root directory.
@@ -239,6 +240,8 @@ def search_code(
       ``modem init`` goes to FTS5 as ``modem* OR init*`` and answers with
       the symbols that hold EITHER word.  ``search_bodies`` does the
       opposite — it takes the query literally, where a space is an AND.
+      A query that holds a double quote, ``AND``, ``OR``, ``NEAR`` or a
+      column filter goes to FTS5 as written.
     - ``init*`` matches init, init_uart, initialize (trailing wildcard)
     - ``"spi init"`` matches the exact phrase "spi init"
     - Do NOT use an underscore in a query.  The tokenizer splits
@@ -266,6 +269,8 @@ def search_code(
     5. FTS5 per query word, results merged — ``"individual_terms"``.
     6. ``macros_fts`` for ``#define`` names and values, kind="macro" —
        ``"macros_fts"``.
+
+    Steps 3-6 ignore ``kind``.
 
     **Kind filter values:** ``function``, ``method``, ``constructor``,
     ``destructor``, ``class``, ``struct``, ``union``, ``enum``, ``enum_constant``,
@@ -317,12 +322,17 @@ def search_code(
         include ``template_usr``, ``parent_usr``, and ``llm_analysis``
         (``{summary, inputs, outputs}`` — written by a model, not by the
         code.  ``get_active_build().analysis.model`` names it). Fallback
-        results include ``_fallback`` with the method name.
+        results include ``_fallback`` with the method name.  A macro
+        result also holds ``_macro_value`` and ``_macro_expanded_value``
+        when they are not empty.
 
         No match gives ``[]``.  A dict with ``error`` means the query
-        failed.  A stale index prepends a dict with ``warning`` + ``hint``,
-        and that dict comes BEFORE the page notice — find the notice by
-        its keys, and not by its position.
+        failed.  When FTS5 refuses the query and no LIKE step finds a row,
+        the answer is one dict with ``warning`` + ``hint``.  When a file
+        that the answer names changed on disk, a dict with ``warning``
+        comes BEFORE the page notice — find the notice by its keys, and
+        not by its position.  An empty answer gets that ``warning`` too
+        when indexed files changed: the code can be in them.
     """
     root = resolve_project_root(project_root)
     # A page of zero rows is not a page.  It would report ``shown: 0`` with
@@ -421,7 +431,7 @@ def search_code(
 async def smart_search(
     query: Annotated[str, Field(description="Natural language description, 5-15 words. E.g. 'how does the modem connect?' or 'handle BLE pairing failure'.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    limit: Annotated[int, Field(description="Maximum results (default 20, max 100).", ge=1)] = 20,
+    limit: Annotated[int, Field(description="Maximum results (default 20). Held between 5 and 100.", ge=1)] = 20,
 ) -> list[dict]:
     """Natural-language search: an LLM generates FTS5 keywords, then searches
     the libclang index. Finds concepts by meaning rather than exact text
@@ -453,7 +463,9 @@ async def smart_search(
     "handle BLE pairing failure").
 
     **Fallback:** When LLM is unavailable, falls back to direct FTS5 search
-    with word-split terms from the query.
+    with word-split terms from the query.  When the LLM call or the
+    embedding step fails, a metadata dict gives the reason in ``warning``
+    or ``detail``.
 
     Args:
         query: Natural language description of what you're looking for.
@@ -465,19 +477,22 @@ async def smart_search(
 
     Returns:
         list of dicts with metadata entries (_generated_queries, _rough_queries,
-        _translated_from) followed by symbol results with name, qualified_name,
-        kind, file, line, is_definition, signature, docstring.
+        _translated_from + _translated_to) followed by symbol results with
+        name, qualified_name, kind, file, line, is_definition, signature,
+        docstring.  A symbol also holds ``summary``, ``inputs`` and
+        ``outputs`` when ``fw-context index --analyze`` wrote them.  A model
+        wrote that text, and the code did not: never quote it as a fact.
 
-        When the LLM stalls, the tool gives the FTS5 results that it has.
-        The leading dict then holds ``_partial: True``, a ``warning`` with
-        the timeout, and a ``hint``.  The result is incomplete: make the
-        query more specific, or increase the LLM timeout.
+        When the pipeline passes the LLM timeout, the answer is one dict
+        with ``_partial: True``, a ``warning`` with the timeout, and a
+        ``hint``.  It holds no symbol: make the query more specific, or
+        increase the LLM timeout.
 
-        When the index is stale, a leading dict holds a ``warning`` and a
-        ``hint`` to reindex.
+        When compile_commands.json changed after the last index run, a
+        trailing dict holds a ``warning`` and a ``hint`` to reindex.
 
-        No match gives ``[]``.  One dict with ``error`` means the query
-        failed — check that key first.
+        No match gives the metadata entries and a dict with ``info``.  One
+        dict with ``error`` means the query failed — check that key first.
     """
     from fw_context_mcp.search.context import PipelineContext
     from fw_context_mcp.search.pipeline import PipelineRunner, _build_smart_search
@@ -512,7 +527,7 @@ async def smart_search(
         results = list(ctx.formatted_results) if ctx.formatted_results else []
         results.insert(0, {
             "warning": f"Smart search timed out after {timeout:.0f}s.",
-            "hint": "Results below are partial (FTS5-only). Try a more specific query or increase LLM timeout.",
+            "hint": "No results: the search timed out first. Try a more specific query or increase LLM timeout.",
             "_partial": True,
         })
         return results
@@ -530,7 +545,7 @@ async def semantic_search(
     query: Annotated[str, Field(description="Natural language description, 5-15 words. E.g. 'parcel locker state machine' or 'how does the modem connect?'.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     threshold: Annotated[float, Field(description="Minimum cosine similarity (0.0-1.0). Default 0.60. Use 0.55 for exploratory, 0.50 for broad search.", ge=0.0, le=1.0)] = 0.60,
-    limit: Annotated[int, Field(description="Maximum results (default 20, max 100).", ge=1)] = 20,
+    limit: Annotated[int, Field(description="Maximum results (default 20). Held between 5 and 100.", ge=1)] = 20,
 ) -> list[dict]:
     """Semantic search using pre-computed libclang symbol embeddings. Finds
     symbols by meaning, not by text — matches concepts even when query
@@ -560,46 +575,52 @@ async def semantic_search(
     **Source-aware ranking:** the similarity of a project symbol is
     multiplied by 1.2, and the similarity of every other symbol by 0.85.
     The index marks each file as project code or not, thus the two tiers
-    are all there are.  ``_similarity`` in the result holds the multiplied
-    score, and not the raw cosine distance.
+    are all there are.  The multiplied score sets the order; the result
+    does not show it.  ``threshold`` applies to the raw cosine similarity.
 
-    **Requires an LLM** with an embedding model.
-    Falls back to ``search_code`` with a warning if the LLM is unavailable.
+    **Requires** ``[llm] enabled = true``, a running Ollama server at
+    ``llm.ollama_url`` (checked even when the embedding model is not an
+    Ollama model), and embeddings in the index.  Without one of them, the
+    tool falls back to a lexical search with a warning.
 
     **This tool names no build.**  It takes neither ``variant`` nor
     ``image``, and it answers for the build that ``get_active_build``
     reports as the active one.  On a project that holds several builds,
     use ``search_code`` or ``search_bodies`` to ask about one named build.
 
-    Read-only: yes. The fallback to ``search_code`` may auto-reindex stale
-    files (non-blocking).
+    Read-only. No side effects.
 
     Args:
         query: Natural language description of what you're looking for.
                Be specific — 5–15 words works best.
         project_root: Project root. Auto-detected if omitted.
         threshold: Minimum cosine similarity (0.0-1.0). Default 0.60.
-        limit: Maximum number of results (default 20, max 100).
+        limit: Maximum number of results (default 20, max 100).  The
+            embedding search holds it at 5 or more.
 
     Returns:
         list of dicts, each with: name, qualified_name, kind, file, line,
-        is_definition, signature, docstring, plus ``_similarity`` (cosine
-        similarity score) and ``_method`` (``"embedding"`` or
-        ``"search_code_fallback"``).
+        is_definition, signature, docstring, ranked by similarity (or by
+        the reranker).  A symbol also holds ``summary``, ``inputs`` and
+        ``outputs`` when ``fw-context index --analyze`` wrote them — model
+        text, never a fact to quote — and ``_rerank_score`` when
+        ``llm.reranker_model`` is set.
 
-        When the best similarity is below the relevance floor (0.68), the
-        result is one dict with ``warning``, ``_best_similarity`` (float),
-        ``_fallback_suggestion`` (``"search_code"``), and ``_results`` (the
-        low-similarity results).  Treat those results as noise, and use
-        ``search_code`` instead.
+        When compile_commands.json changed after the last index run, a
+        trailing dict holds a ``warning`` and a ``hint`` to reindex.
 
-        When the LLM is not running, or the embedding fails, this tool falls
-        back to ``search_code``.  The results then carry
-        ``_method: "search_code_fallback"``, and a leading dict holds a
-        ``warning`` with the reason.
+        Fallback: when the LLM is disabled or not running, or the index
+        holds no embeddings, or the embedding model fails, this tool runs
+        ONE plain FTS5 symbol search (the first step of ``search_code``,
+        with no kind, no relaxation and no paging).  A leading dict holds
+        a ``warning`` with the reason, and each symbol carries
+        ``_method: "search_code_fallback"``.  A changed result file or
+        compile_commands.json adds another leading ``warning``.  When the
+        lexical search finds nothing too, the answer is one ``warning``.
 
-        No match gives ``[]``.  One dict with ``error`` means the query
-        failed — check that key first.
+        No match of the embedding search gives one dict with ``info``.
+        One dict with ``error`` means the query failed — check that key
+        first.
     """
 
     try:
@@ -1005,9 +1026,11 @@ def search_bodies(
         ``get_source`` numbers its lines.
 
         No match gives ``[]``.  A dict with ``error`` means the query
-        failed.  A stale index prepends a dict with ``warning`` + ``hint``,
-        and so does a query that FTS5 refuses to parse — an empty list
-        always means "no such code", never "bad query".
+        failed.  A query that FTS5 refuses to parse, also after the
+        repair, gives one dict with ``warning`` + ``hint`` — an empty list
+        always means "no such code", never "bad query".  When a file that
+        the answer names changed on disk, a dict with ``warning`` comes
+        first; an empty answer gets it too when indexed files changed.
     """
     root = resolve_project_root(project_root)
     # Enforce limit bounds at the function entry point (not inside _do_search)
@@ -1057,12 +1080,12 @@ def search_bodies(
         in Python needs every match first — tens of thousands of rows in a
         large codebase.
 
-        **FTS5 syntax errors:** Invalid FTS5 queries (e.g. unescaped special
-        characters) raise ``sqlite3.OperationalError`` with error code 1.
-        These are caught and logged — we return empty results rather than
-        propagating the error to the operator, because FTS5 syntax errors
-        are typically caused by operator input and are not operational
-        failures.
+        **FTS5 syntax errors:** a query that FTS5 refuses raises
+        ``sqlite3.OperationalError`` with error code 1.  The query is then
+        repaired with ``_sanitize_body_query`` and run once more; the rows
+        carry ``_fallback: "sanitized"``.  When the repair changes nothing
+        or fails too, the answer is the ``_fts5_rejection`` warning, never
+        an empty list.  Any other database error propagates.
 
         Args:
             c: Open read-only SQLite connection (provided by stale recovery).
@@ -1071,8 +1094,8 @@ def search_bodies(
         Returns:
             A page notice, then a result dict per definition with name,
             qualified_name, kind, file, line, is_definition, signature,
-            _match_snippet, and optionally source (truncated at 2000
-            characters).
+            _match_snippet, and optionally source (cut at 2000 characters
+            for a callable, 500 for any other kind) and match_lines.
         """
         kind_filter = ""
         project_filter = ""
@@ -1239,6 +1262,8 @@ def search_content(
     When ``files_fts`` is missing (legacy index), falls back to LIKE
     search on ``files.content`` — results include ``_fallback: "like"``
     and no snippet highlighting. Run ``fw-context index`` to upgrade.
+    The LIKE search splits the query on spaces and underscores and needs
+    EVERY word as a substring (AND, not OR).
 
     Read-only: yes. Requires the FTS5 index with file content. May
     auto-reindex stale files (non-blocking) — see ``search_code``.
@@ -1276,9 +1301,11 @@ def search_content(
           Read ``_match_snippet`` in that case.
 
         No match gives ``[]``.  A dict with ``error`` means the query
-        failed.  A stale index prepends a dict with ``warning`` + ``hint``,
-        and so does a query that FTS5 refuses to parse — the answer then
-        comes from the LIKE path and carries ``_fallback: "like"``.
+        failed.  A query that FTS5 refuses to parse prepends a dict with
+        ``warning`` + ``hint`` — the answer then comes from the LIKE path
+        and carries ``_fallback: "like"``.  When a file that the answer
+        names changed on disk, a dict with ``warning`` comes first; an
+        empty answer gets it too when indexed files changed.
     """
     root = resolve_project_root(project_root)
     # Enforce limit bounds at the function entry point (not inside _do_search)

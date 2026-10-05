@@ -697,7 +697,7 @@ def _try_macro_fallback(
 async def explain_symbol(
     name: Annotated[str, Field(description="Symbol name to explain. E.g. 'uart_init', 'ModemMsg::send'.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    context_lines: Annotated[int, Field(description="Lines of source context around the symbol definition.", ge=0)] = 40,
+    context_lines: Annotated[int, Field(description="Lines of source context around the symbol definition (1-200).", ge=0)] = 40,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> dict:
@@ -727,8 +727,9 @@ async def explain_symbol(
 
     Returns:
         dict: {name, kind, file, line, signature, explanation, llm_analysis
-        (if pre-computed)}, plus source/explain_prompt on fallback. Macro
-        fallback returns ``kind="macro"``, ``signature`` (as ``#define NAME``
+        (if pre-computed)}.  With no pre-computed analysis and no local
+        LLM (disabled), the dict holds ``explain_prompt`` and no
+        ``explanation``.  Macro fallback returns ``kind="macro"``, ``signature`` (as ``#define NAME``
         or ``#define NAME(a, b)``), ``is_function_like``, ``value`` (the
         replacement text ALONE), and ``expanded_value``.
 
@@ -743,18 +744,21 @@ async def explain_symbol(
         that moved gives its indexed body, not the code that now sits at the
         stored line number.
 
+        The on-demand path reads ``context_lines`` around the symbol from
+        the DISK.  That window is NOT ifdef-filtered: it holds every
+        ``#if`` branch.  This tool gives no ``source_origin``.
+
         An ``ambiguous_warning`` key means that *name* matched more than one
         symbol, such as two classes with a method of the same name.  This
-        answer is about ONE of them, and the key names it and lists the
-        others.  Give the full qualified name to ask about one symbol only.
+        answer is about ONE of them, and the key names it.  ``candidates``
+        (max 20) lists the others and ``candidates_total`` counts them.
+        Give a ``qualified_name`` from it to ask about one symbol only.
         It is separate from ``warning``, which the LLM error paths use.
 
-        On failure the dict holds ``error`` with the reason.  One failure
-        carries more than that: when the best match for *name* is in a file
-        outside the project root, the dict also holds ``candidates``,
-        ``candidates_total`` and a ``hint``.  Read them — a common name
-        matches many symbols, and one of the others is often inside the
-        project.
+        A symbol in a file outside the project root, such as an SDK
+        header, is explained and not refused.
+
+        On failure the dict holds only ``error`` with the reason.
     """
     try:
         db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)
@@ -911,7 +915,7 @@ async def explain_symbol(
 
 # ── moved from server.py ──
 def get_source(
-    name: Annotated[str, Field(description="Fully qualified symbol name. Returns exact function body via libclang extent.", min_length=1)],
+    name: Annotated[str, Field(description="Symbol name, or qualified name (Class::method) to select one symbol. Returns exact function body via libclang extent.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
@@ -927,8 +931,9 @@ def get_source(
     this build.  The line numbers do not move.  ``source_origin`` says where
     the text came from — ``"index"`` is the filtered copy, ``"disk"`` is the
     file itself and holds EVERY branch.  A body reaches you from the disk
-    only when the file changed after the last index run, and
-    ``stale_warning`` says so.
+    when the file changed after the last index run (``stale_warning`` says
+    so), or when the index holds no body for the symbol, such as a
+    declaration.
 
     For enums, includes a ``constants`` array listing all member constants
     with their values. For macros, returns kind="macro" with ``signature``
@@ -938,13 +943,13 @@ def get_source(
 
     For rich context (who calls this, what does it call) use
     ``get_symbol_context`` instead — it returns body, callers, and callees
-    in a single call. For the full file, use a normal file read.
+    in a single call. For the full file, use ``read_file``.
 
     Read-only. No side effects.
 
     Args:
-        name: Fully qualified symbol name. Returns exact function body
-            via libclang extent.
+        name: Symbol name, or qualified name (``Class::method``) to select
+            one symbol. Returns exact function body via libclang extent.
         project_root: Project root. Auto-detected if omitted.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
@@ -958,7 +963,7 @@ def get_source(
         warning (str, optional — when source file cannot be read)}.
         May also include ``end_line`` (the last line of the extent),
         ``template_usr``, ``parent_usr``, ``enum_value``, ``constants``
-        (list for enums), ``value`` (raw macro definition),
+        (list for enums), ``value`` (macro replacement text),
         ``expanded_value`` (preprocessor-resolved macro value) when
         applicable.  A declaration has no extent, thus it gets no
         ``end_line``.
@@ -982,23 +987,22 @@ def get_source(
 
         ``_source_truncated`` (True) marks a body that a cap cut:
         ``index.max_symbol_body_lines`` bounds the number of lines, and a
-        second cap bounds the characters.  The character cut lands in the
+        second cap bounds the characters (8000).  The character cut lands in the
         middle of a line, thus a body with this mark can end in an
         unbalanced brace.  Read the rest with ``read_file`` and a range.
 
         An ``ambiguous_warning`` key means that *name* matched more than one
         symbol, such as two classes with a method of the same name.  This
-        body belongs to ONE of them, and the key names it and lists the
-        others.  Give the full qualified name to get one symbol only.  It is
-        separate from ``warning``, which reports a body that could not be
-        read from the disk.
+        body belongs to ONE of them, and the key names it.  ``candidates``
+        (max 20, each with ``in_project_root``) lists the others and
+        ``candidates_total`` counts them.  Give a ``qualified_name`` from it
+        to get one symbol only.  It is separate from ``warning``, which
+        reports a body that could not be read from the disk.
 
-        On failure the dict holds ``error`` with the reason.  One failure
-        carries more than that: when the best match for *name* is in a file
-        outside the project root, the dict also holds ``candidates``,
-        ``candidates_total`` and a ``hint``.  Read them — a common name
-        matches many symbols, and one of the others is often inside the
-        project.
+        A body in a file outside the project root, such as an SDK header,
+        is returned and not refused.
+
+        On failure the dict holds only ``error`` with the reason.
     """
     try:
         db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)
@@ -1117,7 +1121,10 @@ def get_file_map(
     build compiles is reachable like any file of the application.
 
     Pass a path relative to the project root (``src/main.cpp``) or just the
-    filename (``main.cpp``). Returns symbols keyed by kind (function, method,
+    filename (``main.cpp``). The exact path wins; else the path matches
+    whole trailing path segments (``config.h`` matches ``src/config.h``,
+    not ``hw_config.h``), a project file before a vendor file, then the
+    shortest path. Returns symbols keyed by kind (function, method,
     class, struct, enum, ...). Each kind has count (total) and items (first N,
     default 30). Set max_per_kind=0 for unlimited, signatures=true for full sigs.
 
@@ -1151,7 +1158,11 @@ def get_file_map(
         ``end_line`` when the symbol is a definition.  The two line numbers
         are the extent, thus ``file:line-end_line`` is the citation.
 
-        On failure the dict holds only ``error`` with the reason.
+        When the file changed after the last index run, the dict adds
+        ``stale`` (True) and ``stale_warning`` (str).
+
+        On failure the dict holds ``error`` with the reason (plus the stale
+        keys when indexed files changed).
     """
     try:
         db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)
@@ -1445,14 +1456,15 @@ def get_symbol_context(
         dict with: name, qualified_name, kind, file, line, signature,
         docstring (raw Doxygen comment text), is_definition, callers (list),
         callees (list), source (body text),
-        indirect_call_sites (list, for field/variable symbols — where the
-        function pointer is actually invoked).
+        indirect_call_sites (list, max 200 — for a field/variable symbol,
+        where the function pointer is invoked; for a function/method, the
+        calls through function pointers that it makes).
         For field and variable symbols that have function pointer type,
         also includes ``resolution``: {assignments_found, call_sites_found,
         resolved, note} indicating whether assignments and call sites are
         linked (Phase 3).  ``resolved=False`` with a note when parts are
         missing — LLM can detect uncertainty.
-        For enums also returns constants and enum_value.
+        For an enum also returns constants; for an enum constant, enum_value.
         For macros returns ``kind="macro"``, ``signature`` (``#define NAME``
         or ``#define NAME(a, b)``), ``is_function_like``, ``value`` (the
         replacement text ALONE) and ``expanded_value``
@@ -1467,6 +1479,8 @@ def get_symbol_context(
         tells where the body comes from: ``"disk"`` when the symbol did not
         move, ``"index"`` when it did.  The callers and callees come from the
         index in all cases, thus a stale dict can hold an incomplete list.
+        ``_source_truncated`` (True) marks a body that a cap cut, as in
+        ``get_source``.
 
         The dict also carries the libclang flags of the symbol:
         is_virtual, is_pure_virtual, is_template, parent_usr, and
@@ -1478,15 +1492,14 @@ def get_symbol_context(
         An ``ambiguous_warning`` key means that *name* matched more than one
         symbol, such as two classes with a method of the same name.  Every
         part of this answer — body, callers and callees — is about the ONE
-        symbol that the key names, and the key lists the others.  Give the
-        full qualified name to ask about one symbol only.
+        symbol that the key names.  ``candidates`` (max 20) lists the others
+        and ``candidates_total`` counts them.  Give a ``qualified_name`` from
+        it to ask about one symbol only.
 
-        On failure the dict holds ``error`` with the reason.  One failure
-        carries more than that: when the best match for *name* is in a file
-        outside the project root, the dict also holds ``candidates``,
-        ``candidates_total`` and a ``hint``.  Read them — a common name
-        matches many symbols, and one of the others is often inside the
-        project.
+        A symbol in a file outside the project root, such as an SDK header,
+        is returned and not refused.
+
+        On failure the dict holds only ``error`` with the reason.
     """
     try:
         db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)
@@ -1734,9 +1747,14 @@ def read_file(
         line the ``content`` really holds, after the end was clamped to the
         length of the file.
 
-        On failure the dict holds only ``error`` with the reason: a
-        negative bound, an ``end_line`` before ``start_line``, or a
-        ``start_line`` past the end of the file.
+        When the file changed after the last index run, the dict adds
+        ``stale`` (True) and ``stale_warning`` (str): the content comes
+        from the index, not from the disk.
+
+        The path rules are those of ``get_file_map``.  On failure the dict
+        holds only ``error`` with the reason: a path the index does not
+        hold, an ``end_line`` before ``start_line``, or a ``start_line``
+        past the end of the file.
     """
     try:
         db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)

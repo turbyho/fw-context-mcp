@@ -5,11 +5,12 @@ The two counts are pinned by a test — a docstring that drifts describes
 a server that no longer exists.
 
 **Concurrency model — single-tool execution with busy rejection:**
-The server processes at most ONE tool request at a time.  If a request
-arrives while another is already running, the server waits up to 5 s for
-the running request to finish.  If it does not finish within that window,
-the new request is rejected with a ``"server busy"`` error that tells the
-client which tool is currently executing.
+The server processes at most ONE wrapped tool request at a time.  If a
+request arrives while another is already running, the server waits up to
+5 s for the running request to finish.  If it does not finish within that
+window, the new request is rejected with a ``"server busy"`` error that
+names the rejected tool.  The maintenance tools are not wrapped and do not
+take the lock (see the registration block below).
 
 **Why single-tool?**  The underlying SQLite database is WAL-mode but not
 designed for concurrent writers.  Parallel requests serialize on the
@@ -64,7 +65,7 @@ client-side connection timeouts.
 **Maintenance tools:** ``get_active_build``, ``get_environment_status``,
 ``check_dependencies``, ``list_projects``, ``get_project_info``,
 ``check_ollama``, ``configure_llm``, ``reindex_file``,
-``reindex_file_impl``, ``reset_index``.
+``reindex_file_impl``, ``reset_index``, ``list_variants``.
 
 **MCP Resources:** ``fw-context://stats``, ``fw-context://projects``,
 ``fw-context://symbols/{name}``, ``fw-context://skills/fw-review``.
@@ -160,7 +161,7 @@ def _wrap_tool(fn):
                 await asyncio.wait_for(_SERVER_LOCK.acquire(), timeout=_SERVER_LOCK_TIMEOUT)
             except TimeoutError:
                 _wrap_debug(f"[async] {fn.__name__} BUSY — lock timeout")
-                return [{"error": f"The MCP server is currently processing another query ({fn.__name__} cannot run right now because a different tool is already executing). Wait for the active query to complete, then retry. If this error persists, the active query may be stuck — restart the server with `fw-context watch`."}]
+                return [{"error": f"The MCP server is currently processing another query ({fn.__name__} cannot run right now because a different tool is already executing). Wait for the active query to complete, then retry. A query that runs longer than 300 s is cancelled."}]
             try:
                 task = asyncio.ensure_future(fn(*a, **kw))
 
@@ -487,8 +488,8 @@ def _with_project_selector(fn):
 
     Returns:
         A wrapper that accepts ``project``, or *fn* unchanged when it has
-        no ``project_root`` parameter — ``get_project_info`` and
-        ``check_ollama`` take no project.
+        no ``project_root`` parameter — ``get_project_info`` takes a
+        ``project_id`` instead.
     """
     # eval_str=True: the handler modules use PEP 563 string annotations,
     # and a stored __signature__ is given to pydantic as it is — inspect
@@ -580,9 +581,10 @@ mcp = FastMCP(
         "A blank line is thus an inactive line, or a line that is blank on\n"
         "disk, and nothing else.  Three limits:\n"
         "• The filter needs an index.  When a file changed after the last\n"
-        "  index run, get_source gives the current text from the DISK, which\n"
-        "  holds every branch.  It sets source_origin: \"disk\" and a\n"
-        "  stale_warning — read both before you cite such a body.\n"
+        "  index run, get_source and get_symbol_context set a stale_warning.\n"
+        "  When the symbol did not move, they give the current text from the\n"
+        "  DISK, which holds every branch, and set source_origin: \"disk\".\n"
+        "  Read both before you cite such a body.\n"
         "• An empty result can mean the pattern is only in a dead branch.\n"
         "  That is an answer, not a failure: the code does not compile.\n"
         "• A file can come back with every line blank.  read_file marks it\n"
@@ -596,6 +598,7 @@ mcp = FastMCP(
         "• Read a file, or a window of it ____ → read_file (line_numbers, start_line, end_line)\n"
         "• Read function body + callers/callees → get_symbol_context (preferred) / get_source\n"
         "• Function pointer assignments/calls _ → find_indirect_call_sites / find_indirect_targets\n"
+        "• Interrupt handler of each vector __ → get_vector_table (ISRs have no caller)\n"
         "• Natural-language question ________ → smart_search (slow, thorough)\n\n"
         "IMPORTANT: search_code searches symbol NAMES (what the code IS).\n"
         "search_bodies searches the TEXT OF EVERY DEFINITION — not only\n"
@@ -701,8 +704,9 @@ mcp = FastMCP(
         '   search_content("function_name").\n'
         "6. If all fw-context tools return empty, simplify query or use different tool.\n"
         "7. Only AFTER exhausting fw-context — use other available tools.\n\n"
-        "project_only=True (on search_code, search_bodies, search_content, and\n"
-        "callgraph tools) excludes vendor SDK code — use when asking about YOUR code.\n\n"
+        "project_only=True (on search_code, search_bodies, search_content,\n"
+        "find_dead_code, find_hotspots) excludes vendor SDK code — use when asking\n"
+        "about YOUR code.\n\n"
         "MULTI-PROJECT — a question about a DIFFERENT project:\n"
         "Each tool answers about ONE project. Without project or project_root\n"
         "this is the project of the current directory — NOT the project that\n"
@@ -711,6 +715,8 @@ mcp = FastMCP(
         "   root_path of each indexed project.\n"
         '2. Give project="<name>" (or project_root="<root_path>") to EVERY\n'
         "   call that follows, get_active_build included.\n"
+        "A name that several projects share gives an error that lists each one\n"
+        "with its project_id. Repeat the call with that project_id.\n"
         "Do not invent other parameter names. An unknown argument causes an\n"
         "error that names it.\n\n"
         "A PROJECT THAT HOLDS SEVERAL BUILDS — one project can hold several\n"
@@ -718,9 +724,9 @@ mcp = FastMCP(
         "A Zephyr project has `app`, `mcuboot` and `stage0`, and a bootloader\n"
         "is NOT the application.\n"
         "ONE QUERY ANSWERS FOR ONE BUILD.  Both selectors fail closed: when\n"
-        "the project has more than one variant, or the variant holds more than\n"
-        "one image, a query that names none gets an error that lists the\n"
-        "choices.  That is on purpose — an answer blending a bootloader with\n"
+        "the project declares variants and sets no [build] default_variant, or\n"
+        "the variant holds more than one image, a query that names none gets\n"
+        "an error that lists the choices.  That is on purpose — an answer blending a bootloader with\n"
         "an application serves no question, and two builds of one application\n"
         "would repeat nearly every row.\n"
         "• Call get_active_build for `multi`, `variants`, `images`,\n"
@@ -740,7 +746,8 @@ mcp = FastMCP(
         "with a page notice: lookup_symbol, search_code, search_bodies,\n"
         "search_content, find_callers, find_references, find_dead_code,\n"
         "find_hotspots.\n"
-        "The notice is {total, offset, shown, more, hint}, and it is ALWAYS\n"
+        "The notice is {total, offset, shown, more}, plus `hint` when `more`\n"
+        "is true.  It is ALWAYS\n"
         "there when the answer holds a row, thus a full page never leaves you\n"
         "guessing whether more exists.\n"
         "• Find the notice by its KEYS, not by its position.  A `warning`\n"
@@ -758,13 +765,18 @@ mcp = FastMCP(
         "costs a whole call.  The full schema of each tool is in the tool list.\n"
         "Read it there.  Three names cover almost every tool:\n"
         "• `name` — the symbol.  NOT `symbol`, NOT `symbol_name`.\n"
-        "  (lookup_symbol, get_source, get_symbol_context, find_callers,\n"
-        "  find_references, explain_symbol, and the call-graph tools)\n"
+        "  (lookup_symbol, get_source, get_symbol_context, explain_symbol,\n"
+        "  find_callers, find_references, find_all_callers_recursive,\n"
+        "  find_callees_recursive, find_indirect_*, find_variables).\n"
+        "  Exceptions: find_call_path (from_name, to_name), trace_data_flow\n"
+        "  (type_name, to_symbol), find_wrapper_callers and the inheritance\n"
+        "  tools (class_name, method_name, template_name).\n"
         "• `file_path` — the file.  (read_file, get_file_map, reindex_file)\n"
         "• `query` — the search terms.  (search_code, search_bodies,\n"
         "  search_content, smart_search, semantic_search)\n"
         "No tool takes a filler argument.  Send no argument you did not read in\n"
-        "the schema — `get_active_build` accepts only `project_root` and `fast`.\n"
+        "the schema — `get_active_build` accepts only `project`, `project_root`\n"
+        "and `fast`.\n"
         "When a call fails on an argument, DROP the bad argument and REPEAT the\n"
         "call.  Do not continue without the answer, and above all do not skip\n"
         "`get_active_build`: it says whether the index can be trusted at all.\n\n"
@@ -797,6 +809,8 @@ mcp = FastMCP(
         '  • status="ready" or "reindexing" — fw-context is fully operational.\n'
         "    bg_reindex_running does NOT mean the index is unavailable. Continue.\n"
         '  • status="reindex_needed" — queries still work, but schedule fw-context index.\n'
+        '    It wins over "reindexing".  When bg_reindex_running=True, that run\n'
+        "    already does the work: do not start a second one.\n"
         "  • client_restart_required=True — NOT a status, and NO command repairs\n"
         "    it. The index holds a newer row format than this session reads, thus\n"
         "    the index is correct and this session is the old reader. Queries keep\n"
@@ -820,12 +834,13 @@ mcp = FastMCP(
         '    get_active_build() again to confirm status="ready".\n'
         "    NOTE: init and index are NEVER combined — each requires its own\n"
         "    operator confirmation before execution.\n"
-        '  • status="error" — DB corruption or access error. Use other tools.\n\n'
+        "  • NO status, only `error` — DB corruption or access error. There is\n"
+        '    no status="error". Use other tools.\n\n'
         "REVIEW WORKFLOW — when reviewing C/C++ code changes (per changed symbol):\n"
         "0. find_hotspots(project_only=True) — identify highest-impact functions FIRST.\n"
         "   Prioritize review of hotspots (20+ callers) over leaf functions.\n"
         "1. get_symbol_context(name) — body + direct callers + callees + LLM analysis\n"
-        "   in one call. Replaces lookup_symbol + find_callers + find_callees_recursive.\n"
+        "   in one call. Replaces lookup_symbol + find_callers + a list of direct callees.\n"
         '2. If get_symbol_context callers are empty → search_bodies("name") and\n'
         "   find_indirect_call_sites / find_indirect_targets (function pointers,\n"
         "   callbacks, ISRs invisible to the call graph).\n"
@@ -833,16 +848,16 @@ mcp = FastMCP(
         "4. find_callees_recursive() → transitive downstream check.\n"
         "   After a logic change, verify compatibility with everything this function\n"
         "   calls — arguments, init order, error paths may have changed.\n"
-        '6. find_references("SymbolName") → all reads/writes/calls of changed types.\n'
-        '7. search_content("PATTERN") → confirm removal of #define/#ifdef/board names.\n'
-        "8. find_dead_code() → detect newly dead functions after removal.\n"
-        "9. trace_data_flow(type_name, to_symbol) → cross-module data dependencies.\n"
+        '5. find_references("SymbolName") → all reads/writes/calls of changed types.\n'
+        '6. search_content("PATTERN") → confirm removal of #define/#ifdef/board names.\n'
+        "7. find_dead_code() → detect newly dead functions after removal.\n"
+        "8. trace_data_flow(type_name, to_symbol) → cross-module data dependencies.\n"
         "   Use when a changed function produces or consumes typed data that flows\n"
         '   through other modules. E.g. trace_data_flow("SlotPin", "InventoryWriter").\n'
-        "10. For each search_bodies result set: scan ALL results — the 3rd match\n"
+        "9. For each search_bodies result set: scan ALL results — the 3rd match\n"
         "   may reveal an implementation the diff didn't touch (e.g. duplicate CRC\n"
         "   in a private method).\n"
-        "11. When analyzing BOTH a diff AND fw-context results: diff shows SCOPE\n"
+        "10. When analyzing BOTH a diff AND fw-context results: diff shows SCOPE\n"
         "   (what changed), fw-context verifies CORRECTNESS in full project context.\n"
         "   ALWAYS verify diff discoveries recursively with fw-context.\n\n"
         "DIFF → FW-CONTEXT VERIFICATION RULE:\n"
@@ -924,7 +939,10 @@ mcp = FastMCP(
         "    - Cloud: ask for URL, key, model. Call configure_llm.\n"
         "      If URL is external, ALWAYS warn: source code will be sent\n"
         "      to that endpoint — ensure compliance with data security.\n"
-        "  • status='model_missing' — Chat model not installed.\n"
+        "  • status='disabled' — [llm] enabled = false. Continue; no LLM calls.\n"
+        "  • status='error' — report `message` to the operator.\n"
+        "  • status='model_missing' — Chat or embedding model not installed;\n"
+        "    `message` names it and the `ollama pull` command.\n"
         "    YOU estimate download size from model name (your knowledge).\n"
         "    Report to operator with caveat: size may be inaccurate.\n"
         "    ALWAYS ASK: 'Download this model, or configure a separate\n"
@@ -954,8 +972,8 @@ mcp = FastMCP(
         "(gitignored). It does NOT modify global or shared config files.\n"
         "configure_llm returns status='error' — report the error message\n"
         "to the operator. If the test call failed, check API URL/key/model.\n"
-        "The config was still written to local.toml — fix the issue and\n"
-        "call configure_llm again, or call check_ollama to verify.\n"
+        "A failed call restores the previous local.toml, thus nothing changed —\n"
+        "fix the issue and call configure_llm again.\n"
         "configure_llm returns status='error' with 'not initialized' —\n"
         "tell operator to run 'fw-context init' in the project root first.\n"
         "Stream option: when the chat API is behind a reverse proxy (nginx,\n"

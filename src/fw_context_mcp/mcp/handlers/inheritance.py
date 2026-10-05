@@ -186,11 +186,15 @@ def get_inheritance_chain(
             name, qualified_name, kind, file, line,
             bases: [{name, usr, access, is_virtual, file}],
             derived: [{name, usr, access, is_virtual, file}],
-            all_bases: [...] (when transitive=True, ancestors sorted by depth),
-            all_derived: [...] (when transitive=True, descendants sorted by depth)
+            all_bases: [{name, usr, access, is_virtual, depth, file, kind}]
+                (when transitive=True, ancestors sorted by depth),
+            all_derived: [...] (when transitive=True, descendants, same shape)
         }
 
-        On failure the dict holds only ``error`` with the reason.
+        When a file of the answer changed after the last index run, the
+        dict adds ``stale`` (True) and ``stale_warning`` (str).
+
+        On failure the dict holds ``error`` with the reason.
     """
     try:
         db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)
@@ -284,7 +288,7 @@ def get_inheritance_chain(
 
 # ── moved from server.py ──
 def get_class_members(
-    class_name: Annotated[str, Field(description="Class or struct name. E.g. 'ModemManager' or 'the Mbed project::ZMODEM'.", min_length=1)],
+    class_name: Annotated[str, Field(description="Class or struct name. E.g. 'ModemManager' or 'comm::MODEM'.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
@@ -317,7 +321,10 @@ def get_class_members(
         [{name, qualified_name, signature, is_virtual, is_pure_virtual,
         line}]}, member_count}
 
-        On failure the dict holds only ``error`` with the reason.
+        When a file of the answer changed after the last index run, the
+        dict adds ``stale`` (True) and ``stale_warning`` (str).
+
+        On failure the dict holds ``error`` with the reason.
     """
     try:
         db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)
@@ -382,8 +389,8 @@ def get_template_instances(
     specializations across translation units.
 
     Returns concrete instantiations of the template — each with its full type
-    signature (e.g. ``Callback<void(int)>``).  The template declaration itself
-    is also returned as the first result when found.
+    signature (e.g. ``Callback<void(int)>``).  They are nested in the
+    ``instances`` list of one dict that describes the template itself.
 
     Uses the ``template_usr`` column populated during indexing via libclang's
     ``cursor.specialized_template``.
@@ -414,10 +421,12 @@ def get_template_instances(
         {name, qualified_name, kind, file, line, is_definition,
         signature, instances (list of dicts, each with name,
         qualified_name, kind, file, line, signature, is_definition),
-        instance_count (int)}
+        instance_count (int — the number returned, capped by ``limit``)}
 
-        No match gives ``[]``.  One dict with ``error`` means the query
-        failed — check that key first.
+        A dict with ``error`` means that the name was not found, is not a
+        template, or the query failed — check that key first.  When a file
+        of the answer changed after the last index run, a ``warning`` dict
+        comes first.
     """
     limit = max(0, min(limit, 200))  # clamp
     try:
@@ -508,7 +517,10 @@ def get_method_overrides(
             overridden_by: [{usr, name, qualified_name, kind, file, line}]
         }
 
-        On failure the dict holds only ``error`` with the reason.
+        When a file of the answer changed after the last index run, the
+        dict adds ``stale`` (True) and ``stale_warning`` (str).
+
+        On failure the dict holds ``error`` with the reason.
     """
     try:
         db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)

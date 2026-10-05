@@ -2,9 +2,9 @@
 
 All fallback strategies and formatting helpers are defined in
 :mod:`fw_context_mcp.search.shared_fallbacks` and re-exported here
-for backward compatibility.  Only ``_search_code_fts5_kind`` is
-handler-specific (it runs a primary FTS5 search with optional kind
-filter before the fallback chain).
+for backward compatibility.  Only ``_search_code_fts5_kind`` and its
+counter ``count_fts5_kind`` are handler-specific (they run the primary
+FTS5 search with optional kind filter before the fallback chain).
 
 WHY this re-export layer exists: the search fallback chain was
 originally in this module.  When it moved to ``search.shared_fallbacks``

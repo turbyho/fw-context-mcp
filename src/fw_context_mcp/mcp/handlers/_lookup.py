@@ -114,6 +114,11 @@ def lookup_symbol(
     (``uart_`` finds all UART symbols). Use search_code for
     keyword/concept search.
 
+    *name* matches the name or the qualified name.  A name with ``::``
+    that matches nothing is tried once more by its last part, kept where
+    the qualified name ends with *name*: ``Foo::bar`` finds
+    ``ns::Foo::bar``.  Macros are searched only when no symbol matches.
+
     Read-only: yes. May auto-reindex stale files (non-blocking).
 
     Args:
@@ -154,22 +159,23 @@ def lookup_symbol(
         outputs}``) when available.  A model wrote the text in
         ``llm_analysis``, and the code did not — use it to find a symbol,
         and quote ``signature``, ``docstring``, or ``get_source`` instead.
-        When no results found, may include ``_did_you_mean`` with suggested
-        symbol names. When no symbol matches, the list is empty — there is
-        then no page notice, because there is no page.  An ``info`` entry
-        comes back for one case only: an offset past the end of an answer
-        that does hold rows.
+        When nothing matches, a trailing dict may hold ``_did_you_mean``
+        with suggested names.  The symbols of the first suggestion that
+        matches exactly then come back, each with ``_fallback: True`` — its
+        name is NOT *name*.  With no match and no suggestion, the list is
+        empty and has no page notice, because there is no page.  An
+        ``info`` entry comes back for one case only: an offset past the
+        end of an answer that does hold rows.  When a file that the answer
+        names changed on disk, a dict with ``warning`` comes first.
 
         **Note:** C++ constructors share their name with the enclosing
         class, so ``lookup_symbol("Foo")`` may return both ``class Foo``
         and ``constructor Foo::Foo()``.  Use the ``kind`` field to
         filter when you need a specific symbol type.
 
-        A symbol that comes from the relaxed prefix fallback carries
-        ``_fallback: True`` — the name is not an exact match of *name*.
-
         A list with one dict that holds an ``error`` key means that the
-        project has no index, or that the lookup failed.  Read that key
+        project has no index, that the variant or image is wrong, or that
+        the lookup failed.  Read that key
         before you read the result fields.
     """
     try:

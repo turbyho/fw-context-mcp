@@ -535,10 +535,12 @@ def find_callers(
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
     """Find who calls a C/C++ function — direct calls AND indirect via
-    function pointers, callbacks, interrupt vector registrations, and
-    struct init lists. libclang-powered: detects function-pointer
-    assignments and ISR vector registrations that text-based search
-    cannot see.
+    function pointers, callbacks, and struct/array init lists (such as a
+    vector table that the build generates in C). libclang-powered: detects
+    function-pointer assignments that text-based search cannot see.
+    A slot of an assembly vector table (``ref_kind`` ``"vector"``) and an
+    ``NVIC_SetVector`` install (``"runtime_vector"``) are not callers: use
+    ``find_references`` or ``get_vector_table`` for those.
 
     Falls back to macro lookup when the symbol is not found as a
     function/method: returns the macro definition (kind="macro") and
@@ -597,10 +599,13 @@ def find_callers(
         the full qualified name to ask about one symbol only.
 
         A virtual method with no call site of its own answers with the
-        call sites of the methods that override the same base method.
-        Those rows reach a PEER and not the symbol you named, and the page
-        notice counts them, thus a ``warning`` dict always leads such an
-        answer and says so.  Read it before you report a caller count.
+        call sites of its base method and of the other overrides of that
+        base.  A ``warning`` dict leads such an answer, and each row
+        carries ``recorded_against`` (the symbol the index records the
+        call against) and ``reaches_this_symbol`` (true for a call on the
+        base method, which reaches this override at run time; false for a
+        call on a sibling override, which does not).  Read both before you
+        report a caller count.
 
         Never empty: one dict with ``error`` (symbol not resolved) or
         ``info`` (no references of this kind).  Check both keys first.
@@ -611,16 +616,16 @@ def find_callers(
 def find_references(
     name: Annotated[str, Field(description="Symbol name to find all references of — calls, reads, member accesses.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    limit: Annotated[int, Field(description="Maximum results of one page.", ge=1)] = 50,
+    limit: Annotated[int, Field(description="Maximum results of one page (default 50, max 200).", ge=1)] = 50,
     offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a symbol with many references.", ge=0)] = 0,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
     """Find ALL references to a C/C++ symbol — calls, reads, member accesses,
-    function pointer registrations, template references, and macro
+    function pointer registrations, vector table slots, and macro
     usages. libclang-powered: detects function-pointer registrations
-    (interrupt vector table writes, callback attachments, ISR handler
-    assignments) that text-based search cannot see.
+    (vector table entries, callback attachments, ``NVIC_SetVector``
+    installs) that text-based search cannot see.
 
     Falls back to macro lookup when the symbol is not found as a
     function/method: returns the macro definition (kind="macro") and
@@ -654,7 +659,14 @@ def find_references(
         ``"indirect"`` (function-pointer reference in arguments, assignments,
         initializers, or init lists), ``"implicit_construct"`` (implicit
         constructor call from global/static object or member-field
-        initialization), ``"macro_use"`` (macro usage
+        initialization), ``"dispatch"`` (synthetic edge from a dispatch
+        bridge such as ``EventQueue::call_every``), ``"vector"`` (a slot of
+        an assembly vector table names the symbol; file and line are the
+        table entry), ``"vector_data"`` (a slot holds an address computed
+        from the symbol, such as the initial stack pointer),
+        ``"runtime_vector"`` (an ``NVIC_SetVector`` call installs the
+        symbol at run time), ``"alias"`` (``.thumb_set``: another assembly
+        name for the symbol), ``"macro_use"`` (macro usage
         in file). Macro fallback puts a dict with ``kind="macro"``,
         ``signature`` (``NAME`` or ``NAME(a, b)``), ``is_function_like``,
         ``value`` (the replacement text ALONE) and ``expanded_value``
@@ -669,10 +681,11 @@ def find_references(
         about one symbol only.
 
         A virtual method with no reference of its own answers with the
-        references of the methods that override the same base method.
-        Those rows reach a PEER and not the symbol you named, and the page
-        notice counts them, thus a ``warning`` dict always leads such an
-        answer and says so.  Read it before you report a reference count.
+        references of its base method and of the other overrides of that
+        base.  A ``warning`` dict leads such an answer, and each row
+        carries ``recorded_against`` and ``reaches_this_symbol`` (true only
+        for a row on the base method), as in ``find_callers``.  Read both
+        before you report a reference count.
 
         Never empty: one dict with ``error`` (symbol not resolved) or
         ``info`` (no references).  Check both keys first.
@@ -683,7 +696,7 @@ def find_references(
 def find_indirect_call_sites(
     name: Annotated[str, Field(description="Name of the function pointer field or variable to find call sites of. E.g. 'onData' finds all calls through Driver::onData.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root directory. Auto-detected if omitted.")] = None,
-    limit: Annotated[int, Field(description="Maximum results (default 50).", ge=1)] = 50,
+    limit: Annotated[int, Field(description="Maximum results (default 50, max 200).", ge=1)] = 50,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
@@ -710,7 +723,8 @@ def find_indirect_call_sites(
         name: Name of the function pointer field or variable.
             E.g. ``"onData"`` finds every call through a field named
             ``onData``.  Uses three-tier resolution: exact name, exact
-            qualified, suffix LIKE.
+            qualified, suffix LIKE; a function pointer parameter matches
+            by its exact name.
         project_root: Project root directory. Auto-detected if omitted.
         limit: Maximum results (default 50, max 200).
         variant: Build variant (multi-build project). Omit to use
@@ -799,7 +813,10 @@ def find_indirect_targets(
     Args:
         name: Name of the function pointer field, variable, or parameter.
             E.g. ``"onData"`` finds every function assigned to a field
-            named ``onData``.  Uses three-tier resolution.
+            named ``onData``.  Matches the pointer by exact name, exact
+            qualified name, or ``::name`` suffix.  It also matches the
+            ASSIGNED function by exact name or substring, thus a row can be
+            an assignment of a function whose name holds *name*.
         project_root: Project root directory. Auto-detected if omitted.
         limit: Maximum results (default 50, max 200).
         variant: Build variant (multi-build project). Omit to use
@@ -813,10 +830,12 @@ def find_indirect_targets(
         init_list), assign_file, assign_line, assign_caller,
         call_file, call_line, call_expr_text.
 
-        An entry can carry ``_note`` (str) when fw-context cannot resolve
-        the direct call site — the callee is template-obscured, or the call
-        site comes from the type-based fallback.  Read that note before you
-        act on ``call_file`` and ``call_line``.
+        An entry can carry ``_note`` (str) when the callee is
+        template-obscured: the call site is then missing, or comes from
+        the type-based fallback.  A ``call_expr_text`` of ``"<inferred via
+        class hierarchy>"`` marks a call site that a fallback found, not
+        the field's USR.  Read both before you act on ``call_file`` and
+        ``call_line``.
 
         Never empty: one dict with ``error`` (cannot resolve) or ``info``
         (no results) replaces the results.  Check both keys first.
@@ -947,7 +966,7 @@ def find_call_path(
     from_name: Annotated[str, Field(description="Starting symbol for path search.", min_length=1)],
     to_name: Annotated[str, Field(description="Target symbol to find path to.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    max_depth: Annotated[int, Field(description="Maximum BFS depth for path search (default 10).", ge=1)] = 10,
+    max_depth: Annotated[int, Field(description="Maximum BFS depth from each end of the search (default 10). A path can hold up to 2 x max_depth edges.", ge=1)] = 10,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
@@ -960,7 +979,8 @@ def find_call_path(
 
     Use to answer "how does A reach B?" — e.g. tracing how a high-level
     event handler eventually calls a low-level driver.  Returns up to 5
-    shortest paths, each with ``depth`` (edge count) and ``chain``
+    distinct paths in BFS order (short paths first), each with ``depth``
+    (edge count) and ``chain``
     (e.g. ``"main → app_run → modem_init"``).
 
     **Edge types traversed:** The BFS includes ``call``, ``indirect``
@@ -1007,10 +1027,12 @@ def find_call_path(
         from_name: Starting symbol for path search.
         to_name: Target symbol to find path to.
         project_root: Project root. Auto-detected if omitted.
-        max_depth: Maximum BFS depth for path search (default 10). No
-            clamp holds this number. What bounds a deep search is the node
-            budget of the walk — 5000 expansions — thus a large depth
-            gives up on that budget and not on the depth.
+        max_depth: Maximum BFS depth for path search (default 10). The
+            search runs from both ends, and each end goes up to
+            ``max_depth`` hops, thus a path can hold up to 2 × max_depth
+            edges. No clamp holds this number. What bounds a deep search is
+            the node budget of the walk — 5000 expansions — thus a large
+            depth gives up on that budget and not on the depth.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
         image: Sysbuild image within the variant. Required when the
@@ -1229,8 +1251,8 @@ def find_dead_code(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum results of one page (default 100, max 200).", ge=1)] = 100,
     offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a long report.", ge=0)] = 0,
-    exclude_paths: Annotated[list[str] | None, Field(description="Additional LIKE patterns to exclude. Merged with defaults from config. E.g. ['lib/%'].")] = None,
-    project_only: Annotated[bool, Field(description="When True (default), auto-excludes SDK/vendor paths based on the detected build system and applies project config exclude_paths. Set False to see all results.")] = True,
+    exclude_paths: Annotated[list[str] | None, Field(description="LIKE patterns on the project-relative file path to exclude, on top of project_only. E.g. ['lib/%'].")] = None,
+    project_only: Annotated[bool, Field(description="When True (default), keeps only project code (is_project, from the vendor_paths/project_paths config and SDK detection). Set False to see all results.")] = True,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
@@ -1240,8 +1262,10 @@ def find_dead_code(
     just within a single file — text-based search cannot determine
     whether a function is actually reachable.
 
-    **What "dead" means:** zero references in the index — no call, no
-    function-pointer assignment, no indirect call site.  This is a
+    **What "dead" means:** zero references of any ``ref_kind`` in the
+    index — no call, no read, no function-pointer use, no vector slot.
+    Only functions, methods, constructors, and destructors with a
+    definition are checked.  This is a
     single-layer reference check, NOT a reachability analysis from the
     entry points (main, ISR, exported symbols): a function that only a
     second dead function calls still has a reference, thus this tool does
@@ -1251,22 +1275,33 @@ def find_dead_code(
     The ``status`` field splits the results:
 
     * ``"dead"`` — no reference at all.  Likely unused.
-    * ``"possibly_dead"`` — assigned to a function pointer (Phase 1
-      ``ref_kind="indirect"``), but no call site through that pointer
-      resolved (Phase 3).  Unindexed code or a type-erased API can still
-      call it.  Treat it as uncertain, and check each hit with
-      ``find_indirect_targets`` before you delete anything.
+    * ``"possibly_dead"`` — assigned to a function pointer
+      (``ref_kind="indirect"``) and never called directly, but no call
+      site through that pointer resolved.  Unindexed code or a type-erased
+      API can still call it.  Treat it as uncertain, and check each hit
+      with ``find_indirect_targets`` before you delete anything.
 
     fw-context detects a constructor call through global/static object and
     member-field initialization as an ``implicit_construct`` reference.
-    Known false positives remain: constructors from factories, ISRs,
-    virtual method overrides, and weak-aliased symbols.  Always verify
-    before you delete.
+
+    ISRs: a handler that an assembly vector table names (``.word``) has a
+    ``vector`` reference, and one that ``NVIC_SetVector`` installs has a
+    ``runtime_vector`` reference, thus neither is reported.  A handler in
+    a table that the build generates in C has an ``indirect`` reference
+    and can show as ``possibly_dead``.  A handler that no readable table
+    names (a slot with a linker-resolved address; arm64, Xtensa, MIPS
+    tables of branch instructions) shows as ``dead``.  Use
+    ``get_vector_table`` to check.
+
+    Other known false positives: constructors from factories, virtual
+    method overrides, and weak-aliased symbols.  Always verify before you
+    delete.
 
     ``project_only=True`` (default) excludes the SDK and vendor paths
     through the ``is_project`` column, which follows the ``vendor_paths``
     and ``project_paths`` config.  Set ``project_only=False`` to see the
-    vendor results too.
+    vendor results too.  No config default is added to
+    ``exclude_paths``.
 
     Read-only. No side effects. Requires the reference index
     (``fw-context index`` — refs on by default).
@@ -1286,13 +1321,17 @@ def find_dead_code(
             variant holds several: each image is a separate program.
 
     Returns:
-        list of dicts, each with: name, qualified_name, kind, signature,
-        file (str — absolute), line, status (``"dead"`` or
+        The page notice first — ``total``, ``offset``, ``shown``, ``more``
+        — then a dict per function with: name, qualified_name, kind,
+        signature, file (str — absolute), line, status (``"dead"`` or
         ``"possibly_dead"``), and reason (str — explains why the function
-        is classified as dead or possibly dead).
+        is classified as dead or possibly dead).  A ``"possibly_dead"`` row
+        also holds indirect_refs (str — up to 3 ``file:line`` pointer
+        uses, paths relative to the project root).  ``"dead"`` rows come
+        first.
 
-        Never empty: one dict with ``info`` replaces an empty result.
-        Check that key first.
+        Never empty: one dict with ``error`` or ``info`` replaces an empty
+        result.  Check both keys first.
     """
     # One row at least.  With no row the answer falls through to the
     # ``info`` row below, which tells the reader that every defined
@@ -1340,7 +1379,7 @@ def find_dead_code(
 def find_wrapper_callers(
     class_name: Annotated[str, Field(description="Driver class name to find wrappers for. E.g. 'UART_DRIVER' or 'hal::UART_DRIVER'.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    limit: Annotated[int, Field(description="Maximum wrapper method results (default 50, max 50).", ge=1)] = 50,
+    limit: Annotated[int, Field(description="Maximum call sites into the driver that are read and grouped (default 50, max 50).", ge=1)] = 50,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
@@ -1365,7 +1404,10 @@ def find_wrapper_callers(
         class_name: Driver class name to find wrappers for.
             E.g. ``'UART_DRIVER'`` or ``'hal::UART_DRIVER'``.
         project_root: Project root. Auto-detected if omitted.
-        limit: Maximum wrapper method results (default 50, max 50).
+        limit: Maximum call sites into the driver (``call`` and
+            ``indirect`` references) that are read and grouped (default 50,
+            max 50).  The answer holds no page notice, thus a driver with
+            more call sites gives a partial grouping.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
         image: Sysbuild image within the variant. Required when the
@@ -1539,8 +1581,9 @@ def trace_data_flow(
     signature and maps call paths through the full call graph, which
     text-based search cannot trace across translation units.
 
-    Finds functions whose signature mentions *type_name*, then looks for call
-    paths from those functions to *to_symbol*.  Returns a data flow map —
+    Finds definitions whose signature mentions *type_name* (substring
+    match, any symbol kind, most-called first), then looks for call
+    paths from those to *to_symbol*.  Returns a data flow map —
     useful for understanding how a data structure travels through the system
     to its destination.
 
@@ -1571,15 +1614,17 @@ def trace_data_flow(
         list of dicts with a leading ``_summary`` entry:
         {_summary (str), _type (str), _target (str)}, followed by source
         entries each with: source_name, source_qualified_name, source_kind,
-        source_file, source_line, caller_count, reachable (bool), and
-        paths (list of call path dicts — empty when unreachable).
+        source_file (absolute), source_line, caller_count, reachable
+        (bool), and paths (up to 3 path dicts as ``find_call_path`` gives
+        them; the key is absent when unreachable).
 
-        A source entry with ``timed_out: True`` means that the path search
-        stopped at the time limit for that source.  Its ``reachable: False``
-        thus means "not proved reachable", not "proved unreachable".
+        A source entry with ``timed_out: True`` means that the time budget
+        ran out before the search for that source began.  Its
+        ``reachable: False`` thus means "not checked", not "proved
+        unreachable".
 
-        Never empty: one dict with ``info`` replaces an empty result.
-        Check that key first.
+        Never empty: one dict with ``error`` or ``info`` replaces an empty
+        result.  Check both keys first.
     """
     max_depth = max(1, min(max_depth, 20))  # clamp
     limit = max(0, min(limit, 15))  # clamp
@@ -1687,7 +1732,7 @@ def find_hotspots(
     limit: Annotated[int, Field(description="Number of top-called functions per page (default 20, max 50).", ge=1)] = 20,
     offset: Annotated[int, Field(description="Skip this many results. Reads further down the ranking.", ge=0)] = 0,
     project_only: Annotated[bool, Field(description="When True (default), auto-excludes SDK/vendor paths so hotspots reflect project code.")] = True,
-    exclude_paths: Annotated[list[str] | None, Field(description="Additional LIKE patterns to exclude. Merged with defaults. E.g. ['lib/%'].")] = None,
+    exclude_paths: Annotated[list[str] | None, Field(description="LIKE patterns on the project-relative file path to exclude, on top of project_only. E.g. ['lib/%'].")] = None,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
@@ -1726,12 +1771,13 @@ def find_hotspots(
             variant holds several: each image is a separate program.
 
     Returns:
-        list of dicts, each with: name, qualified_name, kind, signature,
-        file (str — absolute), line,
-        caller_count (int — total number of call sites).
+        The page notice first — ``total``, ``offset``, ``shown``, ``more``
+        — then a dict per function with: name, qualified_name, kind,
+        signature, file (str — absolute), line, caller_count (int — number
+        of ``call`` and ``indirect`` references to it).
 
-        Never empty: one dict with ``info`` replaces an empty result.
-        Check that key first.
+        Never empty: one dict with ``error`` or ``info`` replaces an empty
+        result.  Check both keys first.
     """
     # One row at least, for the reason given in ``find_dead_code``: with
     # no row this tool answers that the project holds no hotspot, which
@@ -2064,8 +2110,8 @@ def _vector_rows(
 
 def get_vector_table(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    unhandled_only: Annotated[bool, Field(description="Return only the slots that reach the default handler.")] = False,
-    limit: Annotated[int, Field(description="Maximum slots (default 400).", ge=1)] = 400,
+    unhandled_only: Annotated[bool, Field(description="Return only the slots with status 'unhandled' (an alias of a default handler, nothing installed at run time).")] = False,
+    limit: Annotated[int, Field(description="Maximum slots (default 400, max 1000).", ge=1)] = 400,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
@@ -2091,10 +2137,12 @@ def get_vector_table(
     * ``"c"`` — a definition outside assembly.  Code runs.  When the
       index also holds the weak definition that this one replaced, the
       row has ``overridden`` with its file and line.
-    * ``"assembly"`` — a strong assembly definition.  Assembly services
-      the interrupt.
-    * ``"unhandled"`` — a weak assembly definition that nothing
-      overrode.  A CMSIS startup file makes this an alias of
+    * ``"assembly"`` — an assembly definition that is not an alias.
+      Assembly services the interrupt.
+    * ``"unhandled"`` — an assembly name that is an alias (``.thumb_set``)
+      of another symbol, and nothing overrode it.  The row holds
+      ``aliases``, the name, file and line of the alias target.  A CMSIS
+      startup file aliases each unserviced interrupt to
       ``Default_Handler``, which is an infinite loop.  If the interrupt
       fires, the device stops.
     * ``"runtime"`` — the image holds that same alias, and the code
@@ -2134,7 +2182,7 @@ def get_vector_table(
     file defines each handler weakly, the project defines the same name
     again, and the linker keeps the strong one.
 
-    **Two sources are read**, and ``source`` says which one a row came
+    **Three sources are read**, and ``source`` says which one a row came
     from:
 
     * ``"assembly"`` — a table of address words, ``.word`` or ``.long``
@@ -2156,9 +2204,11 @@ def get_vector_table(
       behind the ``nrfx_isr`` shim it is the real worker
       (``nrfx_power_clock_irq_handler``), while for another driver it is
       the device (``__device_dts_ord_116``).  When the build enables
-      run-time registration, a dict with ``info`` says so, because an
-      interrupt connected at run time leaves nothing to read and the rows
-      are then not all of them.
+      run-time registration (``CONFIG_DYNAMIC_INTERRUPTS``), the
+      ``interrupts`` dict says so, because an interrupt connected at run
+      time leaves nothing to read and the rows are then not all of them.
+      A ``"build"`` row has ``file`` empty and ``line`` 0 when the handler
+      name has no single definition in the index.
 
     Recognition is by shape, never by name, so any array of function
     addresses is reported and the row names its table.  A table of
@@ -2208,8 +2258,8 @@ def get_vector_table(
     ``find_references`` on the handler name still gives every reference
     the index holds.
 
-    Read-only. No side effects. Requires an index of the assembly
-    (``fw-context index``).
+    Read-only. No side effects. Requires an index of the assembly and the
+    reference index (``fw-context index`` — refs on by default).
 
     Args:
         project_root: Project root. Auto-detected if omitted.
@@ -2226,10 +2276,13 @@ def get_vector_table(
         ``"build"``),
         status (``"c"``, ``"assembly"``, ``"unhandled"``, ``"runtime"``,
         ``"data"``, ``"linker"`` or ``"dispatcher"``), and table_file and table_line
-        (where the slot is written).  A ``"c"`` source row also holds
+        (where the slot is written).  Paths in this answer are as the
+        index stores them: relative to the project root for a file inside
+        it.  A ``"c"`` source row also holds
         table_name and table_usr.  A ``"c"`` status row can hold
-        overridden, a dict with file and line.  Any assembly row can hold
-        installed, a list of dicts with name, file, line and at.
+        overridden, a dict with file and line.  An ``"unhandled"`` row
+        holds aliases, a dict with name, file and line.  Any assembly row
+        can hold installed, a list of dicts with name, file, line and at.
 
         Never empty: one dict with ``error`` (no index) or ``info`` (no
         vector table in this build).  Check both keys first.  A dict with

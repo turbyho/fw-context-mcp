@@ -389,17 +389,21 @@ def get_active_build(
     using any other fw-context tools.
 
     Read-only, and it spawns no subprocess — the startup daemon thread and
-    the file watcher own the background reindex.
+    the file watcher own the background reindex.  One exception: the config
+    load creates default ``.fw-context/config.toml`` and ``local.toml``
+    when they are missing.
 
     Act on ``status``:
 
     * ``"ready"`` — up to date. Continue.
-    * ``"reindexing"`` — background reindex running; queries stay accurate.
-      Continue. ``reindex_progress`` holds its last log line.
+    * ``"reindexing"`` — background reindex running, or fw-context builds
+      new source files on its own; queries stay accurate. Continue.
+      ``reindex_progress`` holds the last log line of a running reindex.
     * ``"reindex_needed"`` — schema mismatch, an old row format, changed
-      compile_commands.json, or a source file that compile_commands.json
-      does not cover. Queries still work on existing data. Read
-      ``reindex_reasons``: a missing source file needs
+      compile_commands.json, a branch change since the index, or a source
+      file that compile_commands.json does not cover and fw-context will
+      not build itself. Queries still work on existing data. Read
+      ``reindex_reasons``: a missing source file and a branch change need
       ``fw-context index --build``, the others need only
       ``fw-context index``.
 
@@ -414,16 +418,19 @@ def get_active_build(
     * ``"no_index"`` — initialized, never indexed. Run ``fw-context index``.
     * ``"not_initialized"`` — run ``fw-context init``.
 
-    A failure sets NO ``status``.  DB corruption, or no access to the
-    index, gives a dict that holds ``error`` alone.  Read that key first:
+    A failure sets NO ``status``.  DB corruption, no access to the index,
+    or an index with no build config gives a dict that holds ``error``
+    alone.  Read that key first:
     a reader that waits for ``status == "error"`` waits for a value this
     tool does not produce.
 
-    Four conditions set ``reindex_needed``: an outdated schema, an outdated
-    ROW FORMAT, a changed compile_commands.json, and a source file that is
-    on disk but absent from compile_commands.json.  The last one needs a
-    build, because only the build system writes that file — a plain reindex
-    has no translation unit for the file and skips it without a word.
+    Five conditions set ``reindex_needed``: an outdated schema, an outdated
+    ROW FORMAT, a changed compile_commands.json, a branch change since the
+    index, and a source file that is on disk but absent from
+    compile_commands.json when fw-context will not build it on its own.
+    The last two need a build, because only the build system writes that
+    file — a plain reindex has no translation unit for a new file and skips
+    it without a word.
     Modified source files are something else: they are handled per-query,
     and never set it.
 
@@ -456,8 +463,8 @@ def get_active_build(
 
     ``indexed_at`` and ``first_indexed_at`` are UTC; file mtimes are local
     time.  Never compare the two directly — in UTC+2 a correctly indexed
-    file looks 2 hours newer than ``indexed_at``.  Call with ``fast=False``
-    to find modified files.
+    file looks 2 hours newer than ``indexed_at``.  Read
+    ``modified_files_count`` to find modified files.
 
     ``analysis`` splits the LLM-analysis coverage into project and vendor
     symbols:
@@ -469,10 +476,10 @@ def get_active_build(
       ``skipped`` = tried, but not analyzable (body larger than the model
       context, an unparseable answer, or a body that was not readable).
     * ``complete`` — no work left: every project symbol is analyzed or
-      skipped.  True exactly when ``reindex_reasons`` holds no "unanalyzed
-      symbols" entry.  Vendor symbols excluded by ``analyze_vendor=False``
-      never block it, thus ``vendor.total`` large with ``vendor.analyzed=0``
-      is expected, not a defect.
+      skipped, and every vendor symbol too when ``analyze_vendor`` is True.
+      Vendor symbols excluded by ``analyze_vendor=False`` never block it,
+      thus ``vendor.total`` large with ``vendor.analyzed=0`` is expected,
+      not a defect.  ``index_message`` ends with the same counts as text.
 
     Args:
         project_root: Project root directory. Auto-detected from CWD if
@@ -512,8 +519,9 @@ def get_active_build(
         "reindex_needed"|"no_index"|"not_initialized"; a failure sets no
         status and gives ``error`` alone), reindex_needed (bool —
         structural mismatch requiring a full reindex),
-        reindex_reasons (list[str] — why reindex is needed, empty when False.
-        One of them asks for `fw-context index --build` rather than a plain
+        reindex_reasons (list[str] — why reindex is needed, empty when False,
+        except that a new source file that fw-context builds on its own is
+        listed while ``reindex_needed`` is False.  One of them asks for `fw-context index --build` rather than a plain
         reindex: when the tree is on a different branch than the index,
         compile_commands.json belongs to the OLD branch and carries its file
         list and its compiler flags, so only a build regenerates it.  Read
@@ -545,8 +553,11 @@ def get_active_build(
         ``memory`` and ``entry_point`` describe ONE build.  For a
         multi-variant project they follow ``config_hash``, which is the
         build named by ``[build] default_variant``, and both are empty when
-        the config names no default.  Use ``list_variants`` for the map of
-        every build.
+        the config names no default (``config_hash`` and
+        ``compile_commands`` are then empty too).  For such a project
+        ``symbol_count``, ``file_count``, and ``reference_count`` are sums
+        over all builds.
+        Use ``list_variants`` for the map of every build.
 
         ``memory`` is empty for a build system that records no linker
         script.  A PlatformIO project is the measured case: SCons writes no
@@ -1190,7 +1201,11 @@ def _list_status(db_schema_ver: int, cc_stale: bool) -> str:
 def list_projects(
     project_root: Annotated[
         str | None,
-        Field(description="Project root. Auto-detected if omitted. Pass to distinguish multiple indexed projects."),
+        Field(
+            description="Project root whose config names the index directory; pass it to distinguish multiple "
+            "indexed projects that keep separate index directories. Omitted = the global config. Every "
+            "project in that directory is listed."
+        ),
     ] = None,
 ) -> list[dict]:
     """List all indexed firmware projects with their statistics.
@@ -1206,8 +1221,8 @@ def list_projects(
     ``get_active_build`` for that project.
 
     Args:
-        project_root: Project root. Auto-detected if omitted. Pass to
-            distinguish multiple indexed projects.
+        project_root: Project root whose config names the index
+            directory (``index.db_dir``).  Omitted, the global config does.
 
     Returns:
         list of dicts, each with: project_id, name, root_path, build_system,
@@ -1336,7 +1351,8 @@ def reset_index(
 
     Returns:
         dict: {project_root, db, project_id, action: "dry_run"|"deleted",
-        message, symbol_count, indexed_at (dry-run)}.
+        message, symbol_count, indexed_at}.  ``symbol_count`` and
+        ``indexed_at`` are present only when a build config is readable.
 
         A ``warning`` key means that the database is corrupt — the
         integrity check failed, thus the counts can be incomplete.
@@ -1974,11 +1990,19 @@ def reindex_file_impl(
             method override relationships, PageRank, and embeddings. Set False
             for a fast symbol-only update (used by background auto-reindex).
 
-    Returns:
-        dict: {file, translation_units, symbols_updated, elapsed_s,
-        analysis_updated (if LLM enabled with analysis), or error}.
+    A file that is gone from disk but still in the index has its records
+    removed; the result is then {file, symbols_removed, action: "deleted"}.
 
-        On failure the dict holds only ``error`` with the reason.
+    Returns:
+        dict: {file, translation_units, symbols_updated, elapsed_s}, plus
+        when they apply: skipped_tus and skipped_count (units that failed to
+        parse), warning (header coverage), analysis_updated and
+        embeddings_updated (counts for the whole build, not this file), and
+        analysis_warning, overrides_warning, pagerank_warning, or
+        embedding_warning when a phase failed.
+
+        On failure the dict holds ``error`` with the reason, and can add
+        ``skipped_tus`` or ``action``.
     """
     db_path, cfg, project_id, root = _resolve_context(project_root, skip_ready_check=True)
     if not db_path.exists():
@@ -2287,9 +2311,15 @@ def reindex_file(
             compile_commands.json; a header goes through one including unit.
         project_root: Project root directory. Auto-detected if omitted.
 
+    A file that is gone from disk but still in the index has its records
+    removed; the result is then {file, symbols_removed, action: "deleted"}.
+
     Returns:
-        dict: {file, translation_units, symbols_updated, elapsed_s,
-        analysis_updated (if LLM enabled), or error}.
+        dict: {file, translation_units, symbols_updated, elapsed_s}, plus
+        optional skipped_tus, skipped_count, warning, analysis_updated,
+        embeddings_updated, and per-phase ``*_warning`` keys — the same
+        shape as ``reindex_file_impl``.  On failure the dict holds
+        ``error``.
     """
     return reindex_file_impl(file_path, project_root, with_analysis=True)
 
@@ -2318,12 +2348,20 @@ def check_ollama(
         ollama_running (bool), ollama_url (str), configured_model (str),
         num_ctx (int), installed_models (list[str]),
         chat_api (dict — ``{configured (bool), model (str)}``: whether an
-        external chat API replaces Ollama, and the model it names),
+        external chat API replaces Ollama, and the model it names; a
+        configured one adds endpoint, format, and compliance_warning for an
+        external host),
         configured_embed_model (str), embedding_installed (bool),
-        message (str, on error/disabled), model_details (list[dict], when
-        Ollama running), suggest_cloud (bool), vec_available (bool),
+        message (str, when status is not "ok"), model_details (list[dict]),
+        suggest_cloud (bool), vec_available (bool),
         vec_error (str, optional), debug_log (str, optional — only when
         debug logging is enabled)}
+
+        ollama_url, num_ctx, installed_models, model_details,
+        configured_embed_model, and embedding_installed are present only
+        when Ollama runs; configured_model also needs chat on Ollama.
+        ``"disabled"`` gives only status, ollama_enabled,
+        ollama_running, configured_model, num_ctx, and message.
     """
     try:
         _, cfg, _, _ = _resolve_context(project_root)
@@ -2444,7 +2482,8 @@ def get_environment_status(
 ) -> dict:
     """Return the complete project environment status in one call.
 
-    Read-only. Aggregates five domains into a single call so the LLM can
+    Read-only, except that its ``get_active_build`` call creates default
+    config files when they are missing. Aggregates five domains into a single call so the LLM can
     see everything at session start without extra round-trips:
 
     - ``deps`` — dependency audit (``run_full_check``), each entry with an
@@ -2454,7 +2493,7 @@ def get_environment_status(
     - ``build_system`` — detected build system, ``None`` when unknown.
     - ``compile_db`` — whether compile_commands.json exists and its entry count.
       Reported as ``{"exists": false, ...}`` before init (no config to resolve
-      the path from, and loading one would create empty config files).
+      the path from).
     - ``index`` — the FULL ``get_active_build()`` result, unchanged (its action
       lives in ``index_message``).
     - ``llm`` — LLM backend status with an optional ``action``.
@@ -2475,8 +2514,8 @@ def get_environment_status(
         cannot read the file)}),
         index (dict — the full ``get_active_build`` result),
         llm (dict — {enabled, ollama_running, chat_model, embed_model}, plus
-        ``ollama_enabled`` when the LLM check ran, plus an optional
-        ``action``)}.
+        an optional ``action`` ({message, command}; command is absent for
+        "embedding_unavailable" and "error"))}.
     """
     from ...deps import run_full_check
 
@@ -2637,7 +2676,10 @@ def configure_llm(
     ] = None,
     auto_pull: Annotated[
         bool,
-        Field(description="Auto-pull models on 404 (Ollama only). False for intranet."),
+        Field(
+            description="Auto-pull models on 404 (Ollama only). False for intranet. Written when it differs "
+            "from the current value, thus the default False disables an enabled auto-pull."
+        ),
     ] = False,
     stream: Annotated[
         bool | None,
@@ -2655,7 +2697,10 @@ def configure_llm(
     Writes to ``<project>/.fw-context/local.toml`` ONLY (gitignored,
     per-developer). Does NOT modify the global config or the shared
     project ``config.toml``. After writing, tests the configuration
-    by making a simple API call (skipped when LLM is disabled).
+    by making a simple API call (skipped when LLM is disabled).  When the
+    test fails, the previous ``local.toml`` is restored and ``status`` is
+    ``"error"``.  A call with no change returns ``"error"`` and writes
+    nothing.
 
     IMPORTANT: When ``chat_api_base`` points to an external host, source
     code snippets in chat prompts will be sent to that endpoint. Ensure
