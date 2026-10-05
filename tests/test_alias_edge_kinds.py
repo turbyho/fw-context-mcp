@@ -82,13 +82,8 @@ def test_a_reference_of_the_definition_is_no_callee_of_the_alias(db):
     assert names == {"hw_read"}
 
 
-def test_a_single_underscore_definition_is_an_alias_target_too(tmp_path, monkeypatch):
+def test_a_single_underscore_definition_is_an_alias_target_too(tmp_path):
     """``_spi_irq`` is a candidate as well as ``__spi_irq``: the LIKE filter keeps both."""
-    from fw_context_mcp.indexer.db import _callgraph
-
-    # The alias cache is keyed by id(conn): a connection of an earlier test
-    # can leave its pairs under the id that this connection gets.
-    monkeypatch.setattr(_callgraph, "_alias_cache_global", {})
     conn = open_db(tmp_path / "test.db")
     with transaction(conn):
         upsert_project(conn, "proj-001", "test", "/tmp/test")
@@ -103,5 +98,63 @@ def test_a_single_underscore_definition_is_an_alias_target_too(tmp_path, monkeyp
 
     names = {row["name"] for row in find_all_callers_recursive(conn, CH, "_spi_irq")}
     conn.close()
+
+    assert names == {"main"}
+
+
+# ── The alias cache ─────────────────────────────────────────────────────────
+
+
+def test_a_new_connection_never_reads_the_pairs_of_a_closed_one(tmp_path):
+    """The cache was keyed by id(conn), and CPython gives that id to the next object.
+
+    Forty short connections, each to its own database, make the reuse
+    of an id likely; each must answer from its own database.
+    """
+    for i in range(40):
+        conn = open_db(tmp_path / f"db{i}.db")
+        with transaction(conn):
+            upsert_project(conn, "proj-001", "test", "/tmp/test")
+            upsert_build_config(conn, CH, "proj-001", "/tmp/compile_commands.json")
+        fid = upsert_file(conn, CH, "src/uart.c", "c")
+        alias, target = f"irq{i}", f"__irq{i}"
+        insert_symbols_batch(conn, [
+            _symbol(fid, alias, f"u_alias{i}", 1, definition=False),
+            _symbol(fid, target, f"u_def{i}", 10),
+            _symbol(fid, "main", "u_main", 20),
+        ])
+        insert_refs_batch(conn, [_ref(f"u_alias{i}", 21, "u_main", "call")])
+        conn.commit()
+
+        names = {row["name"] for row in find_all_callers_recursive(conn, CH, target)}
+        conn.close()
+
+        assert names == {"main"}, f"database {i}"
+
+
+def test_a_reindex_by_another_connection_drops_the_cached_pairs(tmp_path):
+    """The executor keeps one connection; an index run commits through another."""
+    reader = open_db(tmp_path / "test.db")
+    with transaction(reader):
+        upsert_project(reader, "proj-001", "test", "/tmp/test")
+        upsert_build_config(reader, CH, "proj-001", "/tmp/compile_commands.json")
+    fid = upsert_file(reader, CH, "src/uart.c", "c")
+    insert_symbols_batch(reader, [
+        _symbol(fid, "dma_irq", "u_dma_alias", 1, definition=False),
+        _symbol(fid, "main", "u_main", 20),
+    ])
+    insert_refs_batch(reader, [_ref("u_dma_alias", 21, "u_main", "call")])
+    reader.commit()
+    # Fills the cache: dma_irq resolves, and the walk reads the alias pairs,
+    # of which there are none yet.
+    assert {row["name"] for row in find_all_callers_recursive(reader, CH, "dma_irq")} == {"main"}
+
+    writer = open_db(tmp_path / "test.db")
+    insert_symbols_batch(writer, [_symbol(fid, "__dma_irq", "u_dma_def", 10)])
+    writer.commit()
+    writer.close()
+
+    names = {row["name"] for row in find_all_callers_recursive(reader, CH, "__dma_irq")}
+    reader.close()
 
     assert names == {"main"}

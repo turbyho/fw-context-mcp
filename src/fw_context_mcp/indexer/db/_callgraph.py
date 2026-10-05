@@ -70,6 +70,7 @@ from collections import deque
 
 from fw_context_mcp.utils import format_number_ranges
 
+from ._connection import ConnectionCache
 from ._resolve import (
     MAX_AMBIGUOUS_TARGETS,
     ambiguity_notice,
@@ -198,16 +199,11 @@ def _paths_with_targets(
     return paths
 
 
-# Cache for _get_alias_pairs — module-level dict keyed by id(conn).
-# pysqlite3.dbapi2.Connection objects lack __dict__ for attribute
-# storage, so we cannot attach _alias_cache to the connection directly.
-# A module-level dict with connection ID keys works because:
-#  - Connection objects are created per request and live for seconds.
-#  - id(conn) is stable for the connection's lifetime.
-#  - The 16-entry eviction limit prevents unbounded growth from
-#    orphaned connections (Python GC does not notify us when a
-#    connection is garbage-collected).
-_alias_cache_global: dict[int, dict[str, list[tuple[str, str]]]] = {}
+# Cache for _get_alias_pairs, per connection and config_hash.  It once
+# was a dict keyed by id(conn): a new connection that got the id of a
+# closed one read its pairs, and a reindex by another process left the
+# pairs of the old symbol table.  ConnectionCache handles both.
+_alias_cache = ConnectionCache()
 
 
 def _get_alias_pairs(conn: sqlite3.Connection, config_hash: str) -> list[tuple[str, str]]:
@@ -231,13 +227,12 @@ def _get_alias_pairs(conn: sqlite3.Connection, config_hash: str) -> list[tuple[s
     Why separate per-connection cache instead of a global cache keyed
     by config_hash: different connections may access databases from
     different points in time (e.g., after a reindex).  A global cache
-    would serve stale data.
+    would serve stale data.  The cache also drops its pairs when the
+    database changes under the connection — see ConnectionCache.
     """
-    per_conn_cache = _alias_cache_global.get(id(conn))
-    if per_conn_cache is not None:
-        cached = per_conn_cache.get(config_hash)
-        if cached is not None:
-            return cached
+    cached = _alias_cache.get(conn, config_hash)
+    if cached is not None:
+        return cached  # type: ignore[return-value]
     try:
         rows = conn.execute(
             """SELECT s.usr, s.name, s.signature
@@ -284,12 +279,7 @@ def _get_alias_pairs(conn: sqlite3.Connection, config_hash: str) -> list[tuple[s
             if def_usr:
                 pairs.append((r["usr"], def_usr))
                 break
-    conn_id = id(conn)
-    if conn_id not in _alias_cache_global:
-        if len(_alias_cache_global) > 16:  # evict stale entries from closed connections
-            _alias_cache_global.clear()
-        _alias_cache_global[conn_id] = {}
-    _alias_cache_global[conn_id][config_hash] = pairs
+    _alias_cache.put(conn, config_hash, pairs)
     return pairs
 
 

@@ -473,3 +473,59 @@ def transaction(conn: sqlite3.Connection, checkpoint: bool = True) -> Generator[
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         except sqlite3.Error:
             pass  # best-effort — data was already committed
+
+
+class ConnectionCache:
+    """Values derived from one connection, valid while its database stays the same.
+
+    WHY not ``dict[id(conn), ...]``: CPython gives the id of a closed and
+    collected connection to the next object, so a new connection to another
+    database read the values of the old one.  ``pysqlite3`` connections take
+    no weak reference either.  Each entry thus holds the connection itself:
+    while the entry lives the id cannot come back, and ``is`` decides.  At
+    most *max_connections* entries live, the oldest goes first.
+
+    WHY the state check: the executor keeps one connection for the whole
+    server session, and an index run in another process rewrites the
+    database under it.  ``PRAGMA data_version`` changes when another
+    connection commits, and ``total_changes`` when this one does; an entry
+    stored under another value of either is stale.
+    """
+
+    def __init__(self, max_connections: int = 16) -> None:
+        import threading
+        from collections import OrderedDict
+
+        self._max = max_connections
+        self._entries: OrderedDict[int, tuple[sqlite3.Connection, tuple[int, int], dict]] = OrderedDict()
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _state(conn: sqlite3.Connection) -> tuple[int, int]:
+        return conn.execute("PRAGMA data_version").fetchone()[0], conn.total_changes
+
+    def get(self, conn: sqlite3.Connection, key: object) -> object | None:
+        """The value stored under *key* for *conn*, or None when absent or stale."""
+        state = self._state(conn)
+        with self._lock:
+            entry = self._entries.get(id(conn))
+            if entry is None or entry[0] is not conn or entry[1] != state:
+                return None
+            return entry[2].get(key)
+
+    def put(self, conn: sqlite3.Connection, key: object, value: object) -> None:
+        """Store *value* under *key* for *conn* and the current state of its database."""
+        state = self._state(conn)
+        with self._lock:
+            entry = self._entries.get(id(conn))
+            if entry is None or entry[0] is not conn or entry[1] != state:
+                entry = (conn, state, {})
+            entry[2][key] = value
+            self._entries[id(conn)] = entry
+            self._entries.move_to_end(id(conn))
+            while len(self._entries) > self._max:
+                self._entries.popitem(last=False)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
