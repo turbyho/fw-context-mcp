@@ -64,7 +64,7 @@ Shared `[build]` keys for multi-variant projects:
 | Key | Default | Scope | Description |
 |-----|---------|-------|-------------|
 | `default_variant` | *(none)* | project | The variant that a query uses when it omits `variant`. Without this key, a query without `variant` fails closed. |
-| `default_image` | *(none)* | project | The image that a query uses when it omits `image`. |
+| `default_image` | *(none)* | project | The image that `get_active_build` reports as `active_image`. A query does not use this key: when a variant has more than one image, the query must name `image`. |
 | `sysbuild` | `false` | project | Use `west build --sysbuild` (Zephyr). |
 | `source_dir` | *(none)* | project | The sysbuild input application directory (Zephyr). |
 | `build_dir` | *(none)* | project | The default build output directory. Each variant can override this value. |
@@ -119,6 +119,7 @@ and multi-image builds](build.md).
 | `project_paths` | `[]` | project | Manual project directory patterns. These patterns override automatic detection. A path that matches one of these patterns gets `is_project=1`. Use this key for vendored code that your team maintains, for example `["src/old_hal"]`. For a path outside the project root, use an absolute path, for example `["/home/user/esp/components/muj_fork"]`. |
 | `index_refs` | `true` | project | Build the cross-reference and call graph data. This key is on by default, and it enables tools such as `find_callers`, `find_call_path`, and `find_dead_code`. Set this key to `false`, or pass `--no-refs`, for faster indexing on very large projects. |
 | `index_embeddings` | `true` | project | Generate vector embeddings during indexing. This key requires Ollama. The embeddings power semantic search and hybrid FTS5+vector re-ranking. Disable this key with `false`, or with `--no-embeddings`. |
+| `max_symbol_body_lines` | `1000` | project | The maximum number of lines of one symbol body. The index stores at most this number of lines, and `get_source` and `get_symbol_context` return at most this number. A body that a cap cut carries `_source_truncated`. |
 
 ### `[llm]` — Ollama
 
@@ -129,7 +130,7 @@ Put these settings in `~/.fw-context/config.toml` for global defaults, or in `<p
 | `enabled` | `true` | global, local | Enable Ollama. When this key is `false`, `smart_search` falls back to word-split FTS5. Also, `explain_symbol` returns the source code and a prompt for the AI assistant. |
 | `ollama_url` | `"http://localhost:11434"` | global, local | The base URL for the Ollama API. Change this key for a remote GPU server. |
 | `model` | `"qwen2.5-coder:14b"` | global, local | The LLM model tag. Override this key for each project, to use a different model for different codebases. |
-| `embed_model` | `"mxbai-embed-large:latest"` | global, local | The embedding model for vector search. When `auto_pull` is `true`, fw-context pulls this model automatically on first use; otherwise pull it manually. `mxbai-embed-large` runs on a CPU. For a GPU, use `qwen3-embedding:8b`, which needs about 4.7 GB of VRAM and creates 4096-dimension vectors. |
+| `embed_model` | `""` *(auto-detect)* | global, local | The embedding model for vector search. Empty: fw-context selects `qwen3-embedding:8b` on a machine with a GPU (about 4.7 GB of VRAM, 4096-dimension vectors), and `qwen3-embedding:0.6b` without one. A name with the prefix `BAAI/`, `ibm-granite/`, `lightonai/`, `cross-encoder/` or `sentence-transformers/` uses sentence-transformers (requires the `st` extra); `ft://` selects a fine-tuned local model; any other name is an Ollama model. When `auto_pull` is `true`, fw-context pulls an Ollama model automatically on first use; otherwise pull it manually. A change of model invalidates the stored embeddings. |
 | `embed_query_prompt` | *(auto-detect)* | global, local | An instruction that fw-context adds before the query text, before it creates the embedding. fw-context detects this instruction automatically from the model name prefix: for `mxbai-*`, fw-context uses `"Represent this sentence for searching relevant passages: "`; for `qwen3-embedding*`, fw-context uses a code-retrieval instruction. Set this key explicitly to override the default, or set it to `""` to disable it. |
 | `embed_doc_prompt` | *(empty)* | global, local | An instruction that fw-context adds before symbol descriptions during indexing. Most models work best with an empty prompt. Set this key only when the model's training expects a per-document instruction. |
 | `auto_pull` | `false` | global, local | When `true`, fw-context pulls a model automatically from the Ollama registry when it is not installed. When `false` (default), you must pull each model explicitly. Set this key to `false` for offline or intranet environments. |
@@ -228,7 +229,7 @@ Configure a remote cache server, to share `llm_analysis` data across developers.
 | `url` | *(none)* | global, local | The cache server URL. Example: `"https://fw-cache.example.com"`. |
 | `token` | *(none)* | global, local | A bearer token with `can_read` and `can_write` permissions. Create this token with the `fw-cache-admin token create` command. |
 | `batch_size` | `100` | global, local | The maximum number of hashes or entries in each HTTP request. |
-| `force` | `false` | global, local | When this key is `true`, fw-context sends the `X-Cache-Overwrite` header, and overwrites existing entries. This key requires a `can_overwrite` token. |
+| `force` | `false` | global, local | When this key is `true`, fw-context sends the `X-Cache-Overwrite` header, and overwrites existing entries. This key applies to the writes during `fw-context index` and `fw-context analyze`. `fw-context index --force` also turns it on. `fw-context cache push` does not read this key: use `fw-context cache push --overwrite`. This key requires a `can_overwrite` token. |
 
 ```toml
 [cache_server]
@@ -316,7 +317,7 @@ compile_commands = "compile_commands.json"
 
 ### Local developer config (`<project>/.fw-context/local.toml`)
 
-Keep this file out of git. Add it to `.gitignore`. This file overrides settings from `config.toml` and from the global config. Use this file for preferences that are specific to each developer.
+Keep this file out of git. `fw-context init` already ignores it: its `.gitignore` rules ignore everything under `.fw-context/` except `config.toml`. This file overrides settings from `config.toml` and from the global config. Use this file for preferences that are specific to each developer.
 
 ```toml
 # ── Build environment (auto-detected by fw-context init) ──

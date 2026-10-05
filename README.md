@@ -39,7 +39,7 @@ The case study includes the review output, methodology and per-tool token analys
 - a project that can produce `compile_commands.json`
 - an MCP-capable coding agent such as Claude Code or OpenCode
 
-Ollama is optional. It is used only for local semantic enrichment and symbol explanations; the core compiler-derived index does not require it.
+Ollama is optional for the core index: symbols, full-text search, call graph and source come from libclang and SQLite only. With the default configuration, Ollama also computes the vector embeddings (`semantic_search`, the re-rank step of `smart_search`) and the symbol analysis (`explain_symbol`, symbol descriptions). Without Ollama, these features fall back to full-text search or return raw prompts. See [Ollama](docs/installation.md#ollama-optional).
 
 ### Install via pip (recommended)
 
@@ -112,8 +112,8 @@ fw-context indexes the project through the same compilation database used by bui
 ```mermaid
 flowchart LR
     CCJ[compile_commands.json] & SRC[(source files)] --> LIBCLANG[libclang<br/>AST parser]
-    LIBCLANG --> SYMBOLS[symbols<br/>name, kind, USR<br/>signature, source body<br/>docstring, tokens] & FILES[files<br/>path, language<br/>ifdef-filtered content<br/>project/SDK sources] & REFS[refs &amp; call graph<br/>fp_assignments<br/>indirect_call_sites] & INHERIT[inheritance<br/>&amp; overrides<br/>virtual dispatch] & MACROS[macros<br/>params, value<br/>&amp; expanded value<br/>FTS5 searchable] & ENRICH[optional enrichment<br/>embeddings &amp; summaries<br/>hotspot cache]
-    SYMBOLS & FILES & REFS & INHERIT & MACROS & ENRICH --> MCP[MCP server<br/>37 tools]
+    LIBCLANG --> SYMBOLS[symbols<br/>name, kind, USR<br/>signature, ifdef-filtered source body<br/>docstring, tokens] & FILES[files<br/>path, language<br/>ifdef-filtered content<br/>project/SDK sources] & REFS[refs &amp; call graph<br/>fp_assignments<br/>indirect_call_sites] & INHERIT[inheritance<br/>&amp; overrides<br/>virtual dispatch] & MACROS[macros<br/>params, value<br/>&amp; expanded value<br/>FTS5 searchable] & ENRICH[optional enrichment<br/>embeddings &amp; summaries<br/>hotspot cache]
+    SYMBOLS & FILES & REFS & INHERIT & MACROS & ENRICH --> MCP[MCP server<br/>39 tools]
     MCP --> LLM[AI coding agent]
 ```
 

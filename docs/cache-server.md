@@ -321,15 +321,20 @@ Each developer configures their `<project>/.fw-context/local.toml`:
 [cache_server]
 url = "https://fw-cache.example.com"
 token = "<your-read-write-token>"
-# batch_size = 100        # hashes per request
+# batch_size = 100        # hashes or entries per request, 1 to 1000
 # force = false           # set true to overwrite existing entries
 ```
 
 The client uses `url` for three endpoints: `POST /cache/batch` to read,
 `PUT /cache/batch` to write, and `POST /cache/clear` to delete. The client
-chunks the requests by `batch_size`. On a network error, the client retries
-3 times, with exponential backoff. If all retries fail, the client falls
-back to the local cache only.
+chunks the requests by `batch_size`. The server takes at most 1000 hashes or
+entries in one request, thus the client uses 1000 for a larger value. The
+client also splits a write chunk into more requests, to keep each request
+body below 8 MB (80 % of the 10 MB server limit). A `batch_size` below 1
+makes `fw-context cache push` exit with status 1. On a network error, a 429
+or a 5xx, the client tries the request 3 times in total, with exponential
+backoff. If all the attempts fail, the client falls back to the local cache
+only.
 
 ### How the client uses the cache
 
@@ -355,7 +360,7 @@ fw-context cache clear --remote -y       # skip confirmation
 
 # Upload the local entries that the remote server does not have
 fw-context cache push                    # batch size 100
-fw-context cache push --batch 500        # larger batches for faster transfer
+fw-context cache push --batch 500        # larger batches for faster transfer (1 or more; above 1000 sends 1000)
 fw-context cache push --overwrite        # also replace the server's entries
 
 # Interactive remote cache setup
@@ -402,10 +407,19 @@ To replace the server's entries with the local ones, add `--overwrite`. This
 sends `X-Cache-Overwrite: true`, and requires `can_overwrite` on the token.
 
 The command checks the token before it sends anything. It exits with status
-1 when the server is unreachable, when the server rejects the token, when
-the token cannot write, when
-`--overwrite` is given without `can_overwrite`, or when the server refuses a
-write part of the way through.
+1 in these cases:
+
+- The server rejects the token (401 or 403).
+- The server answers 429. The server gives 429 only after too many failed
+  token attempts. Check the token, then wait and try again.
+- The server answers with a body that is not a JSON object. A proxy can be
+  in front of the server.
+- The server cannot be reached.
+- The token cannot write.
+- `--overwrite` is given without `can_overwrite`.
+- The server refuses a write part of the way through.
+
+For the first four cases, the message tells which cause it is.
 
 The server refuses a whole request when one entry in it breaks one of these
 limits:
@@ -423,6 +437,11 @@ shows the number of these entries and the first five with the reason, and
 sends the others. These entries do not change the exit status. The client
 also makes each request smaller than the body limit: it splits a batch of
 large entries into more requests.
+
+After the first write request that fails, the command sends no more
+requests. It shows how many entries the server took before the failure, and
+exits with status 1. The entries of the requests before the failure stay on
+the server.
 
 ## Hardening (production)
 
@@ -532,6 +551,22 @@ The token is missing, invalid, or revoked. Check:
 - The token matches the token from `fw-cache-admin token create`
 - `fw-cache-admin token list <project>` shows the token as active, with no
   `revoked_at` value
+
+### 429 Too Many Requests, or a body that is not JSON
+
+The server gives 429 only to a request with a token that failed. After 20
+failed token attempts from one IP address in 60 seconds, the server answers
+429 to the next failed attempts from that address. Check the token, then
+wait and try again.
+
+When the server answers 200 with a body that is not a JSON object, a proxy
+or a captive portal is usually in front of the server. The log names the
+content type of the body. This tells you which device answered.
+
+During `fw-context index`, the client continues for both cases: a read gives
+no cached entries, and a write counts as failed. The client logs the
+non-JSON body as a warning once for each client, and at debug level after
+that.
 
 ### 403 Forbidden on PUT
 

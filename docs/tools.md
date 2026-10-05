@@ -64,6 +64,24 @@ fw-context index --source-roots src lib drivers
 | `--takeover` | off | Terminate another running foreground index run of this project instead of refusing |
 | `-v` | off | Verbose progress output |
 
+**Automatic build:**
+
+Without `--build`, a run can build by itself. It does this when an index
+exists and one of these conditions is true:
+
+- A source file on disk is not in `compile_commands.json`. Such a file has
+  no translation unit, thus a reindex skips it.
+- The tree is on a different git branch than the index.
+  `compile_commands.json` belongs to the old branch.
+
+The run builds only when the backend can build in isolation (see
+[Build Configuration](build.md)). The output goes to
+`.fw-context/autobuild/<variant>`, or `.fw-context/autobuild/default` for a
+single build. When an automatic build fails, it is not tried again for the
+same files (or the same branch) for 30 minutes. An explicit `--build`
+ignores this backoff. `--build` and `--background` are mutually exclusive,
+except for this automatic build.
+
 **When another index run is in progress:**
 
 Only one index run can own a project's index at a time. A manual run takes
@@ -318,6 +336,12 @@ dependency audit, the build, and the checklist.
 | Claude Code | `claude-code` | global (`~/.claude/`) |
 | OpenCode | `opencode` | global (`~/.config/opencode/`) |
 
+A separate instruction file that fw-context owns (`.codex`, `.cursor`)
+carries section markers. A later run updates the text between the markers
+in place. A file that a version before 0.29.2 wrote has no markers, and
+`fw-context init` skips it. Run `fw-context init --force` once to replace
+such a file.
+
 ### `fw-context quickstart`
 
 Alias for `fw-context init --quick`. Provision the project, but skip AI
@@ -423,6 +447,11 @@ Remote cache (Tier 2): https://fw-cache.montyho.com
   Project cache: 3138/3138 cached (452361ffbf84f774)
 ```
 
+When the server gives no statistics, the line under the URL names the
+cause, with the same causes as for `fw-context cache push`. For example:
+`The server rejected the token (401/403) — check [cache_server] token`. The
+exit status is 0, because this command only shows a status.
+
 ### `fw-context cache clear`
 
 Delete cache entries for one or both tiers.
@@ -456,13 +485,29 @@ fw-context cache push --overwrite           # also replace the server's entries
 ```
 
 The client never sends more than 1000 entries in one request, the most that
-the server accepts; a larger `--batch` is capped at 1000.
+the server accepts; a larger `--batch` is capped at 1000. A `--batch` below
+1 is a usage error. A `[cache_server] batch_size` below 1 stops the command
+with exit status 1 and the message
+`error: [cache_server] batch_size must be a positive integer, not <value>`.
 
 This command requires `[cache_server]` and a token with `can_write`.
 `--overwrite` also requires `can_overwrite`. The command reports progress in
 batches, and ends with the number of entries inserted and already on the
-server. It exits with status 1 when the server is unreachable, or when the
-server refuses the write.
+server. It exits with status 1 when the server does not give its
+statistics, or when the server refuses a write. A refused write stops the
+push; no further batch goes. When the statistics fail, the message names
+the cause:
+
+| Cause | Message says |
+|---|---|
+| The server rejects the token (401/403) | check `[cache_server] token` |
+| 429: the token failed too often | check the token, then wait and try again |
+| The body is not a JSON object | a proxy can be in front of the server |
+| No connection | check the URL and the network |
+
+A local entry that breaks a limit of the server stays local. The command
+does not send it, and lists it in a warning (the first five, then a count).
+The other entries go. See [Cache Server](cache-server.md).
 
 ### `fw-context cache remote-init`
 
@@ -572,8 +617,14 @@ Daemon:     running (pid 12345, uptime 3600s)
 Socket:     /home/user/.fw-context/index/a1b2c3d4/daemon.sock (active)
 Modified:   3 file(s)
 Index:      idle
-Last index: [45/45] main.cpp: unchanged
+Last index: 09:35:18 INFO [45/45] main.cpp: unchanged
 ```
+
+`Last index:` shows the newest line of `reindex.log` that begins a
+fw-context record: a log record, a `fw-context: error:` line, or the
+`Project:` header. The output of the build tools in the same file is
+skipped. After a failed build, the line is thus the `fw-context: error:`
+line, not the quoted tool output below it.
 
 #### `fw-context watch restart`
 
@@ -630,13 +681,59 @@ A parameter name that no tool declares causes an error that names it.
 Earlier releases dropped such an argument without a message, and the tool
 then answered about the project of the current directory.
 
-**Multi-variant projects.** For a project with `[[build.variants]]`, every
-query tool also accepts `variant` and `image` parameters. When you omit
-`variant`, fw-context uses `[build] default_variant`, or returns an error
-that lists the valid names. Set `variant` to `"*"` to query every variant.
-A multi-variant result annotates each record with its `variant` and
-`image`. Call `get_active_build` to see the variants and images that
-fw-context has indexed.
+A project name that matches more than one project in the registry causes
+an error. The error lists each candidate with its `project_id` and root
+path. Repeat the call with the `project_id`.
+
+**Multi-variant projects.** One query answers for one build. Every tool
+that answers about code accepts `variant` and `image` parameters, except
+`smart_search` and `semantic_search`. These two take neither, and answer
+for the active build. Both selectors fail closed:
+
+- When the project has variants, name a `variant`. When you omit it,
+  fw-context uses `[build] default_variant`, or returns an error that lists
+  the valid names.
+- When the variant holds more than one image, name an `image`. Each image
+  is a separate program, for example a bootloader and the application. An
+  omitted `image` causes an error that lists the images.
+- `variant="*"` is refused. To learn whether a symbol is in two builds, ask
+  once for each build.
+- A project with one build and no variants refuses `variant` and `image`.
+
+The valid variants are the declared variants (`[[build.variants]]`) and
+the variants in the index. Call `get_active_build` or `list_variants` to
+see the variants and images that fw-context has indexed.
+
+**Paging.** Eight tools take an `offset`: `lookup_symbol`, `search_code`,
+`search_bodies`, `search_content`, `find_callers`, `find_references`,
+`find_dead_code`, and `find_hotspots`. When the answer holds a row, it
+starts with a page notice:
+
+```
+{"total": 137, "offset": 0, "shown": 20, "more": true, "hint": "…pass offset=20…"}
+```
+
+- Find the notice by its keys, not by its position. A stale-index
+  `warning` row, or the row that reports a query FTS5 cannot parse, can
+  come first.
+- When `more` is true, call again with `offset` = `offset` + `shown`. The
+  `hint` names that call. It is absent on the last page.
+- The order of each tool is stable, thus two pages never overlap and never
+  skip a row.
+- An `info` row that names an offset means that the offset is past the
+  end.
+
+**Parameter validation.** The schema refuses a bad value before the tool
+runs, with an error that names the parameter:
+
+| Parameter | Valid values |
+|---|---|
+| `limit`, `max_depth`, `timeout_ms` | 1 or more |
+| `offset`, `context_lines`, `max_per_kind`, `start_line`, `end_line` | 0 or more |
+| `threshold` | 0.0 to 1.0 |
+| A required string (for example `name`, `query`) | not empty |
+
+Only a value that is too large is clamped to the maximum of the tool.
 
 ### Search & lookup
 
@@ -645,14 +742,15 @@ fw-context has indexed.
 Full-text search with FTS5 syntax.
 
 ```
-Input:  {"query": "uart init", "project_root?": "/path/to/project", "kind?": "function", "limit?": 20}
-Output: [{"name": "uart_init", "qualified_name": "drv::uart_init", "kind": "function",
+Input:  {"query": "uart init", "project_root?": "/path/to/project", "kind?": "function", "limit?": 20, "offset?": 0}
+Output: [{"total": 3, "offset": 0, "shown": 3, "more": false},
+         {"name": "uart_init", "qualified_name": "drv::uart_init", "kind": "function",
           "file": "/path/src/uart.c", "line": 42, "is_definition": true,
           "signature": "void uart_init(int baudrate)", "docstring": "Initialize UART",
           "is_template": false, "is_virtual": false, "is_pure_virtual": false,
           "llm_analysis": {"summary": "Initialize the UART peripheral…",
                            "inputs": "baudrate…", "outputs": "…"},
-          "enum_value": null, "_fallback": "fts5+kind"}, …]
+          "enum_value": null}, …]
 ```
 
 Enum constants include `enum_value` (the integer value) when non-None.
@@ -671,11 +769,12 @@ guess. Use `llm_analysis` to find a symbol. Quote `signature`,
 `docstring`, or the `source` of `get_source`.
 `get_active_build().analysis.model` names the model — one for each index.
 
-**Precision:** FTS5 indexes the qualified name, thus a local variable
-matches through the name of its parent. A query for `sensor` also
-returns `V`, `ret`, and `tmp_value` when they live inside
-`read_sensor_value`. Pass `kind` to exclude them, or read `kind` on
-each result before you act on it.
+**Local variables are out:** FTS5 indexes the qualified name, thus a local
+variable matches through the name of its parent. A query for `sensor`
+would also return `V`, `ret`, and `tmp_value` from inside
+`read_sensor_value`. Thus `search_code` leaves out the `varlocal` kind and
+the legacy `variable` kind, in every relaxation step. `varglobal` stays.
+To find a local variable, pass `kind="varlocal"`, or use `find_variables`.
 
 **Progressive relaxation:** when the initial FTS5 search returns nothing, the
 tool automatically broadens the search in up to six steps:
@@ -697,9 +796,17 @@ tool automatically broadens the search in up to six steps:
    `_fallback="macros_fts"`).
 
 Results from fallback steps carry `_fallback` indicating which method
-succeeded: `"fts5"`, `"name_tokens_like"`, `"docstring_like"`,
-`"individual_terms"`, or `"macros_fts"`. Results from the primary FTS5 path have
-`"_fallback": "fts5+kind"` or omit the field.
+succeeded: `"fts5"` (step 2, the retry without `kind`),
+`"name_tokens_like"`, `"docstring_like"`, `"individual_terms"`, or
+`"macros_fts"`. Results from the primary FTS5 path (step 1) have no
+`_fallback` field. One step owns the whole answer, thus all pages of one
+query come from the same step. Steps 3, 4, and 5 read at most 32 terms of
+the query.
+
+When FTS5 cannot parse the query and no step finds a row, the result is
+one row with `warning` and `hint`. The hint names the repair: an unbalanced
+double quote, or a bare operator (`AND`, `OR`, `NOT`, `NEAR`). Search one
+word, or write an explicit phrase.
 
 **FTS5 syntax:**
 - `uart*` — prefix wildcard
@@ -719,7 +826,7 @@ succeeded: `"fts5"`, `"name_tokens_like"`, `"docstring_like"`,
   carries `_fallback: "sanitized"` and `_query_used`; a query FTS5 accepts
   (`NEAR(a b)`, `^term`, a column filter) always runs untouched
 
-**Kind filter:** `function`, `method`, `constructor`, `destructor`, `class`, `struct`, `union`, `enum`, `enum_constant`, `typedef`, `variable`, `field`, `namespace`
+**Kind filter:** `function`, `method`, `constructor`, `destructor`, `class`, `struct`, `union`, `enum`, `enum_constant`, `typedef`, `varglobal`, `varlocal`, `variable`, `field`, `namespace`
 
 #### `search_bodies`
 
@@ -751,9 +858,15 @@ Text that belongs to **no** definition is out of reach: `#define`,
 `#include`, `#ifdef`, `extern "C"`, and a comment or declaration at file
 scope. Use `search_content` for those.
 
+**The stored text is ifdef-filtered.** A line of an inactive `#if` branch
+is blank in the stored body, and line numbers do not move. An empty
+result can thus mean that the pattern is only in a dead branch: the active
+build does not compile it.
+
 ```
-Input:  {"query": "attach", "project_root?": "/path/to/project", "kind?": "function", "limit?": 20, "project_only?": true}
-Output: [{"name": "setup", "qualified_name": "setup", "kind": "function",
+Input:  {"query": "attach", "project_root?": "/path/to/project", "kind?": "function", "limit?": 20, "offset?": 0, "project_only?": true}
+Output: [{"total": 1, "offset": 0, "shown": 1, "more": false},
+         {"name": "setup", "qualified_name": "setup", "kind": "function",
           "file": "/path/src/main.cpp", "line": 55, "is_definition": true,
           "signature": "void setup()",
           "_match_snippet": "…_timeout.<b>attach</b>(callback(&led_blink, 1000))…",
@@ -813,11 +926,14 @@ text that belongs to a definition.
 Searches **ifdef-filtered** file text: only the code that actually
 compiles for the current build configuration. fw-context replaces an
 inactive `#ifdef` branch with blank lines, and keeps the original line
-numbers.
+numbers. Comments and preprocessor directives stay: an include guard, a
+`#define`, and a block comment with its closing marker. A blank line is
+thus an inactive line, or a line that is blank on disk.
 
 ```
-Input:  {"query": "InterruptIn", "project_root?": "/path/to/project", "limit?": 20, "project_only?": false}
-Output: [{"file": "/path/src/main.cpp", "language": "cpp",
+Input:  {"query": "InterruptIn", "project_root?": "/path/to/project", "limit?": 20, "offset?": 0, "project_only?": false}
+Output: [{"total": 1, "offset": 0, "shown": 1, "more": false},
+         {"file": "/path/src/main.cpp", "language": "cpp",
           "mtime": "2026-06-05T09:35:18", "_match_snippet": "…InterruptIn…",
           "match_lines": [29, 105]}]
 ```
@@ -850,11 +966,22 @@ Find a symbol by name (exact or prefix match). Searches functions, methods,
 classes, enums, typedefs, variables, fields, and **macros**.
 
 ```
-Input:  {"name": "uart_init", "project_root?": "/path/to/project", "exact?": true, "limit?": 50}
-Output: [{"name": "uart_init", "qualified_name": "drv::uart_init", "kind": "function",
+Input:  {"name": "uart_init", "project_root?": "/path/to/project", "exact?": true, "limit?": 50, "offset?": 0}
+Output: [{"total": 1, "offset": 0, "shown": 1, "more": false},
+         {"name": "uart_init", "qualified_name": "drv::uart_init", "kind": "function",
           "file": "/path/src/uart.c", "line": 42, "is_definition": true,
           "signature": "void uart_init(int baudrate)", "docstring": "Initialize UART"}]
 ```
+
+A member carries `class`: the class, struct, or union that declares it.
+A free function has no `class`. This field tells two same-name methods
+apart.
+
+When no symbol matches, a trailing dict can hold `_did_you_mean` with
+suggested names. The symbols of the first suggestion that matches exactly
+then come back, each with `_fallback: true`. Their name is NOT the name
+that you asked for. With no match and no suggestion, the list is empty and
+has no page notice.
 
 Macro example:
 ```
@@ -879,7 +1006,8 @@ otherwise. `is_function_like` is what separates the first two: both have an
 empty parameter list. `get_source`, `explain_symbol` and the macro step of
 `search_code` write the same spelling.
 
-fw-context sorts definitions before declarations. Use `exact: true` for an
+The order is stable: definitions before declarations, then by line, then
+by file and USR. Thus two pages never overlap. Use `exact: true` for an
 exact name match. The default is a prefix match: `uart` matches
 `uart_init`, `uart_write`, and other names with that prefix.
 
@@ -902,7 +1030,11 @@ Output: [
 ```
 
 Multi-phase pipeline: translate → rough search → LLM query generation
-→ FTS5 search → refine → vector re-rank → deduplicate → format.
+→ FTS5 search → refine → vector re-rank → adaptive fusion → deduplicate
+→ expand context → format.
+
+When no symbol matches, the result holds the metadata entries and a dict
+with `info`. One dict with `error` means that the query failed.
 
 When you disable Ollama (`[llm] enabled = false`), this tool falls back to
 a word-split FTS5 search. Phase 0 auto-translates a non-English query.
@@ -916,7 +1048,9 @@ query words do not appear literally in the code.
 ```
 Input:  {"query": "parcel locker state machine", "project_root?": "/path/to/project", "threshold?": 0.60, "limit?": 20}
 Output: [{"name": "set_shipment", "qualified_name": "Locker::set_shipment",
-          "_similarity": 0.72, "_method": "embedding", …}, …]
+          "kind": "method", "file": "/path/src/locker.cpp", "line": 118,
+          "is_definition": true, "signature": "void set_shipment(int id)",
+          "docstring": ""}, …]
 ```
 
 Uses cosine similarity over variable-dimension embeddings (generated during
@@ -926,9 +1060,22 @@ conceptual queries ("power consumption" → `get_load_power`) where keywords
 do not match. **When to prefer `search_code`:** known keywords or symbol
 names (`"fram_write"`, `"cbor encode"`).
 
-Results include `_similarity` (cosine similarity score, 0–1) and `_method`
-(`"embedding"` or `"search_code_fallback"`). Source-aware ranking boosts
-project code (1.2×) over vendored SDK paths (0.85×).
+Each symbol holds `name`, `qualified_name`, `kind`, `file`, `line`,
+`is_definition`, `signature`, and `docstring`. It also holds `summary`,
+`inputs`, and `outputs` when `fw-context index --analyze` wrote them (model
+text, not a fact), and `_rerank_score` when `llm.reranker_model` is set.
+The result does not show the similarity score. Source-aware ranking
+multiplies the similarity of project code by 1.2 and of all other code by
+0.85. The multiplied score sets the order. `threshold` applies to the raw
+cosine similarity.
+
+**Known limitation.** The output step drops the similarity score. Thus the
+relevance-floor warning (best similarity below 0.68) never fires today.
+
+When the embedding search finds no match, the result holds one dict with
+`info`. One dict with `error` means that the query failed. When
+compile_commands.json changed after the last index run, a trailing dict
+holds a `warning` and a `hint`.
 
 **Threshold guidance** (mxbai-embed-large):
 - `0.50` — exploratory, more results
@@ -936,12 +1083,17 @@ project code (1.2×) over vendored SDK paths (0.85×).
 - `0.60` — high precision (default)
 - `0.65` — strict, may miss relevant symbols
 
-Requires Ollama with an embedding model. Falls back to `search_code` if
-Ollama is unavailable or disabled.
+Requires `[llm] enabled = true`, a running Ollama server, and embeddings
+in the index. When one of them is missing, or the embedding model fails,
+this tool runs ONE plain FTS5 symbol search (the first step of
+`search_code`, with no kind filter, no relaxation, and no paging). A
+leading dict holds a `warning` with the reason, and each symbol holds
+`_method: "search_code_fallback"`. When the lexical search also finds
+nothing, the result is one `warning`.
 
 #### `find_variables`
 
-Find C/C++ variables by name or prefix, and trace who reads or writes them
+Find C/C++ variables by name or part of it, and trace who reads or writes them
 through the call graph. Splits variables into global (`varglobal`: file,
 namespace, or class scope) and local (`varlocal`: inside a function body).
 
@@ -961,9 +1113,15 @@ Each result includes a type signature, for example `"bool timeSet"` or
 `"const IPAddress modbus_ip"`. Each result also includes the enclosing
 function for a local variable (`"<file scope>"` for a global variable),
 and the enclosing class for a static member. Each result includes a
-`references` list, showing every function that reads or writes the
+`references` list, showing the functions that read or write the
 variable. This list uses the same `ref_kind` values as `find_references`:
-`"call"`, `"ref"`, `"member"`.
+`"call"`, `"ref"`, `"member"`. The list is capped: max 30 references per
+variable, and max 100 over all results. Thus a later result can show fewer
+references than it has.
+
+`name` is a substring match on the name and on the qualified name: `g_`
+finds `g_debug_level` and also `msg_count`. The result holds only
+definitions, globals first, then by name. No match gives `[]`.
 
 Use `find_variables` when you need to:
 - understand shared state
@@ -975,10 +1133,11 @@ For a general symbol search, use `search_code` or `lookup_symbol`. For all
 references to a specific variable, including reads in expressions, use
 `find_references`.
 
-The `kind` parameter accepts `"varglobal"`, `"varlocal"`, or `None` for
-both. Results include legacy indexes that still use `kind="variable"`,
-from before the split. Reindex the project to get the full benefit of
-the split.
+The `kind` parameter accepts `"varglobal"`, `"varlocal"`, `"field"`, or
+`None` for all of them. It also accepts the legacy `"variable"`, for an
+index made before the split. Another value causes an error. Results
+include legacy rows that still use `kind="variable"`. Reindex the project
+to get the full benefit of the split.
 
 ### Understanding
 
@@ -991,13 +1150,19 @@ works like a fast table of contents, before you read the whole file.
 Input:  {"file_path": "src/net_msg.cpp", "project_root?": "/path/to/project", "signatures?": false, "max_per_kind?": 30}
 Output: {"file": "src/net_msg.cpp", "total_symbols": 426,
          "symbols": {
-           "method":    [{"name": "_is_socket_ok", "line": 140, "signature": "bool _is_socket_ok()"}, …],
-           "variable":  [{"name": "_buffer_msg", "line": 105}, …],
-           "constructor": [{"name": "ModemMsg", "line": 130, "signature": "void ModemMsg(…)"}, …],
-           "function":  [{"name": "memset", "line": 94}, …],
-           "struct":    [{"name": "buffer", "line": 3561}, …],
+           "method": {"count": 45, "items": [
+             {"name": "_is_socket_ok", "qualified_name": "ModemMsg::_is_socket_ok",
+              "line": 140, "end_line": 152}, …]},
+           "varglobal": {"count": 3, "items": [
+             {"name": "_buffer_msg", "qualified_name": "_buffer_msg", "line": 105}, …]},
+           "constructor": {"count": 1, "items": [
+             {"name": "ModemMsg", "qualified_name": "ModemMsg::ModemMsg",
+              "line": 130, "end_line": 138}]},
+           "struct": {"count": 2, "items": [
+             {"name": "buffer", "qualified_name": "buffer", "line": 3561, "end_line": 3570}, …]},
            "enum_constant": {
              "count": 8,
+             "items": [],
              "subgroups": [
                {"name": "StatusCode", "count": 5,
                 "constants": [
@@ -1010,16 +1175,34 @@ Output: {"file": "src/net_msg.cpp", "total_symbols": 426,
          }}
 ```
 
+Each kind maps to `{count, items}`. `count` is the real total of that
+kind. `items` holds the first `max_per_kind` symbols (`0` = no limit).
+
 fw-context groups enum constants into `subgroups`, by the parent enum.
+For `enum_constant`, `items` is empty.
 Each subgroup has a `name` (the parent enum), a `count` (the real total,
 even when `max_per_kind` limits the `constants` list), and a `constants`
 list with `name`, `qualified_name`, `line`, and `enum_value` (the integer
 value, when available).
 
+Each item holds `name`, `qualified_name`, and `line`. A definition also
+holds `end_line`, thus `file:line-end_line` is the citation. A declaration
+has no extent and gets no `end_line`. An item holds `signature` only when
+you pass `signatures: true`.
+
 Pass a relative path, such as `src/main.cpp`, or just the filename, such
-as `main.cpp` (fw-context matches the suffix). Use this tool instead of
-`Read` on large files. fw-context organizes the symbols by kind, in a
-single response.
+as `main.cpp`. Use this tool instead of `Read` on large files. fw-context
+organizes the symbols by kind, in a single response.
+
+**Path matching.** fw-context tries the exact path first. Then it matches
+the path as whole trailing path segments: `config.h` matches
+`src/config.h`, but not `hw_config.h`. When more than one file matches,
+a project file wins over a vendor file, and then the shorter path wins.
+`read_file` uses the same rules.
+
+**The index decides access.** Any file of the indexed build is readable,
+also an SDK header outside the project tree. A path that the index does
+not hold is refused with an `error`.
 
 #### `get_source`
 
@@ -1040,6 +1223,46 @@ Every line of `source` starts with its line number in the file: four
 columns, right-aligned, then two spaces. The `source` of `search_bodies`
 is bare, and so is the `content` of `read_file` until you ask for
 `line_numbers=True`.
+
+The body is **ifdef-filtered**. A line of an inactive `#if` branch comes
+back blank, and the line numbers do not move. `source_origin` says where
+the text came from:
+
+| `source_origin` | Meaning |
+|-----------------|---------|
+| `"index"` | The filtered copy that the index holds. |
+| `"disk"` | The file on disk. It holds every `#if` branch. |
+
+The body comes from the disk when the file changed after the last index
+run and the symbol did not move. The result then also holds `stale: true`
+and a `stale_warning`. Read both before you cite such a body. When the
+symbol moved, the body comes from the index, with `stale: true` and a
+`stale_warning`, and its line numbers can be out of date. A symbol that
+the index holds no body for, such as a declaration, also reads from the
+disk.
+
+`_source_truncated: true` marks a body that a cap cut. `[index]
+max_symbol_body_lines` limits the number of lines, and a second cap limits
+the characters (8000). The character cut can stop in the middle of a line.
+Read the rest with `read_file` and a line range.
+
+When the name matches more than one symbol, the body belongs to one of
+them, and the result adds:
+
+- `ambiguous_warning` — one sentence that names the symbol this answer is
+  about.
+- `candidates` — up to 20 of the most referenced matches. Each row holds
+  `qualified_name`, `class`, `kind`, `file`, `line`, `signature`, and
+  `in_project_root`.
+- `candidates_total` — how many symbols the name matches.
+
+To get another symbol, ask again with a `qualified_name` from
+`candidates`. For the full list, page through
+`lookup_symbol(name, exact=True, offset=…)`.
+
+The symbol comes from the index, thus a body in a file outside the project
+root, such as an SDK header, is returned and not refused.
+`in_project_root` on each candidate tells project code from vendor code.
 
 For enum constants, the result includes `enum_value` (the integer value).
 For enums, the result includes a `constants` array that lists all the
@@ -1091,13 +1314,28 @@ instantly. This tool makes no Ollama call, so there is no waiting.
 **On-demand fallback (10–30 s):** When no pre-computed analysis exists, for
 example when you built the index with `--no-analyze`, or when fw-context
 re-indexed the symbol without re-analysis, this tool falls back to calling
-Ollama directly. When Ollama is disabled, this tool returns `source` and
-`explain_prompt`, so the AI assistant can answer with its own model.
+Ollama directly. When the LLM is disabled (`[llm] enabled = false`), this
+tool returns `explain_prompt` and no `source`. The source window is part
+of the prompt text. When the Ollama call fails (timeout, missing model,
+or another error), the result holds a `warning`, `source`, and
+`explain_prompt`. In both cases, the AI assistant can answer with its own
+model.
 
 fw-context generates the analysis during indexing. fw-context uses the
-full function body (through the libclang extent) and the callee names
-from the reference index, as context. When you re-index a file, with
-`reindex_file`, fw-context regenerates the analysis automatically.
+ifdef-filtered body that the index holds and the callee names from the
+reference index, as context. Code in an inactive `#if` branch does not
+reach the model. When every line of a body is inactive, fw-context skips
+the symbol and calls no model, because the build compiles none of its
+code. When you re-index a file, with `reindex_file`, fw-context
+regenerates the analysis automatically.
+
+The on-demand fallback reads a window of `context_lines` around the
+symbol from the disk. That window is not ifdef-filtered.
+
+When the name matches more than one symbol, the result adds
+`ambiguous_warning`, `candidates`, and `candidates_total`, in the same
+shape as `get_source`. When the file changed after the last index run,
+the result adds `stale: true` and a `stale_warning`.
 
 #### `get_symbol_context`
 
@@ -1146,6 +1384,7 @@ Output: {"name": "onData", "kind": "field",
 This tool is designed as one-shot LLM context. This tool answers "what
 does this do, and how does it fit?" in a single call. This tool returns
 all the direct callers and callees, with no artificial limit.
+`indirect_call_sites` is capped at 200 entries.
 
 For a field or variable symbol that has a function pointer type, the
 result also includes a `resolution` block:
@@ -1157,6 +1396,15 @@ note. The LLM can detect the uncertainty from this signal.
 For enums, the result includes a `constants` array, with all the member
 constants and their values, in the same shape as `get_source`. Enum
 constants include `enum_value`.
+
+The body follows the same rules as in `get_source`: it is ifdef-filtered,
+`source_origin` says `"index"` or `"disk"`, `_source_truncated` marks a
+cut body, and an ambiguous name adds `ambiguous_warning`, `candidates`,
+and `candidates_total`. Every part of the answer — body, callers, and
+callees — is about the one symbol that `ambiguous_warning` names. When
+the file changed after the last index run, the result adds `stale: true`
+and a `stale_warning`. The callers and callees always come from the
+index, thus a stale result can hold an incomplete list.
 
 #### `read_file`
 
@@ -1176,9 +1424,22 @@ Code that is behind `#ifdef BOARD_V2` is visible only when the build
 defines `BOARD_V2`.
 
 The path can be relative to the project root, such as `src/main.cpp`, or
-just the filename, such as `main.cpp`. This tool falls back to the raw
+just the filename, such as `main.cpp`. The path matching and the access
+rules are the same as in `get_file_map`. This tool falls back to the raw
 disk content, with a `warning`, when the indexed `files.content` column is
 empty. Run `fw-context index` to populate the ifdef-filtered content.
+
+Comments and preprocessor directives stay in the content: an include
+guard, a `#define`, and a block comment with its closing marker. Thus a
+blank line is an inactive line, or a line that is blank on disk.
+
+When every line of the file is inactive, the result holds
+`all_lines_inactive: true` and a `warning`. Such a file holds code, and
+the active build compiles none of it. It is NOT an empty file.
+
+When the file changed after the last index run, the result holds
+`stale: true` and a `stale_warning`: the content comes from the index, not
+from the disk.
 
 `line_numbers=True` prefixes every line with its number, in the format
 that `get_source` uses. `start_line` and `end_line` cut a window out of
@@ -1213,7 +1474,7 @@ initializer lists. This tool automatically falls back to a **macro
 lookup** when fw-context does not find the symbol as a function or method.
 
 ```
-Input:  {"name": "uart_write", "project_root?": "/path/to/project", "limit?": 50}
+Input:  {"name": "uart_write", "project_root?": "/path/to/project", "limit?": 50, "offset?": 0}
 Output: [{"file": "/path/src/main.c", "line": 35, "ref_kind": "call",
           "caller": "main", "caller_kind": "function"},
          {"file": "/path/src/setup.c", "line": 12, "ref_kind": "indirect",
@@ -1230,6 +1491,29 @@ pointer — use `find_indirect_call_sites`. For linking assignments to call
 sites — which specific functions can run at a given call site — use
 `find_indirect_targets`.
 
+**Ambiguous name.** When the name matches more than one symbol, such as
+two classes with a method of the same name, the answer holds the call
+sites of all of them. A leading `warning` row names the symbols, and each
+row carries `target_qualified_name`, the symbol that the row belongs to.
+Give the full qualified name to ask about one symbol only. The same
+applies to `find_references`, `find_call_path`,
+`find_all_callers_recursive`, and `find_callees_recursive`.
+
+**Virtual methods.** A virtual method with no call site of its own
+answers with the call sites of its base method and of the sibling
+overrides of that base. A `warning` row leads such an answer, and each
+row carries two more fields:
+
+- `recorded_against` — the symbol that the index records the call
+  against: the base method, or a sibling override.
+- `reaches_this_symbol` — `true` when the row is recorded against the base
+  method. Such a call reaches this override when the object has this
+  type. A row with `false` is recorded against a sibling override, and it
+  reaches that sibling and not this method.
+
+Read both fields before you report a caller count. `find_references`
+behaves in the same way.
+
 #### `find_references`
 
 All uses of a symbol — calls, reads, member access, indirect references.
@@ -1238,7 +1522,7 @@ back to a **macro lookup**. In that case, this tool returns
 `ref_kind: "macro_use"` for a file that uses the macro.
 
 ```
-Input:  {"name": "g_sensor_data", "project_root?": "/path/to/project", "limit?": 50}
+Input:  {"name": "g_sensor_data", "project_root?": "/path/to/project", "limit?": 50, "offset?": 0}
 Output: [{"file": "/path/src/sensor.c", "line": 12, "ref_kind": "ref",
           "caller": "sensor_task", "caller_kind": "function"}, …]
 ```
@@ -1252,8 +1536,16 @@ Output: [{"kind": "macro", "name": "CONFIG_BUFFER_SIZE", "file": "…", "line": 
 
 `ref_kind` values: `"call"` (direct call), `"ref"` (variable read/write),
 `"member"` (member access), `"indirect"` (function pointer reference in
-arguments, assignments, initializers, or init lists), `"template_ref"`,
-`"macro_use"` (macro usage in file).
+arguments, assignments, initializers, or init lists),
+`"implicit_construct"` (implicit constructor call from a global or static
+object, or from member-field initialization), `"dispatch"` (a synthetic
+edge from a dispatch bridge, such as `EventQueue::call_every`), `"macro_use"` (macro usage
+in file), `"vector"` (a slot of an assembly vector table names the
+symbol; `file` and `line` are the table entry), `"vector_data"` (a slot
+holds an address computed from the symbol, such as the initial stack
+pointer), `"runtime_vector"` (a `NVIC_SetVector` call installs the symbol
+into a slot at run time), `"alias"` (`.thumb_set`: another assembly name
+for the symbol).
 
 #### `find_call_path`
 
@@ -1261,10 +1553,21 @@ Find paths between two functions via BFS in the call graph.
 
 ```
 Input:  {"from_name": "main", "to_name": "uart_send_byte", "project_root?": "/path/to/project", "max_depth?": 10}
-Output: [{"depth": 3, "chain": "main → app_init → uart_write → uart_send_byte"}]
+Output: [{"depth": 3, "chain": "main → app_init → uart_write → uart_send_byte",
+          "target_usr": "c:@F@uart_send_byte"}]
 ```
 
-Returns up to 5 shortest paths. Requires both symbols to be in the index.
+Returns up to 5 distinct paths, in the order that the BFS finds them. The
+tool does not check that a path is the shortest. The search runs from
+both ends, and each end goes up to `max_depth` hops. Thus a path can hold
+up to 2 × `max_depth` edges. When no path exists, the result is one
+`info` dict. Requires both symbols to be in the index. Each path carries `target_usr`, the USR of the symbol
+that the path ends at. It tells two overloads apart. A chain that the
+search finds at several meeting points is reported once.
+
+When `to_name` matches more than one symbol, the search reaches all of
+them, and each path also carries `target_qualified_name`. The answer can
+then hold two direct paths to two targets of the same name.
 
 #### `find_all_callers_recursive`
 
@@ -1278,6 +1581,11 @@ Output: [{"name": "led_toggle", "qualified_name": "led_toggle", "kind": "functio
 
 fw-context deduplicates the results. Each caller appears once, at its
 shortest distance.
+
+Each row holds `name`, `qualified_name`, `kind`, `signature`, `depth`, and
+`file` (absolute). There is no `line`, because one caller can hold several
+call sites. For the line of each call, use `find_callers` on the name
+that this tool reports. `find_callees_recursive` gives the same fields.
 
 #### `find_callees_recursive`
 
@@ -1294,7 +1602,7 @@ Output: [{"name": "spi_init", "kind": "function", "file": "/path/src/spi.c", "de
 Finds functions that have a definition, but no caller. Returns two categories:
 
 ```
-Input:  {"project_root?": "/path/to/project", "limit?": 100, "project_only?": true, "exclude_paths?": ["lib/%"]}
+Input:  {"project_root?": "/path/to/project", "limit?": 100, "offset?": 0, "project_only?": true, "exclude_paths?": ["lib/%"]}
 Output: [
   {"name": "orphan_fn", "kind": "function", "file": "/path/src/utils.c",
    "signature": "void orphan_fn()", "line": 200,
@@ -1318,10 +1626,23 @@ unindexed code, or through a type-erased API. Treat this result as
 uncertain, not as confirmed dead code. Verify each result with
 `find_indirect_targets`, before you delete the function.
 
-Expect additional false positives from entry points (`main`), ISRs,
-virtual method overrides, constructors called via factories, and
-weak-aliased symbols. fw-context checks only definitions with
+Each row also holds `qualified_name`. `file` is absolute, and `line` is
+the line of the definition.
+
+Expect additional false positives from entry points (`main`), virtual
+method overrides, constructors called via factories, and weak-aliased
+symbols. fw-context checks only definitions with
 `kind IN ('function', 'method', 'constructor', 'destructor')`.
+
+ISRs: a handler that a readable vector table names carries a reference,
+thus it is not reported as `"dead"`. An assembly table of `.word` entries
+gives a `"vector"` reference. A table that the build generates in C gives
+an `"indirect"` reference, thus such a handler can appear as
+`"possibly_dead"`. A handler that a `NVIC_SetVector` call installs gives a
+`"runtime_vector"` reference. Expect ISRs as `"dead"` false positives
+where the architecture builds its table from branch instructions (arm64,
+Xtensa, MIPS), and where a table slot holds an address without a name.
+Use `get_vector_table` to see the table.
 
 By default, fw-context excludes SDK and vendor paths automatically, with
 the `is_project` column, which respects the project's `vendor_paths` and
@@ -1333,10 +1654,14 @@ patterns on top of this. A `%` matches any suffix, for example `lib/%`.
 Most-called functions ranked by caller count.
 
 ```
-Input:  {"project_root?": "/path/to/project", "limit?": 20, "project_only?": true, "exclude_paths?": ["lib/%"]}
+Input:  {"project_root?": "/path/to/project", "limit?": 20, "offset?": 0, "project_only?": true, "exclude_paths?": ["lib/%"]}
 Output: [{"name": "log_debug", "kind": "function", "caller_count": 147, …},
          {"name": "millis", "kind": "function", "caller_count": 89, …}, …]
 ```
+
+Each row holds `name`, `qualified_name`, `kind`, `signature`, `file`
+(absolute), `line`, and `caller_count`. For the call sites of one hotspot,
+use `find_callers`.
 
 #### `find_wrapper_callers`
 
@@ -1345,13 +1670,26 @@ useful for understanding an adapter or wrapper architecture.
 
 ```
 Input:  {"class_name": "UART_DRIVER", "project_root?": "/path/to/project", "limit?": 50}
-Output: [{"wrapper_class": "UART", "wrapper_method": "send",
-          "driver_method": "UART_DRIVER::send", "file": "/path/src/uart.cpp",
-          "line": 45, "ref_kind": "call"}, …]
+Output: [{"wrapper_class": "UART", "method_count": 2,
+          "methods": [
+            {"method": "send", "qualified_name": "UART::send", "kind": "method",
+             "file": "/path/src/uart.cpp",
+             "calls": [{"driver_method": "send", "line": 45}]},
+            {"method": "init", "qualified_name": "UART::init", "kind": "method",
+             "file": "/path/src/uart.cpp",
+             "calls": [{"driver_method": "configure", "line": 30},
+                       {"driver_method": "enable", "line": 31}]}]}, …]
 ```
 
 Pass a fully-qualified class name (`hal::UART_DRIVER`) or just the bare
-name (`UART_DRIVER`). fw-context groups the results by wrapper class.
+name (`UART_DRIVER`). fw-context groups the results by wrapper class. A
+free function goes into `wrapper_class: "(global)"`. `file` is on each
+method, not on the class, because one class can span several files.
+`driver_method` is the bare name of the driver method.
+
+`limit` (max 50) caps the call sites into the driver that fw-context reads
+and groups. The answer has no page notice, thus a driver with more call
+sites gives a partial grouping. No match gives one `info` dict.
 
 #### `find_indirect_call_sites`
 
@@ -1401,6 +1739,13 @@ assignment, `"call_arg"` for a value passed as a callback argument,
 `"var_init"` for a variable initializer, or `"init_list"` for a struct or
 array designated initializer.
 
+**Name matching.** `name` matches the pointer by exact name, exact
+qualified name, or `::name` suffix, and a parameter by its name. `name`
+also matches the ASSIGNED function, by exact name or substring. Thus a
+row can be an assignment of a function whose name holds `name`, to a
+pointer with another name. Read `rhs_name` and the call site before you
+act on such a row.
+
 For the reverse query — where does code call this field — use
 `find_indirect_call_sites`.
 
@@ -1410,15 +1755,116 @@ Trace how data of a given type flows to a target function. **Experimental.**
 
 ```
 Input:  {"type_name": "SensorData", "to_symbol": "uart_send", "project_root?": "/path/to/project", "max_depth?": 8, "limit?": 15}
-Output: [{"source_function": "sensor_read", "source_type": "SensorData",
-          "file": "/path/src/sensor.cpp", "line": 120,
-          "call_path": "sensor_read → pack_payload → uart_send"}, …]
+Output: [{"_summary": "1/2 source functions reach 'uart_send' within depth 8",
+          "_type": "SensorData", "_target": "uart_send"},
+         {"source_name": "sensor_read", "source_qualified_name": "sensor_read",
+          "source_kind": "function", "source_file": "/path/src/sensor.cpp",
+          "source_line": 120, "caller_count": 4, "reachable": true,
+          "paths": [{"depth": 2, "chain": "sensor_read → pack_payload → uart_send",
+                     "target_usr": "c:@F@uart_send"}]},
+         {"source_name": "sensor_log", "source_qualified_name": "sensor_log",
+          "source_kind": "function", "source_file": "/path/src/log.cpp",
+          "source_line": 40, "caller_count": 1, "reachable": false}]
 ```
 
-Finds the functions whose signature mentions `type_name`, then looks for
-call paths from those functions to `to_symbol`. Does **not** resolve type
+Finds the definitions whose signature mentions `type_name` (substring
+match, any symbol kind, most-called first), then looks for call paths from
+those definitions to `to_symbol`. A `_summary` row comes first. Each
+source row holds up to 3 `paths`, in the shape that `find_call_path`
+gives. An unreachable source has no `paths` key. `timed_out: true` means
+that the time budget (`timeout_ms`) ran out before the search for that
+source began: its `reachable: false` means "not checked". When nothing
+matches, the result is one `info` dict. Does **not** resolve type
 transformations, for example CBOR encoding. Use this tool together with
 `find_call_path`, to verify specific paths.
+
+#### `get_vector_table`
+
+Read the interrupt vector table, and say what services each interrupt.
+Nothing calls a handler — the hardware reads a slot and jumps — thus the
+other graph tools show a handler as unreferenced. This tool reads the
+table itself.
+
+```
+Input:  {"project_root?": "/path/to/project", "unhandled_only?": false, "limit?": 400}
+Output: [{"slot": 0, "name": "__StackTop", "file": ".link_script.ld", "line": 148,
+          "status": "linker", "source": "assembly",
+          "table_file": "startup_stm32f429xx.S", "table_line": 60},
+         {"slot": 44, "name": "TIM2_IRQHandler", "file": "src/timer.c", "line": 31,
+          "status": "c", "source": "assembly",
+          "table_file": "startup_stm32f429xx.S", "table_line": 104,
+          "overridden": {"file": "startup_stm32f429xx.S", "line": 412}},
+         {"slot": 45, "name": "TIM3_IRQHandler", "file": "startup_stm32f429xx.S", "line": 413,
+          "status": "unhandled", "source": "assembly",
+          "table_file": "startup_stm32f429xx.S", "table_line": 105,
+          "aliases": {"name": "Default_Handler", "file": "startup_stm32f429xx.S", "line": 380}},
+         …,
+         {"coverage": "…"}, {"interrupts": "…"}]
+```
+
+**`slot` is the position inside its own table.** What the position means
+belongs to the architecture. On Cortex-M, slots 0 to 15 are the system
+exceptions, and slot 16 + n is external interrupt n. fw-context does not
+renumber slots across tables: two tables both start at 0. Read `slot`
+together with `table_name` and `source`.
+
+**Paths are relative.** This tool gives paths as the index stores them:
+relative to the project root for a file inside it. This applies to
+`file`, `table_file`, and the paths in `overridden`, `aliases`, and
+`installed` (also `at`). The other graph tools give absolute paths.
+
+`status` says what services the interrupt:
+
+| Status | Meaning |
+|--------|---------|
+| `"c"` | A definition outside assembly. Code runs. `overridden` holds the weak definition that it replaced, when the index holds one. |
+| `"assembly"` | An assembly definition that is not an alias of another symbol. Assembly services the interrupt. |
+| `"unhandled"` | An assembly name that is an alias (`.thumb_set`) of another symbol, and nothing overrode it. fw-context reads this from the alias edge only, not from weakness. `aliases` names the target, usually `Default_Handler`, an infinite loop. |
+| `"runtime"` | The image holds that alias, but a `NVIC_SetVector` call installs a real handler at run time (a target with `CMSIS_VECTAB_VIRTUAL`). The interrupt is serviced only after the registering code has run. |
+| `"data"` | The slot holds an address built from the symbol, such as `.word sym + CONST`. On Cortex-M this is slot 0, the initial stack pointer. It is not code. |
+| `"linker"` | The linker script gives the address, and no compiled file defines the name. Slot 0 of a CMSIS table looks like this. It is not code. |
+| `"dispatcher"` | The target holds more than one slot of the table AND calls through a pointer, such as Zephyr's `_isr_wrapper`. It decides at run time where to go. Follow it with `get_symbol_context`. |
+
+`source` says where a row came from:
+
+| Source | Meaning |
+|--------|---------|
+| `"assembly"` | A table of `.word` or `.long` address words, as a CMSIS startup file writes it. |
+| `"c"` | A C array whose elements are function addresses, as a build that generates its table writes it. The row also holds `table_name` and `table_usr`. |
+| `"build"` | A registration that the build recorded, for a slot that the other two sources cannot name. The row can hold `argument`, the symbol that the build passes to the handler. It is an argument, not a second handler. |
+
+fw-context recognizes a C table by its shape, not by its name. Thus any
+array of function addresses is reported, and `table_name` tells a table
+of handlers from, for example, a table of state machine steps.
+
+An assembly row can hold `installed`: one entry per `NVIC_SetVector` call
+site, with `name`, `file`, `line`, and `at` (where the registration
+happens). A row with a real static definition keeps its own status and
+still carries `installed`.
+
+Rows other than slots follow the slots. `limit` (max 1000) does not apply
+to them:
+
+- `truncated` — how many slots `limit` cut. It comes first.
+- `coverage` — one row per C table that has slots with no function name.
+  Such a slot holds a zero, an address that the linker resolved, or data.
+  In a table of handlers that is an unused vector. In Zephyr's
+  `_sw_isr_table` it is the opposite: the unnamed slots are the
+  interrupts in use.
+- `interrupts` — which interrupts the build connected and which it did
+  not, where the build recorded its registrations. When the build enables
+  `CONFIG_DYNAMIC_INTERRUPTS`, the text says that some interrupts can be
+  connected at run time.
+
+`unhandled_only=true` returns only the `"unhandled"` slots, and the
+`interrupts` row. A build that generates its table writes no alias, thus
+it gives no `"unhandled"` slot. There, the `interrupts` row is the answer.
+
+The answer is never empty. One `info` row says when the build has no
+vector table that this tool can read. An architecture that builds its
+table from branch instructions (arm64, Xtensa, MIPS) gives this answer.
+Use `find_references` on a handler name instead. Requires the reference
+index.
 
 ### Class analysis
 
@@ -1474,12 +1920,21 @@ Find concrete instantiations of a class or function template.
 
 ```
 Input:  {"template_name": "std::vector", "project_root?": "/path/to/project", "limit?": 50}
-Output: {"template_name": "std::vector", "template_usr": "c:@...",
-         "instance_count": 3,
-         "instances": [{"name": "vector", "qualified_name": "std::vector<int>",
-                         "kind": "class", "file": "/path/src/main.cpp", "line": 42,
-                         "signature": "class vector<int>", "is_definition": true}, …]}
+Output: [{"name": "vector", "qualified_name": "std::vector", "kind": "class",
+          "file": "/usr/include/c++/12/bits/stl_vector.h", "line": 428,
+          "is_definition": true, "signature": "",
+          "instances": [{"name": "vector", "qualified_name": "std::vector<int>",
+                          "kind": "class", "file": "/path/src/main.cpp", "line": 42,
+                          "signature": "class vector<int>", "is_definition": true}, …],
+          "instance_count": 3}]
 ```
+
+The result is a list with one dict. That dict describes the template
+itself and holds the `instances` list. `instance_count` is the number of
+instances returned, capped by `limit` (max 200). A dict with `error` means
+that the name was not found, is not a template, or the query failed. When
+a file of the answer changed after the last index run, a `warning` dict
+comes first.
 
 Returns an empty `instances` list when the template is declared but
 fw-context never finds an instantiation in the project code. Works for
@@ -1494,13 +1949,19 @@ derived-class methods override this one.
 
 ```
 Input:  {"method_name": "UART_DRIVER::send", "project_root?": "/path/to/project"}
-Output: {"method": "send", "qualified_name": "hal::UART_DRIVER::send",
+Output: {"name": "send", "qualified_name": "hal::UART_DRIVER::send",
          "kind": "method", "file": "/path/src/UART_DRIVER.cpp", "line": 88,
-         "is_virtual": true, "is_pure_virtual": false,
-         "overrides": [{"name": "send", "qualified_name": "SerialBase::send",
-                         "usr": "c:@...", "file": "/path/src/SerialBase.h"}],
+         "signature": "int send(const uint8_t *, size_t)",
+         "overrides": [{"usr": "c:@...", "name": "send", "qualified_name": "SerialBase::send",
+                         "kind": "method", "file": "/path/src/SerialBase.h", "line": 30}],
          "overridden_by": []}
 ```
+
+The result has no virtual flags. For `is_virtual` and `is_pure_virtual`,
+use `get_class_members` or `lookup_symbol`. A related `file` can be
+`null` when the index has no path for it. When a file of the answer
+changed after the last index run, the dict adds `stale: true` and a
+`stale_warning`. On failure, the dict holds `error`.
 
 Uses the `overrides` table, which fw-context builds during indexing. A
 parameter-type comparison filters out accidental name collisions, such as
@@ -1536,7 +1997,9 @@ the user without interpretation. The `index` field is the full
 `get_active_build()` result, unchanged; its `index_message` carries the
 action.
 
-This tool is read-only. Use it at session start, to see everything that
+This tool is read-only, with one exception: on an initialized project,
+its `get_active_build` call creates default `.fw-context/config.toml` and
+`local.toml` when they are missing. Use it at session start, to see everything that
 needs fixing before answering the user. Pass `project_root` explicitly
 when the project is not the server's working directory.
 
@@ -1574,36 +2037,98 @@ Output: {"config_hash": "a1b2…", "project_id": "c3d4…", "project_root": "/pa
                       "project": {"analyzed": 8450, "skipped": 6, "total": 8570},
                       "vendor": {"analyzed": 0, "skipped": 0, "total": 42330},
                       "complete": false},
-         "vendor_paths": [], "project_paths": [],
-         "bg_reindex_running": false, "reindex_progress": null,
+         "vendor_paths": [], "project_paths": [], "effective_vendor_patterns": ["zephyr/%", …],
+         "bg_reindex_running": false,
          "status": "ready", "reindex_needed": false, "reindex_reasons": [],
-         "index_message": "Index is fully up to date (12430 symbols) | LLM analysis: project 8450/8570 (vendor skipped — analyze_vendor=false)"}
+         "index_message": "Index is fully up to date (12430 symbols) | LLM analysis: project 8450/8570 (vendor skipped — analyze_vendor=false)",
+         "entry_point": "__start",
+         "memory": [{"name": "FLASH", "attributes": "rx", "origin": "0x0", "length": "0x100000",
+                     "origin_value": 0, "length_value": 1048576,
+                     "file_path": "build/zephyr/linker.cmd", "line": 12}, …],
+         "defines": {"__ZEPHYR__": "1", …}, "defines_varying": 4}
 ```
 
-**Read-only.** This tool has no side effects, and does not spawn background
-tasks. The server startup thread and the file watcher manage the
-background reindex. `bg_reindex_running` and `reindex_progress` report
-whether a background reindex is active, and its last log line.
+**Read-only, with one exception.** The config load creates default
+`.fw-context/config.toml` and `local.toml` when they are missing. This
+tool does not spawn background tasks. The server startup thread and the file watcher manage the
+background reindex. `bg_reindex_running` reports whether an index run is
+active. Only while a run is active, `reindex_progress` holds the newest
+progress or error line that fw-context wrote for that run. Output of the
+build tools in the same log is skipped.
 
 **`status` field (use for decision-making):**
 
 | Status | Meaning | What to do |
 |--------|---------|------------|
 | ``"ready"`` | Fully up to date, no issues | Continue normally |
-| ``"reindexing"`` | Background reindex in progress | Index is still usable — continue normally |
-| ``"reindex_needed"`` | compile_commands.json changed or schema mismatch | Queries still work, but schedule ``fw-context index`` |
-| ``"no_index"`` | No build config indexed | Run ``fw-context index`` |
+| ``"reindexing"`` | Background reindex in progress, or fw-context is about to build a new source file by itself | Index is still usable — continue normally |
+| ``"reindex_needed"`` | A structural cause — see `reindex_reasons` below | Queries still work, but read `reindex_reasons` for the command |
+| ``"no_index"`` | Initialized, but `index.db` does not exist | Run ``fw-context index`` |
 | ``"not_initialized"`` | ``fw-context init`` was not run | Run ``fw-context init`` |
-| ``"error"`` | DB corruption or access error | Use other tools |
 
-`modified_files_count` is 0 with the default `fast=true`. With
-`fast=false`, fw-context does a fresh stat scan of every indexed file. This
-tool does not use the 30-second count cache — only the watcher daemon uses
-it. `header_affected_tus` reports how many translation units have stale
+A failure sets no `status`. On DB corruption, an access error, or a
+database that holds no build config, the result is a dict that holds only
+`error`. Read that key first.
+
+`"reindex_needed"` outranks `"reindexing"`: the answers of this moment
+come from the last finished run. When `bg_reindex_running` is `true` at
+the same time, `index_message` says to wait for the running index run
+instead of naming a command.
+
+**`reindex_reasons`** names each cause of `"reindex_needed"`:
+
+- Schema mismatch (`schema_mismatch: <old> < <new>`).
+- Older row format (`row_format_mismatch: <old> != <new> — <effect>`).
+  The stored text has an older meaning. For example, an index written
+  before `fw-context-rows/1` keeps every inactive `#if` branch, thus
+  answers can hold dead code.
+- compile_commands.json changed.
+- A source file on disk is missing from compile_commands.json, and
+  fw-context will not build it by itself. The reason says why.
+- The tree is on another git branch than the index.
+
+The last two need `fw-context index --build`, because only a build
+regenerates compile_commands.json. The others need `fw-context index`.
+Read the reason text: it names the command.
+
+One reason does not set `"reindex_needed"`: a new source file that is
+missing from compile_commands.json, when fw-context will build it by
+itself. That reason is in `reindex_reasons` while `reindex_needed` is
+`false` and `status` is `"reindexing"`.
+
+**`client_restart_required`.** When the index holds a NEWER row format
+than this server process reads, the result holds
+`client_restart_required: true` and `client_restart_reason`, and
+`index_message` opens with it. `status` stays `"ready"`, and every query
+keeps working. Do NOT reindex: the indexer writes the same new format
+again. Tell the user to restart the LLM client (Claude Code, opencode, or
+the client in use). The MCP server is a child process of that client.
+
+`modified_files_count` counts the files whose content no longer matches
+the index. Both modes count it. `fast` controls only the header check:
+`fast=true` (the default) reuses the cached manifest hashes, and
+`fast=false` recomputes them, which is much slower.
+`header_affected_tus` reports how many translation units have stale
 header dependencies. This count is non-zero when headers changed since the
-last index with `manifest_verification: "full"`. fw-context reports
-`header_affected_tus` in both modes, but `fast=true` reads it from the
-cache.
+last index with `manifest_verification: "full"`.
+
+`effective_vendor_patterns` holds the SQL LIKE patterns that this build
+really used to mark vendor code. `vendor_paths` and `project_paths` hold
+what the config asks for. The list is empty when the manifest cannot be
+read.
+
+**Build facts.** `entry_point` is the `ENTRY()` of the linker script of
+the build that `config_hash` names. `memory` lists the `MEMORY` regions of
+that script: `{name, attributes, origin, length, origin_value,
+length_value, file_path, line}`. `origin` and `length` are the expression
+that the script writes. `origin_value` and `length_value` are numbers, or
+`null` for an expression that names a symbol. An empty value means "not
+recorded", for example on PlatformIO, which records no linker script.
+`defines` holds the `-D` flags that every translation unit of the build
+carries with one value. `defines_varying` counts the names that are left
+out because they are not on every unit or have different values. In a
+multi-variant project with no `[build] default_variant`, the four fields
+are empty. Use `list_variants` for the map of every build.
 
 `manifest_verification` is `"full"` when `manifest.json` is available. In
 that case, fw-context tracks header staleness with SHA-256 hashes that
@@ -1627,8 +2152,8 @@ project symbols that still need analysis:
   symbol is analyzed or skipped (and, when `analyze_vendor` is true, every
   vendor symbol too).
 
-`complete` and the `"N unanalyzed symbols"` entry in `reindex_reasons` come
-from one query. `complete` is `true` exactly when that entry is absent.
+`index_message` also gives the analysis coverage, split into project and
+vendor symbols. An unanalyzed symbol is not a reindex reason.
 
 When `analyze_vendor` is `false`, vendor symbols are skipped by design —
 a large unanalyzed vendor count is normal, not a defect.
@@ -1636,18 +2161,20 @@ a large unanalyzed vendor count is normal, not a defect.
 `indexed_at` and `first_indexed_at` are UTC, in `"YYYY-MM-DD HH:MM:SS"`
 format. File modification times are local time. Do not compare the two
 directly. In UTC+2, a file that fw-context indexed correctly looks 2 hours
-newer than `indexed_at`. To find modified files, use `modified_files_count`
-with `fast=false`.
+newer than `indexed_at`. To find modified files, use `modified_files_count`.
 
-**Multi-variant output.** For a project with `[[build.variants]]`, the
-result adds these fields:
+**Multi-variant output.** The result holds these fields:
 
-- `multi` — `true` for a multi-variant project
-- `variants` — a list of `{name, description, board}`
+- `multi` — `true` for a multi-variant project: the config declares
+  variants, or the index holds a build with a variant name
+- `variants` — a list of `{name, description, board}`: the declared
+  variants, plus the indexed variants that the config does not declare
 - `images` — a list of `{name, description, dir, type, board?}`
 - `variant_images` — a map of variant name to its image names
 - `active_variant` — the `[build] default_variant` value
-- `active_image` — the `[build] default_image` value
+- `active_image` — the `[build] default_image` value. A query tool does
+  not use it to select an image; pass `image` instead. This tool uses it
+  only to pick the build that `config_hash` names
 
 #### `list_variants`
 
@@ -1671,6 +2198,13 @@ For a single-project index, this tool returns one `builds` entry, with an
 empty `variant` and an empty `image`. Use `get_active_build` for the
 human-readable variant and image discovery.
 
+This tool is read-only, with one exception: the config load creates
+default `.fw-context/config.toml` and `local.toml` when they are missing.
+
+Each `builds` entry also holds `entry_point` and `memory`, in the same
+shape as in `get_active_build`. This is the memory map of every build;
+`get_active_build` gives it for one build only.
+
 #### `reindex_file`
 
 Re-index a single file after editing.
@@ -1681,10 +2215,14 @@ Output: {"file": "/abs/path/to/src/main.c", "translation_units": 1,
          "symbols_updated": 28, "elapsed_s": 2.5}
 ```
 
-**Limitation:** The file must appear in `compile_commands.json`. fw-context
-re-indexes a header through the translation unit that includes the
-header. When multiple translation units include a single header, you
-might need a full `fw-context index` run for completeness.
+**Limitation:** A source file must appear in `compile_commands.json`.
+compile_commands.json lists no headers, thus fw-context re-parses a header
+through ONE translation unit that includes it, from the manifest: the unit
+with the lowest path in sort order. The result then holds a `warning`
+("Header re-indexed via one TU…"). Other units can include the header
+with other `#define` values and still hold stale symbols. Run a full
+`fw-context index` for full accuracy. A file that no unit builds or
+includes gives an `error`.
 
 #### `reindex_file_impl`
 
@@ -1697,14 +2235,32 @@ only when you need to control `with_analysis` explicitly.
 Input:  {"file_path": "/abs/path/to/src/main.c", "project_root?": "/path/to/project", "with_analysis?": true}
 Output: {"file": "/abs/path/to/src/main.c", "translation_units": 1,
          "symbols_updated": 28, "elapsed_s": 2.5,
-         "analysis_updated": 12, "analysis_warning": null}
+         "analysis_updated": 12, "embeddings_updated": 12}
 ```
+
+Optional keys are present only when they apply. They are absent
+otherwise, never `null`:
+
+- `skipped_tus` and `skipped_count` — translation units that failed to
+  parse.
+- `warning` — a header went through one translation unit.
+- `analysis_updated` and `embeddings_updated` — counts for the whole
+  build, not only for this file.
+- `analysis_warning`, `overrides_warning`, `pagerank_warning`,
+  `embedding_warning` — a phase failed.
+
+A file that is gone from disk but is still in the index has its records
+removed. The result is then `{"file": …, "symbols_removed": 28,
+"action": "deleted"}`. On failure, the dict holds `error`, and can also
+hold `skipped_tus` or `action`. `reindex_file` gives the same shape.
 
 When `with_analysis=True` (the default), this tool also regenerates the
 LLM symbol analysis and the method override relationships. This is
 slower, but produces a fully up-to-date index. Set `with_analysis=False`
-for a fast, symbol-only update. This tool requires an existing index. The
-file must appear in `compile_commands.json`.
+for a fast, symbol-only update. This tool requires an existing index. A
+source file must appear in `compile_commands.json`. A header goes through
+one including translation unit, with the same `warning` as in
+`reindex_file`.
 
 #### `reset_index`
 
@@ -1714,6 +2270,11 @@ Delete the index. Always run a dry run first, then pass `confirm: true`.
 Input:  {"project_root?": "/path/to/project", "confirm": false}     → {"action": "dry_run", "symbol_count": 8586, …}
 Input:  {"project_root?": "/path/to/project", "confirm": true}      → {"action": "deleted", "message": "…"}
 ```
+
+The delete removes the database with its `-wal`, `-shm`, and `-journal`
+files. It also removes the automatic-build markers `autobuild.failed` and
+`excluded_sources.json` next to the database, because they describe the
+index that is gone.
 
 #### `list_projects`
 
@@ -1769,11 +2330,17 @@ available).
 Input:  {"project_root?": "/path/to/project"}
 Output: {"status": "ok", "ollama_running": true, "ollama_enabled": true,
          "configured_model": "qwen2.5-coder:14b", "num_ctx": 16384,
-         "installed_models": ["qwen2.5-coder:14b", "mxbai-embed-large:latest"], …}
+         "installed_models": ["qwen2.5-coder:14b", "mxbai-embed-large:latest"],
+         "chat_api": {"configured": false, "model": "qwen2.5-coder:14b"}, …}
 ```
 
 Returns `status: "disabled"` when `[llm] enabled = false`. In that case,
 this tool needs no Ollama.
+
+`chat_api` says whether an external chat API replaces Ollama for chat,
+and which model it names. When it is configured, `chat_api` also holds
+`endpoint` and `format`, and a `compliance_warning` for a host that is not
+local.
 
 Note: `explain_symbol`, with pre-computed analysis (the default), returns
 instantly, and does not require Ollama at query time. `num_ctx` is 16384
@@ -1796,6 +2363,11 @@ tool uses the local Ollama instance. When `chat_api_base` points to an
 external host, source code in chat prompts is sent to that host. Verify
 this complies with your data security policy. Prefer the local Ollama
 instance.
+
+When the test call fails, this tool restores the previous
+`.fw-context/local.toml` (or removes the file if it did not exist). The
+result then holds `status: "error"`, and the message says that nothing
+was changed.
 
 ### MCP Resources
 
@@ -1901,19 +2473,40 @@ Phase 3: FTS5 search + merge
 └────────────────────────────────────────────────────┘
                     │
                     ▼
-Phase 4: Vector re-rank (sqlite-vec)
+Phase 4: Vector search (sqlite-vec)
 ┌────────────────────────────────────────────────────┐
-│ FTS5 candidates re-ranked by cosine distance.      │
-│ Query embedded via mxbai-embed-large.              │
-│ Hybrid: text recall + vector precision.            │
+│ Separate KNN query with the query embedding        │
+│ (embed_model), independent of the FTS5 results.    │
+│ Cosine similarity threshold 0.5.                   │
 └────────────────────────────────────────────────────┘
                     │
                     ▼
-Phase 5: Deduplicate + format
+Phase 5: Adaptive fusion
 ┌────────────────────────────────────────────────────┐
-│ Merge FTS5 + vector results.                       │
-│ Prefer definitions.  Score-sort.  Limit to N.      │
-│ Add metadata entries (_generated_queries, …).      │
+│ Prefer the vector results.  When they are fewer    │
+│ than [index] min_dense_count, use the FTS5 results │
+│ instead.  No rank fusion of the two lists.         │
+└────────────────────────────────────────────────────┘
+                    │
+                    ▼
+Phase 6: Deduplicate
+┌────────────────────────────────────────────────────┐
+│ Remove duplicates.  Prefer definitions.            │
+└────────────────────────────────────────────────────┘
+                    │
+                    ▼
+Phase 7: Expand context (call graph)
+┌────────────────────────────────────────────────────┐
+│ Walk callers and callees of the top 10 results.    │
+│ Insert up to 5 project definitions at positions    │
+│ 11-15.                                             │
+└────────────────────────────────────────────────────┘
+                    │
+                    ▼
+Phase 8: Format
+┌────────────────────────────────────────────────────┐
+│ Limit to N.  Add metadata entries                  │
+│ (_generated_queries, …).                           │
 └────────────────────────────────────────────────────┘
 ```
 
@@ -1931,11 +2524,35 @@ Phase 5: Deduplicate + format
 
 ### Staleness recovery on query
 
-`search_code`, `lookup_symbol`, and `semantic_search` detect a stale file
-in their results, when the on-disk `mtime` is greater than the stored
-`mtime`. When fw-context finds a stale file, these tools append a warning
-to the response. The server's background reindex subprocess picks up the
-work, so no query has to wait for the reindex to finish. The file watcher
+The query tools check each file that their result names against the
+index. The content decides: fw-context compares the hash of the file on
+disk with `files.source_hash`. A `git checkout`, `pull`, or `stash pop`
+that only changes the `mtime` thus gives no warning. Only for a row with
+no stored hash does the `mtime` decide.
+
+These tools do the check: `search_code`, `search_bodies`,
+`search_content`, `lookup_symbol`, `find_variables`, `get_file_map`, the
+call-graph tools, and the class-analysis tools. The result shape decides
+where the warning goes:
+
+- A list gets a leading `{"warning": …}` record.
+- A dict gets `stale_warning` and `stale: true`.
+
+An empty result names no file, thus it gets its own message. It says that
+indexed files changed after the last index run, thus the empty result is
+not proof that the code does not exist. When source files are not in
+`compile_commands.json`, the message says so instead, and names
+`fw-context index --build`.
+
+`get_source` and `get_symbol_context` add `source_origin`: `"index"` or
+`"disk"`. When the file changed and the symbol did not move, the body
+comes from the disk, with every `#ifdef` branch. When an edit moved the
+symbol, the tool gives the indexed body with `stale: true`, because the
+stored line number no longer points at the symbol. `explain_symbol` and
+`read_file` also set `stale` and `stale_warning` when the file changed.
+
+The search tools start the watcher daemon in the background when they find
+a changed file, so no query has to wait for a reindex. The file watcher
 independently handles a recently edited file within 500 ms after the
 save, so a stale result is rare in practice.
 
@@ -1954,19 +2571,35 @@ For manual recovery, use `reindex_file` or `fw-context index`.
    Compute is_project per-symbol (project code = 1, vendor/SDK = 0)
    Extract cross-references including vendor/SDK (on by default; skip with --no-refs)
    Extract macros via clang -dM -E (preprocessor dump; stored in macro_defs table)
+   Read the preprocessor skipped ranges (clang_getAllSkippedRanges,
+   indexer/skipped_ranges.py) → blank each inactive #if line in
+   files.content and symbols.source; line numbers do not move;
+   comments and preprocessor directives stay
    Release the write lock between translation units. A manual operation,
    such as `reindex_file`, can interleave through the pause marker
    mechanism, without blocking.
 
-4. Write to SQLite (atomic per-TU transaction):
+3. Write to SQLite (atomic per-TU transaction):
    Delete old symbols for this TU
    Insert new symbols + FTS5 triggers
    Insert references (on by default; skip with --no-refs)
    Insert macros with expanded values
    Generate + store vector embeddings (on by default; skip with --no-embeddings)
 
-5. Write build metadata:
+4. Linker scripts (after the C units, before the assembly; indexer/linker_script.py):
+   Read the linker scripts that the build names
+   Store symbol definitions (NAME = expr; PROVIDE), ENTRY, and MEMORY
+   A symbol that a compiled file defines keeps that definition
+
+5. Assembly units (.S, after every other unit; indexer/asm.py):
+   Preprocess with clang -E -C (#if resolves, C macros expand, comments stay)
+   Expand assembler macros (.macro, .rept, .irp)
+   Store labels, .global/.weak symbols, .equ/.set aliases
+   Link each vector-table slot to its handler (ref_kind "vector")
+
+6. Write build metadata:
    compile_commands.json hash, file mtimes, symbol/file/ref/macro counts
+   Stamp the row format at the end of the run (get_active_build compares it)
 ```
 
 ### Vector search

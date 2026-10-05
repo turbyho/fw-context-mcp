@@ -33,10 +33,10 @@ echo 'export PATH="/opt/homebrew/opt/python@3.12/libexec/bin:$PATH"' >> ~/.zshrc
 | What | Why |
 |------|-----|
 | Python 3.11+ | Runtime |
-| [`uv`](https://docs.astral.sh/uv/) | Fast package installer |
+| [`uv`](https://docs.astral.sh/uv/) *(optional)* | Fast package installer. Without a working `uv`, `make install` uses `python -m venv` and `pip`. |
 | Compiler toolchain (for example ARM GCC or the Zephyr SDK) | libclang needs system headers to parse cross-compiled code |
 | [`bear`](https://github.com/rizsotto/Bear) | Intercepts build commands → `compile_commands.json` |
-| [Ollama](https://ollama.com) *(optional)* | Powers `smart_search` and `explain_symbol`. Disable with `[llm] enabled = false` to let the AI assistant handle results. |
+| [Ollama](https://ollama.com) *(optional)* | Computes the vector embeddings (`semantic_search`, `smart_search` re-rank) and the symbol analysis (`explain_symbol`). The core index does not need it. See [Ollama (optional)](#ollama-optional). |
 
 ## Install
 
@@ -66,6 +66,11 @@ git clone git@github.com:turbyho/fw-context-mcp.git ~/.fw-context/src
 # Install (creates venv, installs package, symlinks binaries into ~/.local/bin)
 cd ~/.fw-context/src && make install
 ```
+
+`make install` uses `uv` when `uv --version` runs. When `uv` is missing,
+or is a shim that cannot run (pyenv, asdf), it uses `python3 -m venv` and
+`pip` in the venv `~/.fw-context/.venv`. The package is installed in
+editable mode.
 
 **File watcher (auto-reindex on save):**
 
@@ -143,7 +148,7 @@ installs the core Python packages automatically: `libclang`, `pysqlite3`,
 | Tool | Why |
 |------|-----|
 | Python 3.11+ | Runtime |
-| `clang` (system binary) | fw-context uses this tool to resolve expanded macro values, with `clang -dM -E` |
+| `clang` (system binary) | fw-context uses this tool to resolve expanded macro values, with `clang -dM -E`. It also preprocesses assembly units (`.S`) with `clang -E -C`. Without `clang`, fw-context does not index assembly symbols and vector tables. |
 
 ```bash
 # Arch / Manjaro
@@ -272,7 +277,8 @@ Use this build system for any CMake project that is not Zephyr or ESP-IDF.
 
 This mode needs no build system. Configure `source_dirs`, `include_dirs`, and
 `defines` in `.fw-context/config.toml`. `fw-context` scans the sources and
-generates `compile_commands.json`.
+generates `compile_commands.json`. The `.d` files go to
+`.fw-context/build/deps`, not next to the sources.
 
 ### STM32CubeIDE (Manual Setup)
 
@@ -313,6 +319,13 @@ bear -- eclipse -nosplash -application com.ti.ccstudio.apps.projectBuild ...
 cd ~/.fw-context/src && make update
 ```
 
+`make update` runs `git pull`, and then the same editable install as
+`make install`.
+
+An update can change the format of the rows in the index. Then
+`get_active_build` reports `row_format_mismatch`. Run `fw-context index`
+once in each project to write the rows again.
+
 ## Verify
 
 ```bash
@@ -322,9 +335,32 @@ fw-context status
 
 ## Ollama (optional)
 
-Ollama powers natural-language search and symbol explanations.
-**Ollama is optional.** Set `enabled = false` in `[llm]`. Then the AI
-assistant processes the results with its own model.
+**The core index does not need Ollama.** Symbols, full-text search, the
+call graph, and source retrieval come from libclang and SQLite only.
+
+With the default configuration, Ollama does three jobs:
+
+| Job | Used by | Without Ollama |
+|-----|---------|----------------|
+| Vector embeddings (`[index] index_embeddings = true`, default) | `semantic_search`, the re-rank step of `smart_search` | `fw-context index` logs a warning and stores no vectors. `semantic_search` falls back to `search_code`, with a `warning`. |
+| Symbol analysis (`[llm] analyze_symbols = true`, default) | `explain_symbol`, symbol descriptions in search results | `fw-context index` logs a warning and skips the analysis. |
+| Search query generation | `smart_search` | `smart_search` uses FTS5 only. |
+
+Alternatives:
+
+- **Chat on another server.** Set `[llm] chat_api_base` to an
+  OpenAI-compatible API. Symbol analysis and query generation then use that
+  API. The embeddings still use the local Ollama.
+- **Embeddings without Ollama at index time.** Install the `st` extra
+  (`pip install "fw-context-mcp[st]"`) and set `embed_model` to a
+  sentence-transformers model, for example `"BAAI/bge-small-en-v1.5"`.
+  `fw-context index` then stores the vectors without Ollama. Note:
+  `semantic_search` still requires a running Ollama at query time; without
+  it, the tool falls back to `search_code`.
+- **No LLM.** Set `enabled = false` in `[llm]`. The LLM-calling tools then
+  return raw prompts, and the AI assistant processes the results with its
+  own model. Set `[index] index_embeddings = false` to skip the embedding
+  pass.
 
 ### Install Ollama
 
@@ -344,7 +380,8 @@ ollama --version
 ```
 
 Ollama runs a daemon on `http://localhost:11434`. This daemon must run when
-you call `smart_search` or `explain_symbol`.
+you run `fw-context index` (embeddings, symbol analysis), and when you call
+`semantic_search`, `smart_search`, or `explain_symbol`.
 
 ```bash
 ollama serve &   # start daemon if not running as a service
@@ -360,8 +397,11 @@ ollama pull qwen2.5-coder:14b        # recommended (~12 GB VRAM)
 ollama pull deepseek-v4-flash:cloud  # 284B MoE, 13B active, great value
 ollama pull qwen3-coder:480b-cloud   # coding-focused, top quality
 
-# Embedding model — required for vector search
-ollama pull mxbai-embed-large:latest
+# Embedding model — required for vector search. With an empty embed_model
+# (default), fw-context selects qwen3-embedding:8b on a machine with a GPU,
+# and qwen3-embedding:0.6b without one. [llm] auto_pull is false by default,
+# so pull the model yourself:
+ollama pull qwen3-embedding:0.6b     # or qwen3-embedding:8b with a GPU
 
 # Verify
 ollama run qwen2.5-coder:14b "Explain: void uart_init(int baudrate)"
@@ -398,7 +438,7 @@ Edit `~/.fw-context/config.toml` (global) or
 [llm]
 enabled      = true
 model        = "qwen2.5-coder:14b"
-embed_model  = "mxbai-embed-large:latest"
+# embed_model = ""                 # empty = auto: qwen3-embedding:8b (GPU) / :0.6b (CPU)
 ollama_url   = "http://localhost:11434"
 num_ctx      = 16384
 ```

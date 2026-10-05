@@ -30,6 +30,14 @@ gives `compile_commands.json` the new content. Thus a build that fails keeps
 the file that the last good build wrote. A reader never gets a database that
 a build still writes.
 
+A multi-variant project writes one file for each build, in the same
+directory. A variant without sysbuild writes
+`compile_commands.<variant>.json`, with the same staging rename. A Zephyr
+sysbuild image gets `compile_commands.<variant>.<image>.json`, which
+fw-context copies from the build directory of the image. The copy goes to
+a temporary file first, and one rename then replaces the target, thus a
+reader never gets a part of it.
+
 Only a build that a signal stops leaves a staging file. The next build in
 that directory deletes it when its process no longer runs. The `<tag>` is
 the host name and the PID namespace of the build. A PID of a container
@@ -75,6 +83,55 @@ checks a higher item first:
 The first builder that matches, wins. Set `system` explicitly, to skip
 detection or to force a specific builder.
 
+## Automatic build
+
+A `fw-context index` run without `--build` can start a build on its own.
+It does this only when an index exists and a build can repair something
+that a reindex cannot:
+
+- Source files are on disk that `compile_commands.json` does not cover.
+- The tree is on a different git branch than the index.
+
+A build that fw-context starts and that fails stops the automatic build
+for the same files, or the same branch, for 30 minutes. An explicit
+`fw-context index --build` ignores this backoff. For the triggers of the
+background runs, see [`fw-context index`](tools.md#fw-context-index).
+
+fw-context starts the build only for a backend that cannot damage the
+output of your own build. Such a backend puts its artifacts into a
+directory of its own, or it compiles nothing:
+
+| Backend | Automatic build | Why |
+|---------|-----------------|-----|
+| Mbed OS | yes | `mbed compile --build <dir>` |
+| PlatformIO | yes | `PLATFORMIO_BUILD_DIR` |
+| Zephyr | yes | `west build -d <dir>` |
+| ESP-IDF | yes | `idf.py -B <dir>` |
+| Arduino | yes | `arduino-cli compile --build-path <dir>` |
+| Generic CMake | yes | configure and build use the chosen build directory |
+| Keil MDK, IAR EWARM | yes | convert only, no compilation |
+| Manual / bare | yes | `.d` files go to a directory of fw-context |
+| Makefile | only with `make_dry_run = true` (default) | a real `make` owns its output directory |
+| STM32CubeIDE, TI CCS | never | fw-context cannot build these projects |
+
+The automatic build writes into `.fw-context/autobuild/<variant>`, or
+`.fw-context/autobuild/default` for a project without variants. fw-context
+writes `.fw-context/autobuild/.gitignore` with the line `*`, thus the
+output stays out of git also in a project that `fw-context init` set up
+before this directory existed.
+
+Exceptions:
+
+- PlatformIO: `pio run -t compiledb` also rewrites
+  `<project>/compile_commands.json`. fw-context cannot move that file
+  without a change to `platformio.ini`.
+- ESP-IDF: fw-context runs `idf.py set-target` only when the project has
+  no `sdkconfig`. `set-target` renames `<project>/sdkconfig`, and `-B`
+  does not move that file.
+- Manual / bare: the `.d` files go to the isolated build directory. In a
+  build that you start, they go to `.fw-context/build/deps`. They never go
+  next to the source.
+
 ## Configuration reference
 
 ### General
@@ -87,6 +144,12 @@ detection or to force a specific builder.
 | `python` | `str` | (auto-detect) | all | The Python interpreter for pip-based CLI tools, such as `mbed-cli`, `platformio`, `keil2clangd`, or `compiledb`. `fw-context init` detects this automatically, from pyenv, venv, and common install paths. Set this parameter manually when automatic detection fails. |
 | `activate` | `str` | (auto-detect) | all | A shell script that fw-context sources before the build, for example `nordic_minimal_setup.sh` for NCS, or `export.sh` for ESP-IDF. `fw-context init` detects this automatically, from common install paths. Set this parameter manually when automatic detection fails. |
 | `pre_build` | `str` | — | all | A shell command that fw-context runs before the build, the convert step, or the generate step. **Security: use this parameter only in `local.toml` (gitignored). Never use this parameter in a committed `config.toml` file.** |
+
+The build process does not get an inherited `BASH_ENV`. fw-context removes
+it from the build environment, because `bash -c` reads that file before
+the command, and `activate` runs through `bash -c`. If a build needs
+`BASH_ENV`, set it in `[build] env` or in `[build] extra_env`
+(`local.toml`). A configured value is applied after the removal.
 
 ### Mbed OS
 
@@ -176,9 +239,9 @@ a **build variant**. You declare each variant with `[[build.variants]]` in
 `.fw-context/config.toml`. Each `(variant, image)` pair becomes one
 indexed build, with its own `config_hash`.
 
-**Why use variants.** You index every board in one run. A query can
-target one variant, or all variants. You do not need one checkout per
-board.
+**Why use variants.** You index every board in one run. A query names one
+variant, and one image of it. To compare two builds, ask once for each
+build. You do not need one checkout per board.
 
 ### Concepts
 
@@ -212,7 +275,7 @@ Shared `[build]` keys for multi-variant projects:
 | Key | Default | Description |
 |-----|---------|-------------|
 | `default_variant` | — | The variant that a query uses when it omits `variant`. |
-| `default_image` | — | The image that a query uses when it omits `image`. |
+| `default_image` | — | The image that `get_active_build` reports as `active_image`. A query does not use this key: when a variant has more than one image, the query must name `image`. |
 | `sysbuild` | `false` | Use `west build --sysbuild` (Zephyr). |
 | `source_dir` | — | The sysbuild input application directory (Zephyr). |
 
@@ -230,6 +293,16 @@ fw-context index --build --variants a,b           # a list of variants
 fw-context index --image app                      # one image only
 fw-context index --exclude-image mcuboot          # skip one image
 ```
+
+With `--build`, a variant without sysbuild writes
+`.fw-context/build/compile_commands.<variant>.json`. A Zephyr sysbuild
+variant writes `.fw-context/build/compile_commands.<variant>.<image>.json`
+for each image. A later run without `--build` reuses the files: the file of
+each variant without sysbuild, and `<build_dir>/<image>/compile_commands.json`
+for each sysbuild image.
+
+A variant name that cannot be part of a file name, for example a name with
+`/`, fails that variant only. The other variants build and index.
 
 ### Manage the variants
 
@@ -583,9 +656,27 @@ sudo apt install bear      # Debian / Ubuntu
 
 ### `compiledb: command not found`
 
+fw-context looks for `compiledb` in this order:
+
+1. `<[build] python> -m compiledb`, when you set `[build] python`
+2. `<interpreter that runs fw-context> -m compiledb`, when that interpreter
+   can import `compiledb`
+3. `compiledb` on `PATH`
+
+When all three fail, the error names each of them. Install `compiledb`
+into the environment that runs fw-context:
+
 ```bash
-pip install compiledb
+python -m pip install compiledb
 ```
+
+Or use `bear` with a custom command: `[build] command = "bear -- make"`.
+
+### A build fails or times out
+
+The error quotes the last 2000 characters of `stdout` and of `stderr`. A
+stream that is longer says how many characters it holds. An empty stream
+is not shown. The cause of a failure is usually at the end of the log.
 
 ### `keil2clangd: command not found`
 
