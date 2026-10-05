@@ -115,6 +115,24 @@ class TestPageNotice:
             "lookup_symbol('uart', offset=50) reads the next page."
         )
 
+    @pytest.mark.parametrize("value", ["it's", 'a "phrase"', "it's \"both\"", "C:\\new\\main.c"])
+    def test_a_string_argument_reads_back_as_itself(self, value):
+        """``tool('it's', …)`` was no call: the string stopped after ``it``."""
+        import ast
+
+        from fw_context_mcp.mcp.handlers._lookup import _page_hint
+        from fw_context_mcp.mcp.handlers.source import _read_file_hint
+        from fw_context_mcp.mcp.shared.paging import page_hint
+
+        for hint in (
+            page_hint("search_code", value, kind="function", next_offset=20),
+            _page_hint(value, 20),
+            _read_file_hint(value, 2001, {"line_numbers": True}),
+        ):
+            call = ast.parse(hint.removesuffix(" reads the next page."), mode="eval").body
+            assert isinstance(call, ast.Call), hint
+            assert ast.literal_eval(call.args[0]) == value, hint
+
     def test_a_past_end_row_is_known_in_every_wording(self):
         """The new helper and the inline rows of the first paged tools share one shape."""
         from fw_context_mcp.mcp.shared.paging import holds_past_end_info, past_end_info

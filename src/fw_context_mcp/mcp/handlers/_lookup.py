@@ -26,7 +26,7 @@ from pydantic import Field
 from fw_context_mcp.indexer.db import count_macros, lookup_macro
 from fw_context_mcp.mcp.handlers._search_fallbacks import _symbol_row_to_dict
 from fw_context_mcp.mcp.shared.context import _db_path
-from fw_context_mcp.mcp.shared.paging import clamp_offset, page_notice
+from fw_context_mcp.mcp.shared.paging import clamp_offset, hint_arg, page_notice
 from fw_context_mcp.utils import abs_path, macro_signature, resolve_project_root
 
 # ``class`` comes from the parent symbol, and it is empty for a free
@@ -90,7 +90,7 @@ def _page_hint(name: str, next_offset: int) -> str:
     Every query of this tool now selects the owner column, thus each row
     carries its class and each page carries the same fields.
     """
-    return f"lookup_symbol('{name}', offset={next_offset}) reads the next page."
+    return f"lookup_symbol({hint_arg(name)}, offset={next_offset}) reads the next page."
 
 
 log = logging.getLogger(__name__)

@@ -259,6 +259,17 @@ class TestSearchBodiesPages:
 
 
 class TestSearchContentPages:
+    def test_a_query_with_an_apostrophe_gives_a_hint_that_is_a_call(self, project: Path):
+        """The hint wrote ``search_content(''probe'', …)``: an empty string, then a bare name."""
+        import ast
+
+        from fw_context_mcp.mcp.handlers.search import search_content
+
+        notice = _notice(search_content("'probe'", project_root=str(project), limit=4))
+        assert notice is not None and notice["more"], notice
+        call = ast.parse(notice["hint"].removesuffix(" reads the next page."), mode="eval").body
+        assert ast.literal_eval(call.args[0]) == "'probe'"
+
     def test_the_notice_leads_and_counts_every_file(self, project: Path):
         from fw_context_mcp.mcp.handlers.search import search_content
 

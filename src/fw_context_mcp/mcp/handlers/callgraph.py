@@ -80,7 +80,7 @@ from ...utils import abs_path
 from ...utils import escape_like as _escape_like
 from ...utils import format_number_ranges as _as_ranges
 from ...utils import macro_signature as _macro_signature
-from ..shared.paging import clamp_offset, page_hint, page_notice, past_end_info
+from ..shared.paging import clamp_offset, hint_arg, page_hint, page_notice, past_end_info
 from ._base import BaseHandler, DbContext
 from .source import _lookup_definition
 
@@ -383,7 +383,7 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
                 macro_refs.insert(0, page_notice(
                     macro_total, macro_skip, len(macro_page),
                     hint=(
-                        f"{tool}('{name}', offset={macro_skip + len(macro_page)}) "
+                        f"{tool}({hint_arg(name)}, offset={macro_skip + len(macro_page)}) "
                         f"reads the next page."
                     ),
                 ))
@@ -451,7 +451,7 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
                 shown = len(virtual_rows)
                 virtual_rows.insert(0, page_notice(
                     virtual_total, skip, shown,
-                    hint=f"{tool}('{name}', offset={skip + shown}) reads the next page.",
+                    hint=f"{tool}({hint_arg(name)}, offset={skip + shown}) reads the next page.",
                 ))
                 if chosen is not None:
                     # The index records none of these rows against the
@@ -509,7 +509,7 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
         ]
         result.insert(0, page_notice(
             total, skip, len(rows),
-            hint=f"{tool}('{name}', offset={skip + len(rows)}) reads the next page.",
+            hint=f"{tool}({hint_arg(name)}, offset={skip + len(rows)}) reads the next page.",
         ))
         if tagged:
             # Every symbol that the name matched is named, and NOT only the

@@ -32,6 +32,7 @@ from pydantic import Field
 from ...utils import abs_path
 from ..shared.paging import (
     clamp_offset,
+    hint_arg,
     holds_past_end_info,
     page_hint,
     page_notice,
@@ -281,7 +282,7 @@ def find_variables(
                 # share the qualified name, and find_references then answers
                 # for both of them.
                 entry["references_hint"] = (
-                    f"find_references('{qualified_name}') pages every reference."
+                    f"find_references({hint_arg(qualified_name)}) pages every reference."
                 )
             results.append(entry)
 

@@ -77,7 +77,7 @@ from ...llm.ollama import OllamaError, OllamaModelNotFoundError, call_ollama_asy
 from ...utils import abs_path, macro_signature, read_file_lines
 from ...utils import escape_like as _escape_like
 from ..shared.context import _normalize_file_path_query
-from ..shared.paging import clamp_offset, page_hint, page_notice, past_end_info
+from ..shared.paging import clamp_offset, hint_arg, page_hint, page_notice, past_end_info
 from ..shared.stale import _file_differs
 from ._base import BaseHandler
 
@@ -281,7 +281,7 @@ def _ambiguity(conn, config_hash: str, name: str, row, root) -> dict:
     # this list; it is the complete listing, and it starts at the top.
     more = (
         f" These are the {shown} most referenced of {total}; "
-        f"lookup_symbol('{name}', exact=True) lists them all, and its "
+        f"lookup_symbol({hint_arg(name)}, exact=True) lists them all, and its "
         f"'offset' pages through them."
         if total > shown else ""
     )
@@ -1350,11 +1350,11 @@ def _list_hints(row: sqlite3.Row, shown: dict[str, int], totals: dict[str, int])
     """
     name = row["qualified_name"] or row["name"]
     tools = {
-        "callers": f"find_callers('{name}') pages the callers.",
-        "callees": f"find_callees_recursive('{name}', max_depth=1) pages the callees.",
+        "callers": f"find_callers({hint_arg(name)}) pages the callers.",
+        "callees": f"find_callees_recursive({hint_arg(name)}, max_depth=1) pages the callees.",
     }
     if row["kind"] in _POINTER_KINDS:
-        tools["indirect_call_sites"] = f"find_indirect_call_sites('{name}') pages the call sites."
+        tools["indirect_call_sites"] = f"find_indirect_call_sites({hint_arg(name)}) pages the call sites."
     return {
         f"{key}_hint": text
         for key, text in tools.items()
@@ -1546,7 +1546,7 @@ def _constants_fields(row: sqlite3.Row, constants: list[dict], total: int) -> di
     fields: dict = {"constants": constants, "constants_total": total}
     if total > len(constants):
         fields["constants_hint"] = (
-            f"lookup_symbol('{row['qualified_name']}::') pages every constant."
+            f"lookup_symbol({hint_arg(row['qualified_name'] + '::')}) pages every constant."
         )
     return fields
 
@@ -2090,4 +2090,4 @@ def _read_file_hint(file_path: str, next_line: int, numbers: dict) -> str:
     the number of lines before the page, ``start_line - 1``.
     """
     extra = "".join(f", {key}={value}" for key, value in numbers.items())
-    return f"read_file('{file_path}'{extra}, start_line={next_line}) reads the next page."
+    return f"read_file({hint_arg(file_path)}{extra}, start_line={next_line}) reads the next page."

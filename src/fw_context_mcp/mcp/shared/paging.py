@@ -67,8 +67,8 @@ def page_hint(tool: str, *args: object, next_offset: int, **kwargs: object) -> s
     the call must repeat every argument that changes the answer, and not
     only the offset.
 
-    A string argument is in single quotes, as in the hints of the older
-    paged tools, and any other value is written as it is.
+    A string argument is written by :func:`hint_arg`, and any other value
+    is written as it is.
     """
     parts = [_hint_value(a) for a in args]
     parts += [f"{key}={_hint_value(value)}" for key, value in kwargs.items()]
@@ -76,8 +76,25 @@ def page_hint(tool: str, *args: object, next_offset: int, **kwargs: object) -> s
     return f"{tool}({', '.join(parts)}) reads the next page."
 
 
+def hint_arg(value: str) -> str:
+    """Write a string argument of a hint as a Python string literal.
+
+    WHY not ``f"'{value}'"``: a query or a path can hold an apostrophe,
+    and ``search_code('it's', offset=20)`` is not a call that a reader can
+    copy — the string stops after ``it``.  ``repr`` gives single quotes
+    for a plain value, thus the hint of a C name or a plain query does not
+    change, and it gives double quotes or escapes for the other values.
+
+    A backslash is doubled, as in a Windows path ``'src\\\\net.c'``.  The
+    old form ``'src\\net.c'`` read as a newline in a Python literal.  A
+    JSON string escapes a backslash the same way, thus a reader that
+    copies the doubled text into a JSON argument sends the right path.
+    """
+    return repr(value)
+
+
 def _hint_value(value: object) -> str:
-    return f"'{value}'" if isinstance(value, str) else str(value)
+    return hint_arg(value) if isinstance(value, str) else str(value)
 
 
 def past_end_info(thing: str, offset: int, total: int) -> dict:

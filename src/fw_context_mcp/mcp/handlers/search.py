@@ -51,7 +51,7 @@ from ...llm.embedder_factory import uses_ollama
 from ...utils import abs_path, resolve_project_root
 from ..shared.context import _db_path, _is_stale, _quick_open_readonly
 from ..shared.fallback import _fallback_to_search_code
-from ..shared.paging import clamp_offset, page_hint, page_notice, past_end_info
+from ..shared.paging import clamp_offset, hint_arg, page_hint, page_notice, past_end_info
 from ..shared.stale import _with_stale_recovery
 from ._lookup import lookup_symbol
 from ._search_fallbacks import (
@@ -423,7 +423,7 @@ def search_code(
                 )}]
             page.insert(0, page_notice(
                 total, skip, len(page),
-                hint=f"search_code('{query}', offset={skip + len(page)}) reads the next page.",
+                hint=f"search_code({hint_arg(query)}, offset={skip + len(page)}) reads the next page.",
             ))
             return page
 
@@ -1395,7 +1395,7 @@ def search_bodies(
             return []
         page.insert(0, page_notice(
             total, skip, len(page),
-            hint=f"search_bodies('{query}', offset={skip + len(page)}) reads the next page.",
+            hint=f"search_bodies({hint_arg(query)}, offset={skip + len(page)}) reads the next page.",
         ))
         return page
 
@@ -1675,7 +1675,7 @@ def search_content(
             return results
         results.append(page_notice(
             total, skip, len(page),
-            hint=f"search_content('{query}', offset={skip + len(page)}) reads the next page.",
+            hint=f"search_content({hint_arg(query)}, offset={skip + len(page)}) reads the next page.",
         ))
         results += page
         return results
