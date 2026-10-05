@@ -46,7 +46,7 @@ from ...indexer.db import (
     get_template_instances as query_template_instances,
 )
 from ...utils import abs_path
-from ..shared.paging import clamp_offset, page_hint, page_notice, past_end_info
+from ..shared.paging import clamp_offset, page_hint, page_notice, past_end_info, selector_args
 from ._base import BaseHandler
 from .source import _lookup_definition
 
@@ -316,7 +316,7 @@ def get_inheritance_chain(
                 result[f"{key}_page"] = page_notice(
                     len(walked), skip, len(page),
                     hint=page_hint("get_inheritance_chain", class_name, transitive=True,
-                                   **depth, next_offset=skip + len(page)),
+                                   **depth, **selector_args(project_root, variant, image), next_offset=skip + len(page)),
                 )
 
         return result
@@ -428,7 +428,8 @@ def get_class_members(
         result["member_count"] = total
         result["page"] = page_notice(
             total, skip, len(members),
-            hint=page_hint("get_class_members", class_name, next_offset=skip + len(members)),
+            hint=page_hint("get_class_members", class_name, **selector_args(project_root, variant, image),
+                           next_offset=skip + len(members)),
         )
 
         return result
@@ -525,7 +526,7 @@ def get_template_instances(
         result: list[dict] = [
             page_notice(
                 total, skip, len(instances),
-                hint=page_hint("get_template_instances", template_name,
+                hint=page_hint("get_template_instances", template_name, **selector_args(project_root, variant, image),
                                next_offset=skip + len(instances)),
             ),
             {

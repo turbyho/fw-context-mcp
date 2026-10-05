@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 from fw_context_mcp.indexer.db import insert_refs_batch, insert_symbols_batch
-from tests._paging import CH, make_project, symbol_row
+from tests._paging import CH, make_project, symbol_row, with_project
 
 CALLERS = 60
 CALLEES = 120
@@ -76,7 +76,7 @@ def test_the_callers_say_that_they_are_cut(project):
     result = _context(project, "hub")
     assert len(result["callers"]) == 50
     assert result["callers_total"] == CALLERS
-    assert result["callers_hint"] == "find_callers('hub') pages the callers."
+    assert result["callers_hint"] == with_project("find_callers('hub') pages the callers.", project)
 
 
 def test_each_callee_comes_once(project):
@@ -85,7 +85,7 @@ def test_each_callee_comes_once(project):
     assert len(names) == len(set(names)) == 100
     assert result["callees_total"] == CALLEES
     assert result["callees_hint"] == (
-        "find_callees_recursive('hub', max_depth=1) pages the callees."
+        with_project("find_callees_recursive('hub', max_depth=1) pages the callees.", project)
     )
 
 
@@ -105,7 +105,7 @@ def test_the_constants_say_that_they_are_cut(project, tool):
     result = getattr(source, tool)("reg_id_t", project_root=str(project))
     assert len(result["constants"]) == 200
     assert result["constants_total"] == CONSTANTS
-    assert result["constants_hint"] == "lookup_symbol('reg_id_t::') pages every constant."
+    assert result["constants_hint"] == with_project("lookup_symbol('reg_id_t::') pages every constant.", project)
     names = {c["name"] for c in result["constants"]}
     assert "OTHER" not in names, "LIKE read _ as any character"
     assert "FOREIGN" not in names, "a constant of xreg_id_t is no constant of reg_id_t"

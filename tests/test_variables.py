@@ -24,6 +24,7 @@ from fw_context_mcp.indexer.db import (
     upsert_file,
     upsert_project,
 )
+from tests._paging import with_project
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -598,7 +599,7 @@ class TestFindVariablesHandler:
         assert total == 7
         assert_whole_and_once(seen, total)
         rows = self._page(tmp_path, conn, "i", 0, limit=3)
-        assert rows[0]["hint"] == "find_variables('i', offset=3) reads the next page."
+        assert rows[0]["hint"] == with_project("find_variables('i', offset=3) reads the next page.", tmp_path)
         assert self._page(tmp_path, conn, "i", 40, limit=3) == [
             {"info": "No variable at offset 40; the answer holds 7."}
         ]
@@ -618,6 +619,6 @@ class TestFindVariablesHandler:
         results = {r["name"]: r for r in self._run(tmp_path, conn, "g_")}
 
         assert results["g_a"]["references_total"] == 150
-        assert results["g_a"]["references_hint"] == "find_references('g_a') pages every reference."
+        assert results["g_a"]["references_hint"] == with_project("find_references('g_a') pages every reference.", tmp_path)
         assert results["g_b"]["references_total"] == 1
         assert "references_hint" not in results["g_b"]

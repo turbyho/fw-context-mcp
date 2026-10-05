@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from fw_context_mcp.indexer.db import insert_refs_batch, insert_symbols_batch
-from tests._paging import CH, assert_whole_and_once, make_project, notice, symbol_row, walk_pages
+from tests._paging import CH, assert_whole_and_once, make_project, notice, symbol_row, walk_pages, with_project
 
 SOURCES = 9
 
@@ -58,10 +58,10 @@ def test_the_sources_walk_whole_and_once(project):
 
 def test_the_hint_repeats_the_target_and_a_depth_that_is_not_the_default(project):
     assert notice(_call(project, 0))["hint"] == (
-        "trace_data_flow('SensorData', 'uart_send', offset=4) reads the next page."
+        with_project("trace_data_flow('SensorData', 'uart_send', offset=4) reads the next page.", project)
     )
     assert notice(_call(project, 0, max_depth=3))["hint"] == (
-        "trace_data_flow('SensorData', 'uart_send', max_depth=3, offset=4) reads the next page."
+        with_project("trace_data_flow('SensorData', 'uart_send', max_depth=3, offset=4) reads the next page.", project)
     )
 
 

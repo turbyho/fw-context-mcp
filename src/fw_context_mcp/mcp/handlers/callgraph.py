@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Annotated
 
@@ -80,7 +81,7 @@ from ...utils import abs_path
 from ...utils import escape_like as _escape_like
 from ...utils import format_number_ranges as _as_ranges
 from ...utils import macro_signature as _macro_signature
-from ..shared.paging import clamp_offset, hint_arg, page_hint, page_notice, past_end_info
+from ..shared.paging import clamp_offset, page_hint, page_notice, past_end_info, selector_args
 from ._base import BaseHandler, DbContext
 from .source import _lookup_definition
 
@@ -287,6 +288,7 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
     except RuntimeError as e:
         return [{"error": str(e)}]
     root = db.root
+    selectors = selector_args(project_root, variant, image)
 
     def _query(conn, config_hash):
         # Runs under the executor lock on the single shared connection;
@@ -382,10 +384,7 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
                 macro_refs.insert(0, macro_def)
                 macro_refs.insert(0, page_notice(
                     macro_total, macro_skip, len(macro_page),
-                    hint=(
-                        f"{tool}({hint_arg(name)}, offset={macro_skip + len(macro_page)}) "
-                        f"reads the next page."
-                    ),
+                    hint=page_hint(tool, name, **selectors, next_offset=macro_skip + len(macro_page)),
                 ))
                 return macro_refs
             return [{"error": f"Symbol not found: {name}"}]
@@ -451,7 +450,7 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
                 shown = len(virtual_rows)
                 virtual_rows.insert(0, page_notice(
                     virtual_total, skip, shown,
-                    hint=f"{tool}({hint_arg(name)}, offset={skip + shown}) reads the next page.",
+                    hint=page_hint(tool, name, **selectors, next_offset=skip + shown),
                 ))
                 if chosen is not None:
                     # The index records none of these rows against the
@@ -509,7 +508,7 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
         ]
         result.insert(0, page_notice(
             total, skip, len(rows),
-            hint=f"{tool}({hint_arg(name)}, offset={skip + len(rows)}) reads the next page.",
+            hint=page_hint(tool, name, **selectors, next_offset=skip + len(rows)),
         ))
         if tagged:
             # Every symbol that the name matched is named, and NOT only the
@@ -797,7 +796,7 @@ def find_indirect_call_sites(
         ]
         notice = page_notice(
             total, skip, len(sites),
-            hint=page_hint("find_indirect_call_sites", name, next_offset=skip + len(sites)),
+            hint=page_hint("find_indirect_call_sites", name, **selector_args(project_root, variant, image), next_offset=skip + len(sites)),
         )
         return [notice, *sites]
 
@@ -902,7 +901,7 @@ def find_indirect_targets(
 
         results: list[dict] = [page_notice(
             total, skip, len(rows),
-            hint=page_hint("find_indirect_targets", name, next_offset=skip + len(rows)),
+            hint=page_hint("find_indirect_targets", name, **selector_args(project_root, variant, image), next_offset=skip + len(rows)),
         )]
         for r in rows:
             call_expr_text: str | None = str(r["call_expr_text"]) if r["call_expr_text"] else None
@@ -1251,22 +1250,42 @@ def find_all_callers_recursive(
         # _wrap_tool (300 s + interrupt), not here.
         return _recursive_page(
             conn, config_hash, db.root, "find_all_callers_recursive", "callers",
-            name, max_depth, limit, offset,
+            name, max_depth, limit, offset, selector_args(project_root, variant, image),
         )
 
     return db.execute_scoped(_query)
 
 
 _DEFAULT_RECURSIVE_DEPTH = 5
-# The default max_depth of trace_data_flow; a hint repeats any other value.
+# The defaults of max_depth and timeout_ms of trace_data_flow; a hint
+# repeats any other value.
 _DEFAULT_TRACE_DEPTH = 8
+_DEFAULT_TRACE_TIMEOUT_MS = 30000
+
+
+def _scope_hint_args(project_only: bool, exclude_paths: list[str] | None) -> dict[str, object]:
+    """The scope arguments of find_dead_code and find_hotspots, for a hint.
+
+    The two filter the answer, thus a next page without them is a page of
+    another answer.  A value at its default (``project_only=True``, no
+    ``exclude_paths``) is left out.
+    """
+    args: dict[str, object] = {}
+    if not project_only:
+        args["project_only"] = False
+    if exclude_paths:
+        args["exclude_paths"] = list(exclude_paths)
+    return args
 
 
 def _recursive_page(
     conn, config_hash: str, root: Path, tool: str, direction: str,
-    name: str, max_depth: int, limit: int, offset: int,
+    name: str, max_depth: int, limit: int, offset: int, selectors: Mapping[str, object],
 ) -> list[dict]:
     """One page of ``find_all_callers_recursive`` or ``find_callees_recursive``.
+
+    *selectors* are the project and build arguments of the call, for the
+    hint (``selector_args``).
 
     The ambiguity ``warning`` row, when the name matches several symbols,
     stays first, and the page notice comes after it, as in
@@ -1289,7 +1308,7 @@ def _recursive_page(
     depth = {} if max_depth == _DEFAULT_RECURSIVE_DEPTH else {"max_depth": max_depth}
     rows.insert(lead, page_notice(
         total, skip, shown,
-        hint=page_hint(tool, name, **depth, next_offset=skip + shown),
+        hint=page_hint(tool, name, **depth, **selectors, next_offset=skip + shown),
     ))
     return _with_absolute_file(rows, root)
 
@@ -1378,7 +1397,7 @@ def find_callees_recursive(
         # _wrap_tool (300 s + interrupt), not here.
         return _recursive_page(
             conn, config_hash, db.root, "find_callees_recursive", "callees",
-            name, max_depth, limit, offset,
+            name, max_depth, limit, offset, selector_args(project_root, variant, image),
         )
 
     return db.execute_scoped(_query)
@@ -1509,7 +1528,8 @@ def find_dead_code(
                 row["indirect_refs"] = _absolute_sites(row["indirect_refs"], db.root)
         out.insert(0, page_notice(
             total, skip, len(rows),
-            hint=f"find_dead_code(offset={skip + len(rows)}) reads the next page.",
+            hint=page_hint("find_dead_code", **_scope_hint_args(project_only, exclude_paths),
+                           **selector_args(project_root, variant, image), next_offset=skip + len(rows)),
         ))
         return out
 
@@ -1710,7 +1730,7 @@ def find_wrapper_callers(
             return [past_end_info("wrapper class", skip, total)]
         result: list[dict] = [page_notice(
             total, skip, len(page),
-            hint=page_hint("find_wrapper_callers", class_name, next_offset=skip + len(page)),
+            hint=page_hint("find_wrapper_callers", class_name, **selector_args(project_root, variant, image), next_offset=skip + len(page)),
         )]
         for wc in page:
             entry = wrapped[wc]
@@ -1732,7 +1752,7 @@ def trace_data_flow(
     limit: Annotated[int, Field(description="Maximum source functions to trace (default 15, max 15).", ge=1)] = 15,
     offset: Annotated[int, Field(description="Skip this many source functions. Reads the next page.", ge=0)] = 0,
     timeout_ms: Annotated[int, Field(description="Maximum total execution time in "
-        "milliseconds (default 30000).", ge=1)] = 30000,
+        "milliseconds (default 30000).", ge=1)] = _DEFAULT_TRACE_TIMEOUT_MS,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> list[dict]:
@@ -1916,12 +1936,15 @@ def trace_data_flow(
         if num_timed_out:
             summary += f" ({num_timed_out} timed out)"
 
-        depth = {} if max_depth == _DEFAULT_TRACE_DEPTH else {"max_depth": max_depth}
+        depth: dict[str, object] = {} if max_depth == _DEFAULT_TRACE_DEPTH else {"max_depth": max_depth}
+        # The budget decides which sources of a page reach the target.
+        if timeout_ms != _DEFAULT_TRACE_TIMEOUT_MS:
+            depth["timeout_ms"] = timeout_ms
         return [
             page_notice(
                 total, skip, len(results),
                 hint=page_hint("trace_data_flow", type_name, to_symbol, **depth,
-                               next_offset=skip + len(results)),
+                               **selector_args(project_root, variant, image), next_offset=skip + len(results)),
             ),
             {
                 "_summary": summary,
@@ -2034,7 +2057,8 @@ def find_hotspots(
         out = _with_absolute_file(rows, db.root)
         out.insert(0, page_notice(
             total, skip, len(rows),
-            hint=f"find_hotspots(offset={skip + len(rows)}) reads the next page.",
+            hint=page_hint("find_hotspots", **_scope_hint_args(project_only, exclude_paths),
+                           **selector_args(project_root, variant, image), next_offset=skip + len(rows)),
         ))
         return out
 
@@ -2211,6 +2235,7 @@ def _slot_key(slot: dict) -> tuple:
 
 def _slots_page(
     slots: list[dict], trailers: list[dict], limit: int, offset: int, *, unhandled_only: bool,
+    selectors: Mapping[str, object],
 ) -> list[dict]:
     """One page of *slots*, after the page notice, with every *trailer* after it.
 
@@ -2236,15 +2261,19 @@ def _slots_page(
     flag = {"unhandled_only": True} if unhandled_only else {}
     notice = page_notice(
         total, offset, len(page),
-        hint=page_hint("get_vector_table", **flag, next_offset=offset + len(page)),
+        hint=page_hint("get_vector_table", **flag, **selectors, next_offset=offset + len(page)),
     )
     return [notice, *page, *trailers]
 
 
 def _vector_rows(
     conn, config_hash: str, *, unhandled_only: bool, limit: int, offset: int = 0,
+    selectors: Mapping[str, object] | None = None,
 ) -> list[dict]:
     """Assemble the answer of ``get_vector_table`` for one build config.
+
+    *selectors* are the project and build arguments of the call, for the
+    hint of the page notice (``selector_args``).
 
     Separate from the tool so a test can hand it a connection.  The tool
     itself only resolves the project and the config; everything that
@@ -2331,7 +2360,8 @@ def _vector_rows(
 
     if not slots:
         return trailers
-    return _slots_page(slots, trailers, limit, offset, unhandled_only=unhandled_only)
+    return _slots_page(slots, trailers, limit, offset, unhandled_only=unhandled_only,
+                       selectors=selectors or {})
 
 
 def get_vector_table(
@@ -2537,6 +2567,7 @@ def get_vector_table(
         # _wrap_tool (300 s + interrupt), not here.
         return _absolute_vector_paths(_vector_rows(
             conn, config_hash, unhandled_only=unhandled_only, limit=limit, offset=skip,
+            selectors=selector_args(project_root, variant, image),
         ), db.root)
 
     return db.execute_scoped(_query)

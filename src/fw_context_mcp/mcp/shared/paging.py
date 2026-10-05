@@ -68,12 +68,50 @@ def page_hint(tool: str, *args: object, next_offset: int, **kwargs: object) -> s
     only the offset.
 
     A string argument is written by :func:`hint_arg`, and any other value
-    is written as it is.
+    is written as it is.  Give the arguments of :func:`selector_args` too:
+    without them the next call answers for another project or build.
+    """
+    return f"{call_text(tool, *args, **kwargs, offset=next_offset)} reads the next page."
+
+
+def call_text(tool: str, *args: object, **kwargs: object) -> str:
+    """Write a tool call as text: ``tool('a', key=value)``.
+
+    For a hint that names another tool, such as ``find_callers('x')
+    pages the callers``.  :func:`page_hint` writes its call with it.
     """
     parts = [_hint_value(a) for a in args]
     parts += [f"{key}={_hint_value(value)}" for key, value in kwargs.items()]
-    parts.append(f"offset={next_offset}")
-    return f"{tool}({', '.join(parts)}) reads the next page."
+    return f"{tool}({', '.join(parts)})"
+
+
+def selector_args(
+    project_root: str | None = None,
+    variant: str | None = None,
+    image: str | None = None,
+) -> dict[str, str]:
+    """The arguments that selected the project and the build, for a hint.
+
+    WHY: a hint without them sent the next call to the project of the
+    current directory and to the default build.  After a question about
+    another project, that next page came from other source code, and
+    nothing in it said so.
+
+    *project_root* is the value that the caller gave: a path, a project
+    name or a project_id.  The ``project`` parameter puts its value there
+    too (``_merge_project_selector`` in ``mcp/server.py``).  The hint
+    writes it as ``project``, because that parameter takes each of the
+    three, and the instructions for the reader name it.  A value that the
+    caller did not give is left out, thus a plain call keeps a short hint.
+    """
+    args: dict[str, str] = {}
+    if project_root:
+        args["project"] = str(project_root)
+    if variant:
+        args["variant"] = variant
+    if image:
+        args["image"] = image
+    return args
 
 
 def hint_arg(value: str) -> str:

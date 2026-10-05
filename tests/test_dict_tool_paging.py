@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 from fw_context_mcp.indexer.db import insert_inheritance_batch, insert_symbols_batch
-from tests._paging import CH, assert_whole_and_once, make_project, symbol_row
+from tests._paging import CH, assert_whole_and_once, make_project, symbol_row, with_project
 
 MEMBERS = 23        # with overloads: three members share the name "set"
 DERIVED = 9         # direct children of Root
@@ -107,7 +107,7 @@ def test_member_count_is_every_member(project):
 
     result = get_class_members("Regs", project_root=str(project), limit=5)
     assert result["member_count"] == MEMBERS
-    assert result["page"]["hint"] == "get_class_members('Regs', offset=5) reads the next page."
+    assert result["page"]["hint"] == with_project("get_class_members('Regs', offset=5) reads the next page.", project)
 
 
 def test_a_members_page_after_the_end_names_the_total(project):
@@ -145,7 +145,7 @@ def test_the_chain_hint_keeps_transitive(project):
 
     result = get_inheritance_chain("Root", project_root=str(project), transitive=True, limit=4)
     assert result["all_derived_page"]["hint"] == (
-        "get_inheritance_chain('Root', transitive=True, offset=4) reads the next page."
+        with_project("get_inheritance_chain('Root', transitive=True, offset=4) reads the next page.", project)
     )
 
 
@@ -156,7 +156,7 @@ def test_a_file_map_group_that_is_cut_names_the_call_for_the_rest(project):
     group = result["symbols"]["function"]
     assert group["count"] == FUNCTIONS
     assert len(group["items"]) == 30
-    assert group["hint"] == "get_file_map('src/f1.c', kind='function', offset=30) reads the next page."
+    assert group["hint"] == with_project("get_file_map('src/f1.c', kind='function', offset=30) reads the next page.", project)
 
 
 def test_the_items_of_one_kind_walk_whole_and_once(project):
@@ -184,7 +184,7 @@ def test_a_cut_enum_constant_group_names_the_call_from_the_first_constant(projec
     group = get_file_map("src/f1.c", project_root=str(project))["symbols"]["enum_constant"]
     assert group["count"] == CONSTANTS
     assert group["hint"] == (
-        "get_file_map('src/f1.c', kind='enum_constant', offset=0) reads the next page."
+        with_project("get_file_map('src/f1.c', kind='enum_constant', offset=0) reads the next page.", project)
     )
 
 
@@ -205,7 +205,7 @@ def test_the_file_map_hint_keeps_the_signatures(project):
 
     result = get_file_map("src/f1.c", project_root=str(project), kind="function", signatures=True)
     assert result["page"]["hint"] == (
-        "get_file_map('src/f1.c', kind='function', signatures=True, offset=30) reads the next page."
+        with_project("get_file_map('src/f1.c', kind='function', signatures=True, offset=30) reads the next page.", project)
     )
     assert all("signature" in i for i in result["items"])
 
@@ -224,5 +224,5 @@ def test_the_chain_hint_keeps_a_depth_that_is_not_the_default(project):
     result = get_inheritance_chain("Root", project_root=str(project), transitive=True,
                                    max_depth=3, limit=4)
     assert result["all_derived_page"]["hint"] == (
-        "get_inheritance_chain('Root', transitive=True, max_depth=3, offset=4) reads the next page."
+        with_project("get_inheritance_chain('Root', transitive=True, max_depth=3, offset=4) reads the next page.", project)
     )

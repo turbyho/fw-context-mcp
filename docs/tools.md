@@ -740,6 +740,13 @@ page holds the whole answer:
   come first.
 - When `more` is true, call again with `offset` = `offset` + `shown`. The
   `hint` names that call. It is absent on the last page.
+- The `hint` repeats each argument that changes the answer and that is
+  not at its default: a filter such as `kind`, `project_only` or `exact`,
+  and the selection of the project and the build (`project`, `variant`,
+  `image`). A call with `project_root` gets `project=` with the same
+  value, because `project` takes a path, a name or a `project_id`.
+  Without them, the next page came from the project of the current
+  directory.
 - The order of each tool is stable, thus two pages never overlap and never
   skip a row.
 - An `info` row that names an offset means that the offset is past the

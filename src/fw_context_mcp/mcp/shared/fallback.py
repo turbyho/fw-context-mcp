@@ -104,7 +104,7 @@ def _fallback_to_search_code_inner(
     One page of the plain FTS5 symbol search, and its count on the same
     conditions (``count_symbols``), thus ``total`` describes the rows.
     *hint_args* are the arguments of the semantic_search call that the hint
-    repeats (a threshold that is not the default).
+    repeats: a threshold that is not the default, and the project.
     """
     from fw_context_mcp.indexer.db import search_symbols
     from fw_context_mcp.indexer.db._symbols import count_symbols

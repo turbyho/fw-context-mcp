@@ -485,14 +485,14 @@ class TestTheLimitIsVisible:
         from fw_context_mcp.mcp.handlers.callgraph import _slots_page
 
         rows = self._rows(5)
-        out = _slots_page(rows, [], 9, 0, unhandled_only=False)
+        out = _slots_page(rows, [], 9, 0, unhandled_only=False, selectors={})
         assert out[0] == {"total": 5, "offset": 0, "shown": 5, "more": False}
         assert out[1:] == rows
 
     def test_the_cut_is_reported_with_both_counts(self):
         from fw_context_mcp.mcp.handlers.callgraph import _slots_page
 
-        out = _slots_page(self._rows(301), [], 300, 0, unhandled_only=False)
+        out = _slots_page(self._rows(301), [], 300, 0, unhandled_only=False, selectors={})
         assert out[0]["total"] == 301
         assert out[0]["shown"] == 300
         assert out[0]["hint"] == "get_vector_table(offset=300) reads the next page."
@@ -501,7 +501,7 @@ class TestTheLimitIsVisible:
     def test_the_hint_keeps_the_filter(self):
         from fw_context_mcp.mcp.handlers.callgraph import _slots_page
 
-        out = _slots_page(self._rows(7), [], 2, 0, unhandled_only=True)
+        out = _slots_page(self._rows(7), [], 2, 0, unhandled_only=True, selectors={})
         assert out[0]["hint"] == "get_vector_table(unhandled_only=True, offset=2) reads the next page."
 
     def test_the_pages_walk_whole_and_once(self):
@@ -510,7 +510,7 @@ class TestTheLimitIsVisible:
 
         rows = self._rows(23)
         seen, total = walk_pages(
-            lambda offset: _slots_page(rows, [{"coverage": "…"}], 5, offset, unhandled_only=False),
+            lambda offset: _slots_page(rows, [{"coverage": "…"}], 5, offset, unhandled_only=False, selectors={}),
             lambda r: r["slot"],
             is_answer=lambda r: "slot" in r,
         )
@@ -527,13 +527,13 @@ class TestTheLimitIsVisible:
         from fw_context_mcp.mcp.handlers.callgraph import _slots_page
 
         trailers = [{"coverage": "…"}, {"interrupts": "…"}]
-        out = _slots_page(self._rows(7), trailers, 2, 0, unhandled_only=False)
+        out = _slots_page(self._rows(7), trailers, 2, 0, unhandled_only=False, selectors={})
         assert out[1:3] == self._rows(7)[:2]
         assert out[3:] == trailers
         # Each page carries them, the last one too.
-        assert _slots_page(self._rows(7), trailers, 2, 6, unhandled_only=False)[-2:] == trailers
+        assert _slots_page(self._rows(7), trailers, 2, 6, unhandled_only=False, selectors={})[-2:] == trailers
         # A page after the end names the total and keeps them.
-        assert _slots_page(self._rows(7), trailers, 2, 50, unhandled_only=False) == [
+        assert _slots_page(self._rows(7), trailers, 2, 50, unhandled_only=False, selectors={}) == [
             {"info": "No slot at offset 50; the answer holds 7."}, *trailers,
         ]
 
@@ -543,8 +543,8 @@ class TestTheLimitIsVisible:
 
         a = {"source": "c", "slot": 3, "name": "h", "file": "src/b.c", "line": 9}
         b = {"source": "c", "slot": 3, "name": "h", "file": "src/a.c", "line": 4}
-        assert _slots_page([a, b], [], 9, 0, unhandled_only=False)[1:] == [b, a]
-        assert _slots_page([b, a], [], 9, 0, unhandled_only=False)[1:] == [b, a]
+        assert _slots_page([a, b], [], 9, 0, unhandled_only=False, selectors={})[1:] == [b, a]
+        assert _slots_page([b, a], [], 9, 0, unhandled_only=False, selectors={})[1:] == [b, a]
 
     def test_the_default_limit_holds_a_measured_table(self):
         """290 generated entries plus a 92-slot assembly table must fit."""

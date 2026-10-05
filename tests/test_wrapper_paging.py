@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from fw_context_mcp.indexer.db import insert_refs_batch, insert_symbols_batch
-from tests._paging import CH, assert_whole_and_once, make_project, symbol_row, walk_pages
+from tests._paging import CH, assert_whole_and_once, make_project, symbol_row, walk_pages, with_project
 
 WRAPPERS = 5
 # The first wrapper has more methods with calls than the old cut of 50 sites.
@@ -71,7 +71,7 @@ def test_a_class_with_many_calls_is_whole(project):
 
 def test_the_hint_names_the_next_call(project):
     assert _call(project, 0)[0]["hint"] == (
-        "find_wrapper_callers('UART_DRIVER', offset=2) reads the next page."
+        with_project("find_wrapper_callers('UART_DRIVER', offset=2) reads the next page.", project)
     )
 
 

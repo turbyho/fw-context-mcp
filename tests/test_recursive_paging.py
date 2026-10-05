@@ -149,7 +149,7 @@ class TestRecursivePage:
     def _page(self, db, offset: int, limit: int = 5, max_depth: int = 5) -> list[dict]:
         return _recursive_page(
             db, CH, ROOT, "find_all_callers_recursive", "callers",
-            "hub", max_depth, limit, offset,
+            "hub", max_depth, limit, offset, {},
         )
 
     def test_the_handler_walks_whole_and_once(self, db):
@@ -185,14 +185,14 @@ class TestRecursivePage:
 
     def test_a_symbol_with_no_caller_says_so(self, db):
         rows = _recursive_page(
-            db, CH, ROOT, "find_all_callers_recursive", "callers", "top00", 5, 5, 0,
+            db, CH, ROOT, "find_all_callers_recursive", "callers", "top00", 5, 5, 0, {},
         )
         assert rows == [{"info": "No callers found for 'top00'."}]
 
     def test_an_ambiguous_name_keeps_its_warning_first_and_out_of_the_count(self, db):
         """Twelve symbols are named ``cb``: the warning leads, the notice follows it."""
         rows = _recursive_page(
-            db, CH, ROOT, "find_all_callers_recursive", "callers", "cb", 5, 5, 0,
+            db, CH, ROOT, "find_all_callers_recursive", "callers", "cb", 5, 5, 0, {},
         )
         assert set(rows[0]) == {"warning"}
         assert notice(rows) is rows[1]

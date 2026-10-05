@@ -880,6 +880,10 @@ def test_every_copy_of_the_instructions_teaches_paging():
         assert "offset" in text, label
         assert "total" in text, label
         assert "more" in text, label
+        # The hint repeats the project: a reader that drops it reads the
+        # next page of the project of the current directory.
+        flat = " ".join(text.split())
+        assert "the filters, and the project and the build" in flat, label
 
 
 def test_every_copy_of_the_instructions_states_the_corrected_tool_rules():

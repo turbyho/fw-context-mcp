@@ -674,7 +674,7 @@ class TestSingleBodyToolsOfferTheChoice:
 
     def test_a_bare_name_offers_every_match_as_a_row(self, db):
         row = _lookup_definition(db, CH, "probe", preferred_kinds=None)
-        out = _ambiguity(db, CH, "probe", row, Path("/tmp/test"))
+        out = _ambiguity(db, CH, "probe", row, Path("/tmp/test"), {})
         names = {c["qualified_name"] for c in out["candidates"]}
         assert names == {"ClassA::probe", "ClassB::probe"}, f"got: {names}"
         assert out["candidates_total"] == 2
@@ -682,14 +682,14 @@ class TestSingleBodyToolsOfferTheChoice:
     def test_each_row_names_the_class(self, db):
         """The field that tells two same-name methods apart at a glance."""
         row = _lookup_definition(db, CH, "probe", preferred_kinds=None)
-        out = _ambiguity(db, CH, "probe", row, Path("/tmp/test"))
+        out = _ambiguity(db, CH, "probe", row, Path("/tmp/test"), {})
         by_name = {c["qualified_name"]: c["class"] for c in out["candidates"]}
         assert by_name["ClassA::probe"] == "ClassA", f"got: {by_name}"
         assert by_name["ClassB::probe"] == "ClassB", f"got: {by_name}"
 
     def test_each_row_carries_what_the_choice_needs(self, db):
         row = _lookup_definition(db, CH, "probe", preferred_kinds=None)
-        out = _ambiguity(db, CH, "probe", row, Path("/tmp/test"))
+        out = _ambiguity(db, CH, "probe", row, Path("/tmp/test"), {})
         assert set(out["candidates"][0]) == {
             "qualified_name", "class", "kind", "file", "line", "signature",
             # Two files can carry one name and one of them can be vendor
@@ -700,18 +700,18 @@ class TestSingleBodyToolsOfferTheChoice:
 
     def test_the_warning_names_the_symbol_that_the_answer_is_about(self, db):
         row = _lookup_definition(db, CH, "probe", preferred_kinds=None)
-        out = _ambiguity(db, CH, "probe", row, Path("/tmp/test"))
+        out = _ambiguity(db, CH, "probe", row, Path("/tmp/test"), {})
         chosen = row["qualified_name"]
         assert chosen in out["ambiguous_warning"]
         assert "candidates" in out["ambiguous_warning"]
 
     def test_a_qualified_name_offers_nothing(self, db):
         row = _lookup_definition(db, CH, "ClassB::probe", preferred_kinds=None)
-        assert _ambiguity(db, CH, "ClassB::probe", row, Path("/tmp/test")) == {}
+        assert _ambiguity(db, CH, "ClassB::probe", row, Path("/tmp/test"), {}) == {}
 
     def test_an_unambiguous_bare_name_offers_nothing(self, db):
         row = _lookup_definition(db, CH, "only", preferred_kinds=None)
-        assert _ambiguity(db, CH, "only", row, Path("/tmp/test")) == {}
+        assert _ambiguity(db, CH, "only", row, Path("/tmp/test"), {}) == {}
 
     def test_a_declaration_is_not_a_second_definition(self, db):
         """A declaration shares the USR of its definition — one symbol, not two."""
@@ -724,7 +724,7 @@ class TestSingleBodyToolsOfferTheChoice:
         db.commit()
 
         row = _lookup_definition(db, CH, "only", preferred_kinds=None)
-        assert _ambiguity(db, CH, "only", row, Path("/tmp/test")) == {}
+        assert _ambiguity(db, CH, "only", row, Path("/tmp/test"), {}) == {}
 
 
 class TestAmbiguousAnswerStaysWithinItsPromises:
@@ -856,7 +856,7 @@ class TestTheNoticeStaysReadableAndHonest:
         assert f"matches {total} symbols" in rows[0]["warning"], f"got: {rows[0]}"
 
         row = _lookup_definition(db, CH, "probe", preferred_kinds=None)
-        body = _ambiguity(db, CH, "probe", row, Path("/tmp/test"))
+        body = _ambiguity(db, CH, "probe", row, Path("/tmp/test"), {})
         assert body["candidates_total"] == total, f"got: {body}"
 
 

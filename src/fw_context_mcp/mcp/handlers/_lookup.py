@@ -26,7 +26,7 @@ from pydantic import Field
 from fw_context_mcp.indexer.db import count_macros, lookup_macro
 from fw_context_mcp.mcp.handlers._search_fallbacks import _symbol_row_to_dict
 from fw_context_mcp.mcp.shared.context import _db_path
-from fw_context_mcp.mcp.shared.paging import clamp_offset, hint_arg, page_notice
+from fw_context_mcp.mcp.shared.paging import clamp_offset, page_hint, page_notice, selector_args
 from fw_context_mcp.utils import abs_path, macro_signature, resolve_project_root
 
 # ``class`` comes from the parent symbol, and it is empty for a free
@@ -84,13 +84,13 @@ def _escape_like(text: str) -> str:
     return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-def _page_hint(name: str, next_offset: int) -> str:
+def _page_hint(name: str, next_offset: int, **kwargs: object) -> str:
     """Spell out the call that reads the next page.
 
-    Every query of this tool now selects the owner column, thus each row
-    carries its class and each page carries the same fields.
+    *kwargs* are the other arguments that changed the answer: ``exact``,
+    and the selectors of the project and the build.
     """
-    return f"lookup_symbol({hint_arg(name)}, offset={next_offset}) reads the next page."
+    return page_hint("lookup_symbol", name, **kwargs, next_offset=next_offset)
 
 
 log = logging.getLogger(__name__)
@@ -178,6 +178,10 @@ def lookup_symbol(
         the lookup failed.  Read that key
         before you read the result fields.
     """
+    hint_args: dict[str, object] = {
+        **({"exact": True} if exact else {}),
+        **selector_args(project_root, variant, image),
+    }
     try:
         root = resolve_project_root(project_root)
         db_path = _db_path(root)
@@ -295,7 +299,7 @@ def lookup_symbol(
                     ]
                     result.insert(0, page_notice(
                         macro_total, skip, len(result),
-                        hint=_page_hint(name, skip + len(result)),
+                        hint=_page_hint(name, skip + len(result), **hint_args),
                     ))
                     if _suggestions:
                         result.append({"_did_you_mean": _suggestions})
@@ -323,7 +327,7 @@ def lookup_symbol(
             if result:
                 result.insert(0, page_notice(
                     total, skip, len(result),
-                    hint=_page_hint(name, skip + len(result)),
+                    hint=_page_hint(name, skip + len(result), **hint_args),
                 ))
             elif skip and total:
                 result.append({"info": (

@@ -33,7 +33,7 @@ from fw_context_mcp.indexer.db import (
     upsert_project,
 )
 from fw_context_mcp.utils import compute_source_hash
-from tests._paging import assert_whole_and_once, notice, walk_pages
+from tests._paging import assert_whole_and_once, notice, walk_pages, with_project
 
 CH = "hash-deadbeef"
 PROJECT_ID = "proj-indirect"
@@ -182,7 +182,7 @@ class TestHandlers:
 
         rows = tool("on_data", project_root=str(project), limit=3)
         assert notice(rows)["hint"] == (
-            "find_indirect_call_sites('on_data', offset=3) reads the next page."
+            with_project("find_indirect_call_sites('on_data', offset=3) reads the next page.", project)
         )
 
     @pytest.mark.parametrize(("tool_name", "thing", "total"), [

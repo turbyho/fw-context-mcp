@@ -23,6 +23,21 @@ CH = "hash-paging"
 PROJECT_ID = "proj-paging"
 
 
+def with_project(expected: str, root: Path | str) -> str:
+    """*expected*, a hint, with the ``project`` argument of a call on *root*.
+
+    A test that calls a tool with ``project_root`` gets a hint that repeats
+    it, thus the next call reads the same project.  The argument goes
+    before ``offset`` or ``start_line``, and else at the end of the call.
+    """
+    selector = f"project={str(root)!r}"
+    for marker in (", offset=", ", start_line="):
+        if marker in expected:
+            return expected.replace(marker, f", {selector}{marker}", 1)
+    head, close, tail = expected.partition(") ")
+    return f"{head}, {selector}{close}{tail}"
+
+
 def symbol_row(
     file_id: int, path: str, name: str, qualified_name: str, usr: str, line: int,
     *, kind: str = "function", parent_usr: str = "", template_usr: str = "",

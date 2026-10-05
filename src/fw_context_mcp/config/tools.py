@@ -194,7 +194,8 @@ comes before it when the index is stale, and so does the row that reports
 a query FTS5 could not parse.
 
 - When `more` is true, call again with `offset=<offset + shown>`. The
-  `hint` spells out that call.
+  `hint` spells out that call, with each argument that changes the
+  answer: the filters, and the project and the build.
 - Do NOT conclude "that is all of them" from a page alone. Read `total` —
   a hot function can have hundreds of call sites, and a common name such
   as `read` can name hundreds of symbols.

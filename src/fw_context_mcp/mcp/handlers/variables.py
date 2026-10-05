@@ -31,12 +31,13 @@ from pydantic import Field
 
 from ...utils import abs_path
 from ..shared.paging import (
+    call_text,
     clamp_offset,
-    hint_arg,
     holds_past_end_info,
     page_hint,
     page_notice,
     past_end_info,
+    selector_args,
 )
 from ..shared.stale import (
     _stale_files,
@@ -282,13 +283,13 @@ def find_variables(
                 # share the qualified name, and find_references then answers
                 # for both of them.
                 entry["references_hint"] = (
-                    f"find_references({hint_arg(qualified_name)}) pages every reference."
+                    f"{call_text('find_references', qualified_name, **selector_args(project_root, variant, image))} pages every reference."
                 )
             results.append(entry)
 
         hint = page_hint(
             "find_variables", name, **({"kind": kind} if kind else {}),
-            next_offset=skip + len(results),
+            **selector_args(project_root, variant, image), next_offset=skip + len(results),
         )
         return [page_notice(total, skip, len(results), hint=hint), *results]
 

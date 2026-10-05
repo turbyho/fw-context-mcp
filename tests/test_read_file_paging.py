@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from tests._paging import make_project
+from tests._paging import make_project, with_project
 
 LINES = 4500
 
@@ -54,10 +54,10 @@ def test_the_pages_walk_the_whole_file_once(project):
 
 def test_the_hint_names_the_next_start_line(project):
     assert _read(project)["page"]["hint"] == (
-        "read_file('src/f0.c', start_line=2001) reads the next page."
+        with_project("read_file('src/f0.c', start_line=2001) reads the next page.", project)
     )
     assert _read(project, line_numbers=True)["page"]["hint"] == (
-        "read_file('src/f0.c', line_numbers=True, start_line=2001) reads the next page."
+        with_project("read_file('src/f0.c', line_numbers=True, start_line=2001) reads the next page.", project)
     )
 
 

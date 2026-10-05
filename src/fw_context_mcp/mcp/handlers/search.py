@@ -51,7 +51,7 @@ from ...llm.embedder_factory import uses_ollama
 from ...utils import abs_path, resolve_project_root
 from ..shared.context import _db_path, _is_stale, _quick_open_readonly
 from ..shared.fallback import _fallback_to_search_code
-from ..shared.paging import clamp_offset, hint_arg, page_hint, page_notice, past_end_info
+from ..shared.paging import clamp_offset, page_hint, page_notice, past_end_info, selector_args
 from ..shared.stale import _with_stale_recovery
 from ._lookup import lookup_symbol
 from ._search_fallbacks import (
@@ -423,7 +423,8 @@ def search_code(
                 )}]
             page.insert(0, page_notice(
                 total, skip, len(page),
-                hint=f"search_code({hint_arg(query)}, offset={skip + len(page)}) reads the next page.",
+                hint=page_hint("search_code", query, **_search_hint_args(kind, project_only, project_root, variant, image),
+                               next_offset=skip + len(page)),
             ))
             return page
 
@@ -545,7 +546,7 @@ async def smart_search(
     if total:
         results.append(page_notice(
             total, skip, len(page),
-            hint=page_hint("smart_search", query, next_offset=skip + len(page)),
+            hint=page_hint("smart_search", query, **selector_args(project_root), next_offset=skip + len(page)),
         ))
     results += page
     # Append staleness warning unless the LLM setup itself failed — in that
@@ -557,6 +558,27 @@ async def smart_search(
 
 # The symbols of one smart_search answer: the pages are cut from them.
 _SMART_ANSWER_SIZE = 100
+
+
+def _search_hint_args(
+    kind: str | None,
+    project_only: bool,
+    project_root: str | None,
+    variant: str | None,
+    image: str | None,
+) -> dict[str, object]:
+    """The arguments that the hint of search_code, search_bodies or search_content repeats.
+
+    ``kind`` and ``project_only`` filter the answer, thus a next page
+    without them is a page of another answer.  A value at its default
+    (``None``, ``False``) is left out.
+    """
+    args: dict[str, object] = {}
+    if kind:
+        args["kind"] = kind
+    if project_only:
+        args["project_only"] = True
+    return {**args, **selector_args(project_root, variant, image)}
 
 
 async def _smart_search_run(
@@ -756,9 +778,10 @@ async def semantic_search(
         limit = max(1, min(limit, 100))
         skip = clamp_offset(offset)
         threshold = max(0.0, min(1.0, threshold))
-        # The hint of each page repeats a threshold that is not the default:
-        # the next call must ask for the same set.
-        args = {} if threshold == _SEMANTIC_DEFAULT_THRESHOLD else {"threshold": threshold}
+        # The hint of each page repeats a threshold that is not the default,
+        # and the project: the next call must ask for the same set.
+        args: dict[str, object] = {} if threshold == _SEMANTIC_DEFAULT_THRESHOLD else {"threshold": threshold}
+        args.update(selector_args(project_root))
 
         # Verify LLM setup — embedding generation runs against the configured
         # Ollama instance or cloud API. Without an active LLM, embedding-based
@@ -1395,7 +1418,8 @@ def search_bodies(
             return []
         page.insert(0, page_notice(
             total, skip, len(page),
-            hint=f"search_bodies({hint_arg(query)}, offset={skip + len(page)}) reads the next page.",
+            hint=page_hint("search_bodies", query, **_search_hint_args(kind, project_only, project_root, variant, image),
+                           next_offset=skip + len(page)),
         ))
         return page
 
@@ -1675,7 +1699,8 @@ def search_content(
             return results
         results.append(page_notice(
             total, skip, len(page),
-            hint=f"search_content({hint_arg(query)}, offset={skip + len(page)}) reads the next page.",
+            hint=page_hint("search_content", query, **_search_hint_args(None, project_only, project_root, variant, image),
+                           next_offset=skip + len(page)),
         ))
         results += page
         return results

@@ -52,6 +52,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Annotated
 
@@ -77,7 +78,7 @@ from ...llm.ollama import OllamaError, OllamaModelNotFoundError, call_ollama_asy
 from ...utils import abs_path, macro_signature, read_file_lines
 from ...utils import escape_like as _escape_like
 from ..shared.context import _normalize_file_path_query
-from ..shared.paging import clamp_offset, hint_arg, page_hint, page_notice, past_end_info
+from ..shared.paging import call_text, clamp_offset, page_hint, page_notice, past_end_info, selector_args
 from ..shared.stale import _file_differs
 from ._base import BaseHandler
 
@@ -234,7 +235,9 @@ def _lookup_definition(
     return None
 
 
-def _ambiguity(conn, config_hash: str, name: str, row, root) -> dict:
+def _ambiguity(
+    conn, config_hash: str, name: str, row, root, selectors: Mapping[str, object],
+) -> dict:
     """Describe the other symbols that *name* matches, or give ``{}``.
 
     Returns the keys to merge into the answer of a tool that gives ONE
@@ -281,7 +284,7 @@ def _ambiguity(conn, config_hash: str, name: str, row, root) -> dict:
     # this list; it is the complete listing, and it starts at the top.
     more = (
         f" These are the {shown} most referenced of {total}; "
-        f"lookup_symbol({hint_arg(name)}, exact=True) lists them all, and its "
+        f"{call_text('lookup_symbol', name, exact=True, **selectors)} lists them all, and its "
         f"'offset' pages through them."
         if total > shown else ""
     )
@@ -793,7 +796,7 @@ async def explain_symbol(
         llm_analysis = get_llm_analysis_for_symbol(conn, row["id"])
         return (
             row, file_path, llm_analysis, _stored_file_state(conn, row["file_id"]),
-            _ambiguity(conn, config_hash, name, row, root),
+            _ambiguity(conn, config_hash, name, row, root, selector_args(project_root, variant, image)),
         )
 
     query_result = db.executor.execute_sync(_query, db.config_hash)
@@ -1049,7 +1052,7 @@ def get_source(
         }
         # Keys of their own, because ``warning`` on this tool already
         # reports a body that could not be verified against the disk.
-        result.update(_ambiguity(conn, config_hash, name, row, root))
+        result.update(_ambiguity(conn, config_hash, name, row, root, selector_args(project_root, variant, image)))
         # `end_line` completes the citation.  With `line` alone a caller
         # that must quote `file:start-end` has to count the lines of
         # `source` by hand, and one that reads the body from disk has no
@@ -1065,7 +1068,10 @@ def get_source(
         if row["enum_value"] is not None:
             result["enum_value"] = row["enum_value"]
         # For enums, the member constants (see _collect_enum_constants).
-        result.update(_constants_fields(row, *_collect_enum_constants(conn, config_hash, row)))
+        result.update(_constants_fields(
+            row, *_collect_enum_constants(conn, config_hash, row),
+            selectors=selector_args(project_root, variant, image),
+        ))
         # The mtime must come from the same connection as the symbol row —
         # _read_verified_body compares it against the file on disk to decide
         # whether the stored line number still points at this symbol.
@@ -1186,7 +1192,8 @@ def get_file_map(
         # refused above; a vendor header of the SDK reaches one and is as
         # much part of the build as a file of the application.
         # The hint repeats each argument that changes the items of a page.
-        extra = {"signatures": True} if signatures else {}
+        extra: dict[str, object] = {"signatures": True} if signatures else {}
+        extra.update(selector_args(project_root, variant, image))
         if kind:
             skip = clamp_offset(offset)
             page = index_db.get_file_map_kind(
@@ -1341,7 +1348,10 @@ def _list_totals(
     return {"callers": callers, "callees": callees, "indirect_call_sites": indirect}
 
 
-def _list_hints(row: sqlite3.Row, shown: dict[str, int], totals: dict[str, int]) -> dict[str, str]:
+def _list_hints(
+    row: sqlite3.Row, shown: dict[str, int], totals: dict[str, int],
+    selectors: Mapping[str, object],
+) -> dict[str, str]:
     """Name the tool that pages each list that the cap cut.
 
     The hint names no offset: the paged tool counts a wider set (for
@@ -1350,11 +1360,13 @@ def _list_hints(row: sqlite3.Row, shown: dict[str, int], totals: dict[str, int])
     """
     name = row["qualified_name"] or row["name"]
     tools = {
-        "callers": f"find_callers({hint_arg(name)}) pages the callers.",
-        "callees": f"find_callees_recursive({hint_arg(name)}, max_depth=1) pages the callees.",
+        "callers": f"{call_text('find_callers', name, **selectors)} pages the callers.",
+        "callees": f"{call_text('find_callees_recursive', name, max_depth=1, **selectors)} pages the callees.",
     }
     if row["kind"] in _POINTER_KINDS:
-        tools["indirect_call_sites"] = f"find_indirect_call_sites({hint_arg(name)}) pages the call sites."
+        tools["indirect_call_sites"] = (
+            f"{call_text('find_indirect_call_sites', name, **selectors)} pages the call sites."
+        )
     return {
         f"{key}_hint": text
         for key, text in tools.items()
@@ -1535,7 +1547,9 @@ def _collect_enum_constants(
     return constants, total
 
 
-def _constants_fields(row: sqlite3.Row, constants: list[dict], total: int) -> dict:
+def _constants_fields(
+    row: sqlite3.Row, constants: list[dict], total: int, selectors: Mapping[str, object],
+) -> dict:
     """The ``constants`` keys of an enum answer, with a hint when the list is cut.
 
     ``lookup_symbol`` with the enum name and ``::`` matches the qualified
@@ -1546,7 +1560,7 @@ def _constants_fields(row: sqlite3.Row, constants: list[dict], total: int) -> di
     fields: dict = {"constants": constants, "constants_total": total}
     if total > len(constants):
         fields["constants_hint"] = (
-            f"lookup_symbol({hint_arg(row['qualified_name'] + '::')}) pages every constant."
+            f"{call_text('lookup_symbol', row['qualified_name'] + '::', **selectors)} pages every constant."
         )
     return fields
 
@@ -1727,7 +1741,7 @@ def get_symbol_context(
             row, file_path, callers_list, callees_list, indirect_calls_list,
             resolution, enum_constants, llm_analysis, overrides_info,
             _stored_file_state(conn, row["file_id"]),
-            _ambiguity(conn, config_hash, name, row, root),
+            _ambiguity(conn, config_hash, name, row, root, selector_args(project_root, variant, image)),
             totals,
         )
 
@@ -1765,7 +1779,7 @@ def get_symbol_context(
         "callers": len(callers_list),
         "callees": len(callees_list),
         "indirect_call_sites": len(indirect_calls_list),
-    }, totals))
+    }, totals, selector_args(project_root, variant, image)))
     # Every part of this answer — body, callers, callees — is about the one
     # symbol named here, and these keys say which one that is.
     result.update(ambiguity)
@@ -1777,7 +1791,10 @@ def get_symbol_context(
         result["parent_usr"] = row["parent_usr"]
     if row["enum_value"] is not None:
         result["enum_value"] = row["enum_value"]
-    result.update(_constants_fields(row, *enum_constants))
+    constants, constants_total = enum_constants
+    result.update(_constants_fields(
+        row, constants, constants_total, selector_args(project_root, variant, image),
+    ))
     if llm_analysis:
         result["llm_analysis"] = llm_analysis
     if overrides_info:
@@ -2070,7 +2087,8 @@ def read_file(
         result["start_line"] = first
         result["end_line"] = last
     if paged:
-        numbers = {"line_numbers": True} if line_numbers else {}
+        numbers: dict[str, object] = {"line_numbers": True} if line_numbers else {}
+        numbers.update(selector_args(project_root, variant, image))
         result["page"] = page_notice(
             total, first - 1, last - first + 1,
             hint=_read_file_hint(file_path, last + 1, numbers),
@@ -2082,12 +2100,12 @@ def read_file(
 _READ_FILE_PAGE = 2000
 
 
-def _read_file_hint(file_path: str, next_line: int, numbers: dict) -> str:
+def _read_file_hint(file_path: str, next_line: int, numbers: Mapping[str, object]) -> str:
     """The call that reads the next page of a file.
 
     read_file names its position with ``start_line`` and not with
     ``offset``, thus the hint does too.  ``offset`` in the page notice is
-    the number of lines before the page, ``start_line - 1``.
+    the number of lines before the page, ``start_line - 1``.  *numbers*
+    are the other arguments: ``line_numbers`` and the selectors.
     """
-    extra = "".join(f", {key}={value}" for key, value in numbers.items())
-    return f"read_file({hint_arg(file_path)}{extra}, start_line={next_line}) reads the next page."
+    return f"{call_text('read_file', file_path, **numbers, start_line=next_line)} reads the next page."

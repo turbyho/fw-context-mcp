@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from fw_context_mcp.indexer.db import insert_symbols_batch
-from tests._paging import assert_whole_and_once, make_project, notice, symbol_row, walk_pages
+from tests._paging import assert_whole_and_once, make_project, notice, symbol_row, walk_pages, with_project
 
 INSTANCES = 11
 TEMPLATE_USR = "c:@ST>1#T@Callback"
@@ -68,7 +68,7 @@ def test_instance_count_is_every_instance_and_not_the_page(project):
 
 def test_the_hint_names_the_next_call(project):
     assert notice(_call(project, 0))["hint"] == (
-        "get_template_instances('Callback', offset=4) reads the next page."
+        with_project("get_template_instances('Callback', offset=4) reads the next page.", project)
     )
 
 
