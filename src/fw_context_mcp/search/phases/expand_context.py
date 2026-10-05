@@ -83,10 +83,12 @@ class ExpandContextPhase(Phase):
         results = ctx.final_results
         seeds = results[: self.SEEDS]
 
-        # A neighbor goes after the seeds.  When the seeds fill the limit,
-        # no neighbor can go in, thus the call-graph query is not necessary.
+        # Each return cuts to the limit, also the returns with no neighbor.
         # The cut is for an input longer than the limit: when adaptive fusion
         # fails, the uncut embedding rows come here.
+        #
+        # A neighbor goes after the seeds.  When the seeds fill the limit,
+        # no neighbor can go in, thus the call-graph query is not necessary.
         if len(seeds) >= ctx.limit:
             return ctx.evolve(final_results=results[: ctx.limit])
 
@@ -102,7 +104,7 @@ class ExpandContextPhase(Phase):
 
         if not seed_usrs:
             log.debug("ExpandContext: no seeds have USR — skipping")
-            return ctx
+            return ctx.evolve(final_results=results[: ctx.limit])
 
         def _query(conn, config_hash):
             # Runs under the executor lock on the single shared
@@ -117,7 +119,7 @@ class ExpandContextPhase(Phase):
         neighbors = ctx.executor.execute_sync(_query, ctx.config_hash)
 
         if not neighbors:
-            return ctx
+            return ctx.evolve(final_results=results[: ctx.limit])
 
         # Mixed strategy: original seeds + new neighbors + remaining results.
         # Neighbors appear at positions 11-15 (after seeds, before tail).
