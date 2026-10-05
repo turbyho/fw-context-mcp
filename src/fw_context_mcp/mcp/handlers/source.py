@@ -59,12 +59,14 @@ from pydantic import Field
 
 from ...indexer import db as index_db
 from ...indexer.db import (
+    count_indirect_call_site_matches,
     find_indirect_call_sites,
     get_llm_analysis_for_symbol,
     get_overrides_for_method,
     lookup_macro,
     refs_for_symbol,
 )
+from ...indexer.db._refs import count_refs_for_symbol
 from ...indexer.db._resolve import (
     CANDIDATES_SHOWN,
     candidate_rows,
@@ -73,7 +75,9 @@ from ...indexer.db._resolve import (
 )
 from ...llm.ollama import OllamaError, OllamaModelNotFoundError, call_ollama_async
 from ...utils import abs_path, macro_signature, read_file_lines
+from ...utils import escape_like as _escape_like
 from ..shared.context import _normalize_file_path_query
+from ..shared.paging import clamp_offset, page_hint, page_notice, past_end_info
 from ..shared.stale import _file_differs
 from ._base import BaseHandler
 
@@ -935,8 +939,10 @@ def get_source(
     so), or when the index holds no body for the symbol, such as a
     declaration.
 
-    For enums, includes a ``constants`` array listing all member constants
-    with their values. For macros, returns kind="macro" with ``signature``
+    For enums, includes a ``constants`` array of the member constants
+    with their values (at most 200; ``constants_total`` counts them all,
+    and ``constants_hint`` names the call that pages them).  For macros,
+    returns kind="macro" with ``signature``
     (``#define NAME`` or ``#define NAME(a, b)``), ``is_function_like``,
     ``value`` (the replacement text ALONE — the parameter list is not part
     of it) and ``expanded_value`` (preprocessor-resolved).
@@ -1058,29 +1064,8 @@ def get_source(
             result["parent_usr"] = row["parent_usr"]
         if row["enum_value"] is not None:
             result["enum_value"] = row["enum_value"]
-        # For enums, collect all member constants.
-        # Two LIKE patterns cover both unqualified (EnumName::CONST) and
-        # namespaced (prefix::EnumName::CONST, e.g. inner enum in a class).
-        # SQLite GLOB/REGEXP would be cleaner but LIKE is indexed for FTS5
-        # prefix scans and avoids a second table lookup per enum.
-        if row["kind"] == "enum":
-            qn = row["qualified_name"]
-            const_rows = conn.execute(
-                """SELECT name, qualified_name, line, enum_value
-                   FROM symbols
-                   WHERE config_hash = ? AND kind = 'enum_constant'
-                     AND (qualified_name LIKE ? OR qualified_name LIKE ?)
-                   ORDER BY line""",
-                (config_hash, f"{qn}::%", f"%{qn}::%"),
-            ).fetchall()
-            if const_rows:
-                result["constants"] = [
-                    {
-                        "name": c["name"],
-                        **({"enum_value": c["enum_value"]} if c["enum_value"] is not None else {}),
-                    }
-                    for c in const_rows
-                ]
+        # For enums, the member constants (see _collect_enum_constants).
+        result.update(_constants_fields(row, *_collect_enum_constants(conn, config_hash, row)))
         # The mtime must come from the same connection as the symbol row —
         # _read_verified_body compares it against the file on disk to decide
         # whether the stored line number still points at this symbol.
@@ -1107,7 +1092,9 @@ def get_file_map(
     file_path: Annotated[str, Field(description="Path to source file — relative to project root or just filename.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     signatures: Annotated[bool, Field(description="Include full function signatures in output.")] = False,
-    max_per_kind: Annotated[int, Field(description="Max items per symbol kind group (default 30, 0 = unlimited).", ge=0)] = 30,
+    max_per_kind: Annotated[int, Field(description="Max items per symbol kind group (default 30, 0 = unlimited). With kind, the size of the page.", ge=0)] = 30,
+    kind: Annotated[str | None, Field(description="One symbol kind, e.g. 'function' or 'enum_constant'. Gives one page of the items of that kind.")] = None,
+    offset: Annotated[int, Field(description="With kind: skip this many items of that kind. Reads the next page.", ge=0)] = 0,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> dict:
@@ -1145,6 +1132,12 @@ def get_file_map(
         project_root: Project directory. Auto-detected if omitted.
         signatures: Include full function signatures. Default: False.
         max_per_kind: Max items per kind group (default 30, 0 = unlimited).
+            With ``kind``, the size of the page.
+        kind: One symbol kind, for example ``"function"`` or
+            ``"enum_constant"``.  Gives one page of the items of that kind
+            instead of the map.
+        offset: With ``kind``: skip this many items of that kind.  Reads
+            the next page; ``page`` names the offset to use.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
         image: Sysbuild image within the variant. Required when the
@@ -1156,7 +1149,14 @@ def get_file_map(
 
         Each item holds ``name``, ``qualified_name``, and ``line``, plus
         ``end_line`` when the symbol is a definition.  The two line numbers
-        are the extent, thus ``file:line-end_line`` is the citation.
+        are the extent, thus ``file:line-end_line`` is the citation.  A
+        group that ``max_per_kind`` cut holds ``hint``, the call that pages
+        its items.
+
+        With ``kind``: {file, kind, count, items[], page}, where ``items``
+        is one flat page of that kind, enum constants too, and ``page`` is
+        the page notice ``{total, offset, shown, more, hint}``.  A page
+        after the last item gives one ``info`` dict that names the total.
 
         When the file changed after the last index run, the dict adds
         ``stale`` (True) and ``stale_warning`` (str).
@@ -1185,10 +1185,45 @@ def get_file_map(
         # project ("../../etc/passwd") reaches no row and was already
         # refused above; a vendor header of the SDK reaches one and is as
         # much part of the build as a file of the application.
-        return index_db.get_file_map(
+        # The hint repeats each argument that changes the items of a page.
+        extra = {"signatures": True} if signatures else {}
+        if kind:
+            skip = clamp_offset(offset)
+            page = index_db.get_file_map_kind(
+                conn, config_hash, resolved, kind,
+                signatures=signatures, limit=max_per_kind, offset=skip,
+            )
+            if not page["count"]:
+                # A kind with no symbol here is often a typo ("functions"),
+                # thus the answer names the kinds that the file holds.
+                kinds = sorted(index_db.get_file_map(conn, config_hash, resolved)["symbols"])
+                return {"info": f"No symbol of kind {kind!r} in {resolved}. "
+                                f"Kinds in this file: {', '.join(kinds) or 'none'}."}
+            if skip and not page["items"]:
+                return past_end_info(kind, skip, page["count"])
+            page["page"] = page_notice(
+                page["count"], skip, len(page["items"]),
+                hint=page_hint("get_file_map", file_path, kind=kind, **extra,
+                               next_offset=skip + len(page["items"])),
+            )
+            return page
+        file_map = index_db.get_file_map(
             conn, config_hash, resolved,
             signatures=signatures, max_per_kind=max_per_kind,
         )
+        # A group that the cap cut names the call that pages it.  The enum
+        # constants sit in subgroups, each cut on its own, thus the call
+        # for them starts at the first constant.
+        for group_kind, group in file_map["symbols"].items():
+            if group_kind == "enum_constant":
+                shown = sum(len(sub["constants"]) for sub in group.get("subgroups", ()))
+                start = 0
+            else:
+                shown = start = len(group["items"])
+            if group["count"] > shown:
+                group["hint"] = page_hint("get_file_map", file_path, kind=group_kind,
+                                          **extra, next_offset=start)
+        return file_map
 
     from ..shared.stale import with_stale_annotation
 
@@ -1215,7 +1250,8 @@ def _collect_callers(
     answer now describe one symbol.
     """
     callers = refs_for_symbol(
-        conn, config_hash, row["usr"], row["kind"], ref_kind=["call", "indirect"]
+        conn, config_hash, row["usr"], row["kind"], ref_kind=["call", "indirect"],
+        limit=_CALLERS_SHOWN,
     )
     return [
         {"name": c["caller_name"] or "?", "qualified_name": c["caller_qname"] or "",
@@ -1226,17 +1262,37 @@ def _collect_callers(
     ]
 
 
+# The rows of _collect_callees, and of their count in _list_totals.  The
+# answer holds no line, thus two calls of one callee gave two rows that a
+# reader could not tell apart: DISTINCT keeps one row per callee and kind
+# of reference.  The order ends at the usr, thus it is the same each time.
+_CALLEES_FROM = """FROM refs r
+           JOIN symbols s ON s.usr = r.to_usr AND s.config_hash = r.config_hash
+           WHERE r.from_usr = ? AND r.config_hash = ?
+             AND r.ref_kind IN ('call', 'indirect')"""
+# The callees that get_symbol_context shows.  find_callees_recursive with
+# max_depth=1 pages the same list.
+_CALLEES_SHOWN = 100
+# The callers that get_symbol_context shows: the default page of
+# refs_for_symbol.  find_callers pages them.
+_CALLERS_SHOWN = 50
+# The indirect call sites that get_symbol_context shows.
+_INDIRECT_SHOWN = 200
+
+
 def _collect_callees(
     conn: sqlite3.Connection, config_hash: str, symbol_usr: str, root: Path
 ) -> list[dict]:
-    """Return immediate callees (direct + indirect calls made by this symbol)."""
+    """Return immediate callees (direct + indirect calls made by this symbol).
+
+    One row per callee and kind of reference, at most ``_CALLEES_SHOWN``.
+    """
     callees_rows = conn.execute(
-        """SELECT s.name, s.qualified_name, s.kind, s.file_path, r.ref_kind
-           FROM refs r
-           JOIN symbols s ON s.usr = r.to_usr AND s.config_hash = r.config_hash
-           WHERE r.from_usr = ? AND r.config_hash = ?
-             AND r.ref_kind IN ('call', 'indirect')""",
-        (symbol_usr, config_hash),
+        f"""SELECT DISTINCT s.name, s.qualified_name, s.kind, s.file_path, r.ref_kind, s.usr
+           {_CALLEES_FROM}
+           ORDER BY s.qualified_name, s.usr, r.ref_kind
+           LIMIT ?""",
+        (symbol_usr, config_hash, _CALLEES_SHOWN),
     ).fetchall()
     return [
         {"name": c["name"], "qualified_name": c["qualified_name"] or "",
@@ -1244,6 +1300,66 @@ def _collect_callees(
          "ref_kind": c["ref_kind"]}
         for c in callees_rows
     ]
+
+
+# The kinds for which _collect_indirect_calls gives the call sites THROUGH
+# the symbol (a function pointer), and the kinds for which it gives the
+# indirect calls made BY the symbol.
+_POINTER_KINDS = ("field", "variable", "varglobal", "varlocal")
+_CODE_KINDS = ("function", "method")
+
+
+def _list_totals(
+    conn: sqlite3.Connection, config_hash: str, row: sqlite3.Row, symbol_usr: str,
+) -> dict[str, int]:
+    """Count each list of get_symbol_context, on the conditions of its collector.
+
+    WHY: each list is cut — callers at ``_CALLERS_SHOWN``, callees at
+    ``_CALLEES_SHOWN``, indirect call sites at ``_INDIRECT_SHOWN`` — and a
+    cut list used to read as the whole truth.  A count beside each list
+    tells the reader that a tool that pages it has more.
+    """
+    callers = count_refs_for_symbol(
+        conn, config_hash, symbol_usr, row["kind"], ref_kind=["call", "indirect"],
+    )
+    callees = int(conn.execute(
+        f"""SELECT COUNT(*) FROM (
+               SELECT DISTINCT s.usr, r.ref_kind {_CALLEES_FROM}
+           )""",
+        (symbol_usr, config_hash),
+    ).fetchone()[0])
+    indirect = 0
+    if row["kind"] in _POINTER_KINDS:
+        indirect = count_indirect_call_site_matches(
+            conn, config_hash, row["qualified_name"] or row["name"],
+        )
+    elif row["kind"] in _CODE_KINDS:
+        indirect = int(conn.execute(
+            "SELECT COUNT(*) FROM indirect_call_sites WHERE config_hash = ? AND from_usr = ?",
+            (config_hash, symbol_usr),
+        ).fetchone()[0])
+    return {"callers": callers, "callees": callees, "indirect_call_sites": indirect}
+
+
+def _list_hints(row: sqlite3.Row, shown: dict[str, int], totals: dict[str, int]) -> dict[str, str]:
+    """Name the tool that pages each list that the cap cut.
+
+    The hint names no offset: the paged tool counts a wider set (for
+    example find_callers also counts ``implicit_construct``), thus its
+    pages do not continue this list row for row.
+    """
+    name = row["qualified_name"] or row["name"]
+    tools = {
+        "callers": f"find_callers('{name}') pages the callers.",
+        "callees": f"find_callees_recursive('{name}', max_depth=1) pages the callees.",
+    }
+    if row["kind"] in _POINTER_KINDS:
+        tools["indirect_call_sites"] = f"find_indirect_call_sites('{name}') pages the call sites."
+    return {
+        f"{key}_hint": text
+        for key, text in tools.items()
+        if totals[key] > shown[key]
+    }
 
 
 def _collect_indirect_calls(
@@ -1266,9 +1382,9 @@ def _collect_indirect_calls(
     Returns an empty list for all other kinds (enum, class, struct, etc.).
     """
     kind = row["kind"]
-    if kind in ("field", "variable", "varglobal", "varlocal"):
+    if kind in _POINTER_KINDS:
         ics_rows = find_indirect_call_sites(
-            conn, config_hash, row["qualified_name"] or row["name"], limit=200
+            conn, config_hash, row["qualified_name"] or row["name"], limit=_INDIRECT_SHOWN
         )
         return [
             {
@@ -1280,7 +1396,7 @@ def _collect_indirect_calls(
             }
             for r in ics_rows
         ]
-    if kind in ("function", "method"):
+    if kind in _CODE_KINDS:
         ics_rows = conn.execute(
             """SELECT ics.*, caller.name AS caller_name,
                       caller.qualified_name AS caller_qname,
@@ -1290,9 +1406,9 @@ def _collect_indirect_calls(
                  ON caller.config_hash = ics.config_hash
                 AND caller.usr = ics.from_usr
                WHERE ics.config_hash = ? AND ics.from_usr = ?
-               ORDER BY ics.from_file, ics.from_line
-               LIMIT 200""",
-            (config_hash, symbol_usr),
+               ORDER BY ics.from_file, ics.from_line, ics.id
+               LIMIT ?""",
+            (config_hash, symbol_usr, _INDIRECT_SHOWN),
         ).fetchall()
         return [
             {
@@ -1312,7 +1428,7 @@ def _collect_resolution_info(
     config_hash: str,
     row: sqlite3.Row,
     symbol_usr: str,
-    indirect_calls_list: list[dict],
+    indirect_call_total: int,
 ) -> dict | None:
     """Build Phase 3 resolution metadata for function-pointer symbols.
 
@@ -1335,7 +1451,9 @@ def _collect_resolution_info(
         "SELECT COUNT(*) FROM fp_assignments WHERE config_hash = ? AND lhs_usr = ?",
         (config_hash, symbol_usr),
     ).fetchone()[0]
-    ics_count = len(indirect_calls_list)
+    # The count of every call site, not the length of the cut list: the
+    # note and the answer must agree with indirect_call_sites_total.
+    ics_count = indirect_call_total
     if assign_count == 0 and ics_count == 0:
         return None
     resolved = assign_count > 0 and ics_count > 0
@@ -1365,34 +1483,72 @@ def _collect_resolution_info(
     }
 
 
+# The constants of one enum that get_source and get_symbol_context show.
+# A register enum of a vendor header can hold hundreds.
+_CONSTANTS_SHOWN = 200
+_ENUM_CONSTANTS_WHERE = r"""config_hash = ? AND kind = 'enum_constant'
+             AND qualified_name LIKE ? ESCAPE '\'"""
+
+
 def _collect_enum_constants(
     conn: sqlite3.Connection, config_hash: str, row: sqlite3.Row
-) -> list[dict]:
-    """Return enum member constants (name + value) for an enum symbol.
+) -> tuple[list[dict], int]:
+    """Return the member constants (name + value) of an enum, and their count.
 
-    Uses two LIKE patterns to match both unqualified constants
-    (``EnumName::CONST``) and namespaced ones (``prefix::EnumName::CONST``).
-    LIKE is preferred over GLOB/REGEXP because SQLite can optimise it with
-    the FTS5-backed index prefix scan, a pattern repeated in ``get_source``.
+    A constant has the qualified name of its enum and ``::`` before its
+    own name, thus the match is that prefix — the same prefix that
+    ``lookup_symbol('<enum>::')`` pages, which the hint names.  The name
+    is escaped: an enum name such as ``uart_mode_t`` holds ``_``, which
+    LIKE reads as any character.
+
+    WHY no second pattern ``%<enum>::%``: it matched the qualified name
+    anywhere, thus ``gpio_mode_t`` also got the constants of
+    ``rtc_gpio_mode_t``.  Measured over every index on one machine: 6751
+    enums, 504 constants of another enum from that pattern, and 7 that had
+    a ``::`` before the name.
+
+    The list stops at ``_CONSTANTS_SHOWN``, in the order of the source
+    (``line``, then ``usr`` for two constants on one line).  The count is
+    of every constant, thus a cut list says that it is cut.
     """
     if row["kind"] != "enum":
-        return []
-    qn = row["qualified_name"]
+        return [], 0
+    qn = _escape_like(row["qualified_name"] or "")
+    params = (config_hash, f"{qn}::%")
     const_rows = conn.execute(
-        """SELECT name, qualified_name, line, enum_value
-           FROM symbols
-           WHERE config_hash = ? AND kind = 'enum_constant'
-             AND (qualified_name LIKE ? OR qualified_name LIKE ?)
-           ORDER BY line""",
-        (config_hash, f"{qn}::%", f"%{qn}::%"),
+        f"""SELECT name, enum_value FROM symbols
+           WHERE {_ENUM_CONSTANTS_WHERE}
+           ORDER BY line, usr
+           LIMIT ?""",
+        (*params, _CONSTANTS_SHOWN),
     ).fetchall()
-    return [
+    total = int(conn.execute(
+        f"SELECT COUNT(*) FROM symbols WHERE {_ENUM_CONSTANTS_WHERE}", params,
+    ).fetchone()[0])
+    constants = [
         {
             "name": c["name"],
             **({"enum_value": c["enum_value"]} if c["enum_value"] is not None else {}),
         }
         for c in const_rows
     ]
+    return constants, total
+
+
+def _constants_fields(row: sqlite3.Row, constants: list[dict], total: int) -> dict:
+    """The ``constants`` keys of an enum answer, with a hint when the list is cut.
+
+    ``lookup_symbol`` with the enum name and ``::`` matches the qualified
+    names of the constants as a prefix, and it pages them.
+    """
+    if not constants:
+        return {}
+    fields: dict = {"constants": constants, "constants_total": total}
+    if total > len(constants):
+        fields["constants_hint"] = (
+            f"lookup_symbol('{row['qualified_name']}::') pages every constant."
+        )
+    return fields
 
 
 def _collect_override_info(
@@ -1416,12 +1572,12 @@ def _collect_override_info(
 
 # ── moved from server.py ──
 def get_symbol_context(
-    name: Annotated[str, Field(description="Symbol name. Returns body, signature, all direct callers and callees.", min_length=1)],
+    name: Annotated[str, Field(description="Symbol name. Returns body, signature, the direct callers and callees (each list with its total).", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> dict:
-    """Rich one-shot context for a C/C++ symbol: body, signature, all direct
+    """Rich one-shot context for a C/C++ symbol: body, signature, the direct
     callers and callees. Answers "what does this do and how does it fit in
     the system?" in a single response — libclang powers the call graph,
     not regex. Falls back to macro display when the symbol is not found.
@@ -1432,9 +1588,11 @@ def get_symbol_context(
     slightly faster. For transitive call-graph exploration use
     ``find_all_callers_recursive`` or ``find_callees_recursive``.
 
-    Returns ALL callers and callees including vendor/SDK code — the call
-    graph naturally spans project and vendor boundaries in both directions
-    (project → vendor API, vendor callback → project handler).
+    The callers and callees include vendor/SDK code — the call graph
+    naturally spans project and vendor boundaries in both directions
+    (project → vendor API, vendor callback → project handler).  Each list
+    is cut (callers at 50, callees at 100), and its ``*_total`` says how
+    many there are; ``*_hint`` names the tool that pages a cut list.
 
     The body is **ifdef-filtered**, the same as in ``get_source``: a line of
     an inactive ``#if`` branch comes back blank and the line numbers do not
@@ -1444,8 +1602,8 @@ def get_symbol_context(
     Read-only. No side effects.
 
     Args:
-        name: Symbol name. Returns body, signature, all direct callers
-            and callees.
+        name: Symbol name. Returns body, signature, the direct callers
+            and callees (each list with its total).
         project_root: Project root. Auto-detected if omitted.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
@@ -1454,17 +1612,24 @@ def get_symbol_context(
 
     Returns:
         dict with: name, qualified_name, kind, file, line, signature,
-        docstring (raw Doxygen comment text), is_definition, callers (list),
-        callees (list), source (body text),
+        docstring (raw Doxygen comment text), is_definition, callers (list,
+        max 50 — ``call`` and ``indirect`` references, each with its line),
+        callees (list, max 100 — one row for each callee and kind of
+        reference), source (body text),
         indirect_call_sites (list, max 200 — for a field/variable symbol,
         where the function pointer is invoked; for a function/method, the
         calls through function pointers that it makes).
+        ``callers_total``, ``callees_total`` and
+        ``indirect_call_sites_total`` count each whole list.  When a list
+        is cut, ``callers_hint``, ``callees_hint`` or
+        ``indirect_call_sites_hint`` names the tool that pages it.
         For field and variable symbols that have function pointer type,
         also includes ``resolution``: {assignments_found, call_sites_found,
         resolved, note} indicating whether assignments and call sites are
         linked (Phase 3).  ``resolved=False`` with a note when parts are
         missing — LLM can detect uncertainty.
-        For an enum also returns constants; for an enum constant, enum_value.
+        For an enum also returns constants (at most 200), constants_total and,
+        when the list is cut, constants_hint; for an enum constant, enum_value.
         For macros returns ``kind="macro"``, ``signature`` (``#define NAME``
         or ``#define NAME(a, b)``), ``is_function_like``, ``value`` (the
         replacement text ALONE) and ``expanded_value``
@@ -1544,7 +1709,10 @@ def get_symbol_context(
         indirect_calls_list = _collect_indirect_calls(conn, config_hash, row, symbol_usr, root)
 
         # Resolution info — for function pointer fields/variables
-        resolution = _collect_resolution_info(conn, config_hash, row, symbol_usr, indirect_calls_list)
+        totals = _list_totals(conn, config_hash, row, symbol_usr)
+        resolution = _collect_resolution_info(
+            conn, config_hash, row, symbol_usr, totals["indirect_call_sites"],
+        )
 
         # For enums, collect all constants with their values
         enum_constants = _collect_enum_constants(conn, config_hash, row)
@@ -1560,6 +1728,7 @@ def get_symbol_context(
             resolution, enum_constants, llm_analysis, overrides_info,
             _stored_file_state(conn, row["file_id"]),
             _ambiguity(conn, config_hash, name, row, root),
+            totals,
         )
 
     query_result = db.executor.execute_sync(_query, db.config_hash)
@@ -1569,7 +1738,7 @@ def get_symbol_context(
     (
         row, file_path, callers_list, callees_list, indirect_calls_list,
         resolution, enum_constants, llm_analysis, overrides_info,
-        stored_state, ambiguity,
+        stored_state, ambiguity, totals,
     ) = query_result
 
     source, source_origin, stale_warning = _read_verified_body(row, file_path, stored_state)
@@ -1585,10 +1754,18 @@ def get_symbol_context(
         "is_virtual": bool(row["is_virtual"]),
         "is_pure_virtual": bool(row["is_pure_virtual"]),
         "callers": callers_list,
+        "callers_total": totals["callers"],
         "callees": callees_list,
+        "callees_total": totals["callees"],
         "indirect_call_sites": indirect_calls_list,
+        "indirect_call_sites_total": totals["indirect_call_sites"],
         "docstring": row["docstring"] or "",
     }
+    result.update(_list_hints(row, {
+        "callers": len(callers_list),
+        "callees": len(callees_list),
+        "indirect_call_sites": len(indirect_calls_list),
+    }, totals))
     # Every part of this answer — body, callers, callees — is about the one
     # symbol named here, and these keys say which one that is.
     result.update(ambiguity)
@@ -1600,8 +1777,7 @@ def get_symbol_context(
         result["parent_usr"] = row["parent_usr"]
     if row["enum_value"] is not None:
         result["enum_value"] = row["enum_value"]
-    if enum_constants:
-        result["constants"] = enum_constants
+    result.update(_constants_fields(row, *enum_constants))
     if llm_analysis:
         result["llm_analysis"] = llm_analysis
     if overrides_info:
@@ -1664,11 +1840,11 @@ def read_file(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     line_numbers: Annotated[bool, Field(description="Prefix every line with its line number, like get_source. Default False (bare text).")] = False,
     start_line: Annotated[int, Field(description="First line to return, 1-based inclusive. 0 = from the start of the file.", ge=0)] = 0,
-    end_line: Annotated[int, Field(description="Last line to return, 1-based inclusive. 0 = to the end of the file.", ge=0)] = 0,
+    end_line: Annotated[int, Field(description="Last line to return, 1-based inclusive. 0 = one page of at most 2000 lines.", ge=0)] = 0,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> dict:
-    """Read a complete C/C++ source file with **ifdef-filtered** content —
+    """Read a C/C++ source file, one page at a time, with **ifdef-filtered** content —
     only code that actually compiles for the current build configuration.
     Inactive ``#ifdef`` branches are replaced with blank lines (preserving
     original line numbers).
@@ -1697,6 +1873,13 @@ def read_file(
     known line costs a fraction of the whole file — 40 lines around a match
     instead of 2000 lines of a header.
 
+    Without ``end_line`` the answer is ONE PAGE of at most 2000 lines from
+    ``start_line`` on, and ``page`` holds the page notice: ``total`` is
+    the number of lines of the file, ``offset`` the number of lines before
+    the page, ``shown`` the lines on it.  When ``more`` is true, the
+    ``hint`` names the ``read_file`` call with the next ``start_line``.
+    An explicit ``end_line`` gives the whole range that it names.
+
     A comment and a preprocessor directive are part of the answer.  Both
     are text that the file holds and the build reads, thus both stay — an
     include guard, a ``#define``, and the description of a register in a
@@ -1721,7 +1904,8 @@ def read_file(
         line_numbers: Prefix every line with its number, right-aligned and
             followed by two spaces, as ``get_source`` does. Default False.
         start_line: First line to return, 1-based inclusive. 0 = file start.
-        end_line: Last line to return, 1-based inclusive. 0 = file end.
+        end_line: Last line to return, 1-based inclusive. 0 = one page of
+            at most 2000 lines.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
         image: Sysbuild image within the variant. Required when the
@@ -1743,9 +1927,11 @@ def read_file(
         this field that answer reads as an empty file, and the two mean
         opposite things.
 
-        A range adds ``start_line`` and ``end_line`` — the first and last
-        line the ``content`` really holds, after the end was clamped to the
-        length of the file.
+        A range, or a page that is not the whole file, adds ``start_line``
+        and ``end_line`` — the first and last line the ``content`` really
+        holds, after the end was clamped to the length of the file.
+        Without ``end_line`` the dict also holds ``page``, the page notice
+        ``{total, offset, shown, more, hint}`` in lines.
 
         When the file changed after the last index run, the dict adds
         ``stale`` (True) and ``stale_warning`` (str): the content comes
@@ -1855,19 +2041,53 @@ def read_file(
     # Both paths end here: `lines` stays the length of the whole file, and
     # the range only decides how much of it travels to the caller.
     lines_list = content.splitlines()
-    result["lines"] = len(lines_list)
-    if not (start_line or end_line or line_numbers):
+    total = len(lines_list)
+    result["lines"] = total
+    # Without end_line, one page of at most _READ_FILE_PAGE lines.  WHY: a
+    # vendor header holds 10 000 to 20 000 lines, and the whole file came
+    # back in one answer.  An explicit end_line is a range the caller chose,
+    # and it stays whole.
+    paged = not end_line
+    page_end = end_line
+    if paged and start_line <= total:
+        # A start_line after the end keeps page_end at 0, thus
+        # _shape_file_lines reports "past the end" and not a range that
+        # ends before it starts.
+        page_end = min(total, (start_line or 1) + _READ_FILE_PAGE - 1)
+    if paged and not start_line and page_end == total and not line_numbers:
         # The whole file, bare: hand over the stored text itself.  Rebuilding
         # it from the split would drop the closing newline, and a caller that
         # compares the text with the file would see a difference that is not
         # there.
         result["content"] = content
+        result["page"] = page_notice(total, 0, total)
         return result
-    shaped = _shape_file_lines(lines_list, start_line, end_line, line_numbers)
+    shaped = _shape_file_lines(lines_list, start_line, page_end, line_numbers)
     if isinstance(shaped, str):
         return {"error": shaped}
     result["content"], first, last = shaped
-    if start_line or end_line:
+    if start_line or end_line or last < total:
         result["start_line"] = first
         result["end_line"] = last
+    if paged:
+        numbers = {"line_numbers": True} if line_numbers else {}
+        result["page"] = page_notice(
+            total, first - 1, last - first + 1,
+            hint=_read_file_hint(file_path, last + 1, numbers),
+        )
     return result
+
+
+# The lines of one read_file page when the caller gives no end_line.
+_READ_FILE_PAGE = 2000
+
+
+def _read_file_hint(file_path: str, next_line: int, numbers: dict) -> str:
+    """The call that reads the next page of a file.
+
+    read_file names its position with ``start_line`` and not with
+    ``offset``, thus the hint does too.  ``offset`` in the page notice is
+    the number of lines before the page, ``start_line - 1``.
+    """
+    extra = "".join(f", {key}={value}" for key, value in numbers.items())
+    return f"read_file('{file_path}'{extra}, start_line={next_line}) reads the next page."

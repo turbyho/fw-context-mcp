@@ -31,6 +31,7 @@ from typing import Annotated
 from pydantic import Field
 
 from ...indexer.db import (
+    count_class_members,
     count_template_instances,
     get_direct_bases,
     get_direct_bases_batch,
@@ -142,12 +143,18 @@ def _bfs_inheritance_walk(
 
     return all_results
 
+# The default max_depth of get_inheritance_chain; a hint repeats any other value.
+_DEFAULT_CHAIN_DEPTH = 10
+
+
 # ── moved from server.py ──
 def get_inheritance_chain(
     class_name: Annotated[str, Field(description="Class or struct name to get inheritance information for. E.g. 'UART_DRIVER' or 'comm::MODEM'.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     transitive: Annotated[bool, Field(description="When True, walk the full inheritance tree both up (ancestors) and down (descendants). Default: False (direct bases and derived only).")] = False,
-    max_depth: Annotated[int, Field(description="Maximum BFS depth for transitive walk (default 10).", ge=1, le=50)] = 10,
+    max_depth: Annotated[int, Field(description="Maximum BFS depth for transitive walk (default 10).", ge=1, le=50)] = _DEFAULT_CHAIN_DEPTH,
+    limit: Annotated[int, Field(description="Maximum classes in all_bases and in all_derived on one page (default 100, max 500). Only with transitive=True.", ge=1)] = 100,
+    offset: Annotated[int, Field(description="Skip this many classes in all_bases and in all_derived. Reads the next page of a large hierarchy. Only with transitive=True.", ge=0)] = 0,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> dict:
@@ -178,6 +185,10 @@ def get_inheritance_chain(
         max_depth: Maximum BFS depth for transitive walk (default 10).
             The schema holds it between 1 and 50, thus a number outside
             that range is REFUSED and not cut down to fit.
+        limit: Maximum classes in ``all_bases`` and in ``all_derived`` on
+            one page (default 100, max 500).  Only with ``transitive=True``.
+        offset: Skip this many classes in ``all_bases`` and in
+            ``all_derived``.  One offset pages the two lists together.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
         image: Sysbuild image within the variant. Required when the
@@ -189,15 +200,22 @@ def get_inheritance_chain(
             bases: [{name, usr, access, is_virtual, file}],
             derived: [{name, usr, access, is_virtual, file}],
             all_bases: [{name, usr, access, is_virtual, depth, file, kind}]
-                (when transitive=True, ancestors sorted by depth),
+                (when transitive=True, ancestors sorted by depth, then
+                name),
             all_derived: [...] (when transitive=True, descendants, same shape)
         }
+
+        With ``transitive=True`` each of the two lists is one page, and
+        ``all_bases_page`` and ``all_derived_page`` hold its page notice
+        ``{total, offset, shown, more, hint}``.  A hierarchy below a root
+        class of a framework can hold thousands of classes.
 
         When a file of the answer changed after the last index run, the
         dict adds ``stale`` (True) and ``stale_warning`` (str).
 
         On failure the dict holds ``error`` with the reason.
     """
+    limit = max(1, min(limit, 500))
     try:
         db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)
     except RuntimeError as e:
@@ -284,6 +302,23 @@ def get_inheritance_chain(
                 max_depth=max_depth,
             )
 
+            # One page of each list.  The walk visits each class once, at
+            # its shortest depth, thus ``usr`` is unique in a list and the
+            # sort is a total order.
+            skip = clamp_offset(offset)
+            depth = {} if max_depth == _DEFAULT_CHAIN_DEPTH else {"max_depth": max_depth}
+            for key in ("all_bases", "all_derived"):
+                walked = sorted(
+                    result[key], key=lambda r: (r["depth"], r["name"] or "", r["usr"] or ""),
+                )
+                page = walked[skip:skip + limit]
+                result[key] = page
+                result[f"{key}_page"] = page_notice(
+                    len(walked), skip, len(page),
+                    hint=page_hint("get_inheritance_chain", class_name, transitive=True,
+                                   **depth, next_offset=skip + len(page)),
+                )
+
         return result
 
     return db.execute_scoped(_query)
@@ -292,6 +327,8 @@ def get_inheritance_chain(
 def get_class_members(
     class_name: Annotated[str, Field(description="Class or struct name. E.g. 'ModemManager' or 'comm::MODEM'.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+    limit: Annotated[int, Field(description="Maximum members on one page (default 200, max 500).", ge=1)] = 200,
+    offset: Annotated[int, Field(description="Skip this many members. Reads the next page of a large class.", ge=0)] = 0,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
 ) -> dict:
@@ -313,6 +350,9 @@ def get_class_members(
         class_name: Class or struct name. E.g. ``'ModemManager'`` or
             ``'comm::MODEM'``.
         project_root: Project root. Auto-detected if omitted.
+        limit: Maximum members on one page (default 200, max 500).
+        offset: Skip this many members.  Reads the next page; ``page``
+            names the offset to use.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
         image: Sysbuild image within the variant. Required when the
@@ -321,13 +361,20 @@ def get_class_members(
     Returns:
         dict: {name, qualified_name, kind, file, line, members: {kind:
         [{name, qualified_name, signature, is_virtual, is_pure_virtual,
-        line}]}, member_count}
+        line}]}, member_count (int — every member), page}
+
+        ``page`` is the page notice ``{total, offset, shown, more,
+        hint}``.  A page holds the members in the order kind, name and
+        line, and groups them by kind after the cut, thus one kind can go
+        on on the next page.  A page after the last member gives one
+        ``info`` dict that names the total.
 
         When a file of the answer changed after the last index run, the
         dict adds ``stale`` (True) and ``stale_warning`` (str).
 
         On failure the dict holds ``error`` with the reason.
     """
+    limit = max(1, min(limit, 500))
     try:
         db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)
     except RuntimeError as e:
@@ -355,7 +402,15 @@ def get_class_members(
         }
 
         # ── Members grouped by kind ──
-        members = query_class_members(conn, config_hash, usr)
+        # The page is a slice of the members in one flat order (kind,
+        # name, line, usr), and the slice is grouped after the cut.  Thus a
+        # kind can continue on the next page, and the next page goes on
+        # where this one stops.
+        skip = clamp_offset(offset)
+        total = count_class_members(conn, config_hash, usr)
+        members = query_class_members(conn, config_hash, usr, limit=limit, offset=skip)
+        if skip and not members and total:
+            return past_end_info("member", skip, total)
         grouped: dict[str, list[dict]] = {}
         for m in members:
             k = m["kind"]
@@ -370,7 +425,11 @@ def get_class_members(
                 "line": m["line"],
             })
         result["members"] = grouped
-        result["member_count"] = len(members)
+        result["member_count"] = total
+        result["page"] = page_notice(
+            total, skip, len(members),
+            hint=page_hint("get_class_members", class_name, next_offset=skip + len(members)),
+        )
 
         return result
 

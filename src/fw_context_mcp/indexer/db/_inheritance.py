@@ -18,6 +18,7 @@ inheritance edges are updated, not the entire class hierarchy.
 import sqlite3
 
 __all__ = [
+    "count_class_members",
     "count_template_instances",
     "delete_inheritance_for_file",
     "delete_overrides_for_file",
@@ -93,7 +94,7 @@ def get_direct_bases(conn: sqlite3.Connection, config_hash: str, usr: str) -> li
            FROM inheritance i
            LEFT JOIN symbols s ON s.usr = i.base_usr AND s.config_hash = i.config_hash
            WHERE i.config_hash = ? AND i.derived_usr = ?
-           ORDER BY s.name""",
+           ORDER BY s.name, i.base_usr""",
         (config_hash, usr),
     ).fetchall()
     return [dict(r) for r in rows]
@@ -112,7 +113,7 @@ def get_direct_derived(conn: sqlite3.Connection, config_hash: str, usr: str) -> 
            FROM inheritance i
            LEFT JOIN symbols s ON s.usr = i.derived_usr AND s.config_hash = i.config_hash
            WHERE i.config_hash = ? AND i.base_usr = ?
-           ORDER BY s.name""",
+           ORDER BY s.name, i.derived_usr""",
         (config_hash, usr),
     ).fetchall()
     return [dict(r) for r in rows]
@@ -137,7 +138,7 @@ def get_direct_bases_batch(
             FROM inheritance i
             LEFT JOIN symbols s ON s.usr = i.base_usr AND s.config_hash = i.config_hash
             WHERE i.config_hash = ? AND i.derived_usr IN ({placeholders})
-            ORDER BY s.name""",
+            ORDER BY s.name, i.base_usr""",
         (config_hash, *usrs),
     ).fetchall()
     result: dict[str, list[dict]] = {u: [] for u in usrs}
@@ -166,7 +167,7 @@ def get_direct_derived_batch(
             FROM inheritance i
             LEFT JOIN symbols s ON s.usr = i.derived_usr AND s.config_hash = i.config_hash
             WHERE i.config_hash = ? AND i.base_usr IN ({placeholders})
-            ORDER BY s.name""",
+            ORDER BY s.name, i.derived_usr""",
         (config_hash, *usrs),
     ).fetchall()
     result: dict[str, list[dict]] = {u: [] for u in usrs}
@@ -224,7 +225,7 @@ def get_overrides_for_method(
            FROM overrides o
            LEFT JOIN symbols s ON s.usr = o.base_usr AND s.config_hash = ?
            WHERE o.config_hash = ? AND o.derived_usr = ?
-           ORDER BY s.qualified_name""",
+           ORDER BY s.qualified_name, o.base_usr""",
         (config_hash, config_hash, usr),
     ).fetchall()
 
@@ -233,7 +234,7 @@ def get_overrides_for_method(
            FROM overrides o
            LEFT JOIN symbols s ON s.usr = o.derived_usr AND s.config_hash = ?
            WHERE o.config_hash = ? AND o.base_usr = ?
-           ORDER BY s.qualified_name""",
+           ORDER BY s.qualified_name, o.derived_usr""",
         (config_hash, config_hash, usr),
     ).fetchall()
 
@@ -247,26 +248,43 @@ def get_class_members(
     conn: sqlite3.Connection,
     config_hash: str,
     parent_usr: str,
+    limit: int = -1,
+    offset: int = 0,
 ) -> list[sqlite3.Row]:
-    """Return all symbols (methods, fields, nested types) belonging to a class/struct.
+    """Return one page of the symbols (methods, fields, nested types) of a class/struct.
 
     Args:
         conn: Open database connection.
         config_hash: Build config hash.
         parent_usr: USR of the parent class/struct.
+        limit: The size of the page; -1 (the SQLite value for no limit)
+            gives every member.
+        offset: Skip this many members.
 
     Returns:
-        List of sqlite3.Row objects with symbol fields, ordered by kind then name.
-        Empty list if no members found (e.g. index predates parent_usr support).
+        List of sqlite3.Row objects with symbol fields, ordered by kind,
+        name, line and usr.  Overloads and constructors tie on kind and
+        name, and ``usr`` is unique in one build, thus two pages never
+        overlap or skip.  Empty list if no members found (e.g. index
+        predates parent_usr support).
     """
     return conn.execute(
         """SELECT name, qualified_name, kind, file_path, line, col AS column,
                   signature, is_definition, is_virtual, is_pure_virtual
            FROM symbols
            WHERE config_hash = ? AND parent_usr = ?
-           ORDER BY kind, name""",
-        (config_hash, parent_usr),
+           ORDER BY kind, name, line, usr
+           LIMIT ? OFFSET ?""",
+        (config_hash, parent_usr, limit, offset),
     ).fetchall()
+
+
+def count_class_members(conn: sqlite3.Connection, config_hash: str, parent_usr: str) -> int:
+    """Count the members of one class or struct, on every page of ``get_class_members``."""
+    return int(conn.execute(
+        "SELECT COUNT(*) FROM symbols WHERE config_hash = ? AND parent_usr = ?",
+        (config_hash, parent_usr),
+    ).fetchone()[0])
 
 
 def get_template_instances(

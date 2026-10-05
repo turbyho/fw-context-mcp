@@ -74,6 +74,7 @@ __all__ = [
     "delete_symbols_for_file",
     "get_file_hashes",
     "get_file_map",
+    "get_file_map_kind",
     "get_file_mtime_indexed",
     "get_file_mtimes",
     "purge_file_records",
@@ -359,13 +360,67 @@ def get_file_map(
     *signatures* adds full signatures (off by default to keep output compact).
     *max_per_kind* limits items per kind; the ``count`` field always shows the
     real total.  Set to 0 for no limit.
+
+    The order ends at ``usr``: two symbols of one kind can start on one
+    line (two variables in one declaration), and ``get_file_map_kind``
+    pages the items of one kind in this same order.
     """
+    rows = _file_map_rows(conn, config_hash, file_path)
+    return _file_map_groups(rows, file_path, signatures, max_per_kind)
+
+
+def get_file_map_kind(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    file_path: str,
+    kind: str,
+    *,
+    signatures: bool = False,
+    limit: int = 30,
+    offset: int = 0,
+) -> dict:
+    """Return one page of the symbols of one *kind* in a file, and their count.
+
+    WHY: ``get_file_map`` shows at most *max_per_kind* items of each kind,
+    and a vendor device header can hold thousands of one kind.  The map
+    gives the count, and this page gives the items after the first ones.
+    The items are flat, enum constants too: a page of one kind needs no
+    second grouping.  *limit* 0 gives every item from *offset* on.
+    """
+    rows = [r for r in _file_map_rows(conn, config_hash, file_path) if r["kind"] == kind]
+    end = None if limit == 0 else offset + limit
+    return {
+        "file": file_path,
+        "kind": kind,
+        "count": len(rows),
+        "items": [_file_map_item(r, signatures) for r in rows[offset:end]],
+    }
+
+
+def _file_map_item(r: sqlite3.Row, signatures: bool) -> dict:
+    """One item of a file map: name, qualified name, line, and what applies of the rest."""
+    entry: dict = {"name": r["name"], "qualified_name": r["qualified_name"], "line": r["line"]}
+    # The SELECT has always read `end_line`, and nothing gave it to the
+    # caller.  A map that gives the start and not the end makes the reader
+    # open the file to find where a symbol stops.  0 means a declaration,
+    # which has no extent, thus the key appears only when it answers.
+    if r["end_line"]:
+        entry["end_line"] = r["end_line"]
+    if signatures and r["signature"]:
+        entry["signature"] = r["signature"]
+    if r["enum_value"] is not None:
+        entry["enum_value"] = r["enum_value"]
+    return entry
+
+
+def _file_map_rows(conn: sqlite3.Connection, config_hash: str, file_path: str) -> list[sqlite3.Row]:
+    """The symbol rows of one file, in the order kind, line, usr."""
     rows = conn.execute(
         """SELECT name, qualified_name, kind, line, col, end_line,
                   is_definition, signature, enum_value
            FROM symbols
            WHERE config_hash = ? AND file_path = ?
-           ORDER BY kind, line""",
+           ORDER BY kind, line, usr""",
         (config_hash, file_path),
     ).fetchall()
 
@@ -387,10 +442,16 @@ def get_file_map(
                       is_definition, signature, enum_value
                FROM symbols
                WHERE config_hash = ? AND (file_path = ? OR file_path LIKE ? ESCAPE '\\')
-               ORDER BY kind, line""",
+               ORDER BY kind, line, usr""",
             (config_hash, file_path, f"%{_escape_like(file_path)}"),
         ).fetchall()
+    return rows
 
+
+def _file_map_groups(
+    rows: list[sqlite3.Row], file_path: str, signatures: bool, max_per_kind: int,
+) -> dict:
+    """Group the symbol *rows* of a file by kind, at most *max_per_kind* items each."""
     groups: dict[str, dict] = {}
     for r in rows:
         kind = r["kind"]
@@ -433,21 +494,7 @@ def get_file_map(
                 subgroups[parent_enum]["constants"].append(entry)
         else:
             if max_per_kind == 0 or len(groups[kind]["items"]) < max_per_kind:
-                entry = {
-                    "name": r["name"],
-                    "qualified_name": r["qualified_name"],
-                    "line": r["line"],
-                }
-                # The SELECT above has always read `end_line`, and nothing
-                # here gave it to the caller.  A map that gives the start
-                # and not the end makes the reader open the file to find
-                # where a symbol stops.  0 means a declaration, which has
-                # no extent, thus the key appears only when it answers.
-                if r["end_line"]:
-                    entry["end_line"] = r["end_line"]
-                if signatures and r["signature"]:
-                    entry["signature"] = r["signature"]
-                groups[kind]["items"].append(entry)
+                groups[kind]["items"].append(_file_map_item(r, signatures))
 
     # Convert enum_constant subgroups from dict to sorted list
     for group in groups.values():

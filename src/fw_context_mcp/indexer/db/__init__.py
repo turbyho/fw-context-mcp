@@ -35,6 +35,7 @@ __all__ = [
     "clean_orphan_embeddings",
     "clean_orphan_embeddings_vec",
     "compute_analysis_coverage",
+    "count_class_members",
     "count_dead_code",
     "count_fp_assignments",
     "count_hotspots",
@@ -82,6 +83,7 @@ __all__ = [
     "get_entry_points_by_config",
     "get_file_hashes",
     "get_file_map",
+    "get_file_map_kind",
     "get_file_mtime_indexed",
     "get_file_mtimes",
     "get_function_address_arrays",
@@ -171,6 +173,7 @@ from ._files import (
     delete_symbols_for_file,
     get_file_hashes,
     get_file_map,
+    get_file_map_kind,
     get_file_mtime_indexed,
     get_file_mtimes,
     purge_file_records,
@@ -184,6 +187,7 @@ from ._fts import (
     rebuild_macros_fts,
 )
 from ._inheritance import (
+    count_class_members,
     count_template_instances,
     delete_inheritance_for_file,
     delete_overrides_for_file,
