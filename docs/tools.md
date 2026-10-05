@@ -1129,8 +1129,11 @@ similarity.
 
 **Pages.** The tool ranks every symbol above `threshold`, as far as one
 KNN query reaches: 4096 vector rows. A symbol of several chunks uses
-several rows. A page is a slice of that order: the multiplied score, then
-the symbol id. `total` counts the whole set. When the KNN query stops at
+several rows. A page is a slice of that order: windows of 200 raw ranks,
+and inside a window the multiplied score, then the symbol id. Thus the
+multiplier moves a symbol only inside its window, and the first page is
+the one that the tool gave before it paged. `total` counts the whole set.
+When the KNN query stops at
 4096 rows and its last row is still above `threshold`, the notice holds
 `total_capped: true`, and `total` is a lower bound. `limit` is the size of
 one page, from 1 to 100. The hint repeats a `threshold` that is not the

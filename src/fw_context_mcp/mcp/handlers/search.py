@@ -708,8 +708,10 @@ async def semantic_search(
 
         Then a list of dicts, each with: name, qualified_name, kind, file, line,
         is_definition, signature, docstring, plus ``_method``
-        (``"embedding"`` or ``"search_code_fallback"``), ranked by the
-        boosted similarity, then by the symbol id.  The reranker (when
+        (``"embedding"`` or ``"search_code_fallback"``), ranked in windows
+        of 200 raw ranks: inside a window by the boosted similarity, then
+        by the symbol id.  Thus the boost moves a symbol only inside its
+        window.  The reranker (when
         ``llm.reranker_model`` is set) reorders the first symbols of a
         page, and moves no symbol to another page.  An ``"embedding"``
         result also holds ``_similarity``, the raw cosine similarity.  A
@@ -849,8 +851,9 @@ async def semantic_search(
             item["_method"] = "embedding"
 
         # The page is a slice of the whole ranked set: every symbol above
-        # the threshold, in the order of the boosted score and the symbol
-        # id.  Thus two pages never overlap or skip.
+        # the threshold, in windows of 200 raw ranks, inside a window by the
+        # boosted score and the symbol id.  Thus two pages never overlap or
+        # skip.
         total = len(symbols)
         page = symbols[skip:skip + limit]
         if not page:

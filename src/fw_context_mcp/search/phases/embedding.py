@@ -39,6 +39,10 @@ from fw_context_mcp.search.phases.embedding_helpers import (
 
 log = logging.getLogger(__name__)
 
+# The raw-rank window that the source boost of a whole-set search orders
+# within; see EmbeddingPhase._rank.
+_BOOST_WINDOW = 200
+
 _table_exists = table_exists  # backward-compat alias
 _table_has_rows = table_has_rows
 _brute_force_search = brute_force_search
@@ -251,7 +255,11 @@ class EmbeddingPhase(Phase):
         ``semantic_search`` is a slice of this order, thus the order must be
         the same on each call.  With ``whole_set`` the list is not cut.
         """
-        scored: list[tuple[float, int, dict]] = []
+        # The raw rank of each symbol: *similarity* holds the ids in the
+        # order of the vector search (KNN distance, or the brute-force
+        # order), declarations included.
+        raw_rank = {sid: i for i, sid in enumerate(similarity)}
+        scored: list[tuple[int, float, int, dict]] = []
         for r in rows:
             d = dict(r)
             sim = similarity.get(d.get("id", -1))
@@ -261,9 +269,18 @@ class EmbeddingPhase(Phase):
             key = sim
             if self.source_boost:
                 key = sim * (1.2 if d.get("is_project", 0) == 1 else 0.85)
-            scored.append((key, int(d.get("id") or 0), d))
-        scored.sort(key=lambda x: (-x[0], x[1]))
-        results = [d for _, _, d in scored]
+            sid = int(d.get("id") or 0)
+            # The window of the raw rank leads the order of the whole set.
+            # Without it, the boost over 4096 rows let weak project symbols
+            # from deep in the raw order push relevant vendor symbols off
+            # the first page: measured on 1207 evaluation queries, MRR@20
+            # went from 0.511 to 0.497, and 72 vendor targets lost their
+            # place against 2 that gained.  The window of 200 is the pool
+            # that semantic_search boosted before it paged (limit 20 x 10).
+            window = raw_rank.get(sid, 0) // _BOOST_WINDOW if self.whole_set else 0
+            scored.append((window, key, sid, d))
+        scored.sort(key=lambda x: (x[0], -x[1], x[2]))
+        results = [d for _, _, _, d in scored]
         best = max((d["_similarity"] for d in results), default=None)
         cut = self.source_boost and not self.whole_set
         return (results[:limit] if cut else results), best

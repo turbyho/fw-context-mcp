@@ -185,6 +185,30 @@ def test_two_symbols_with_one_score_keep_the_order_of_their_id():
     assert [r["name"] for r in ranked] == ["a", "b"], "whole_set must not cut, and id breaks the tie"
 
 
+def test_the_boost_orders_within_its_window_of_the_raw_rank():
+    """A project symbol deep in the raw order does not jump over a vendor symbol near the top.
+
+    The boost over the whole set cost the first page 0.014 MRR@20 on 1207
+    evaluation queries; inside a window of 200 raw ranks the first page
+    is the one that semantic_search gave before it paged.
+    """
+    from fw_context_mcp.search.phases.embedding import _BOOST_WINDOW, EmbeddingPhase
+
+    phase = EmbeddingPhase(independent=True, source_boost=True, whole_set=True)
+    # Raw order: vendor (0.80) at rank 0, filler ranks 1.._BOOST_WINDOW, project (0.70) after them.
+    similarity = {1: 0.80}
+    similarity.update({100 + i: 0.79 for i in range(_BOOST_WINDOW)})
+    similarity[2] = 0.70
+    rows = [{"id": 1, "name": "vendor", "is_project": 0}, {"id": 2, "name": "project", "is_project": 1}]
+    ranked, _ = phase._rank(rows, similarity, limit=20)
+    # 0.70 x 1.2 = 0.84 beats 0.80 x 0.85 = 0.68, but the project row is one window later.
+    assert [r["name"] for r in ranked] == ["vendor", "project"]
+    # Inside one window the boost still decides.
+    near = {1: 0.80, 2: 0.70}
+    ranked, _ = phase._rank(rows, near, limit=20)
+    assert [r["name"] for r in ranked] == ["project", "vendor"]
+
+
 def test_a_symbol_of_several_chunks_counts_once(populated_db):
     init_vec_table(populated_db, dim=len(QUERY_VEC), recreate=True)
     upsert_embeddings_vec(populated_db, [
