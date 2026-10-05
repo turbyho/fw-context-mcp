@@ -42,6 +42,7 @@ log = logging.getLogger(__name__)
 
 _VALID_KINDS = frozenset({"varglobal", "varlocal", "variable", "field"})
 _VAR_KINDS = ("varglobal", "varlocal", "variable", "field")
+_REFS_PER_VARIABLE = 30
 
 
 def find_variables(
@@ -66,9 +67,9 @@ def find_variables(
     (``"<file scope>"`` for globals), and a ``references`` list of the
     functions that read or write the variable — the same ``ref_kind``
     values as ``find_references`` (``"call"``, ``"ref"``, ``"member"``).
-    The list is capped: max 30 per variable, and max 100 over all results,
-    thus a later result can show fewer than it has.  Only definitions are
-    returned, globals first, then by name.
+    The list is capped at 30 per variable, and holds only references of
+    the selected build.  Only definitions are returned, globals first, then
+    by name.
 
     Use when you need to understand shared state, find who modifies a
     global variable, trace side effects, or distinguish important globals
@@ -168,8 +169,8 @@ def find_variables(
             placeholders = ",".join("?" * len(parent_usrs))
             parent_rows = c.execute(
                 f"SELECT usr, name, qualified_name, kind FROM symbols "
-                f"WHERE usr IN ({placeholders})",
-                tuple(parent_usrs),
+                f"WHERE config_hash = ? AND usr IN ({placeholders})",
+                (config_hash, *parent_usrs),
             ).fetchall()
             parents = {r["usr"]: dict(r) for r in parent_rows}
 
@@ -178,30 +179,33 @@ def find_variables(
         refs_map: dict[str, list[dict]] = {}
         if var_usrs:
             placeholders = ",".join("?" * len(var_usrs))
+            # The cap is per variable (ROW_NUMBER over to_usr): one cap over
+            # all variables gave a later variable no reference at all.
             ref_rows = c.execute(
-                f"""SELECT r.to_usr, r.from_file, r.from_line, r.ref_kind,
-                           r.from_usr, c.name AS caller_name,
-                           c.qualified_name AS caller_qname, c.kind AS caller_kind
-                    FROM refs r
-                    LEFT JOIN symbols c ON c.config_hash = r.config_hash
-                        AND c.usr = r.from_usr AND c.is_definition = 1
-                    WHERE r.to_usr IN ({placeholders})
-                    ORDER BY r.from_file, r.from_line
-                    LIMIT 100""",
-                tuple(var_usrs),
+                f"""SELECT * FROM (
+                        SELECT r.to_usr, r.from_file, r.from_line, r.ref_kind,
+                               r.from_usr, c.name AS caller_name,
+                               c.qualified_name AS caller_qname, c.kind AS caller_kind,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY r.to_usr ORDER BY r.from_file, r.from_line
+                               ) AS rn
+                        FROM refs r
+                        LEFT JOIN symbols c ON c.config_hash = r.config_hash
+                            AND c.usr = r.from_usr AND c.is_definition = 1
+                        WHERE r.config_hash = ? AND r.to_usr IN ({placeholders})
+                    )
+                    WHERE rn <= ?
+                    ORDER BY from_file, from_line""",
+                (config_hash, *var_usrs, _REFS_PER_VARIABLE),
             ).fetchall()
             for ref in ref_rows:
                 rdict = dict(ref)
-                usr = rdict["to_usr"]
-                if usr not in refs_map:
-                    refs_map[usr] = []
-                if len(refs_map[usr]) < 30:
-                    refs_map[usr].append({
-                        "function": rdict.get("caller_qname") or rdict.get("caller_name") or "<unknown>",
-                        "file": abs_path(root, rdict["from_file"]),
-                        "line": rdict["from_line"],
-                        "ref_kind": rdict["ref_kind"],
-                    })
+                refs_map.setdefault(rdict["to_usr"], []).append({
+                    "function": rdict.get("caller_qname") or rdict.get("caller_name") or "<unknown>",
+                    "file": abs_path(root, rdict["from_file"]),
+                    "line": rdict["from_line"],
+                    "ref_kind": rdict["ref_kind"],
+                })
 
         results = []
         for row in rows_list:

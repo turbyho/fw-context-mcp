@@ -481,3 +481,75 @@ class TestKindSplit:
         assert count.kind == "varglobal", (
             f"namespace-scope var should be varglobal, got {count.kind}"
         )
+
+
+# ── find_variables handler: one build, a cap per variable ──────────────────
+
+
+class TestFindVariablesHandler:
+    """The real handler, on a database with two builds."""
+
+    def _run(self, tmp_path, conn, name: str) -> list[dict]:
+        from unittest import mock
+
+        from fw_context_mcp.mcp.handlers._base import BaseHandler, DbContext
+        from fw_context_mcp.mcp.handlers.variables import find_variables
+        from fw_context_mcp.mcp.shared.executor import SyncQueryExecutor
+
+        conn.commit()
+        conn.close()
+        db_path = tmp_path / "test.db"
+        db_ctx = DbContext(
+            db_path=db_path,
+            executor=SyncQueryExecutor(str(db_path.resolve()), db_path),
+            config_hash="hash-deadbeef",
+            project_id="proj-001",
+            root=tmp_path,
+            cfg=None,
+        )
+        # The indexed files are not on disk, thus the result is stale; the
+        # test project has no registry entry for the daemon start.
+        with mock.patch.object(BaseHandler, "resolve_db_context", return_value=db_ctx), \
+                mock.patch("fw_context_mcp.mcp.background._ensure_daemon_running"):
+            return [r for r in find_variables(name=name, project_root=str(tmp_path)) if "warning" not in r]
+
+    def test_references_and_parents_come_from_the_selected_build_only(self, tmp_path):
+        conn, chash = _setup_project_db(tmp_path)
+        with transaction(conn):
+            upsert_build_config(conn, "hash-other", "proj-001", str(tmp_path / "other.json"))
+            fid = upsert_file(conn, chash, "src/a.c", "c")
+            other_fid = upsert_file(conn, "hash-other", "src/a.c", "c")
+            _insert_symbol(conn, chash, fid, "src/a.c", usr="c:@F@run", name="run", kind="function")
+            _insert_symbol(conn, chash, fid, "src/a.c", usr="c:a.c@F@run@counter",
+                           name="counter", kind="varlocal", parent_usr="c:@F@run")
+            # The other build names the same USR as the parent with another kind.
+            _insert_symbol(conn, "hash-other", other_fid, "src/a.c", usr="c:@F@run",
+                           name="Run", kind="struct")
+            insert_refs_batch(conn, [
+                (chash, "c:a.c@F@run@counter", "src/a.c", 5, "c:@F@run", "ref", None),
+                ("hash-other", "c:a.c@F@run@counter", "src/a.c", 99, "c:@F@run", "ref", None),
+            ])
+
+        results = self._run(tmp_path, conn, "counter")
+
+        assert len(results) == 1, results
+        assert [r["line"] for r in results[0]["references"]] == [5]
+        assert results[0]["enclosing_function"] == "run"
+        assert results[0]["enclosing_class"] == ""
+
+    def test_each_variable_keeps_its_own_references(self, tmp_path):
+        conn, chash = _setup_project_db(tmp_path)
+        with transaction(conn):
+            fid = upsert_file(conn, chash, "src/a.c", "c")
+            _insert_symbol(conn, chash, fid, "src/a.c", usr="c:@F@f", name="f", kind="function")
+            _insert_symbol(conn, chash, fid, "src/a.c", usr="c:@g_a", name="g_a", kind="varglobal")
+            _insert_symbol(conn, chash, fid, "src/a.c", usr="c:@g_b", name="g_b", kind="varglobal")
+            # g_a has 150 references, all before the one of g_b in file order.
+            insert_refs_batch(conn, [
+                (chash, "c:@g_a", "src/a.c", line, "c:@F@f", "ref", None) for line in range(1, 151)
+            ] + [(chash, "c:@g_b", "src/z.c", 1, "c:@F@f", "ref", None)])
+
+        results = {r["name"]: r for r in self._run(tmp_path, conn, "g_")}
+
+        assert len(results["g_a"]["references"]) == 30
+        assert len(results["g_b"]["references"]) == 1
