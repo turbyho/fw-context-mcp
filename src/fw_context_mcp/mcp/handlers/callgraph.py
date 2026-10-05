@@ -1102,6 +1102,14 @@ def find_call_path(
         When no path exists within the depth limit, the list holds one
         ``info`` dict.
 
+        The number of paths cannot be counted, thus this tool has no page
+        notice and no ``offset``.  A trailing ``info`` dict says when paths
+        can be left out: the search found 5 paths and stopped, it spent
+        its budget of node expansions, or a direct call answered and the
+        longer paths were not searched.  After a spent budget an empty
+        answer says that a path can still exist, and NOT "no path".  The
+        paths come in a fixed order: the same query gives the same paths.
+
         When *to_name* matches more than one symbol, the search reaches
         all of them.  A ``warning`` dict then comes first and names the
         symbols, and each path carries ``target_qualified_name`` next to
@@ -1127,9 +1135,30 @@ def find_call_path(
             return [{"error": f"Symbol not found: {from_name}"}]
         if _lookup_definition(conn, config_hash, to_name, preferred_kinds=None) is None:
             return [{"error": f"Symbol not found: {to_name}"}]
-        rows = index_db.find_call_path(conn, config_hash, from_name, to_name, max_depth=max_depth)
+        rows, outcome = index_db.search_call_paths(
+            conn, config_hash, from_name, to_name, max_depth=max_depth,
+        )
+        # The number of paths cannot be counted, thus this tool gives no
+        # page notice.  It says instead why the search stopped, when that
+        # leaves paths unseen: a full list of paths, or a spent budget.
+        if outcome == index_db.CALL_PATHS_BUDGET:
+            budget = (
+                "The search stopped at its budget of node expansions before it "
+                "reached every node within the depth."
+            )
+            if not rows:
+                return [{"info": f"No path found from '{from_name}' to '{to_name}' yet. "
+                                 f"{budget} A path can still exist: name a closer "
+                                 f"start or target, or check with find_callers."}]
+            return [*rows, {"info": f"{budget} More paths can exist."}]
         if not rows:
             return [{"info": f"No path found from '{from_name}' to '{to_name}' within depth {max_depth}."}]
+        if outcome == index_db.CALL_PATHS_CAPPED:
+            return [*rows, {"info": f"The answer holds the first {sum(1 for r in rows if 'chain' in r)} paths that "
+                                    "the search found. More paths can exist."}]
+        if outcome == index_db.CALL_PATHS_DIRECT:
+            return [*rows, {"info": f"'{from_name}' calls '{to_name}' directly. Longer paths "
+                                    "were not searched."}]
         return rows
 
     return db.execute_scoped(_query)
@@ -1763,6 +1792,11 @@ def trace_data_flow(
         past it.  To check it, call again with the same ``offset``: each
         page gets the whole time budget.
 
+        A source entry with ``budget_spent: True`` means that the path
+        search of that source spent its budget of node expansions.  Its
+        ``reachable: False`` thus means "not found", not "proved
+        unreachable".
+
         A page after the last source function gives one ``info`` dict
         that names the total.  Never empty: one dict with ``error`` or
         ``info`` replaces an empty result.  Check both keys first.
@@ -1843,7 +1877,7 @@ def trace_data_flow(
                     "timed_out": True,
                 })
                 continue
-            paths = index_db.find_call_path(
+            paths, outcome = index_db.search_call_paths(
                 conn, config_hash, src["qualified_name"], to_symbol, max_depth=max_depth,
             )
             entry = {
@@ -1866,6 +1900,10 @@ def trace_data_flow(
                 entry["paths"] = paths[:3]
             else:
                 entry["reachable"] = False
+                if outcome == index_db.CALL_PATHS_BUDGET:
+                    # The walk spent its node budget: no path found is NOT
+                    # proof that no path exists.
+                    entry["budget_spent"] = True
             results.append(entry)
 
         num_reachable = sum(1 for r in results if r.get("reachable"))

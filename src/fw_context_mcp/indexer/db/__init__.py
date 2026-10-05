@@ -24,6 +24,10 @@ testable in isolation and reducing merge conflicts in team workflows.
 from __future__ import annotations
 
 __all__ = [
+    "CALL_PATHS_BUDGET",
+    "CALL_PATHS_CAPPED",
+    "CALL_PATHS_COMPLETE",
+    "CALL_PATHS_DIRECT",
     "CURRENT_ROW_FORMAT",
     "CURRENT_SCHEMA_VERSION",
     "DatabaseCorruptionError",
@@ -117,6 +121,7 @@ __all__ = [
     "row_format_effect",
     "row_format_is_newer",
     "row_format_is_older",
+    "search_call_paths",
     "search_similar_hybrid",
     "search_similar_vec",
     "search_similar_vec_all",
@@ -137,6 +142,10 @@ __all__ = [
 import logging
 
 from ._callgraph import (
+    CALL_PATHS_BUDGET,
+    CALL_PATHS_CAPPED,
+    CALL_PATHS_COMPLETE,
+    CALL_PATHS_DIRECT,
     count_dead_code,
     count_hotspots,
     find_all_callers_recursive,
@@ -147,6 +156,7 @@ from ._callgraph import (
     get_function_address_arrays,
     get_table_coverage,
     get_vector_table,
+    search_call_paths,
     walk_recursive,
 )
 from ._connection import (

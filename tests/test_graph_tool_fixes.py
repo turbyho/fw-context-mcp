@@ -129,7 +129,9 @@ def test_the_ambiguity_warning_takes_no_path_slot(db, tmp_path):
     paths = [{"warning": "'uart_send' matches 2 symbols"}] + [
         {"depth": 1, "chain": f"pack → uart_send#{i}", "target_usr": f"u{i}"} for i in range(4)
     ]
-    with _handler_db(tmp_path), mock.patch.object(callgraph.index_db, "find_call_path", return_value=paths):
+    with _handler_db(tmp_path), mock.patch.object(
+        callgraph.index_db, "search_call_paths", return_value=(paths, "complete"),
+    ):
         rows = _without_stale_warning(callgraph.trace_data_flow(
             type_name="SensorData", to_symbol="uart_send", project_root=str(tmp_path),
         ))

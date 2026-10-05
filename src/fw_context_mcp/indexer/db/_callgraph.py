@@ -82,12 +82,17 @@ from ._resolve import (
 log = logging.getLogger(__name__)
 
 __all__ = [
+    "CALL_PATHS_BUDGET",
+    "CALL_PATHS_CAPPED",
+    "CALL_PATHS_COMPLETE",
+    "CALL_PATHS_DIRECT",
     "find_all_callers_recursive",
     "find_call_path",
     "find_callees_recursive",
     "find_dead_code",
     "find_hotspots",
     "get_vector_table",
+    "search_call_paths",
     "walk_recursive",
 ]
 
@@ -358,7 +363,40 @@ def find_call_path(
     max_depth: int = 10,
     max_nodes: int = 5000,
 ) -> list[dict]:
+    """Find call paths from *from_name* to *to_name*; see ``search_call_paths``."""
+    paths, _outcome = search_call_paths(
+        conn, config_hash, from_name, to_name, max_depth=max_depth, max_nodes=max_nodes,
+    )
+    return paths
+
+
+#: Why a search of ``search_call_paths`` stopped.
+CALL_PATHS_COMPLETE = "complete"        # the depth bound, or no node was left
+CALL_PATHS_CAPPED = "path_cap"          # _MAX_CALL_PATHS paths were found
+CALL_PATHS_BUDGET = "node_budget"       # max_nodes expansions were spent, work was left
+CALL_PATHS_DIRECT = "direct_only"       # direct calls answered; longer paths not searched
+
+
+def search_call_paths(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    from_name: str,
+    to_name: str,
+    max_depth: int = 10,
+    max_nodes: int = 5000,
+) -> tuple[list[dict], str]:
     """Find call paths from *from_name* to *to_name* via bidirectional BFS.
+
+    The second value tells why the search stopped (``CALL_PATHS_*``).  A
+    caller needs it: an empty answer after the node budget is no proof
+    that no path exists, and a full list of paths is no proof that there
+    are no more.  The number of paths cannot be counted (it grows
+    exponentially), thus this tool reports the reason and not a total.
+
+    The walk is deterministic: the edges of a node come in USR order and
+    the seeds are sorted, thus one query gives the same paths on each
+    call.  Before, the order of a Python set of USR strings decided it,
+    and that order changes with the hash seed of each process.
 
     Uses Python BFS with cycle detection instead of a SQL recursive CTE.
     The refs table can contain 1M+ edges — a recursive CTE over that many
@@ -392,7 +430,8 @@ def find_call_path(
 
     Returns:
         Up to 5 paths, each with ``depth`` (edge count), ``chain``
-        (``A → B → C`` string), and ``target_usr``.
+        (``A → B → C`` string), and ``target_usr``; and the reason the
+        search stopped.
     """
     # Edges from ANY USR of from_name are valid, thus every variant of the
     # best match seeds the forward BFS.  The ranked resolver keeps the TU
@@ -401,7 +440,7 @@ def find_call_path(
     from_usrs, _from_names = _resolve_target_usrs(conn, config_hash, from_name)
     to_usrs, to_names = _resolve_target_usrs(conn, config_hash, to_name)
     if not from_usrs or not to_usrs:
-        return []
+        return [], CALL_PATHS_COMPLETE
     # Counted once here, because four returns below build the same notice
     # and they must all report the same number.
     to_total = _matched_total(conn, config_hash, to_name, to_usrs)
@@ -458,7 +497,8 @@ def find_call_path(
                        FROM refs r
                        WHERE r.config_hash = ? AND r.from_usr = ?
                          AND r.ref_kind IN ('call', 'indirect', 'implicit_construct', 'dispatch')
-                       GROUP BY r.to_usr""",
+                       GROUP BY r.to_usr
+                       ORDER BY r.to_usr""",
                     (config_hash, usr),
                 ).fetchall()
                 _edge_cache[usr] = [(r["to_usr"], r["callee_name"]) for r in rows]
@@ -485,7 +525,8 @@ def find_call_path(
                        WHERE r.config_hash = ? AND r.to_usr = ?
                          AND r.from_usr IS NOT NULL
                          AND r.ref_kind IN ('call', 'indirect', 'implicit_construct', 'dispatch')
-                       GROUP BY r.from_usr""",
+                       GROUP BY r.from_usr
+                       ORDER BY r.from_usr""",
                     (config_hash, usr),
                 ).fetchall()
                 _in_edge_cache[usr] = [(r["from_usr"], r["caller_name"]) for r in rows]
@@ -498,7 +539,7 @@ def find_call_path(
         """Return all outgoing edges from ANY of the given USRs."""
         edges: list[tuple[str, str]] = []
         seen: set[str] = set()
-        for u in usrs:
+        for u in sorted(usrs):
             for to_usr, name in _get_edges(u):
                 if to_usr not in seen:
                     seen.add(to_usr)
@@ -561,7 +602,10 @@ def find_call_path(
         ):
             break
     if direct:
-        return _paths_with_targets(direct, to_name, to_usrs, to_names, to_total)
+        # The fast path gives the shortest paths only: it does not search
+        # the longer ones, thus it is never COMPLETE.
+        outcome = CALL_PATHS_CAPPED if len(direct) >= _MAX_CALL_PATHS else CALL_PATHS_DIRECT
+        return _paths_with_targets(direct, to_name, to_usrs, to_names, to_total), outcome
 
     # ── Bidirectional BFS — expands forward from source AND reverse from target
     # simultaneously.  Halves the effective search depth (O(b^(d/2)) vs O(b^d))
@@ -578,7 +622,7 @@ def find_call_path(
     r_target: dict[str, str] = {}
 
     # Seed forward: all USR variants of from_name
-    for u in _from_variants:
+    for u in sorted(_from_variants):
         if u not in f_dist:
             f_dist[u] = 0
             f_chain[u] = _get_name(u) if u != from_usr else from_name_resolved
@@ -617,7 +661,7 @@ def find_call_path(
                     chain = f_chain[v] if not tail else f"{f_chain[v]} → {tail}"
                     if _record_path(found, seen_chains, total_depth, chain, r_target[v]):
                         return _paths_with_targets(
-                            found, to_name, to_usrs, to_names, to_total)
+                            found, to_name, to_usrs, to_names, to_total), CALL_PATHS_CAPPED
 
         # ── Expand reverse (incoming edges) ──
         for _ in range(len(r_queue)):
@@ -638,9 +682,14 @@ def find_call_path(
                     chain = f_chain[v] if not tail else f"{f_chain[v]} → {tail}"
                     if _record_path(found, seen_chains, total_depth, chain, r_target[v]):
                         return _paths_with_targets(
-                            found, to_name, to_usrs, to_names, to_total)
+                            found, to_name, to_usrs, to_names, to_total), CALL_PATHS_CAPPED
 
-    return _paths_with_targets(found, to_name, to_usrs, to_names, to_total)
+    # The budget stopped the search only when work was left: both fronts
+    # still had nodes and the depth bound was not reached.  A level always
+    # runs to its end, thus the count can pass max_nodes on the last level.
+    budget_spent = bool(f_queue and r_queue) and depth < max_depth and nodes_expanded >= max_nodes
+    outcome = CALL_PATHS_BUDGET if budget_spent else CALL_PATHS_COMPLETE
+    return _paths_with_targets(found, to_name, to_usrs, to_names, to_total), outcome
 
 
 

@@ -76,6 +76,7 @@ def test_both_meeting_points_go_through_the_helper():
 
     from fw_context_mcp.indexer.db import _callgraph
 
-    source = inspect.getsource(_callgraph.find_call_path)
+    # The walk lives in search_call_paths; find_call_path wraps it.
+    source = inspect.getsource(_callgraph.search_call_paths)
     assert source.count("_record_path(found, seen_chains") == 2
     assert 'found.append({"depth"' not in source
