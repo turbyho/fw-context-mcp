@@ -429,10 +429,16 @@ def _find_fn_refs_in_expr(
     cursor: cx.Cursor,
     _skip_usr: str | None = None,
     _depth: int = 0,
+    expected: cx.Type | None = None,
 ) -> list[cx.Cursor]:
     """Recursively extract function/method declarations referenced inside an expression.
 
     Depth-limited to prevent stack overflow on deeply nested C++ expressions.
+
+    *expected* is the type of the storage that receives the function, when
+    the caller knows it.  It picks one function out of an overload set
+    (see ``_resolve_overload_set``).  It does not reach the arguments of a
+    nested call: they go to the parameters of that call.
     """
     _FN_REF_MAX_DEPTH = 500
     if _depth > _FN_REF_MAX_DEPTH:
@@ -444,6 +450,16 @@ def _find_fn_refs_in_expr(
     # Direct reference to a callable (bare function name, method ref, etc.)
     if cursor.kind in (cx.CursorKind.DECL_REF_EXPR, cx.CursorKind.MEMBER_REF_EXPR):
         ref = cursor.referenced
+        if ref is not None and ref.kind == cx.CursorKind.OVERLOADED_DECL_REF:
+            # Only with a storage type: without one, the set is the callee
+            # of a dependent call in a template (``h(x)``), and a pick
+            # would turn a direct call into an indirect reference.
+            if expected is None:
+                return results
+            for target in _resolve_overload_set(ref, expected):
+                if not (_skip_usr and target.get_usr() == _skip_usr) and target.location.file:
+                    results.append(target)
+            return results
         if ref is not None and ref.kind in _INDIRECT_TARGET_KINDS:
             # Skip if this is the callee of the enclosing function call
             if _skip_usr and ref.get_usr() == _skip_usr:
@@ -456,7 +472,7 @@ def _find_fn_refs_in_expr(
     # Address-of operator (&) — peel and recurse into the operand
     if cursor.kind == cx.CursorKind.UNARY_OPERATOR:
         for child in cursor.get_children():
-            results.extend(_find_fn_refs_in_expr(child, _skip_usr, _depth + 1))
+            results.extend(_find_fn_refs_in_expr(child, _skip_usr, _depth + 1, expected))
         return results
 
     # Nested call expression — e.g. callback(&Class::method, this).
@@ -483,8 +499,11 @@ def _find_fn_refs_in_expr(
         return results
 
     # Default: recurse into all children (handles implicit casts, parentheses, etc.)
+    # The body of a lambda is code of its own: the storage type of the
+    # element does not reach it.
+    inner_expected = None if cursor.kind == cx.CursorKind.LAMBDA_EXPR else expected
     for child in cursor.get_children():
-        results.extend(_find_fn_refs_in_expr(child, _skip_usr, _depth + 1))
+        results.extend(_find_fn_refs_in_expr(child, _skip_usr, _depth + 1, inner_expected))
 
     return results
 
@@ -944,12 +963,14 @@ def _emit_fn_ptr_targets(
     qn_to_usr: dict[str, str] | None = None,
     slot_index: int | None = None,
     lhs_type: str = "",
+    expected_type: cx.Type | None = None,
 ) -> None:
     """Emit indirect refs and FnPointerAssignment records for function pointer assignments.
 
     *lhs_type* is the type of the storage when the caller already knows
     it (``_init_list_element_field``); without it the type is read from
-    the child of *expr_cursor* that names *lhs_name*.
+    the child of *expr_cursor* that names *lhs_name*.  *expected_type* is
+    that storage type as a libclang type, for an overload set.
 
     *slot_index* is the position of *expr_cursor* inside a positional init
     list, and reaches the stored reference unchanged.  Only the init-list
@@ -995,7 +1016,7 @@ def _emit_fn_ptr_targets(
         scanned = list(expr_cursor.get_children())
 
     for child in scanned:
-        targets = _find_fn_refs_in_expr(child, skip_usr)
+        targets = _find_fn_refs_in_expr(child, skip_usr, expected=expected_type)
         if not targets:
             continue
         for target in targets:
@@ -1045,7 +1066,7 @@ def _emit_fn_ptr_targets(
     if qn_to_usr is not None:
         any_found = False
         for child in scanned:
-            if _find_fn_refs_in_expr(child, skip_usr):
+            if _find_fn_refs_in_expr(child, skip_usr, expected=expected_type):
                 any_found = True
                 break
         if not any_found:
@@ -2116,12 +2137,93 @@ def _field_type_spelling(field_ref: cx.Cursor) -> str:
         return ""
 
 
-def _init_list_element_field(element: cx.Cursor) -> tuple[str | None, str, str]:
-    """The field that one element of an INIT_LIST_EXPR assigns: (USR, name, type).
+def _storage_type(type_: cx.Type) -> cx.Type | None:
+    """The type of one function pointer that *type_* stores, or None.
 
-    Gives ``(None, "", "")`` when the element assigns no function to a
-    field of this list.  The type is ``""`` when the caller must read it
-    from the element, as before.
+    The array levels come off (``cb_t[4]`` stores ``cb_t``).  A type that
+    does not end in a pointer to a function gives None: a struct list has
+    no single storage type.
+    """
+    try:
+        storage = _strip_arrays(type_)
+        canonical = storage.get_canonical()
+    except (ValueError, TypeError, RuntimeError, AttributeError):
+        return None
+    if canonical.kind in (cx.TypeKind.POINTER, cx.TypeKind.MEMBERPOINTER):
+        return storage
+    return None
+
+
+def _resolve_overload_set(overload_ref: cx.Cursor, expected: cx.Type) -> list[cx.Cursor]:
+    """Pick the function that an overloaded name gives to *expected*.
+
+    WHY: in an init list, libclang gives the syntactic form of the
+    element.  ``static cb_t table[] = { ov, tf<int> };`` comes as a
+    DECL_REF_EXPR to an OVERLOADED_DECL_REF, the overload set, and not to
+    the function that the conversion chose, as it does for ``gcb = ov``.
+    A C++ table of overloaded or template handlers thus gave no indirect
+    reference and no slot.
+
+    The choice repeats what the compiler did, as far as it is certain:
+
+    * The function whose type is the type that *expected* points to,
+      when there is exactly one.  A plain pointer takes a free function or
+      a static method; a member pointer takes a non-static method.  A
+      ``noexcept`` function also goes into a pointer without
+      ``noexcept``, when no exact match exists.
+    * Else the one function template, when the set holds no function:
+      ``tf<int>`` gives the template, because an implicit specialization
+      is no symbol of the index.
+    * Else the only member of the set.
+
+    Anything else gives no target: a wrong edge in the call graph is
+    worse than a missing one.
+    """
+    lib = cx.conf.lib
+    try:
+        count = int(lib.clang_getNumOverloadedDecls(overload_ref))
+        decls = [lib.clang_getOverloadedDecl(overload_ref, i) for i in range(count)]
+    except (ValueError, TypeError, RuntimeError, AttributeError, ctypes.ArgumentError):
+        return []
+    decls = [d for d in decls if d is not None and d.kind in _INDIRECT_TARGET_KINDS]
+    functions = [d for d in decls if d.kind != cx.CursorKind.FUNCTION_TEMPLATE]
+    templates = [d for d in decls if d.kind == cx.CursorKind.FUNCTION_TEMPLATE]
+    try:
+        canonical = expected.get_canonical()
+        member = canonical.kind == cx.TypeKind.MEMBERPOINTER
+        wanted = canonical.get_pointee().get_canonical().spelling
+        fitting = [
+            f for f in functions
+            if (f.kind == cx.CursorKind.CXX_METHOD and not f.is_static_method()) == member
+        ]
+        spellings = {id(f): f.type.get_canonical().spelling for f in fitting}
+    except (ValueError, TypeError, RuntimeError, AttributeError):
+        fitting, spellings, wanted = [], {}, ""
+    for same in (
+        lambda text: text == wanted,
+        lambda text: text.replace(" noexcept", "") == wanted,
+    ):
+        matching = [f for f in fitting if same(spellings[id(f)])]
+        if len(matching) == 1:
+            return matching
+        if matching:
+            break
+    if not functions and len(templates) == 1:
+        return templates
+    if len(decls) == 1:
+        return decls
+    return []
+
+
+def _init_list_element_field(
+    element: cx.Cursor,
+) -> tuple[str | None, str, str, cx.Type | None]:
+    """The field that one element of an INIT_LIST_EXPR assigns: (USR, name, type, storage).
+
+    Gives ``(None, "", "", None)`` when the element assigns no function to
+    a field of this list.  The type is ``""`` when the caller must read it
+    from the element, as before.  *storage* is the type of one element of
+    the field, for an overload set; None when it is not known.
 
     libclang gives a designated element as an UNEXPOSED_EXPR whose children
     are the designators (MEMBER_REF, or an index for ``[n] =``), and then
@@ -2145,20 +2247,20 @@ def _init_list_element_field(element: cx.Cursor) -> tuple[str | None, str, str]:
     An element that is neither of the two keeps the old reading.
     """
     if _holds_nested_list(element):
-        return (None, "", "")
+        return (None, "", "", None)
     children = list(element.get_children())
     if len(children) >= 2:
         if _holds_nested_list(children[-1]):
-            return (None, "", "")
+            return (None, "", "", None)
         designators = children[:-1]
         member_at = [i for i, c in enumerate(designators) if c.kind == cx.CursorKind.MEMBER_REF]
         if member_at:
             last = member_at[-1]
             ref = designators[last].referenced
             if ref is not None and ref.kind == cx.CursorKind.FIELD_DECL:
-                return (ref.get_usr(), ref.spelling, _field_type_spelling(ref))
+                return (ref.get_usr(), ref.spelling, _field_type_spelling(ref), _storage_type(ref.type))
     usr, name = _extract_lhs_field(element)
-    return (usr, name, "")
+    return (usr, name, "", None)
 
 
 def _handle_fn_ptr_cases(cursor: cx.Cursor, cur_fn: str | None,
@@ -2205,11 +2307,14 @@ def _handle_fn_ptr_cases(cursor: cx.Cursor, cur_fn: str | None,
         # counter is the slot number.  A hole keeps its child (`{ a, 0, c }`
         # has three), which is what keeps the count aligned with the array.
         gives_slots = _init_list_gives_slots(cursor)
+        # The element type of an array list: the storage of each element
+        # that names no field.
+        array_storage = _storage_type(cursor.type)
         for position, child in enumerate(cursor.get_children()):
-            child_usr, child_name, child_type = _init_list_element_field(child)
+            child_usr, child_name, child_type, storage = _init_list_element_field(child)
             _emit_fn_ptr_targets(child, cur_fn, seen_ref, refs, fp_assignments,
                                  lhs_usr=child_usr, lhs_name=child_name, method="init_list",
-                                 lhs_type=child_type,
+                                 lhs_type=child_type, expected_type=storage or array_storage,
                                  slot_index=position if gives_slots else None)
 
 
