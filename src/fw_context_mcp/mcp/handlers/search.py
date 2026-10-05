@@ -790,8 +790,12 @@ async def semantic_search(
         # holds a relevant match at all.  The source boost orders and cuts
         # the rows in the embedding phase, and the reranker and the limit
         # cut them here, thus each of them can drop that match.  The phase
-        # keeps the best raw score from before its cut; ``matched`` is the
-        # alternative when no standalone search set it.
+        # keeps the best raw score from before its cut.  The semantic
+        # pipeline runs the standalone search, which sets that score for
+        # each answer that holds a row.  ``matched`` is for the hybrid
+        # re-rank path of EmbeddingPhase, which gives rows and no score:
+        # a change of the pipeline then gives a floor over the rows that
+        # remain, and not a crash on None.
         _RELEVANCE_FLOOR = 0.68
         if ctx.embedding_best_similarity is not None:
             best_score = ctx.embedding_best_similarity
