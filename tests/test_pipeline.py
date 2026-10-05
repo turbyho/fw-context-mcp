@@ -170,10 +170,18 @@ class TestPipelineConfig:
         assert any(isinstance(p, Phase) for p in cfg.phases)
 
     def test_semantic_search_uses_params(self) -> None:
+        from fw_context_mcp.search.phases.embedding import EmbeddingPhase
+        from fw_context_mcp.search.phases.format import FormatPhase
+
         cfg = _build_semantic_search(threshold=0.7, overfetch=60)
-        # Should have an EmbeddingPhase instance and format
         assert len(cfg.phases) == 2
-        assert cfg.phases[1] == "format"
+        embedding, fmt = cfg.phases
+        assert isinstance(embedding, EmbeddingPhase)
+        assert (embedding.threshold, embedding.overfetch, embedding.source_boost) == (0.7, 60, True)
+        # The handler reads `_similarity` for its relevance floor, thus the
+        # format phase of this pipeline must keep the field.
+        assert isinstance(fmt, FormatPhase)
+        assert fmt.keep_similarity is True
 
 
 # ── PipelineRunner ──────────────────────────────────────────────────────────

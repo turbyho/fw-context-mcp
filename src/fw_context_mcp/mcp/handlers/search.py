@@ -595,8 +595,9 @@ async def semantic_search(
     **Source-aware ranking:** the similarity of a project symbol is
     multiplied by 1.2, and the similarity of every other symbol by 0.85.
     The index marks each file as project code or not, thus the two tiers
-    are all there are.  The multiplied score sets the order; the result
-    does not show it.  ``threshold`` applies to the raw cosine similarity.
+    are all there are.  The multiplied score sets the order.
+    ``_similarity`` in the result holds the raw cosine similarity, thus it
+    is on the same scale as ``threshold`` and never above 1.0.
 
     **Requires** ``[llm] enabled = true``, embeddings in the index, and
     for an Ollama embedding model a running Ollama server at
@@ -616,15 +617,20 @@ async def semantic_search(
                Be specific — 5–15 words works best.
         project_root: Project root. Auto-detected if omitted.
         threshold: Minimum cosine similarity (0.0-1.0). Default 0.60.
+            The tool applies it to the raw cosine similarity, before the
+            source boost.
         limit: Maximum number of results (default 20, max 100).  The
             embedding search holds it at 5 or more.
 
     Returns:
         list of dicts, each with: name, qualified_name, kind, file, line,
-        is_definition, signature, docstring, ranked by similarity (or by
-        the reranker).  A symbol also holds ``summary``, ``inputs`` and
-        ``outputs`` when ``fw-context index --analyze`` wrote them — model
-        text, never a fact to quote — and ``_rerank_score`` when
+        is_definition, signature, docstring, plus ``_method``
+        (``"embedding"`` or ``"search_code_fallback"``), ranked by the
+        boosted similarity (or by the reranker).  An ``"embedding"``
+        result also holds ``_similarity``, the raw cosine similarity.  A
+        symbol also holds ``summary``, ``inputs`` and ``outputs`` when
+        ``fw-context index --analyze`` wrote them — model text, never a
+        fact to quote — and ``_rerank_score`` when
         ``llm.reranker_model`` is set.
 
         When compile_commands.json changed after the last index run, a
@@ -640,11 +646,13 @@ async def semantic_search(
         lexical search finds nothing too, the answer is one ``warning``.
 
         No match above ``threshold`` runs the same lexical fallback, with a
-        ``warning`` that suggests a lower threshold.  When the best raw
-        similarity of all matches is below 0.68, the answer is one dict: a
-        ``warning`` that the matches are likely unrelated,
+        ``warning`` that suggests a lower threshold.  When a phase of the
+        search failed, that ``warning`` gives the error of the phase.  When
+        the best raw similarity of all matches is below 0.68, the answer is
+        one dict: a ``warning`` that the matches are likely unrelated,
         ``_fallback_suggestion: "search_code"``, ``_best_similarity``, and
         the matches in ``_results``.
+
         One dict with ``error`` means the query failed — check that key
         first.
     """
@@ -729,14 +737,27 @@ async def semantic_search(
             )
 
         # The symbols, not ``results``: FormatPhase always adds a dict, an
-        # ``info`` when nothing matched, and it drops ``_similarity``.
+        # ``info`` when nothing matched.  The reranker below changes only
+        # ``results``, thus ``matched`` keeps every match for the floor.
         matched = list(ctx.final_results)
         if not matched:
-            return _fallback_to_search_code(
-                root, db_path, query, limit,
-                warning=f"No symbols matched with similarity > {threshold}. "
-                        "Try lowering the threshold or rephrasing the query.",
-            )
+            # The runner records a failed phase in ctx.warnings and goes on,
+            # thus an empty result can come from an error.  Give that error
+            # as the reason, not the threshold.
+            if ctx.warnings:
+                no_match_reason = "; ".join(ctx.warnings)
+            else:
+                no_match_reason = (
+                    f"No symbols matched with similarity > {threshold}. "
+                    "Try lowering the threshold or rephrasing the query."
+                )
+            return _fallback_to_search_code(root, db_path, query, limit, warning=no_match_reason)
+
+        # `_method` tells a result of this path from a result of the
+        # search_code fallback, which sets "search_code_fallback".
+        for item in results:
+            if "name" in item:
+                item["_method"] = "embedding"
 
         # Apply reranker when configured
         # Apply LLM-based reranker when configured.

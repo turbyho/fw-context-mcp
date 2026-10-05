@@ -1056,7 +1056,7 @@ Input:  {"query": "parcel locker state machine", "project_root?": "/path/to/proj
 Output: [{"name": "set_shipment", "qualified_name": "Locker::set_shipment",
           "kind": "method", "file": "/path/src/locker.cpp", "line": 118,
           "is_definition": true, "signature": "void set_shipment(int id)",
-          "docstring": ""}, …]
+          "docstring": "", "_method": "embedding", "_similarity": 0.8123}, …]
 ```
 
 Uses cosine similarity over variable-dimension embeddings (generated during
@@ -1067,13 +1067,15 @@ do not match. **When to prefer `search_code`:** known keywords or symbol
 names (`"fram_write"`, `"cbor encode"`).
 
 Each symbol holds `name`, `qualified_name`, `kind`, `file`, `line`,
-`is_definition`, `signature`, and `docstring`. It also holds `summary`,
+`is_definition`, `signature`, `docstring`, and `_method` (`"embedding"` or
+`"search_code_fallback"`). An `"embedding"` result also holds
+`_similarity`, the raw cosine similarity. A symbol also holds `summary`,
 `inputs`, and `outputs` when `fw-context index --analyze` wrote them (model
 text, not a fact), and `_rerank_score` when `llm.reranker_model` is set.
-The result does not show the similarity score. Source-aware ranking
-multiplies the similarity of project code by 1.2 and of all other code by
-0.85. The multiplied score sets the order. `threshold` applies to the raw
-cosine similarity.
+Source-aware ranking multiplies the similarity of project code by 1.2 and
+of all other code by 0.85. The multiplied score sets the order, and
+`_similarity` does not show it. `threshold` applies to the raw cosine
+similarity.
 
 **Relevance floor.** When the best raw cosine similarity of all matches is
 below 0.68, the result is one dict: a `warning` that the matches are likely
@@ -1082,9 +1084,10 @@ the matches in `_results`.
 
 When the embedding search finds no match above `threshold`, the tool runs
 the lexical fallback below, with a `warning` that suggests a lower
-threshold. One dict with `error` means that the query failed. When
-compile_commands.json changed after the last index run, a trailing dict
-holds a `warning` and a `hint`.
+threshold. When a phase of the search failed, that `warning` gives the
+error of the phase. One dict with `error` means that the query failed.
+When compile_commands.json changed after the last index run, a trailing
+dict holds a `warning` and a `hint`.
 
 **Threshold guidance** (mxbai-embed-large):
 - `0.50` — exploratory, more results

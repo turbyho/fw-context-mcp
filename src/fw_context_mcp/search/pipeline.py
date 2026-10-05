@@ -205,9 +205,14 @@ def _build_semantic_search(threshold: float, overfetch: int) -> PipelineConfig:
         project-owned symbols rank higher than framework code in semantic
         search results, matching user expectations.
 
+    Why ``keep_similarity=True``?
+        semantic_search gives the raw cosine similarity of each result in
+        ``_similarity``.  The default format drops the field.
+
     Standalone embedding with source boosting for project-code ranking.
     """
     from fw_context_mcp.search.phases.embedding import EmbeddingPhase
+    from fw_context_mcp.search.phases.format import FormatPhase
 
     return PipelineConfig(
         phases=[
@@ -217,7 +222,7 @@ def _build_semantic_search(threshold: float, overfetch: int) -> PipelineConfig:
                 overfetch=overfetch,
                 source_boost=True,
             ),
-            "format",
+            FormatPhase(keep_similarity=True),
         ],
     )
 
