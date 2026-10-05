@@ -78,7 +78,13 @@ class SmartSearchCache:
             self._answer = answer
 
     def clear(self) -> None:
-        """Empty the slot.  For tests: the server never clears it."""
+        """Empty the slot.
+
+        The server calls it in one case only: a new search (offset 0) that
+        passes the timeout.  Its partial answer is not stored, and the
+        older answer must not serve the next page of the new search.
+        Tests call it too.
+        """
         with self._lock:
             self._answer = None
 
