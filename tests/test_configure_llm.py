@@ -360,3 +360,43 @@ class TestConfigureLlmTimeout:
         )
         _, kwargs = mock_post.call_args
         assert kwargs["timeout"] == 30.0
+
+
+# ── An omitted auto_pull or chat_api_format keeps its value ─────────────────
+
+
+class TestOmittedParametersKeepTheirValue:
+    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    def test_a_model_change_keeps_an_enabled_auto_pull(self, mock_post, tmp_path):
+        mock_post.return_value = _mock_openai_response()
+        root = _make_project(tmp_path)
+        (root / ".fw-context" / "local.toml").write_text(
+            '[llm]\nauto_pull = true\nchat_api_base = "https://api.example.com/v1"\n', encoding="utf-8"
+        )
+
+        result = configure_llm(project_root=str(root), model="deepseek-chat")
+
+        assert result["status"] == "ok", result
+        assert result["auto_pull"] is True
+        assert "auto_pull = true" in (root / ".fw-context" / "local.toml").read_text(encoding="utf-8")
+
+    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    def test_auto_returns_a_forced_format_to_detection(self, mock_post, tmp_path):
+        mock_post.return_value = _mock_openai_response()
+        root = _make_project(tmp_path)
+        (root / ".fw-context" / "local.toml").write_text(
+            '[llm]\nchat_api_format = "openai"\nchat_api_base = "https://api.example.com/v1"\n', encoding="utf-8"
+        )
+
+        result = configure_llm(project_root=str(root), chat_api_format="auto")
+
+        assert result["status"] == "ok", result
+        assert 'chat_api_format = "auto"' in (root / ".fw-context" / "local.toml").read_text(encoding="utf-8")
+
+    def test_an_unknown_format_is_refused(self, tmp_path):
+        root = _make_project(tmp_path)
+
+        result = configure_llm(project_root=str(root), chat_api_format="anthropic")
+
+        assert result["status"] == "error"
+        assert "chat_api_format" in result["message"]

@@ -389,9 +389,8 @@ def get_active_build(
     using any other fw-context tools.
 
     Read-only, and it spawns no subprocess — the startup daemon thread and
-    the file watcher own the background reindex.  One exception: the config
-    load creates default ``.fw-context/config.toml`` and ``local.toml``
-    when they are missing.
+    the file watcher own the background reindex.  It creates no
+    ``.fw-context`` file in a project that is not initialized.
 
     Act on ``status``:
 
@@ -2487,9 +2486,10 @@ def get_environment_status(
 ) -> dict:
     """Return the complete project environment status in one call.
 
-    Read-only, except that its ``get_active_build`` call creates default
-    config files when they are missing. Aggregates five domains into a single call so the LLM can
-    see everything at session start without extra round-trips:
+    Read-only. No side effects: it creates no ``.fw-context`` file in a
+    project that is not initialized.  Aggregates five domains into a single
+    call so the LLM can see everything at session start without extra
+    round-trips:
 
     - ``deps`` — dependency audit (``run_full_check``), each entry with an
       optional ``action`` (``message`` + shell ``command``).  ``status="skipped"``
@@ -2535,9 +2535,8 @@ def get_environment_status(
         # apt install libclang-18-dev" signal must work before the first init.
         pip_subset = {"pysqlite3", "sqlite-vec", "libclang-python", "libclang-so", "watchfiles", "tomli-w"}
         dep_results = run_full_check(project_root=str(root), subset=pip_subset)
-        # No [index] compile_commands path exists pre-init, and load_config()
-        # would create empty .fw-context/config.toml + local.toml.  Skip it so
-        # this read-only tool has no file-creation side effect before init.
+        # No [index] compile_commands path exists pre-init: nothing to
+        # resolve, thus no compile database to report.
         compile_db: dict = {"exists": False, "path": None, "entry_count": None}
     else:
         dep_results = run_full_check(project_root=str(root))
@@ -2554,11 +2553,9 @@ def get_environment_status(
     build_system = None if build_system_raw == "unknown" else build_system_raw
 
     if index.get("status") == "not_initialized":
-        # No config exists yet — probe the LLM backend from defaults so this
-        # read-only tool does NOT create .fw-context config files.  check_ollama
-        # routes through load() (via _resolve_context), which has that
-        # file-creation side effect.  Resolve the embed model first so the
-        # report mirrors the initialized path (concrete embed_model, no pull).
+        # No project config exists yet — probe the LLM backend from the
+        # defaults.  Resolve the embed model first so the report mirrors the
+        # initialized path (concrete embed_model, no pull).
         from ...config.settings import LLMConfig
         from ...llm.auto_model import resolve_embed_model
 
@@ -2668,9 +2665,10 @@ def configure_llm(
         Field(description="API key for cloud/proxy APIs. None for local/no-auth."),
     ] = None,
     chat_api_format: Annotated[
-        str,
-        Field(description="Format override: 'auto' (default), 'ollama', or 'openai'."),
-    ] = "auto",
+        str | None,
+        Field(description="Format override: 'ollama' or 'openai'; 'auto' returns to detection from the URL. "
+              "None = keep current."),
+    ] = None,
     model: Annotated[
         str | None,
         Field(description="Chat model name. None = keep current."),
@@ -2680,12 +2678,9 @@ def configure_llm(
         Field(description="Embedding model name (Ollama only). None = keep current."),
     ] = None,
     auto_pull: Annotated[
-        bool,
-        Field(
-            description="Auto-pull models on 404 (Ollama only). False for intranet. Written when it differs "
-            "from the current value, thus the default False disables an enabled auto-pull."
-        ),
-    ] = False,
+        bool | None,
+        Field(description="Auto-pull models on 404 (Ollama only). False for intranet. None = keep current."),
+    ] = None,
     stream: Annotated[
         bool | None,
         Field(
@@ -2716,10 +2711,13 @@ def configure_llm(
         project_root: Project root directory. Auto-detected if omitted.
         chat_api_base: Chat API URL (see description for format details).
         chat_api_key: Bearer token for cloud/proxy APIs.
-        chat_api_format: Override auto-detection: "auto", "ollama", "openai".
+        chat_api_format: Override auto-detection: "ollama" or "openai";
+            "auto" returns to detection from the URL.  None keeps the
+            current value.
         model: Chat model name.
         embed_model: Embedding model name (Ollama only).
-        auto_pull: Whether to auto-pull models on 404.
+        auto_pull: Whether to auto-pull models on 404.  None keeps the
+            current value.
         stream: Stream chat responses via SSE. True avoids reverse-proxy idle timeouts.
 
     Returns:
@@ -2744,22 +2742,26 @@ def configure_llm(
             ),
         }
 
-    # Collect only non-default/non-None values to avoid overwriting
-    # existing settings with defaults.  The auto_pull comparison uses
-    # the current config value (not a constant) to distinguish "user
-    # explicitly set False" from "user passed the default arg False".
+    # Collect only the parameters the caller passed: None means "keep
+    # current".  A value equal to the current one is not a change, so a
+    # call that repeats the config writes nothing.
+    if chat_api_format is not None and chat_api_format not in ("auto", "ollama", "openai"):
+        return {
+            "status": "error",
+            "message": f"Invalid chat_api_format {chat_api_format!r} — use 'auto', 'ollama', or 'openai'.",
+        }
     updates: dict[str, object] = {}
     if chat_api_base is not None:
         updates["chat_api_base"] = chat_api_base
     if chat_api_key is not None:
         updates["chat_api_key"] = chat_api_key
-    if chat_api_format != "auto":
+    if chat_api_format is not None and chat_api_format != cfg.llm.chat_api_format:
         updates["chat_api_format"] = chat_api_format
     if model is not None:
         updates["model"] = model
     if embed_model is not None:
         updates["embed_model"] = embed_model
-    if auto_pull != cfg.llm.auto_pull:
+    if auto_pull is not None and auto_pull != cfg.llm.auto_pull:
         updates["auto_pull"] = auto_pull
     if stream is not None:
         updates["stream"] = stream
@@ -2767,7 +2769,7 @@ def configure_llm(
     if not updates:
         return {
             "status": "error",
-            "message": "No configuration changes to write — all parameters are None or default.",
+            "message": "No configuration changes to write — all parameters are None or equal to the current values.",
         }
 
     # Delegate to the shared write+test implementation (llm/configure.py).
