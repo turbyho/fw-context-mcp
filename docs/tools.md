@@ -1852,7 +1852,13 @@ Output: [{"total": 3, "offset": 0, "shown": 3, "more": false},
 ```
 
 Pass a fully-qualified class name (`hal::UART_DRIVER`) or just the bare
-name (`UART_DRIVER`). fw-context groups the results by wrapper class. A
+name (`UART_DRIVER`). The name is case-sensitive. When no top-level class
+has a bare name, the name matches the class of that name in each
+namespace, but not a class whose name only ends with it: `Gap` does not
+match `PalGap`. The methods of a class nested in the driver class count as
+driver methods.
+
+fw-context groups the results by wrapper class. A
 free function goes into `wrapper_class: "(global)"`. `file` is on each
 method, not on the class, because one class can span several files.
 `driver_method` is the bare name of the driver method.

@@ -1517,7 +1517,7 @@ def find_dead_code(
 
 # ── moved from server.py ──
 def find_wrapper_callers(
-    class_name: Annotated[str, Field(description="Driver class name to find wrappers for. E.g. 'UART_DRIVER' or 'hal::UART_DRIVER'.", min_length=1)],
+    class_name: Annotated[str, Field(description="Driver class name to find wrappers for. E.g. 'UART_DRIVER' or 'hal::UART_DRIVER'. Case-sensitive.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum wrapper classes on one page (default 20, max 100).", ge=1)] = 20,
     offset: Annotated[int, Field(description="Skip this many wrapper classes. Reads the next page.", ge=0)] = 0,
@@ -1543,7 +1543,11 @@ def find_wrapper_callers(
 
     Args:
         class_name: Driver class name to find wrappers for.
-            E.g. ``'UART_DRIVER'`` or ``'hal::UART_DRIVER'``.
+            E.g. ``'UART_DRIVER'`` or ``'hal::UART_DRIVER'``.  The name
+            is case-sensitive.  A bare name that names no top-level class
+            matches the class of that name in each namespace, but not a
+            class whose name only ends with it.  The methods of a class
+            nested in the driver class count as driver methods.
         project_root: Project root. Auto-detected if omitted.
         limit: Maximum wrapper classes on one page (default 20, max 100).
             Each class comes with all of its methods and calls into the
@@ -1590,47 +1594,44 @@ def find_wrapper_callers(
             return [{"error": f"Symbol not found: {class_name}"}]
 
         # Find all methods of the class. Three-tier resolution:
-        # 1. Exact prefix LIKE (class_name::%) — matches when the
+        # 1. Qualified-name prefix ``class_name::`` — matches when the
         #    class was indexed with its full qualified name.
-        # 2. Escaped LIKE with leading wildcard (%class_name::%) —
-        #    catches cases where the class is nested in a namespace.
-        #    ESCAPE clause prevents SQLite from treating '::' specially.
+        # 2. ``::class_name::`` anywhere — the class is nested in a
+        #    namespace.  The ``::`` before the name is necessary: without
+        #    it, ``Gap`` also got the methods of ``ble::impl::PalGap``.
         # 3. Short-name fallback — when the class has a fully-qualified
         #    name (Namespace::Class), strip the namespace and retry
         #    with just the short name as prefix.
-        driver_methods = conn.execute(
-            """SELECT s.usr, s.name, s.qualified_name
-               FROM symbols s
-               WHERE s.config_hash = ?
-                 AND s.kind = 'method'
-                 AND s.qualified_name LIKE ?
-               ORDER BY s.name, s.usr""",
-            (config_hash, f"{class_name}::%"),
-        ).fetchall()
+        #
+        # WHY substr() and instr() and not LIKE: the first and the third
+        # tier did not escape the name, thus LIKE read ``_`` as any
+        # character and ``I2C_Base::%`` also matched ``I2CxBase``.  In
+        # SQLite LIKE also ignores the case of ASCII letters, thus
+        # ``Timer::%`` matched ``TIMER``.  The two functions compare the
+        # text as it is.  The second tier was ``%X::%``, with no ``::``
+        # before the name, thus ``mutex`` got ``__gnu_cxx::__mutex``.
+        # Measured over every index on one machine: 493 of 29748 class
+        # names got the methods of another class.
+        def _methods(where: str, *params: object) -> list:
+            return conn.execute(
+                f"""SELECT s.usr, s.name, s.qualified_name
+                    FROM symbols s
+                    WHERE s.config_hash = ?
+                      AND s.kind = 'method'
+                      AND {where}
+                    ORDER BY s.name, s.usr""",
+                (config_hash, *params),
+            ).fetchall()
 
+        def _with_prefix(owner: str) -> list:
+            prefix = f"{owner}::"
+            return _methods("substr(s.qualified_name, 1, ?) = ?", len(prefix), prefix)
+
+        driver_methods = _with_prefix(class_name)
         if not driver_methods:
-            esc_name = _escape_like(class_name)
-            driver_methods = conn.execute(
-                """SELECT s.usr, s.name, s.qualified_name
-                   FROM symbols s
-                   WHERE s.config_hash = ?
-                     AND s.kind = 'method'
-                     AND s.qualified_name LIKE ? ESCAPE '\\'
-                   ORDER BY s.name, s.usr""",
-                (config_hash, f"%{esc_name}::%"),
-            ).fetchall()
-
+            driver_methods = _methods("instr(s.qualified_name, ?) > 0", f"::{class_name}::")
         if not driver_methods and "::" in class_name:
-            short_name = class_name.rsplit("::", 1)[-1]
-            driver_methods = conn.execute(
-                """SELECT s.usr, s.name, s.qualified_name
-                   FROM symbols s
-                   WHERE s.config_hash = ?
-                     AND s.kind = 'method'
-                     AND s.qualified_name LIKE ? ESCAPE '\\'
-                   ORDER BY s.name, s.usr""",
-                (config_hash, f"{short_name}::%"),
-            ).fetchall()
+            driver_methods = _with_prefix(class_name.rsplit("::", 1)[-1])
 
         if not driver_methods:
             return [{"info": f"No methods found for class '{class_name}'."}]
