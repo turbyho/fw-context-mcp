@@ -29,6 +29,22 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# Model-name prefixes of the sentence-transformers backend (compared lower-case).
+_ST_PREFIXES = ("ibm-granite/", "lightonai/", "baai/", "cross-encoder/", "sentence-transformers/")
+
+
+def uses_ollama(cfg: LLMConfig) -> bool:
+    """Return True when :func:`get_embedder` gives an ``OllamaEmbedder`` for *cfg*.
+
+    The same rules as :func:`get_embedder`, without a model to construct:
+    an empty ``embed_model`` auto-detects an Ollama model, ``ft://`` and the
+    sentence-transformers prefixes run locally, and every other name is an
+    Ollama tag.  A caller that needs the Ollama server for embedding only
+    asks for it when this is True.
+    """
+    model = cfg.embed_model.lower()
+    return not (model.startswith("ft://") or model.startswith(_ST_PREFIXES))
+
 
 def get_embedder(cfg: LLMConfig) -> Embedder:
     """Return the appropriate :class:`Embedder` for *cfg*.
@@ -60,8 +76,7 @@ def get_embedder(cfg: LLMConfig) -> Embedder:
     try:
         if model.startswith("ft://"):
             return _get_ft_embedder(cfg)
-        _st_prefixes = ("ibm-granite/", "lightonai/", "baai/", "cross-encoder/", "sentence-transformers/")
-        if model.startswith(_st_prefixes):
+        if model.startswith(_ST_PREFIXES):
             return _get_st_embedder(cfg)
         from .ollama import OllamaEmbedder
         return OllamaEmbedder(cfg)

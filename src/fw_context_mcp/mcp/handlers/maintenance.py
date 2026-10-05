@@ -2352,6 +2352,10 @@ def check_ollama(
         configured one adds endpoint, format, and compliance_warning for an
         external host),
         configured_embed_model (str), embedding_installed (bool),
+        embedding_backend (str — "ollama", or "local" for a
+        sentence-transformers or ``ft://`` model, which needs no Ollama:
+        it counts as installed, and with chat on an external API a
+        stopped Ollama still gives "ok"),
         message (str, when status is not "ok"), model_details (list[dict]),
         suggest_cloud (bool), vec_available (bool),
         vec_error (str, optional), debug_log (str, optional — only when
@@ -2361,7 +2365,8 @@ def check_ollama(
         configured_embed_model, and embedding_installed are present only
         when Ollama runs; configured_model also needs chat on Ollama.
         ``"disabled"`` gives only status, ollama_enabled,
-        ollama_running, configured_model, num_ctx, and message.
+        ollama_running, configured_model, num_ctx, and message;
+        embedding_backend is present on every other status.
     """
     try:
         _, cfg, _, _ = _resolve_context(project_root)

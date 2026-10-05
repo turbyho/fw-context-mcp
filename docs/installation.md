@@ -351,12 +351,11 @@ Alternatives:
 - **Chat on another server.** Set `[llm] chat_api_base` to an
   OpenAI-compatible API. Symbol analysis and query generation then use that
   API. The embeddings still use the local Ollama.
-- **Embeddings without Ollama at index time.** Install the `st` extra
+- **Embeddings without Ollama.** Install the `st` extra
   (`pip install "fw-context-mcp[st]"`) and set `embed_model` to a
   sentence-transformers model, for example `"BAAI/bge-small-en-v1.5"`.
-  `fw-context index` then stores the vectors without Ollama. Note:
-  `semantic_search` still requires a running Ollama at query time; without
-  it, the tool falls back to `search_code`.
+  `fw-context index` then stores the vectors without Ollama, and
+  `semantic_search` embeds the query locally too.
 - **No LLM.** Set `enabled = false` in `[llm]`. The LLM-calling tools then
   return raw prompts, and the AI assistant processes the results with its
   own model. Set `[index] index_embeddings = false` to skip the embedding

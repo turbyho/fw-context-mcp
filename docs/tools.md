@@ -1036,6 +1036,12 @@ Multi-phase pipeline: translate → rough search → LLM query generation
 When no symbol matches, the result holds the metadata entries and a dict
 with `info`. One dict with `error` means that the query failed.
 
+The whole pipeline has a time limit: `[llm] timeout` of the project
+(default 600 s). When the pipeline passes it, a leading dict holds
+`_partial: true`, a `warning` with the timeout, and a `hint`. The symbols
+that follow are the ones that the steps before the timeout found, without
+the later re-rank steps; there can be none.
+
 When you disable Ollama (`[llm] enabled = false`), this tool falls back to
 a word-split FTS5 search. Phase 0 auto-translates a non-English query.
 
@@ -1069,11 +1075,14 @@ multiplies the similarity of project code by 1.2 and of all other code by
 0.85. The multiplied score sets the order. `threshold` applies to the raw
 cosine similarity.
 
-**Known limitation.** The output step drops the similarity score. Thus the
-relevance-floor warning (best similarity below 0.68) never fires today.
+**Relevance floor.** When the best raw cosine similarity of all matches is
+below 0.68, the result is one dict: a `warning` that the matches are likely
+unrelated, `_fallback_suggestion: "search_code"`, `_best_similarity`, and
+the matches in `_results`.
 
-When the embedding search finds no match, the result holds one dict with
-`info`. One dict with `error` means that the query failed. When
+When the embedding search finds no match above `threshold`, the tool runs
+the lexical fallback below, with a `warning` that suggests a lower
+threshold. One dict with `error` means that the query failed. When
 compile_commands.json changed after the last index run, a trailing dict
 holds a `warning` and a `hint`.
 
@@ -1083,8 +1092,10 @@ holds a `warning` and a `hint`.
 - `0.60` — high precision (default)
 - `0.65` — strict, may miss relevant symbols
 
-Requires `[llm] enabled = true`, a running Ollama server, and embeddings
-in the index. When one of them is missing, or the embedding model fails,
+Requires `[llm] enabled = true`, embeddings in the index, and, for an
+Ollama embedding model, a running Ollama server. A sentence-transformers or
+`ft://` model embeds the query locally and needs no Ollama. When one of
+them is missing, or the embedding model fails,
 this tool runs ONE plain FTS5 symbol search (the first step of
 `search_code`, with no kind filter, no relaxation, and no paging). A
 leading dict holds a `warning` with the reason, and each symbol holds
@@ -1115,9 +1126,9 @@ function for a local variable (`"<file scope>"` for a global variable),
 and the enclosing class for a static member. Each result includes a
 `references` list, showing the functions that read or write the
 variable. This list uses the same `ref_kind` values as `find_references`:
-`"call"`, `"ref"`, `"member"`. The list is capped: max 30 references per
-variable, and max 100 over all results. Thus a later result can show fewer
-references than it has.
+`"call"`, `"ref"`, `"member"`. The list is capped at 30 references per
+variable, and holds only the references of the selected build (variant and
+image).
 
 `name` is a substring match on the name and on the qualified name: `g_`
 finds `g_debug_level` and also `msg_count`. The result holds only
@@ -2341,6 +2352,12 @@ this tool needs no Ollama.
 and which model it names. When it is configured, `chat_api` also holds
 `endpoint` and `format`, and a `compliance_warning` for a host that is not
 local.
+
+`embedding_backend` is `"ollama"` for an Ollama embedding model, and
+`"local"` for a sentence-transformers or `ft://` model. A local model needs
+no Ollama: it counts as installed, and with chat on an external API the
+status is `"ok"` even when Ollama does not run. `"embedding_unavailable"`
+thus means an Ollama embedding model and a stopped Ollama.
 
 Note: `explain_symbol`, with pre-computed analysis (the default), returns
 instantly, and does not require Ollama at query time. `num_ctx` is 16384

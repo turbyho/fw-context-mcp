@@ -27,6 +27,7 @@ Why continue on phase failure?
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 import time
@@ -244,6 +245,10 @@ class PipelineRunner:
     def __init__(self, config: PipelineConfig) -> None:
         self.config = config
         self.registry = _build_registry()  # lazy on first use
+        #: The context after the last phase that ended.  A caller that
+        #: cancels :meth:`run` (``asyncio.wait_for``) reads the partial
+        #: results here.
+        self.last_ctx = None
 
     async def run(self, ctx):
         """Run all configured phases sequentially, returning the final context.
@@ -259,7 +264,12 @@ class PipelineRunner:
         Each phase that ``should_run()`` returns True for receives the
         context, runs, and returns an updated context.  Skipped phases
         pass through verbatim.
+
+        A cancellation (``asyncio.CancelledError``) is never a phase
+        failure: it ends the run, and :attr:`last_ctx` holds what the
+        phases before it found.
         """
+        self.last_ctx = ctx
         for item in self.config.phases:
             if isinstance(item, Phase):
                 phase = item
@@ -283,7 +293,7 @@ class PipelineRunner:
                 log.debug("Phase %r completed in %.2fs", phase_name, elapsed)
             except BaseException as exc:
                 from fw_context_mcp.utils import is_fatal
-                if is_fatal(exc):
+                if is_fatal(exc) or isinstance(exc, asyncio.CancelledError):
                     raise
                 if isinstance(exc, (ValueError, TypeError, AttributeError, RuntimeError)):
                     log.exception("Phase %r crashed — this is likely a bug", phase_name)
@@ -293,5 +303,6 @@ class PipelineRunner:
                 # Continue with remaining phases — one phase failure
                 # shouldn't break the entire search.  Users get partial
                 # results from earlier phases instead of an opaque error.
+            self.last_ctx = ctx
 
         return ctx

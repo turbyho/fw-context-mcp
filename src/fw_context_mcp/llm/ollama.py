@@ -694,8 +694,11 @@ def check_setup(cfg: LLMConfig) -> dict:
     """Check LLM backend connectivity and model availability.
 
     Reports on both the chat API (Ollama native or external) and the
-    embedding API (always Ollama).  When ``chat_api_base`` points to an
-    external host, a compliance warning is included.
+    embedding backend.  An Ollama embedding model needs the Ollama server;
+    a sentence-transformers or ``ft://`` model runs locally, and
+    ``embedding_backend`` tells which one is configured.  When
+    ``chat_api_base`` points to an external host, a compliance warning is
+    included.
 
     Args:
         cfg: LLM configuration.
@@ -707,7 +710,9 @@ def check_setup(cfg: LLMConfig) -> dict:
             - ``"ok"`` — chat and embedding backends ready.
             - ``"disabled"`` — ``cfg.enabled`` is False.
             - ``"not_configured"`` — Ollama not running and no chat_api_base.
-            - ``"embedding_unavailable"`` — Ollama down but chat on external API.
+            - ``"embedding_unavailable"`` — Ollama down, chat on external
+              API, and the embedding model is an Ollama model.  With a
+              local embedding model the status is ``"ok"``.
             - ``"model_missing"`` — Ollama running but chat model not installed.
             - ``"error"`` — unexpected error probing Ollama.
 
@@ -716,8 +721,13 @@ def check_setup(cfg: LLMConfig) -> dict:
         ``compliance_warning`` (str, when chat_api_base is external).
     """
     from ..config.settings import _is_loopback_url
+    from .embedder_factory import uses_ollama
 
-    result: dict = {"suggest_cloud": False}
+    ollama_embedding = uses_ollama(cfg)
+    result: dict = {
+        "suggest_cloud": False,
+        "embedding_backend": "ollama" if ollama_embedding else "local",
+    }
 
     # ── Chat API configuration info ──
     if cfg.chat_api_base:
@@ -747,7 +757,9 @@ def check_setup(cfg: LLMConfig) -> dict:
         resp.raise_for_status()
     except httpx.ConnectError:
         result["ollama_running"] = False
-        if cfg.chat_api_base:
+        if cfg.chat_api_base and not ollama_embedding:
+            result["status"] = "ok"
+        elif cfg.chat_api_base:
             result["status"] = "embedding_unavailable"
             result["message"] = (
                 "Ollama is not running. Chat is configured on an external "
@@ -786,8 +798,8 @@ def check_setup(cfg: LLMConfig) -> dict:
     ]
     result["model_details"] = model_details
 
-    # Embedding model check (embedding always uses Ollama)
-    embed_found = _check_model_installed(cfg.embed_model, installed)
+    # Embedding model check: only an Ollama model must be installed there.
+    embed_found = not ollama_embedding or _check_model_installed(cfg.embed_model, installed)
     result["configured_embed_model"] = cfg.embed_model
     result["embedding_installed"] = embed_found
 

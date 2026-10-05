@@ -17,6 +17,7 @@ import sqlite3
 from typing import TYPE_CHECKING
 
 from fw_context_mcp.indexer.db import get_embeddings, search_similar_hybrid, search_similar_vec
+from fw_context_mcp.llm.embedder import EmbedderError
 from fw_context_mcp.llm.embedder_factory import get_embedder
 from fw_context_mcp.llm.ollama import OllamaError
 from fw_context_mcp.search.phases.base import Phase
@@ -108,7 +109,9 @@ class EmbeddingPhase(Phase):
                     embedder = get_embedder(ctx.config.llm)
                     query_embs = embedder.embed_queries([ctx.query])
                     query_vec = query_embs[0]
-                except OllamaError:
+                except (OllamaError, EmbedderError, ImportError):
+                    # EmbedderError and ImportError: a sentence-transformers
+                    # model that fails to load, or the [st] extra is missing.
                     return ctx.evolve(ollama_warning={"detail": "Embedding model unavailable"})
 
                 # ---- Hybrid re-rank path (default) ----
@@ -160,25 +163,8 @@ class EmbeddingPhase(Phase):
                                 AND is_definition = 1""",
                             (ctx.config_hash, *sym_ids),
                         ).fetchall()
-                        results: list[dict] = []
-                        for r in emb_rows:
-                            d = dict(r)
-                            dist = distance_map.get(d.get("id", -1), 0.0)
-                            d["_similarity"] = round(float(1.0 - dist), 4)
-                            results.append(d)
-                        if self.source_boost:
-                            sym_proj: dict[int, int] = {r["id"]: r.get("is_project", 0) for r in emb_rows}
-                            scored: list[tuple[float, int, float, dict]] = []
-                            for d in results:
-                                sid = d.get("id", -1)
-                                if sid not in sym_proj:
-                                    continue
-                                raw_sim = d["_similarity"]
-                                boost = 1.2 if sym_proj[sid] == 1 else 0.85
-                                d["_similarity"] = round(raw_sim * boost, 4)
-                                scored.append((d["_similarity"], sid, raw_sim, d))
-                            scored.sort(key=lambda x: -x[0])
-                            results = [d for _, _, _, d in scored[:ctx.limit]]
+                        similarity = {sid: 1.0 - dist for sid, dist in distance_map.items()}
+                        results = self._rank(emb_rows, similarity, ctx.limit)
                         return ctx.evolve(embedding_results=results, final_results=list(results))
 
                 # ---- Brute-force fallback (legacy BLOB table) ----
@@ -197,9 +183,34 @@ class EmbeddingPhase(Phase):
                             AND is_definition = 1""",
                         (ctx.config_hash, *top_ids),
                     ).fetchall()
-                    emb_row_dicts = [dict(r) for r in emb_rows]
-                    return ctx.evolve(embedding_results=emb_row_dicts, final_results=emb_row_dicts)
+                    results = self._rank(emb_rows, dict(scored_bf[: self.overfetch]), ctx.limit)
+                    return ctx.evolve(embedding_results=results, final_results=list(results))
 
                 return ctx
 
         return ctx.executor.execute_sync(_query, ctx.config_hash)
+
+    def _rank(self, rows: list, similarity: dict[int, float], limit: int) -> list[dict]:
+        """Order the symbol *rows* of a standalone search by similarity.
+
+        *similarity* maps a symbol id to its cosine similarity.  The rows come
+        from ``id IN (...)``, thus in no order.  Each row gets the raw
+        similarity in ``_similarity``, which ``semantic_search`` compares with
+        its relevance floor.  With ``source_boost`` the order uses the boosted
+        score (project code x1.2, other code x0.85) and the list stops at
+        *limit*; without it, the caller gets every candidate to fuse.
+        """
+        scored: list[tuple[float, dict]] = []
+        for r in rows:
+            d = dict(r)
+            sim = similarity.get(d.get("id", -1))
+            if sim is None:
+                continue
+            d["_similarity"] = round(float(sim), 4)
+            key = sim
+            if self.source_boost:
+                key = sim * (1.2 if d.get("is_project", 0) == 1 else 0.85)
+            scored.append((key, d))
+        scored.sort(key=lambda x: -x[0])
+        results = [d for _, d in scored]
+        return results[:limit] if self.source_boost else results

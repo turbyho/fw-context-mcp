@@ -47,6 +47,7 @@ from ...config import load as load_config
 from ...indexer.db import _expand_query, get_active_config
 from ...indexer.db._symbols import _RE_COL_FILTER, _sanitize_body_query
 from ...llm._diag import check_setup
+from ...llm.embedder_factory import uses_ollama
 from ...utils import abs_path, resolve_project_root
 from ..shared.context import _db_path, _is_stale, _quick_open_readonly
 from ..shared.fallback import _fallback_to_search_code
@@ -483,9 +484,11 @@ async def smart_search(
         ``outputs`` when ``fw-context index --analyze`` wrote them.  A model
         wrote that text, and the code did not: never quote it as a fact.
 
-        When the pipeline passes the LLM timeout, the answer is one dict
-        with ``_partial: True``, a ``warning`` with the timeout, and a
-        ``hint``.  It holds no symbol: make the query more specific, or
+        When the pipeline passes the LLM timeout (``[llm] timeout`` of the
+        project), a leading dict holds ``_partial: True``, a ``warning``
+        with the timeout, and a ``hint``.  The symbols that follow are the
+        ones that the steps before the timeout found, without the later
+        re-rank steps; there can be none.  Make the query more specific, or
         increase the LLM timeout.
 
         When compile_commands.json changed after the last index run, a
@@ -505,15 +508,12 @@ async def smart_search(
     config = _build_smart_search()
     runner = PipelineRunner(config)
 
-    # Load pipeline timeout from config — smart_search involves multiple
-    # LLM round-trips (translate, rough_search, llm_query, refine, embedding)
-    # each of which can stall. A hard timeout prevents runaway sessions.
-    try:
-        from fw_context_mcp.config.settings import load as load_settings
-        cfg = load_settings()
-        timeout = cfg.llm.timeout if cfg and cfg.llm else 120.0
-    except (OSError, ValueError):
-        timeout = 120.0
+    # Pipeline timeout from the config of the project (ctx.config, which
+    # create() loaded with the project root) — smart_search involves
+    # multiple LLM round-trips (translate, rough_search, llm_query, refine,
+    # embedding) each of which can stall. A hard timeout prevents runaway
+    # sessions.
+    timeout = ctx.config.llm.timeout if ctx.config and ctx.config.llm else 120.0
 
     try:
         # await is required because the pipeline calls external chat and
@@ -521,16 +521,10 @@ async def smart_search(
         # for 10–30 seconds per invocation.
         ctx = await asyncio.wait_for(runner.run(ctx), timeout=timeout)
     except TimeoutError:
-        # On timeout, return whatever FTS5 results were collected before the
-        # LLM stalled — partial results are better than nothing. The warning
+        # On timeout, return the symbols that the phases before the stall
+        # found — partial results are better than nothing. The warning
         # tells the operator the results are incomplete.
-        results = list(ctx.formatted_results) if ctx.formatted_results else []
-        results.insert(0, {
-            "warning": f"Smart search timed out after {timeout:.0f}s.",
-            "hint": "No results: the search timed out first. Try a more specific query or increase LLM timeout.",
-            "_partial": True,
-        })
-        return results
+        return await _smart_search_partial(runner.last_ctx or ctx, timeout)
 
     # Flatten the pipeline's formatted results iterator into a list.
     results = list(ctx.formatted_results)
@@ -539,6 +533,32 @@ async def smart_search(
     if ctx.ollama_warning is None:
         results = _append_staleness_warning(results, ctx.db_path, ctx.project_root)
     return results
+
+
+async def _smart_search_partial(ctx, timeout: float) -> list[dict]:
+    """The answer of a smart_search that passed *timeout*.
+
+    *ctx* is the context after the last phase that ended.  Its symbols are
+    the fused list when a fusion ran, else the FTS5 rows; they get the same
+    format as a full answer, with a leading ``_partial`` warning.
+    """
+    from fw_context_mcp.search.phases.format import FormatPhase
+
+    rows = ctx.final_results or ctx.fts5_results
+    formatted = (await FormatPhase().run(ctx.evolve(final_results=list(rows)[:ctx.limit]))).formatted_results
+    results = [r for r in formatted if "info" not in r]
+    if rows:
+        hint = "Partial results: the search timed out before its last steps. " \
+               "Try a more specific query or increase LLM timeout."
+    else:
+        hint = "No results: the search timed out first. Try a more specific query or increase LLM timeout."
+    results.insert(0, {
+        "warning": f"Smart search timed out after {timeout:.0f}s.",
+        "hint": hint,
+        "_partial": True,
+    })
+    return results
+
 
 # ── moved from server.py ──
 async def semantic_search(
@@ -578,10 +598,11 @@ async def semantic_search(
     are all there are.  The multiplied score sets the order; the result
     does not show it.  ``threshold`` applies to the raw cosine similarity.
 
-    **Requires** ``[llm] enabled = true``, a running Ollama server at
-    ``llm.ollama_url`` (checked even when the embedding model is not an
-    Ollama model), and embeddings in the index.  Without one of them, the
-    tool falls back to a lexical search with a warning.
+    **Requires** ``[llm] enabled = true``, embeddings in the index, and
+    for an Ollama embedding model a running Ollama server at
+    ``llm.ollama_url``.  A sentence-transformers or ``ft://`` model embeds
+    the query locally and needs no Ollama.  Without one of them, the tool
+    falls back to a lexical search with a warning.
 
     **This tool names no build.**  It takes neither ``variant`` nor
     ``image``, and it answers for the build that ``get_active_build``
@@ -618,7 +639,12 @@ async def semantic_search(
         compile_commands.json adds another leading ``warning``.  When the
         lexical search finds nothing too, the answer is one ``warning``.
 
-        No match of the embedding search gives one dict with ``info``.
+        No match above ``threshold`` runs the same lexical fallback, with a
+        ``warning`` that suggests a lower threshold.  When the best raw
+        similarity of all matches is below 0.68, the answer is one dict: a
+        ``warning`` that the matches are likely unrelated,
+        ``_fallback_suggestion: "search_code"``, ``_best_similarity``, and
+        the matches in ``_results``.
         One dict with ``error`` means the query failed — check that key
         first.
     """
@@ -629,8 +655,8 @@ async def semantic_search(
         if not db_path.exists():
             return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
 
-        # One row at least: an answer of zero rows says nothing that an
-        # empty result does not already say, and it costs the whole search.
+        # Held at 100 here; PipelineContext.create then holds the embedding
+        # search at 5 or more (the lexical fallback keeps this value).
         limit = max(1, min(limit, 100))
         threshold = max(0.0, min(1.0, threshold))
 
@@ -646,10 +672,15 @@ async def semantic_search(
                         "Enable it with `[llm] enabled = true` to use semantic search.",
             )
 
-        try:
-            setup = check_setup(cfg.llm)
-        except (RuntimeError, OSError):
-            setup = {"ollama_running": False}
+        # The Ollama server matters only for an Ollama embedding model: a
+        # sentence-transformers or ft:// model embeds the query locally.
+        if uses_ollama(cfg.llm):
+            try:
+                setup = check_setup(cfg.llm)
+            except (RuntimeError, OSError):
+                setup = {"ollama_running": False}
+        else:
+            setup = {"ollama_running": True}
 
         if not setup.get("ollama_running"):
             return _fallback_to_search_code(
@@ -697,7 +728,10 @@ async def semantic_search(
                 warning=warning_msg,
             )
 
-        if not results:
+        # The symbols, not ``results``: FormatPhase always adds a dict, an
+        # ``info`` when nothing matched, and it drops ``_similarity``.
+        matched = list(ctx.final_results)
+        if not matched:
             return _fallback_to_search_code(
                 root, db_path, query, limit,
                 warning=f"No symbols matched with similarity > {threshold}. "
@@ -726,9 +760,11 @@ async def semantic_search(
         # models can return low-similarity matches for any input — this
         # threshold prevents the LLM from treating noise as signal.
         # The warning suggests search_code (lexical) as a better alternative.
+        # The best raw cosine similarity of all matches, not of the first
+        # row: the reranker and the source boost both change the order.
         _RELEVANCE_FLOOR = 0.68
-        if results and results[0].get("_similarity", 1.0) < _RELEVANCE_FLOOR:
-            best_score = results[0].get("_similarity", 0)
+        best_score = max(float(r.get("_similarity", 1.0)) for r in matched)
+        if best_score < _RELEVANCE_FLOOR:
             return [
                 {
                     "warning": (
@@ -1033,17 +1069,16 @@ def search_bodies(
         first; an empty answer gets it too when indexed files changed.
     """
     root = resolve_project_root(project_root)
-    # Enforce limit bounds at the function entry point (not inside _do_search)
-    # because _do_search may be called multiple times by stale recovery —
-    # applying the clamp once here ensures consistency across retries.
+    # Enforce limit bounds at the function entry point; _do_search reads
+    # the clamped value through its closure.
     #
     # One row at least: a page of zero rows reports ``shown: 0`` with
     # ``more: true`` and hints at the offset it already stands at, thus a
     # reader that follows the hint never moves.
     limit = max(1, min(limit, 100))
 
-    # Computed once, outside the query closure: stale recovery can call the
-    # closure again, and the terms depend only on the operator's query.
+    # Computed outside the query closure: the terms depend only on the
+    # operator's query, and the closure runs under the executor lock.
     terms = _body_query_terms(query)
 
     # The body search keeps the query of the caller: no wildcard is added and
