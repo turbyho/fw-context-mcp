@@ -2144,7 +2144,10 @@ that script: `{name, attributes, origin, length, origin_value,
 length_value, file_path, line}`. `origin` and `length` are the expression
 that the script writes. `origin_value` and `length_value` are numbers, or
 `null` for an expression that names a symbol. An empty value means "not
-recorded", for example on PlatformIO, which records no linker script.
+recorded", never "no memory". A build system such as Keil or IAR records
+no linker script. A PlatformIO project records its link only in
+`fw-context index --build`, thus an empty value there means that no build
+recorded the link yet.
 `defines` holds the `-D` flags that every translation unit of the build
 carries with one value. `defines_varying` counts the names that are left
 out because they are not on every unit or have different values. In a
