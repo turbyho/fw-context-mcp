@@ -91,7 +91,8 @@ def test_a_compound_literal_gives_its_own_fields_only(extracted, text, row):
 
 @pytest.mark.libclang
 def test_a_struct_in_an_array_gives_its_field_once(extracted):
-    assert _rows(extracted, "table[]") == [("init", "dev_init", "init_fn_t")]
+    # { dev_init, dev_cb } gives its two fields by position, { .init = ... } the same init.
+    assert _rows(extracted, "table[]") == [("cb", "dev_cb", "cb_t"), ("init", "dev_init", "init_fn_t")]
     assert _rows(extracted, "indexed[3]") == [("cb", "dev_cb", "cb_t")]
 
 

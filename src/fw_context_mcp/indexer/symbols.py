@@ -964,13 +964,16 @@ def _emit_fn_ptr_targets(
     slot_index: int | None = None,
     lhs_type: str = "",
     expected_type: cx.Type | None = None,
+    stored: frozenset[str] | None = None,
 ) -> None:
     """Emit indirect refs and FnPointerAssignment records for function pointer assignments.
 
     *lhs_type* is the type of the storage when the caller already knows
     it (``_init_list_element_field``); without it the type is read from
     the child of *expr_cursor* that names *lhs_name*.  *expected_type* is
-    that storage type as a libclang type, for an overload set.
+    that storage type as a libclang type, for an overload set.  *stored*,
+    when given, holds the USRs of the functions that the storage really
+    receives: only those get an assignment row.
 
     *slot_index* is the position of *expr_cursor* inside a positional init
     list, and reaches the stored reference unchanged.  Only the init-list
@@ -1010,7 +1013,13 @@ def _emit_fn_ptr_targets(
     # a scan of the children found nothing, and a C++ table of functions
     # gave no indirect reference and no slot.  ``{ &dev_cb }`` worked,
     # because the UNARY_OPERATOR has the reference as a child.
-    if expr_cursor.kind == cx.CursorKind.DECL_REF_EXPR:
+    #
+    # A call that is an init-list element (``{ f_init, pick(fb) }``) is
+    # scanned as a whole too: the CALL_EXPR branch of the search skips its
+    # callee, which a scan of its children took as the stored function.
+    if expr_cursor.kind == cx.CursorKind.DECL_REF_EXPR or (
+        method == "init_list" and expr_cursor.kind == cx.CursorKind.CALL_EXPR
+    ):
         scanned = [expr_cursor]
     else:
         scanned = list(expr_cursor.get_children())
@@ -1035,7 +1044,9 @@ def _emit_fn_ptr_targets(
                         ref_kind="indirect",
                         slot_index=slot_index,
                     ))
-                if (lhs_usr and lhs_usr != target_usr) or lhs_name:
+                if ((lhs_usr and lhs_usr != target_usr) or lhs_name) and (
+                    stored is None or target_usr in stored
+                ):
                     try:
                         _fp_type = lhs_fp_type or child.type.spelling
                     except (ValueError, TypeError, RuntimeError, AttributeError):
@@ -2062,6 +2073,10 @@ _VALUE_WRAPPERS = frozenset({
     cx.CursorKind.PAREN_EXPR,
     cx.CursorKind.UNARY_OPERATOR,
     cx.CursorKind.CSTYLE_CAST_EXPR,
+    cx.CursorKind.CXX_STATIC_CAST_EXPR,
+    cx.CursorKind.CXX_REINTERPRET_CAST_EXPR,
+    cx.CursorKind.CXX_CONST_CAST_EXPR,
+    cx.CursorKind.CXX_NEW_EXPR,
 })
 # The cursor kinds of a struct value that holds an init list of its own.
 _LIST_VALUES = frozenset({
@@ -2218,12 +2233,14 @@ def _resolve_overload_set(overload_ref: cx.Cursor, expected: cx.Type) -> list[cx
 def _init_list_element_field(
     element: cx.Cursor,
 ) -> tuple[str | None, str, str, cx.Type | None]:
-    """The field that one element of an INIT_LIST_EXPR assigns: (USR, name, type, storage).
+    """The field that one element of an INIT_LIST_EXPR assigns: (USR, name, type, field type).
 
     Gives ``(None, "", "", None)`` when the element assigns no function to
     a field of this list.  The type is ``""`` when the caller must read it
-    from the element, as before.  *storage* is the type of one element of
-    the field, for an overload set; None when it is not known.
+    from the element, as before.  The field type is the libclang type of
+    the field: the caller reads from it which functions the field really
+    receives (``_stored_functions``) and the storage type of an overload
+    set.
 
     libclang gives a designated element as an UNEXPOSED_EXPR whose children
     are the designators (MEMBER_REF, or an index for ``[n] =``), and then
@@ -2262,8 +2279,461 @@ def _init_list_element_field(
             last = member_at[-1]
             ref = designators[last].referenced
             if ref is not None and ref.kind == cx.CursorKind.FIELD_DECL:
-                return (ref.get_usr(), ref.spelling, _field_type_spelling(ref), _storage_type(ref.type))
+                return (ref.get_usr(), ref.spelling, _field_type_spelling(ref), ref.type)
     return (None, "", "", None)
+
+
+def _is_fn_pointer_storage(type_: cx.Type) -> bool:
+    """Tell if *type_*, after its array levels, is a pointer to a function."""
+    try:
+        canonical = _strip_arrays(type_).get_canonical()
+        if canonical.kind == cx.TypeKind.MEMBERPOINTER:
+            return True
+        return canonical.kind == cx.TypeKind.POINTER and canonical.get_pointee().kind in (
+            cx.TypeKind.FUNCTIONPROTO, cx.TypeKind.FUNCTIONNOPROTO,
+        )
+    except (ValueError, TypeError, RuntimeError, AttributeError):
+        return False
+
+
+def _positional_struct_fields(cursor: cx.Cursor) -> list[tuple[str | None, str, str, cx.Type | None]]:
+    """The field of each leading element of a positional struct init list.
+
+    ``static struct ops o = { dev_init, dev_cb };`` names no field: the
+    position of each element is its field, in the order of the struct.
+    The designated path (``_init_list_element_field``) has no name to read
+    there, thus such an element gave no ``fp_assignments`` row at all.
+
+    The list maps a position to a field only while that is certain, and
+    stops at the first doubt.  The elements after the stop keep the old
+    reading, which gives them no field.
+
+    * The list must be positional: no element may carry a designator.
+      ``_init_list_is_positional`` reads ``.`` and ``[``; the old GNU form
+      ``cb: f`` shows as a MEMBER_REF before the value, as ``.cb = f``
+      does, and is caught here.
+    * The type must be a struct, a union or a C++ aggregate class with no
+      base class.  A positional element of a C++17 aggregate initializes
+      the bases first.  A union takes one element, its first member.
+    * The members are read in their order.  An anonymous struct or union
+      member stops the list, because its fields take the next positions
+      and libclang gives no field for it.  ``is_anonymous`` is also True
+      for the unnamed type of a named field (``struct { ... } f;``): that
+      stop costs rows, never a wrong one.  An unnamed bit-field takes no
+      element and is skipped.
+    * A field that is a struct, a union or an array, with an element that
+      has no braces of its own, stops the list: brace elision spreads that
+      element over the inner values.  A field that is an array of function
+      pointers takes that first element, then the list stops.  A string
+      literal fills a whole ``char`` array.
+    * A braced element of a struct field gives its own fields through the
+      nested list; the outer field gets no row.  Every other named field
+      gets its position, as a designated field does.
+
+    Each entry is ``(USR, name, type, field type)`` as
+    ``_init_list_element_field`` gives it.
+    """
+    try:
+        list_type = cursor.type.get_canonical()
+        if list_type.kind != cx.TypeKind.RECORD or not _init_list_is_positional(cursor):
+            return []
+        record = list_type.get_declaration()
+        members = list(record.get_children())
+        elements = list(cursor.get_children())
+    except (ValueError, TypeError, RuntimeError, AttributeError):
+        return []
+    if any(m.kind == cx.CursorKind.CXX_BASE_SPECIFIER for m in members):
+        return []
+    if any(_has_member_designator(e) for e in elements):
+        return []
+    union = record.kind == cx.CursorKind.UNION_DECL
+    mapped: list[tuple[str | None, str, str, cx.Type | None]] = []
+    for member in members:
+        if len(mapped) == len(elements) or (union and mapped):
+            break
+        if member.kind in _RECORD_DECL_KINDS and member.is_anonymous():
+            break
+        if member.kind != cx.CursorKind.FIELD_DECL:
+            continue
+        if not member.spelling:
+            if member.is_bitfield():
+                continue
+            break
+        element = elements[len(mapped)]
+        try:
+            whole_type = member.type.get_canonical()
+            inner = _strip_arrays(member.type).get_canonical()
+        except (ValueError, TypeError, RuntimeError, AttributeError):
+            break
+        storage = _is_fn_pointer_storage(member.type)
+        aggregate = inner.kind == cx.TypeKind.RECORD or whole_type.kind in _ARRAY_TYPE_KINDS
+        if aggregate and _is_char_array(member.type) and _is_string_literal(element):
+            mapped.append((None, "", "", None))
+            continue
+        if aggregate and not _initializes_whole_field(element, member.type):
+            if storage:
+                mapped.append(_field_entry(member))
+            break
+        if aggregate and not storage:
+            mapped.append((None, "", "", None))
+            continue
+        mapped.append(_field_entry(member))
+    return mapped
+
+
+_RECORD_DECL_KINDS = frozenset({
+    cx.CursorKind.STRUCT_DECL,
+    cx.CursorKind.UNION_DECL,
+    cx.CursorKind.CLASS_DECL,
+})
+
+
+_ADDRESS_TYPE_KINDS = frozenset({
+    cx.TypeKind.POINTER,
+    cx.TypeKind.MEMBERPOINTER,
+    cx.TypeKind.LVALUEREFERENCE,
+    cx.TypeKind.RVALUEREFERENCE,
+    cx.TypeKind.BLOCKPOINTER,
+})
+
+
+# Integer types that can hold the address of a function on the targets
+# of the index: ``uintptr_t`` is ``unsigned int`` on a 32-bit MCU.
+_ADDRESS_INTEGER_KINDS = frozenset({
+    cx.TypeKind.INT, cx.TypeKind.UINT, cx.TypeKind.LONG, cx.TypeKind.ULONG,
+    cx.TypeKind.LONGLONG, cx.TypeKind.ULONGLONG, cx.TypeKind.INT128, cx.TypeKind.UINT128,
+})
+
+
+def _constructor_takes_function(record: cx.Cursor, _depth: int = 0) -> bool:
+    """Tell if the class *record* can be built from a function: a callback wrapper.
+
+    A constructor qualifies when one of its parameters takes a function
+    (``_param_takes_function``).  A copy or move constructor does not:
+    every class template has one, and a test that read them counted
+    ``std::vector`` as a wrapper.  ``Timer() {}`` or a defaulted
+    constructor does not make a class a wrapper either.
+
+    The class template of an implicit instance is read too (see
+    ``_class_and_template``), a template constructor is found also when
+    libclang spells it ``Opt<T>``, and ``using Base::Base;`` brings the
+    constructors of the base.  Measured on 15 classes (mbed-style and
+    hand-written callback templates, std::function, std::vector, a box,
+    a span, plain structs, an inherited constructor): every one sorted as
+    expected.
+    """
+    if _depth > 8:
+        return False
+    for candidate in _class_and_template(record):
+        try:
+            children = list(candidate.get_children())
+        except (ValueError, TypeError, RuntimeError, AttributeError):
+            continue
+        class_params = _template_type_params(candidate)
+        for constructor in children:
+            if not _is_constructor_of(constructor, candidate):
+                continue
+            if constructor.kind == cx.CursorKind.CONSTRUCTOR and (
+                constructor.is_copy_constructor() or constructor.is_move_constructor()
+            ):
+                continue
+            own_params = _template_type_params(constructor)
+            params = [c for c in constructor.get_children() if c.kind == cx.CursorKind.PARM_DECL]
+            if any(_param_takes_function(p.type, own_params, class_params, len(params) == 1)
+                   for p in params):
+                return True
+        if any(c.kind == cx.CursorKind.USING_DECLARATION for c in children):
+            for base in children:
+                if base.kind != cx.CursorKind.CXX_BASE_SPECIFIER or base.referenced is None:
+                    continue
+                definition = base.referenced.get_definition() or base.referenced
+                if _constructor_takes_function(definition, _depth + 1):
+                    return True
+    return False
+
+
+def _template_type_params(cursor: cx.Cursor) -> set[str]:
+    """The names of the template type parameters that *cursor* declares."""
+    try:
+        return {c.spelling for c in cursor.get_children()
+                if c.kind == cx.CursorKind.TEMPLATE_TYPE_PARAMETER}
+    except (ValueError, TypeError, RuntimeError, AttributeError):
+        return set()
+
+
+def _is_constructor_of(child: cx.Cursor, record: cx.Cursor) -> bool:
+    """Tell if *child* is a constructor of *record*, a template constructor included.
+
+    libclang spells a template constructor of a class template with its
+    arguments (``Opt<T>``), thus a match on the bare name missed it.
+    """
+    if child.kind == cx.CursorKind.CONSTRUCTOR:
+        return True
+    if child.kind != cx.CursorKind.FUNCTION_TEMPLATE:
+        return False
+    return child.spelling == record.spelling or child.spelling.startswith(record.spelling + "<")
+
+
+def _param_takes_function(
+    param_type: cx.Type, own_params: set[str], class_params: set[str], single: bool,
+) -> bool:
+    """Tell if a constructor parameter of *param_type* receives a function.
+
+    * a pointer to a function, or a member pointer, also through a
+      reference;
+    * ``F *`` where ``F`` is a template parameter of the class: the
+      hand-written ``template <class F> Callback(F *f)``;
+    * a template parameter of the constructor itself, by value or as a
+      forwarding reference, as its one parameter: ``std::function(F f)``,
+      ``Handler(F &&f)``.  Not ``Span(C &c)`` (an lvalue reference), and
+      not ``vector(It first, It last)`` (two parameters).
+    """
+    try:
+        lvalue = param_type.kind == cx.TypeKind.LVALUEREFERENCE
+        value_type = param_type
+        if value_type.kind in (cx.TypeKind.LVALUEREFERENCE, cx.TypeKind.RVALUEREFERENCE):
+            value_type = value_type.get_pointee()
+        canonical = value_type.get_canonical()
+        if canonical.kind == cx.TypeKind.MEMBERPOINTER:
+            return True
+        if canonical.kind == cx.TypeKind.POINTER:
+            if canonical.get_pointee().get_canonical().kind in (
+                cx.TypeKind.FUNCTIONPROTO, cx.TypeKind.FUNCTIONNOPROTO,
+            ):
+                return True
+            return _bare_type_name(value_type.get_pointee()) in class_params
+        return single and not lvalue and _bare_type_name(value_type) in own_params
+    except (ValueError, TypeError, RuntimeError, AttributeError):
+        return False
+
+
+def _bare_type_name(type_: cx.Type) -> str:
+    """The spelling of *type_* without ``const`` and reference marks."""
+    return type_.spelling.replace("const ", "").replace("&", "").strip()
+
+
+def _class_and_template(record: cx.Cursor) -> list[cx.Cursor]:
+    """*record*, and the class template that it instantiates, when there is one."""
+    candidates = [record]
+    template_of = _template_of_instance_call()
+    if template_of is not None:
+        try:
+            template = template_of(record)
+        except (ValueError, TypeError, RuntimeError, AttributeError, ctypes.ArgumentError):
+            template = None
+        if template is not None:
+            candidates.append(template)
+    return candidates
+
+
+def _stored_functions(
+    value: cx.Cursor, field_type: cx.Type | None, expected: cx.Type | None,
+) -> frozenset[str]:
+    """The USRs of the functions that a field really receives from *value*.
+
+    WHY: a function that the value only mentions was written as stored in
+    the field.  ``{ reg(fa), fb }`` and ``.n = sizeof(&fa)`` gave
+    ``n = fa`` for an ``int n``, and ``.cb = pick(fb)`` gave ``cb = fb``
+    although ``cb`` holds what ``pick`` returns.  A rule over the whole
+    value was too coarse: a call in the condition of
+    ``.cb = is_v2() ? isr_v2 : isr_v1`` then cost both correct rows.
+
+    The search follows the path on which a value reaches the field:
+
+    * wrappers (casts, parentheses, ``&``, ``*``) to the wrapped value;
+    * both branches of ``?:``, never its condition.  GNU ``a ?: b`` comes
+      from libclang as an UNEXPOSED_EXPR and is read as a wrapper, thus
+      only ``b`` counts: a known gap;
+    * the last operand of ``,``;
+    * the elements of a brace list or a compound literal of an array or
+      a scalar.  A struct list gives its own fields instead.
+
+    A call ends the path: the field holds what the call returns.  Two
+    exceptions build a class field from the functions of the arguments:
+
+    * a call of a constructor of the field's class (``Derived(fa)``, also
+      through an inherited constructor);
+    * a call whose type is the field's class when that class has a
+      constructor that takes a function (``.k = callback(fa)``): a
+      callback wrapper.  A plain struct that a factory fills
+      (``.o = make_ops(fa)``) is not built from ``fa``.
+
+    A C++ functional cast (``cb_t(fa)``, ``cb_t{fa}``) is followed when its
+    type can hold an address (a pointer, a member pointer, an integer of
+    at least ``int``), when it builds the field's class, or when it makes
+    a callback wrapper that a non-class field converts back
+    (``.cb = Wrap(fb)``).  ``bool(fa)`` stores no function.  An overload
+    set takes the function that *expected* picks.
+    """
+    try:
+        if field_type is not None and _strip_arrays(field_type).get_canonical().kind == cx.TypeKind.BOOL:
+            # A bool holds no function: ``.has = (bool)fa`` or ``!fa``.
+            return frozenset()
+    except (ValueError, TypeError, RuntimeError, AttributeError):
+        return frozenset()
+    field_class = ""
+    field_wraps = False
+    try:
+        storage = _strip_arrays(field_type) if field_type is not None else None
+        if storage is not None and storage.get_canonical().kind == cx.TypeKind.RECORD:
+            field_class = storage.get_canonical().spelling
+            field_wraps = _constructor_takes_function(storage.get_canonical().get_declaration())
+    except (ValueError, TypeError, RuntimeError, AttributeError):
+        field_class = ""
+
+    def _type_of(node: cx.Cursor) -> cx.Type | None:
+        try:
+            return node.type.get_canonical()
+        except (ValueError, TypeError, RuntimeError, AttributeError):
+            return None
+
+    def _is_field_class(node: cx.Cursor) -> bool:
+        node_type = _type_of(node)
+        return bool(field_class) and node_type is not None and node_type.spelling == field_class
+
+    def _follow_call(node: cx.Cursor) -> bool:
+        ref = node.referenced
+        is_constructor = ref is not None and ref.kind == cx.CursorKind.CONSTRUCTOR
+        if _is_field_class(node):
+            return is_constructor or field_wraps
+        if field_class or not is_constructor:
+            return False
+        # A wrapper that a non-class field converts back: ``.cb = Wrap(fb)``.
+        # libclang shows the syntactic form, the constructor call without
+        # the conversion.
+        node_type = _type_of(node)
+        return node_type is not None and _constructor_takes_function(node_type.get_declaration())
+
+    def _follow_cast(node: cx.Cursor) -> bool:
+        node_type = _type_of(node)
+        if node_type is None:
+            return False
+        if node_type.kind in _ADDRESS_TYPE_KINDS or node_type.kind in _ADDRESS_INTEGER_KINDS:
+            return True
+        if node_type.kind != cx.TypeKind.RECORD:
+            return False
+        if field_class:
+            return _is_field_class(node)
+        return _constructor_takes_function(node_type.get_declaration())
+
+    def _walk(node: cx.Cursor, depth: int) -> set[str]:
+        if depth > 64:
+            return set()
+        kind = node.kind
+        children = list(node.get_children())
+        if kind in (cx.CursorKind.DECL_REF_EXPR, cx.CursorKind.MEMBER_REF_EXPR):
+            ref = node.referenced
+            if ref is None:
+                return set()
+            if ref.kind == cx.CursorKind.OVERLOADED_DECL_REF:
+                if expected is None:
+                    return set()
+                return {d.get_usr() for d in _resolve_overload_set(ref, expected)}
+            return {ref.get_usr()} if ref.kind in _INDIRECT_TARGET_KINDS else set()
+        if kind == cx.CursorKind.CALL_EXPR:
+            if not _follow_call(node):
+                return set()
+            found: set[str] = set()
+            for arg in node.get_arguments():
+                found |= _walk(arg, depth + 1)
+            return found
+        if kind == cx.CursorKind.CXX_FUNCTIONAL_CAST_EXPR:
+            if not children or not _follow_cast(node):
+                return set()
+            return _walk(children[-1], depth + 1)
+        if kind == cx.CursorKind.CXX_NEW_EXPR:
+            # The field holds a pointer to a new object, not a function.
+            return set()
+        if kind in _VALUE_WRAPPERS or kind == cx.CursorKind.COMPOUND_LITERAL_EXPR:
+            return _walk(children[-1], depth + 1) if children else set()
+        if kind == cx.CursorKind.CONDITIONAL_OPERATOR:
+            found = set()
+            for branch in children[1:]:
+                found |= _walk(branch, depth + 1)
+            return found
+        if kind == cx.CursorKind.BINARY_OPERATOR:
+            spelling_call = _binary_operator_spelling_call()
+            try:
+                is_comma = spelling_call is not None and spelling_call(node) == ","
+            except (ValueError, TypeError, RuntimeError, AttributeError, ctypes.ArgumentError):
+                is_comma = False
+            return _walk(children[-1], depth + 1) if is_comma and children else set()
+        if kind == cx.CursorKind.INIT_LIST_EXPR:
+            try:
+                if _strip_arrays(node.type.get_canonical()).kind == cx.TypeKind.RECORD:
+                    return set()
+            except (ValueError, TypeError, RuntimeError, AttributeError):
+                return set()
+            found = set()
+            for element in children:
+                found |= _walk(element, depth + 1)
+            return found
+        return set()
+
+    if _holds_nested_list(value):
+        return frozenset()
+    return frozenset(_walk(value, 0))
+
+
+_CHAR_TYPE_KINDS = frozenset({
+    cx.TypeKind.CHAR_S, cx.TypeKind.CHAR_U, cx.TypeKind.SCHAR, cx.TypeKind.UCHAR,
+    cx.TypeKind.WCHAR, cx.TypeKind.CHAR16, cx.TypeKind.CHAR32,
+})
+
+
+def _is_char_array(field_type: cx.Type) -> bool:
+    """Tell if *field_type* is one array of characters, which one string literal fills."""
+    try:
+        canonical = field_type.get_canonical()
+        return (canonical.kind in _ARRAY_TYPE_KINDS
+                and canonical.element_type.get_canonical().kind in _CHAR_TYPE_KINDS)
+    except (ValueError, TypeError, RuntimeError, AttributeError):
+        return False
+
+
+def _initializes_whole_field(element: cx.Cursor, field_type: cx.Type) -> bool:
+    """Tell if *element*, an aggregate value with braces, is the whole field.
+
+    Braces alone do not say it.  ``(cb_t){ fa }`` is a scalar, and a
+    struct literal into an array of structs fills one element of the
+    array: in both cases brace elision goes on, and the next element is
+    not the next field.  The value is the whole field when its type is
+    the type of the field.
+    """
+    value = element
+    while value.kind in _VALUE_WRAPPERS:
+        children = list(value.get_children())
+        if not children:
+            return False
+        value = children[-1]
+    if value.kind != cx.CursorKind.INIT_LIST_EXPR and value.kind not in _LIST_VALUES:
+        return False
+    try:
+        return value.type.get_canonical().spelling == field_type.get_canonical().spelling
+    except (ValueError, TypeError, RuntimeError, AttributeError):
+        return False
+
+
+def _has_member_designator(element: cx.Cursor) -> bool:
+    """Tell if *element* names its field: a MEMBER_REF before the value (``.cb = f``, ``cb: f``)."""
+    children = list(element.get_children())
+    return any(c.kind == cx.CursorKind.MEMBER_REF for c in children[:-1])
+
+
+def _is_string_literal(value: cx.Cursor) -> bool:
+    """Tell if *value* is a string literal, through the wrappers of a value."""
+    while value.kind in _VALUE_WRAPPERS:
+        inner = list(value.get_children())
+        if not inner:
+            return False
+        value = inner[-1]
+    return value.kind == cx.CursorKind.STRING_LITERAL
+
+
+def _field_entry(field_decl: cx.Cursor) -> tuple[str | None, str, str, cx.Type | None]:
+    """The ``(USR, name, type, field type)`` entry of a field that can receive a function."""
+    return (field_decl.get_usr(), field_decl.spelling, _field_type_spelling(field_decl),
+            field_decl.type)
 
 
 def _handle_fn_ptr_cases(cursor: cx.Cursor, cur_fn: str | None,
@@ -2313,12 +2783,25 @@ def _handle_fn_ptr_cases(cursor: cx.Cursor, cur_fn: str | None,
         # The element type of an array list: the storage of each element
         # that names no field.
         array_storage = _storage_type(cursor.type)
+        # A positional struct list: the position of an element is its field.
+        positional_fields = _positional_struct_fields(cursor)
         for position, child in enumerate(cursor.get_children()):
-            child_usr, child_name, child_type, storage = _init_list_element_field(child)
+            if position < len(positional_fields):
+                child_usr, child_name, child_type, field_type = positional_fields[position]
+            else:
+                child_usr, child_name, child_type, field_type = _init_list_element_field(child)
+            storage = (_storage_type(field_type) if field_type is not None else None) or array_storage
+            # The functions that the field really receives.  A function
+            # that the value only mentions gets its indirect reference,
+            # but no assignment row.
+            stored = _stored_functions(child, field_type, storage) if child_name else None
+            if child_name and not stored:
+                child_usr, child_name, child_type = None, "", ""
             _emit_fn_ptr_targets(child, cur_fn, seen_ref, refs, fp_assignments,
                                  lhs_usr=child_usr, lhs_name=child_name, method="init_list",
-                                 lhs_type=child_type, expected_type=storage or array_storage,
-                                 slot_index=position if gives_slots else None)
+                                 lhs_type=child_type, expected_type=storage,
+                                 slot_index=position if gives_slots else None,
+                                 stored=stored)
 
 
 def _handle_implicit_constructors(cursor: cx.Cursor, cur_fn: str | None,
