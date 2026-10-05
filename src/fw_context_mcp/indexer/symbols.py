@@ -57,11 +57,12 @@ For each translation unit it produces:
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import re
 import threading
 from collections.abc import Callable, Generator
-from dataclasses import dataclass, field
+from dataclasses import astuple, dataclass, field
 from functools import cache
 from pathlib import Path
 
@@ -1182,7 +1183,9 @@ def _build_refs_and_fp_assignments(
         tu, refs, fp_assignments, pending_dispatches, seen_ref, _fn_spans, qn_to_usr, usr_to_qn, _log,
     )
 
-    return refs, indirect_call_sites, fp_assignments, pending_dispatches
+    # indirect_call_sites keep each row: two calls through one pointer on
+    # one line are two call sites (see find_indirect_call_sites in _refs.py).
+    return refs, indirect_call_sites, _distinct_records(fp_assignments), pending_dispatches
 
 
 @cache
@@ -1223,6 +1226,99 @@ def _template_of_instance_call() -> Callable[[cx.Cursor], cx.Cursor | None] | No
         "cannot answer."
     )
     return None
+
+
+@cache
+def _binary_operator_spelling_call() -> Callable[[cx.Cursor], str] | None:
+    """Resolve, ONCE, how to ask libclang for the operator of a BINARY_OPERATOR.
+
+    WHY: every BINARY_OPERATOR was read as an assignment, thus a comparison
+    such as ``hi2c->XferISR != I2C_Master_ISR_DMA`` became an
+    ``fp_assignments`` row, and the enclosing ``&&`` wrote the same row a
+    second time.  Measured over every index on one machine: 353 such
+    repeated rows of the method ``assignment``.
+
+    The pinned binding (libclang 18.1.1) has no ``Cursor.binary_operator``.
+    The C entry points ``clang_getCursorBinaryOperatorKind`` and
+    ``clang_getBinaryOperatorKindSpelling`` (libclang 17 and later) are in
+    the library, but not in the function table of the binding, thus this
+    function gives them their types.  They read the AST, not the tokens,
+    thus they also answer for an operator that a macro expands to.
+
+    When the library does not have them, the answer is None.  The caller
+    then reads each BINARY_OPERATOR as an assignment, as before, and the
+    reason is said ONCE at WARNING.
+    """
+    lib = cx.conf.lib
+    kind_of = getattr(lib, "clang_getCursorBinaryOperatorKind", None)
+    spelling_of = getattr(lib, "clang_getBinaryOperatorKindSpelling", None)
+    cx_string = getattr(cx, "_CXString", None)
+    if kind_of is None or spelling_of is None or cx_string is None:
+        _log.warning(
+            "libclang gives no way to read the operator of a binary "
+            "expression. Each one is read as an assignment, thus a "
+            "comparison with a function can show as an fp_assignments row."
+        )
+        return None
+    kind_of.argtypes = [cx.Cursor]
+    kind_of.restype = ctypes.c_uint
+    spelling_of.argtypes = [ctypes.c_uint]
+    spelling_of.restype = cx_string
+    spelling_of.errcheck = cx_string.from_result
+
+    def _spelling(cursor: cx.Cursor) -> str:
+        # clang_getCString gives None for a NULL string: "" then means
+        # "unknown", and the caller reads that as the old behaviour.
+        return spelling_of(kind_of(cursor)) or ""
+
+    return _spelling
+
+
+def _is_plain_assignment(cursor: cx.Cursor) -> bool:
+    """Tell if the BINARY_OPERATOR *cursor* is ``=``.
+
+    A compound operator such as ``+=`` is a COMPOUND_ASSIGNMENT_OPERATOR,
+    a different cursor kind, thus ``=`` is the only assignment here.
+    When the operator is unknown (no C API, a failed call, no spelling),
+    the answer is True, which is the old behaviour.
+    """
+    spelling_call = _binary_operator_spelling_call()
+    if spelling_call is None:
+        return True
+    try:
+        spelling = spelling_call(cursor)
+    except (ValueError, TypeError, RuntimeError, AttributeError, ctypes.ArgumentError):
+        _log.debug("binary operator kind failed for %s", cursor.spelling)
+        return True
+    return spelling == "=" if spelling else True
+
+
+def _distinct_records(records: list[FnPointerAssignment]) -> list[FnPointerAssignment]:
+    """Keep the first of each set of equal records, in the order of the walk.
+
+    WHY: two causes gave rows that were equal in each column, and
+    ``find_indirect_targets`` showed them as rows that a reader cannot tell
+    apart.  Measured over every index on one machine: 617 repeated
+    ``fp_assignments`` rows.
+
+    * The walk reaches one fact more than once.  Each nested CALL_EXPR of
+      ``_in_task = mbed::callback(this, &USBMSD::_in)`` found the same
+      target.
+    * A macro that expands once for each device
+      (``DT_INST_FOREACH_STATUS_OKAY``) assigns the same function to the
+      same field of each instance.  Those are different facts, but the row
+      cannot name the instance: each expansion has the same file, line and
+      field.  One row says all that the rows can say.
+    """
+    seen: set[tuple] = set()
+    distinct: list[FnPointerAssignment] = []
+    for record in records:
+        key = astuple(record)
+        if key in seen:
+            continue
+        seen.add(key)
+        distinct.append(record)
+    return distinct
 
 
 def _process_one_symbol(
@@ -1948,7 +2044,12 @@ def _handle_fn_ptr_cases(cursor: cx.Cursor, cur_fn: str | None,
     """
 
     if cursor.kind == cx.CursorKind.BINARY_OPERATOR:
-        lhs_usr, lhs_name = _extract_lhs_field(cursor)
+        # Only ``=`` assigns.  Another operator, such as ``!=`` or ``&&``,
+        # still gives its indirect references, but it has no left-hand
+        # side that receives the function, thus no assignment row.
+        lhs_usr, lhs_name = (
+            _extract_lhs_field(cursor) if _is_plain_assignment(cursor) else (None, "")
+        )
         _emit_fn_ptr_targets(cursor, cur_fn, seen_ref, refs, fp_assignments,
                              lhs_usr=lhs_usr, lhs_name=lhs_name, method="assignment")
     elif cursor.kind == cx.CursorKind.VAR_DECL and _is_fn_ptr_type(cursor.type):
