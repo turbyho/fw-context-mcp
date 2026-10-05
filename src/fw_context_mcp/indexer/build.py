@@ -658,8 +658,9 @@ def resolve_reuse_compile_commands(project_root: Path, configured: Path) -> Path
     (explicit user overrides) are returned unchanged.
     """
     root = project_root.resolve()
-    if not configured.is_absolute():
-        configured = (root / configured).resolve()
+    # An absolute path is resolved too: every other path here is, and a
+    # caller that compares the result must not see /var and /private/var.
+    configured = (root / configured).resolve()
     legacy = root / "compile_commands.json"
     canonical = cc_output_path(root)
     if configured == legacy and canonical.exists():

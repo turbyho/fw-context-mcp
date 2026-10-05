@@ -531,9 +531,12 @@ def stop_process_group(
                 return
             time.sleep(0.05)
     finally:
+        # PermissionError: macOS refuses a signal to a group that holds only
+        # zombies (EPERM, where Linux gives success).  Nothing runs there, and
+        # the parent of each zombie reaps it.
         try:
             os.killpg(pgid, signal.SIGKILL)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
 
 
