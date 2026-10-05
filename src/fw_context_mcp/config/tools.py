@@ -132,9 +132,9 @@ One project can hold several builds on two axes: `variant` is the board,
 — a bootloader is NOT the application.
 
 **One query answers for ONE build.** Both selectors fail closed: when the
-project declares variants and sets no `[build] default_variant`, or the
-variant holds more than one image, a query that names none gets an error
-that lists the choices. That
+project holds variants (declared in the config or found in the index) and
+sets no `[build] default_variant`, or the variant holds more than one
+image, a query that names none gets an error that lists the choices. That
 is on purpose — an answer blending a bootloader with an application serves
 no question, and two builds of one application would repeat nearly every
 row.
@@ -199,9 +199,9 @@ cover almost every tool:
 - `query` — the search terms (every search tool).
 
 No tool takes a filler argument. `get_active_build` accepts only
-`project`, `project_root` and `fast`. When a call fails on an argument, drop that
-argument and REPEAT the call — never continue without the answer, and
-never skip `get_active_build`.
+`project`, `project_root` and `fast`. When a call fails on an argument,
+drop that argument and REPEAT the call — never continue without the
+answer, and never skip `get_active_build`.
 
 ### search_bodies reaches more than functions
 

@@ -890,13 +890,25 @@ def test_every_copy_of_the_instructions_states_the_corrected_tool_rules():
     then looked for a ``status="error"`` that the tool never gives, and
     did not know that ``get_symbol_context`` can also answer from the disk.
     """
+    rules = (
+        "get_source and get_symbol_context set a stale_warning",
+        "There is no status",
+        'wins over "reindexing"',
+        "found in the index) and sets no [build] default_variant",
+        "when more is true",
+        "search_content, find_dead_code",
+        "Repeat the call with that project_id",
+        "find_call_path (from_name, to_name)",
+        "trace_data_flow (type_name, to_symbol)",
+        "get_vector_table",
+        "accepts only project, project_root and fast",
+    )
     for label, text in _instruction_copies():
-        assert "get_source and get_symbol_context set a stale_warning" in " ".join(
-            text.replace("`", "").split()
-        ), label
-        assert "There is no status" in " ".join(text.split()), label
-        assert "default_variant" in text, label
-        assert "`project`, `project_root`" in text, label
+        # One copy is Markdown and the other a wrapped string literal, thus
+        # the check removes the backticks and the line breaks.
+        flat = " ".join(text.replace("`", "").split())
+        for rule in rules:
+            assert rule in flat, f"{label}: {rule!r}"
 
 
 def test_no_copy_of_the_instructions_holds_a_dead_file():
