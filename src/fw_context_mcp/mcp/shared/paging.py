@@ -56,6 +56,38 @@ def page_notice(
     return notice
 
 
+def page_hint(tool: str, *args: object, next_offset: int, **kwargs: object) -> str:
+    """Spell out the call that reads the next page.
+
+    The text is the call itself, for example
+    ``find_variables('g_', kind='varglobal', offset=20) reads the next page.``
+    A reader that copies it gets the same answer one page further on, thus
+    the call must repeat every argument that changes the answer, and not
+    only the offset.
+
+    A string argument is in single quotes, as in the hints of the older
+    paged tools, and any other value is written as it is.
+    """
+    parts = [_hint_value(a) for a in args]
+    parts += [f"{key}={_hint_value(value)}" for key, value in kwargs.items()]
+    parts.append(f"offset={next_offset}")
+    return f"{tool}({', '.join(parts)}) reads the next page."
+
+
+def _hint_value(value: object) -> str:
+    return f"'{value}'" if isinstance(value, str) else str(value)
+
+
+def past_end_info(thing: str, offset: int, total: int) -> dict:
+    """The answer to a page that starts after the last row.
+
+    An empty list would read as "no such code".  The row says instead that
+    the answer exists and is shorter than the offset, thus the reader goes
+    back and does not conclude that nothing matched.
+    """
+    return {"info": f"No {thing} at offset {offset}; the answer holds {total}."}
+
+
 def clamp_offset(offset: int | None) -> int:
     """Read the offset a caller gave.  A missing or negative one is zero."""
     if not offset or offset < 0:

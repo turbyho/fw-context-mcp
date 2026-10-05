@@ -97,6 +97,31 @@ class TestPageNotice:
         assert clamp_offset(0) == 0
         assert clamp_offset(7) == 7
 
+    def test_the_hint_repeats_each_argument_that_changes_the_answer(self):
+        from fw_context_mcp.mcp.shared.paging import page_hint
+
+        assert page_hint("find_variables", "g_", kind="varglobal", next_offset=20) == (
+            "find_variables('g_', kind='varglobal', offset=20) reads the next page."
+        )
+        assert page_hint("get_vector_table", unhandled_only=True, next_offset=400) == (
+            "get_vector_table(unhandled_only=True, offset=400) reads the next page."
+        )
+
+    def test_the_hint_has_the_shape_of_the_older_hints(self):
+        """The older tools write ``tool('name', offset=N)``; a new tool must read the same."""
+        from fw_context_mcp.mcp.shared.paging import page_hint
+
+        assert page_hint("lookup_symbol", "uart", next_offset=50) == (
+            "lookup_symbol('uart', offset=50) reads the next page."
+        )
+
+    def test_a_page_past_the_end_names_the_size_of_the_answer(self):
+        from fw_context_mcp.mcp.shared.paging import past_end_info
+
+        assert past_end_info("variable", 40, 12) == {
+            "info": "No variable at offset 40; the answer holds 12."
+        }
+
 
 class TestRefsPageWalk:
     """Two pages of one walk must not overlap and must not skip."""
