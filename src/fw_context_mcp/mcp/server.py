@@ -115,14 +115,32 @@ _SERVER_LOCK_TIMEOUT = 5.0  # seconds
 
 
 def _wrap_debug(msg: str) -> None:
-    """Write to /tmp/fw-context-debug.log when FW_CONTEXT_DEBUG_WRAP=1."""
+    """Write to ``fw-context-debug.log`` in the temp directory when FW_CONTEXT_DEBUG_WRAP=1.
+
+    The temp directory of the platform (``tempfile.gettempdir()``), not a
+    fixed ``/tmp``: it honours ``TMPDIR`` and exists on every platform.
+    """
     if os.environ.get("FW_CONTEXT_DEBUG_WRAP") != "1":
         return
+    import tempfile
+
     try:
-        with open("/tmp/fw-context-debug.log", "a") as f:
+        with open(Path(tempfile.gettempdir()) / "fw-context-debug.log", "a", encoding="utf-8") as f:
             f.write(f"{msg}\n")
     except OSError:
         pass
+
+
+def _busy_error(tool: str) -> list[dict]:
+    """The answer of a tool that did not get the server lock in time.
+
+    One text for the sync and the async path.
+    """
+    return [{"error": (
+        f"The MCP server is currently processing another query ({tool} cannot run right now "
+        "because a different tool is already executing). Wait for the active query to complete, "
+        "then retry. A query that runs longer than 300 s is cancelled."
+    )}]
 
 
 def _wrap_tool(fn):
@@ -161,7 +179,7 @@ def _wrap_tool(fn):
                 await asyncio.wait_for(_SERVER_LOCK.acquire(), timeout=_SERVER_LOCK_TIMEOUT)
             except TimeoutError:
                 _wrap_debug(f"[async] {fn.__name__} BUSY — lock timeout")
-                return [{"error": f"The MCP server is currently processing another query ({fn.__name__} cannot run right now because a different tool is already executing). Wait for the active query to complete, then retry. A query that runs longer than 300 s is cancelled."}]
+                return _busy_error(fn.__name__)
             try:
                 task = asyncio.ensure_future(fn(*a, **kw))
 
@@ -215,7 +233,7 @@ def _wrap_tool(fn):
             await asyncio.wait_for(_SERVER_LOCK.acquire(), timeout=_SERVER_LOCK_TIMEOUT)
         except TimeoutError:
             _wrap_debug(f"[sync] {fn.__name__} BUSY — lock timeout")
-            return [{"error": f"Server busy — {fn.__name__} cannot run, another query is in progress. Retry in a few seconds."}]
+            return _busy_error(fn.__name__)
         try:
             # functools.partial captures *a and **kw into a zero-argument
             # callable that asyncio.to_thread can execute on the thread pool.
