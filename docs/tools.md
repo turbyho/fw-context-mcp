@@ -1622,7 +1622,8 @@ lookup** when fw-context does not find the symbol as a function or method.
 
 ```
 Input:  {"name": "uart_write", "project_root?": "/path/to/project", "limit?": 50, "offset?": 0}
-Output: [{"file": "/path/src/main.c", "line": 35, "ref_kind": "call",
+Output: [{"total": 2, "offset": 0, "shown": 2, "more": false},
+         {"file": "/path/src/main.c", "line": 35, "ref_kind": "call",
           "caller": "main", "caller_kind": "function"},
          {"file": "/path/src/setup.c", "line": 12, "ref_kind": "indirect",
           "caller": "setup", "caller_kind": "function"}]
@@ -1670,7 +1671,9 @@ back to a **macro lookup**. In that case, this tool returns
 
 ```
 Input:  {"name": "g_sensor_data", "project_root?": "/path/to/project", "limit?": 50, "offset?": 0}
-Output: [{"file": "/path/src/sensor.c", "line": 12, "ref_kind": "ref",
+Output: [{"total": 74, "offset": 0, "shown": 50, "more": true,
+          "hint": "find_references('g_sensor_data', offset=50) reads the next page."},
+         {"file": "/path/src/sensor.c", "line": 12, "ref_kind": "ref",
           "caller": "sensor_task", "caller_kind": "function"}, …]
 ```
 
@@ -1773,6 +1776,7 @@ Finds functions that have a definition, but no caller. Returns two categories:
 ```
 Input:  {"project_root?": "/path/to/project", "limit?": 100, "offset?": 0, "project_only?": true, "exclude_paths?": ["lib/%"]}
 Output: [
+  {"total": 12, "offset": 0, "shown": 12, "more": false},
   {"name": "orphan_fn", "kind": "function", "file": "/path/src/utils.c",
    "signature": "void orphan_fn()", "line": 200,
    "status": "dead", "reason": "no references found — likely unused"},
@@ -1824,7 +1828,9 @@ Most-called functions ranked by caller count.
 
 ```
 Input:  {"project_root?": "/path/to/project", "limit?": 20, "offset?": 0, "project_only?": true, "exclude_paths?": ["lib/%"]}
-Output: [{"name": "log_debug", "kind": "function", "caller_count": 147, …},
+Output: [{"total": 212, "offset": 0, "shown": 20, "more": true,
+          "hint": "find_hotspots(offset=20) reads the next page."},
+         {"name": "log_debug", "kind": "function", "caller_count": 147, …},
          {"name": "millis", "kind": "function", "caller_count": 89, …}, …]
 ```
 
