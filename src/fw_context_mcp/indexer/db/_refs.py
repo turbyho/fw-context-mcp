@@ -381,7 +381,7 @@ def find_indirect_targets(
                  -- assignments where neither lhs_usr nor lhs_name match the
                  -- searched field name)
                  fpa.rhs_name = ?
-                 OR fpa.rhs_name LIKE ?
+                 OR fpa.rhs_name LIKE ? ESCAPE '\\'
              )
            ORDER BY fpa.from_file, fpa.from_line
            LIMIT ?""",

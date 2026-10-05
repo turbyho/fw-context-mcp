@@ -1622,7 +1622,7 @@ Output: [
    "signature": "void handler_timeout()", "line": 25,
    "status": "possibly_dead",
    "reason": "assigned as function pointer but call sites unresolved",
-   "indirect_refs": "src/main.c:60"},
+   "indirect_refs": "/path/src/main.c:60"},
   …
 ]
 ```
@@ -1755,7 +1755,14 @@ qualified name, or `::name` suffix, and a parameter by its name. `name`
 also matches the ASSIGNED function, by exact name or substring. Thus a
 row can be an assignment of a function whose name holds `name`, to a
 pointer with another name. Read `rhs_name` and the call site before you
-act on such a row.
+act on such a row. `_` and `%` in `name` match themselves, not any
+character.
+
+**Inferred call sites.** When the pointer has no call site of its own,
+fw-context tries fallbacks. An entry that one of them filled carries
+`_note`, or `call_expr_text: "<inferred via class hierarchy>"`. The
+`fn_ptr_type` fallback gives a call through another pointer of the same
+type: a candidate, not a proof.
 
 For the reverse query — where does code call this field — use
 `find_indirect_call_sites`.
@@ -1782,7 +1789,9 @@ Finds the definitions whose signature mentions `type_name` (substring
 match, any symbol kind, most-called first), then looks for call paths from
 those definitions to `to_symbol`. A `_summary` row comes first. Each
 source row holds up to 3 `paths`, in the shape that `find_call_path`
-gives. An unreachable source has no `paths` key. `timed_out: true` means
+gives. An unreachable source has no `paths` key. When `to_symbol` matches
+more than one symbol, a source row also holds the `warning` that names
+them, and each path its `target_qualified_name`. `timed_out: true` means
 that the time budget (`timeout_ms`) ran out before the search for that
 source began: its `reachable: false` means "not checked". When nothing
 matches, the result is one `info` dict. Does **not** resolve type
@@ -1798,17 +1807,17 @@ table itself.
 
 ```
 Input:  {"project_root?": "/path/to/project", "unhandled_only?": false, "limit?": 400}
-Output: [{"slot": 0, "name": "__StackTop", "file": ".link_script.ld", "line": 148,
+Output: [{"slot": 0, "name": "__StackTop", "file": "/path/.link_script.ld", "line": 148,
           "status": "linker", "source": "assembly",
-          "table_file": "startup_stm32f429xx.S", "table_line": 60},
-         {"slot": 44, "name": "TIM2_IRQHandler", "file": "src/timer.c", "line": 31,
+          "table_file": "/path/startup_stm32f429xx.S", "table_line": 60},
+         {"slot": 44, "name": "TIM2_IRQHandler", "file": "/path/src/timer.c", "line": 31,
           "status": "c", "source": "assembly",
-          "table_file": "startup_stm32f429xx.S", "table_line": 104,
-          "overridden": {"file": "startup_stm32f429xx.S", "line": 412}},
-         {"slot": 45, "name": "TIM3_IRQHandler", "file": "startup_stm32f429xx.S", "line": 413,
+          "table_file": "/path/startup_stm32f429xx.S", "table_line": 104,
+          "overridden": {"file": "/path/startup_stm32f429xx.S", "line": 412}},
+         {"slot": 45, "name": "TIM3_IRQHandler", "file": "/path/startup_stm32f429xx.S", "line": 413,
           "status": "unhandled", "source": "assembly",
-          "table_file": "startup_stm32f429xx.S", "table_line": 105,
-          "aliases": {"name": "Default_Handler", "file": "startup_stm32f429xx.S", "line": 380}},
+          "table_file": "/path/startup_stm32f429xx.S", "table_line": 105,
+          "aliases": {"name": "Default_Handler", "file": "/path/startup_stm32f429xx.S", "line": 380}},
          …,
          {"coverage": "…"}, {"interrupts": "…"}]
 ```
@@ -1819,10 +1828,10 @@ exceptions, and slot 16 + n is external interrupt n. fw-context does not
 renumber slots across tables: two tables both start at 0. Read `slot`
 together with `table_name` and `source`.
 
-**Paths are relative.** This tool gives paths as the index stores them:
-relative to the project root for a file inside it. This applies to
+**Paths are absolute**, as in the other graph tools. This applies to
 `file`, `table_file`, and the paths in `overridden`, `aliases`, and
-`installed` (also `at`). The other graph tools give absolute paths.
+`installed` (also `at`, a `file:line`). A `"build"` row without a single
+definition has an empty `file`.
 
 `status` says what services the interrupt:
 
@@ -2008,9 +2017,8 @@ the user without interpretation. The `index` field is the full
 `get_active_build()` result, unchanged; its `index_message` carries the
 action.
 
-This tool is read-only, with one exception: on an initialized project,
-its `get_active_build` call creates default `.fw-context/config.toml` and
-`local.toml` when they are missing. Use it at session start, to see everything that
+This tool is read-only, and it creates no `.fw-context` file in a project
+that is not initialized. Use it at session start, to see everything that
 needs fixing before answering the user. Pass `project_root` explicitly
 when the project is not the server's working directory.
 
@@ -2059,9 +2067,8 @@ Output: {"config_hash": "a1b2…", "project_id": "c3d4…", "project_root": "/pa
          "defines": {"__ZEPHYR__": "1", …}, "defines_varying": 4}
 ```
 
-**Read-only, with one exception.** The config load creates default
-`.fw-context/config.toml` and `local.toml` when they are missing. This
-tool does not spawn background tasks. The server startup thread and the file watcher manage the
+**Read-only.** It creates no `.fw-context` file in a project that is not
+initialized. This tool does not spawn background tasks. The server startup thread and the file watcher manage the
 background reindex. `bg_reindex_running` reports whether an index run is
 active. Only while a run is active, `reindex_progress` holds the newest
 progress or error line that fw-context wrote for that run. Output of the
@@ -2380,6 +2387,12 @@ tool uses the local Ollama instance. When `chat_api_base` points to an
 external host, source code in chat prompts is sent to that host. Verify
 this complies with your data security policy. Prefer the local Ollama
 instance.
+
+Every parameter you omit keeps its current value. `auto_pull` and
+`chat_api_format` are written only when you pass them and they differ from
+the current value; `chat_api_format: "auto"` returns to the detection from
+the URL. A call that changes nothing returns `status: "error"` and writes
+nothing.
 
 When the test call fails, this tool restores the previous
 `.fw-context/local.toml` (or removes the file if it did not exist). The

@@ -832,7 +832,9 @@ def find_indirect_targets(
 
         An entry can carry ``_note`` (str) when the callee is
         template-obscured: the call site is then missing, or comes from
-        the type-based fallback.  A ``call_expr_text`` of ``"<inferred via
+        the type-based fallback.  ``_note`` also marks a call site that
+        the ``fn_ptr_type`` fallback found: a call through another pointer
+        of the same type.  A ``call_expr_text`` of ``"<inferred via
         class hierarchy>"`` marks a call site that a fallback found, not
         the field's USR.  Read both before you act on ``call_file`` and
         ``call_line``.
@@ -900,6 +902,10 @@ def find_indirect_targets(
                         "Call site resolved via type-based fallback "
                         "(template-obscured callback → receiver class handler)."
                     )
+            if "_note" not in entry and r.get("_note"):
+                # The fn_ptr_type fallback of the DB layer: a call site of
+                # another pointer with the same type, not of this one.
+                entry["_note"] = str(r["_note"])
             results.append(entry)
         return results
 
@@ -935,6 +941,19 @@ def _refs_guard(project_root: str | None, variant: str | None = None, image: str
         )}]
 
     return db, None
+
+
+def _absolute_sites(sites: str, root: Path) -> str:
+    """Make each ``file:line`` of a ``", "``-joined list absolute.
+
+    The index stores a path relative to the project root; every other path
+    that a graph tool gives is absolute.
+    """
+    out: list[str] = []
+    for site in sites.split(", "):
+        file, sep, line = site.rpartition(":")
+        out.append(f"{abs_path(root, file)}:{line}" if sep else site)
+    return ", ".join(out)
 
 
 def _with_absolute_file(rows: list[dict], root: Path) -> list[dict]:
@@ -1327,7 +1346,7 @@ def find_dead_code(
         ``"possibly_dead"``), and reason (str — explains why the function
         is classified as dead or possibly dead).  A ``"possibly_dead"`` row
         also holds indirect_refs (str — up to 3 ``file:line`` pointer
-        uses, paths relative to the project root).  ``"dead"`` rows come
+        uses, absolute paths, joined with ``", "``).  ``"dead"`` rows come
         first.
 
         Never empty: one dict with ``error`` or ``info`` replaces an empty
@@ -1367,6 +1386,9 @@ def find_dead_code(
                 )}]
             return [{"info": "No dead or possibly-dead functions found — every defined function has at least one caller."}]
         out = _with_absolute_file(rows, db.root)
+        for row in out:
+            if row.get("indirect_refs"):
+                row["indirect_refs"] = _absolute_sites(row["indirect_refs"], db.root)
         out.insert(0, page_notice(
             total, skip, len(rows),
             hint=f"find_dead_code(offset={skip + len(rows)}) reads the next page.",
@@ -1616,7 +1638,10 @@ def trace_data_flow(
         entries each with: source_name, source_qualified_name, source_kind,
         source_file (absolute), source_line, caller_count, reachable
         (bool), and paths (up to 3 path dicts as ``find_call_path`` gives
-        them; the key is absent when unreachable).
+        them; the key is absent when unreachable).  When *to_symbol*
+        matches more than one symbol, a source entry also holds the
+        ``warning`` that names them, and each path its
+        ``target_qualified_name``.
 
         A source entry with ``timed_out: True`` means that the time budget
         ran out before the search for that source began.  Its
@@ -1702,6 +1727,13 @@ def trace_data_flow(
                 "source_line": src["line"],
                 "caller_count": src["caller_count"],
             }
+            # An ambiguous to_symbol makes find_call_path lead with a
+            # ``warning`` row: it is no path, and it must not take one of
+            # the three places.
+            notices = [p for p in paths if "warning" in p]
+            paths = [p for p in paths if "warning" not in p]
+            if notices:
+                entry["warning"] = notices[0]["warning"]
             if paths:
                 entry["reachable"] = True
                 entry["paths"] = paths[:3]
@@ -1819,7 +1851,11 @@ def find_hotspots(
                 )}]
             if project_only:
                 return [{"info": "No project hotspots found. Try project_only=False to include vendor code."}]
-            return [{"info": "No references indexed — enable index_refs and re-index."}]
+            # _refs_guard already found references: none of them is a call
+            # of a function that the filters keep.
+            if exclude_paths:
+                return [{"info": "No hotspots found: exclude_paths removed every called function."}]
+            return [{"info": "No hotspots found: no function has a call or indirect reference."}]
         out = _with_absolute_file(rows, db.root)
         out.insert(0, page_notice(
             total, skip, len(rows),
@@ -2276,9 +2312,8 @@ def get_vector_table(
         ``"build"``),
         status (``"c"``, ``"assembly"``, ``"unhandled"``, ``"runtime"``,
         ``"data"``, ``"linker"`` or ``"dispatcher"``), and table_file and table_line
-        (where the slot is written).  Paths in this answer are as the
-        index stores them: relative to the project root for a file inside
-        it.  A ``"c"`` source row also holds
+        (where the slot is written).  Every path in this answer is
+        absolute, ``at`` included.  A ``"c"`` source row also holds
         table_name and table_usr.  A ``"c"`` status row can hold
         overridden, a dict with file and line.  An ``"unhandled"`` row
         holds aliases, a dict with name, file and line.  Any assembly row
@@ -2304,8 +2339,31 @@ def get_vector_table(
         # Runs under the executor lock on the single shared connection;
         # must not open its own connection.  Timeout is enforced by
         # _wrap_tool (300 s + interrupt), not here.
-        return _vector_rows(
+        return _absolute_vector_paths(_vector_rows(
             conn, config_hash, unhandled_only=unhandled_only, limit=limit,
-        )
+        ), db.root)
 
     return db.execute_scoped(_query)
+
+
+def _absolute_vector_paths(value, root: Path):
+    """Make every path of a get_vector_table answer absolute.
+
+    ``file`` and ``table_file`` are paths, ``at`` is a ``file:line``.  They
+    sit in the rows and in the nested ``overridden``, ``aliases`` and
+    ``installed`` entries, thus the walk goes through dicts and lists.
+    An empty ``file`` (a ``"build"`` row without a definition) stays empty.
+    """
+    if isinstance(value, list):
+        return [_absolute_vector_paths(v, root) for v in value]
+    if not isinstance(value, dict):
+        return value
+    out: dict = {}
+    for key, item in value.items():
+        if key in ("file", "table_file") and isinstance(item, str):
+            out[key] = abs_path(root, item)
+        elif key == "at" and isinstance(item, str) and item:
+            out[key] = _absolute_sites(item, root)
+        else:
+            out[key] = _absolute_vector_paths(item, root)
+    return out
