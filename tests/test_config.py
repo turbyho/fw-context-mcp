@@ -172,10 +172,15 @@ class TestLocalConfig:
 
     def test_load_with_local_toml(self, tmpdir, monkeypatch):
         """load() reads local.toml as the 4th layer."""
-        # Point global config to a temp file that doesn't exist yet
+        import fw_context_mcp.config.settings as settings
+
         fake_home = tmpdir / "fake-home"
         fake_home.mkdir()
         monkeypatch.setattr(Path, "home", lambda: fake_home)
+        # The fake home does not move _GLOBAL_CONFIG_PATH, which the module
+        # computes at import.  Point it to a temp file that does not exist
+        # yet, thus load() creates it there and not in the real home.
+        monkeypatch.setattr(settings, "_GLOBAL_CONFIG_PATH", Path(fake_home) / "global.toml")
 
         # Create project config (shared)
         proj_dir = tmpdir / "project"
@@ -210,9 +215,17 @@ class TestQueryDriverTrust:
     """
 
     def _project(self, tmpdir, monkeypatch, committed: str, local: str = "") -> Path:
+        import fw_context_mcp.config.settings as settings
+
         fake_home = tmpdir / "fake-home"
         fake_home.mkdir()
         monkeypatch.setattr(Path, "home", lambda: fake_home)
+        # The module computes _GLOBAL_CONFIG_PATH at import, thus the fake
+        # home does not move it.  Without this line, load() reads the global
+        # config of the operator, and a query_driver there breaks the tests.
+        global_cfg = Path(fake_home) / "global.toml"
+        global_cfg.write_text("")
+        monkeypatch.setattr(settings, "_GLOBAL_CONFIG_PATH", global_cfg)
         proj_dir = Path(tmpdir / "project")
         (proj_dir / ".fw-context").mkdir(parents=True)
         (proj_dir / ".fw-context" / "config.toml").write_text(committed)
