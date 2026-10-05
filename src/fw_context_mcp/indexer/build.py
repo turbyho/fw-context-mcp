@@ -23,7 +23,7 @@ from pathlib import Path
 
 from fw_context_mcp.utils import (
     CC_STAGING_GLOB,
-    build_env,
+    build_cfg_env,
     cc_output_path,
     cc_staging_path,
     ignore_autobuild_dir,
@@ -452,12 +452,14 @@ def _run_pre_build(cfg: BuildConfig, cwd: Path) -> None:
     import shlex
     # build_env, not the raw inherited environment: a hook the harness put in
     # BASH_ENV hijacks any `bash -c` the user configures here — see utils.
+    # build_cfg_env adds [build] env, extra_path and extra_env, as for every
+    # builder command.
     # In its own process group, as each build command — see
     # utils.run_in_process_group.  The timeout is a RuntimeError, because
     # each caller of generate_compile_commands catches only that.
     try:
         result = run_in_process_group(
-            shlex.split(cfg.pre_build), cwd=cwd, env=build_env(),
+            shlex.split(cfg.pre_build), cwd=cwd, env=build_cfg_env(cfg),
             timeout=cfg.timeout, capture_output=False,
         )
     except subprocess.TimeoutExpired:
@@ -582,7 +584,7 @@ def _generate_into(root: Path, cfg: BuildConfig) -> Path:
         # documented override, and BASH_ENV would hijack it.
         # In its own process group — see utils.run_in_process_group.
         result = run_in_process_group(
-            shlex.split(cfg.command), cwd=root, env=build_env(),
+            shlex.split(cfg.command), cwd=root, env=build_cfg_env(cfg),
             timeout=None, capture_output=False,
         )
         if result.returncode != 0:

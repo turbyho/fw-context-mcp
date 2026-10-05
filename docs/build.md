@@ -151,6 +151,10 @@ the command, and `activate` runs through `bash -c`. If a build needs
 `BASH_ENV`, set it in `[build] env` or in `[build] extra_env`
 (`local.toml`). A configured value is applied after the removal.
 
+`[build] env`, `extra_path` and `extra_env` apply to every command that
+the build runs: the builder commands, the `pre_build` hook, and the
+`command` override. `activate` applies to the builder commands only.
+
 ### Mbed OS
 
 | Parameter | Type | Default | Description |

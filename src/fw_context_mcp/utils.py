@@ -607,6 +607,26 @@ def run_in_process_group(
     return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
 
+def build_cfg_env(build_cfg: BuildConfig | None, env: dict[str, str] | None = None) -> dict[str, str]:
+    """The environment of a build command: :func:`build_env` plus the build config.
+
+    *env* goes on top of :func:`build_env`, then ``build_cfg.env``,
+    ``build_cfg.extra_path`` (prepended to ``PATH``) and
+    ``build_cfg.extra_env``.  Every command that the build config runs gets
+    it: the builders through :func:`run_build_command`, and the
+    ``pre_build`` hook and the ``command`` override in ``indexer.build``.
+    """
+    merged_env = build_env(env)
+    if build_cfg:
+        if build_cfg.env:
+            merged_env.update(build_cfg.env)
+        if build_cfg.extra_path:
+            merged_env["PATH"] = os.pathsep.join(build_cfg.extra_path) + os.pathsep + merged_env.get("PATH", "")
+        if build_cfg.extra_env:
+            merged_env.update(build_cfg.extra_env)
+    return merged_env
+
+
 def run_build_command(
     cmd: list[str],
     cwd: Path,
@@ -659,15 +679,9 @@ def run_build_command(
     if timeout is None:
         timeout = build_cfg.timeout if build_cfg is not None else 7200
 
-    merged_env = build_env(env)
+    merged_env = build_cfg_env(build_cfg, env)
 
     if build_cfg:
-        if build_cfg.env:
-            merged_env.update(build_cfg.env)
-        if build_cfg.extra_path:
-            merged_env["PATH"] = os.pathsep.join(build_cfg.extra_path) + os.pathsep + merged_env.get("PATH", "")
-        if build_cfg.extra_env:
-            merged_env.update(build_cfg.extra_env)
         if build_cfg.activate:
             expanded = str(Path(build_cfg.activate).expanduser())
             cmd_str = " ".join(shlex.quote(c) for c in cmd)
