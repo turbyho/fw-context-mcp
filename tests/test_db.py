@@ -2501,11 +2501,11 @@ class TestReconcileGenerated:
         """The UPDATE is scoped to this config_hash."""
         from fw_context_mcp.indexer._postprocess import _step_reconcile_generated
         from fw_context_mcp.indexer.db import (
+            open_db,
             upsert_build_config,
             upsert_file,
             upsert_project,
         )
-        from fw_context_mcp.indexer.db import open_db
 
         conn = open_db(tmp_path / "index.db")
         try:
@@ -2698,7 +2698,11 @@ class TestOrphanFileCleanup:
 
     def test_another_build_is_not_touched(self, tmp_path: Path):
         from fw_context_mcp.indexer.db import (
-            delete_orphan_files, open_db, upsert_build_config, upsert_file, upsert_project,
+            delete_orphan_files,
+            open_db,
+            upsert_build_config,
+            upsert_file,
+            upsert_project,
         )
 
         header = tmp_path / "stale.h"

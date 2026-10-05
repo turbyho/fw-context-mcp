@@ -17,10 +17,10 @@ from pathlib import Path
 import pytest
 
 from fw_context_mcp.utils import (
+    C_SOURCE_EXTENSIONS,
     CPP_EXTENSIONS,
     CPP_HEADER_EXTENSIONS,
     CPP_SOURCE_EXTENSIONS,
-    C_SOURCE_EXTENSIONS,
     HEADER_EXTENSIONS,
     TU_EXTENSIONS,
 )

@@ -89,11 +89,15 @@ profile = "release"
         assert variant.overrides.get("profile") == "release"
         assert variant.index_overrides == {}
 
-    def test_a_valid_variant_index_key_does_not_warn(self, tmp_path: Path, caplog):
+    def test_a_valid_variant_index_key_does_not_warn(self, tmp_path: Path, caplog, monkeypatch):
         """The unknown-key warning must fire on a typo only."""
         import logging
 
+        import fw_context_mcp.config.settings as settings
         from fw_context_mcp.indexer.build import build_variant_config
+
+        # The global config of the developer must not add its own warnings.
+        monkeypatch.setattr(settings, "_GLOBAL_CONFIG_PATH", tmp_path / "global.toml")
 
         _write_config(tmp_path, """
 [build]

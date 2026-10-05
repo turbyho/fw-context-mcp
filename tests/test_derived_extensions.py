@@ -12,8 +12,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-
 from fw_context_mcp.indexer.manifest import derive_extension_sets
 
 

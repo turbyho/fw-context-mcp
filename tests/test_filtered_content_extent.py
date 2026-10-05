@@ -168,7 +168,7 @@ def _assert_lines(content: str, source: str, *, blank: set[int]) -> None:
         f"the stored text must be as long as the file: "
         f"{len(stored)} lines stored, {len(original)} on disk"
     )
-    for number, (got, want) in enumerate(zip(stored, original), start=1):
+    for number, (got, want) in enumerate(zip(stored, original, strict=True), start=1):
         if number in blank:
             assert got.strip() == "", (
                 f"line {number} is inside an inactive #if branch, thus it "

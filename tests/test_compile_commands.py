@@ -3,7 +3,6 @@
 import json
 from pathlib import Path
 
-from fw_context_mcp.utils import TU_EXTENSIONS
 from fw_context_mcp.indexer.compile_commands import (
     _detect_language,
     _detect_target_triple,
@@ -13,6 +12,7 @@ from fw_context_mcp.indexer.compile_commands import (
     normalize_args,
     parse,
 )
+from fw_context_mcp.utils import TU_EXTENSIONS
 
 
 class TestIsSourceFile:

@@ -1,15 +1,14 @@
 """Tests for fw_context_mcp.indexer.build."""
 
 import json
-
 from pathlib import Path
 
 from fw_context_mcp.indexer.build import (
     BuildConfig,
     BuildVariant,
-    build_variant_config,
     _mbed_target_from_custom_targets,
     _parse_mbed_dotfile,
+    build_variant_config,
     check_completeness,
     detect_build_system,
     resolve_reuse_compile_commands,
@@ -144,7 +143,7 @@ class TestResolveReuseCompileCommands:
         canonical.write_text("[]")
 
         result = resolve_reuse_compile_commands(tmpdir, Path("compile_commands.json"))
-        assert result == canonical
+        assert result == canonical.resolve()
 
     def test_legacy_root_value_without_canonical_keeps_root(self, tmpdir):
         result = resolve_reuse_compile_commands(tmpdir, Path("compile_commands.json"))

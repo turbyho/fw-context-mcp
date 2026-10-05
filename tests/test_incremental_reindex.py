@@ -4256,7 +4256,28 @@ class TestCoveragePurge:
         does NOT exercise the extension whitelist that made the manifest
         incomplete: this fixture's system headers are all ``.h``, so they were
         recorded either way.  ``TestManifestRecordsEveryInclude`` covers that.
+
+        The out-of-project header is a file of the test, not ``<stdio.h>``:
+        libclang finds no system header on macOS without ``-isysroot``.
         """
+        import json
+
+        sdk = c_project.parent / "sdk"
+        sdk.mkdir()
+        _write_file(sdk / "sdk_hal.h", "#ifndef SDK_HAL_H\n#define SDK_HAL_H\nint sdk_hal_init(void);\n#endif\n")
+        main_c = c_project / "src" / "main.c"
+        main_c.write_text(
+            main_c.read_text(encoding="utf-8").replace(
+                '#include "utils.h"', '#include "utils.h"\n#include <sdk_hal.h>'
+            ),
+            encoding="utf-8",
+        )
+        cc_json = c_project / "compile_commands.json"
+        cc = json.loads(cc_json.read_text(encoding="utf-8"))
+        for entry in cc:
+            entry["arguments"][1:1] = ["-isystem", str(sdk)]
+        cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+
         db_path = _db_path_for_project(c_project)
         assert _index_cli(c_project).returncode == 0
 
@@ -4627,8 +4648,8 @@ class TestReindexKeepsTheGeneratedFlag:
         the stub records the patterns and returns the header the build
         generates.
         """
-        from fw_context_mcp.mcp.handlers import maintenance
         from fw_context_mcp.indexer import manifest as manifest_mod
+        from fw_context_mcp.mcp.handlers import maintenance
 
         saved: dict = {}
         seen: list = []
