@@ -164,6 +164,42 @@ class _Stalls(Phase):
         return ctx
 
 
+class _GivesFiftyRows(Phase):
+    """Stand-in embedding phase: 50 uncut rows, as with no source boost."""
+
+    name = "_gives_fifty_rows"
+
+    async def run(self, ctx):
+        rows = [_symbol(f"s{i}") for i in range(50)]
+        return ctx.evolve(embedding_results=rows, final_results=list(rows))
+
+
+class _Fails(Phase):
+    name = "_fails"
+
+    async def run(self, ctx):
+        # Imported here: sqlite3 must not load before fw_context_mcp, which
+        # redirects it to pysqlite3.
+        import sqlite3
+
+        raise sqlite3.OperationalError("database is locked")
+
+
+def test_the_limit_holds_when_the_cutting_phases_fail(tmp_path):
+    """Fusion and expansion cut to the limit.  When both fail, the runner goes on.
+
+    The uncut rows then reach FormatPhase, the last phase, which must cut.
+    """
+    from fw_context_mcp.search.phases.format import FormatPhase
+
+    runner = PipelineRunner(PipelineConfig(phases=[_GivesFiftyRows(), _Fails(), _Fails(), FormatPhase()]))
+
+    ctx = asyncio.run(runner.run(_ctx(tmp_path, limit=20)))
+
+    assert len([r for r in ctx.formatted_results if "name" in r]) == 20
+    assert len(ctx.warnings) == 2
+
+
 def test_a_cancelled_run_stops_and_keeps_what_it_found(tmp_path):
     runner = PipelineRunner(PipelineConfig(phases=[_FindsRows(), _Stalls()]))
 

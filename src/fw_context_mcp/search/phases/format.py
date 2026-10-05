@@ -46,6 +46,14 @@ class FormatPhase(Phase):
         its results mix scored embedding rows with call-graph neighbors
         and FTS5 rows that have no score.  Thus only the semantic pipeline
         sets the flag, and the default output stays as it was.
+
+    Why cut to ``ctx.limit`` here?
+        Each phase that orders the results also cuts them to the limit.
+        But the runner records a failed phase in ``warnings`` and goes on
+        with the context from before that phase.  When adaptive fusion and
+        context expansion both fail, the uncut embedding rows come here.
+        This is the last phase of each pipeline, thus a cut here makes the
+        limit hold for every answer.
     """
 
     name = "format"  #: Phase identifier used in pipeline configuration.
@@ -100,7 +108,7 @@ class FormatPhase(Phase):
             results.append({"warning": w})
 
         # Symbol results
-        results += [_fmt(r) for r in ctx.final_results]
+        results += [_fmt(r) for r in ctx.final_results[: ctx.limit]]
 
         if not ctx.final_results:
             results.append({"info": "No results found for the generated queries."})
