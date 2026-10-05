@@ -118,10 +118,12 @@ def test_the_group_is_recorded_while_the_build_runs(tmp_path: Path):
     record = tmp_path / "reindex.build"
     copy = tmp_path / "copy.json"
 
+    # The parent writes the record after Popen returns (the PID is known
+    # only then), thus the child waits for it: a bare `cat` raced the write.
     with record_build_groups(record):
         result = run_in_process_group(
-            ["sh", "-c", f"cat {record} > {copy}; echo $$"], cwd=tmp_path,
-            env=dict(os.environ), timeout=30.0, capture_output=True,
+            ["sh", "-c", f"while [ ! -s {record} ]; do sleep 0.01; done; cat {record} > {copy}; echo $$"],
+            cwd=tmp_path, env=dict(os.environ), timeout=30.0, capture_output=True,
         )
 
     seen = json.loads(copy.read_text(encoding="utf-8"))
@@ -246,9 +248,11 @@ def test_the_owned_index_records_its_build(tmp_path: Path):
 
     copy = tmp_path / "copy.json"
     with _owned_index(tmp_path, SimpleNamespace(background=False, takeover=False)):
+        record = tmp_path / "reindex.build"
         run_in_process_group(
-            ["sh", "-c", f"cat {tmp_path / 'reindex.build'} > {copy}"], cwd=tmp_path,
-            env=dict(os.environ), timeout=30.0, capture_output=True,
+            # Waits for the record, as in test_the_group_is_recorded_while_the_build_runs.
+            ["sh", "-c", f"while [ ! -s {record} ]; do sleep 0.01; done; cat {record} > {copy}"],
+            cwd=tmp_path, env=dict(os.environ), timeout=30.0, capture_output=True,
         )
 
     assert json.loads(copy.read_text(encoding="utf-8"))["index_pid"] == os.getpid()
