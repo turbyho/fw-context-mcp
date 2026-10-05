@@ -107,20 +107,43 @@ def test_rank_orders_by_the_boosted_score_and_keeps_the_raw_similarity():
         {"id": 3, "name": "dropped", "is_project": 1},
     ]
 
-    ranked = phase._rank(rows, {1: 0.80, 2: 0.70, 3: 0.50}, limit=2)
+    ranked, best = phase._rank(rows, {1: 0.80, 2: 0.70, 3: 0.50}, limit=2)
 
     # 0.70 * 1.2 = 0.84 beats 0.80 * 0.85 = 0.68.
     assert [r["name"] for r in ranked] == ["project", "vendor"]
     assert [r["_similarity"] for r in ranked] == [0.70, 0.80]
+    assert best == 0.80
+
+
+def test_rank_gives_the_best_raw_similarity_of_a_row_that_the_limit_drops():
+    """The boost puts the vendor row with the best raw score after the limit."""
+    phase = EmbeddingPhase(independent=True, source_boost=True)
+    rows = [
+        {"id": 1, "name": "vendor", "is_project": 0},
+        {"id": 2, "name": "project", "is_project": 1},
+    ]
+
+    ranked, best = phase._rank(rows, {1: 0.70, 2: 0.65}, limit=1)
+
+    # 0.65 * 1.2 = 0.78 beats 0.70 * 0.85 = 0.595, thus "vendor" is cut.
+    assert [r["name"] for r in ranked] == ["project"]
+    assert best == 0.70
 
 
 def test_rank_without_boost_orders_by_similarity_and_keeps_every_candidate():
     phase = EmbeddingPhase(independent=True, source_boost=False)
     rows = [{"id": i, "name": str(i), "is_project": 1} for i in range(1, 4)]
 
-    ranked = phase._rank(rows, {1: 0.5, 2: 0.9, 3: 0.7}, limit=1)
+    ranked, best = phase._rank(rows, {1: 0.5, 2: 0.9, 3: 0.7}, limit=1)
 
     assert [r["name"] for r in ranked] == ["2", "3", "1"]
+    assert best == 0.9
+
+
+def test_rank_gives_no_best_similarity_for_no_row():
+    phase = EmbeddingPhase(independent=True, source_boost=True)
+
+    assert phase._rank([{"id": 9, "name": "x"}], {1: 0.9}, limit=5) == ([], None)
 
 
 # ── smart_search timeout ────────────────────────────────────────────────────

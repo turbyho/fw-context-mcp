@@ -131,14 +131,20 @@ FALLBACK = [{"warning": "fallback", "_method": "search_code_fallback"}]
 
 def _run_handler(
     db_path: Path, embedder: object, threshold: float = 0.5, config: object | None = None,
-    limit: int = 20,
+    limit: int = 20, context_limit: int = 20,
 ) -> tuple[list[dict], mock.MagicMock]:
-    """Call the semantic_search handler with the index, the LLM and the fallback replaced."""
+    """Call the semantic_search handler with the index, the LLM and the fallback replaced.
+
+    *context_limit* is the limit of the pipeline context, which the
+    embedding phase cuts to.  ``PipelineContext.create`` is replaced, thus
+    the context does not follow *limit*.
+    """
     from fw_context_mcp.config.settings import Config
     from fw_context_mcp.mcp.handlers import search as handler
     from fw_context_mcp.search.context import PipelineContext
 
     fallback = mock.MagicMock(return_value=FALLBACK)
+    context = _context(db_path).evolve(limit=context_limit)
     with (
         mock.patch.object(handler, "resolve_project_root", return_value=db_path.parent),
         mock.patch.object(handler, "_db_path", return_value=db_path),
@@ -146,11 +152,33 @@ def _run_handler(
         mock.patch.object(handler, "check_setup", return_value={"ollama_running": True}),
         mock.patch.object(handler, "_fallback_to_search_code", fallback),
         mock.patch.object(handler, "_append_staleness_warning", side_effect=lambda r, *_: r),
-        mock.patch.object(PipelineContext, "create", return_value=_context(db_path)),
+        mock.patch.object(PipelineContext, "create", return_value=context),
         mock.patch("fw_context_mcp.search.phases.embedding.get_embedder", return_value=embedder),
     ):
         results = asyncio.run(handler.semantic_search("q", threshold=threshold, limit=limit))
     return results, fallback
+
+
+@pytest.mark.parametrize("path", sorted(SEEDERS))
+def test_the_relevance_floor_sees_a_match_that_the_boosted_cut_drops(populated_db, db_path, path):
+    """Raw scores: far 0.7 and middle 0.7 (vendor), near 0.547 (project).
+
+    The boost puts "near" first (0.656 against 0.595), and the cut to one
+    row keeps only "near".  The best raw score of all matches, 0.7, is above
+    the floor, thus the answer is "near" with no warning.  A floor that
+    reads only the rows after the cut sees 0.547 and gives the warning.
+    """
+    ids = SEEDERS[path](populated_db)
+    populated_db.execute(
+        "UPDATE symbols SET is_project = 0 WHERE id IN (?, ?)", (ids["far"], ids["middle"])
+    )
+    populated_db.commit()
+
+    results, fallback = _run_handler(db_path, _OffAxisEmbedder(), limit=1, context_limit=1)
+
+    fallback.assert_not_called()
+    assert [r.get("name") for r in results] == ["near"]
+    assert "warning" not in results[0]
 
 
 @pytest.mark.parametrize("path", sorted(SEEDERS))

@@ -164,8 +164,12 @@ class EmbeddingPhase(Phase):
                             (ctx.config_hash, *sym_ids),
                         ).fetchall()
                         similarity = {sid: 1.0 - dist for sid, dist in distance_map.items()}
-                        results = self._rank(emb_rows, similarity, ctx.limit)
-                        return ctx.evolve(embedding_results=results, final_results=list(results))
+                        results, best = self._rank(emb_rows, similarity, ctx.limit)
+                        return ctx.evolve(
+                            embedding_results=results,
+                            final_results=list(results),
+                            embedding_best_similarity=best,
+                        )
 
                 # ---- Brute-force fallback (legacy BLOB table) ----
                 if has_blob:
@@ -183,22 +187,33 @@ class EmbeddingPhase(Phase):
                             AND is_definition = 1""",
                         (ctx.config_hash, *top_ids),
                     ).fetchall()
-                    results = self._rank(emb_rows, dict(scored_bf[: self.overfetch]), ctx.limit)
-                    return ctx.evolve(embedding_results=results, final_results=list(results))
+                    results, best = self._rank(emb_rows, dict(scored_bf[: self.overfetch]), ctx.limit)
+                    return ctx.evolve(
+                        embedding_results=results,
+                        final_results=list(results),
+                        embedding_best_similarity=best,
+                    )
 
                 return ctx
 
         return ctx.executor.execute_sync(_query, ctx.config_hash)
 
-    def _rank(self, rows: list, similarity: dict[int, float], limit: int) -> list[dict]:
+    def _rank(
+        self, rows: list, similarity: dict[int, float], limit: int
+    ) -> tuple[list[dict], float | None]:
         """Order the symbol *rows* of a standalone search by similarity.
 
         *similarity* maps a symbol id to its cosine similarity.  The rows come
         from ``id IN (...)``, thus in no order.  Each row gets the raw
-        similarity in ``_similarity``, which ``semantic_search`` compares with
-        its relevance floor.  With ``source_boost`` the order uses the boosted
-        score (project code x1.2, other code x0.85) and the list stops at
-        *limit*; without it, the caller gets every candidate to fuse.
+        similarity in ``_similarity``.  With ``source_boost`` the order uses
+        the boosted score (project code x1.2, other code x0.85) and the list
+        stops at *limit*; without it, the caller gets every candidate to fuse.
+
+        The second value is the best raw similarity of ALL ranked rows, or
+        None when no row has a similarity.  WHY before the cut: the boosted
+        order can put a vendor row with the best raw score after *limit*.
+        The relevance floor of ``semantic_search`` asks if the index holds a
+        relevant match at all, thus it must see that row.
         """
         scored: list[tuple[float, dict]] = []
         for r in rows:
@@ -213,4 +228,5 @@ class EmbeddingPhase(Phase):
             scored.append((key, d))
         scored.sort(key=lambda x: -x[0])
         results = [d for _, d in scored]
-        return results[:limit] if self.source_boost else results
+        best = max((d["_similarity"] for d in results), default=None)
+        return (results[:limit] if self.source_boost else results), best

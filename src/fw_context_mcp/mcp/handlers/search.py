@@ -736,8 +736,7 @@ async def semantic_search(
             )
 
         # The symbols, not ``results``: FormatPhase always adds a dict, an
-        # ``info`` when nothing matched.  The reranker below changes only
-        # ``results``, thus ``matched`` keeps every match for the floor.
+        # ``info`` when nothing matched.
         matched = list(ctx.final_results)
         if not matched:
             # The runner records a failed phase in ctx.warnings and goes on,
@@ -778,9 +777,7 @@ async def semantic_search(
         # PipelineContext.create lifts a limit below 5 to 5, because the
         # re-rank steps of smart_search need a set to choose from.  This
         # tool accepts a limit of 1 and more, thus cut to it here, after the
-        # reranker had the larger set.  The floor reads ``matched``, the
-        # whole set: it asks if the index has a relevant match at all, also
-        # when the reranker and the cut drop that match.
+        # reranker had the larger set.
         results = results[:limit]
 
         # Relevance floor: when the best cosine-similarity score is below
@@ -788,10 +785,18 @@ async def semantic_search(
         # models can return low-similarity matches for any input — this
         # threshold prevents the LLM from treating noise as signal.
         # The warning suggests search_code (lexical) as a better alternative.
-        # The best raw cosine similarity of all matches, not of the first
-        # row: the reranker and the source boost both change the order.
+        # The best raw cosine similarity of ALL matches, not of the first
+        # row and not of the rows after a cut: the floor asks if the index
+        # holds a relevant match at all.  The source boost orders and cuts
+        # the rows in the embedding phase, and the reranker and the limit
+        # cut them here, thus each of them can drop that match.  The phase
+        # keeps the best raw score from before its cut; ``matched`` is the
+        # alternative when no standalone search set it.
         _RELEVANCE_FLOOR = 0.68
-        best_score = max(float(r.get("_similarity", 1.0)) for r in matched)
+        if ctx.embedding_best_similarity is not None:
+            best_score = ctx.embedding_best_similarity
+        else:
+            best_score = max(float(r.get("_similarity", 1.0)) for r in matched)
         if best_score < _RELEVANCE_FLOOR:
             return [
                 {

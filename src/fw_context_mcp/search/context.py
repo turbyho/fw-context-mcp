@@ -83,6 +83,12 @@ class PipelineContext:
 
     # ── Phase 5 output ────────────────────────────────────────────────────
     embedding_results: list[dict] = field(default_factory=list)
+    # The best raw cosine similarity of all candidates of a standalone
+    # search, before the source boost cuts the list to ``limit``.  The
+    # relevance floor of semantic_search reads it: the boosted order can
+    # drop the candidate with the best raw score.  None when no standalone
+    # search ran.
+    embedding_best_similarity: float | None = None
 
     # ── Phase 6 output ────────────────────────────────────────────────────
     final_results: list[dict] = field(default_factory=list)
