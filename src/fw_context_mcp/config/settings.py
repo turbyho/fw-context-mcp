@@ -1116,16 +1116,44 @@ def _is_loopback_url(url: str) -> bool:
 # Why mtime instead of inotify?  Simplicity — the MCP server is short-lived
 # (one session), config files change rarely, and mtime comparison costs ~0.
 # An inotify watcher would need threads and cleanup logic for no real benefit.
-_config_cache: OrderedDict[tuple, tuple[float, Config]] = OrderedDict()
+_config_cache: OrderedDict[tuple, tuple[tuple[float | None, ...], Config]] = OrderedDict()
 _CONFIG_CACHE_MAX = 50
+
+
+def _read_toml_if_present(path: Path) -> dict:
+    """Parse *path*, or return ``{}`` when the file does not exist."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    return tomllib.loads(text)
+
+
+def _mtime_signature(paths: tuple[Path | None, ...]) -> tuple[float | None, ...]:
+    """The mtime of each of *paths*, None for a path that is absent.
+
+    A project file may be missing (see :func:`load`), thus a file that
+    appears or goes changes the signature as an edit does.
+    """
+    signature: list[float | None] = []
+    for p in paths:
+        try:
+            signature.append(p.stat().st_mtime if p is not None else None)
+        except OSError:
+            signature.append(None)
+    return tuple(signature)
 
 
 def load(project_root: Path | None = None) -> Config:
     """Load merged config for the given project root.
 
-    Creates default config files on first use.  TOML parse errors in user
-    configs are logged and the built-in defaults are used instead — a broken
-    config file must not prevent the MCP tools from loading.
+    Creates the global config on first use, never a project file: a
+    missing ``.fw-context/config.toml`` or ``local.toml`` reads as empty.
+    A read-only tool on a project that ``fw-context init`` never saw must
+    not write into it; ``init`` and the writers (``_write_project_id``,
+    ``update_local_toml``) create the files they write.  TOML parse errors
+    in user configs are logged and the built-in defaults are used instead —
+    a broken config file must not prevent the MCP tools from loading.
 
     Results are cached per (global_path, proj_path, local_path) tuple and
     invalidated when any source file's mtime changes.
@@ -1144,8 +1172,10 @@ def load(project_root: Path | None = None) -> Config:
     data: dict = {}
 
     global_path = _ensure_global_config()
-    proj_path = _ensure_project_config(project_root) if project_root is not None else None
-    local_path = _ensure_project_local_config(project_root) if project_root is not None else None
+    proj_path = local_path = None
+    if project_root is not None:
+        proj_path = project_root / _PROJECT_CONFIG_DIR / _PROJECT_CONFIG_NAME
+        local_path = project_root / _PROJECT_CONFIG_DIR / _PROJECT_LOCAL_CONFIG_NAME
 
     # Check mtime-based cache — if no config file has changed since last
     # load, return the cached Config object directly.  TOML parsing and
@@ -1153,14 +1183,10 @@ def load(project_root: Path | None = None) -> Config:
     # runs subprocess checks (ollama list, nvidia-smi) that cost ~200 ms.
     cache_key = (global_path, proj_path, local_path)
     if cache_key in _config_cache:
-        cached_ts, cached_cfg = _config_cache[cache_key]
-        # Check if any source file changed
-        try:
-            newest = max(p.stat().st_mtime for p in cache_key if p is not None)
-            if newest <= cached_ts:
-                return cached_cfg
-        except OSError:
-            pass  # File missing → reload
+        cached_sig, cached_cfg = _config_cache[cache_key]
+        # Check if any source file changed, appeared, or went away.
+        if _mtime_signature(cache_key) == cached_sig:
+            return cached_cfg
 
     # Phase 1: load global config (always present — _ensure_global_config
     # creates it from template if missing).
@@ -1176,7 +1202,7 @@ def load(project_root: Path | None = None) -> Config:
         # Uses _deep_merge so nested sections accumulate — [index] keys
         # from global and project config coexist.
         try:
-            proj_data = tomllib.loads(proj_path.read_text(encoding="utf-8"))
+            proj_data = _read_toml_if_present(proj_path)
             data = _deep_merge(data, proj_data)
             # Security: validate committed config doesn't contain dangerous settings.
             # pre_build, command, and non-loopback ollama_url in committed config.toml
@@ -1190,7 +1216,7 @@ def load(project_root: Path | None = None) -> Config:
         # Phase 3: deep-merge local config (gitignored, per-developer).
         # This is the last merge — local.toml values have highest precedence.
         try:
-            local_data = tomllib.loads(local_path.read_text(encoding="utf-8"))
+            local_data = _read_toml_if_present(local_path)
             data = _deep_merge(data, local_data)
         except (OSError, ValueError):
             log.exception("Failed to parse %s — ignoring local config", local_path)
@@ -1238,15 +1264,9 @@ def load(project_root: Path | None = None) -> Config:
         cfg.index.db_dir = Path(_env_index_dir).expanduser().resolve()
 
     # Cache with current mtime
-    try:
-        newest_mtime = max(
-            p.stat().st_mtime for p in cache_key if p is not None
-        )
-        if len(_config_cache) >= _CONFIG_CACHE_MAX:
-            _config_cache.popitem(last=False)
-        _config_cache[cache_key] = (newest_mtime, cfg)
-    except OSError:
-        pass  # Can't cache if we can't stat files
+    if len(_config_cache) >= _CONFIG_CACHE_MAX:
+        _config_cache.popitem(last=False)
+    _config_cache[cache_key] = (_mtime_signature(cache_key), cfg)
 
     return cfg
 

@@ -220,3 +220,44 @@ class TestVendorProjectPaths:
         })
         assert cfg.index.vendor_paths == ["lib"]
         assert cfg.index.project_paths == ["lib/muj_modul"]
+
+
+class TestLoadCreatesNoProjectFile:
+    """load() reads a missing project file as empty, and never creates one."""
+
+    @pytest.fixture(autouse=True)
+    def _isolated_global(self, tmp_path, monkeypatch):
+        import fw_context_mcp.config.settings as settings
+
+        monkeypatch.setattr(settings, "_GLOBAL_CONFIG_PATH", tmp_path / "home" / "config.toml")
+
+    def test_an_uninitialized_project_stays_untouched(self, tmp_path):
+        project = tmp_path / "proj"
+        project.mkdir()
+
+        cfg = load(project)
+
+        assert not (project / ".fw-context").exists()
+        assert not cfg.project.id
+
+    def test_a_project_file_that_appears_or_goes_reloads_the_config(self, tmp_path):
+        project = tmp_path / "proj"
+        (project / ".fw-context").mkdir(parents=True)
+        local = project / ".fw-context" / "local.toml"
+
+        assert load(project).llm.num_ctx != 1234
+        local.write_text("[llm]\nnum_ctx = 1234\n", encoding="utf-8")
+        assert load(project).llm.num_ctx == 1234
+        local.unlink()
+        assert load(project).llm.num_ctx != 1234
+
+    def test_get_active_build_creates_nothing_before_init(self, tmp_path):
+        from fw_context_mcp.mcp.handlers.maintenance import get_active_build
+
+        project = tmp_path / "proj"
+        project.mkdir()
+
+        result = get_active_build(project_root=str(project))
+
+        assert result["status"] == "not_initialized"
+        assert not (project / ".fw-context").exists()

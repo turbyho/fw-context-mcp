@@ -78,7 +78,7 @@ The MCP server starts a background watcher daemon automatically. This daemon rei
 
 ## Configure your project
 
-After you install fw-context, create `<project>/.fw-context/config.toml` in your firmware project. Or let `fw-context index` create this file automatically, with default values.
+After you install fw-context, run `fw-context init` in your firmware project. It creates `<project>/.fw-context/config.toml` and `local.toml` with default values and a project ID. The MCP tools and `fw-context index` create no config file in a project that `init` did not set up.
 
 Two project-level files exist:
 
