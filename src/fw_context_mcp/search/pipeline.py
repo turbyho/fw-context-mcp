@@ -3,7 +3,8 @@
 Why a pipeline with configurable phases?
     Different search modes need different phase combinations:
 
-    - ``SEARCH_CODE``: fast FTS5 symbol search (no LLM, no embeddings)
+    - ``SEARCH_CODE``: fast FTS5 symbol search without the chat model
+      (the comment at ``SEARCH_CODE`` gives the use of the embedding model)
     - ``SMART_SEARCH``: full pipeline (translate → rough → LLM → FTS5 →
       refine → embedding → fusion → deduplicate → expand → format)
     - ``SEMANTIC_SEARCH``: embedding-only similarity search
@@ -139,7 +140,12 @@ class PipelineConfig:
 # Predefined pipelines
 
 # SEARCH_CODE: fast FTS5 symbol search with progressive fallbacks.
-# No LLM, no embeddings — runs entirely on the SQLite index.
+# No phase calls the chat model.  When `llm.enabled` is true,
+# RoughSearchPhase calls the embedding model for its samples.  With 5 or
+# more samples, fts5_search uses the terms of the sample names.  With
+# fewer samples, fts5_search uses the words of the query.
+# The MCP tool search_code does not use this pipeline: it has its own
+# fallback steps in mcp/handlers/search.py.
 # Each fallback only executes when the previous phase found nothing.
 SEARCH_CODE = PipelineConfig(
     phases=[

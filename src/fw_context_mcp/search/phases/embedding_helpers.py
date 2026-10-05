@@ -111,8 +111,12 @@ def round_robin_by_kind(rows: list, limit: int = 20) -> list:
     Groups rows by kind (function, method, class, struct, varglobal, other),
     then round-robins one from each group until *limit* is reached.  Avoids
     the ORDER BY CASE problem where functions crowd out structs/globals.
-    Preserves the original order within each group (already sorted by
-    vector similarity from search_similar_vec).
+    Keeps the incoming order within each group.  The caller in
+    ``rough_search`` gives rows in SQLite order (``WHERE id IN (...)``),
+    not in vector similarity order.  This order is intentional.  An A/B
+    test on 2026-09-30 (189 smart_search queries) found no gain from the
+    vector order here.  The vector order changed the generated FTS5 terms
+    in 161 of these queries.
 
     Each row must be dict-like with a ``kind`` key (str or None).
     """
