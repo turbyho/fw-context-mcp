@@ -159,9 +159,28 @@ Both read the INDEX and not only the config, thus a build indexed with
 
 ### Reading past the first page
 
-Eight tools take an `offset` and lead with a page notice: `lookup_symbol`,
-`search_code`, `search_bodies`, `search_content`, `find_callers`,
-`find_references`, `find_dead_code`, `find_hotspots`.
+Each tool that can give a long list pages it, and says how much there is:
+
+- A list answer leads with a page notice and takes an `offset`:
+  `lookup_symbol`, `search_code`, `search_bodies`, `search_content`,
+  `smart_search`, `semantic_search`, `find_callers`, `find_references`,
+  `find_all_callers_recursive`, `find_callees_recursive`,
+  `find_indirect_call_sites`, `find_indirect_targets`, `find_variables`,
+  `find_dead_code`, `find_hotspots`, `find_wrapper_callers`,
+  `trace_data_flow`, `get_template_instances`, `get_vector_table`.
+- A dict answer holds the notice under the key `page`:
+  `get_class_members`, `get_file_map` with `kind`, and `read_file`, which
+  pages LINES and names the next page with `start_line`, not `offset`.
+  `get_inheritance_chain` (transitive) has `all_bases_page` and
+  `all_derived_page`.
+- `get_symbol_context` and `get_source` cut each list: `<list>_total`
+  counts it, and `<list>_hint` names the tool that pages a cut list.
+- `smart_search`: no offset, or 0, is a NEW search. A larger offset pages
+  the stored answer of the last search of the same query.
+- `semantic_search`: `total_capped: true` means that `total` is a lower
+  bound — the search reaches 4096 vector rows at most.
+- `find_call_path` has no pages: the paths cannot be counted. A trailing
+  `info` says when paths can be left out.
 
     {"total": 137, "offset": 0, "shown": 50, "more": true, "hint": "…"}
 

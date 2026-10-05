@@ -704,15 +704,37 @@ The valid variants are the declared variants (`[[build.variants]]`) and
 the variants in the index. Call `get_active_build` or `list_variants` to
 see the variants and images that fw-context has indexed.
 
-**Paging.** Eight tools take an `offset`: `lookup_symbol`, `search_code`,
-`search_bodies`, `search_content`, `find_callers`, `find_references`,
-`find_dead_code`, and `find_hotspots`. When the answer holds a row, it
-starts with a page notice:
+**Paging.** Each tool that can give a long list gives it in pages, and
+says how much there is. The answer has one of these forms:
+
+- A list answer starts with a page notice, and the tool takes an
+  `offset`. These tools give a list answer: `lookup_symbol`,
+  `search_code`, `search_bodies`, `search_content`, `smart_search`,
+  `semantic_search`, `find_callers`, `find_references`,
+  `find_all_callers_recursive`, `find_callees_recursive`,
+  `find_indirect_call_sites`, `find_indirect_targets`, `find_variables`,
+  `find_dead_code`, `find_hotspots`, `find_wrapper_callers`,
+  `trace_data_flow`, `get_template_instances`, and `get_vector_table`.
+- A dict answer holds the page notice under the key `page`. These tools
+  give a dict answer: `get_class_members`, `get_file_map` with `kind`, and
+  `read_file`. `read_file` pages lines, and names the next page with
+  `start_line`, not with `offset`.
+- `get_inheritance_chain` with `transitive: true` holds two page notices:
+  `all_bases_page` and `all_derived_page`.
+- `get_symbol_context` and `get_source` cut each list at a maximum.
+  `<list>_total` counts the whole list, and `<list>_hint` names the tool
+  that pages a cut list.
+- `find_call_path` has no pages, because fw-context cannot count the
+  paths. A trailing `info` row says when the answer can leave out paths.
+
+When the answer holds a row, the page notice is there, also when one
+page holds the whole answer:
 
 ```
 {"total": 137, "offset": 0, "shown": 20, "more": true, "hint": "…pass offset=20…"}
 ```
 
+- `total` counts every row that the query matches, not only the page.
 - Find the notice by its keys, not by its position. A stale-index
   `warning` row, or the row that reports a query FTS5 cannot parse, can
   come first.
@@ -721,7 +743,12 @@ starts with a page notice:
 - The order of each tool is stable, thus two pages never overlap and never
   skip a row.
 - An `info` row that names an offset means that the offset is past the
-  end.
+  end. The row also gives the total.
+- `smart_search`: an `offset` of 0, or no `offset`, starts a new search.
+  A larger `offset` gives a page of the stored answer of the last search
+  of the same query.
+- `semantic_search`: `total_capped: true` in the notice means that
+  `total` is a lower bound. One search reaches 4096 vector rows at most.
 
 **Parameter validation.** The schema refuses a bad value before the tool
 runs, with an error that names the parameter:
@@ -1021,10 +1048,11 @@ include `enum_value` when the value is not `None`.
 Natural language → FTS5 keywords via Ollama (optional).
 
 ```
-Input:  {"query": "how does the modem connect to the network?", "project_root?": "/path/to/project", "limit?": 20}
+Input:  {"query": "how does the modem connect to the network?", "project_root?": "/path/to/project", "limit?": 20, "offset?": 0}
 Output: [
   {"_generated_queries": ["network_reg*", "modem_attach*", "pdp_context*"]},
   {"_rough_queries": ["modem", "connect", "network"]},
+  {"total": 64, "offset": 0, "shown": 20, "more": true, "hint": "…offset=20…"},
   …symbol results…
 ]
 ```
@@ -1036,11 +1064,32 @@ Multi-phase pipeline: translate → rough search → LLM query generation
 When no symbol matches, the result holds the metadata entries and a dict
 with `info`. One dict with `error` means that the query failed.
 
+**Pages.** `limit` is the size of one page, from 1 to 100. The search
+ranks up to 100 symbols, and `total` counts them. An LLM writes the
+queries of this tool, thus two runs of one question can find different
+symbols. For this reason, all pages of one answer come from one run:
+
+- An `offset` of 0, or no `offset`, starts a new search. Its answer
+  replaces the stored answer.
+- A larger `offset` gives a page of the stored answer, when that answer
+  is of the same query on the same build.
+- When the stored answer is of another query, another project or another
+  build, or when the server holds no stored answer, the tool runs the
+  search first. Then it stores the answer and gives the page.
+
+The server stores one answer only. No other tool changes it, and it has
+no time limit. An index run that keeps the build keeps the stored answer.
+The metadata entries come with each page. A page after the last symbol
+gives one `info` dict that names the total.
+
 The whole pipeline has a time limit: `[llm] timeout` of the project
 (default 600 s). When the pipeline passes it, a leading dict holds
 `_partial: true`, a `warning` with the timeout, and a `hint`. The symbols
 that follow are the ones that the steps before the timeout found, without
-the later re-rank steps; there can be none.
+the later re-rank steps; there can be none. This answer has no page
+notice, and the server does not store it. Thus a next page runs the
+search again. A timeout at `offset` 0 also removes the older stored
+answer.
 
 When you disable Ollama (`[llm] enabled = false`), this tool falls back to
 a word-split FTS5 search. Phase 0 auto-translates a non-English query.
@@ -1052,8 +1101,9 @@ are conceptually related to a natural-language query, even when the
 query words do not appear literally in the code.
 
 ```
-Input:  {"query": "parcel locker state machine", "project_root?": "/path/to/project", "threshold?": 0.60, "limit?": 20}
-Output: [{"name": "set_shipment", "qualified_name": "Locker::set_shipment",
+Input:  {"query": "parcel locker state machine", "project_root?": "/path/to/project", "threshold?": 0.60, "limit?": 20, "offset?": 0}
+Output: [{"total": 175, "offset": 0, "shown": 20, "more": true, "hint": "…offset=20…"},
+         {"name": "set_shipment", "qualified_name": "Locker::set_shipment",
           "kind": "method", "file": "/path/src/locker.cpp", "line": 118,
           "is_definition": true, "signature": "void set_shipment(int id)",
           "docstring": "", "_method": "embedding", "_similarity": 0.8123}, …]
@@ -1077,10 +1127,21 @@ of all other code by 0.85. The multiplied score sets the order, and
 `_similarity` does not show it. `threshold` applies to the raw cosine
 similarity.
 
+**Pages.** The tool ranks every symbol above `threshold`, as far as one
+KNN query reaches: 4096 vector rows. A symbol of several chunks uses
+several rows. A page is a slice of that order: the multiplied score, then
+the symbol id. `total` counts the whole set. When the KNN query stops at
+4096 rows and its last row is still above `threshold`, the notice holds
+`total_capped: true`, and `total` is a lower bound. `limit` is the size of
+one page, from 1 to 100. The hint repeats a `threshold` that is not the
+default. The reranker changes the order of the first symbols of a page
+only, and it moves no symbol to another page. A page after the last
+symbol gives one `info` dict that names the total.
+
 **Relevance floor.** When the best raw cosine similarity of all matches is
-below 0.68, the result is one dict: a `warning` that the matches are likely
-unrelated, `_fallback_suggestion: "search_code"`, `_best_similarity`, and
-the matches in `_results`.
+below 0.68, the result is the page notice and one dict: a `warning` that
+the matches are likely unrelated, `_fallback_suggestion: "search_code"`,
+`_best_similarity`, and the matches of the page in `_results`.
 
 When the embedding search finds no match above `threshold`, the tool runs
 the lexical fallback below, with a `warning` that suggests a lower
@@ -1100,10 +1161,11 @@ Ollama embedding model, a running Ollama server. A sentence-transformers or
 `ft://` model embeds the query locally and needs no Ollama. When one of
 them is missing, when the embedding model fails, or when no match is above
 `threshold`, this tool runs ONE plain FTS5 symbol search (the first step of
-`search_code`, with no kind filter, no relaxation, and no paging). A
-leading dict holds a `warning` with the reason, and each symbol holds
-`_method: "search_code_fallback"`. When the lexical search also finds
-nothing, the result is one `warning`.
+`search_code`, with no kind filter and no relaxation). The fallback gives
+one page at `offset`, with the page notice of `semantic_search`. A
+leading dict holds a `warning` with the reason, the page notice follows,
+and each symbol holds `_method: "search_code_fallback"`. When the lexical
+search also finds nothing, the result is one `warning`.
 
 #### `find_variables`
 
@@ -1112,15 +1174,17 @@ through the call graph. Splits variables into global (`varglobal`: file,
 namespace, or class scope) and local (`varlocal`: inside a function body).
 
 ```
-Input:  {"name": "g_", "project_root?": "/path/to/project", "kind?": "varglobal", "limit?": 20}
-Output: [{"name": "g_debug_level", "qualified_name": "g_debug_level",
+Input:  {"name": "g_", "project_root?": "/path/to/project", "kind?": "varglobal", "limit?": 20, "offset?": 0}
+Output: [{"total": 7, "offset": 0, "shown": 7, "more": false},
+         {"name": "g_debug_level", "qualified_name": "g_debug_level",
           "kind": "varglobal", "file": "/path/src/logging.c", "line": 15,
           "signature": "int g_debug_level",
           "enclosing_function": "<file scope>", "enclosing_class": "",
           "references": [
             {"function": "log_init", "file": "/path/src/logging.c", "line": 42, "ref_kind": "ref"},
             {"function": "log_write", "file": "/path/src/logging.c", "line": 68, "ref_kind": "ref"}
-          ]}, …]
+          ],
+          "references_total": 2}, …]
 ```
 
 Each result includes a type signature, for example `"bool timeSet"` or
@@ -1131,11 +1195,18 @@ and the enclosing class for a static member. Each result includes a
 variable. This list uses the same `ref_kind` values as `find_references`:
 `"call"`, `"ref"`, `"member"`. The list is capped at 30 references per
 variable, and holds only the references of the selected build (variant and
-image).
+image). `references_total` counts every reference of the variable. When
+the cap cuts the list, `references_hint` names the `find_references` call
+that pages every reference.
 
 `name` is a substring match on the name and on the qualified name: `g_`
 finds `g_debug_level` and also `msg_count`. The result holds only
 definitions, globals first, then by name. No match gives `[]`.
+
+The page notice comes before the variables, and `total` counts every
+variable that matches. `limit` (max 100) is the size of one page. The
+hint repeats `kind`. A page after the last variable gives one `info` dict
+that names the total.
 
 Use `find_variables` when you need to:
 - understand shared state
@@ -1161,12 +1232,13 @@ Structural overview of a file: all symbols grouped by kind. This tool
 works like a fast table of contents, before you read the whole file.
 
 ```
-Input:  {"file_path": "src/net_msg.cpp", "project_root?": "/path/to/project", "signatures?": false, "max_per_kind?": 30}
+Input:  {"file_path": "src/net_msg.cpp", "project_root?": "/path/to/project", "signatures?": false, "max_per_kind?": 30, "kind?": null, "offset?": 0}
 Output: {"file": "src/net_msg.cpp", "total_symbols": 426,
          "symbols": {
            "method": {"count": 45, "items": [
              {"name": "_is_socket_ok", "qualified_name": "ModemMsg::_is_socket_ok",
-              "line": 140, "end_line": 152}, …]},
+              "line": 140, "end_line": 152}, …],
+             "hint": "get_file_map('src/net_msg.cpp', kind='method', offset=30) reads the next page."},
            "varglobal": {"count": 3, "items": [
              {"name": "_buffer_msg", "qualified_name": "_buffer_msg", "line": 105}, …]},
            "constructor": {"count": 1, "items": [
@@ -1191,6 +1263,27 @@ Output: {"file": "src/net_msg.cpp", "total_symbols": 426,
 
 Each kind maps to `{count, items}`. `count` is the real total of that
 kind. `items` holds the first `max_per_kind` symbols (`0` = no limit).
+A group that `max_per_kind` cut also holds `hint`: the `get_file_map`
+call with `kind` that pages the items of that kind. For `enum_constant`,
+the hint starts at the first constant, because fw-context cuts each
+subgroup separately.
+
+**One kind.** With `kind`, the answer is one flat page of the items of
+that kind, enum constants too:
+
+```
+Input:  {"file_path": "src/net_msg.cpp", "kind": "method", "max_per_kind": 30, "offset": 30}
+Output: {"file": "src/net_msg.cpp", "kind": "method", "count": 45,
+         "items": [{"name": "send", "qualified_name": "ModemMsg::send",
+                    "line": 410, "end_line": 432}, …],
+         "page": {"total": 45, "offset": 30, "shown": 15, "more": false}}
+```
+
+`max_per_kind` is then the size of the page (`0` = every item from
+`offset` on), and `offset` skips that many items. `page` holds the page
+notice. The hint repeats `signatures: true`. A kind that the file does
+not hold gives one `info` dict that names the kinds of the file. A page
+after the last item gives one `info` dict that names the total.
 
 fw-context groups enum constants into `subgroups`, by the parent enum.
 For `enum_constant`, `items` is empty.
@@ -1279,8 +1372,8 @@ root, such as an SDK header, is returned and not refused.
 `in_project_root` on each candidate tells project code from vendor code.
 
 For enum constants, the result includes `enum_value` (the integer value).
-For enums, the result includes a `constants` array that lists all the
-member constants, with their names and values:
+For enums, the result includes a `constants` array that lists the member
+constants, with their names and values, in the order of the source:
 
 ```
 Input:  {"name": "BleCmd::StatusCode", "project_root?": "/path/to/project"}
@@ -1290,8 +1383,13 @@ Output: {"name": "StatusCode", "kind": "enum", "file": "/path/src/radio_cmd.h",
            {"name": "OPERATION_SUCCESSFUL", "enum_value": 1},
            {"name": "TOKEN_INVALID", "enum_value": -2}
          ],
+         "constants_total": 2,
          "source": "  20  enum StatusCode {\n  …\n  24  }"}
 ```
+
+`constants` holds at most 200 constants. `constants_total` counts all of
+them. When the list is cut, `constants_hint` names the
+`lookup_symbol('<enum>::')` call that pages every constant.
 
 #### `explain_symbol`
 
@@ -1354,8 +1452,9 @@ the result adds `stale: true` and a `stale_warning`.
 #### `get_symbol_context`
 
 Rich LLM context — body, callers, and callees in one response. Returns
-**all** callers and callees, including vendor and SDK code. The call
-graph naturally spans the project and vendor boundaries.
+the direct callers and callees, including vendor and SDK code. The call
+graph naturally spans the project and vendor boundaries. Each list has a
+maximum, and a count of the whole list.
 
 ```
 Input:  {"name": "modem_connect", "project_root?": "/path/to/project"}
@@ -1373,6 +1472,7 @@ Output: {"name": "modem_connect", "kind": "function",
            {"name": "pdp_activate", "kind": "function", "file": "/path/src/net.c"}
          ],
          "indirect_call_sites": [],
+         "callers_total": 2, "callees_total": 3, "indirect_call_sites_total": 0,
          "resolution": null}
 ```
 
@@ -1396,9 +1496,21 @@ Output: {"name": "onData", "kind": "field",
 ```
 
 This tool is designed as one-shot LLM context. This tool answers "what
-does this do, and how does it fit?" in a single call. This tool returns
-all the direct callers and callees, with no artificial limit.
-`indirect_call_sites` is capped at 200 entries.
+does this do, and how does it fit?" in a single call. Each list stops at
+a maximum:
+
+| List | Maximum | Tool that pages it |
+|------|---------|--------------------|
+| `callers` | 50 `call` and `indirect` references, each with its line | `find_callers` |
+| `callees` | 100 rows, one for each callee and kind of reference | `find_callees_recursive` with `max_depth=1` |
+| `indirect_call_sites` | 200 entries | `find_indirect_call_sites`, for a field or a variable |
+
+`callers_total`, `callees_total`, and `indirect_call_sites_total` count
+each whole list. When the maximum cuts a list, `callers_hint`,
+`callees_hint`, or `indirect_call_sites_hint` names the tool that pages
+it. `indirect_call_sites_hint` is there only for a field or a variable.
+The hint names no offset: the paged tool counts a wider set, thus its
+pages do not continue the list row for row.
 
 For a field or variable symbol that has a function pointer type, the
 result also includes a `resolution` block:
@@ -1407,9 +1519,10 @@ indicates whether the assignments and the call sites are linked (Phase 3).
 When the data is incomplete, `resolved` is `false`, with an explanatory
 note. The LLM can detect the uncertainty from this signal.
 
-For enums, the result includes a `constants` array, with all the member
-constants and their values, in the same shape as `get_source`. Enum
-constants include `enum_value`.
+For enums, the result includes a `constants` array, with the member
+constants and their values, in the same shape as `get_source`: at most
+200 constants, `constants_total`, and `constants_hint` when the list is
+cut. Enum constants include `enum_value`.
 
 The body follows the same rules as in `get_source`: it is ifdef-filtered,
 `source_origin` says `"index"` or `"disk"`, `_source_truncated` marks a
@@ -1422,15 +1535,16 @@ index, thus a stale result can hold an incomplete list.
 
 #### `read_file`
 
-Read a complete source file with ifdef-filtered content — only code that
-actually compiles for the current build configuration. fw-context replaces
-an inactive `#ifdef` branch with blank lines, and keeps the original line
-numbers.
+Read a source file, one page at a time, with ifdef-filtered content —
+only code that actually compiles for the current build configuration.
+fw-context replaces an inactive `#ifdef` branch with blank lines, and
+keeps the original line numbers.
 
 ```
-Input:  {"file_path": "src/modem.c", "project_root?": "/path/to/project"}
+Input:  {"file_path": "src/modem.c", "project_root?": "/path/to/project", "start_line?": 0}
 Output: {"file": "/path/src/modem.c", "language": "c", "mtime": 1748534400.0,
-         "lines": 512, "content": "/* Modem driver */\n\n#include \"modem.h\"\n…"}
+         "lines": 512, "content": "/* Modem driver */\n\n#include \"modem.h\"\n…",
+         "page": {"total": 512, "offset": 0, "shown": 512, "more": false}}
 ```
 
 Unlike a generic file reader, this tool returns build-accurate content.
@@ -1457,8 +1571,24 @@ from the disk.
 
 `line_numbers=True` prefixes every line with its number, in the format
 that `get_source` uses. `start_line` and `end_line` cut a window out of
-the file — 1-based, both ends inclusive, and 0 means no bound on that
-side. Reading around a known line costs a fraction of the whole file.
+the file — 1-based, both ends inclusive. A `start_line` of 0 starts at
+line 1. An `end_line` of 0 gives one page of at most 2000 lines. Reading
+around a known line costs a fraction of the whole file.
+
+**Pages.** Without `end_line`, the answer is one page of at most 2000
+lines from `start_line` on. `page` holds the page notice, in lines:
+
+- `total` is the number of lines of the file.
+- `offset` is the number of lines before the page.
+- `shown` is the number of lines on the page.
+
+When `more` is true, the `hint` names the `read_file` call with the next
+`start_line`, for example
+`read_file('src/stm32f4xx.h', start_line=2001) reads the next page.`
+The hint repeats `line_numbers=True`. A page that is not the whole file
+also holds `start_line` and `end_line`. An explicit
+`end_line` gives the whole range that it names, and the answer then has
+no `page`.
 
 ```
 Input:  {"file_path": "src/command.h", "start_line": 25, "end_line": 31, "line_numbers": true}
@@ -1572,10 +1702,12 @@ Output: [{"depth": 3, "chain": "main → app_init → uart_write → uart_send_b
 ```
 
 Returns up to 5 distinct paths, in the order that the BFS finds them. The
-tool does not check that a path is the shortest. The search runs from
-both ends, and each end goes up to `max_depth` hops. Thus a path can hold
-up to 2 × `max_depth` edges. When no path exists, the result is one
-`info` dict. Requires both symbols to be in the index. Each path carries `target_usr`, the USR of the symbol
+order is fixed: the same query gives the same paths. The tool does not
+check that a path is the shortest. The search runs from both ends, and
+each end goes up to `max_depth` hops. Thus a path can hold up to
+2 × `max_depth` edges. When the search finds no path within the depth,
+the result is one `info` dict. Requires both symbols to be in the index.
+Each path carries `target_usr`, the USR of the symbol
 that the path ends at. It tells two overloads apart. A chain that the
 search finds at several meeting points is reported once.
 
@@ -1583,18 +1715,37 @@ When `to_name` matches more than one symbol, the search reaches all of
 them, and each path also carries `target_qualified_name`. The answer can
 then hold two direct paths to two targets of the same name.
 
+**No pages.** This tool takes no `offset` and gives no page notice,
+because fw-context cannot count the paths. A trailing `info` row says
+when the answer can leave out paths:
+
+- The search found 5 paths and stopped. More paths can exist.
+- The search used its budget of node expansions before it reached each
+  node within the depth. More paths can exist.
+
+When the search used its budget and found no path, the answer is one
+`info` row. That row says that a path can still exist, and NOT "no path".
+Then name a start or a target that is nearer, or use `find_callers`.
+
 #### `find_all_callers_recursive`
 
 All transitive callers — who calls this, directly or indirectly?
 
 ```
-Input:  {"name": "gpio_set", "project_root?": "/path/to/project", "max_depth?": 5, "limit?": 50}
-Output: [{"name": "led_toggle", "qualified_name": "led_toggle", "kind": "function",
+Input:  {"name": "gpio_set", "project_root?": "/path/to/project", "max_depth?": 5, "limit?": 50, "offset?": 0}
+Output: [{"total": 12, "offset": 0, "shown": 12, "more": false},
+         {"name": "led_toggle", "qualified_name": "led_toggle", "kind": "function",
           "file": "/path/src/led.c", "depth": 1}, … (2 steps away), … (3 steps away)]
 ```
 
 fw-context deduplicates the results. Each caller appears once, at its
 shortest distance.
+
+The page notice comes before the rows, and after the `warning` row of an
+ambiguous name. `total` counts every caller within `max_depth`. The hint
+repeats `max_depth` when it is not the default. A page after the last row
+gives one `info` dict that names the total. `find_callees_recursive` pages
+in the same way.
 
 Each row holds `name`, `qualified_name`, `kind`, `signature`, `depth`, and
 `file` (absolute). There is no `line`, because one caller can hold several
@@ -1606,8 +1757,9 @@ that this tool reports. `find_callees_recursive` gives the same fields.
 What does this call, directly or indirectly?
 
 ```
-Input:  {"name": "main", "project_root?": "/path/to/project", "max_depth?": 5, "limit?": 50}
-Output: [{"name": "spi_init", "kind": "function", "file": "/path/src/spi.c", "depth": 1},
+Input:  {"name": "main", "project_root?": "/path/to/project", "max_depth?": 5, "limit?": 50, "offset?": 0}
+Output: [{"total": 87, "offset": 0, "shown": 50, "more": true, "hint": "…offset=50…"},
+         {"name": "spi_init", "kind": "function", "file": "/path/src/spi.c", "depth": 1},
          {"name": "spi_transfer", "kind": "function", "file": "/path/src/spi.c", "depth": 2}, …]
 ```
 
@@ -1683,8 +1835,9 @@ Find wrapper classes that call methods of a driver class. This tool is
 useful for understanding an adapter or wrapper architecture.
 
 ```
-Input:  {"class_name": "UART_DRIVER", "project_root?": "/path/to/project", "limit?": 50}
-Output: [{"wrapper_class": "UART", "method_count": 2,
+Input:  {"class_name": "UART_DRIVER", "project_root?": "/path/to/project", "limit?": 20, "offset?": 0}
+Output: [{"total": 3, "offset": 0, "shown": 3, "more": false},
+         {"wrapper_class": "UART", "method_count": 2,
           "methods": [
             {"method": "send", "qualified_name": "UART::send", "kind": "method",
              "file": "/path/src/uart.cpp",
@@ -1701,17 +1854,21 @@ free function goes into `wrapper_class: "(global)"`. `file` is on each
 method, not on the class, because one class can span several files.
 `driver_method` is the bare name of the driver method.
 
-`limit` (max 50) caps the call sites into the driver that fw-context reads
-and groups. The answer has no page notice, thus a driver with more call
-sites gives a partial grouping. No match gives one `info` dict.
+A page is a slice of the wrapper classes, in the order of the class name.
+`limit` is the number of classes on one page (default 20, max 100). Each
+class comes with all of its methods and all of its calls into the driver,
+thus a class is never split over two pages. `total` counts every wrapper
+class. A page after the last class gives one `info` dict that names the
+total. No match gives one `info` dict.
 
 #### `find_indirect_call_sites`
 
 Find indirect call sites where a function pointer field or variable is invoked.
 
 ```
-Input:  {"name": "onData", "project_root?": "/path/to/project", "limit?": 50}
-Output: [{"file": "/path/src/main.c", "line": 36, "expr_text": "drv . onData",
+Input:  {"name": "onData", "project_root?": "/path/to/project", "limit?": 50, "offset?": 0}
+Output: [{"total": 1, "offset": 0, "shown": 1, "more": false},
+         {"file": "/path/src/main.c", "line": 36, "expr_text": "drv . onData",
           "target_usr": "c:@S@Driver@FI@onData", "target_name": "onData",
           "fn_ptr_type": "void (*)(unsigned char *, int)",
           "caller": "test_assign", "caller_kind": "function"}]
@@ -1725,13 +1882,18 @@ functions are assigned to this field?"*
 
 Uses three-tier name resolution: exact name, exact qualified, suffix LIKE.
 
+`limit` (max 200) is the size of one page. `total` counts every call site
+that matches. A page after the last call site gives one `info` dict that
+names the total. `find_indirect_targets` pages in the same way.
+
 #### `find_indirect_targets`
 
 Find functions assigned to a function pointer field, variable, or parameter.
 
 ```
-Input:  {"name": "onData", "project_root?": "/path/to/project", "limit?": 50}
-Output: [{"rhs_name": "handler_data", "rhs_qname": "handler_data",
+Input:  {"name": "onData", "project_root?": "/path/to/project", "limit?": 50, "offset?": 0}
+Output: [{"total": 1, "offset": 0, "shown": 1, "more": false},
+         {"rhs_name": "handler_data", "rhs_qname": "handler_data",
           "fn_ptr_type": "void (*)(unsigned char *, int)",
           "method": "assignment",
           "assign_file": "/path/src/main.c", "assign_line": 14,
@@ -1775,8 +1937,9 @@ For the reverse query — where does code call this field — use
 Trace how data of a given type flows to a target function. **Experimental.**
 
 ```
-Input:  {"type_name": "SensorData", "to_symbol": "uart_send", "project_root?": "/path/to/project", "max_depth?": 8, "limit?": 15}
-Output: [{"_summary": "1/2 source functions reach 'uart_send' within depth 8",
+Input:  {"type_name": "SensorData", "to_symbol": "uart_send", "project_root?": "/path/to/project", "max_depth?": 8, "limit?": 15, "offset?": 0}
+Output: [{"total": 2, "offset": 0, "shown": 2, "more": false},
+         {"_summary": "1/2 source functions on this page reach 'uart_send' within depth 8",
           "_type": "SensorData", "_target": "uart_send"},
          {"source_name": "sensor_read", "source_qualified_name": "sensor_read",
           "source_kind": "function", "source_file": "/path/src/sensor.cpp",
@@ -1790,16 +1953,25 @@ Output: [{"_summary": "1/2 source functions reach 'uart_send' within depth 8",
 
 Finds the definitions whose signature mentions `type_name` (substring
 match, any symbol kind, most-called first), then looks for call paths from
-those definitions to `to_symbol`. A `_summary` row comes first. Each
-source row holds up to 3 `paths`, in the shape that `find_call_path`
+those definitions to `to_symbol`. The page notice comes first, and
+`total` counts every source function that matches. A `_summary` row
+follows, and it describes the source functions of this page. `limit`
+(max 15) is the number of source functions on one page. The hint repeats
+`max_depth` when it is not the default.
+
+Each source row holds up to 3 `paths`, in the shape that `find_call_path`
 gives. An unreachable source has no `paths` key. When `to_symbol` matches
 more than one symbol, a source row also holds the `warning` that names
 them, and each path its `target_qualified_name`. `timed_out: true` means
 that the time budget (`timeout_ms`) ran out before the search for that
-source began: its `reachable: false` means "not checked". When nothing
-matches, the result is one `info` dict. Does **not** resolve type
-transformations, for example CBOR encoding. Use this tool together with
-`find_call_path`, to verify specific paths.
+source began: its `reachable: false` means "not checked". Such a source
+counts as shown, thus the hint goes past it. To do a check of it, call
+again with the same `offset`: each page gets the whole time budget.
+
+A page after the last source function gives one `info` dict that names
+the total. When nothing matches, the result is one `info` dict. Does
+**not** resolve type transformations, for example CBOR encoding. Use this
+tool together with `find_call_path`, to verify specific paths.
 
 #### `get_vector_table`
 
@@ -1809,8 +1981,9 @@ other graph tools show a handler as unreferenced. This tool reads the
 table itself.
 
 ```
-Input:  {"project_root?": "/path/to/project", "unhandled_only?": false, "limit?": 400}
-Output: [{"slot": 0, "name": "__StackTop", "file": "/path/.link_script.ld", "line": 148,
+Input:  {"project_root?": "/path/to/project", "unhandled_only?": false, "limit?": 400, "offset?": 0}
+Output: [{"total": 98, "offset": 0, "shown": 98, "more": false},
+         {"slot": 0, "name": "__StackTop", "file": "/path/.link_script.ld", "line": 148,
           "status": "linker", "source": "assembly",
           "table_file": "/path/startup_stm32f429xx.S", "table_line": 60},
          {"slot": 44, "name": "TIM2_IRQHandler", "file": "/path/src/timer.c", "line": 31,
@@ -1865,10 +2038,17 @@ site, with `name`, `file`, `line`, and `at` (where the registration
 happens). A row with a real static definition keeps its own status and
 still carries `installed`.
 
-Rows other than slots follow the slots. `limit` (max 1000) does not apply
-to them:
+The page notice comes before the slots, and `total` counts every slot of
+every table. The slots come in the order of source, then table, then
+slot. `limit` (max 1000) is the size of one page. When `unhandled_only`
+is true, the hint repeats it. A page after the last slot gives one `info`
+dict that names the total, and then the rows that follow. An answer with
+no slot row has no page notice.
 
-- `truncated` — how many slots `limit` cut. It comes first.
+Rows other than slots follow the slots of each page. The page does not
+apply to them, thus they are on every page. They describe the whole
+table:
+
 - `coverage` — one row per C table that has slots with no function name.
   Such a slot holds a zero, an address that the linker resolved, or data.
   In a table of handlers that is an unused vector. In Zephyr's
@@ -1898,7 +2078,7 @@ Return the C++ inheritance hierarchy for a class or struct — direct bases
 this), with access level and virtual flag.
 
 ```
-Input:  {"class_name": "UART_DRIVER", "project_root?": "/path/to/project", "transitive?": false, "max_depth?": 10}
+Input:  {"class_name": "UART_DRIVER", "project_root?": "/path/to/project", "transitive?": false, "max_depth?": 10, "limit?": 100, "offset?": 0}
 Output: {"name": "UART_DRIVER", "qualified_name": "hal::UART_DRIVER",
          "kind": "class", "file": "/path/src/UART_DRIVER.h", "line": 45,
          "bases": [{"name": "SerialBase", "usr": "c:@...", "access": "public",
@@ -1910,6 +2090,14 @@ Output: {"name": "UART_DRIVER", "qualified_name": "hal::UART_DRIVER",
 When `transitive: true`, adds `all_bases` (ancestors BFS) and `all_derived`
 (descendants BFS) with `depth` and cycle detection for diamond inheritance.
 
+Each of the two lists is one page, in the order of depth, then name.
+`limit` is the size of the page (default 100, max 500). `offset` skips
+that many classes, in the two lists together. `all_bases_page` and
+`all_derived_page` hold the page notice of each list. `limit` and
+`offset` apply only with `transitive: true`. The hint repeats `max_depth`
+when it is not the default. A hierarchy below a root class of a framework
+can hold thousands of classes.
+
 The `class_name` can be a bare name (`UART_DRIVER`) or qualified
 (`hal::UART_DRIVER`). Only classes and structs are valid targets.
 
@@ -1918,7 +2106,7 @@ The `class_name` can be a bare name (`UART_DRIVER`) or qualified
 Return all methods, fields, and nested types of a class/struct grouped by kind.
 
 ```
-Input:  {"class_name": "ModemManager", "project_root?": "/path/to/project"}
+Input:  {"class_name": "ModemManager", "project_root?": "/path/to/project", "limit?": 200, "offset?": 0}
 Output: {"name": "ModemManager", "qualified_name": "ns::ModemManager",
          "kind": "class", "file": "/path/src/modem.h", "line": 120,
          "members": {
@@ -1929,12 +2117,19 @@ Output: {"name": "ModemManager", "qualified_name": "ns::ModemManager",
              "constructor": [{"name": "ModemManager", …}],
              "enum": [{"name": "State", …}]
          },
-         "member_count": 12}
+         "member_count": 12,
+         "page": {"total": 12, "offset": 0, "shown": 12, "more": false}}
 ```
 
-fw-context orders the members by kind, then by name. This tool shows the
-full API surface, without opening the header file. This tool also works
-for C structs, but a struct will not have methods. This tool returns
+A page holds the members in one order: kind, name, and line. fw-context
+groups the members of a page by kind after the cut, thus one kind can
+continue on the next page. `limit` is the size of one page (default 200,
+max 500), and `offset` skips that many members. `member_count` counts
+every member, not only the page. `page` holds the page notice. A page
+after the last member gives one `info` dict that names the total.
+
+This tool shows the full API surface, without opening the header file.
+This tool also works for C structs, but a struct will not have methods. This tool returns
 `member_count: 0` for an index that predates this feature.
 
 #### `get_template_instances`
@@ -1942,8 +2137,9 @@ for C structs, but a struct will not have methods. This tool returns
 Find concrete instantiations of a class or function template.
 
 ```
-Input:  {"template_name": "std::vector", "project_root?": "/path/to/project", "limit?": 50}
-Output: [{"name": "vector", "qualified_name": "std::vector", "kind": "class",
+Input:  {"template_name": "std::vector", "project_root?": "/path/to/project", "limit?": 50, "offset?": 0}
+Output: [{"total": 3, "offset": 0, "shown": 3, "more": false},
+         {"name": "vector", "qualified_name": "std::vector", "kind": "class",
           "file": "/usr/include/c++/12/bits/stl_vector.h", "line": 428,
           "is_definition": true, "signature": "",
           "instances": [{"name": "vector", "qualified_name": "std::vector<int>",
@@ -1952,9 +2148,12 @@ Output: [{"name": "vector", "qualified_name": "std::vector", "kind": "class",
           "instance_count": 3}]
 ```
 
-The result is a list with one dict. That dict describes the template
-itself and holds the `instances` list. `instance_count` is the number of
-instances returned, capped by `limit` (max 200). A dict with `error` means
+The result is a list: the page notice, then one dict. That dict describes
+the template itself and holds the `instances` list, which is one page of
+the instances. `limit` (max 200) is the size of the page, and `offset`
+skips that many instances. `instance_count` counts all instances: it is
+the same number as `total`. A page after the last instance gives one
+`info` dict that names the total. A dict with `error` means
 that the name was not found, is not a template, or the query failed. When
 a file of the answer changed after the last index run, a `warning` dict
 comes first.

@@ -911,6 +911,31 @@ def test_every_copy_of_the_instructions_states_the_corrected_tool_rules():
             assert rule in flat, f"{label}: {rule!r}"
 
 
+def test_every_copy_of_the_instructions_names_each_paged_tool():
+    """A tool that pages and is not named reads as one that gives everything.
+
+    The list grew from eight tools to every tool with a long list.  A
+    reader that knows only the old list takes a full page of
+    find_all_callers_recursive for the whole call tree.
+    """
+    paged = (
+        "lookup_symbol", "search_code", "search_bodies", "search_content",
+        "smart_search", "semantic_search", "find_callers", "find_references",
+        "find_all_callers_recursive", "find_callees_recursive",
+        "find_indirect_call_sites", "find_indirect_targets", "find_variables",
+        "find_dead_code", "find_hotspots", "find_wrapper_callers",
+        "trace_data_flow", "get_template_instances", "get_vector_table",
+        "get_class_members", "get_file_map", "read_file",
+        "get_inheritance_chain", "all_bases_page", "total_capped", "_total",
+    )
+    for label, text in _instruction_copies():
+        start = text.lower().index("reading past the first page")
+        section = text[start:start + 3000]
+        for name in paged:
+            assert name in section, f"{label}: {name} is not in the paging section"
+        assert "Eight tools" not in text and "eight tools" not in text, label
+
+
 def test_no_copy_of_the_instructions_holds_a_dead_file():
     """``data/instructions.md`` is gone.  Nothing may point a reader at it."""
     from pathlib import Path
