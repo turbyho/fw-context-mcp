@@ -160,17 +160,17 @@ def _build_smart_search() -> PipelineConfig:
     )
 
 
-# Semantic search pipeline — built lazily because threshold & overfetch
-# depend on the caller's parameters.
+# Semantic search pipeline — built lazily because the threshold depends on
+# the caller's parameters.
 
 
-def _build_semantic_search(threshold: float, overfetch: int) -> PipelineConfig:
+def _build_semantic_search(threshold: float) -> PipelineConfig:
     """Build the pipeline config of the semantic_search tool.
 
     Why a builder function instead of a constant?
-        Semantic search is always called with caller-provided ``threshold``
-        and ``overfetch`` parameters.  These vary per invocation — a
-        constant couldn't capture them.
+        Semantic search is always called with a caller-provided
+        ``threshold``.  It varies per invocation — a constant couldn't
+        capture it.
 
     Why source_boost=True?
         Project code is weighted 1.2× and vendor SDK 0.85×.  This ensures
@@ -180,6 +180,11 @@ def _build_semantic_search(threshold: float, overfetch: int) -> PipelineConfig:
     Why ``keep_similarity=True``?
         semantic_search gives the raw cosine similarity of each result in
         ``_similarity``.  The default format drops the field.
+
+    Why ``whole_set=True`` and ``cut=False``?
+        semantic_search pages its answer.  The pipeline gives every symbol
+        above the threshold in one fixed order, and the handler cuts the
+        page out of it.
 
     Standalone embedding with source boosting for project-code ranking.
     """
@@ -191,10 +196,10 @@ def _build_semantic_search(threshold: float, overfetch: int) -> PipelineConfig:
             EmbeddingPhase(
                 independent=True,
                 threshold=threshold,
-                overfetch=overfetch,
                 source_boost=True,
+                whole_set=True,
             ),
-            FormatPhase(keep_similarity=True),
+            FormatPhase(keep_similarity=True, cut=False),
         ],
     )
 

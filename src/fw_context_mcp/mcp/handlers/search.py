@@ -38,7 +38,7 @@ import asyncio
 import logging
 import sqlite3
 from pathlib import Path
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 from pydantic import Field
 
@@ -51,7 +51,7 @@ from ...llm.embedder_factory import uses_ollama
 from ...utils import abs_path, resolve_project_root
 from ..shared.context import _db_path, _is_stale, _quick_open_readonly
 from ..shared.fallback import _fallback_to_search_code
-from ..shared.paging import clamp_offset, page_notice
+from ..shared.paging import clamp_offset, page_hint, page_notice, past_end_info
 from ..shared.stale import _with_stale_recovery
 from ._lookup import lookup_symbol
 from ._search_fallbacks import (
@@ -64,6 +64,10 @@ from ._search_fallbacks import (
     _search_code_name_tokens,
     count_fts5_kind,
 )
+from ._smart_cache import SMART_SEARCH_CACHE, CachedAnswer, answer_key
+
+if TYPE_CHECKING:
+    from fw_context_mcp.search.context import PipelineContext
 
 # The relaxation chain of ``search_code``, each step beside its counter.
 # The primary FTS5 search leads it: it is a step of the same shape, and a
@@ -432,7 +436,8 @@ def search_code(
 async def smart_search(
     query: Annotated[str, Field(description="Natural language description, 5-15 words. E.g. 'how does the modem connect?' or 'handle BLE pairing failure'.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    limit: Annotated[int, Field(description="Maximum results (default 20). Held between 5 and 100.", ge=1)] = 20,
+    limit: Annotated[int, Field(description="Maximum results on one page (default 20). Held between 1 and 100.", ge=1)] = 20,
+    offset: Annotated[int, Field(description="Skip this many results of the previous search of this query. 0 (the default) is a new search.", ge=0)] = 0,
 ) -> list[dict]:
     """Natural-language search: an LLM generates FTS5 keywords, then searches
     the libclang index. Finds concepts by meaning rather than exact text
@@ -472,15 +477,23 @@ async def smart_search(
         query: Natural language description of what you're looking for.
                Be specific — 5–15 words works best.
         project_root: Project root directory. Auto-detected from CWD if omitted.
-        limit: Maximum number of results (default 20). The pipeline holds
-            it between 5 and 100: a smaller number becomes 5, because the
-            re-rank steps need a set to choose from.
+        limit: Maximum number of results on one page (default 20, max
+            100).  The search itself always ranks up to 100 symbols.
+        offset: Skip this many results of the previous search of the same
+            query.  0, the default, is a NEW search.  A page with an offset
+            comes out of the stored answer of the last search; when the
+            last search was of another query (or another project, or a
+            build that a reindex changed), the tool searches again first.
+            An index run that keeps the build keeps the stored answer.
 
     Returns:
         list of dicts with metadata entries (_generated_queries, _rough_queries,
-        _translated_from + _translated_to) followed by symbol results with
+        _translated_from + _translated_to), then the page notice
+        ``{total, offset, shown, more, hint}``, followed by symbol results with
         name, qualified_name, kind, file, line, is_definition, signature,
-        docstring.  A symbol also holds ``summary``, ``inputs`` and
+        docstring.  ``total`` counts the symbols of the answer (at most
+        100).  A page after the last symbol gives one ``info`` dict that
+        names the total.  A symbol also holds ``summary``, ``inputs`` and
         ``outputs`` when ``fw-context index --analyze`` wrote them.  A model
         wrote that text, and the code did not: never quote it as a fact.
 
@@ -488,8 +501,9 @@ async def smart_search(
         project), a leading dict holds ``_partial: True``, a ``warning``
         with the timeout, and a ``hint``.  The symbols that follow are the
         ones that the steps before the timeout found, without the later
-        re-rank steps; there can be none.  Make the query more specific, or
-        increase the LLM timeout.
+        re-rank steps; there can be none.  This answer has no page notice
+        and is not stored, thus a next page searches again.  Make the query
+        more specific, or increase the LLM timeout.
 
         When compile_commands.json changed after the last index run, a
         trailing dict holds a ``warning`` and a ``hint`` to reindex.
@@ -498,15 +512,66 @@ async def smart_search(
         dict with ``error`` means the query failed — check that key first.
     """
     from fw_context_mcp.search.context import PipelineContext
-    from fw_context_mcp.search.pipeline import PipelineRunner, _build_smart_search
 
+
+    page_size = max(1, min(limit, 100))
+    skip = clamp_offset(offset)
     try:
-        ctx = PipelineContext.create(query=query, project_root=project_root, limit=limit)
+        # The pipeline gives the whole answer that the pages are cut from.
+        ctx = PipelineContext.create(query=query, project_root=project_root, limit=_SMART_ANSWER_SIZE)
     except ValueError as e:
         return [{"error": str(e)}]
 
-    config = _build_smart_search()
-    runner = PipelineRunner(config)
+    # offset 0 is a new search.  A later page comes out of the stored
+    # answer of the same query and build; without one, the search runs.
+    key = answer_key(ctx.db_path, ctx.config_hash, query)
+    answer = SMART_SEARCH_CACHE.get(key) if skip else None
+    if answer is None:
+        searched = await _smart_search_run(ctx, key, page_size, skip)
+        if isinstance(searched, list):
+            # The timeout answer is not stored.  At offset 0 it is still a
+            # new search, thus the older answer must not serve a next page.
+            if not skip:
+                SMART_SEARCH_CACHE.clear()
+            return searched
+        answer = searched
+        SMART_SEARCH_CACHE.put(answer)
+
+    total = len(answer.symbols)
+    page = list(answer.symbols[skip:skip + page_size])
+    if skip and not page:
+        return [past_end_info("symbol", skip, total)]
+    results = list(answer.meta)
+    if total:
+        results.append(page_notice(
+            total, skip, len(page),
+            hint=page_hint("smart_search", query, next_offset=skip + len(page)),
+        ))
+    results += page
+    # Append staleness warning unless the LLM setup itself failed — in that
+    # case the meta rows already carry a warning.
+    if not answer.llm_failed:
+        results = _append_staleness_warning(results, ctx.db_path, ctx.project_root)
+    return results
+
+
+# The symbols of one smart_search answer: the pages are cut from them.
+_SMART_ANSWER_SIZE = 100
+
+
+async def _smart_search_run(
+    ctx: PipelineContext, key: str, page_size: int, skip: int,
+) -> CachedAnswer | list[dict]:
+    """Run the smart_search pipeline; give the answer to store, or the timeout page.
+
+    The timeout answer is a list and is NOT stored: it holds what the steps
+    before the stall found, and a later page of it would cut a list that
+    a complete run would give in another order.
+    """
+    from fw_context_mcp.search.pipeline import PipelineRunner, _build_smart_search
+
+
+    runner = PipelineRunner(_build_smart_search())
 
     # Pipeline timeout from the config of the project (ctx.config, which
     # create() loaded with the project root) — smart_search involves
@@ -524,28 +589,32 @@ async def smart_search(
         # On timeout, return the symbols that the phases before the stall
         # found — partial results are better than nothing. The warning
         # tells the operator the results are incomplete.
-        return await _smart_search_partial(runner.last_ctx or ctx, timeout)
+        return await _smart_search_partial(runner.last_ctx or ctx, timeout, page_size, skip)
 
-    # Flatten the pipeline's formatted results iterator into a list.
-    results = list(ctx.formatted_results)
-    # Append staleness warning unless the LLM setup itself failed — in that
-    # case ctx.ollama_warning is set and the results already carry a warning.
-    if ctx.ollama_warning is None:
-        results = _append_staleness_warning(results, ctx.db_path, ctx.project_root)
-    return results
+    rows = list(ctx.formatted_results)
+    return CachedAnswer(
+        key=key,
+        meta=tuple(r for r in rows if "name" not in r),
+        symbols=tuple(r for r in rows if "name" in r),
+        llm_failed=ctx.ollama_warning is not None,
+    )
 
 
-async def _smart_search_partial(ctx, timeout: float) -> list[dict]:
+async def _smart_search_partial(
+    ctx: PipelineContext, timeout: float, page_size: int, skip: int,
+) -> list[dict]:
     """The answer of a smart_search that passed *timeout*.
 
     *ctx* is the context after the last phase that ended.  Its symbols are
     the fused list when a fusion ran, else the FTS5 rows; they get the same
-    format as a full answer, with a leading ``_partial`` warning.
+    format as a full answer, with a leading ``_partial`` warning.  The
+    answer holds one page of the caller's size and no page notice: there
+    is no complete answer to page.
     """
     from fw_context_mcp.search.phases.format import FormatPhase
 
     rows = ctx.final_results or ctx.fts5_results
-    formatted = (await FormatPhase().run(ctx.evolve(final_results=list(rows)[:ctx.limit]))).formatted_results
+    formatted = (await FormatPhase().run(ctx.evolve(final_results=list(rows)[skip:skip + page_size]))).formatted_results
     results = [r for r in formatted if "info" not in r]
     if rows:
         hint = "Partial results: the search timed out before its last steps. " \
@@ -561,11 +630,16 @@ async def _smart_search_partial(ctx, timeout: float) -> list[dict]:
 
 
 # ── moved from server.py ──
+# The default threshold of semantic_search; a hint repeats any other value.
+_SEMANTIC_DEFAULT_THRESHOLD = 0.60
+
+
 async def semantic_search(
     query: Annotated[str, Field(description="Natural language description, 5-15 words. E.g. 'parcel locker state machine' or 'how does the modem connect?'.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    threshold: Annotated[float, Field(description="Minimum cosine similarity (0.0-1.0). Default 0.60. Use 0.55 for exploratory, 0.50 for broad search.", ge=0.0, le=1.0)] = 0.60,
-    limit: Annotated[int, Field(description="Maximum results (default 20). Held between 1 and 100.", ge=1)] = 20,
+    threshold: Annotated[float, Field(description="Minimum cosine similarity (0.0-1.0). Default 0.60. Use 0.55 for exploratory, 0.50 for broad search.", ge=0.0, le=1.0)] = _SEMANTIC_DEFAULT_THRESHOLD,
+    limit: Annotated[int, Field(description="Maximum results on one page (default 20). Held between 1 and 100.", ge=1)] = 20,
+    offset: Annotated[int, Field(description="Skip this many results. Reads the next page of the symbols above the threshold.", ge=0)] = 0,
 ) -> list[dict]:
     """Semantic search using pre-computed libclang symbol embeddings. Finds
     symbols by meaning, not by text — matches concepts even when query
@@ -619,13 +693,25 @@ async def semantic_search(
         threshold: Minimum cosine similarity (0.0-1.0). Default 0.60.
             The tool applies it to the raw cosine similarity, before the
             source boost.
-        limit: Maximum number of results (default 20, max 100).
+        limit: Maximum number of results on one page (default 20, max 100).
+        offset: Skip this many results.  Reads the next page; the page
+            notice names the offset to use.
 
     Returns:
-        list of dicts, each with: name, qualified_name, kind, file, line,
+        The page notice ``{total, offset, shown, more, hint}`` comes before
+        the symbols.  ``total`` counts every symbol above ``threshold``, as
+        far as one KNN query reaches (4096 vector rows; a symbol of several
+        chunks takes several of them).  When the KNN stopped
+        there with its last row still above the threshold, the notice also
+        holds ``total_capped: True``, and ``total`` is a lower bound.  A page
+        after the last symbol gives one ``info`` dict that names the total.
+
+        Then a list of dicts, each with: name, qualified_name, kind, file, line,
         is_definition, signature, docstring, plus ``_method``
         (``"embedding"`` or ``"search_code_fallback"``), ranked by the
-        boosted similarity (or by the reranker).  An ``"embedding"``
+        boosted similarity, then by the symbol id.  The reranker (when
+        ``llm.reranker_model`` is set) reorders the first symbols of a
+        page, and moves no symbol to another page.  An ``"embedding"``
         result also holds ``_similarity``, the raw cosine similarity.  A
         symbol also holds ``summary``, ``inputs`` and ``outputs`` when
         ``fw-context index --analyze`` wrote them — model text, never a
@@ -637,20 +723,21 @@ async def semantic_search(
 
         Fallback: when the LLM is disabled or not running, or the index
         holds no embeddings, or the embedding model fails, this tool runs
-        ONE plain FTS5 symbol search (the first step of ``search_code``,
-        with no kind, no relaxation and no paging).  A leading dict holds
-        a ``warning`` with the reason, and each symbol carries
-        ``_method: "search_code_fallback"``.  A changed result file or
-        compile_commands.json adds another leading ``warning``.  When the
-        lexical search finds nothing too, the answer is one ``warning``.
+        a plain FTS5 symbol search (the first step of ``search_code``,
+        with no kind and no relaxation), one page of it.  A leading dict
+        holds a ``warning`` with the reason, the page notice follows, and
+        each symbol carries ``_method: "search_code_fallback"``.  A
+        changed result file or compile_commands.json adds another leading
+        ``warning``.  When the lexical search finds nothing too, the answer
+        is one ``warning``.
 
         No match above ``threshold`` runs the same lexical fallback, with a
         ``warning`` that suggests a lower threshold.  When a phase of the
         search failed, that ``warning`` gives the error of the phase.  When
         the best raw similarity of all matches is below 0.68, the answer is
-        one dict: a ``warning`` that the matches are likely unrelated,
-        ``_fallback_suggestion: "search_code"``, ``_best_similarity``, and
-        the matches in ``_results``.
+        the page notice and one dict: a ``warning`` that the matches are
+        likely unrelated, ``_fallback_suggestion: "search_code"``,
+        ``_best_similarity``, and the matches of the page in ``_results``.
 
         One dict with ``error`` means the query failed — check that key
         first.
@@ -662,10 +749,14 @@ async def semantic_search(
         if not db_path.exists():
             return [{"error": f"No index found for {root}. Run 'fw-context index' first."}]
 
-        # Held at 100 here; PipelineContext.create then holds the embedding
-        # search at 5 or more (the lexical fallback keeps this value).
+        # The size of one page.  The embedding search does not use it: it
+        # ranks the whole set above the threshold, and the page is a slice.
         limit = max(1, min(limit, 100))
+        skip = clamp_offset(offset)
         threshold = max(0.0, min(1.0, threshold))
+        # The hint of each page repeats a threshold that is not the default:
+        # the next call must ask for the same set.
+        args = {} if threshold == _SEMANTIC_DEFAULT_THRESHOLD else {"threshold": threshold}
 
         # Verify LLM setup — embedding generation runs against the configured
         # Ollama instance or cloud API. Without an active LLM, embedding-based
@@ -674,7 +765,7 @@ async def semantic_search(
         cfg = load_config(project_root=root)
         if not cfg.llm.enabled:
             return _fallback_to_search_code(
-                root, db_path, query, limit,
+                root, db_path, query, limit, offset=skip, hint_args=args,
                 warning="LLM is disabled in config. "
                         "Enable it with `[llm] enabled = true` to use semantic search.",
             )
@@ -691,7 +782,7 @@ async def semantic_search(
 
         if not setup.get("ollama_running"):
             return _fallback_to_search_code(
-                root, db_path, query, limit,
+                root, db_path, query, limit, offset=skip, hint_args=args,
                 warning="LLM is not running. Start it to use semantic search.",
             )
 
@@ -709,13 +800,10 @@ async def semantic_search(
 
         from fw_context_mcp.search.pipeline import PipelineRunner, _build_semantic_search
 
-        # Build the semantic pipeline with an oversampling factor of 10×.
-        # The KNN query fetches limit * 10 candidates from the vector DB,
-        # then cosine-similarity filtering at the requested threshold and
-        # source-aware boosting prune to the final limit. Oversampling
-        # compensates for the post-filter — many candidates will be vendor
-        # code that gets down-weighted by source-aware scoring.
-        config = _build_semantic_search(threshold, limit * 10)
+        # Build the semantic pipeline: one KNN query for every symbol above
+        # the threshold (at most VEC_KNN_MAX_K), ranked with the source boost.
+        # The handler cuts the page out of that order below.
+        config = _build_semantic_search(threshold)
         runner = PipelineRunner(config)
         # await is used because embedding generation requires an HTTP call
         # to the embedding model — it is I/O-bound, not CPU-bound.
@@ -731,7 +819,7 @@ async def semantic_search(
             else:
                 warning_msg = str(ctx.ollama_warning)
             return _fallback_to_search_code(
-                root, db_path, query, limit,
+                root, db_path, query, limit, offset=skip, hint_args=args,
                 warning=warning_msg,
             )
 
@@ -749,36 +837,59 @@ async def semantic_search(
                     f"No symbols matched with similarity > {threshold}. "
                     "Try lowering the threshold or rephrasing the query."
                 )
-            return _fallback_to_search_code(root, db_path, query, limit, warning=no_match_reason)
+            return _fallback_to_search_code(
+                root, db_path, query, limit, offset=skip, hint_args=args, warning=no_match_reason,
+            )
 
         # `_method` tells a result of this path from a result of the
         # search_code fallback, which sets "search_code_fallback".
-        for item in results:
-            if "name" in item:
-                item["_method"] = "embedding"
+        symbols = [item for item in results if "name" in item]
+        meta = [item for item in results if "name" not in item]
+        for item in symbols:
+            item["_method"] = "embedding"
 
-        # Apply reranker when configured
+        # The page is a slice of the whole ranked set: every symbol above
+        # the threshold, in the order of the boosted score and the symbol
+        # id.  Thus two pages never overlap or skip.
+        total = len(symbols)
+        page = symbols[skip:skip + limit]
+        if not page:
+            return [past_end_info("symbol", skip, total)]
+
         # Apply LLM-based reranker when configured.
-        # The reranker re-scores the top-N embedding results using a
-        # cross-encoder model, producing a relevance-ranked list. This
-        # is optional — without it, cosine similarity is the sole signal.
-        if cfg.llm.reranker_model and results:
+        # The reranker re-scores the first ``rerank_top_k`` symbols of the
+        # PAGE with a cross-encoder model.  It does not move a symbol to
+        # another page, thus the pages stay a partition of the set, and it
+        # drops no row of the page: the rest of the page follows the
+        # re-scored part.  Without it, cosine similarity is the sole signal.
+        if cfg.llm.reranker_model:
             try:
                 from fw_context_mcp.search.reranker import get_reranker
                 reranker = get_reranker(cfg.llm.reranker_model)
                 if reranker is not None:
-                    results = reranker.rank(
-                        query, results,
-                        min(cfg.index.rerank_top_k, len(results)),
-                    )
+                    head_size = min(cfg.index.rerank_top_k, len(page))
+                    head = reranker.rank(query, page[:head_size], head_size)
+                    if len(head) == head_size:
+                        page = [*head, *page[head_size:]]
+                    else:
+                        # A reranker that gives fewer rows than it got would
+                        # move the next offset back, and two pages would
+                        # overlap.  Keep the vector order of this page then.
+                        log.warning("Reranker gave %d of %d rows; page kept in vector order",
+                                    len(head), head_size)
             except (RuntimeError, ValueError) as e:
                 log.warning("Reranker failed, returning unranked results: %s", e)
 
-        # PipelineContext.create lifts a limit below 5 to 5, because the
-        # re-rank steps of smart_search need a set to choose from.  This
-        # tool accepts a limit of 1 and more, thus cut to it here, after the
-        # reranker had the larger set.
-        results = results[:limit]
+        notice = page_notice(
+            total, skip, len(page),
+            hint=page_hint("semantic_search", query, **args, next_offset=skip + len(page)),
+        )
+        if ctx.embedding_capped:
+            # One KNN query reaches at most VEC_KNN_MAX_K symbols, and the
+            # last of them was still above the threshold: the set can be
+            # larger, thus ``total`` is a lower bound.
+            notice["total_capped"] = True
+        results = [*meta, notice, *page]
 
         # Relevance floor: when the best cosine-similarity score is below
         # 0.68, the results are likely unrelated to the query. Embedding
@@ -803,6 +914,7 @@ async def semantic_search(
             best_score = max(float(r.get("_similarity", 1.0)) for r in matched)
         if best_score < _RELEVANCE_FLOOR:
             return [
+                notice,
                 {
                     "warning": (
                         f"Best result similarity ({best_score:.3f}) is below relevance "
@@ -811,7 +923,7 @@ async def semantic_search(
                     ),
                     "_fallback_suggestion": "search_code",
                     "_best_similarity": best_score,
-                    "_results": results,
+                    "_results": page,
                 },
             ]
 

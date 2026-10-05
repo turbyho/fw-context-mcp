@@ -114,3 +114,28 @@ def test_neighbors_fill_a_short_result_list():
     names = _run(limit=20, result_count=8, neighbor_count=5)
 
     assert names == [f"r{i}" for i in range(8)] + [f"n{i}" for i in range(5)]
+
+
+def test_a_neighbor_that_is_in_the_tail_is_not_added_again(populated_db):
+    """smart_search pages up to 100 rows: a copy after the seeds and one in the tail land on two pages."""
+    from fw_context_mcp.indexer.db import insert_symbols_batch, upsert_file
+    from fw_context_mcp.search.phases.expand_context import _resolve_project_defs
+    from tests._paging import symbol_row
+
+    ch = "hash-deadbeef"
+    fid = upsert_file(populated_db, ch, "src/a.c", "c")
+    # symbol_row writes the config hash of tests/_paging; this db has another.
+    insert_symbols_batch(populated_db, [
+        (ch, *row[1:])
+        for row in (
+            symbol_row(fid, "src/a.c", "tail_fn", "tail_fn", "c:@F@tail_fn", 5),
+            symbol_row(fid, "src/a.c", "new_fn", "new_fn", "c:@F@new_fn", 9),
+        )
+    ])
+    known = {("r0", "src/r0.c"), ("tail_fn", "src/a.c")}
+
+    neighbors = _resolve_project_defs(
+        populated_db, ch, {"c:@F@tail_fn", "c:@F@new_fn"}, known, 5,
+    )
+
+    assert [n["name"] for n in neighbors] == ["new_fn"]

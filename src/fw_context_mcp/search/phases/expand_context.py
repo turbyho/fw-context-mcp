@@ -95,12 +95,15 @@ class ExpandContextPhase(Phase):
         # Collect seed USRs (skip seeds missing a USR — they can't
         # participate in call-graph queries)
         seed_usrs: list[str] = []
-        seed_set: set[tuple] = set()
         for r in seeds:
-            seed_set.add((r["name"], r.get("file_path", "")))
             usr = r.get("usr")
             if usr:
                 seed_usrs.append(usr)
+        # A neighbor must be NEW to the answer, not only to the seeds.  A
+        # neighbor that is also in the tail would come twice: once after
+        # the seeds and once in its own place.  smart_search pages a list
+        # of up to 100 rows, thus the two copies landed on two pages.
+        known: set[tuple] = {(r["name"], r.get("file_path", "")) for r in results}
 
         if not seed_usrs:
             log.debug("ExpandContext: no seeds have USR — skipping")
@@ -113,7 +116,7 @@ class ExpandContextPhase(Phase):
             if not neighbor_usrs:
                 return None
             return _resolve_project_defs(
-                conn, config_hash, neighbor_usrs, seed_set, self.MAX_NEIGHBORS
+                conn, config_hash, neighbor_usrs, known, self.MAX_NEIGHBORS
             )
 
         neighbors = ctx.executor.execute_sync(_query, ctx.config_hash)
@@ -174,9 +177,9 @@ def _get_neighbors(
 
 
 def _resolve_project_defs(
-    conn, config_hash: str, usrs: set[str], seed_set: set[tuple], limit: int
+    conn, config_hash: str, usrs: set[str], known: set[tuple], limit: int
 ) -> list[dict]:
-    """Resolve USRs to symbol rows — project definitions only, exclude seeds.
+    """Resolve USRs to symbol rows — project definitions only, none of the answer.
 
     Why round_robin_by_kind?
         Call-graph neighbors inherit the kind distribution of the call
@@ -184,10 +187,13 @@ def _resolve_project_defs(
         ensures at least one struct, class, or global neighbor appears
         if the call graph contains them.
 
-    Why exclude seeds?
-        A seed that calls another seed (or is called by it) would appear
-        in the neighbor set — inserting it again would duplicate results.
-        The seed_set check prevents this.
+    Why exclude every row of the answer, and not only the seeds?
+        A neighbor that is in the answer already would come twice: after
+        the seeds and in its own place.  smart_search pages up to 100
+        rows, thus the two copies landed on two pages.
+
+    The rows come in USR order: round_robin_by_kind takes the first rows
+    of each kind, and without an order SQLite chose them.
     """
     ph = ",".join("?" * len(usrs))
     rows = conn.execute(
@@ -196,7 +202,7 @@ def _resolve_project_defs(
         f"  is_pure_virtual, parent_usr, is_template, template_usr, "
         f"  summary, inputs, outputs "
         f"FROM symbols WHERE config_hash = ? AND usr IN ({ph}) "
-        f"AND is_definition = 1 AND is_project = 1",
+        f"AND is_definition = 1 AND is_project = 1 ORDER BY usr",
         (config_hash, *usrs),
     ).fetchall()
 
@@ -205,8 +211,8 @@ def _resolve_project_defs(
     neighbors: list[dict] = []
     for r in rows:
         key = (r["name"], r["file_path"])
-        if key in seed_set:
-            continue  # already in original results
+        if key in known:
+            continue  # already in the answer
         neighbors.append(dict(r))
         if len(neighbors) >= limit:
             break

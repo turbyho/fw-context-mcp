@@ -16,7 +16,13 @@ import logging
 import sqlite3
 from typing import TYPE_CHECKING
 
-from fw_context_mcp.indexer.db import get_embeddings, search_similar_hybrid, search_similar_vec
+from fw_context_mcp.indexer.db import (
+    get_embeddings,
+    search_similar_hybrid,
+    search_similar_vec,
+    search_similar_vec_all,
+)
+from fw_context_mcp.indexer.db._embeddings import VEC_KNN_MAX_K
 from fw_context_mcp.llm.embedder import EmbedderError
 from fw_context_mcp.llm.embedder_factory import get_embedder
 from fw_context_mcp.llm.ollama import OllamaError
@@ -59,11 +65,21 @@ class EmbeddingPhase(Phase):
         threshold: float = 0.5,
         overfetch: int = 30,
         source_boost: bool = False,
+        whole_set: bool = False,
     ):
+        """*whole_set* is for semantic_search, which pages its answer.
+
+        The phase then takes every symbol above the threshold, as far as one
+        KNN query reaches (``VEC_KNN_MAX_K``), ranks it and does not cut it
+        to the limit.  ``embedding_capped`` says that the KNN stopped at its
+        maximum, thus that the set can be larger.  *overfetch* does not
+        apply.
+        """
         self.independent = independent
         self.threshold = threshold
         self.overfetch = overfetch
         self.source_boost = source_boost
+        self.whole_set = whole_set
 
     def should_run(self, ctx) -> bool:
         """Only run when LLM is enabled and no Ollama warning occurred earlier."""
@@ -140,15 +156,21 @@ class EmbeddingPhase(Phase):
                     return ctx.evolve(embedding_results=rows, final_results=list(rows))
 
                 # ---- Direct KNN path ----
+                capped = False
                 if _vec0_usable:
                     try:
-                        vec_rows = search_similar_vec(
-                            conn,
-                            query_vec,
-                            ctx.config_hash,
-                            threshold=self.threshold,
-                            limit=self.overfetch,
-                        )
+                        if self.whole_set:
+                            vec_rows, capped = search_similar_vec_all(
+                                conn, query_vec, ctx.config_hash, threshold=self.threshold,
+                            )
+                        else:
+                            vec_rows = search_similar_vec(
+                                conn,
+                                query_vec,
+                                ctx.config_hash,
+                                threshold=self.threshold,
+                                limit=self.overfetch,
+                            )
                     except sqlite3.Error as e:
                         log.warning("vec0 KNN query failed — falling back to BLOB: %s", e)
                         _vec0_usable = False
@@ -169,6 +191,7 @@ class EmbeddingPhase(Phase):
                             embedding_results=results,
                             final_results=list(results),
                             embedding_best_similarity=best,
+                            embedding_capped=capped,
                         )
 
                 # ---- Brute-force fallback (legacy BLOB table) ----
@@ -177,7 +200,14 @@ class EmbeddingPhase(Phase):
                     if not stored:
                         return ctx.evolve(ollama_warning={"detail": "No stored embeddings found"})
                     scored_bf = _brute_force_search(query_vec, stored, threshold=self.threshold)
-                    top_ids = [s[0] for s in scored_bf[: self.overfetch]]
+                    # The whole set stops at the size of the KNN cap, and the
+                    # id list stays far below the SQLite limit of bound
+                    # parameters.  The BLOB table holds one row per symbol, thus
+                    # this path can reach a little further than the KNN, which
+                    # counts chunk rows.
+                    reach = VEC_KNN_MAX_K if self.whole_set else self.overfetch
+                    capped = self.whole_set and len(scored_bf) > reach
+                    top_ids = [s[0] for s in scored_bf[:reach]]
                     if not top_ids:
                         return ctx
                     placeholders = ",".join("?" * len(top_ids))  # SAFE: values in params, not f-string
@@ -187,11 +217,12 @@ class EmbeddingPhase(Phase):
                             AND is_definition = 1""",
                         (ctx.config_hash, *top_ids),
                     ).fetchall()
-                    results, best = self._rank(emb_rows, dict(scored_bf[: self.overfetch]), ctx.limit)
+                    results, best = self._rank(emb_rows, dict(scored_bf[:reach]), ctx.limit)
                     return ctx.evolve(
                         embedding_results=results,
                         final_results=list(results),
                         embedding_best_similarity=best,
+                        embedding_capped=capped,
                     )
 
                 return ctx
@@ -214,8 +245,13 @@ class EmbeddingPhase(Phase):
         order can put a vendor row with the best raw score after *limit*.
         The relevance floor of ``semantic_search`` asks if the index holds a
         relevant match at all, thus it must see that row.
+
+        WHY the symbol id breaks a tie: two symbols with one score came in
+        the order of ``id IN (...)``, which SQLite does not fix.  A page of
+        ``semantic_search`` is a slice of this order, thus the order must be
+        the same on each call.  With ``whole_set`` the list is not cut.
         """
-        scored: list[tuple[float, dict]] = []
+        scored: list[tuple[float, int, dict]] = []
         for r in rows:
             d = dict(r)
             sim = similarity.get(d.get("id", -1))
@@ -225,8 +261,9 @@ class EmbeddingPhase(Phase):
             key = sim
             if self.source_boost:
                 key = sim * (1.2 if d.get("is_project", 0) == 1 else 0.85)
-            scored.append((key, d))
-        scored.sort(key=lambda x: -x[0])
-        results = [d for _, d in scored]
+            scored.append((key, int(d.get("id") or 0), d))
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        results = [d for _, _, d in scored]
         best = max((d["_similarity"] for d in results), default=None)
-        return (results[:limit] if self.source_boost else results), best
+        cut = self.source_boost and not self.whole_set
+        return (results[:limit] if cut else results), best

@@ -54,12 +54,17 @@ class FormatPhase(Phase):
         context expansion both fail, the uncut embedding rows come here.
         This is the last phase of each pipeline, thus a cut here makes the
         limit hold for every answer.
+
+    Why ``cut=False``?
+        semantic_search pages its answer: the handler takes the page out of
+        the whole ranked set, thus the format must keep the whole set.
     """
 
     name = "format"  #: Phase identifier used in pipeline configuration.
 
-    def __init__(self, keep_similarity: bool = False) -> None:
+    def __init__(self, keep_similarity: bool = False, cut: bool = True) -> None:
         self.keep_similarity = keep_similarity
+        self.cut = cut
 
     async def run(self, ctx: PipelineContext) -> PipelineContext:
         """Convert final scored results to MCP tool output dicts.
@@ -108,7 +113,8 @@ class FormatPhase(Phase):
             results.append({"warning": w})
 
         # Symbol results
-        results += [_fmt(r) for r in ctx.final_results[: ctx.limit]]
+        rows = ctx.final_results[: ctx.limit] if self.cut else ctx.final_results
+        results += [_fmt(r) for r in rows]
 
         if not ctx.final_results:
             results.append({"info": "No results found for the generated queries."})

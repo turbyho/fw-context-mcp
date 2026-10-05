@@ -26,6 +26,7 @@ from unittest import mock
 
 import pytest
 
+from tests._paging import NOTICE_KEYS
 from tests.test_embedding_phase_order import (
     SYMBOLS,
     _context,
@@ -94,7 +95,7 @@ def test_the_semantic_pipeline_gives_the_similarity(populated_db, db_path, path)
     from fw_context_mcp.search.pipeline import PipelineRunner, _build_semantic_search
 
     SEEDERS[path](populated_db)
-    runner = PipelineRunner(_build_semantic_search(threshold=0.5, overfetch=50))
+    runner = PipelineRunner(_build_semantic_search(threshold=0.5))
     with mock.patch("fw_context_mcp.search.phases.embedding.get_embedder", return_value=_FakeEmbedder()):
         ctx = asyncio.run(runner.run(_context(db_path)))
 
@@ -131,7 +132,7 @@ FALLBACK = [{"warning": "fallback", "_method": "search_code_fallback"}]
 
 def _run_handler(
     db_path: Path, embedder: object, threshold: float = 0.5, config: object | None = None,
-    limit: int = 20, context_limit: int = 20,
+    limit: int = 20, context_limit: int = 20, offset: int = 0,
 ) -> tuple[list[dict], mock.MagicMock]:
     """Call the semantic_search handler with the index, the LLM and the fallback replaced.
 
@@ -155,7 +156,9 @@ def _run_handler(
         mock.patch.object(PipelineContext, "create", return_value=context),
         mock.patch("fw_context_mcp.search.phases.embedding.get_embedder", return_value=embedder),
     ):
-        results = asyncio.run(handler.semantic_search("q", threshold=threshold, limit=limit))
+        rows = asyncio.run(handler.semantic_search("q", threshold=threshold, limit=limit, offset=offset))
+    # The page notice is a row of its own; the tests below read the answer.
+    results = [r for r in rows if not NOTICE_KEYS <= set(r)]
     return results, fallback
 
 
@@ -286,8 +289,12 @@ def test_the_floor_reads_the_best_score_and_not_the_reranked_first(populated_db,
     assert all("warning" not in r for r in results)
 
 
-def test_the_cut_to_the_limit_comes_after_the_reranker(populated_db, db_path):
-    """The reranker chooses from the whole set, then the handler cuts to the limit."""
+def test_the_reranker_orders_inside_one_page(populated_db, db_path):
+    """The pages are a slice of the vector order; the reranker moves no symbol to another page.
+
+    Vector order: near, middle, far.  Page one of two holds near and middle,
+    and the reversing reranker turns them around.  far stays on page two.
+    """
     from fw_context_mcp.config.settings import Config
 
     _seed_vec0(populated_db)
@@ -295,9 +302,11 @@ def test_the_cut_to_the_limit_comes_after_the_reranker(populated_db, db_path):
     config.llm.reranker_model = "stand-in"
 
     with mock.patch("fw_context_mcp.search.reranker.get_reranker", return_value=_ReversingReranker()):
-        results, _ = _run_handler(db_path, _FakeEmbedder(), config=config, limit=1)
+        first, _ = _run_handler(db_path, _FakeEmbedder(), config=config, limit=2)
+        second, _ = _run_handler(db_path, _FakeEmbedder(), config=config, limit=2, offset=2)
 
-    assert [r["name"] for r in results] == ["far"]
+    assert [r["name"] for r in first] == ["middle", "near"]
+    assert [r["name"] for r in second] == ["far"]
 
 
 class _FailingEmbedder:

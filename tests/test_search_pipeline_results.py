@@ -21,6 +21,7 @@ from fw_context_mcp.search.context import PipelineContext
 from fw_context_mcp.search.phases.base import Phase
 from fw_context_mcp.search.phases.embedding import EmbeddingPhase
 from fw_context_mcp.search.pipeline import PipelineConfig, PipelineRunner
+from tests._paging import NOTICE_KEYS
 
 
 def _ctx(tmp_path: Path, **overrides) -> PipelineContext:
@@ -71,7 +72,9 @@ def _semantic_search(tmp_path: Path, final_results: list[dict]) -> tuple[list[di
             patch.object(search, "_append_staleness_warning", side_effect=lambda r, *_: r), \
             patch.object(PipelineContext, "create", return_value=_ctx(tmp_path)), \
             patch.object(PipelineRunner, "run", _run):
-        return asyncio.run(search.semantic_search(query="modem connect")), fallback
+        rows = asyncio.run(search.semantic_search(query="modem connect"))
+    # The page notice is a row of its own; the tests below read the answer.
+    return [r for r in rows if not NOTICE_KEYS <= set(r)], fallback
 
 
 def test_no_symbol_falls_back_to_the_lexical_search(tmp_path):
@@ -93,7 +96,7 @@ def test_a_relevant_result_is_returned(tmp_path):
     results, fallback = _semantic_search(tmp_path, [_symbol("a", 0.80)])
 
     assert not fallback.called
-    assert [r["name"] for r in results] == ["a"]
+    assert [r["name"] for r in results if "name" in r] == ["a"]
 
 
 # ── EmbeddingPhase._rank ────────────────────────────────────────────────────
@@ -271,7 +274,7 @@ def test_semantic_search_with_a_local_model_does_not_probe_ollama(tmp_path):
         results = asyncio.run(search.semantic_search(query="modem connect"))
 
     assert not probe.called
-    assert [r["name"] for r in results] == ["a"]
+    assert [r["name"] for r in results if "name" in r] == ["a"]
 
 
 def test_check_setup_with_a_local_model_and_a_cloud_chat_is_ok_without_ollama():

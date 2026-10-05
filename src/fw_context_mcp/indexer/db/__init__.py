@@ -119,6 +119,7 @@ __all__ = [
     "row_format_is_older",
     "search_similar_hybrid",
     "search_similar_vec",
+    "search_similar_vec_all",
     "search_symbols",
     "set_entry_point",
     "split_tokens",
@@ -164,6 +165,7 @@ from ._embeddings import (
     init_vec_table,
     search_similar_hybrid,
     search_similar_vec,
+    search_similar_vec_all,
     upsert_embeddings,
     upsert_embeddings_vec,
 )

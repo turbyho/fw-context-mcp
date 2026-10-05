@@ -89,6 +89,10 @@ class PipelineContext:
     # drop the candidate with the best raw score.  None when no standalone
     # search ran.
     embedding_best_similarity: float | None = None
+    # True when a whole-set search (semantic_search) stopped at the largest
+    # k of one KNN query with its last row still above the threshold: more
+    # symbols can be above it, and the count of the rows is a lower bound.
+    embedding_capped: bool = False
 
     # ── Phase 6 output ────────────────────────────────────────────────────
     final_results: list[dict] = field(default_factory=list)

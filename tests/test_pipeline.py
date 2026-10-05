@@ -153,15 +153,17 @@ class TestPipelineConfig:
         from fw_context_mcp.search.phases.embedding import EmbeddingPhase
         from fw_context_mcp.search.phases.format import FormatPhase
 
-        cfg = _build_semantic_search(threshold=0.7, overfetch=60)
+        cfg = _build_semantic_search(threshold=0.7)
         assert len(cfg.phases) == 2
         embedding, fmt = cfg.phases
         assert isinstance(embedding, EmbeddingPhase)
-        assert (embedding.threshold, embedding.overfetch, embedding.source_boost) == (0.7, 60, True)
+        assert (embedding.threshold, embedding.source_boost, embedding.whole_set) == (0.7, True, True)
         # The handler reads `_similarity` for its relevance floor, thus the
-        # format phase of this pipeline must keep the field.
+        # format phase of this pipeline must keep the field.  The handler
+        # cuts the page, thus the format must keep the whole set.
         assert isinstance(fmt, FormatPhase)
         assert fmt.keep_similarity is True
+        assert fmt.cut is False
 
 
 # ── PipelineRunner ──────────────────────────────────────────────────────────
