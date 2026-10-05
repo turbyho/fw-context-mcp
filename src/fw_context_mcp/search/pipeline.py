@@ -5,7 +5,9 @@ Why a pipeline with configurable phases?
 
     - ``SMART_SEARCH``: full pipeline (translate → rough → LLM → FTS5 →
       refine → embedding → fusion → deduplicate → expand → format)
-    - ``SEMANTIC_SEARCH``: embedding-only similarity search
+    - ``_build_semantic_search()``: embedding-only similarity search.  It
+      is a builder and not a constant, because the caller sets the
+      threshold and the overfetch.
 
     A composable pipeline lets each mode pick its phases without code
     duplication.  New search modes add a new ``PipelineConfig`` without
@@ -163,7 +165,7 @@ def _build_smart_search() -> PipelineConfig:
 
 
 def _build_semantic_search(threshold: float, overfetch: int) -> PipelineConfig:
-    """Lazy-built SEMANTIC_SEARCH config.
+    """Build the pipeline config of the semantic_search tool.
 
     Why a builder function instead of a constant?
         Semantic search is always called with caller-provided ``threshold``
