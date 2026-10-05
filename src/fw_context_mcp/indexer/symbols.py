@@ -943,8 +943,13 @@ def _emit_fn_ptr_targets(
     method: str = "assignment",
     qn_to_usr: dict[str, str] | None = None,
     slot_index: int | None = None,
+    lhs_type: str = "",
 ) -> None:
     """Emit indirect refs and FnPointerAssignment records for function pointer assignments.
+
+    *lhs_type* is the type of the storage when the caller already knows
+    it (``_init_list_element_field``); without it the type is read from
+    the child of *expr_cursor* that names *lhs_name*.
 
     *slot_index* is the position of *expr_cursor* inside a positional init
     list, and reaches the stored reference unchanged.  Only the init-list
@@ -966,8 +971,8 @@ def _emit_fn_ptr_targets(
     # This ensures fp_assignments.fn_ptr_type uses the function-pointer
     # typedef (e.g., nrfx_power_usb_event_handler_t), matching the type
     # stored in indirect_call_sites and enabling the Phase 3 USR join.
-    lhs_fp_type = ""
-    if method in ("assignment", "init_list") and lhs_name:
+    lhs_fp_type = lhs_type
+    if not lhs_fp_type and method in ("assignment", "init_list") and lhs_name:
         for _c in expr_cursor.get_children():
             _lhs_usr, _lhs_name = _extract_lhs_field(_c)
             if _lhs_name and _lhs_name == lhs_name:
@@ -2017,6 +2022,133 @@ def _init_list_gives_slots(cursor: cx.Cursor) -> bool:
     return _init_list_is_positional(cursor)
 
 
+# The cursor kinds that wrap a value without changing what it is: the
+# value of a designated element can sit inside each of them.
+_VALUE_WRAPPERS = frozenset({
+    cx.CursorKind.UNEXPOSED_EXPR,
+    cx.CursorKind.PAREN_EXPR,
+    cx.CursorKind.UNARY_OPERATOR,
+    cx.CursorKind.CSTYLE_CAST_EXPR,
+})
+# The cursor kinds of a struct value that holds an init list of its own.
+_LIST_VALUES = frozenset({
+    cx.CursorKind.COMPOUND_LITERAL_EXPR,
+    cx.CursorKind.CXX_FUNCTIONAL_CAST_EXPR,
+})
+
+
+def _holds_nested_list(value: cx.Cursor) -> bool:
+    """Tell if *value* is a struct value that an init list of its own gives.
+
+    ``{ ... }``, ``(struct ops){ ... }``, ``&(struct ops){ ... }`` and the
+    C++ ``ops{ ... }`` all give their fields through an INIT_LIST_EXPR of
+    their own, which the walk reaches and reads.  The last child of a
+    wrapper is the wrapped value: a cast gives its TYPE_REF first.
+
+    Only a list of a struct (or union, or an array of them) counts.  A
+    list of an array of function pointers, ``.handlers = { f, g }``, or a
+    scalar in braces, ``.cb = { f }``, has no designators of its own: its
+    functions go to THIS field, and the element gives the row.
+    """
+    while value.kind in _VALUE_WRAPPERS:
+        inner = list(value.get_children())
+        if not inner:
+            return False
+        value = inner[-1]
+    if value.kind in _LIST_VALUES:
+        inner = list(value.get_children())
+        if not inner:
+            return False
+        value = inner[-1]
+    if value.kind != cx.CursorKind.INIT_LIST_EXPR:
+        return False
+    try:
+        return _strip_arrays(value.type.get_canonical()).kind == cx.TypeKind.RECORD
+    except (ValueError, TypeError, RuntimeError, AttributeError):
+        return False
+
+
+def _strip_arrays(type_: cx.Type) -> cx.Type:
+    """The element type of *type_* after every array level, or *type_* itself.
+
+    A typedef of an array (``typedef cb_t cb_arr_t[4]``) is an array too:
+    its declared type is read, and not its canonical type, thus the
+    element keeps its own name (``cb_t``), the name that a call site has.
+    The loop stops after a fixed number of steps: each step removes one
+    level of sugar or of array, and a real type has few of them.
+    """
+    for _ in range(32):
+        if type_.kind in _ARRAY_TYPE_KINDS:
+            type_ = type_.element_type
+        elif type_.kind == cx.TypeKind.ELABORATED:
+            type_ = type_.get_named_type()
+        elif type_.kind == cx.TypeKind.TYPEDEF and type_.get_canonical().kind in _ARRAY_TYPE_KINDS:
+            type_ = type_.get_declaration().underlying_typedef_type
+        else:
+            break
+    return type_
+
+
+def _field_type_spelling(field_ref: cx.Cursor) -> str:
+    """The type of the storage that receives the function: the field, or its element.
+
+    A function can go into an array field only as an element, through an
+    index (``.handlers[2] = f``, ``.h[1][2] = f``) or a brace list
+    (``.handlers = { f, g }``).  Thus each array level comes off.  The
+    type of the field (``cb_t[4]``) would never join on the type of a
+    call site (``cb_t``).
+    """
+    try:
+        return _strip_arrays(field_ref.type).spelling
+    except (ValueError, TypeError, RuntimeError, AttributeError):
+        return ""
+
+
+def _init_list_element_field(element: cx.Cursor) -> tuple[str | None, str, str]:
+    """The field that one element of an INIT_LIST_EXPR assigns: (USR, name, type).
+
+    Gives ``(None, "", "")`` when the element assigns no function to a
+    field of this list.  The type is ``""`` when the caller must read it
+    from the element, as before.
+
+    libclang gives a designated element as an UNEXPOSED_EXPR whose children
+    are the designators (MEMBER_REF, or an index for ``[n] =``), and then
+    the value.  ``_extract_lhs_field``, which the element used before,
+    takes the FIRST field reference anywhere in the element.  That gave
+    these wrong rows, measured on the local indexes and on probes:
+
+    * A value that is a nested struct (``.ops = { .init = f }``,
+      ``.ops = (struct ops){ .init = f }``, ``{ .cmd = X, .handler = h }``
+      in an array) wrote ``ops = f`` or ``cmd = h`` next to the correct
+      row of the nested list.  Such an element now gives no row.  The
+      nested list is an INIT_LIST_EXPR of its own, and the walk gives its
+      fields.  The element still gives its indirect references, with the
+      slot of an array (see ``_record_indirect``).
+    * A chain of designators wrote its FIRST field: ``.ops.init = f`` gave
+      ``ops = f``.  The chain now gives its LAST field, and the type of
+      that field, because a name can repeat along the chain
+      (``.cb.cb = f``).  An array field gives the type of its element
+      (see ``_field_type_spelling``).
+
+    An element that is neither of the two keeps the old reading.
+    """
+    if _holds_nested_list(element):
+        return (None, "", "")
+    children = list(element.get_children())
+    if len(children) >= 2:
+        if _holds_nested_list(children[-1]):
+            return (None, "", "")
+        designators = children[:-1]
+        member_at = [i for i, c in enumerate(designators) if c.kind == cx.CursorKind.MEMBER_REF]
+        if member_at:
+            last = member_at[-1]
+            ref = designators[last].referenced
+            if ref is not None and ref.kind == cx.CursorKind.FIELD_DECL:
+                return (ref.get_usr(), ref.spelling, _field_type_spelling(ref))
+    usr, name = _extract_lhs_field(element)
+    return (usr, name, "")
+
+
 def _handle_fn_ptr_cases(cursor: cx.Cursor, cur_fn: str | None,
                         refs: list[Reference],
                         fp_assignments: list[FnPointerAssignment],
@@ -2062,9 +2194,10 @@ def _handle_fn_ptr_cases(cursor: cx.Cursor, cur_fn: str | None,
         # has three), which is what keeps the count aligned with the array.
         gives_slots = _init_list_gives_slots(cursor)
         for position, child in enumerate(cursor.get_children()):
-            child_usr, child_name = _extract_lhs_field(child)
+            child_usr, child_name, child_type = _init_list_element_field(child)
             _emit_fn_ptr_targets(child, cur_fn, seen_ref, refs, fp_assignments,
                                  lhs_usr=child_usr, lhs_name=child_name, method="init_list",
+                                 lhs_type=child_type,
                                  slot_index=position if gives_slots else None)
 
 
