@@ -157,21 +157,31 @@ class TestTheDriverAlwaysRuns:
         unit = next(parse(_cc(tmp_path, str(driver))))
         assert "-nostdinc" in unit.clang_args
 
-    def test_a_compiler_inside_the_project_is_asked(self, tmp_path: Path) -> None:
+    def test_the_query_runs_in_the_directory_of_the_entry(self, tmp_path: Path) -> None:
+        """The build runs the compiler there, thus a relative flag means the same file.
+
+        Measured: ``-specs=my.specs`` of the build, with the file in the entry
+        directory, stopped the query with "cannot read spec file" when the
+        query ran in the directory of the compiler.
+        """
         from fw_context_mcp.indexer.compile_commands import parse
 
-        project = tmp_path / "proj"
-        driver, _ = _stub_driver(project / "tools", "vendored-gcc")
-        unit = next(parse(_cc(tmp_path, str(driver)), project_root=project))
-        assert "-nostdinc" in unit.clang_args
+        driver, _ = _stub_driver(tmp_path / "tools", "some-gcc")
+        unit = next(parse(_cc(tmp_path, str(driver))))
+        entry_dir = str((tmp_path / "proj").resolve())
+        assert f"-D__STUB_CWD__={entry_dir}" in unit.clang_args
 
-    def test_a_list_of_globs_at_the_old_position_fails(self, tmp_path: Path) -> None:
-        """``parse`` took the allowlist second; an old caller must fail, not misread it."""
+    @pytest.mark.parametrize("old_call", [
+        lambda parse, cc: parse(cc, ["/opt/**"]),
+        lambda parse, cc: parse(cc, project_root=Path("/proj")),
+    ])
+    def test_an_old_call_fails(self, tmp_path: Path, old_call) -> None:
+        """``parse`` took the allowlist and the project root; an old caller must fail, not misread them."""
         from fw_context_mcp.indexer.compile_commands import parse
 
         driver, _ = _stub_driver(tmp_path / "tools", "some-gcc")
         with pytest.raises(TypeError):
-            next(parse(_cc(tmp_path, str(driver)), ["/opt/**"]))
+            next(old_call(parse, _cc(tmp_path, str(driver))))
 
 
 class TestReadTheDriverAnswer:
@@ -183,10 +193,33 @@ class TestReadTheDriverAnswer:
             f" {tmp_path}/bin/../lib/gcc\n"
             "End of search list.\n"
         )
-        triple, dirs = parse_verbose_output(stderr)
+        triple, dirs = parse_verbose_output(stderr, tmp_path)
         assert triple == "xtensa-esp32-elf"
         # Resolved: GCC writes them relative to its binary.
         assert dirs == [str((tmp_path / "lib/c++").resolve()), str((tmp_path / "lib/gcc").resolve())]
+
+    def test_a_relative_directory_is_relative_to_the_driver_directory(self, tmp_path: Path, monkeypatch) -> None:
+        """``--sysroot=sr`` and ``-Btools/`` make GCC print relative directories.
+
+        Measured with GCC 16 in a build directory: ``tools/include`` and
+        ``sr/usr/include``.  Resolved against this process they named
+        ``/sr/usr/include``, and libclang stopped with "file not found".
+        """
+        build = tmp_path / "build"
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)  # the indexer does not run in the build directory
+        stderr = (
+            "#include <...> search starts here:\n"
+            " tools/include\n"
+            " /usr/lib/gcc/x86_64-pc-linux-gnu/16/include\n"
+            " sr/usr/include\n"
+            "End of search list.\n"
+        )
+        _, dirs = parse_verbose_output(stderr, build)
+        assert dirs == [str((build / "tools/include").resolve()),
+                        str(Path("/usr/lib/gcc/x86_64-pc-linux-gnu/16/include").resolve()),
+                        str((build / "sr/usr/include").resolve())]
 
     def test_the_macros_keep_parameters_and_empty_values(self) -> None:
         macros = dict(parse_defines(XTENSA_MACROS))
@@ -215,33 +248,34 @@ class TestPredefineFlags:
     def test_only_flags_that_change_a_predefine_go_to_the_driver(self, tmp_path: Path) -> None:
         args = ["-std=gnu++11", "-Os", "-mlongcalls", "-fno-rtti", "-I/x", "-DA=1", "-Wall",
                 "-isystem", "/y", "-c", "-ffunction-sections"]
-        assert predefine_flags(args, tmp_path) == ("-std=gnu++11", "-Os", "-mlongcalls", "-fno-rtti")
+        assert predefine_flags(args) == ("-std=gnu++11", "-Os", "-mlongcalls", "-fno-rtti")
 
-    def test_a_flag_that_runs_or_writes_something_is_left_out(self, tmp_path: Path) -> None:
-        """-B runs another cc1, a specs file can add -fplugin, SARIF output writes a file.
+    def test_an_f_flag_outside_the_list_is_left_out(self) -> None:
+        """A plugin changes no predefine; SARIF output and tree dumps write files even under -E."""
+        args = ["-fplugin=evil.so", "-fdiagnostics-format=sarif-file", "-fdump-tree-all"]
+        assert predefine_flags(args) == ()
 
-        A bare specs name too: the driver looks it up under --sysroot, which
-        the repository sets (measured: a plugin from the repository loaded).
+    def test_path_flags_go_to_the_driver_as_the_build_gives_them(self) -> None:
+        """The query runs in the entry directory, thus a relative path needs no change.
+
+        ``-specs=picolibc.specs`` of a Zephyr build put ``picolibc/include``
+        first in the answer; without it the query gave the newlib headers.
         """
-        args = ["-B/x/", "-B", "/y/", "-fplugin=evil.so", "-specs=/repo/evil.specs",
-                "-fdiagnostics-format=sarif-file", "-fdump-tree-all", "--specs=nano.specs"]
-        assert predefine_flags(args, tmp_path) == ()
+        args = ["-B/x/", "-B", "../bin", "-Btools/", "-specs=/abs/my.specs", "--specs=nano.specs",
+                "-specs=cfg/rel.specs", "--sysroot=sr", "-isysroot", "/opt/sdk", "-Os"]
+        assert predefine_flags(args) == tuple(args)
 
-    def test_a_sysroot_inside_the_project_is_left_out(self, tmp_path: Path) -> None:
-        """The driver reads files from the sysroot; the project comes from its repository."""
-        project = tmp_path / "proj"
-        flags = predefine_flags(["--sysroot=sr", "-isysroot", "/opt/sdk", "-Os"], project, project)
-        assert flags == ("-isysroot", "/opt/sdk", "-Os")
+    @pytest.mark.parametrize("flag", ["-specs", "--specs"])
+    def test_a_two_token_specs_flag_goes_to_the_driver(self, flag: str) -> None:
+        """GCC takes ``-specs file`` too; the flag and its file must stay together."""
+        assert predefine_flags([flag, "my.specs", "-Os"]) == (flag, "my.specs", "-Os")
 
-    def test_a_signedness_synonym_reaches_the_driver(self, tmp_path: Path) -> None:
+    def test_a_two_token_flag_without_a_value_is_left_out(self) -> None:
+        assert predefine_flags(["-Os", "-B"]) == ("-Os",)
+
+    def test_a_signedness_synonym_reaches_the_driver(self) -> None:
         """-fno-signed-char changes __CHAR_UNSIGNED__ as -funsigned-char does."""
-        assert predefine_flags(["-fno-signed-char", "-fno-inline"], tmp_path) == ("-fno-signed-char", "-fno-inline")
-
-    def test_a_relative_sysroot_is_made_absolute_against_the_entry(self, tmp_path: Path) -> None:
-        """The query runs in the directory of the compiler, not of the build."""
-        flags = predefine_flags(["--sysroot=../sr", "-isysroot", "rel"], tmp_path / "build")
-        assert flags == (f"--sysroot={os.path.normpath(tmp_path / 'sr')}", "-isysroot",
-                         os.path.normpath(tmp_path / "build" / "rel"))
+        assert predefine_flags(["-fno-signed-char", "-fno-inline"]) == ("-fno-signed-char", "-fno-inline")
 
 
 class TestResolveCompiler:
@@ -382,28 +416,52 @@ class TestClangResourceDir:
 class TestQueryTheDriver:
     def test_the_stub_driver_answers(self, tmp_path: Path) -> None:
         driver, dirs = _stub_driver(tmp_path, "xtensa-esp32-elf-gcc")
-        info = query_gcc_driver(driver, "c", ())
+        info = query_gcc_driver(driver, "c", (), tmp_path)
         assert info is not None
         assert info.triple == "xtensa-esp32-elf"
         assert info.include_dirs == tuple(str(d.resolve()) for d in dirs)
         assert info.macro("__XTENSA__") == "1"
 
-    def test_the_query_runs_in_the_compiler_directory_with_the_language_and_flags(self, tmp_path: Path) -> None:
-        """The query runs in the compiler directory, with the language and the flags it got."""
+    def test_the_query_runs_in_the_given_directory_with_the_language_and_flags(self, tmp_path: Path) -> None:
+        """The caller gives the entry directory, in which the build runs the compiler."""
         driver, _ = _stub_driver(tmp_path, "xtensa-esp32-elf-gcc")
-        info = query_gcc_driver(driver, "cpp", ("-std=gnu++11", "-Os"))
+        build = tmp_path / "build"
+        build.mkdir()
+        info = query_gcc_driver(driver, "cpp", ("-std=gnu++11", "-Os"), build)
         assert info is not None
-        assert info.macro("__STUB_CWD__") == str(driver.parent.resolve())
+        assert info.macro("__STUB_CWD__") == str(build.resolve())
         assert info.macro("__STUB_ARGS__") == "-std=gnu++11 -Os -x c++ -dM -E -"
+
+    def test_each_directory_is_asked_once(self, tmp_path: Path, monkeypatch) -> None:
+        """A relative flag depends on the directory, thus the directory is in the key."""
+        driver, _ = _stub_driver(tmp_path, "xtensa-esp32-elf-gcc")
+        one, two = tmp_path / "one", tmp_path / "two"
+        one.mkdir()
+        two.mkdir()
+        runs: list[Path] = []
+        real_run = _driver_query._run_query
+        monkeypatch.setattr(_driver_query, "_run_query", lambda *a: runs.append(a[3]) or real_run(*a))
+        for directory in (one, one, two, two):
+            assert query_gcc_driver(driver, "c", ("--sysroot=sr",), directory) is not None
+        assert runs == [one, two]
+
+    def test_a_missing_build_directory_is_not_queried(self, tmp_path: Path, monkeypatch, caplog) -> None:
+        """The build directory is gone (``rm -rf build``); a query elsewhere would be a guess."""
+        driver, _ = _stub_driver(tmp_path, "xtensa-esp32-elf-gcc")
+        runs: list[Path] = []
+        monkeypatch.setattr(_driver_query, "_run_query", lambda *a: runs.append(a[3]))
+        assert query_gcc_driver(driver, "c", (), tmp_path / "gone") is None
+        assert runs == []
+        assert any("does not exist" in r.message and "--build" in r.message for r in caplog.records)
 
     def test_a_clang_that_poses_as_gcc_is_not_used(self, tmp_path: Path) -> None:
         """Its directories belong to another resource dir than the parsing libclang."""
         driver, _ = _stub_driver(tmp_path, "cc", macros="#define __GNUC__ 4\n#define __clang__ 1\n")
-        assert query_gcc_driver(driver, "c", ()) is None
+        assert query_gcc_driver(driver, "c", (), tmp_path) is None
 
     def test_a_failing_driver_gives_none(self, tmp_path: Path) -> None:
         driver, _ = _stub_driver(tmp_path, "broken-gcc", exit_code=3)
-        assert query_gcc_driver(driver, "c", ()) is None
+        assert query_gcc_driver(driver, "c", (), tmp_path) is None
 
     def test_a_failure_is_not_asked_again_for_each_unit(self, tmp_path: Path, monkeypatch) -> None:
         """A clang installed as cc fails each query; 2000 units must not run 4000 queries."""
@@ -412,28 +470,28 @@ class TestQueryTheDriver:
         real_run = _driver_query._run_query
         monkeypatch.setattr(_driver_query, "_run_query", lambda *a: runs.append(a[0]) or real_run(*a))
         for _ in range(5):
-            assert query_gcc_driver(driver, "c", ()) is None
+            assert query_gcc_driver(driver, "c", (), tmp_path) is None
         assert len(runs) == 1
 
     def test_a_failure_is_asked_again_after_a_while(self, tmp_path: Path, monkeypatch) -> None:
         """A timeout under load must not hold for the life of an MCP server."""
         driver, _ = _stub_driver(tmp_path, "flaky-gcc", exit_code=3)
-        assert query_gcc_driver(driver, "c", ()) is None
+        assert query_gcc_driver(driver, "c", (), tmp_path) is None
         status = driver.stat()
         _stub_driver(tmp_path, "flaky-gcc")  # the same path, now working
         os.utime(driver, ns=(status.st_atime_ns, status.st_mtime_ns))  # the same identity
-        assert query_gcc_driver(driver, "c", ()) is None, "inside the time limit the failure holds"
+        assert query_gcc_driver(driver, "c", (), tmp_path) is None, "inside the time limit the failure holds"
         monkeypatch.setattr(_driver_query, "_FAILURE_TTL_S", 0.0)
-        assert query_gcc_driver(driver, "c", ()) is not None
+        assert query_gcc_driver(driver, "c", (), tmp_path) is not None
 
     def test_a_changed_binary_is_asked_again(self, tmp_path: Path) -> None:
         """A toolchain update in a long MCP server process must not keep the old directories."""
         driver, _ = _stub_driver(tmp_path, "xtensa-esp32-elf-gcc")
-        first = query_gcc_driver(driver, "c", ())
+        first = query_gcc_driver(driver, "c", (), tmp_path)
         _stub_driver(tmp_path, "xtensa-esp32-elf-gcc", macros=XTENSA_MACROS + "#define __NEW__ 1\n")
         status = driver.stat()
         os.utime(driver, ns=(status.st_atime_ns, status.st_mtime_ns + 1_000_000_000))
-        second = query_gcc_driver(driver, "c", ())
+        second = query_gcc_driver(driver, "c", (), tmp_path)
         assert first is not None and second is not None
         assert first.macro("__NEW__") is None and second.macro("__NEW__") == "1"
 

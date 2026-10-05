@@ -2200,7 +2200,7 @@ def _reindex_match_tus(
         return [], False, {"error": f"compile_commands.json not found: {cc_path}"}
     # list(), not the iterator parse_cc returns: the header fallback below
     # walks the units a second time, and a generator is empty by then.
-    units = list(parse_cc(cc_path, project_root=project_root))
+    units = list(parse_cc(cc_path))
     matching = [u for u in units if Path(u.file).resolve() == target]
     if matching:
         return matching, False, None

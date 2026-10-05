@@ -448,7 +448,7 @@ def run(
     # Parse compile_commands.json to discover translation units.  Must
     # happen before config_hash computation so the manifest can be built
     # from the actual TU list.
-    all_units = list(parse_compile_commands(compile_commands, project_root=project_root))
+    all_units = list(parse_compile_commands(compile_commands))
 
     # libclang reads a translation unit as C or C++.  Given an assembly
     # unit, it parses that unit as C and gets no cursor and one error

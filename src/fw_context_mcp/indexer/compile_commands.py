@@ -509,7 +509,6 @@ def _clang_args_for_unit(
     file: Path,
     compiler: Path | None,
     known: dict[str, Path],
-    project_root: Path | None,
 ) -> list[str]:
     """Build the libclang flags of one unit, from the GCC driver when it answers.
 
@@ -522,7 +521,7 @@ def _clang_args_for_unit(
     flags of ``compile_commands.json``, a target from the compiler name, and
     the guessed toolchain directories.
     """
-    driver = _driver_for_unit(raw_args, cwd, file, compiler, known, project_root)
+    driver = _driver_for_unit(raw_args, cwd, file, compiler, known)
     if driver is not None:
         return libclang_args(driver, normalize_args(raw_args, cwd, str(file), None))
     clang_args = normalize_args(raw_args, cwd, str(file), compiler)
@@ -540,7 +539,6 @@ def _driver_for_unit(
     file: Path,
     compiler: Path | None,
     known: dict[str, Path],
-    project_root: Path | None,
 ) -> DriverInfo | None:
     if compiler is None or not is_gcc_driver_name(compiler):
         return None
@@ -551,14 +549,10 @@ def _driver_for_unit(
     for token in raw_args:
         expanded.extend(expand_response_file(token, cwd) if token.startswith("@") else [token])
     language = _detect_language(file, expanded)
-    return query_gcc_driver(resolved, language, predefine_flags(expanded, cwd, project_root))
+    return query_gcc_driver(resolved, language, predefine_flags(expanded), cwd)
 
 
-def parse(
-    path: Path,
-    *,
-    project_root: Path | None = None,
-) -> Iterator[CompilationUnit]:
+def parse(path: Path) -> Iterator[CompilationUnit]:
     """Yield one CompilationUnit per entry in compile_commands.json.
 
     WHY iterator: compile_commands.json for large firmware projects (mbed-os,
@@ -567,10 +561,9 @@ def parse(
     TU is materialized.
 
     Each GCC driver of the build is asked for its system directories and
-    macros (``_driver_query``).  *project_root* only limits which path flags
-    go to that query, see ``predefine_flags``.  WHY keyword-only: an earlier
-    release took a list of globs at this position, and a caller that still
-    gives one must fail at once, not use the list as the root.
+    macros (``_driver_query``).  An earlier release took a list of globs
+    and the project root as more arguments; a caller that still gives them
+    fails at once with a TypeError.
     """
     entries = json.loads(path.read_text(encoding="utf-8-sig"))
     # One build can name a compiler with its directory in some entries and
@@ -593,7 +586,7 @@ def parse(
             compiler = Path(raw_args[0])
             raw_args = raw_args[1:]
 
-        clang_args = _clang_args_for_unit(raw_args, cwd, file, compiler, known, project_root)
+        clang_args = _clang_args_for_unit(raw_args, cwd, file, compiler, known)
         lang = _detect_language(file, clang_args)
 
         yield CompilationUnit(

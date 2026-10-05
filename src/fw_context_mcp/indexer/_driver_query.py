@@ -49,7 +49,6 @@ import re
 import shlex
 import shutil
 import subprocess
-import sys
 import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -57,10 +56,6 @@ from functools import cache, lru_cache
 from pathlib import Path
 
 log = logging.getLogger(__name__)
-
-#: macOS (APFS, HFS+) and Windows (NTFS) ignore the case of a path by
-#: default, thus the project check must ignore it too.
-_CASE_INSENSITIVE_FS = sys.platform in ("darwin", "win32")
 
 #: Time limit for one driver call.  A driver that runs the preprocessor on
 #: an empty input answers in milliseconds; a hang must not stop the index.
@@ -76,10 +71,14 @@ _GCC_DRIVER_NAME = re.compile(r"(?:^|-)(?:gcc|g\+\+|cc|c\+\+)(?:-\d+(?:\.\d+)*)?
 #: the driver.  An include path, a ``-D`` and a warning flag cannot, and
 #: leaving them out keeps the number of distinct queries small.
 #:
-#: WHY ``-f`` is a list and not a prefix: some ``-f`` flags write files even
-#: under ``-E``.  Measured with GCC 16: ``-fdiagnostics-format=sarif-file``
-#: wrote ``null.sarif`` into the working directory of the query.
-_PREDEFINE_PREFIXES = ("-std=", "-ansi", "-O", "-m", "-pthread", "--sysroot=", "-isysroot", "-nostdinc")
+#: WHY ``-f`` is a list and not a prefix: most ``-f`` flags change no
+#: predefine, and some write files even under ``-E``.  Measured with GCC 16:
+#: ``-fdiagnostics-format=sarif-file`` wrote ``null.sarif`` into the working
+#: directory of the query.  The build writes such a file for its own source,
+#: and the query must not add one more with another name.  A specs file of
+#: the build can still add such a flag; the file then goes to the build
+#: directory, as for the build.
+_PREDEFINE_PREFIXES = ("-std=", "-ansi", "-O", "-m", "-pthread", "-nostdinc")
 _PREDEFINE_F_FLAGS = frozenset({
     "-fshort-wchar", "-fno-short-wchar", "-fsigned-char", "-funsigned-char",
     "-fno-signed-char", "-fno-unsigned-char", "-fno-inline",
@@ -96,7 +95,13 @@ _PREDEFINE_F_FLAGS = frozenset({
 _PREDEFINE_F_PREFIXES = ("-fsanitize=",)
 
 #: The path flags of the two-token form: the value is the next token.
-_PATH_WITH_VALUE = frozenset({"--sysroot", "-isysroot"})
+#: GCC takes ``-specs file`` and ``--specs file`` too, not only the joined form.
+_PATH_WITH_VALUE = frozenset({"--sysroot", "-isysroot", "-B", "-specs", "--specs"})
+
+#: The path flags of the joined form (``-B<dir>``, ``--sysroot=<dir>``).
+#: No prefix starts another one, thus the order of the test does not matter.
+#: The bare two-token forms are in ``_PATH_WITH_VALUE`` and match first.
+_JOINED_PATH_FLAGS = ("--sysroot=", "-isysroot", "--specs=", "-specs=", "-B")
 
 #: Macros that clang defines itself, also under ``-undef``.  A ``-D`` for
 #: one of them redefines a builtin and gives nothing but an error:
@@ -159,26 +164,6 @@ def is_gcc_driver_name(compiler: Path) -> bool:
     return bool(_GCC_DRIVER_NAME.search(compiler.name))
 
 
-def inside_project(path: Path | str, project_root: Path) -> bool:
-    """Say if *path* is inside *project_root*, by its normalized path or by its real path.
-
-    The real path counts too, thus a link from a directory outside the
-    project into the project is inside it.  On macOS and Windows the file system ignores
-    case, thus ``/Users/x/Proj`` and ``/users/x/proj`` are one directory.
-    """
-    root = _fs_key(os.path.realpath(project_root)).rstrip(os.sep)
-    normal = os.path.normpath(str(path))
-    for candidate in (normal, os.path.realpath(normal)):
-        key = _fs_key(candidate)
-        if key == root or key.startswith(root + os.sep):
-            return True
-    return False
-
-
-def _fs_key(path: str) -> str:
-    return path.casefold() if _CASE_INSENSITIVE_FS else path
-
-
 def known_compilers(entries: Iterable[Mapping[str, object]]) -> dict[str, Path]:
     """Map the file name of each compiler to a path that an entry gives with a directory.
 
@@ -235,44 +220,40 @@ def _existing(path: Path, cwd: Path) -> Path | None:
     return Path(os.path.normpath(str(candidate)))
 
 
-def predefine_flags(args: Sequence[str], cwd: Path, project_root: Path | None = None) -> tuple[str, ...]:
-    """Keep the flags of *args* that can change what the driver predefines.
+def predefine_flags(args: Sequence[str]) -> tuple[str, ...]:
+    """Keep the flags of *args* that can change what the driver predefines or where it searches.
 
-    A relative ``--sysroot`` or ``-isysroot`` is made absolute against
-    *cwd*, the directory of the entry: the query runs in the directory of
-    the compiler, not in the build directory.  A sysroot inside
-    *project_root* is left out: the driver reads files from the sysroot,
-    and the files of a project come from its repository.
+    The flags go to the query exactly as the build gives them, and the query
+    runs in the directory of the entry, as the build does (see
+    ``query_gcc_driver``).  Thus a relative path means the same file for
+    the query as for the build.  These path flags change the answer:
 
-    Left out on purpose:
+    - ``--sysroot`` and ``-isysroot``: the root of the system headers.
+    - ``-B``: the directory of ``cc1`` and of the startup files.
+    - ``-specs`` and ``--specs``, joined or two tokens: a specs file can add
+      include directories and macros.  Measured on a Zephyr build:
+      ``-specs=picolibc.specs`` puts ``picolibc/include`` first; without it
+      the query gave the newlib headers, which the build does not use.
 
-    - ``-B``: it makes the driver run ``<dir>/cc1``, a second binary.
-    - ``-specs``, also a bare name: a specs file can add any option to
-      ``cc1``, ``-fplugin`` included, and the driver looks up a bare name
-      under ``--sysroot`` too.  Measured: ``--sysroot=<repo dir>
-      -specs=nano.specs`` read ``<repo dir>/usr/lib/nano.specs`` and loaded
-      the plugin it named.  The cost: the query does not see the
-      ``newlib-nano`` directories, which libclang never saw before either.
-    - ``-f`` flags outside ``_PREDEFINE_F_FLAGS``: some write files.
+    WHY the build value and no filter: the build runs the same driver with
+    the same flags, and with the code of the repository, thus a filter on
+    these flags protects nothing and costs a correct answer.
+
+    Left out on purpose: ``-f`` flags outside ``_PREDEFINE_F_FLAGS`` (see
+    there), and each flag that cannot change a predefine or a system
+    directory (``-I``, ``-D``, warnings), which keeps the number of
+    distinct queries small.
     """
-    def trusted(path: str) -> bool:
-        return project_root is None or not inside_project(path, project_root)
-
     kept: list[str] = []
     path_flag = ""
     for token in args:
         if path_flag:
-            value = _absolute(token, cwd)
-            if trusted(value):
-                kept += [path_flag, value]
+            kept += [path_flag, token]
             path_flag = ""
         elif token in _PATH_WITH_VALUE:
             path_flag = token
-        elif token.startswith(("--sysroot=", "-isysroot")):
-            flag = "--sysroot=" if token.startswith("--sysroot=") else "-isysroot"
-            value = _absolute(token[len(flag):], cwd)
-            if trusted(value):
-                kept.append(flag + value)
+        elif token.startswith(_JOINED_PATH_FLAGS):
+            kept.append(token)
         elif token.startswith("-f"):
             if token in _PREDEFINE_F_FLAGS or token.startswith(_PREDEFINE_F_PREFIXES):
                 kept.append(token)
@@ -281,16 +262,19 @@ def predefine_flags(args: Sequence[str], cwd: Path, project_root: Path | None = 
     return tuple(kept)
 
 
-def _absolute(path: str, cwd: Path) -> str:
-    return path if not path or Path(path).is_absolute() else os.path.normpath(str(cwd / path))
-
-
-def parse_verbose_output(stderr: str) -> tuple[str, list[str]]:
+def parse_verbose_output(stderr: str, cwd: Path) -> tuple[str, list[str]]:
     """Read the target triple and the ``#include <...>`` directories from ``gcc -v``.
 
     The directories come back resolved, because GCC writes them relative to
     its own binary (``bin/../lib/gcc/...``) and one directory must have one
     spelling in the index.
+
+    *cwd* is the directory in which the driver ran.  GCC writes a directory
+    of a relative flag as relative too: ``--sysroot=sr`` gives
+    ``sr/usr/include``, ``-Btools/`` gives ``tools/include``.  Such a path is
+    relative to *cwd*, not to the directory of this process.  Measured:
+    resolved against this process it named ``/sr/usr/include``, which does
+    not exist, and libclang stopped with "file not found".
     """
     triple = ""
     dirs: list[str] = []
@@ -305,7 +289,7 @@ def parse_verbose_output(stderr: str) -> tuple[str, list[str]]:
         elif inside and line.strip():
             # A macOS driver marks a framework directory; it is no include root.
             text = line.strip().removesuffix(" (framework directory)")
-            dirs.append(str(Path(text).resolve()))
+            dirs.append(str((cwd / text).resolve()))
     return triple, dirs
 
 
@@ -325,7 +309,8 @@ def parse_defines(stdout: str) -> list[tuple[str, str]]:
     return macros
 
 
-_QueryKey = tuple[str, int, int, str, tuple[str, ...]]
+#: (compiler path, mtime, size, language, flags, working directory)
+_QueryKey = tuple[str, int, int, str, tuple[str, ...], str]
 
 #: Successful answers, keyed by the identity of the binary.
 _QUERY_CACHE: dict[_QueryKey, DriverInfo] = {}
@@ -345,30 +330,48 @@ def clear_query_cache() -> None:
     _FAILED_QUERIES.clear()
 
 
-def query_gcc_driver(compiler: Path, language: str, flags: tuple[str, ...]) -> DriverInfo | None:
+def query_gcc_driver(compiler: Path, language: str, flags: tuple[str, ...], cwd: Path) -> DriverInfo | None:
     """Ask the GCC driver *compiler* for its triple, system directories and macros.
 
     *language* is ``"c"`` or ``"cpp"``, because the two have different
     directories (libstdc++) and different macros.  This function runs
-    *compiler*, as the build of the project does.
+    *compiler* in *cwd*, the directory of the entry, with *flags* as the
+    build gives them: the same run as the build, thus a relative path in a
+    flag means the same file.  Measured: a specs file of the build named
+    ``-specs=my.specs`` stopped the query with "cannot read spec file" when
+    the query ran in the directory of the compiler.
 
-    The answer is kept per (path, mtime, size, language, flags).  A toolchain
-    update changes the binary, thus a long MCP server process asks again.
+    The answer is kept per (path, mtime, size, language, flags, cwd) for
+    the life of the process.  A toolchain update changes the binary, thus a
+    long MCP server process asks again.  An edit of a file that a flag names
+    (a specs file, a sysroot) does not change the key: a long MCP server
+    process sees it after a restart of the client.  An index run is a
+    process of its own and always asks again.  WHY not a stamp of those
+    files: to find them, fw-context would have to repeat the search of GCC
+    (``-B`` directories, the sysroot, the directories of the toolchain),
+    which is a guess.  *cwd* is in the key, because a relative path in a
+    flag depends on it; the measured builds name one to a few directories,
+    thus few more queries.
 
     Returns None when the binary is not a GCC driver, does not run, or gives
-    an answer that this function cannot read.
+    an answer that this function cannot read.  When *cwd* does not exist,
+    the build directory is gone, and the query does not run (see
+    ``_warn_missing_build_directory``).
     """
     try:
         status = compiler.stat()
     except OSError:
         return None
-    key = (str(compiler), status.st_mtime_ns, status.st_size, language, flags)
+    if not cwd.is_dir():
+        _warn_missing_build_directory(cwd)
+        return None
+    key = (str(compiler), status.st_mtime_ns, status.st_size, language, flags, str(cwd))
     if key in _QUERY_CACHE:
         return _QUERY_CACHE[key]
     failed_at = _FAILED_QUERIES.get(key)
     if failed_at is not None and time.monotonic() - failed_at < _FAILURE_TTL_S:
         return None
-    info = _run_query(compiler, language, flags)
+    info = _run_query(compiler, language, flags, cwd)
     if info is None:
         _FAILED_QUERIES[key] = time.monotonic()
     else:
@@ -377,12 +380,12 @@ def query_gcc_driver(compiler: Path, language: str, flags: tuple[str, ...]) -> D
     return info
 
 
-def _run_query(compiler: Path, language: str, flags: tuple[str, ...]) -> DriverInfo | None:
+def _run_query(compiler: Path, language: str, flags: tuple[str, ...], cwd: Path) -> DriverInfo | None:
     lang = "c++" if language == "cpp" else "c"
     base = [str(compiler), *flags, "-x", lang]
     try:
-        verbose = _run_driver([*base, "-E", "-v", "-o", os.devnull, "-"], compiler.parent)
-        defines = _run_driver([*base, "-dM", "-E", "-"], compiler.parent)
+        verbose = _run_driver([*base, "-E", "-v", "-o", os.devnull, "-"], cwd)
+        defines = _run_driver([*base, "-dM", "-E", "-"], cwd)
     except (OSError, subprocess.TimeoutExpired) as error:
         log.warning("Cannot query the compiler %s for its system headers: %s", compiler, error)
         return None
@@ -392,7 +395,7 @@ def _run_query(compiler: Path, language: str, flags: tuple[str, ...]) -> DriverI
             compiler, verbose.returncode, defines.returncode, (verbose.stderr or defines.stderr)[-300:],
         )
         return None
-    triple, dirs = parse_verbose_output(verbose.stderr)
+    triple, dirs = parse_verbose_output(verbose.stderr, cwd)
     macros = parse_defines(defines.stdout)
     names = {name for name, _ in macros}
     # A clang that is installed as `cc` or `gcc` also answers both queries.
@@ -408,9 +411,8 @@ def _run_driver(argv: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
     """Run one driver query.
 
     An argv list and no shell.  The input is an empty stdin (``-``), which
-    works on every host — Windows has no /dev/null.  The working directory
-    is the one of the compiler: the query reads no relative path, because
-    ``predefine_flags`` makes each path flag absolute.
+    works on every host — Windows has no /dev/null.  *cwd* is the directory
+    of the entry, in which the build runs the same compiler.
     """
     return subprocess.run(
         argv, capture_output=True, text=True, timeout=_QUERY_TIMEOUT_S, check=False,
@@ -579,6 +581,22 @@ def libclang_args(info: DriverInfo, args: Sequence[str]) -> list[str]:
     for directory in replaced:
         result += ["-idirafter", directory]
     return result
+
+
+@cache
+def _warn_missing_build_directory(directory: Path) -> None:
+    """Say once that the build directory of compile_commands.json is gone.
+
+    WHY no query in another directory: a relative flag would then name
+    another file, and the answer would be a guess.  The build of the project
+    makes the directory again.
+    """
+    log.warning(
+        "The build directory %s of compile_commands.json does not exist, thus fw-context "
+        "cannot ask the compiler for its system headers; the units of that directory get "
+        "no answer of the compiler. Run 'fw-context index --build'.",
+        directory,
+    )
 
 
 @cache
