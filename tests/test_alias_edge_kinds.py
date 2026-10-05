@@ -82,8 +82,13 @@ def test_a_reference_of_the_definition_is_no_callee_of_the_alias(db):
     assert names == {"hw_read"}
 
 
-def test_a_single_underscore_definition_is_an_alias_target_too(tmp_path):
+def test_a_single_underscore_definition_is_an_alias_target_too(tmp_path, monkeypatch):
     """``_spi_irq`` is a candidate as well as ``__spi_irq``: the LIKE filter keeps both."""
+    from fw_context_mcp.indexer.db import _callgraph
+
+    # The alias cache is keyed by id(conn): a connection of an earlier test
+    # can leave its pairs under the id that this connection gets.
+    monkeypatch.setattr(_callgraph, "_alias_cache_global", {})
     conn = open_db(tmp_path / "test.db")
     with transaction(conn):
         upsert_project(conn, "proj-001", "test", "/tmp/test")
