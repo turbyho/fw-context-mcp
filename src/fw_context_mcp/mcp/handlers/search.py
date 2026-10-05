@@ -565,7 +565,7 @@ async def semantic_search(
     query: Annotated[str, Field(description="Natural language description, 5-15 words. E.g. 'parcel locker state machine' or 'how does the modem connect?'.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     threshold: Annotated[float, Field(description="Minimum cosine similarity (0.0-1.0). Default 0.60. Use 0.55 for exploratory, 0.50 for broad search.", ge=0.0, le=1.0)] = 0.60,
-    limit: Annotated[int, Field(description="Maximum results (default 20). Held between 5 and 100.", ge=1)] = 20,
+    limit: Annotated[int, Field(description="Maximum results (default 20). Held between 1 and 100.", ge=1)] = 20,
 ) -> list[dict]:
     """Semantic search using pre-computed libclang symbol embeddings. Finds
     symbols by meaning, not by text — matches concepts even when query
