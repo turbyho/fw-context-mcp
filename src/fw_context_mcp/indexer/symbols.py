@@ -982,7 +982,19 @@ def _emit_fn_ptr_targets(
                     pass
                 break
 
-    for child in expr_cursor.get_children():
+    # The expressions that can hold the function.  WHY the element itself
+    # when it is a DECL_REF_EXPR: in C++, libclang gives the element of
+    # ``{ dev_cb, other }`` as a bare DECL_REF_EXPR, with no implicit-cast
+    # wrapper as in C.  Its children are only qualifiers (``ns::``), thus
+    # a scan of the children found nothing, and a C++ table of functions
+    # gave no indirect reference and no slot.  ``{ &dev_cb }`` worked,
+    # because the UNARY_OPERATOR has the reference as a child.
+    if expr_cursor.kind == cx.CursorKind.DECL_REF_EXPR:
+        scanned = [expr_cursor]
+    else:
+        scanned = list(expr_cursor.get_children())
+
+    for child in scanned:
         targets = _find_fn_refs_in_expr(child, skip_usr)
         if not targets:
             continue
@@ -1032,7 +1044,7 @@ def _emit_fn_ptr_targets(
     # structure, only on a linear token sequence.
     if qn_to_usr is not None:
         any_found = False
-        for child in expr_cursor.get_children():
+        for child in scanned:
             if _find_fn_refs_in_expr(child, skip_usr):
                 any_found = True
                 break
