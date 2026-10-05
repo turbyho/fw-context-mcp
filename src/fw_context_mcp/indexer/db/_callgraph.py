@@ -679,7 +679,9 @@ def find_all_callers_recursive(
     Why extended_refs with alias UNION ALL: when A calls decl_usr
     (a weak alias) and decl_usr aliases def_usr, A also effectively
     calls def_usr.  The UNION ALL injects these synthetic edges so the
-    recursive CTE can traverse past aliases.
+    recursive CTE can traverse past aliases.  The synthetic edges take the
+    same ``ref_kind`` filter as the real ones: a ``ref``, ``vector`` or
+    ``alias`` row that names the alias is no call.
 
     Why COALESCE(s_def.name, s_any.name): some callers may exist only
     as declarations (not definitions) in the index — e.g., an ISR
@@ -699,7 +701,8 @@ def find_all_callers_recursive(
         SELECT r.from_usr, ap.def_usr
         FROM refs r
         JOIN alias_pairs ap ON r.to_usr = ap.decl_usr
-        WHERE r.config_hash = ?"""
+        WHERE r.config_hash = ?
+          AND r.ref_kind IN ('call', 'indirect', 'implicit_construct', 'dispatch')"""
         if alias_cte
         else ""
     )
@@ -798,7 +801,8 @@ def find_callees_recursive(
         SELECT ap.decl_usr, r.to_usr
         FROM refs r
         JOIN alias_pairs ap ON r.from_usr = ap.def_usr
-        WHERE r.config_hash = ?"""
+        WHERE r.config_hash = ?
+          AND r.ref_kind IN ('call', 'indirect', 'implicit_construct', 'dispatch')"""
         if alias_cte
         else ""
     )
