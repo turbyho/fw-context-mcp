@@ -57,6 +57,7 @@ file-reading tool:
 | Body only | `get_source` | function name |
 | Read a file, or a range of it | `read_file` | `"main.cpp"`, `start_line=60` |
 | File structure overview | `get_file_map` | `"main.cpp"` |
+| Interrupt handler of each vector | `get_vector_table` | — ISRs have no caller |
 | Check index health | `get_active_build` | — always call first |
 
 SELF-CORRECT: the moment you reach for any tool that is NOT fw-context
@@ -78,9 +79,10 @@ This is why a dead `#ifdef` block cannot reach you as live code. Three
 limits:
 
 - The filter needs an index. When a file changed after the last index run,
-  `get_source` gives the current text from the DISK, which holds every
-  branch. It sets `source_origin: "disk"` and a `stale_warning`. Read both
-  before you cite such a body.
+  `get_source` and `get_symbol_context` set a `stale_warning`. When the
+  symbol did not move, they give the current text from the DISK, which
+  holds every branch, and set `source_origin: "disk"`. Read both before you
+  cite such a body.
 - An empty result can mean "the pattern is only in a dead branch". That is
   an answer, not a failure — the code does not compile.
 - A file can come back with every line blank. `read_file` marks it with
@@ -101,7 +103,9 @@ manual exploration before calling the skill.
 Your project has TWO kinds of code:
   • Application code: `src/`, `lib/` — YOUR team's code.
   • Vendor SDK: `mbed-os/`, `.pio/`, `zephyr/` — framework code.
-Set `project_only=True` for questions about YOUR code.
+Set `project_only=True` for questions about YOUR code. The parameter is on
+`search_code`, `search_bodies`, `search_content`, `find_dead_code` and
+`find_hotspots`.
 Leave `project_only=False` (default) when vendor code is relevant.
 
 ### A question about a DIFFERENT project
@@ -115,6 +119,9 @@ operator asked about.
 2. Give `project="<name>"` (or `project_root="<root_path>"`) to EVERY
    call that follows, `get_active_build` included.
 
+A name that several projects share gives an error that lists each one
+with its `project_id`. Repeat the call with that `project_id`.
+
 Do not invent other parameter names. An unknown argument causes an error
 that names it.
 
@@ -125,8 +132,9 @@ One project can hold several builds on two axes: `variant` is the board,
 — a bootloader is NOT the application.
 
 **One query answers for ONE build.** Both selectors fail closed: when the
-project has more than one variant, or the variant holds more than one
-image, a query that names none gets an error that lists the choices. That
+project declares variants and sets no `[build] default_variant`, or the
+variant holds more than one image, a query that names none gets an error
+that lists the choices. That
 is on purpose — an answer blending a bootloader with an application serves
 no question, and two builds of one application would repeat nearly every
 row.
@@ -157,8 +165,9 @@ Eight tools take an `offset` and lead with a page notice: `lookup_symbol`,
 
     {"total": 137, "offset": 0, "shown": 50, "more": true, "hint": "…"}
 
-It is ALWAYS there when the answer holds a row, thus a full page never
-leaves you guessing whether more exists. `total` counts every row the
+The `hint` key is there only when `more` is true. The notice is ALWAYS
+there when the answer holds a row, thus a full page never leaves you
+guessing whether more exists. `total` counts every row the
 query matches; `more` says whether any are left.
 
 Find the notice by its keys, and not by its position. A `warning` row
@@ -182,12 +191,15 @@ Every tool rejects an unknown argument, thus a guess costs a whole call.
 The schema of each tool is in the tool list — read it there. Three names
 cover almost every tool:
 
-- `name` — the symbol. NOT `symbol`, NOT `symbol_name`.
+- `name` — the symbol. NOT `symbol`, NOT `symbol_name`. Exceptions:
+  `find_call_path` (`from_name`, `to_name`), `trace_data_flow`
+  (`type_name`, `to_symbol`), `find_wrapper_callers` and the inheritance
+  tools (`class_name`, `method_name`, `template_name`).
 - `file_path` — the file (`read_file`, `get_file_map`).
 - `query` — the search terms (every search tool).
 
 No tool takes a filler argument. `get_active_build` accepts only
-`project_root` and `fast`. When a call fails on an argument, drop that
+`project`, `project_root` and `fast`. When a call fails on an argument, drop that
 argument and REPEAT the call — never continue without the answer, and
 never skip `get_active_build`.
 
@@ -328,10 +340,13 @@ Check(`get_active_build`) → Find(`search_code`/`lookup_symbol`)
 
 get_active_build() status:
   • "ready" / "reindexing" — fully operational. Continue.
-  • "reindex_needed" — queries work, schedule `fw-context index`.
+  • "reindex_needed" — queries work, schedule `fw-context index`. It wins
+    over "reindexing". When `bg_reindex_running` is true, that run already
+    does the work: do not start a second one.
   • "not_initialized" — ask operator, then run `fw-context init` via bash.
   • "no_index" — ask operator, then run `fw-context index --build` via bash.
-  • "error" — DB corruption. Use other tools.
+  • NO status, only `error` — DB corruption or access error. There is no
+    status "error". Use other tools.
 
 `client_restart_required: True` is not a status, and NO command repairs it.
 The index holds a newer row format than this session reads, thus the index

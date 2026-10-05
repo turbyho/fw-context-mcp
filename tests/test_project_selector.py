@@ -882,6 +882,23 @@ def test_every_copy_of_the_instructions_teaches_paging():
         assert "more" in text, label
 
 
+def test_every_copy_of_the_instructions_states_the_corrected_tool_rules():
+    """A correction in one copy must also go into the other copy.
+
+    A docs commit corrected these rules in the FastMCP string only, and
+    ``BASE_INSTRUCTIONS`` kept the old text.  A reader of ``CLAUDE.md``
+    then looked for a ``status="error"`` that the tool never gives, and
+    did not know that ``get_symbol_context`` can also answer from the disk.
+    """
+    for label, text in _instruction_copies():
+        assert "get_source and get_symbol_context set a stale_warning" in " ".join(
+            text.replace("`", "").split()
+        ), label
+        assert "There is no status" in " ".join(text.split()), label
+        assert "default_variant" in text, label
+        assert "`project`, `project_root`" in text, label
+
+
 def test_no_copy_of_the_instructions_holds_a_dead_file():
     """``data/instructions.md`` is gone.  Nothing may point a reader at it."""
     from pathlib import Path
