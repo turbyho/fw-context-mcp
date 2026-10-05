@@ -214,7 +214,7 @@ def _get_alias_pairs(conn: sqlite3.Connection, config_hash: str) -> list[tuple[s
     """Find weak-alias declaration → definition pairs in the index.
 
     Detects the ``__attribute__((weak, alias("__func")))`` pattern by
-    finding declaration-only symbols that have a ``__``-prefixed sibling
+    finding declaration-only symbols that have a ``__``- or ``_``-prefixed sibling
     definition with the same parameter count.
 
     Why parameter-count matching over exact signature comparison:
@@ -257,11 +257,13 @@ def _get_alias_pairs(conn: sqlite3.Connection, config_hash: str) -> list[tuple[s
     if not rows:
         return []
 
-    # Build index of __-prefixed definitions by (name, param_count)
+    # Build index of _- and __-prefixed definitions by (name, param_count).
+    # ESCAPE: a bare `_` is the one-character wildcard of LIKE, and '__%'
+    # took every name of two characters or more.
     try:
         def_rows = conn.execute(
             """SELECT usr, name, signature FROM symbols
-               WHERE config_hash = ? AND is_definition = 1 AND name LIKE '__%'
+               WHERE config_hash = ? AND is_definition = 1 AND name LIKE '\\_%' ESCAPE '\\'
             """,
             (config_hash,),
         ).fetchall()

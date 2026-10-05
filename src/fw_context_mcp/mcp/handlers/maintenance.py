@@ -2675,7 +2675,7 @@ def configure_llm(
     ] = None,
     embed_model: Annotated[
         str | None,
-        Field(description="Embedding model name (Ollama only). None = keep current."),
+        Field(description="Embedding model: an Ollama tag, a sentence-transformers name (e.g. 'BAAI/bge-small-en-v1.5'), or 'ft://latest'. None = keep current."),
     ] = None,
     auto_pull: Annotated[
         bool | None,
@@ -2715,7 +2715,8 @@ def configure_llm(
             "auto" returns to detection from the URL.  None keeps the
             current value.
         model: Chat model name.
-        embed_model: Embedding model name (Ollama only).
+        embed_model: Embedding model: an Ollama tag, a sentence-transformers
+            name (``BAAI/...``, needs the ``st`` extra), or ``ft://``.
         auto_pull: Whether to auto-pull models on 404.  None keeps the
             current value.
         stream: Stream chat responses via SSE. True avoids reverse-proxy idle timeouts.

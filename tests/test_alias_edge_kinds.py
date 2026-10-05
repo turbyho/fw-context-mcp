@@ -80,3 +80,23 @@ def test_a_reference_of_the_definition_is_no_callee_of_the_alias(db):
     names = {row["name"] for row in find_callees_recursive(db, CH, "uart_irq")}
 
     assert names == {"hw_read"}
+
+
+def test_a_single_underscore_definition_is_an_alias_target_too(tmp_path):
+    """``_spi_irq`` is a candidate as well as ``__spi_irq``: the LIKE filter keeps both."""
+    conn = open_db(tmp_path / "test.db")
+    with transaction(conn):
+        upsert_project(conn, "proj-001", "test", "/tmp/test")
+        upsert_build_config(conn, CH, "proj-001", "/tmp/compile_commands.json")
+    fid = upsert_file(conn, CH, "src/uart.c", "c")
+    insert_symbols_batch(conn, [
+        _symbol(fid, "spi_irq", "u_spi_alias", 1, definition=False),
+        _symbol(fid, "_spi_irq", "u_spi_def", 10),
+        _symbol(fid, "main", "u_main", 20),
+    ])
+    insert_refs_batch(conn, [_ref("u_spi_alias", 21, "u_main", "call")])
+
+    names = {row["name"] for row in find_all_callers_recursive(conn, CH, "_spi_irq")}
+    conn.close()
+
+    assert names == {"main"}
