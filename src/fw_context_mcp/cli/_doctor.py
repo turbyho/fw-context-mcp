@@ -17,39 +17,6 @@ from __future__ import annotations
 import argparse
 
 
-def _allow_toolchains(project: str | None, *, to_stderr: bool) -> None:
-    """Add the toolchains of the project to the allowlist in ``toolchains.toml``, and say which.
-
-    WHY without ``--fix``: the allowlist is basic project setup that a user
-    does not know about.  A toolchain outside it keeps the guessed headers
-    without any visible sign, thus ``doctor`` writes it each time it runs.
-    See ``indexer/_allowlist.py``.
-    """
-    import sys
-
-    from ..indexer._allowlist import allow_project_toolchains
-    from ..utils import resolve_project_root
-
-    try:
-        root = resolve_project_root(project)
-    except (OSError, ValueError):
-        # ValueError: an ambiguous project name.  The checks still run and
-        # report the project problem themselves.
-        return
-    if not (root / ".fw-context" / "config.toml").is_file():
-        return  # not an initialized project
-    try:
-        added = allow_project_toolchains(root)
-    except (OSError, ValueError) as error:
-        # ValueError: a ``command`` field with an unclosed quote.  The
-        # checks of doctor must still run.
-        print(f"  query-driver: cannot add the toolchains of {root}: {error}", file=sys.stderr)
-        return
-    out = sys.stderr if to_stderr else sys.stdout
-    for glob in added:
-        print(f"  query-driver: added {glob} to .fw-context/toolchains.toml", file=out)
-
-
 def cmd_doctor(args: argparse.Namespace) -> int:
     """Audit all dependencies.  With ``--fix``, attempt auto-repair.
 
@@ -73,8 +40,6 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             known = ", ".join(name for name, _ in CHECK_ORDER)
             print(f"fw-context doctor: unknown check(s): {', '.join(sorted(unknown))}. Known: {known}")
             return 2
-
-    _allow_toolchains(args.project, to_stderr=bool(getattr(args, "json", False)))
 
     results = run_full_check(project_root=args.project, subset=subset)
 

@@ -450,13 +450,7 @@ def _run_pre_build(cfg: BuildConfig, cwd: Path) -> None:
     """
     if not cfg.pre_build:
         return
-    log.warning(
-        "Running pre-build hook: %s\n"
-        "Pre-build hooks execute arbitrary shell commands.  For security, "
-        "configure pre_build only in .fw-context/local.toml (gitignored), "
-        "not in .fw-context/config.toml (committed).",
-        cfg.pre_build,
-    )
+    log.info("Running pre-build hook: %s", cfg.pre_build)
     import shlex
     # build_env, not the raw inherited environment: a hook the harness put in
     # BASH_ENV hijacks any `bash -c` the user configures here — see utils.

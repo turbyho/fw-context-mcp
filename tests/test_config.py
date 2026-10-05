@@ -207,14 +207,16 @@ model = "my-local-model"
         assert cfg.llm.model == "my-local-model"
 
 
-class TestQueryDriverTrust:
-    """``[index] query_driver`` selects the compilers that the indexer runs.
+class TestRetiredQueryDriverKeys:
+    """``[index] query_driver``, ``query_driver_extra`` and ``query_driver_auto`` are retired.
 
-    A committed config must not set it, or a repository could allow the
-    compiler script it commits.
+    They were an allowlist of the compilers that the index run could ask
+    for their system headers.  fw-context now asks the compiler of the build
+    in all cases, thus an old config must load without an error, and a
+    warning names each file that still has a retired key.
     """
 
-    def _project(self, tmpdir, monkeypatch, committed: str, local: str = "") -> Path:
+    def _project(self, tmpdir, monkeypatch, committed: str = "", local: str = "", global_text: str = "") -> Path:
         import fw_context_mcp.config.settings as settings
 
         fake_home = tmpdir / "fake-home"
@@ -222,10 +224,12 @@ class TestQueryDriverTrust:
         monkeypatch.setattr(Path, "home", lambda: fake_home)
         # The module computes _GLOBAL_CONFIG_PATH at import, thus the fake
         # home does not move it.  Without this line, load() reads the global
-        # config of the operator, and a query_driver there breaks the tests.
+        # config of the operator.
         global_cfg = Path(fake_home) / "global.toml"
-        global_cfg.write_text("")
+        global_cfg.write_text(global_text)
         monkeypatch.setattr(settings, "_GLOBAL_CONFIG_PATH", global_cfg)
+        # The warning is given once per file and process; each test starts clean.
+        monkeypatch.setattr(settings, "_retired_warned", set())
         proj_dir = Path(tmpdir / "project")
         (proj_dir / ".fw-context").mkdir(parents=True)
         (proj_dir / ".fw-context" / "config.toml").write_text(committed)
@@ -233,49 +237,70 @@ class TestQueryDriverTrust:
             (proj_dir / ".fw-context" / "local.toml").write_text(local)
         return proj_dir
 
-    def test_the_default_allowlist_applies_without_a_setting(self):
-        from fw_context_mcp.config.settings import DEFAULT_QUERY_DRIVER
+    def test_the_config_has_no_query_driver_field(self):
+        assert not hasattr(Config().index, "query_driver")
 
-        assert Config().index.query_driver == list(DEFAULT_QUERY_DRIVER)
+    @pytest.mark.parametrize("layer", ["committed", "local", "global_text"])
+    def test_a_retired_key_is_ignored_with_a_warning(self, tmpdir, monkeypatch, capsys, layer):
+        files = {layer: '[index]\nquery_driver = ["**"]\nquery_driver_auto = false\nvendor_paths = ["x"]\n'}
+        cfg = load(self._project(tmpdir, monkeypatch, **files))
+        assert cfg.index.vendor_paths == ["x"], "the other [index] keys of the file stay"
+        err = capsys.readouterr().err
+        assert "query_driver, query_driver_auto" in err
+        assert "has no effect" in err
 
-    def test_the_committed_config_cannot_set_it(self, tmpdir, monkeypatch, capsys):
-        from fw_context_mcp.config.settings import DEFAULT_QUERY_DRIVER
-
-        proj = self._project(tmpdir, monkeypatch, '[index]\nquery_driver = ["**"]\nvendor_paths = ["x"]\n')
-        cfg = load(proj)
-        assert cfg.index.query_driver == list(DEFAULT_QUERY_DRIVER)
-        assert cfg.index.vendor_paths == ["x"], "the other [index] keys of the committed config stay"
-        assert "query_driver" in capsys.readouterr().err
-
-    def test_local_toml_can_set_it(self, tmpdir, monkeypatch):
-        """The operator decided: local.toml is the developer's own file."""
-        proj = self._project(tmpdir, monkeypatch, "[index]\n", '[index]\nquery_driver = ["~/tools/**"]\n')
-        assert load(proj).index.query_driver == ["~/tools/**"]
-
-    def test_a_variant_cannot_set_it(self, tmpdir, monkeypatch):
-        from fw_context_mcp.config.settings import DEFAULT_QUERY_DRIVER
-
-        committed = '[[build.variants]]\nname = "a"\nquery_driver = ["**"]\n'
-        cfg = load(self._project(tmpdir, monkeypatch, committed))
-        assert cfg.index.query_driver == list(DEFAULT_QUERY_DRIVER)
-        assert all("query_driver" not in v.index_overrides for v in cfg.build.variants)
-
-    def test_a_malformed_build_table_does_not_crash_the_trust_check(self, tmp_path):
-        """``build = "x"`` is a typo; the check must leave it to the rest of the loader."""
-        from fw_context_mcp.config.settings import _drop_committed_trust_keys
-
-        data = {"build": "x", "index": {"query_driver": ["**"]}}
-        _drop_committed_trust_keys(data, tmp_path / "local.toml")
-        assert data == {"build": "x", "index": {}}
-
-    def test_the_global_config_can_set_it(self, tmpdir, monkeypatch):
+    def test_the_warning_is_given_once_per_file(self, tmpdir, monkeypatch, capsys):
         import fw_context_mcp.config.settings as settings
 
-        proj = self._project(tmpdir, monkeypatch, "[index]\n")
-        global_cfg = Path(tmpdir) / "global.toml"
-        global_cfg.write_text('[index]\nquery_driver = ["~/tools/**"]\n')
-        monkeypatch.setattr(settings, "_GLOBAL_CONFIG_PATH", global_cfg)
-        assert load(proj).index.query_driver == ["~/tools/**"]
+        proj = self._project(tmpdir, monkeypatch, local='[index]\nquery_driver_extra = ["~/x/**"]\n')
+        load(proj)
+        settings._config_cache.clear()  # force a second parse of the same file
+        load(proj)
+        assert capsys.readouterr().err.count("query_driver_extra") == 1
+
+    def test_a_retired_key_in_a_variant_is_not_an_unknown_build_key(self, tmpdir, monkeypatch, capsys):
+        """A variant copies a non-[index] key into its [build] overrides.
+
+        Without the removal, ``build_variant_config`` said "unknown [build]
+        key", which is the wrong message for a retired key.
+        """
+        committed = '[[build.variants]]\nname = "a"\nquery_driver = ["**"]\n'
+        cfg = load(self._project(tmpdir, monkeypatch, committed))
+        variant = cfg.build.variants[0]
+        assert "query_driver" not in variant.overrides
+        assert "has no effect" in capsys.readouterr().err
+
+    def test_a_malformed_build_table_does_not_crash_the_removal(self, tmp_path, monkeypatch):
+        """``build = "x"`` is a typo; the removal must leave it to the rest of the loader."""
+        import fw_context_mcp.config.settings as settings
+
+        monkeypatch.setattr(settings, "_retired_warned", set())
+        data = {"build": "x", "index": {"query_driver": ["**"]}}
+        settings._drop_retired_keys(data, tmp_path / "local.toml")
+        assert data == {"build": "x", "index": {}}
+
+    def test_an_old_toolchains_file_gets_a_warning_and_stays(self, tmpdir, monkeypatch, capsys):
+        proj = self._project(tmpdir, monkeypatch)
+        toolchains = proj / ".fw-context" / "toolchains.toml"
+        toolchains.write_text('[index]\nquery_driver_extra = ["~/x/bin/gcc"]\n')
+        load(proj)
+        assert "toolchains.toml" in capsys.readouterr().err
+        assert toolchains.is_file(), "fw-context does not delete a file of the user"
+
+    def test_a_committed_pre_build_gives_no_warning(self, tmpdir, monkeypatch, capsys):
+        """The build runs the code of the repository in all cases.
+
+        Thus a warning on a committed ``pre_build`` or ``command`` protected
+        nothing, and it is gone.  A non-local ``ollama_url`` still warns.
+        """
+        committed = '[build]\npre_build = "make gen"\ncommand = "make"\n'
+        load(self._project(tmpdir, monkeypatch, committed))
+        assert "SECURITY" not in capsys.readouterr().err
+
+    def test_a_committed_remote_ollama_url_still_warns(self, tmpdir, monkeypatch, capsys):
+        committed = '[llm]\nollama_url = "http://198.51.100.7:11434"\n'
+        load(self._project(tmpdir, monkeypatch, committed))
+        assert "SECURITY: ollama_url" in capsys.readouterr().err
 
 
 class TestMalformedSection:
@@ -312,10 +337,8 @@ class TestMalformedSection:
 
     def test_a_string_section_is_not_read_as_a_substring(self, tmpdir, monkeypatch):
         """``_apply_section`` tested ``key in section``; on a string that is a substring test."""
-        from fw_context_mcp.config.settings import DEFAULT_QUERY_DRIVER
-
-        cfg = self._load(tmpdir, monkeypatch, local='index = "query_driver"\n')
-        assert cfg.index.query_driver == list(DEFAULT_QUERY_DRIVER)
+        cfg = self._load(tmpdir, monkeypatch, local='index = "vendor_paths"\n')
+        assert cfg.index.vendor_paths == []
 
 
 class TestVendorProjectPaths:

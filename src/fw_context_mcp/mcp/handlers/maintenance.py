@@ -35,7 +35,7 @@ from pydantic import Field
 
 from ...config import derive_project_id
 from ...config import load as load_config
-from ...config.settings import DEFAULT_QUERY_DRIVER, Config
+from ...config.settings import Config
 from ...indexer.autobuild import AutobuildState
 from ...indexer.autobuild import state as autobuild_state
 from ...indexer.compile_commands import command_line_defines
@@ -451,9 +451,9 @@ def get_active_build(
     toolchain headers and the macros of clang: an ESP32 or AVR index there
     holds host headers from ``/usr/include`` and takes the ``#if`` branches
     of the host, for example ``#if __XTENSA__`` as false, and an ARM index
-    saw ``__GNUC__`` 4.  A build whose compiler is outside ``[index]
-    query_driver``, or inside the project directory, keeps that fault also
-    after ``/4``; the index run names such a compiler in a warning.
+    saw ``__GNUC__`` 4.  A build whose GCC driver does not answer the query
+    keeps that fault also after ``/4``; the index run names such a compiler
+    in a warning.
 
     ``client_restart_required`` is the OPPOSITE case, and no command repairs
     it.  The index carries a NEWER row format than this server process
@@ -2200,13 +2200,7 @@ def _reindex_match_tus(
         return [], False, {"error": f"compile_commands.json not found: {cc_path}"}
     # list(), not the iterator parse_cc returns: the header fallback below
     # walks the units a second time, and a generator is empty by then.
-    # The same allowlist as the index run, thus the same flags for the unit.
-    if project_root:
-        from ...indexer._allowlist import ensure_project_toolchains
-
-        ensure_project_toolchains(project_root, cc_path)
-    query_driver = load_config(project_root=project_root).index.query_driver if project_root else DEFAULT_QUERY_DRIVER
-    units = list(parse_cc(cc_path, query_driver, project_root))
+    units = list(parse_cc(cc_path, project_root=project_root))
     matching = [u for u in units if Path(u.file).resolve() == target]
     if matching:
         return matching, False, None

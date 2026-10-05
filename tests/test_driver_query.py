@@ -24,7 +24,6 @@ from fw_context_mcp.indexer import _driver_query
 from fw_context_mcp.indexer._driver_query import (
     DriverInfo,
     clear_query_cache,
-    driver_allowed,
     is_gcc_driver_name,
     libclang_args,
     parse_defines,
@@ -141,82 +140,38 @@ class TestDriverName:
         assert not is_gcc_driver_name(Path(name))
 
 
-class TestAllowlist:
-    """The query runs the binary, thus only a compiler on the allowlist runs."""
+class TestTheDriverAlwaysRuns:
+    """The query runs the GCC driver of the build, wherever that driver is.
 
-    def test_a_double_star_crosses_directories(self) -> None:
-        assert driver_allowed(Path("/opt/sdk/v1/bin/arm-none-eabi-gcc"), ["/opt/**"])
+    The build runs the same compiler and the code of the repository, thus an
+    allowlist protected nothing.  It also cost a correct parse: a compiler
+    outside it got guessed directories (156 of 881 units of one Mbed build
+    stopped at the error limit).  ``-nostdinc`` in the flags shows that the
+    answer of the driver was used.
+    """
 
-    def test_a_single_star_stays_in_one_directory(self) -> None:
-        assert driver_allowed(Path("/usr/bin/gcc"), ["/usr/bin/*"])
-        assert not driver_allowed(Path("/usr/bin/sub/gcc"), ["/usr/bin/*"])
+    def test_a_compiler_anywhere_is_asked(self, tmp_path: Path) -> None:
+        from fw_context_mcp.indexer.compile_commands import parse
 
-    def test_a_dot_dot_path_does_not_escape(self) -> None:
-        """``fnmatch`` would let ``/usr/bin/*`` match this path."""
-        assert not driver_allowed(Path("/usr/bin/../../home/x/proj/evil-gcc"), ["/usr/bin/*"])
+        driver, _ = _stub_driver(tmp_path / "tools", "some-gcc")
+        unit = next(parse(_cc(tmp_path, str(driver))))
+        assert "-nostdinc" in unit.clang_args
 
-    def test_a_case_insensitive_host_ignores_case(self, monkeypatch) -> None:
-        """macOS and Windows ignore case, thus /Opt/X is /opt/x there."""
-        monkeypatch.setattr(_driver_query, "_CASE_INSENSITIVE_FS", True)
-        assert driver_allowed(Path("/OPT/sdk/bin/arm-none-eabi-gcc"), ["/opt/**"])
-        assert not driver_allowed(Path("/Proj/tools/x-gcc"), ["/**"], project_root=Path("/proj"))
-        monkeypatch.setattr(_driver_query, "_CASE_INSENSITIVE_FS", False)
-        assert not driver_allowed(Path("/OPT/sdk/bin/arm-none-eabi-gcc"), ["/opt/**"])
-
-    @pytest.mark.parametrize("platform, expected", [
-        ("linux", "~/.arduino15/packages/**"),
-        ("darwin", "~/Library/Arduino15/packages/**"),
-        ("win32", "~/AppData/Local/Arduino15/packages/**"),
-    ])
-    def test_each_host_has_its_own_default(self, platform, expected) -> None:
-        from fw_context_mcp.config.settings import _default_query_driver
-
-        defaults = _default_query_driver(platform)
-        assert expected in defaults
-        assert "~/.platformio/packages/**" in defaults
-
-    def test_the_home_directory_expands(self) -> None:
-        home_tool = Path.home() / ".platformio" / "packages" / "tc" / "bin" / "gcc"
-        assert driver_allowed(home_tool, ["~/.platformio/packages/**"])
-
-    def test_a_compiler_inside_the_project_never_runs(self, tmp_path: Path) -> None:
-        """A broad pattern such as /opt/** also covers a project stored under /opt."""
-        project = tmp_path / "proj"
-        tool = project / "tools" / "x-gcc"
-        tool.parent.mkdir(parents=True)
-        tool.write_text("")
-        assert driver_allowed(tool, [f"{tmp_path}/**"])
-        assert not driver_allowed(tool, [f"{tmp_path}/**"], project_root=project)
-
-    def test_a_link_into_the_project_does_not_pass(self, tmp_path: Path) -> None:
-        project = tmp_path / "proj"
-        (project / "tools").mkdir(parents=True)
-        (project / "tools" / "x-gcc").write_text("")
-        link = tmp_path / "allowed" / "x-gcc"
-        link.parent.mkdir()
-        link.symlink_to(project / "tools" / "x-gcc")
-        assert not driver_allowed(link, [f"{tmp_path}/allowed/*"], project_root=project)
-
-    def test_a_compiler_inside_the_project_gets_its_own_warning(self, tmp_path: Path, caplog) -> None:
-        """A glob in query_driver cannot allow it, thus the warning must not advise one."""
+    def test_a_compiler_inside_the_project_is_asked(self, tmp_path: Path) -> None:
         from fw_context_mcp.indexer.compile_commands import parse
 
         project = tmp_path / "proj"
-        project.mkdir()
-        driver, _ = _stub_driver(project, "vendored-gcc")
-        unit = next(parse(_cc(tmp_path, str(driver)), [f"{tmp_path}/**"], project))
-        assert "-nostdinc" not in unit.clang_args
-        assert any("inside the project" in r.message for r in caplog.records)
+        driver, _ = _stub_driver(project / "tools", "vendored-gcc")
+        unit = next(parse(_cc(tmp_path, str(driver)), project_root=project))
+        assert "-nostdinc" in unit.clang_args
 
-    def test_a_compiler_in_the_repository_is_not_run(self, tmp_path: Path, caplog) -> None:
+    def test_a_list_of_globs_at_the_old_position_fails(self, tmp_path: Path) -> None:
+        """``parse`` took the allowlist second; an old caller must fail, not misread it."""
         from fw_context_mcp.indexer.compile_commands import parse
 
-        driver, _ = _stub_driver(tmp_path, "evil-gcc")
-        cc = _cc(tmp_path, str(driver))
-        unit = next(parse(cc, ["/opt/**"]))
-
-        assert "-nostdinc" not in unit.clang_args, "a compiler outside the allowlist must not run"
-        assert any("query_driver" in r.message for r in caplog.records)
+        driver, _ = _stub_driver(tmp_path / "tools", "some-gcc")
+        with pytest.raises(TypeError):
+            next(parse(_cc(tmp_path, str(driver)), ["/opt/**"]))
 
 
 class TestReadTheDriverAnswer:
@@ -434,7 +389,7 @@ class TestQueryTheDriver:
         assert info.macro("__XTENSA__") == "1"
 
     def test_the_query_runs_in_the_compiler_directory_with_the_language_and_flags(self, tmp_path: Path) -> None:
-        """The build directory belongs to the repository; the compiler directory to the allowlist."""
+        """The query runs in the compiler directory, with the language and the flags it got."""
         driver, _ = _stub_driver(tmp_path, "xtensa-esp32-elf-gcc")
         info = query_gcc_driver(driver, "cpp", ("-std=gnu++11", "-Os"))
         assert info is not None
@@ -503,7 +458,7 @@ class TestParseUsesTheDriver:
         monkeypatch.setattr(_driver_query, "libclang_supports", lambda triple: False)
         driver, dirs = _stub_driver(tmp_path, "xtensa-esp32-elf-gcc")
         monkeypatch.setenv("PATH", f"{driver.parent}:/usr/bin:/bin")
-        unit = next(parse(_cc(tmp_path, "xtensa-esp32-elf-gcc"), [f"{tmp_path}/**"]))
+        unit = next(parse(_cc(tmp_path, "xtensa-esp32-elf-gcc")))
 
         assert "--target=i386-unknown-elf" in unit.clang_args
         assert "-nostdinc" in unit.clang_args
@@ -515,7 +470,7 @@ class TestParseUsesTheDriver:
         from fw_context_mcp.indexer.compile_commands import parse
 
         monkeypatch.setenv("PATH", str(tmp_path / "empty"))
-        unit = next(parse(_cc(tmp_path, "nowhere-elf-gcc"), [f"{tmp_path}/**"]))
+        unit = next(parse(_cc(tmp_path, "nowhere-elf-gcc")))
         assert "-nostdinc" not in unit.clang_args
         assert "-std=gnu99" in unit.clang_args
 
@@ -527,11 +482,12 @@ class TestParseUsesTheDriver:
         monkeypatch.setattr(_driver_query, "libclang_supports", lambda triple: False)
         driver, _ = _stub_driver(tmp_path, "xtensa-esp32-elf-gcc")
         cc = _cc(tmp_path, str(driver))
-        allow = [f"{tmp_path}/**"]
-        first = compute_config_hash(list(parse(cc, allow)), tmp_path / "proj", "pid")
+        first = compute_config_hash(list(parse(cc)), tmp_path / "proj", "pid")
         clear_query_cache()
-        second = compute_config_hash(list(parse(cc, allow)), tmp_path / "proj", "pid")
-        without = compute_config_hash(list(parse(cc, [])), tmp_path / "proj", "pid")
+        second = compute_config_hash(list(parse(cc)), tmp_path / "proj", "pid")
+        # A driver that does not answer gives the flags of the build alone.
+        silent, _ = _stub_driver(tmp_path / "silent", "xtensa-esp32-elf-gcc", exit_code=1)
+        without = compute_config_hash(list(parse(_cc(tmp_path, str(silent)))), tmp_path / "proj", "pid")
         assert first == second
         assert first != without, "the driver flags are a different build identity"
 
@@ -573,7 +529,7 @@ def test_libclang_takes_the_branch_of_the_real_target(tmp_path: Path, monkeypatc
         "directory": str(src.parent), "file": str(src),
         "arguments": [str(driver), "-std=gnu99", "-c", str(src)],
     }]))
-    unit = next(parse(cc, [f"{tmp_path}/**"]))
+    unit = next(parse(cc))
     tu = cindex.Index.create().parse(str(unit.file), args=unit.clang_args)
 
     errors = [d.spelling for d in tu.diagnostics if d.severity >= cindex.Diagnostic.Error]

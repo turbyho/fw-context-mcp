@@ -143,7 +143,7 @@ Exceptions:
 | `command` | `str` | — | all | A full override for the shell command. Highest priority: fw-context ignores all other settings. |
 | `python` | `str` | (auto-detect) | all | The Python interpreter for pip-based CLI tools, such as `mbed-cli`, `platformio`, `keil2clangd`, or `compiledb`. `fw-context init` detects this automatically, from pyenv, venv, and common install paths. Set this parameter manually when automatic detection fails. |
 | `activate` | `str` | (auto-detect) | all | A shell script that fw-context sources before the build, for example `nordic_minimal_setup.sh` for NCS, or `export.sh` for ESP-IDF. `fw-context init` detects this automatically, from common install paths. Set this parameter manually when automatic detection fails. |
-| `pre_build` | `str` | — | all | A shell command that fw-context runs before the build, the convert step, or the generate step. **Security: use this parameter only in `local.toml` (gitignored). Never use this parameter in a committed `config.toml` file.** |
+| `pre_build` | `str` | — | all | A shell command that fw-context runs before the build, the convert step, or the generate step. Put it in `config.toml` when the whole team uses it, or in `local.toml` when it is specific to your machine. |
 
 The build process does not get an inherited `BASH_ENV`. fw-context removes
 it from the build environment, because `bash -c` reads that file before
@@ -471,7 +471,7 @@ it has.
 ### 9. IAR EWARM with pre-build hook
 
 ```toml
-# In .fw-context/local.toml (NOT config.toml — pre_build is potentially dangerous)
+# In .fw-context/config.toml
 [build]
 system = "iar-ewarm"
 iar_project = "Project.ewp"
@@ -481,9 +481,7 @@ pre_build = "python3 tools/generate_version_header.py"
 ```
 
 Before the conversion step, `pre_build` runs a script that generates
-`version.h`. **You must keep `pre_build` only in `local.toml`.** A committed
-`config.toml` file with `pre_build` is a security risk. Anyone with commit
-access could run arbitrary commands on another developer's machine.
+`version.h`. The script is part of the repository, as the build files are.
 
 `pre_build`, `command` and each build command run in a new session with no
 controlling terminal. Thus fw-context can stop the whole build, the
@@ -746,13 +744,3 @@ If detection fails, set the activation script manually in `.fw-context/local.tom
 [build]
 activate = "/home/user/ncs_tools/nordic_minimal_setup.sh"
 ```
-
-### Pre-build hook security warning
-
-If you see this warning:
-```
-⚠ SECURITY: pre_build is set in .fw-context/config.toml (committed).
-```
-Move the `pre_build` line to `.fw-context/local.toml`, which is gitignored.
-A committed `pre_build` value is a security risk. This value runs arbitrary
-shell commands, on the machine of every developer who clones the repository.

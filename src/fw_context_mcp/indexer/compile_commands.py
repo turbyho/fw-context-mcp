@@ -14,23 +14,18 @@ from __future__ import annotations
 import json
 import re
 import shlex
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from fw_context_mcp.config.settings import DEFAULT_QUERY_DRIVER
 from fw_context_mcp.indexer._driver_query import (
     DriverInfo,
-    driver_allowed,
-    inside_project,
     is_gcc_driver_name,
     known_compilers,
     libclang_args,
     predefine_flags,
     query_gcc_driver,
     resolve_compiler,
-    warn_inside_project,
-    warn_not_allowed,
 )
 from fw_context_mcp.utils import CPP_SOURCE_EXTENSIONS, TU_EXTENSIONS
 
@@ -459,8 +454,7 @@ def _gcc_system_includes(compiler: Path, triple: str) -> list[str]:
     layout of the toolchain, and the guess is not the search order of GCC
     (libstdc++ comes after the C library here, and before it in GCC).
     ``_driver_query`` asks the driver instead.  This guess stays for a
-    compiler that the query may not run (outside ``[index] query_driver``)
-    or that does not answer, because it reads directories and runs nothing.
+    driver that does not answer.
 
     WHY at all: when ``--target=arm-none-eabi`` is injected, libclang
     switches to that target's header search path, but the GCC toolchain's
@@ -515,7 +509,6 @@ def _clang_args_for_unit(
     file: Path,
     compiler: Path | None,
     known: dict[str, Path],
-    query_driver: Sequence[str],
     project_root: Path | None,
 ) -> list[str]:
     """Build the libclang flags of one unit, from the GCC driver when it answers.
@@ -525,11 +518,11 @@ def _clang_args_for_unit(
     earlier code guessed both from the layout of the toolchain, and a
     target that libclang has no backend for got the headers of the host.
 
-    When the query may not run the compiler, or the driver does not answer,
-    the flags are the earlier ones: the flags of ``compile_commands.json``,
-    a target from the compiler name, and the guessed toolchain directories.
+    When the driver does not answer, the flags are the earlier ones: the
+    flags of ``compile_commands.json``, a target from the compiler name, and
+    the guessed toolchain directories.
     """
-    driver = _driver_for_unit(raw_args, cwd, file, compiler, known, query_driver, project_root)
+    driver = _driver_for_unit(raw_args, cwd, file, compiler, known, project_root)
     if driver is not None:
         return libclang_args(driver, normalize_args(raw_args, cwd, str(file), None))
     clang_args = normalize_args(raw_args, cwd, str(file), compiler)
@@ -547,19 +540,12 @@ def _driver_for_unit(
     file: Path,
     compiler: Path | None,
     known: dict[str, Path],
-    query_driver: Sequence[str],
     project_root: Path | None,
 ) -> DriverInfo | None:
     if compiler is None or not is_gcc_driver_name(compiler):
         return None
     resolved = resolve_compiler(str(compiler), cwd, known)
     if resolved is None:
-        return None
-    if project_root is not None and inside_project(resolved, project_root):
-        warn_inside_project(resolved)
-        return None
-    if not driver_allowed(resolved, query_driver, project_root):
-        warn_not_allowed(resolved)
         return None
     expanded: list[str] = []
     for token in raw_args:
@@ -570,7 +556,7 @@ def _driver_for_unit(
 
 def parse(
     path: Path,
-    query_driver: Sequence[str] = DEFAULT_QUERY_DRIVER,
+    *,
     project_root: Path | None = None,
 ) -> Iterator[CompilationUnit]:
     """Yield one CompilationUnit per entry in compile_commands.json.
@@ -580,10 +566,11 @@ def parse(
     loading the entire structure into memory at once — only the current
     TU is materialized.
 
-    *query_driver* holds the path globs of the compilers that the query may
-    run (``[index] query_driver``).  A caller with a project configuration
-    must pass it; the default is the default of that setting.  A compiler
-    inside *project_root* never runs, see ``driver_allowed``.
+    Each GCC driver of the build is asked for its system directories and
+    macros (``_driver_query``).  *project_root* only limits which path flags
+    go to that query, see ``predefine_flags``.  WHY keyword-only: an earlier
+    release took a list of globs at this position, and a caller that still
+    gives one must fail at once, not use the list as the root.
     """
     entries = json.loads(path.read_text(encoding="utf-8-sig"))
     # One build can name a compiler with its directory in some entries and
@@ -606,7 +593,7 @@ def parse(
             compiler = Path(raw_args[0])
             raw_args = raw_args[1:]
 
-        clang_args = _clang_args_for_unit(raw_args, cwd, file, compiler, known, query_driver, project_root)
+        clang_args = _clang_args_for_unit(raw_args, cwd, file, compiler, known, project_root)
         lang = _detect_language(file, clang_args)
 
         yield CompilationUnit(

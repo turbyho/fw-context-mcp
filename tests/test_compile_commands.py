@@ -214,7 +214,7 @@ class TestNormalizeArgs:
 
 
 class TestGccSystemIncludes:
-    """The fallback for a compiler that the driver query may not run."""
+    """The fallback for a GCC driver that does not answer the query."""
 
     def test_no_lib_gcc_returns_empty(self, tmpdir):
         """If lib/gcc does not exist, return empty without crash."""
@@ -232,8 +232,8 @@ class TestGccSystemIncludes:
         assert all(r.startswith("-isystem") for r in result[::2])
         assert any("include-fixed" in r for r in result)
 
-    def test_a_compiler_outside_the_allowlist_keeps_the_guessed_directories(self, fake_arm_gcc_toolchain, tmpdir):
-        """No regression for a toolchain that the query may not run."""
+    def test_a_driver_that_does_not_answer_keeps_the_guessed_directories(self, fake_arm_gcc_toolchain, tmpdir):
+        """The fake compiler is an empty file that cannot run, thus the query gets no answer."""
         toolchain, compiler = fake_arm_gcc_toolchain
         (tmpdir / "main.c").write_text("int x;\n")
         cc = tmpdir / "cc.json"
@@ -241,7 +241,7 @@ class TestGccSystemIncludes:
             "directory": str(tmpdir), "file": "main.c",
             "arguments": [str(compiler), "-mcpu=cortex-m4", "-c", "main.c"],
         }]))
-        unit = next(parse(Path(cc), []))
+        unit = next(parse(Path(cc)))
         assert "--target=arm-none-eabi" in unit.clang_args
         assert any("include-fixed" in a for a in unit.clang_args)
         assert "-nostdinc" not in unit.clang_args

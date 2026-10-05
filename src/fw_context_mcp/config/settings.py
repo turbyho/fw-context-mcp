@@ -25,11 +25,11 @@ reflection — this avoids fragile naming conventions, gives explicit
 control over type coercion per field, and makes the TOML schema
 self-documenting through the mapping tables themselves.
 
-**Safety — committed config validation:**  ``config.toml`` is shared
-via git, so anyone with commit access could set ``pre_build`` or
-``command`` to arbitrary shell commands.  The config loader warns
-loudly when dangerous settings appear in committed config.  These
-settings must live in ``local.toml`` (gitignored, per-developer).
+**Safety — committed config validation:**  ``config.toml`` comes from
+git.  The config loader warns when the committed ``[llm] ollama_url``
+points to a host that is not local, because the LLM prompts send source
+code to that host.  It does not warn on ``pre_build`` or ``command``: the
+build of the project runs the code of the repository in all cases.
 """
 
 from __future__ import annotations
@@ -452,55 +452,6 @@ def _apply_embed_prompt_defaults(llm_cfg: LLMConfig) -> None:
             llm_cfg.embed_doc_prompt = ""
 
 
-def _default_query_driver(platform: str) -> tuple[str, ...]:
-    """Give the default of ``[index] query_driver`` for *platform* (``sys.platform``).
-
-    The globs cover the toolchain managers that install a compiler outside
-    the project (PlatformIO, Arduino, ESP-IDF, nRF Connect, the Zephyr SDK)
-    and the system directories of each host.  WHY per host: the same tool
-    installs in another place on each system — the Arduino packages are in
-    ``~/.arduino15`` on Linux, ``~/Library/Arduino15`` on macOS and
-    ``~/AppData/Local/Arduino15`` on Windows.
-    """
-    common = (
-        "~/.platformio/packages/**",
-        "~/.espressif/**",
-        "~/zephyr-sdk*/**",
-    )
-    if platform == "darwin":
-        return common + (
-            "~/Library/Arduino15/packages/**",
-            "~/ncs/toolchains/**",
-            "/opt/**",                          # Homebrew (Apple silicon), MacPorts, nRF Connect
-            "/usr/local/bin/*",                 # Homebrew (Intel)
-            "/usr/local/Cellar/**",
-            "/Applications/ArmGNUToolchain/**",  # the Arm GNU Toolchain package
-            "/Applications/STM32CubeIDE.app/**",
-            "/usr/bin/*",
-        )
-    if platform == "win32":
-        return common + (
-            "~/AppData/Local/Arduino15/packages/**",
-            "C:/ncs/toolchains/**",
-            "C:/Espressif/**",                   # the ESP-IDF installer for Windows
-            "C:/ST/**",                          # STM32CubeIDE
-            "C:/Program Files*/Arm GNU Toolchain*/**",
-            "C:/Program Files*/GNU Arm Embedded Toolchain/**",
-            "C:/msys64/*/bin/*",
-        )
-    return common + (
-        "~/.arduino15/packages/**",
-        "~/ncs/toolchains/**",
-        "/opt/**",
-        "/usr/bin/*",
-        "/usr/local/bin/*",
-    )
-
-
-#: The default of ``[index] query_driver`` on this host.
-DEFAULT_QUERY_DRIVER: tuple[str, ...] = _default_query_driver(sys.platform)
-
-
 @dataclass
 class IndexConfig:
     """Index storage and scoping configuration.
@@ -534,17 +485,6 @@ class IndexConfig:
         max_symbol_body_lines: Maximum number of source lines stored per
             function/method body in the index.  Bodies longer than this are
             truncated.  Default 1000.
-        query_driver: Path globs of the GCC compilers that fw-context may run
-            to ask for their system headers and predefined macros, as clangd
-            ``--query-driver`` does.  ``*`` matches one path component, ``**``
-            any number, ``~`` is the home directory.  A compiler outside the
-            list is not run, and its units keep the flags of
-            ``compile_commands.json``.  WHY a list: the query runs the binary
-            that ``compile_commands.json`` names, and a repository can commit
-            that file.  A value replaces the default ``DEFAULT_QUERY_DRIVER``.
-            Set it in ``.fw-context/local.toml`` of the project (or in the
-            global config); the committed ``config.toml`` cannot set it (see
-            ``_drop_committed_trust_keys``).
     """
 
     db_dir: Path = field(default_factory=lambda: Path.home() / ".fw-context" / "index")
@@ -559,22 +499,6 @@ class IndexConfig:
     rerank_top_k: int = 50
     min_dense_count: int = 3
     max_symbol_body_lines: int = 1000
-    query_driver: list[str] = field(default_factory=lambda: list(DEFAULT_QUERY_DRIVER))
-    query_driver_extra: list[str] = field(default_factory=list)
-    """Globs ADDED to ``query_driver`` (it does not replace the default).
-    ``fw-context init``, ``doctor`` and each index run write the compilers
-    of the project to ``.fw-context/toolchains.toml`` under this key; after
-    the load, ``query_driver`` holds both lists.  The lists of the global
-    config, of ``local.toml`` and of ``toolchains.toml`` are all added: a
-    developer who adds a glob to ``local.toml`` keeps the global ones.  WHY
-    a key of its own: a written copy of the default list would freeze it,
-    and a later release with more default entries would not reach the
-    project."""
-    query_driver_auto: bool = True
-    """Let fw-context add the compilers of the build to ``toolchains.toml``,
-    and use that file.  ``false`` stops both: the allowlist is then only
-    what the developer wrote, for example ``query_driver = []`` to run no
-    compiler at all."""
     purge_max_missing_percent: int = 20
     """Abort the automatic ghost-file purge when more than this percent of
     indexed files are missing from disk — guards against an offline network
@@ -919,9 +843,6 @@ _INDEX_FIELDS: list[tuple[str, str, str]] = [
     ("rerank_top_k", "rerank_top_k", "int(50)"),
     ("min_dense_count", "min_dense_count", "int(3)"),
     ("max_symbol_body_lines", "max_symbol_body_lines", "int(1000)"),
-    ("query_driver", "query_driver", "list"),
-    ("query_driver_extra", "query_driver_extra", "list"),
-    ("query_driver_auto", "query_driver_auto", "bool"),
     ("purge_max_missing_percent", "purge_max_missing_percent", "int(20)"),
 ]
 
@@ -1135,31 +1056,22 @@ def _ensure_project_local_config(project_root: Path) -> Path:
 
 
 def _validate_config_safety(proj_data: dict, proj_path: Path) -> None:
-    """Warn if committed config contains security-sensitive settings.
+    """Warn if the committed config sends source code to another host.
 
-    Committed config (.fw-context/config.toml) is shared via git.  Dangerous
-    settings should only be in local.toml (gitignored).
+    The committed config (``.fw-context/config.toml``) comes from git.  A
+    non-local ``ollama_url`` there sends source code from the machine of
+    each developer to a host that the repository selects.
 
-    **Why separate validation?**  The deep merge in ``load()`` would silently
-    execute a malicious ``pre_build`` from a committed config.  Separate
-    validation (checking the committed layer BEFORE merge with local)
-    catches this.  A local.toml override for ``pre_build`` is fine — it's
-    per-developer and not shared.
+    **Why the committed layer alone?**  The check reads the committed layer
+    BEFORE the merge with ``local.toml``, because a ``local.toml`` value is
+    the choice of the developer.
+
+    WHY no check of ``[build] pre_build`` and ``command``: the build of the
+    project runs the code of the repository (Makefile, CMake, PlatformIO
+    scripts) in all cases, thus a warning on these two keys protects nothing.
 
     .. versionadded:: v0.18
     """
-    build = proj_data.get("build") or {}
-    for key in ("pre_build", "command"):
-        if build.get(key):
-            msg = (
-                f"SECURITY: {key} is set in .fw-context/config.toml "
-                f"(committed).  This allows anyone with commit access to run "
-                f"arbitrary shell commands on other developers' machines.  "
-                f"Move {key} to .fw-context/local.toml (gitignored) instead."
-            )
-            log.warning(msg)
-            print(f"⚠ {msg}", file=sys.stderr)
-
     ollama_url = (proj_data.get("llm") or {}).get("ollama_url")
     if ollama_url and not _is_loopback_url(ollama_url):
         msg = (
@@ -1193,97 +1105,72 @@ def _drop_malformed_sections(layer: dict, path: Path) -> None:
             del layer[name]
 
 
-#: The file in which fw-context keeps the toolchains of a project (written by
-#: ``indexer/_allowlist.py``).  A file of its own and not ``local.toml``:
-#: the automatic write must not touch the comments and keys of the
-#: developer, and a syntax error there must not cost them.
-TOOLCHAINS_FILE_NAME = "toolchains.toml"
+#: ``[index]`` keys that fw-context does not use any more.  They were an
+#: allowlist of the compilers that the index run could ask for their system
+#: headers and macros.  fw-context now asks the compiler of the build in all
+#: cases, because the build runs that compiler too.
+_RETIRED_INDEX_KEYS: tuple[str, ...] = ("query_driver", "query_driver_extra", "query_driver_auto")
+
+#: The file in which fw-context kept the allowlist of a project.  fw-context
+#: does not read or write it any more.
+_RETIRED_TOOLCHAINS_FILE = "toolchains.toml"
+
+#: The files that got the warning about a retired key or file in this
+#: process.  WHY: ``load()`` runs many times in one MCP session, and one
+#: warning for each file is sufficient.
+_retired_warned: set[Path] = set()
 
 
-def _index_value(layer: dict, key: str) -> object:
-    """Give ``[index] <key>`` of one config layer, or None."""
-    index = layer.get("index")
-    return index.get(key) if isinstance(index, dict) else None
+def _warn_retired_once(path: Path, what: str) -> None:
+    """Warn one time for each *path* in this process that fw-context ignores *what*."""
+    if path in _retired_warned:
+        return
+    _retired_warned.add(path)
+    msg = (
+        f"{path}: {what} has no effect. fw-context asks the compiler of the build "
+        f"for its system headers and macros in all cases, as the build runs it too. "
+        f"You can remove it."
+    )
+    log.warning(msg)
+    print(f"⚠ {msg}", file=sys.stderr)
 
 
-def _string_list(value: object) -> list[str]:
-    """Give the strings of a list value (a string alone counts as one); ignore any other type."""
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, list):
-        return [item for item in value if isinstance(item, str)]
-    return []
+def _drop_retired_keys(layer: dict, path: Path) -> None:
+    """Remove the retired ``[index]`` keys from one config layer, and warn.
 
-
-def toolchains_path(project_root: Path) -> Path:
-    """Give the path of the toolchain allowlist file of *project_root*."""
-    return project_root / _PROJECT_CONFIG_DIR / TOOLCHAINS_FILE_NAME
-
-
-def read_toolchain_globs(project_root: Path) -> list[str]:
-    """Give the ``[index] query_driver_extra`` globs of ``toolchains.toml``, or [].
-
-    A link is refused: a repository could commit ``.fw-context/toolchains.toml``
-    as a link to a file of its choice, and the allowlist must come from this
-    machine.  A file that does not parse gives [] and a warning.
-    """
-    path = toolchains_path(project_root)
-    try:
-        if path.is_symlink() or path.parent.is_symlink():
-            log.warning("%s is a link; fw-context ignores it", path)
-            return []
-        if not path.is_file():
-            return []
-        data = tomllib.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as error:
-        log.warning("Cannot read %s: %s", path, error)
-        return []
-    return _string_list(_index_value(data, "query_driver_extra"))
-
-
-def _drop_committed_trust_keys(proj_data: dict, proj_path: Path) -> None:
-    """Remove ``[index] query_driver``, ``query_driver_extra`` and ``query_driver_auto`` from the committed config.
-
-    WHY remove and not warn, as ``_validate_config_safety`` does: the keys are
-    the allowlist of the binaries that the indexer runs without a build.  A
-    repository that could set it could also allow the compiler script it
-    commits, thus the allowlist would protect nothing.
-
-    ``query_driver_auto`` too: a committed ``true`` would cancel a
-    ``false`` of the global config.
-
-    The keys are read from the global config, from ``local.toml``, the
-    per-developer file of the project, and (``query_driver_extra`` only)
-    from ``toolchains.toml``, which fw-context writes.  The operator decided that
-    ``local.toml`` counts as the developer's own file.  Note: only a
-    convention keeps those files out of git, thus a repository that commits a
-    ``local.toml`` or a ``toolchains.toml`` can still set the keys.  A ``[[build.variants]]`` table is
-    cleaned too, because a variant carries ``[index]`` keys as overrides.
+    WHY remove before the merge, and not only leave the keys unread: a
+    ``[[build.variants]]`` table copies each key that is not an ``[index]``
+    field into its ``[build]`` overrides, and ``build_variant_config`` then
+    reports a retired key as an unknown ``[build]`` key.  That message is
+    wrong.  The file of the user is not changed.
     """
     tables: list[dict] = []
-    index = proj_data.get("index")
+    index = layer.get("index")
     if isinstance(index, dict):
         tables.append(index)
     # A malformed file (``build = "x"``) must not crash load(): the other
     # layers of the config still apply, as for any other typo.
-    build = proj_data.get("build")
+    build = layer.get("build")
     variants = build.get("variants") if isinstance(build, dict) else None
     if isinstance(variants, list):
         tables.extend(v for v in variants if isinstance(v, dict))
-    found = False
+    found = sorted({key for table in tables for key in _RETIRED_INDEX_KEYS if key in table})
     for table in tables:
-        for key in ("query_driver", "query_driver_extra", "query_driver_auto"):
-            if key in table:
-                del table[key]
-                found = True
+        for key in _RETIRED_INDEX_KEYS:
+            table.pop(key, None)
     if found:
-        msg = (
-            f"SECURITY: query_driver(_extra, _auto) in {proj_path} (committed) is ignored. It selects the "
-            f"compilers that fw-context runs, thus only .fw-context/local.toml or "
-            f"~/.fw-context/config.toml can set it."
-        )
-        log.warning(msg)
-        print(f"⚠ {msg}", file=sys.stderr)
+        _warn_retired_once(path, "[index] " + ", ".join(found))
+
+
+def _warn_retired_toolchains_file(project_root: Path) -> None:
+    """Warn when the project still has the retired ``toolchains.toml``.
+
+    WHY not delete it: the file belongs to the project directory of the
+    user, and fw-context does not remove a file that it does not use.
+    """
+    path = project_root / _PROJECT_CONFIG_DIR / _RETIRED_TOOLCHAINS_FILE
+    if path.is_file():
+        _warn_retired_once(path, "this file")
 
 
 def _is_loopback_url(url: str) -> bool:
@@ -1310,15 +1197,7 @@ def _is_loopback_url(url: str) -> bool:
 # Why mtime instead of inotify?  Simplicity — the MCP server is short-lived
 # (one session), config files change rarely, and mtime comparison costs ~0.
 # An inotify watcher would need threads and cleanup logic for no real benefit.
-#
-# The toolchains.toml file of a project is not in the key, because it is not
-# a layer of the merge.  Its stamp (``_file_stamp``) is kept beside the mtime
-# signature instead and compared for equality, thus a file that appears,
-# changes or goes away all reload.  The stamp does not follow a link, because
-# read_toolchain_globs refuses a link and reads nothing through it.
-_config_cache: OrderedDict[
-    tuple, tuple[tuple[float | None, ...], tuple[int, int] | None, Config]
-] = OrderedDict()
+_config_cache: OrderedDict[tuple, tuple[tuple[float | None, ...], Config]] = OrderedDict()
 _CONFIG_CACHE_MAX = 50
 
 
@@ -1346,17 +1225,6 @@ def _mtime_signature(paths: tuple[Path | None, ...]) -> tuple[float | None, ...]
     return tuple(signature)
 
 
-def _file_stamp(path: Path | None) -> tuple[int, int] | None:
-    """Give ``(mtime_ns, size)`` of *path* without following a link, or None when it is missing."""
-    if path is None:
-        return None
-    try:
-        info = path.lstat()
-    except OSError:
-        return None
-    return (info.st_mtime_ns, info.st_size)
-
-
 def load(project_root: Path | None = None) -> Config:
     """Load merged config for the given project root.
 
@@ -1369,9 +1237,7 @@ def load(project_root: Path | None = None) -> Config:
     a broken config file must not prevent the MCP tools from loading.
 
     Results are cached per (global_path, proj_path, local_path) tuple and
-    invalidated when any source file's mtime changes, or when the stamp of
-    ``.fw-context/toolchains.toml`` changes (the file appears, changes or
-    goes away).
+    invalidated when any source file's mtime changes.
 
     **Why deep merge?**  Shallow merge loses nested keys —
     ``config.toml`` sets ``[llm] embed_model = "foo"``, ``local.toml`` sets
@@ -1385,9 +1251,6 @@ def load(project_root: Path | None = None) -> Config:
     Log loudly, continue with defaults.
     """
     data: dict = {}
-    # The query_driver_extra list of each trusted layer.  WHY not the merged
-    # value: the deep merge replaces a list, and the key must add.
-    extra_layers: list[object] = []
 
     global_path = _ensure_global_config()
     proj_path = local_path = None
@@ -1400,11 +1263,10 @@ def load(project_root: Path | None = None) -> Config:
     # dataclass construction are cheap (sub-ms), but resolve_embed_model
     # runs subprocess checks (ollama list, nvidia-smi) that cost ~200 ms.
     cache_key = (global_path, proj_path, local_path)
-    toolchains_stamp = _file_stamp(toolchains_path(project_root) if project_root is not None else None)
     if cache_key in _config_cache:
-        cached_sig, cached_stamp, cached_cfg = _config_cache[cache_key]
+        cached_sig, cached_cfg = _config_cache[cache_key]
         # Check if any source file changed, appeared, or went away.
-        if _mtime_signature(cache_key) == cached_sig and cached_stamp == toolchains_stamp:
+        if _mtime_signature(cache_key) == cached_sig:
             return cached_cfg
 
     # Phase 1: load global config (always present — _ensure_global_config
@@ -1412,7 +1274,7 @@ def load(project_root: Path | None = None) -> Config:
     try:
         data = tomllib.loads(global_path.read_text(encoding="utf-8"))
         _drop_malformed_sections(data, global_path)
-        extra_layers.append(_index_value(data, "query_driver_extra"))
+        _drop_retired_keys(data, global_path)
     except (OSError, ValueError):
         log.exception("Failed to parse %s — using defaults", global_path)
 
@@ -1425,11 +1287,10 @@ def load(project_root: Path | None = None) -> Config:
         try:
             proj_data = _read_toml_if_present(proj_path)
             _drop_malformed_sections(proj_data, proj_path)
-            _drop_committed_trust_keys(proj_data, proj_path)
+            _drop_retired_keys(proj_data, proj_path)
             data = _deep_merge(data, proj_data)
-            # Security: validate committed config doesn't contain dangerous settings.
-            # pre_build, command, and non-loopback ollama_url in committed config.toml
-            # are potential RCE / data exfiltration vectors.
+            # A non-loopback ollama_url in the committed config.toml sends
+            # source code to a host that the repository selects.
             _validate_config_safety(proj_data, proj_path)
         except (OSError, ValueError):
             log.exception("Failed to parse %s — ignoring project config", proj_path)
@@ -1441,7 +1302,7 @@ def load(project_root: Path | None = None) -> Config:
         try:
             local_data = _read_toml_if_present(local_path)
             _drop_malformed_sections(local_data, local_path)
-            extra_layers.append(_index_value(local_data, "query_driver_extra"))
+            _drop_retired_keys(local_data, local_path)
             data = _deep_merge(data, local_data)
         except (OSError, ValueError):
             log.exception("Failed to parse %s — ignoring local config", local_path)
@@ -1472,19 +1333,9 @@ def load(project_root: Path | None = None) -> Config:
                 file=sys.stderr,
             )
 
+        _warn_retired_toolchains_file(project_root)
+
     cfg = _from_dict(data)
-    # The effective allowlist: query_driver (the default or a replacement)
-    # plus the globs that are added to it.  The toolchains.toml globs come
-    # last, from a file that only fw-context writes (indexer/_allowlist.py).
-    cfg.index.query_driver_extra = list(dict.fromkeys(
-        item for layer in extra_layers for item in _string_list(layer)
-    ))
-    toolchain_globs: list[str] = []
-    if project_root is not None and cfg.index.query_driver_auto:
-        toolchain_globs = read_toolchain_globs(project_root)
-    cfg.index.query_driver = list(dict.fromkeys(
-        [*cfg.index.query_driver, *cfg.index.query_driver_extra, *toolchain_globs],
-    ))
     from ..llm.auto_model import resolve_embed_model
     resolve_embed_model(cfg.llm)
     cfg.index.db_dir = cfg.index.db_dir.expanduser().resolve()
@@ -1503,7 +1354,7 @@ def load(project_root: Path | None = None) -> Config:
     # Cache with current mtime
     if len(_config_cache) >= _CONFIG_CACHE_MAX:
         _config_cache.popitem(last=False)
-    _config_cache[cache_key] = (_mtime_signature(cache_key), toolchains_stamp, cfg)
+    _config_cache[cache_key] = (_mtime_signature(cache_key), cfg)
 
     return cfg
 

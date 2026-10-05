@@ -23,12 +23,13 @@ does:
   include directories in search order.
 - ``<gcc> -x <lang> -dM -E -`` prints the predefined macros.
 
-WHY an allowlist: the query RUNS the binary that ``compile_commands.json``
-names, also when no build runs — ``fw-context index`` without ``--build``,
-and ``reindex_file`` from an MCP client.  A repository can commit that file
-and name a script of its own.  The query therefore runs only a compiler
-whose path matches ``[index] query_driver``, as clangd does.  Any other
-compiler keeps the flags of the build and the guessed directories.
+WHY no allowlist: the query runs the compiler that ``compile_commands.json``
+names.  The build of the project runs that compiler too, together with the
+code of the repository (Makefile, CMake, build scripts), and fw-context
+starts that build itself (``init``, the automatic build of an index run).
+An allowlist for the compiler alone thus protects nothing.  An earlier
+release had one (``[index] query_driver``), and a compiler outside it got
+guessed directories and a much worse parse.
 
 WHY a proxy target: libclang has no backend for some GCC targets (xtensa),
 and ``--target`` for such a triple stops the parse with
@@ -58,7 +59,7 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 #: macOS (APFS, HFS+) and Windows (NTFS) ignore the case of a path by
-#: default, thus the allowlist and the project check must ignore it too.
+#: default, thus the project check must ignore it too.
 _CASE_INSENSITIVE_FS = sys.platform in ("darwin", "win32")
 
 #: Time limit for one driver call.  A driver that runs the preprocessor on
@@ -67,8 +68,8 @@ _QUERY_TIMEOUT_S = 30.0
 
 #: A GCC driver name ends in one of these, after an optional version suffix
 #: (``arm-none-eabi-gcc``, ``xtensa-esp32-elf-g++``, ``gcc-12``, ``cc``).
-#: This is no security boundary — the allowlist is — but it keeps the query
-#: away from a binary that is not a compiler driver.
+#: It keeps the query away from a binary that is not a GCC driver: a clang
+#: or a vendor compiler does not answer the query in the GCC format.
 _GCC_DRIVER_NAME = re.compile(r"(?:^|-)(?:gcc|g\+\+|cc|c\+\+)(?:-\d+(?:\.\d+)*)?(?:\.exe)?$")
 
 #: Flags that can change the predefined macros or the system directories of
@@ -158,57 +159,11 @@ def is_gcc_driver_name(compiler: Path) -> bool:
     return bool(_GCC_DRIVER_NAME.search(compiler.name))
 
 
-def _glob_regex(pattern: str) -> re.Pattern[str]:
-    """Compile a path glob: ``**`` crosses directories, ``*`` and ``?`` do not.
-
-    WHY not ``fnmatch``: its ``*`` matches ``/`` too, thus ``/usr/bin/*``
-    would match ``/usr/bin/sub/dir/tool``.  On Windows ``normpath`` gives
-    ``\\``, thus the separator class holds both.
-    """
-    not_separator = "[^/\\\\]" if os.sep == "\\" else "[^/]"
-    expanded = os.path.normpath(os.path.expanduser(pattern))
-    flags = re.IGNORECASE if _CASE_INSENSITIVE_FS else 0
-    parts: list[str] = []
-    i = 0
-    while i < len(expanded):
-        if expanded.startswith("**", i):
-            parts.append(".*")
-            i += 2
-        elif expanded[i] == "*":
-            parts.append(not_separator + "*")
-            i += 1
-        elif expanded[i] == "?":
-            parts.append(not_separator)
-            i += 1
-        else:
-            parts.append(re.escape(expanded[i]))
-            i += 1
-    return re.compile("".join(parts) + r"\Z", flags)
-
-
-def driver_allowed(compiler: Path, patterns: Sequence[str], project_root: Path | None = None) -> bool:
-    """Say if the query may run *compiler*: its absolute path matches one of *patterns*.
-
-    The path is normalized first, thus ``/usr/bin/../../home/x/tool`` does
-    not pass as ``/usr/bin/*``.
-
-    A compiler inside *project_root* never runs, whatever the patterns
-    say: a broad pattern such as ``/opt/**`` also covers a project that is
-    stored under ``/opt``, and the files of a project come from its
-    repository.  The real path counts here, thus a link from an allowed
-    directory into the project does not pass either.
-    """
-    if project_root is not None and inside_project(compiler, project_root):
-        return False
-    path = os.path.normpath(str(compiler))
-    return any(_glob_regex(pattern).match(path) for pattern in patterns)
-
-
 def inside_project(path: Path | str, project_root: Path) -> bool:
     """Say if *path* is inside *project_root*, by its normalized path or by its real path.
 
-    The real path counts too, thus a link from an allowed directory into
-    the project is inside it.  On macOS and Windows the file system ignores
+    The real path counts too, thus a link from a directory outside the
+    project into the project is inside it.  On macOS and Windows the file system ignores
     case, thus ``/Users/x/Proj`` and ``/users/x/proj`` are one directory.
     """
     root = _fs_key(os.path.realpath(project_root)).rstrip(os.sep)
@@ -291,8 +246,7 @@ def predefine_flags(args: Sequence[str], cwd: Path, project_root: Path | None = 
 
     Left out on purpose:
 
-    - ``-B``: it makes the driver run ``<dir>/cc1``, a second binary that
-      the allowlist did not check.
+    - ``-B``: it makes the driver run ``<dir>/cc1``, a second binary.
     - ``-specs``, also a bare name: a specs file can add any option to
       ``cc1``, ``-fplugin`` included, and the driver looks up a bare name
       under ``--sysroot`` too.  Measured: ``--sysroot=<repo dir>
@@ -395,8 +349,8 @@ def query_gcc_driver(compiler: Path, language: str, flags: tuple[str, ...]) -> D
     """Ask the GCC driver *compiler* for its triple, system directories and macros.
 
     *language* is ``"c"`` or ``"cpp"``, because the two have different
-    directories (libstdc++) and different macros.  The caller must check
-    ``driver_allowed`` first: this function runs *compiler*.
+    directories (libstdc++) and different macros.  This function runs
+    *compiler*, as the build of the project does.
 
     The answer is kept per (path, mtime, size, language, flags).  A toolchain
     update changes the binary, thus a long MCP server process asks again.
@@ -455,8 +409,8 @@ def _run_driver(argv: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
 
     An argv list and no shell.  The input is an empty stdin (``-``), which
     works on every host — Windows has no /dev/null.  The working directory
-    is the one of the compiler, which the allowlist approved, and not the
-    build directory, which the repository controls.
+    is the one of the compiler: the query reads no relative path, because
+    ``predefine_flags`` makes each path flag absolute.
     """
     return subprocess.run(
         argv, capture_output=True, text=True, timeout=_QUERY_TIMEOUT_S, check=False,
@@ -625,33 +579,6 @@ def libclang_args(info: DriverInfo, args: Sequence[str]) -> list[str]:
     for directory in replaced:
         result += ["-idirafter", directory]
     return result
-
-
-@cache
-def warn_not_allowed(compiler: Path) -> None:
-    """Say once that a compiler is outside ``[index] query_driver``."""
-    log.warning(
-        "The compiler %s is not in [index] query_driver, thus fw-context does not run it "
-        "to ask for its system headers; the parse uses the flags of compile_commands.json "
-        "and the guessed toolchain directories. fw-context adds the compilers of a build to "
-        ".fw-context/toolchains.toml at init, doctor and each index run, unless it refused "
-        "this one (a warning gives the reason) or [index] query_driver_auto is false. If you "
-        "trust it, add a glob for it to "
-        "[index] query_driver_extra in .fw-context/local.toml.",
-        compiler,
-    )
-
-
-@cache
-def warn_inside_project(compiler: Path) -> None:
-    """Say once that a compiler inside the project is never run."""
-    log.warning(
-        "The compiler %s is inside the project, thus fw-context never runs it to ask for its "
-        "system headers, whatever [index] query_driver says: the files of a project come from "
-        "its repository. The parse uses the flags of compile_commands.json and the guessed "
-        "toolchain directories.",
-        compiler,
-    )
 
 
 @cache
