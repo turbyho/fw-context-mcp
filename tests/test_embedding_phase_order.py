@@ -115,16 +115,18 @@ def _seed_vec0(conn: sqlite3.Connection) -> dict[str, int]:
 def test_source_boost_path_sorts_by_boosted_similarity(populated_db, db_path):
     """semantic_search path: project x1.2, vendor x0.85, then descending.
 
-    "far" is vendor code here.  0.6 x 0.85 stays below the others, and
-    "middle" (0.8 x 1.2) stays below "near" (0.995 x 1.2).
+    "near" is vendor code here: 0.995 x 0.85 = 0.846 goes below "middle"
+    (0.8 x 1.2 = 0.96), and stays above "far" (0.6 x 1.2 = 0.72).  The
+    boosted order thus differs from the vector order, and a phase that
+    ignores the boost fails.
     """
     ids = _seed_vec0(populated_db)
-    populated_db.execute("UPDATE symbols SET is_project = 0 WHERE id = ?", (ids["far"],))
+    populated_db.execute("UPDATE symbols SET is_project = 0 WHERE id = ?", (ids["near"],))
     populated_db.commit()
 
     ctx = _run_phase(db_path, source_boost=True)
 
-    assert [r["name"] for r in ctx.embedding_results] == EXPECTED
+    assert [r["name"] for r in ctx.embedding_results] == ["middle", "near", "far"]
 
 
 def test_a_declaration_is_left_out_and_the_order_stays(populated_db, db_path):
