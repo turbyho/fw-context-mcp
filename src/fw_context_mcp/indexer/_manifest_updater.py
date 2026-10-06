@@ -45,17 +45,13 @@ def _mtime_bump_is_safe(
     keep serving symbols parsed from the old text while reporting itself as
     up to date.
 
-    Only a build-generated header keeps the unconditional behaviour, because
-    :func:`header_is_trusted` is the one rule and this is one of its five
-    callers.  A vendor header and a header outside the project are verified
-    here now: without that, a header with changed content would still get a
-    new mtime, ``_count_modified_files`` would stop seeing the change, and
-    the end of trust in the other four callers would have no effect.
+    Every header is verified, the generated one too: without that, a header
+    with changed content would still get a new mtime,
+    ``_count_modified_files`` would stop seeing the change, and the staleness
+    checks of the manifest would have no effect.
     """
-    from .manifest import _hash_with_cache, header_is_trusted
+    from .manifest import _hash_with_cache
 
-    if header_is_trusted(header):
-        return True
     return _hash_with_cache(resolved, hash_cache) == header.get("hash", "")
 
 
@@ -98,15 +94,10 @@ def _headers_moved_on(entry: dict, before: dict, after: dict) -> bool:
     them, and nothing queues the second unit again — its rows stay at the old
     header text until --force.
 
-    Calls header_is_trusted() instead of a copy of the rules: what the
-    pipeline trusts is one decision, and this is one of its FIVE callers.
+    Every header counts, as in check_tu_staleness().
     """
-    from .manifest import header_is_trusted
-
     for path in entry.get("headers") or ():
         record = after.get(path, {})
-        if header_is_trusted(record):
-            continue
         if record.get("hash", "") != before.get(path, {}).get("hash", ""):
             return True
     return False
@@ -263,9 +254,9 @@ def _update_manifest_after_index(
         elif _patterns_changed(manifest, build_dir_patterns, vendor_patterns):
             # `generated` is a function of the path and the build-output
             # patterns.  When those change the stored flags describe a
-            # boundary this build no longer has, and header_is_trusted()
-            # reads them — so a narrowed pattern would have no effect until
-            # --force.  Measured: narrowing PlatformIO from '.pio/' to
+            # boundary this build no longer has, and the query layer and the
+            # coverage purge read them — so a narrowed pattern would have no
+            # effect until --force.  Measured: narrowing PlatformIO from '.pio/' to
             # '.pio/build/' leaves the config_hash identical, so nothing else
             # would ever rewrite this file.
             log.info(

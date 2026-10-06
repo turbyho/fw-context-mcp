@@ -2550,23 +2550,20 @@ class TestPlatformIOBuildDirPattern:
         assert any(_path_matches(".pio/libdeps/Foo/foo.cpp", p) for p in vendor)
         assert not any(_path_matches(".pio/build/env/gen.h", p) for p in vendor)
 
-    def test_a_libdeps_header_is_no_longer_trusted(self):
-        """The K4 hole this closes: a vendor header must not read as generated.
+    def test_a_libdeps_header_is_not_generated(self):
+        """A vendored library header is not build output.
 
-        A build-generated header is the only thing the staleness check still
-        trusts.  While libdeps counted as build output, every vendored
-        library header was trusted and an edit to one went unnoticed.
+        While libdeps counted as build output, every vendored library header
+        was classified as generated, and the staleness check of that time
+        trusted it: an edit to one went unnoticed.  The query layer and the
+        coverage purge still read the flag.
         """
         from fw_context_mcp.indexer.builders.platformio import PlatformIOBuildSystem
-        from fw_context_mcp.indexer.manifest import _is_generated_header, header_is_trusted
+        from fw_context_mcp.indexer.manifest import _is_generated_header
 
         patterns = PlatformIOBuildSystem().get_build_dir_patterns(Path("/proj"))
-        record = {
-            "hash": "x",
-            "generated": _is_generated_header(".pio/libdeps/Foo/foo.h", patterns),
-        }
 
-        assert header_is_trusted(record) is False
+        assert _is_generated_header(".pio/libdeps/Foo/foo.h", patterns) is False
 
 
 class TestOrphanFileCleanup:

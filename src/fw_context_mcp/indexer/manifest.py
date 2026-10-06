@@ -1115,40 +1115,6 @@ def _hash_with_cache(path: Path, hash_cache: dict[str, str] | None) -> str:
     return cached
 
 
-def header_is_trusted(record: dict) -> bool:
-    """May the pipeline keep the stored hash of this header without a re-read?
-
-    ONE definition, FIVE callers: collect_stale_headers(),
-    check_tu_staleness(), compute_current_entry_hash(),
-    _mtime_bump_is_safe() and _headers_moved_on().  What the pipeline trusts
-    is one decision, and five copies of it move apart.  A caller that
-    repeats the rule instead of a call to this function is a defect.
-
-    compute_current_entry_hash() was the copy that four rounds of review did
-    not see: it answers a different question ("what IS the hash now") and so
-    it reads as a hash function, not as a trust rule.  It carries the same
-    three conditions, and a copy that keeps the STORED hash for a header the
-    run just re-read writes a files.content_hash that describes no text at
-    all.  grep for the rule, not for the word "trust".
-
-    Only a build-generated header is trusted.  Its content changes with every
-    build without a change of meaning, and config_hash plus flags_hash carry
-    what does change.
-
-    A vendor header and a header outside the project are NOT trusted any
-    more.  External code reaches the index THROUGH the project's own units:
-    an inline function, a macro, a constexpr, a C++ template, or a struct
-    layout expands from the header INTO every unit that includes it.  A
-    changed external header therefore changes the indexed symbols of PROJECT
-    files — their signatures, their lines, and which code survives the
-    #ifdefs.  A full reparse is the correct answer, not a conservative one.
-
-    Cost measured: to hash every header in the manifest takes 45 ms, against
-    an index run of 42 minutes.
-    """
-    return bool(record.get("generated"))
-
-
 def merge_header_records(
     manifest: dict,
     header_records: dict[str, dict],
@@ -1158,8 +1124,8 @@ def merge_header_records(
     Merge, do not replace: the hash is newer and wins, but ``generated`` is a
     property of the PATH, not of this parse.  A caller with no
     build_dir_patterns computes False for every header, and ``generated`` is
-    the only trust rule the pipeline has left — to let False overwrite True
-    disables it in silence.
+    a property of the file that the query layer and the coverage purge
+    read — to let False overwrite True gives them a wrong answer in silence.
 
     ONE definition, and every writer of that map calls it.  A second copy of
     this merge is how the defect it fixes came back the first time.
@@ -1191,9 +1157,20 @@ def check_tu_staleness(
     when only a few source files changed.  This function enables incremental
     indexing — only TUs whose source or project headers changed are re-parsed.
 
-    Every header is re-hashed except a build-generated one — see
-    :func:`header_is_trusted` for the one rule and for why the vendor and
-    out-of-tree exceptions are gone.
+    Every header is re-hashed, and no header keeps its stored hash without a
+    re-read.  A vendor header and a header outside the project are re-hashed
+    because external code reaches the index THROUGH the project's own units:
+    an inline function, a macro, a constexpr, a C++ template, or a struct
+    layout expands from the header INTO every unit that includes it.  A
+    build-generated header is re-hashed because it carries the configuration
+    of the build: ``autoconf.h`` (Zephyr), ``sdkconfig.h`` (ESP-IDF) and
+    ``mbed_config.h`` (Mbed) change when ``prj.conf``, ``sdkconfig`` or
+    ``mbed_app.json`` changes, and the #ifdefs of the units follow them.
+    The rule that trusted it said that its content changes with each build;
+    measured on 2026-10-07, it does not: 0 of 212 (NCS), 2 (ESP-IDF), 1 (Mbed)
+    and 325 (a real sysbuild project) headers changed between two pristine
+    builds, and only the header of the configuration changed after a change
+    of it.  Cost: to hash every header of a manifest takes 45 ms.
 
     An entry marked ``needs_reparse`` is stale whatever its hashes say.  The
     manifest keeps ONE hash per header path and every entry shares it, so a
@@ -1225,9 +1202,6 @@ def check_tu_staleness(
 
     # ── Check header hashes ──
     for h in headers or ():
-        if header_is_trusted(h):
-            continue
-
         header_path = h["path"]
         p = Path(header_path)
         if not p.is_absolute():
@@ -1253,9 +1227,7 @@ def collect_stale_headers(
     would stay frozen at their first-index state.  Collecting the changed
     headers up front lets the runner mark the dependent TUs for re-parsing.
 
-    Trust rules match :func:`check_tu_staleness` exactly, because both call
-    :func:`header_is_trusted`.  A build-generated header keeps its stored
-    hash; every other header is re-read.
+    Every header is re-read, as :func:`check_tu_staleness` re-reads it.
 
     Reads the manifest's ``headers`` map, which already holds each path once,
     so a header shared by 300 TUs is checked once.  Pass *hash_cache* to share
@@ -1267,9 +1239,6 @@ def collect_stale_headers(
     stale: set[str] = set()
 
     for header_path, record in (manifest.get("headers") or {}).items():
-        if header_is_trusted(record):
-            continue
-
         p = Path(header_path)
         if not p.is_absolute():
             p = (project_root / header_path).resolve()
@@ -1335,8 +1304,8 @@ def mark_entries_behind(
 ) -> int:
     """Flag each entry that depends on a header another unit refreshed.
 
-    Trusts what :func:`header_is_trusted` trusts, and nothing else — the same
-    one decision that collect_stale_headers() and _headers_moved_on() read.
+    Every changed header counts, as in collect_stale_headers() and
+    _headers_moved_on().
 
     *changed_paths* is the difference of the shared header table, taken
     BEFORE the loop over the re-parsed units, not one time per unit.  A
@@ -1425,11 +1394,8 @@ def compute_current_entry_hash(
 
     When *entry* is stale (headers or source changed), this function reads
     the actual on-disk hashes rather than trusting the stored values.
-    Trusts what :func:`header_is_trusted` trusts and nothing else.  This
-    function reads as a hash function rather than as a trust rule, which is
-    why its copy of the rules survived four rounds of review: a copy that
-    keeps the STORED hash for a header the run just re-read writes a
-    files.content_hash that describes no text at all.
+    Every header is re-read: a STORED hash for a header the run just re-read
+    would write a files.content_hash that describes no text at all.
 
     *new_source_hash* overrides ``entry["source_hash"]`` when the source
     file content has also changed.
@@ -1440,10 +1406,6 @@ def compute_current_entry_hash(
 
     current_headers: list[dict] = []
     for h in headers or ():
-        if header_is_trusted(h):
-            current_headers.append(dict(h))
-            continue
-
         header_path = h["path"]
         p = Path(header_path)
         if not p.is_absolute():

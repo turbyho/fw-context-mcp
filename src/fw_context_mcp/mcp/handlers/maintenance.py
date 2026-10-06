@@ -1763,7 +1763,6 @@ def _update_manifest_after_reindex(
         from ...indexer.manifest import (
             _collect_headers_from_tokens,
             _intern_arguments,
-            header_is_trusted,
             mark_entries_behind,
             merge_header_records,
             update_entry,
@@ -1838,8 +1837,7 @@ def _update_manifest_after_reindex(
             changed = {
                 path
                 for path, record in (manifest_data.get("headers") or {}).items()
-                if not header_is_trusted(record)
-                and record.get("hash", "") != table_before.get(path, "")
+                if record.get("hash", "") != table_before.get(path, "")
             }
             behind = mark_entries_behind(manifest_data, changed, reparsed_rel)
             if behind:

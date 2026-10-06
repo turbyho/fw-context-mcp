@@ -350,7 +350,13 @@ class TestCheckTuStaleness:
         )
         assert stale is True  # header hash differs
 
-    def test_generated_header_skipped(self, tmp_path: Path):
+    def test_a_changed_generated_header_makes_the_unit_stale(self, tmp_path: Path):
+        """mbed_config.h carries mbed_app.json, and the #ifdefs of the unit follow it.
+
+        The rule that trusted a generated header said that its content
+        changes with each build.  Measured on 2026-10-07 it does not: a
+        header of the build changes only with the configuration.
+        """
         import hashlib
 
         from fw_context_mcp.indexer.manifest import check_tu_staleness
@@ -372,7 +378,7 @@ class TestCheckTuStaleness:
             entry, tmp_path,
             headers=[{"path": "BUILD/mbed_config.h", "hash": "nonexistent_hash", "generated": True}],
         )
-        assert stale is False  # generated header is trusted
+        assert stale is True
 
     def test_an_in_tree_vendor_header_is_not_trusted(self, tmp_path: Path):
         """A changed vendor header makes its dependent TU stale.
@@ -638,12 +644,12 @@ class TestCollectStaleHeaders:
         )
         assert collect_stale_headers(manifest, tmp_path) == set()
 
-    def test_a_generated_header_is_still_trusted(self, tmp_path: Path):
-        """The one rule that survives: build output changes every build.
+    def test_a_changed_generated_header_is_stale(self, tmp_path: Path):
+        """No header is trusted.  A pristine build gives the same generated headers.
 
-        This is the half of the old test that keeps its sign.  Without it the
-        end of vendor trust would overshoot into trusting nothing, and every
-        build would then force a full reparse.
+        Measured on 2026-10-07: 0 of 325 headers of a real sysbuild project
+        changed between two pristine builds, thus to re-hash them costs no
+        reparse when nothing changed.
         """
         from fw_context_mcp.indexer.manifest import collect_stale_headers
 
@@ -654,7 +660,7 @@ class TestCollectStaleHeaders:
             tmp_path,
             [{"path": "BUILD/mbed_config.h", "hash": "stale", "generated": True}],
         )
-        assert collect_stale_headers(manifest, tmp_path) == set()
+        assert collect_stale_headers(manifest, tmp_path) == {"BUILD/mbed_config.h"}
 
     def test_an_in_tree_vendor_header_change_is_detected(self, tmp_path: Path):
         """The other half of the old test, with its sign inverted.
@@ -1117,7 +1123,10 @@ class TestMtimeBumpIsSafe:
             header, {"hash": stored, "generated": False}, None
         ) is True
 
-    def test_a_generated_header_still_bumps_unconditionally(self, tmp_path: Path):
+    def test_a_changed_generated_header_keeps_its_stale_mtime(self, tmp_path: Path):
+        """A bump would hide the change of the configuration from the next run."""
+        import hashlib
+
         from fw_context_mcp.indexer._manifest_updater import _mtime_bump_is_safe
 
         header = tmp_path / "BUILD" / "mbed_config.h"
@@ -1126,16 +1135,18 @@ class TestMtimeBumpIsSafe:
 
         assert _mtime_bump_is_safe(
             header, {"hash": "whatever", "generated": True}, None
-        ) is True
+        ) is False
+        same = hashlib.sha256(header.read_bytes()).hexdigest()
+        assert _mtime_bump_is_safe(header, {"hash": same, "generated": True}, None) is True
 
 
 class TestMergeHeaderRecords:
     """``generated`` goes from False to True, never the other way.
 
     ``generated`` is a property of the PATH, not of one parse.  A caller with
-    no build_dir_patterns computes False for every header, and after the end
-    of vendor trust ``generated`` is the only trust rule the pipeline has
-    left — to let False overwrite True disables it in silence.
+    no build_dir_patterns computes False for every header, and the query
+    layer and the coverage purge read the flag — to let False overwrite True
+    gives them a wrong answer in silence.
     """
 
     def test_update_entry_does_not_downgrade_generated(self):
@@ -1202,16 +1213,19 @@ class TestMergeHeaderRecords:
         assert records["build/autoconf.h"]["generated"] is False
 
 
-class TestTheTrustRuleHasOneDefinition:
-    """A copy of the rule anywhere else is the defect this commit removes."""
+class TestNoHeaderIsTrusted:
+    """No staleness check skips a header because the manifest calls it generated.
 
-    def test_every_caller_uses_the_shared_trust_predicate(self):
-        """Grep src/, do not assert over a list of known functions.
+    A trust rule did that until 2026-10-07: it said that a generated header
+    changes with each build.  Measured, it does not, and a generated header
+    carries the configuration of the build (autoconf.h, sdkconfig.h,
+    mbed_config.h).  The rule had copies in five functions once, and four
+    rounds of review missed the fifth, thus the guard greps and does not
+    list functions.
+    """
 
-        A test written as "these four functions delegate" cannot find a fifth
-        copy — and a fifth copy in compute_current_entry_hash is exactly what
-        four rounds of review missed.  The grep finds any new one.
-        """
+    def test_only_the_merge_of_the_header_table_reads_generated(self):
+        """Grep src/: the flag is kept for the query layer, and no check reads it."""
         import re
 
         src = Path(__file__).resolve().parent.parent / "src" / "fw_context_mcp"
@@ -1222,11 +1236,11 @@ class TestTheTrustRuleHasOneDefinition:
                 if line.lstrip().startswith("#"):
                     continue
                 # The rule read as: skip when the record says generated.
-                if re.search(r'\.get\("generated"\)', line) and "header_is_trusted" not in line:
+                if re.search(r'\.get\("generated"\)', line):
                     offenders.append(f"{path.relative_to(src)}:{lineno}: {line.strip()}")
 
         allowed = {
-            # The one definition.
+            # merge_header_records keeps the flag; it decides nothing.
             "indexer/manifest.py",
         }
         unexpected = [
@@ -1234,7 +1248,7 @@ class TestTheTrustRuleHasOneDefinition:
             if not any(o.startswith(a + ":") for a in allowed)
         ]
         assert unexpected == [], (
-            "the trust rule is copied outside header_is_trusted():\n"
+            "a check reads `generated` again, and no header is trusted:\n"
             + "\n".join(unexpected)
         )
 
@@ -1338,12 +1352,12 @@ class TestNeedsReparse:
         assert result is not None
         assert "needs_reparse" not in self._entry(result, "src/a.c")
 
-    def test_a_generated_header_does_not_flag_anything(self, tmp_path: Path):
-        """The one header the pipeline still trusts must not queue anybody."""
+    def test_a_changed_generated_header_queues_the_other_unit(self, tmp_path: Path):
+        """A generated header is a header like any other: no header is trusted."""
         result = self._run(tmp_path, reparsed={"src/a.c"}, generated=True)
 
         assert result is not None
-        assert "needs_reparse" not in self._entry(result, "src/b.c")
+        assert self._entry(result, "src/b.c").get("needs_reparse") is True
 
     def test_an_unchanged_header_does_not_flag_anything(self, tmp_path: Path):
         """No difference in the shared table means nothing to mark."""

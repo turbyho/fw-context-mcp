@@ -805,11 +805,11 @@ def _check_header_staleness(
         return 0, []
 
     project_root = Path(manifest.get("project_root", str(root)))
-    # No vendor set is needed here any more: header_is_trusted() is the one
-    # rule, and it reads `generated` alone.  This layer used to derive its
-    # own set, which differed from the indexer's — it has no compiler flags —
-    # and the narrower answer made this check re-hash headers the indexer had
-    # trusted.  maintenance.py turned that into "stale": true and asked for a
+    # No vendor set is needed here: every header is re-hashed, as the indexer
+    # re-hashes it (check_tu_staleness).  This layer used to derive its own
+    # set, which differed from the indexer's — it has no compiler flags — and
+    # the different answer made this check re-hash headers the indexer had
+    # not.  maintenance.py turned that into "stale": true and asked for a
     # reindex that could not clear it.
 
     stale_count = 0

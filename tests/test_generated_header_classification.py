@@ -1,11 +1,9 @@
 """A generated header must be recognised wherever the build put it.
 
-`header_is_trusted()` reads one thing: whether the manifest calls the header
-`generated`.  A header the pipeline does not know is generated is re-hashed
-on every index run, and a generated header changes with every build without
-a change of meaning — so every unit that includes it is marked header-stale
-and re-parsed, which is the opposite of what the three staleness tiers are
-for.
+The query layer and the coverage purge read whether the manifest calls a
+header `generated`: a header of the build output is not code of the project,
+and it is not a file that left the build when the build writes it again.
+No staleness check reads the flag: every header is re-hashed.
 
 Each build of fw-context writes those headers under
 `.fw-context/build/<variant>/out/`, and the patterns of the backend do not
