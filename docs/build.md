@@ -53,6 +53,19 @@ The index reads `compile_commands.json` where the build system writes it in
 | Zephyr without sysbuild (upstream Zephyr, or `west build --no-sysbuild`) | `out/compile_commands.json` |
 | Zephyr sysbuild, one per image | `out/<image>/compile_commands.json`, for each image that `out/domains.yaml` names |
 
+An older fw-context wrote its build output into `.fw-context/autobuild/`
+and directly into `.fw-context/build/`: a copy of each database
+(`compile_commands.json`, `compile_commands.<variant>.<image>.json`),
+`platformio_link.json` and `deps/`. Each `fw-context index` run that
+ends well removes that output, and it logs one line for each path that it
+removes. A database that a build of the index reads stays, until a run
+indexes that build again: a run that `--variant` narrows leaves the other
+variants on their old copies. The file on the command line stays too. A
+directory of the build root that holds `out/` is the directory of a
+variant and stays, also when its name is `deps`. The first index run
+gives the files of the index their new paths, thus it indexes the
+project again.
+
 A tool that fw-context gives the output path to (bear, compiledb,
 keil2clangd, the manual backend) does not write the file directly. It writes
 a staging file in the directory of the variant,

@@ -36,6 +36,8 @@ backend says where its compilation databases are, see
 from __future__ import annotations
 
 import logging
+import os
+import shutil
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -169,3 +171,128 @@ class BuildLayout:
             marker.write_text("# Build output of fw-context. Not for committing.\n*\n", encoding="utf-8")
         except OSError:
             log.warning("Cannot write %s, thus git can show the build output as untracked", marker, exc_info=True)
+
+
+# The build directory of a background build before this layout, relative to
+# the project root.
+_LEGACY_AUTOBUILD_REL: Path = Path(".fw-context") / "autobuild"
+
+# Files and directories that fw-context wrote directly into the build root
+# before this layout: the copies of each database, the PlatformIO sidecar,
+# and the dependency files of the manual backend.
+_LEGACY_SIDECAR_NAME = "platformio_link.json"
+_LEGACY_DEPS_NAME = "deps"
+
+
+def _is_legacy_database(path: Path) -> bool:
+    """Say if *path* is a copy of a database in the build root, as fw-context wrote it before this layout.
+
+    The copies were ``compile_commands.json`` and, for each variant and
+    image, ``compile_commands.<variant>.<image>.json``.
+    """
+    name = path.name
+    return name == COMPILE_COMMANDS_NAME or (name.startswith("compile_commands.") and name.endswith(".json"))
+
+
+def _legacy_candidates(project_root: Path) -> list[Path]:
+    """Return the paths of the layout before this one that are there.
+
+    A directory in the build root is the directory of a variant when it
+    holds ``out/``: then it stays, also when its name is ``deps``, also on a
+    file system that ignores the case of a name.  The sidecar and the
+    database copies are files; a directory of that name is a variant.
+    """
+    candidates: list[Path] = []
+    autobuild = project_root / _LEGACY_AUTOBUILD_REL
+    if autobuild.exists() or autobuild.is_symlink():
+        candidates.append(autobuild)
+    root = project_root / BUILD_ROOT_REL
+    if not root.is_dir():
+        return candidates
+    candidates += sorted(p for p in root.iterdir() if p.is_file() and _is_legacy_database(p))
+    sidecar = root / _LEGACY_SIDECAR_NAME
+    if sidecar.is_file():
+        candidates.append(sidecar)
+    deps = root / _LEGACY_DEPS_NAME
+    if deps.is_dir() and not deps.is_symlink() and not (deps / OUT_DIR_NAME).exists():
+        candidates.append(deps)
+    return candidates
+
+
+def _protects(path: Path, keep: list[Path]) -> bool:
+    """Say if *path* is a kept file, or a directory that holds one.
+
+    ``os.path.samefile`` compares two paths that exist: a file system that
+    ignores the case of a name (macOS, Windows) gives one file for two
+    spellings, and ``Path.resolve`` does not fold the case.  A path that
+    cannot be compared counts as kept: a doubt never removes a file.
+    """
+    for kept in keep:
+        for candidate in (kept, *kept.parents):
+            try:
+                if candidate.exists() and path.exists():
+                    if os.path.samefile(candidate, path):
+                        return True
+                elif candidate.resolve() == path.resolve():
+                    return True
+            except (OSError, RuntimeError):
+                # RuntimeError: Path.resolve on a loop of symbolic links
+                # (Python 3.11 and 3.12).
+                return True
+    return False
+
+
+def has_legacy_output(project_root: Path) -> bool:
+    """Say if the build output of an older fw-context is there, see :func:`remove_legacy_output`.
+
+    A directory that cannot be read counts as one with old output, thus the
+    removal runs and gives its warning.
+    """
+    try:
+        return bool(_legacy_candidates(project_root))
+    except OSError:
+        return True
+
+
+def remove_legacy_output(project_root: Path, keep: Iterable[Path] = ()) -> list[Path]:
+    """Remove the build output that fw-context wrote before ``.fw-context/build/<variant>/out``.
+
+    The paths are ``.fw-context/autobuild/``, the copies of each database in
+    ``.fw-context/build/``, ``.fw-context/build/platformio_link.json`` and
+    ``.fw-context/build/deps/``.  Nothing writes them since this layout, and
+    an old copy of a database looks like a build that is there.
+
+    *keep* holds the databases that must stay: each database that a build
+    of the index reads, and the file that the user gives.  A path in
+    *keep*, and a directory that holds one, stays.  The old index reads
+    the old copies until a run indexes the build again, thus a copy goes
+    only when no build of the index reads it any more.
+
+    One log line for each removed path, because the user did not ask for
+    the removal.  A path that cannot be read or removed gives a warning,
+    and the run continues: the old output takes space, and it does not
+    change an answer.  Returns the removed paths.
+    """
+    kept = list(keep)
+    try:
+        candidates = _legacy_candidates(project_root)
+    except OSError as exc:
+        log.warning("Cannot read the build output of an older fw-context in %s: %s", project_root, exc)
+        return []
+
+    removed: list[Path] = []
+    for path in candidates:
+        if _protects(path, kept):
+            continue
+        try:
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            else:
+                # A symbolic link goes, and not what it names.
+                path.unlink()
+        except OSError as exc:
+            log.warning("Cannot remove the build output of an older fw-context, %s: %s", path, exc)
+            continue
+        log.info("Removed the build output of an older fw-context: %s", path)
+        removed.append(path)
+    return removed

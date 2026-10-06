@@ -955,8 +955,8 @@ def plan_gitignore(
     it must not.  ``config.toml`` holds the build configuration of the
     project and belongs in the repository, thus every developer gets the
     same index.  ``local.toml`` holds the settings of one developer
-    (paths, API keys), and ``build/`` and ``autobuild/`` hold generated
-    output; none of the three belongs in the repository.
+    (paths, API keys), and ``build/`` holds generated output; neither
+    belongs in the repository.
     ``FW_CONTEXT_IGNORE_PAIR`` gives that split, and its documentation
     tells why the exclude needs the ``/*``.
 
