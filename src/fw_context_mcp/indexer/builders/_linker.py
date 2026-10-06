@@ -364,47 +364,6 @@ def _ninja_value_tokens(value: str) -> list[str]:
     return [word.replace(_DOLLAR_MARK, "$") for word in words]
 
 
-def output_dirs_from_units(
-    project_root: Path, units: list | None, marker: str
-) -> list[Path]:
-    """Return the output directories that the build compiled into.
-
-    A build system can keep one output tree per configuration.  mbed-tools
-    compiles into `BUILD/<target>/<toolchain>-<profile>/`, and
-    the second Mbed project holds two such trees, `GCC_ARM-DEBUG` and
-    `GCC_ARM-DEVELOP`, each with its own linker script.  Only one belongs
-    to the build the index describes, and the build itself says which.
-
-    The source is `raw_entry`, the entry as the build wrote it.  NOT
-    `clang_args`: those are normalized for libclang, and the normalization
-    removes the output flag — measured on the second Mbed project, 349 normalized tokens
-    and no `-o` among them, against 105 raw tokens that hold it.
-
-    Two fields carry the answer, in this order:
-
-    * `output`, which the JSON Compilation Database defines for exactly
-      this purpose.
-    * The argument of `-o`, for a build that writes no `output` field.
-
-    *marker* is the component that starts the tree, such as `BUILD`.  The
-    result keeps *marker* and the two components after it, which is the
-    depth mbed-tools uses.
-
-    The order is by how many units name each directory, most first, so one
-    stray object file outside the tree of this build cannot win.
-    """
-    if not units:
-        return []
-    counts: dict[Path, int] = {}
-    for unit in units:
-        for target in _output_paths(unit):
-            directory = _tree_of(target, unit, project_root, marker)
-            if directory is not None:
-                counts[directory] = counts.get(directory, 0) + 1
-    ordered = sorted(counts.items(), key=lambda item: (-item[1], str(item[0])))
-    return [path for path, _ in ordered if path.is_dir()]
-
-
 def _output_paths(unit: object) -> list[str]:
     """Return what one unit says about where its object file went."""
     raw = getattr(unit, "raw_entry", None)
@@ -426,55 +385,3 @@ def _output_paths(unit: object) -> list[str]:
         elif token.startswith("-o") and len(token) > 2:
             found.append(token[2:])
     return found
-
-
-def _tree_of(
-    target: str, unit: object, project_root: Path, marker: str
-) -> Path | None:
-    """Return the output tree that holds *target*, or None.
-
-    A relative path resolves against the working directory of the
-    compilation, which is the directory the compiler itself used.
-    """
-    path = Path(target)
-    if not path.is_absolute():
-        base = getattr(unit, "directory", None) or project_root
-        path = Path(base) / path
-    parts = path.parts
-    if marker not in parts:
-        return None
-    at = parts.index(marker)
-    # marker plus the two components after it.  Fewer means the object file
-    # is not in a per-configuration tree.
-    if at + 2 >= len(parts):
-        return None
-    return Path(*parts[: at + 3])
-
-
-def single_script_in(directory: Path, preferred: str = "") -> list[Path]:
-    """Return the one linker script in *directory*, or an empty list.
-
-    *preferred* is a file name the build system is known to write.  The
-    function takes it when it is there.
-
-    Without it the function accepts a `.ld` file ONLY when the directory
-    holds exactly one.  A directory with two candidates offers a choice,
-    and a choice made by a pattern is a guess — so the answer is nothing,
-    and the log says how many were seen.
-    """
-    if preferred:
-        candidate = directory / preferred
-        if candidate.is_file():
-            return [candidate.resolve()]
-    try:
-        scripts = sorted(p for p in directory.glob("*.ld") if p.is_file())
-    except OSError:
-        return []
-    if len(scripts) == 1:
-        return [scripts[0].resolve()]
-    if scripts:
-        log.debug(
-            "%s holds %d linker scripts and no preferred name, thus none is "
-            "used: %s", directory, len(scripts), ", ".join(p.name for p in scripts),
-        )
-    return []

@@ -28,7 +28,7 @@ def _fmt_kv(key: str, value) -> str:
 def _fmt_variant_block(variant: dict) -> str:
     """Format one ``[[build.variants]]`` table (scalar fields only)."""
     lines = ["[[build.variants]]"]
-    for key in ("name", "description", "board", "build_dir"):
+    for key in ("name", "description", "board"):
         if variant.get(key):
             lines.append(_fmt_kv(key, variant[key]))
     env = variant.get("env")
@@ -90,8 +90,6 @@ def _add_variant(cfg_path: Path, args) -> int:
         variant["board"] = args.board
     if getattr(args, "description", None):
         variant["description"] = args.description
-    if getattr(args, "build_dir", None):
-        variant["build_dir"] = args.build_dir
     env = {}
     for kv in getattr(args, "env", None) or []:
         if "=" in kv:

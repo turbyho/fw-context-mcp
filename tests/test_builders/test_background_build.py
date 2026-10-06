@@ -7,7 +7,8 @@ build of the IDE — the IDE knows nothing about it.
 
 Every backend therefore has to answer one question: may fw-context run this
 build on its own?  A backend answers yes only when it writes every artifact
-under ``BuildConfig.isolated_build_dir``, or when it compiles nothing.
+under the output directory of fw-context, ``.fw-context/build/<variant>/out``,
+or when it compiles nothing.
 """
 
 from __future__ import annotations
@@ -30,7 +31,6 @@ from fw_context_mcp.indexer.builders.mbed_os import MbedOSBuildSystem
 from fw_context_mcp.indexer.builders.platformio import PlatformIOBuildSystem
 from fw_context_mcp.indexer.builders.stubs import STM32CubeIDEStub, TICCSStub
 from fw_context_mcp.indexer.builders.zephyr import ZephyrBuildSystem
-from fw_context_mcp.utils import resolve_build_dir
 
 # Every backend, with the answer it must give for a default configuration.
 # A new backend that reaches the registry without a decision here fails
@@ -120,27 +120,6 @@ class TestMakefileDependsOnDryRun:
         assert background_build_safe(MakefileBuildSystem(), cfg) is False
 
 
-class TestResolveBuildDir:
-    def test_the_default_wins_without_the_setting(self, tmp_path: Path):
-        assert resolve_build_dir(tmp_path, BuildConfig(), "build") == tmp_path / "build"
-
-    def test_a_relative_setting_resolves_against_the_root(self, tmp_path: Path):
-        cfg = BuildConfig(isolated_build_dir=".fw-context/autobuild/default")
-        assert resolve_build_dir(tmp_path, cfg, "build") == (
-            tmp_path / ".fw-context/autobuild/default"
-        )
-
-    def test_an_absolute_setting_is_kept(self, tmp_path: Path):
-        cfg = BuildConfig(isolated_build_dir="/var/tmp/fwctx")
-        assert resolve_build_dir(tmp_path, cfg, "build") == Path("/var/tmp/fwctx")
-
-    def test_a_backend_default_other_than_build_is_kept(self, tmp_path: Path):
-        """Zephyr passes its per-variant directory as the default."""
-        assert resolve_build_dir(tmp_path, BuildConfig(), "build/nrf52840") == (
-            tmp_path / "build/nrf52840"
-        )
-
-
 class TestManualDependencyFiles:
     """The manual backend must not write ``.d`` files into the source tree.
 
@@ -200,27 +179,14 @@ class TestManualDependencyFiles:
                 f"{target} sits in the source tree of the user"
             )
 
-    def test_the_default_goes_under_the_fw_context_directory(
+    def test_they_go_under_the_output_directory_of_the_variant(
         self, tmp_path: Path, monkeypatch
     ):
-        cfg = BuildConfig(system="bare", source_dirs=["src"])
+        cfg = BuildConfig(system="bare", source_dirs=["src"], variant_name="dev")
 
         targets = self._dep_targets(self._run(tmp_path, monkeypatch, cfg))
 
-        assert targets == [tmp_path / ".fw-context/build/deps/src/main.d"]
-
-    def test_an_isolated_build_wins(self, tmp_path: Path, monkeypatch):
-        cfg = BuildConfig(
-            system="bare",
-            source_dirs=["src"],
-            isolated_build_dir=".fw-context/autobuild/default",
-        )
-
-        targets = self._dep_targets(self._run(tmp_path, monkeypatch, cfg))
-
-        assert targets == [
-            tmp_path / ".fw-context/autobuild/default/src/main.d"
-        ]
+        assert targets == [tmp_path / ".fw-context/build/dev/out/deps/src/main.d"]
 
     def test_two_sources_of_one_name_do_not_collide(self, tmp_path: Path, monkeypatch):
         """`a/foo.c` and `b/foo.c` would share one `foo.d` without mirroring."""
@@ -272,41 +238,27 @@ class TestPlatformIOIsolatesObjectFiles:
         mod.PlatformIOBuildSystem().build(root, cfg)
         return envs
 
-    def test_an_isolated_build_redirects_every_call(self, tmp_path: Path, monkeypatch):
+    def test_every_call_goes_to_the_output_directory(self, tmp_path: Path, monkeypatch):
         from dataclasses import replace
 
         from fw_context_mcp.indexer.build import BuildConfig
-        from fw_context_mcp.utils import autobuild_dir
+        from fw_context_mcp.indexer.build_layout import BuildLayout
 
-        cfg = replace(BuildConfig(), isolated_build_dir=autobuild_dir(), clean=False)
+        cfg = replace(BuildConfig(), clean=True)
         envs = self._run(cfg, tmp_path, monkeypatch)
 
         assert envs, "the backend must invoke pio at least once"
         for env in envs:
-            assert env.get("PLATFORMIO_BUILD_DIR") == autobuild_dir(), (
-                "every pio call has to carry it, or one of them writes into "
-                ".pio/build while the user is building there"
-            )
-
-    def test_an_explicit_build_does_not_redirect(self, tmp_path: Path, monkeypatch):
-        from dataclasses import replace
-
-        from fw_context_mcp.indexer.build import BuildConfig
-
-        envs = self._run(replace(BuildConfig(), clean=False), tmp_path, monkeypatch)
-
-        assert envs
-        for env in envs:
-            assert "PLATFORMIO_BUILD_DIR" not in env, (
-                "the user asked for this build; it belongs in their own "
-                "output directory"
+            assert env.get("PLATFORMIO_BUILD_DIR") == str(BuildLayout(tmp_path / "proj").out_dir("")), (
+                "every pio call has to carry it, the clean included, or one of "
+                "them writes into .pio/build while the user is building there"
             )
 
 
 class TestObjectPathStaysOutOfTheHashes:
     """Why the project-root compile_commands.json rewrite costs nothing.
 
-    An isolated build differs from the build of the user in one token per
+    A build of fw-context differs from the build of the user in one token per
     entry — the `.o` output path.  If that reached config_hash the two
     builds would own two half-populated indexes; if it reached flags_hash
     every translation unit would look changed and be reparsed.  Neither
@@ -328,9 +280,9 @@ class TestObjectPathStaysOutOfTheHashes:
         from fw_context_mcp.indexer.config_hash import compute_flags_hash
 
         user = self._entry(".pio/build/x/main.c.o")
-        isolated = self._entry(".fw-context/autobuild/default/x/main.c.o")
+        ours = self._entry(".fw-context/build/default/out/x/main.c.o")
 
-        assert compute_flags_hash(user) == compute_flags_hash(isolated), (
+        assert compute_flags_hash(user) == compute_flags_hash(ours), (
             "a differing flags_hash marks the unit changed and reparses it"
         )
 
@@ -344,5 +296,5 @@ class TestObjectPathStaysOutOfTheHashes:
             return compute_config_hash(list(parse_cc(cc)), tmp_path, "pid")
 
         assert _hash(".pio/build/x/main.c.o") == _hash(
-            ".fw-context/autobuild/default/x/main.c.o"
+            ".fw-context/build/default/out/x/main.c.o"
         ), "a differing config_hash splits the index into two half-filled sets"

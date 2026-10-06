@@ -1,15 +1,17 @@
 """An index run builds first when the build of compile_commands.json is gone.
 
 The parse asks the compiler of each unit in the ``directory`` of its entry,
-as the build runs it (``_driver_query``).  A builder keeps a copy of
-compile_commands.json in ``.fw-context/``, thus the file can outlive the
-build directory (``rm -rf build``, ``idf.py fullclean``).  Without that
-directory each unit gets no answer of its compiler: wrong system headers and
-macros.  Thus:
+as the build runs it (``_driver_query``).  Without the build each unit gets
+no answer of its compiler: wrong system headers and macros.
+
+A build of fw-context keeps its database in its output directory,
+``.fw-context/build/<variant>/out`` (see ``build_layout``), thus a removed
+build takes the database with it.  A database whose ``directory`` is gone
+while the file stays is the other form of a missing build.  Thus:
 
 - A run of the user turns ``--build`` on, as the user would.
-- A background run plans an isolated build (``_plan_auto_build``), as it does
-  for a branch switch.
+- A background run plans a build (``_plan_auto_build``), as it does for a
+  branch switch.
 - A run that builds nothing does not index: it stops with a clear error, and
   each MCP answer carries the same text.  A build that fw-context cannot run
   (a stub such as STM32CubeIDE) must run outside of fw-context.
@@ -24,6 +26,7 @@ from pathlib import Path
 import pytest
 
 from fw_context_mcp.indexer.autobuild import build_missing_reason
+from fw_context_mcp.indexer.build_layout import BuildLayout
 from fw_context_mcp.indexer.db import open_db, transaction, upsert_build_config, upsert_project
 
 PROJECT_ID = "0123456789abcdef0123456789abcdef"
@@ -34,6 +37,31 @@ def _write_cc(path: Path, directory: Path) -> Path:
     path.write_text(json.dumps([{"directory": str(directory), "file": "main.c",
                                  "arguments": ["cc", "-c", "main.c"]}]), encoding="utf-8")
     return path
+
+
+def _out(root: Path) -> Path:
+    """The output directory of the build without variants."""
+    return BuildLayout(root).out_dir("")
+
+
+def _default_cc(root: Path) -> Path:
+    """The database that a CMake build of fw-context writes, and a run without a file reads."""
+    return _out(root) / "compile_commands.json"
+
+
+def _built(root: Path) -> Path:
+    """A build of fw-context that is there: the database in out/, its units compiled in out/."""
+    return _write_cc(_default_cc(root), _out(root))
+
+
+def _gone(root: Path) -> Path:
+    """A build that the user removed: no output directory, thus no database either."""
+    return _default_cc(root)
+
+
+def _half_gone(root: Path) -> Path:
+    """A database that stays while the directory that its units name is gone."""
+    return _write_cc(_default_cc(root), _out(root) / "app")
 
 
 @pytest.fixture
@@ -123,18 +151,30 @@ class TestTheCheckedFile:
         return load_config(project_root=root)
 
     def test_without_an_index_the_default_file_is_checked(self, tmp_path: Path) -> None:
-        from fw_context_mcp.indexer.build import checked_compile_commands, resolve_reuse_compile_commands
+        from fw_context_mcp.indexer.build import checked_compile_commands
 
         cfg = self._cfg(tmp_path)
-        expected = resolve_reuse_compile_commands(tmp_path, cfg.index.compile_commands)
-        assert checked_compile_commands(tmp_path, cfg, None) == expected
+        assert checked_compile_commands(tmp_path, cfg, None) == _default_cc(tmp_path)
 
     def test_an_index_of_the_default_file_is_checked(self, tmp_path: Path) -> None:
-        from fw_context_mcp.indexer.build import checked_compile_commands, resolve_reuse_compile_commands
+        from fw_context_mcp.indexer.build import checked_compile_commands
 
         cfg = self._cfg(tmp_path)
-        default = resolve_reuse_compile_commands(tmp_path, cfg.index.compile_commands)
+        default = _default_cc(tmp_path)
         assert checked_compile_commands(tmp_path, cfg, default) == default
+
+    def test_a_removed_build_with_a_deeper_database_is_checked(self, tmp_path: Path) -> None:
+        """Zephyr without sysbuild writes out/zephyr/compile_commands.json.
+
+        After `rm -rf .fw-context/build`, the build cannot say where its
+        database was.  The path of the index can, and it is in out/.
+        """
+        from fw_context_mcp.indexer.build import checked_compile_commands
+
+        cfg = self._cfg(tmp_path, 'system = "zephyr"\nboard = "b"')
+        indexed = _out(tmp_path) / "zephyr" / "compile_commands.json"
+        assert checked_compile_commands(tmp_path, cfg, indexed) == indexed
+        assert "does not exist" in build_missing_reason(indexed)
 
     def test_an_index_of_another_file_is_not_checked(self, tmp_path: Path) -> None:
         from fw_context_mcp.indexer.build import checked_compile_commands
@@ -159,42 +199,48 @@ class TestTheBackgroundPlan:
             root, db_path, load_config(project_root=root), None, background=background
         )
 
-    def test_a_run_of_the_user_plans_no_isolated_build(self, tmp_path: Path) -> None:
-        """A run of the user builds in the build directory of the user, as --build does."""
+    def test_a_run_of_the_user_plans_no_build_for_a_missing_build(self, tmp_path: Path) -> None:
+        """A run of the user builds as --build does (`_build_if_missing`, `_resolve_compile_commands`)."""
         root = tmp_path / "proj"
         root.mkdir()
-        cc = _write_cc(root / ".fw-context" / "build" / "compile_commands.json", root / "build")
-        db_path = _project(root, tmp_path / "index", cc)
+        db_path = _project(root, tmp_path / "index", _gone(root))
         assert self._plan(root, db_path, background=False) == ([], None, "")
 
     def test_an_index_of_another_file_plans_no_build(self, tmp_path: Path) -> None:
         """An index of an explicit file: a build would replace that file with its own.
 
-        The default file is there and its build is gone, but the index did
-        not come from it.
+        The build of the default file is gone, but the index did not come
+        from it.
         """
         root = tmp_path / "proj"
         root.mkdir()
-        _write_cc(root / ".fw-context" / "build" / "compile_commands.json", root / "build")
         explicit = _write_cc(tmp_path / "ci" / "compile_commands.json", tmp_path / "ci")
         db_path = _project(root, tmp_path / "index", explicit)
         assert self._plan(root, db_path) == ([], None, "")
 
-    def test_a_missing_build_directory_plans_an_isolated_build(self, tmp_path: Path) -> None:
+    def test_a_removed_build_plans_a_build(self, tmp_path: Path) -> None:
+        """`rm -rf .fw-context/build/default/out` removes the database too."""
         root = tmp_path / "proj"
         root.mkdir()
-        cc = _write_cc(root / ".fw-context" / "build" / "compile_commands.json", root / "build")
-        db_path = _project(root, tmp_path / "index", cc)
+        db_path = _project(root, tmp_path / "index", _gone(root))
         keys, config, reason = self._plan(root, db_path)
         assert keys == ["build-missing"]
-        assert config is not None and config.isolated_build_dir, "only an isolated build may run in the background"
+        assert config is not None
+        assert "does not exist" in reason
+        assert str(_out(root)) in reason, "the line names where the build goes"
+
+    def test_a_missing_build_directory_plans_a_build(self, tmp_path: Path) -> None:
+        root = tmp_path / "proj"
+        root.mkdir()
+        db_path = _project(root, tmp_path / "index", _half_gone(root))
+        keys, _config, reason = self._plan(root, db_path)
+        assert keys == ["build-missing"]
         assert "the build directory" in reason
 
     def test_a_present_build_plans_nothing(self, tmp_path: Path) -> None:
         root = tmp_path / "proj"
-        (root / "build").mkdir(parents=True)
-        cc = _write_cc(root / ".fw-context" / "build" / "compile_commands.json", root / "build")
-        db_path = _project(root, tmp_path / "index", cc)
+        root.mkdir()
+        db_path = _project(root, tmp_path / "index", _built(root))
         assert self._plan(root, db_path) == ([], None, "")
 
     def test_an_earlier_failure_does_not_block_the_next_build(self, tmp_path: Path) -> None:
@@ -203,8 +249,7 @@ class TestTheBackgroundPlan:
 
         root = tmp_path / "proj"
         root.mkdir()
-        cc = _write_cc(root / ".fw-context" / "build" / "compile_commands.json", root / "build")
-        db_path = _project(root, tmp_path / "index", cc)
+        db_path = _project(root, tmp_path / "index", _gone(root))
         record_problem(db_path.parent, "The last index run failed (exit code 1).")
         keys, _config, _reason = self._plan(root, db_path)
         assert keys == ["build-missing"]
@@ -225,7 +270,7 @@ class TestTheRunOfTheUser:
 
         root = tmp_path / "proj"
         cfg = self._cfg(root, 'system = "cmake"')
-        _write_cc(root / cfg.index.compile_commands, root / "build")
+        _half_gone(root)
         args = argparse.Namespace(build=False)
         _build_if_missing(args, root, cfg, None, None)
         assert args.build is True
@@ -236,8 +281,7 @@ class TestTheRunOfTheUser:
 
         root = tmp_path / "proj"
         cfg = self._cfg(root, 'system = "cmake"')
-        (root / "build").mkdir()
-        _write_cc(root / cfg.index.compile_commands, root / "build")
+        _built(root)
         args = argparse.Namespace(build=False)
         _build_if_missing(args, root, cfg, None, None)
         assert args.build is False
@@ -262,7 +306,7 @@ class TestTheRunOfTheUser:
 
         root = tmp_path / "proj"
         cfg = self._cfg(root, 'command = "bear -- make"')
-        _write_cc(root / cfg.index.compile_commands, root / "build")
+        _half_gone(root)
         args = argparse.Namespace(build=False)
         _build_if_missing(args, root, cfg, None, None)
         assert args.build is True
@@ -277,7 +321,7 @@ class TestTheRunOfTheUser:
 
         root = tmp_path / "proj"
         cfg = self._cfg(root, 'system = "cmake"')
-        _write_cc(root / cfg.index.compile_commands, root / "build")
+        _half_gone(root)
         refusal = _refuse_without_build(root, cfg, None, None)
         assert "does not index without the build" in refusal
         assert "fw-context index --build" in refusal
@@ -317,20 +361,18 @@ class TestTheRunOfTheUser:
         Another run can refuse and write its marker while this run runs,
         and the build can go away meanwhile.
         """
+        import shutil
         from types import SimpleNamespace
 
         from fw_context_mcp.cli import _index as index_mod
-        from fw_context_mcp.config import load as load_config
         from fw_context_mcp.indexer.autobuild import read_problem
 
         root = tmp_path / "proj"
-        (root / "build").mkdir(parents=True)
-        cc = _write_cc(root / ".fw-context" / "build" / "compile_commands.json", root / "build")
-        db_path = _project(root, tmp_path / "index", cc)
-        _write_cc(root / load_config(project_root=root).index.compile_commands, root / "build")
+        root.mkdir()
+        db_path = _project(root, tmp_path / "index", _built(root))
 
         def _run_single(*a, **kw) -> int:
-            (root / "build").rmdir()  # `rm -rf build` while the run indexes
+            shutil.rmtree(_out(root))  # `rm -rf .fw-context/build` while the run indexes
             return 0
 
         monkeypatch.setattr(index_mod, "_run_single", _run_single)
@@ -346,10 +388,39 @@ class TestTheRunOfTheUser:
         assert index_mod.cmd_index(args) == 0
         problem = read_problem(db_path.parent)
         assert problem is not None and problem.build_missing
-        assert f"the build directory {root / 'build'}" in problem.text
+        assert f"{_default_cc(root)} does not exist" in problem.text
+
+    def test_a_retired_build_dir_stops_the_run_before_any_build(self, tmp_path: Path, monkeypatch) -> None:
+        """The config names a directory that the build does not use, thus the run refuses it."""
+        from types import SimpleNamespace
+
+        from fw_context_mcp.cli import _index as index_mod
+        from fw_context_mcp.indexer.autobuild import read_problem
+
+        root = tmp_path / "proj"
+        root.mkdir()
+        db_path = _project(root, tmp_path / "index", _built(root))
+        config = root / ".fw-context" / "config.toml"
+        config.write_text(
+            config.read_text(encoding="utf-8")
+            + '[[build.variants]]\nname = "dev"\nboard = "b"\nbuild_dir = "build/dev"\n',
+            encoding="utf-8",
+        )
+        built: list[str] = []
+        monkeypatch.setattr(index_mod, "_run_multi", lambda *a, **kw: built.append("multi") or 0)
+        args = SimpleNamespace(
+            verbose=False, project=str(root), background=False, build=True,
+            compile_commands=None, no_clean=False, force=False, takeover=False,
+            vendor_paths=None, project_paths=None,
+        )
+
+        assert index_mod.cmd_index(args) == 1
+        assert built == []
+        problem = read_problem(db_path.parent)
+        assert problem is not None and "[[build.variants]] 'dev' build_dir" in problem.text
 
     def test_a_missing_file_is_left_to_the_default_path(self, tmp_path: Path) -> None:
-        """``_resolve_compile_commands`` builds then, or gives its own error."""
+        """Before the run, ``_resolve_compile_commands`` builds then, or gives its own error."""
         from fw_context_mcp.cli._index import _build_if_missing, _refuse_without_build
 
         root = tmp_path / "proj"
@@ -367,9 +438,8 @@ class TestTheMcpAnswers:
     @staticmethod
     def _indexed(tmp_path: Path) -> tuple[Path, Path]:
         root = tmp_path / "proj"
-        (root / "build").mkdir(parents=True)
-        cc = _write_cc(root / ".fw-context" / "build" / "compile_commands.json", root / "build")
-        return root, _project(root, tmp_path / "index", cc)
+        root.mkdir()
+        return root, _project(root, tmp_path / "index", _built(root))
 
     def test_no_marker_leaves_the_answer_as_it_is(self, tmp_path: Path) -> None:
         from fw_context_mcp.mcp.shared.stale import annotate_build_problem
@@ -417,15 +487,29 @@ class TestTheMcpAnswers:
 
     def test_get_active_build_finds_a_build_that_went_away(self, tmp_path: Path) -> None:
         """No run has seen it yet, thus there is no marker; the tool checks itself."""
+        import shutil
+
         from fw_context_mcp.mcp.handlers.maintenance import get_active_build
 
         root, _ = self._indexed(tmp_path)
-        (root / "build").rmdir()
+        shutil.rmtree(_out(root))
 
         result = get_active_build(project_root=str(root))
         assert result["status"] == "reindex_needed"
-        assert result["index_message"].startswith(f"the build directory {root / 'build'}")
+        assert result["index_message"].startswith(f"compile_commands.json {_default_cc(root)} does not exist")
         assert "fw-context index --build" in result["index_message"]
+        assert "compile_commands_missing" not in result["reindex_reasons"], "one reason names it once"
+
+    def test_get_active_build_finds_a_missing_build_directory(self, tmp_path: Path) -> None:
+        from fw_context_mcp.mcp.handlers.maintenance import get_active_build
+
+        root = tmp_path / "proj"
+        root.mkdir()
+        _project(root, tmp_path / "index", _half_gone(root))
+
+        result = get_active_build(project_root=str(root))
+        assert result["status"] == "reindex_needed"
+        assert result["index_message"].startswith(f"the build directory {_out(root) / 'app'}")
 
     def test_a_reason_of_a_build_that_is_back_goes_away(self, tmp_path: Path) -> None:
         """The user built outside of fw-context: the old text must not stay in each answer."""
@@ -454,11 +538,13 @@ class TestTheMcpAnswers:
 
     def test_a_missing_build_is_named_once(self, tmp_path: Path) -> None:
         """The marker of the refused run and the check of the tool say the same."""
+        import shutil
+
         from fw_context_mcp.indexer.autobuild import record_problem
         from fw_context_mcp.mcp.handlers.maintenance import get_active_build
 
         root, db_path = self._indexed(tmp_path)
-        (root / "build").rmdir()
+        shutil.rmtree(_out(root))
         record_problem(db_path.parent, "refused: the build is gone.", build_missing=True)
 
         result = get_active_build(project_root=str(root))
@@ -467,19 +553,19 @@ class TestTheMcpAnswers:
     def test_an_index_of_an_explicit_file_gets_no_check(self, tmp_path: Path) -> None:
         """`fw-context index cc.json` does no check, and `--build` would replace the file.
 
-        The default file is there too, and its build is gone: only the
-        comparison with the file of the index keeps the check away.
+        The build of the default file is gone too: only the comparison with
+        the file of the index keeps the check away.
         """
         from fw_context_mcp.mcp.handlers.maintenance import get_active_build
 
         root = tmp_path / "proj"
         root.mkdir()
-        _write_cc(root / ".fw-context" / "build" / "compile_commands.json", root / "build")
         explicit = _write_cc(tmp_path / "ci" / "compile_commands.json", tmp_path / "ci-machine" / "build")
         _project(root, tmp_path / "index", explicit)
 
         result = get_active_build(project_root=str(root))
         assert not any("the build directory" in r for r in result["reindex_reasons"])
+        assert not any("does not exist" in r for r in result["reindex_reasons"])
 
     def test_a_marker_stays_when_the_tool_cannot_check(self, tmp_path: Path) -> None:
         """No check is no evidence that the build is back."""
@@ -496,7 +582,7 @@ class TestTheMcpAnswers:
         assert "refused: the build is gone." in result["reindex_reasons"]
         assert read_problem(db_path.parent) is not None
 
-    def test_an_isolated_build_clears_the_marker_at_the_end_of_the_run(
+    def test_a_build_of_the_run_clears_the_marker_at_the_end_of_the_run(
         self, tmp_path: Path, monkeypatch
     ) -> None:
         """The single path: the build writes the default file, and the end check finds it."""
@@ -507,14 +593,11 @@ class TestTheMcpAnswers:
 
         root = tmp_path / "proj"
         root.mkdir()
-        cc = _write_cc(root / ".fw-context" / "build" / "compile_commands.json", root / "build")
-        db_path = _project(root, tmp_path / "index", cc)
+        db_path = _project(root, tmp_path / "index", _gone(root))
         record_problem(db_path.parent, "refused: the build is gone.", build_missing=True)
-        isolated = root / ".fw-context" / "autobuild" / "default"
 
         def _run_single(*a, **kw) -> int:
-            isolated.mkdir(parents=True)
-            _write_cc(cc, isolated)  # the isolated build writes the default file
+            _built(root)  # the build writes the default file into its output directory
             return 0
 
         monkeypatch.setattr(index_mod, "_run_single", _run_single)

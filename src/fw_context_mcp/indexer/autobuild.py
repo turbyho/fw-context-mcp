@@ -110,7 +110,7 @@ def state(builder_cls, build_cfg) -> AutobuildState:
     *builder_cls* is the class from the registry, or None when no build
     system was detected.  The question goes to the backend with the config
     the build would really use — ``protocol.py`` states that the answer may
-    depend on ``isolated_build_dir``.
+    depend on it, as the makefile backend answers by ``make_dry_run``.
     """
     from .builders import background_build_safe
 
@@ -169,9 +169,11 @@ def build_missing_reason(compile_commands: Path) -> str:
     """Say why the build of *compile_commands* is not there, or give "".
 
     The build is not there when compile_commands.json does not exist, or
-    when a ``directory`` of its entries does not exist (``rm -rf build``,
-    ``idf.py fullclean``, while a builder kept a copy of the file in
-    ``.fw-context/``).  WHY it matters: the parse asks the compiler of each
+    when a ``directory`` of its entries does not exist.  A build of
+    fw-context keeps the database in its output directory, thus a removed
+    output directory takes the database with it.  The ``directory`` check
+    covers a database that the user names, whose build directory is
+    elsewhere.  WHY it matters: the parse asks the compiler of each
     unit in that directory, as the build runs it (``_driver_query``), and the
     build makes its generated headers there.  Without the directory, each
     unit gets no answer of its compiler.

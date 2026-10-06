@@ -415,11 +415,11 @@ class TestTheToolAsksForABuild:
 class TestThePlanTakesTheBranch:
     """`cli._index._plan_auto_build` is where fw-context decides to build.
 
-    It is also the only path that sets `isolated_build_dir`, and that value
-    is what makes `--build` legal on a `--background` run.  A `--build` from
-    anywhere else fails: measured on a real checkout of the Mbed project, the
-    daemon passing the flag itself produced "error: --build and --background
-    are mutually exclusive" and the run died in under a second.
+    It turns `--build` on for a `--background` run, and only for a backend
+    that may build on its own.  The daemon does not pass the flag itself:
+    measured on a real checkout of the Mbed project, that produced "error:
+    --build and --background are mutually exclusive" and the run died in
+    under a second.
     """
 
     def _project(self, repo: Path, tmp_path: Path, description: str,
@@ -432,7 +432,7 @@ class TestThePlanTakesTheBranch:
         """
         import json
 
-        cc = repo / ".fw-context" / "build" / "compile_commands.json"
+        cc = repo / ".fw-context" / "build" / "default" / "out" / "compile_commands.json"
         cc.parent.mkdir(parents=True, exist_ok=True)
         cc.write_text(
             json.dumps([{
@@ -489,8 +489,6 @@ class TestThePlanTakesTheBranch:
         keys, config, reason = self._plan(repo, db_path)
         assert keys == ["branch:release/4.15.1"]
         assert config is not None
-        # The value that makes --build legal on a --background run.
-        assert config.isolated_build_dir
         assert "branch changed from main to release/4.15.1" in reason
         assert "compile_commands.json belongs to the old branch" in reason
 

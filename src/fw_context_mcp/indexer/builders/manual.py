@@ -18,14 +18,9 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from fw_context_mcp.utils import (
-    DEPS_REL,
-    TU_EXTENSIONS,
-    cc_output_path,
-    resolve_build_dir,
-    run_build_command,
-)
+from fw_context_mcp.utils import TU_EXTENSIONS, cc_output_path, run_build_command
 
+from ..build_layout import BuildLayout
 from . import registry
 from .protocol import BuildIssue
 
@@ -154,10 +149,9 @@ class ManualBuildSystem:
         # The .d files go to a directory that fw-context owns, never beside
         # the source.  Beside the source they sit where the build of the user
         # reads them, and the compiler does not write them atomically, thus a
-        # concurrent `make` could read a truncated file.  resolve_build_dir
-        # gives the isolated directory when fw-context started the build, and
-        # .fw-context/build/deps otherwise.
-        dep_root = resolve_build_dir(root, cfg, str(DEPS_REL))
+        # concurrent `make` could read a truncated file.  They go to the
+        # output directory of the variant, as the database does.
+        dep_root = BuildLayout(root).out_dir(cfg.variant_name) / "deps"
         entries: list[dict] = []
         for src in sources:
             # Mirror the tree under dep_root: `a/foo.c` and `b/foo.c` would
@@ -217,10 +211,9 @@ class ManualBuildSystem:
         file atomically, so a `make` that reads `src/foo.d` while this build
         rewrites it can see a truncated one.
 
-        They now go under ``cfg.isolated_build_dir`` when fw-context started
-        the build, and under ``.fw-context/build/deps`` otherwise.  Either
-        way nothing reaches the tree of the user, which is the first branch
-        of the contract in protocol.py.
+        They now go under ``out/deps`` in the output directory of the
+        variant, thus nothing reaches the tree of the user, which is the
+        first branch of the contract in protocol.py.
         """
         return True
 

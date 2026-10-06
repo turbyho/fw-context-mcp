@@ -9,14 +9,9 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from fw_context_mcp.utils import (
-    AUTOBUILD_REL,
-    cc_output_path,
-    resolve_build_dir,
-    resolve_real_binary,
-    run_build_command,
-)
+from fw_context_mcp.utils import resolve_real_binary, run_build_command
 
+from ..build_layout import BuildLayout
 from . import _linker, registry
 from .protocol import BuildIssue
 
@@ -38,50 +33,6 @@ def _app_elf(build_dir: Path) -> str | None:
         return None
     app_elf = description.get("app_elf") if isinstance(description, dict) else None
     return app_elf if isinstance(app_elf, str) and app_elf else None
-
-
-# A unit of an ESP-IDF build compiles in a directory of the build directory,
-# such as `build/esp-idf/esp_system`.  The walk up from it stops after this
-# many levels, which is far deeper than any measured layout.
-_MAX_BUILD_DIR_DEPTH = 12
-
-
-def _build_dir_of(compile_commands: Path, units: list | None) -> Path | None:
-    """Return the build directory that *compile_commands* comes from, or None.
-
-    The directory of *compile_commands* when it holds ``build.ninja``.  Else
-    the first directory above the ``directory`` of a unit that holds
-    ``build.ninja`` and a ``compile_commands.json`` with the content of
-    *compile_commands*.  WHY the content: ``build()`` copies the database,
-    and a build directory whose database changed after the copy has
-    another link.  The build directory can be ``build/`` or an isolated
-    one in ``.fw-context/autobuild/``, thus a fixed name would be a guess.
-    """
-    if (compile_commands.parent / "build.ninja").is_file():
-        return compile_commands.parent
-    try:
-        content = compile_commands.read_bytes()
-    except OSError:
-        return None
-    checked: set[Path] = set()
-    for unit in units or []:
-        directory = getattr(unit, "directory", None)
-        if not directory:
-            continue
-        for candidate in [Path(directory), *Path(directory).parents][:_MAX_BUILD_DIR_DEPTH]:
-            if candidate in checked:
-                break
-            checked.add(candidate)
-            if not (candidate / "build.ninja").is_file():
-                continue
-            try:
-                same = (candidate / "compile_commands.json").read_bytes() == content
-            except OSError:
-                same = False
-            if same:
-                return candidate
-            break
-    return None
 
 
 class ESPIDFBuildSystem:
@@ -139,16 +90,11 @@ class ESPIDFBuildSystem:
         # the gate that asks whether it is configured, and the read of the
         # compilation database.  Three spellings of the same thing is how
         # they came apart — `-B` moved and neither of the other two
-        # followed, so an isolated build either failed outright or copied
-        # the stale compile_commands.json of the build of the user.
-        #
-        # Without an isolated directory this resolves to project_root/"build",
-        # which is the default of idf.py, thus one value serves both modes.
-        build_dir = resolve_build_dir(project_root, cfg, "build")
+        # followed, so a build either failed outright or read the stale
+        # compile_commands.json of the build of the user.
+        build_dir = BuildLayout(project_root).out_dir(cfg.variant_name)
         # -B is a global flag of idf.py, thus it comes before the command.
-        # Passed only when the directory is not the default, so an explicit
-        # build keeps the plain command line it always had.
-        build_dir_flag: list[str] = ["-B", str(build_dir)] if cfg.isolated_build_dir else []
+        build_dir_flag: list[str] = ["-B", str(build_dir)]
 
         cmd: list[str] = [idf_py, *build_dir_flag, "build"]
 
@@ -253,23 +199,19 @@ class ESPIDFBuildSystem:
         # ESP-IDF puts compile_commands.json in the build directory — the
         # one `-B` named, which is why this reads build_dir and not a second
         # spelling of it.  The message names the directory it looked in;
-        # saying "build/" while looking elsewhere is what hid this.
+        # saying "build/" while looking elsewhere is what hid this.  The
+        # database stays there, beside build.ninja and
+        # project_description.json, which the linker pass reads.
         cc_in_build = build_dir / "compile_commands.json"
         if not cc_in_build.exists():
             raise RuntimeError(
                 f"compile_commands.json not found in {build_dir}. "
                 "Ensure the ESP-IDF project was configured correctly."
             )
-
-        # Copy to the gitignored fw-context build dir for a stable location
-        target_cc = cc_output_path(project_root, cfg)
-        shutil.copy2(cc_in_build, target_cc)
-        log.info("Copied %s → %s", cc_in_build, target_cc)
-
-        return target_cc
+        return cc_in_build
 
     def background_build_safe(self, cfg: BuildConfig) -> bool:
-        """Safe — ``idf.py -B <dir>`` puts every artifact there."""
+        """Safe — ``idf.py -B <dir>`` puts every artifact in the output directory of fw-context."""
         return True
 
     # ── Build dir patterns ──
@@ -312,18 +254,16 @@ class ESPIDFBuildSystem:
         know ``-L``, and found none of them.
 
         Without ``project_description.json`` the only executable edge of
-        the file is the link.  None ("not known") when the build directory
-        is not known or the link cannot be read.
-
-        ``fw-context index --build`` indexes the copy that ``build()``
-        publishes in ``.fw-context/build/``, where no ``build.ninja`` is.
-        See ``_build_dir_of`` for how the build directory is found then.
+        the file is the link.  None ("not known") when the directory of
+        *compile_commands* holds no ``build.ninja``, or when the link cannot
+        be read.  ``build()`` leaves the database in the build directory,
+        thus that directory is the build directory.
         """
         if compile_commands is None:
             return None
-        build_dir = _build_dir_of(compile_commands, units)
-        if build_dir is None:
-            log.info("linker script: no build.ninja belongs to %s", compile_commands)
+        build_dir = compile_commands.parent
+        if not (build_dir / "build.ninja").is_file():
+            log.info("linker script: no build.ninja beside %s", compile_commands)
             return None
         return _linker.ninja_link(build_dir, _app_elf(build_dir))
 
@@ -352,30 +292,30 @@ class ESPIDFBuildSystem:
     # ── Validation ──
 
     def validate_artifacts(self, compile_commands: Path, project_root: Path) -> list[BuildIssue]:
-        """Report a project that was never built.
+        """Warn about a database whose directory is no ESP-IDF build directory.
 
-        Either directory answers the question, because the build may have
-        gone to an isolated one: `-B` sends a build that fw-context started
-        under AUTOBUILD_REL, and this method has no BuildConfig to tell it
-        which run produced the artifacts.  Asking only about `build/` made
-        an isolated build fail validation right after it succeeded, and the
-        error aborts the index run — the automatic build then recorded a
-        failure and backed off for half an hour.
-
-        The signature carries no config on purpose: it is the shared
-        protocol of thirteen backends, and widening it for this would cost
-        far more than the one extra test here.
+        ``build()`` leaves the database in the build directory that `-B`
+        names, beside ``build.ninja``.  A database without ``build.ninja``
+        beside it is a file that the user gives (a copy for clangd, a file
+        of a CI machine).  The index of its units is correct, but fw-context
+        does not know where its build is, thus the link of the application
+        and the memory map are not known.  That is a warning and not an
+        error: a search for the build from the paths of the units would be a
+        guess.
         """
         issues: list[BuildIssue] = []
-        built = (project_root / "build").exists() or (project_root / AUTOBUILD_REL).is_dir()
+        built = (compile_commands.parent / "build.ninja").is_file()
         if not built:
             issues.append(
                 BuildIssue(
-                    severity="error",
+                    severity="warning",
                     category="missing_build_dir",
-                    message="ESP-IDF build directory not found",
+                    message=(
+                        f"no ESP-IDF build directory beside {compile_commands}: the linker "
+                        "scripts and the memory map stay unknown"
+                    ),
                     auto_fixable=False,
-                    fix_hint="Run 'fw-context index --build' to compile the project.",
+                    fix_hint="Run 'fw-context index --build' to index the build of fw-context.",
                 )
             )
         return issues

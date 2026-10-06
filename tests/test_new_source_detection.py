@@ -313,16 +313,16 @@ class TestFwContextDirIsSkipped:
     """The directory fw-context writes into is never scanned for sources.
 
     The patterns of the backend do not cover it.  Measured against
-    ``.fw-context/autobuild/default/``: mbed-os contributes ``BUILD/`` and
+    ``.fw-context/build/default/out/``: mbed-os contributes ``BUILD/`` and
     platformio ``.pio/build/``, and neither matches; five other backends
-    match only because "autobuild/" happens to hold the substring "build/".
-    A generated .c left inside would be reported as missing from
+    match only because ".fw-context/build/" happens to hold the substring
+    "build/".  A generated .c left inside would be reported as missing from
     compile_commands.json, and that arms the automatic build again.
     """
 
-    def test_a_source_under_autobuild_is_not_reported(self, project):
+    def test_a_source_in_the_output_directory_is_not_reported(self, project):
         conn, root, cc = project
-        _add_file(root, ".fw-context/autobuild/default/src/generated.c", newer_than=cc)
+        _add_file(root, ".fw-context/build/default/out/src/generated.c", newer_than=cc)
 
         assert find_unindexed_sources(conn, _CONFIG_HASH, root, cc) == []
 
@@ -336,7 +336,7 @@ class TestFwContextDirIsSkipped:
         """The exclusion must not narrow the scan any further than that."""
         conn, root, cc = project
         _add_file(root, "src/added.c", newer_than=cc)
-        _add_file(root, ".fw-context/autobuild/default/src/generated.c", newer_than=cc)
+        _add_file(root, ".fw-context/build/default/out/src/generated.c", newer_than=cc)
 
         assert find_unindexed_sources(conn, _CONFIG_HASH, root, cc) == ["src/added.c"]
 
@@ -350,16 +350,16 @@ class TestFwContextDirIsSkipped:
         from fw_context_mcp.indexer.db import transaction, upsert_file
 
         conn, root, cc = project
-        generated = _add_file(root, ".fw-context/autobuild/default/cfg.c", newer_than=cc)
+        generated = _add_file(root, ".fw-context/build/default/out/cfg.c", newer_than=cc)
         with transaction(conn):
             upsert_file(
-                conn, _CONFIG_HASH, ".fw-context/autobuild/default/cfg.c", "c",
+                conn, _CONFIG_HASH, ".fw-context/build/default/out/cfg.c", "c",
                 mtime=os.path.getmtime(generated),
             )
             conn.execute(
                 "UPDATE files SET is_project=1 WHERE config_hash=?", (_CONFIG_HASH,)
             )
-        _add_file(root, ".fw-context/autobuild/default/other.c", newer_than=cc)
+        _add_file(root, ".fw-context/build/default/out/other.c", newer_than=cc)
 
         assert find_unindexed_sources(conn, _CONFIG_HASH, root, cc) == []
 

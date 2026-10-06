@@ -8,7 +8,8 @@ Two things guard that build:
 
 * The backend must be able to build without touching the output of the build
   that the user runs — see ``builders.background_build_safe``.
-* ``--background`` keeps refusing ``--build``, except for this one case.
+* ``--background`` refuses ``--build`` for every other backend, and for a
+  ``[build] command``.
 
 A failure does not block the next build for a time.  The failed run writes
 its text for each MCP answer (``autobuild.record_problem``), and the user
@@ -27,24 +28,7 @@ from fw_context_mcp.indexer.autobuild import (
     read_problem,
     record_problem,
 )
-from fw_context_mcp.utils import AUTOBUILD_REL, autobuild_dir
-
-
-class TestAutobuildDir:
-    def test_the_single_build_case_has_a_name(self):
-        assert autobuild_dir() == str(AUTOBUILD_REL / "default")
-
-    def test_each_variant_gets_its_own_directory(self):
-        """Variants build into separate directories and must stay separate.
-
-        One shared directory would make the variants overwrite each other.
-        """
-        assert autobuild_dir("nrf52840") != autobuild_dir("nrf5340")
-        assert autobuild_dir("nrf52840") == str(AUTOBUILD_REL / "nrf52840")
-
-    def test_it_lives_under_the_gitignored_directory(self):
-        """`fw-context init` adds .fw-context to .gitignore."""
-        assert autobuild_dir("x").startswith(".fw-context/")
+from fw_context_mcp.indexer.build import BuildVariant
 
 
 class TestProblemMarker:
@@ -93,15 +77,15 @@ class TestProblemMarker:
 
 
 class TestBackgroundBuildGate:
-    """``--background`` refuses ``--build``, except for the automatic case."""
+    """``--background`` builds only with a backend that may build on its own."""
 
     @staticmethod
-    def _cfg(isolated: str | None):
+    def _cfg(**build):
         from fw_context_mcp.indexer.build import BuildConfig
 
         class _Cfg:
             def __init__(self) -> None:
-                self.build = BuildConfig(isolated_build_dir=isolated)
+                self.build = BuildConfig(**build)
                 self.index = None
 
         return _Cfg()
@@ -112,18 +96,30 @@ class TestBackgroundBuildGate:
 
         return SimpleNamespace(build=True, compile_commands=None, no_clean=False)
 
-    def test_a_plain_background_build_is_refused(self, tmp_path: Path, capsys):
+    def test_a_build_that_compiles_in_the_tree_of_the_user_is_refused(self, tmp_path: Path, capsys):
+        """makefile compiles for real once the dry run is off, and the Makefile owns the output."""
         from fw_context_mcp.cli._index import _resolve_compile_commands
 
         result = _resolve_compile_commands(
-            self._args(), tmp_path, self._cfg(None), "makefile", True
+            self._args(), tmp_path, self._cfg(make_dry_run=False), "makefile", True
         )
 
         assert result == (None, False)
         assert "mutually exclusive" in capsys.readouterr().err
 
-    def test_an_isolated_background_build_passes_the_gate(self, tmp_path: Path, monkeypatch):
-        """With an isolated directory the two builds cannot meet."""
+    def test_a_custom_command_is_refused(self, tmp_path: Path, capsys):
+        """fw-context does not know where a build that the user wrote puts its output."""
+        from fw_context_mcp.cli._index import _resolve_compile_commands
+
+        result = _resolve_compile_commands(
+            self._args(), tmp_path, self._cfg(command="make"), "makefile", True
+        )
+
+        assert result == (None, False)
+        assert "mutually exclusive" in capsys.readouterr().err
+
+    def test_a_backend_that_may_build_passes_the_gate(self, tmp_path: Path, monkeypatch):
+        """The dry run of makefile compiles nothing, thus the two builds cannot meet."""
         import fw_context_mcp.indexer.build as build_mod
 
         marker = tmp_path / "generated.json"
@@ -133,7 +129,7 @@ class TestBackgroundBuildGate:
         )
 
         result = _resolve_compile_commands_with(
-            self._args(), tmp_path, self._cfg(autobuild_dir()), "makefile", True
+            self._args(), tmp_path, self._cfg(), "makefile", True
         )
 
         assert result == (marker, False), "the gate must not stop the automatic build"
@@ -150,18 +146,18 @@ class TestAutobuildState:
     """The two answers that decide both the status and the wording."""
 
     @staticmethod
-    def _cfg(isolated: str | None = ".fw-context/autobuild/default"):
+    def _cfg():
         from fw_context_mcp.indexer.build import BuildConfig
 
-        return BuildConfig(isolated_build_dir=isolated)
+        return BuildConfig()
 
-    def test_a_backend_that_isolates_will_build(self):
+    def test_a_backend_that_builds_into_the_build_tree_will_build(self):
         from fw_context_mcp.indexer.autobuild import AutobuildState, state
         from fw_context_mcp.indexer.builders.mbed_os import MbedOSBuildSystem
 
         assert state(MbedOSBuildSystem, self._cfg()) is AutobuildState.WILL_BUILD
 
-    def test_a_backend_that_compiles_without_isolation_is_unsupported(self):
+    def test_a_backend_that_compiles_in_the_tree_of_the_user_is_unsupported(self):
         """makefile compiles for real once the dry run is off."""
         from fw_context_mcp.indexer.autobuild import AutobuildState, state
         from fw_context_mcp.indexer.build import BuildConfig
@@ -237,7 +233,7 @@ class TestPlanAutoBuild:
             tmp_path, missing_db, self._cfg("makefile"), None, background=True
         ) == ([], None, "")
 
-    def test_a_backend_that_cannot_isolate_is_refused(self, tmp_path: Path):
+    def test_a_backend_that_cannot_build_is_refused(self, tmp_path: Path):
         """stm32cubeide cannot build at all, thus an attempt only wastes a run."""
         from fw_context_mcp.cli._index import _plan_auto_build
 
@@ -258,21 +254,16 @@ class TestPlanAutoBuild:
             tmp_path, db, self._cfg("no-such-system"), None, background=True
         ) == ([], None, "")
 
-    def test_the_backend_is_asked_with_the_isolated_directory(
+    def test_the_backend_is_asked_with_the_config_of_the_build(
         self, tmp_path: Path, monkeypatch
     ):
-        """protocol.py lets the answer depend on cfg.isolated_build_dir.
-
-        The question must therefore carry the value the build would really
-        use.  It used to be asked with the untouched cfg, where the field is
-        still None, so a backend that answered on it would answer wrongly.
-        """
+        """protocol.py lets the answer depend on the config, as makefile answers by make_dry_run."""
         from fw_context_mcp.cli import _index
 
         seen: list[object] = []
 
         def _spy(builder, cfg):
-            seen.append(cfg.isolated_build_dir)
+            seen.append(cfg)
             return False  # stop early; the recorded value is the point
 
         # _plan_auto_build imports the helper inside the function body, thus
@@ -283,21 +274,21 @@ class TestPlanAutoBuild:
 
         db = tmp_path / "index.db"
         db.write_text("", encoding="utf-8")
-        _index._plan_auto_build(tmp_path, db, self._cfg("makefile"), None, background=True)
+        cfg = self._cfg("makefile")
+        _index._plan_auto_build(tmp_path, db, cfg, None, background=True)
 
-        assert seen == [".fw-context/autobuild/default"]
+        assert seen == [cfg.build]
 
-    def test_a_refusal_leaves_the_config_untouched(self, tmp_path: Path):
-        """The planner must not set an isolated directory it never used."""
+    def test_a_custom_command_is_refused(self, tmp_path: Path):
+        """A build that the user wrote never starts on its own."""
         from fw_context_mcp.cli._index import _plan_auto_build
 
         db = tmp_path / "index.db"
         db.write_text("", encoding="utf-8")
-        cfg = self._cfg("stm32cubeide")
+        cfg = self._cfg("makefile")
+        cfg.build.command = "make"
 
-        _plan_auto_build(tmp_path, db, cfg, None, background=True)
-
-        assert cfg.build.isolated_build_dir is None
+        assert _plan_auto_build(tmp_path, db, cfg, None, background=True) == ([], None, "")
 
 
 class TestTheProblemOfAMultiRun:
@@ -340,7 +331,8 @@ class TestTheProblemOfAMultiRun:
         @dataclass
         class _Build:
             system: str | None = "zephyr"
-            variants: list = field(default_factory=lambda: ["one"])
+            build_dir: str | None = None
+            variants: list = field(default_factory=lambda: [BuildVariant(name="one")])
 
         @dataclass
         class _Cfg:

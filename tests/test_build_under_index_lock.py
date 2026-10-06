@@ -11,16 +11,16 @@ Observed on 2026-09-23, on a project with a daemon:
 
 ``cmd_index`` called ``_resolve_compile_commands`` — the function that builds —
 BEFORE it took ``index_run_lock``.  The lock covered the indexing only, thus
-two runs of one project could build at the same time.  Both builds write one
-canonical ``compile_commands.json``, because ``isolated_build_dir`` separates
-the object files and not that file.
+two runs of one project could build at the same time, and both wrote one
+``compile_commands.json``.
 
 Two repairs, and these tests hold each one:
 
 1. ``cmd_index`` builds inside the lock.  A run that loses the lock builds
    nothing at all.
 2. ``generate_compile_commands`` writes a staging file and renames it.  The
-   canonical file gets every byte at once, or it keeps what it had.
+   final file, ``out/compile_commands.json`` of the variant, gets every byte
+   at once, or it keeps what it had.
 """
 
 from __future__ import annotations
@@ -37,13 +37,23 @@ import pytest
 
 from fw_context_mcp.exit_codes import EXIT_ALREADY_RUNNING
 from fw_context_mcp.indexer.build import BuildConfig, generate_compile_commands
+from fw_context_mcp.indexer.build_layout import BuildLayout
 from fw_context_mcp.utils import (
-    CC_OUTPUT_REL,
     cc_output_path,
     cc_staging_path,
     owner_token,
     staging_owner,
 )
+
+
+def _final(project_root: Path, variant: str = "") -> Path:
+    """The database that a build of *variant* gives, in its output directory."""
+    return BuildLayout(project_root).out_dir(variant) / "compile_commands.json"
+
+
+def _staging(project_root: Path, variant: str = "") -> Path:
+    """The staging file of this process, in the directory of *variant* beside out/."""
+    return cc_staging_path(BuildLayout(project_root).variant_dir(variant))
 
 # ── Configuration stubs ──────────────────────────────────────────────────────
 
@@ -59,6 +69,8 @@ class _FakeIndexCfg:
 @dataclass
 class _FakeBuildCfg:
     system: str | None = "makefile"
+    build_dir: str | None = None
+    command: str | None = None
     variants: list = field(default_factory=list)
 
 
@@ -274,19 +286,19 @@ class TestTheCanonicalFileChangesInOneStep:
         fake_backend(_Recorder)
         generate_compile_commands(tmp_path, BuildConfig(system="fake"))
 
-        assert seen == [cc_staging_path(tmp_path)]
+        assert seen == [_staging(tmp_path)]
 
     def test_a_finished_build_reaches_the_canonical_file(self, tmp_path: Path, fake_backend):
         fake_backend(_GoodBuilder)
         result = generate_compile_commands(tmp_path, BuildConfig(system="fake"))
 
-        canonical = tmp_path / CC_OUTPUT_REL
+        canonical = _final(tmp_path)
         assert result == canonical
         assert canonical.read_text(encoding="utf-8") == _GoodBuilder.PAYLOAD
 
     def test_a_failed_build_keeps_the_file_that_worked(self, tmp_path: Path, fake_backend):
         """The whole point of the rename: a dead build costs no good database."""
-        canonical = tmp_path / CC_OUTPUT_REL
+        canonical = _final(tmp_path)
         canonical.parent.mkdir(parents=True)
         canonical.write_text('[{"file": "old.c"}]', encoding="utf-8")
 
@@ -327,10 +339,10 @@ class TestTheCanonicalFileChangesInOneStep:
             def build(self, project_root: Path, cfg: BuildConfig) -> Path:
                 return cc_output_path(project_root, cfg)
 
-        canonical = tmp_path / CC_OUTPUT_REL
+        canonical = _final(tmp_path)
         canonical.parent.mkdir(parents=True)
         canonical.write_text('[{"file": "old.c"}]', encoding="utf-8")
-        cc_staging_path(tmp_path).write_text('[{"file": "ma', encoding="utf-8")
+        _staging(tmp_path).write_text('[{"file": "ma', encoding="utf-8")
 
         fake_backend(_SilentBuilder)
         with pytest.raises(RuntimeError, match="no compilation database"):
@@ -354,31 +366,91 @@ class TestTheCanonicalFileChangesInOneStep:
         with pytest.raises(RuntimeError, match="the build died"):
             generate_compile_commands(tmp_path, BuildConfig(system="fake"))
 
-        assert list((tmp_path / CC_OUTPUT_REL).parent.glob(".compile_commands.*.json")) == []
+        assert list(_staging(tmp_path).parent.glob(".compile_commands.*.json")) == []
+
+    def test_a_clean_of_out_during_the_build_does_not_lose_the_database(self, tmp_path: Path, fake_backend):
+        """`mbed compile --clean` removes the --build directory while bear runs."""
+        import shutil
+
+        class _CleaningBuilder:
+            def build(self, project_root: Path, cfg: BuildConfig) -> Path:
+                target = cc_output_path(project_root, cfg)
+                out = BuildLayout(project_root).out_dir(cfg.variant_name)
+                out.mkdir(parents=True, exist_ok=True)
+                shutil.rmtree(out)  # the clean of the build system
+                target.write_text(_GoodBuilder.PAYLOAD, encoding="utf-8")
+                return target
+
+        fake_backend(_CleaningBuilder)
+        result = generate_compile_commands(tmp_path, BuildConfig(system="fake"))
+
+        assert result.read_text(encoding="utf-8") == _GoodBuilder.PAYLOAD
+
+    def test_a_variant_builds_into_its_own_output_directory(self, tmp_path: Path, fake_backend):
+        """Two variants with one output directory would overwrite each other."""
+        fake_backend(_GoodBuilder)
+        result = generate_compile_commands(tmp_path, BuildConfig(system="fake", variant_name="dev"))
+
+        assert result == _final(tmp_path, "dev")
+        assert not _final(tmp_path).exists()
+
+    def test_the_database_of_the_build_system_stays_where_it_is(self, tmp_path: Path, fake_backend):
+        """CMake, Zephyr, ESP-IDF and Arduino write the database beside build.ninja.
+
+        The linker pass reads build.ninja from the directory of the database,
+        thus a copy elsewhere would lose the linker script.
+        """
+        native = BuildLayout(tmp_path).out_dir("") / "app" / "compile_commands.json"
+
+        class _NativeBuilder:
+            def build(self, project_root: Path, cfg: BuildConfig) -> Path:
+                native.parent.mkdir(parents=True)
+                native.write_text("[]", encoding="utf-8")
+                return native
+
+        fake_backend(_NativeBuilder)
+        assert generate_compile_commands(tmp_path, BuildConfig(system="fake")) == native
+
+    def test_the_build_tree_is_ignored_before_the_build(self, tmp_path: Path, fake_backend):
+        seen: list[bool] = []
+
+        class _Recorder:
+            def build(self, project_root: Path, cfg: BuildConfig) -> Path:
+                seen.append((project_root / ".fw-context" / "build" / ".gitignore").is_file())
+                return _GoodBuilder().build(project_root, cfg)
+
+        fake_backend(_Recorder)
+        generate_compile_commands(tmp_path, BuildConfig(system="fake"))
+
+        assert seen == [True]
 
 
 class TestStagingPaths:
-    def test_the_staging_file_is_beside_the_canonical_file(self, tmp_path: Path):
-        """``os.replace`` is atomic only inside one directory."""
-        assert cc_staging_path(tmp_path).parent == (tmp_path / CC_OUTPUT_REL).parent
+    def test_the_staging_file_is_beside_out_and_not_in_it(self, tmp_path: Path):
+        """A clean of the build system removes out/ while bear still writes.
+
+        The variant directory is on the file system of out/, thus the rename
+        stays atomic.
+        """
+        assert _staging(tmp_path).parent == _final(tmp_path).parent.parent
 
     def test_the_name_holds_the_owner_token(self, tmp_path: Path):
         """The PID alone is not unique when a container shares the project."""
-        token = staging_owner(cc_staging_path(tmp_path))
+        token = staging_owner(_staging(tmp_path))
         assert token == owner_token()
         assert token.startswith(f"{os.getpid()}@")
 
-    def test_the_name_hides_from_the_variant_scan(self, tmp_path: Path):
-        """``compile_commands.<variant>.json`` is a variant.  A staging file is not.
+    def test_the_name_hides_from_a_scan_for_databases(self, tmp_path: Path):
+        """A staging file that matched ``compile_commands.*`` would be read as a build.
 
-        ``cli/_index._discover_existing_cc`` reads that name, and
-        ``indexer/_embedding._cleanup_orphaned_cc_artifacts`` reads the same
-        prefix.  A staging file that matched either would be read as a build.
+        ``indexer/_embedding._cleanup_orphaned_cc_artifacts`` reads that
+        prefix.
         """
-        assert cc_staging_path(tmp_path).name.startswith(".")
+        assert _staging(tmp_path).name.startswith(".")
 
-    def test_no_cfg_gives_the_canonical_path(self, tmp_path: Path):
-        assert cc_output_path(tmp_path) == tmp_path / CC_OUTPUT_REL
+    def test_a_cfg_without_a_staging_file_gives_the_final_file_of_its_variant(self, tmp_path: Path):
+        assert cc_output_path(tmp_path, BuildConfig()) == _final(tmp_path)
+        assert cc_output_path(tmp_path, BuildConfig(variant_name="dev")) == _final(tmp_path, "dev")
 
     def test_a_cfg_with_a_staging_file_gives_that_file(self, tmp_path: Path):
         staging = tmp_path / ".fw-context" / "build" / ".compile_commands.1.json"
@@ -387,7 +459,7 @@ class TestStagingPaths:
 
 def _staging_of(tmp_path: Path, token: str) -> Path:
     """The staging file that the owner *token* would write in *tmp_path*."""
-    return cc_staging_path(tmp_path).with_name(f".compile_commands.{token}.json")
+    return _staging(tmp_path).with_name(f".compile_commands.{token}.json")
 
 
 def _token_of(pid: int | str) -> str:
@@ -402,11 +474,24 @@ class TestDeadStagingFiles:
     def _clear(tmp_path: Path) -> None:
         from fw_context_mcp.indexer.build import clear_dead_staging_files
 
-        clear_dead_staging_files(cc_staging_path(tmp_path))
+        clear_dead_staging_files(_staging(tmp_path))
 
     def test_the_file_of_a_dead_process_goes(self, tmp_path: Path):
         orphan = _staging_of(tmp_path, _token_of(2147483646))
         orphan.write_text("[]", encoding="utf-8")
+
+        self._clear(tmp_path)
+
+        assert not orphan.exists()
+
+    def test_the_file_of_an_earlier_version_with_a_variant_name_goes(self, tmp_path: Path):
+        """Earlier versions wrote ``.compile_commands.<variant>.<image>.<token>.json``.
+
+        A copy that SIGKILL stopped left such a file, and the cleanup must
+        still find it.
+        """
+        orphan = _staging_of(tmp_path, f"dev.app.{_token_of(2147483646)}")
+        orphan.write_text("[", encoding="utf-8")
 
         self._clear(tmp_path)
 
@@ -493,10 +578,10 @@ class TestDeadStagingFiles:
             other.kill()
             other.wait(timeout=10)
 
-    def test_the_canonical_file_stays(self, tmp_path: Path):
-        canonical = cc_output_path(tmp_path)
-        canonical.write_text("[]", encoding="utf-8")
+    def test_the_final_file_stays(self, tmp_path: Path):
+        final = cc_output_path(tmp_path, BuildConfig())
+        final.write_text("[]", encoding="utf-8")
 
         self._clear(tmp_path)
 
-        assert canonical.exists()
+        assert final.exists()

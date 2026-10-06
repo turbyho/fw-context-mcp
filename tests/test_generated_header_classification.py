@@ -7,9 +7,9 @@ a change of meaning — so every unit that includes it is marked header-stale
 and re-parsed, which is the opposite of what the three staleness tiers are
 for.
 
-An isolated automatic build writes those headers under
-`.fw-context/autobuild/`, and the patterns of the backend do not reach
-there.
+Each build of fw-context writes those headers under
+`.fw-context/build/<variant>/out/`, and the patterns of the backend do not
+reach there.
 """
 
 from __future__ import annotations
@@ -17,12 +17,15 @@ from __future__ import annotations
 import pytest
 
 from fw_context_mcp.indexer.manifest import _is_generated_header
-from fw_context_mcp.utils import autobuild_dir, build_dir_patterns_with_fw_context
+from fw_context_mcp.utils import build_dir_patterns_with_fw_context
+
+# The output directory of a build of fw-context, as build_layout names it.
+_OUT = ".fw-context/build/default/out"
 
 # The real values, read out of the manifests of the test projects.  They are
 # the point: three of these do not match the fw-context directory at all,
-# and the ones that do match only because ".fw-context/autobuild/" happens
-# to hold the substring "build/".
+# and the ones that do match only because ".fw-context/build/" happens to
+# hold the substring "build/".
 REAL_PATTERNS = {
     "mbed_os": ["BUILD/"],
     "platformio": [".pio/build/"],
@@ -39,14 +42,14 @@ REAL_PATTERNS = {
 
 class TestFwContextCountsAsBuildOutput:
     @pytest.mark.parametrize("backend", sorted(REAL_PATTERNS))
-    def test_a_generated_header_in_the_isolated_directory(self, backend: str):
+    def test_a_generated_header_in_the_output_directory(self, backend: str):
         """Parametrised on purpose: today only some of these match by luck."""
         patterns = build_dir_patterns_with_fw_context(REAL_PATTERNS[backend])
-        header = f"{autobuild_dir()}/mbed_config.h"
+        header = f"{_OUT}/mbed_config.h"
 
         assert _is_generated_header(header, patterns), (
             f"{backend} gives {REAL_PATTERNS[backend]}, which does not reach "
-            "the directory an isolated build writes to"
+            "the directory a build of fw-context writes to"
         )
 
     @pytest.mark.parametrize("backend", sorted(REAL_PATTERNS))
@@ -58,10 +61,10 @@ class TestFwContextCountsAsBuildOutput:
         """The helper adds, it does not replace."""
         patterns = build_dir_patterns_with_fw_context(["BUILD/"])
         assert _is_generated_header("BUILD/mbed_config.h", patterns)
-        assert _is_generated_header(f"{autobuild_dir('nrf52')}/autoconf.h", patterns)
+        assert _is_generated_header(".fw-context/build/nrf52/out/zephyr/include/generated/autoconf.h", patterns)
 
     def test_an_empty_pattern_list_still_covers_fw_context(self):
         """iar, keil and manual give no patterns at all."""
         assert _is_generated_header(
-            f"{autobuild_dir()}/sdkconfig.h", build_dir_patterns_with_fw_context([])
+            f"{_OUT}/config/sdkconfig.h", build_dir_patterns_with_fw_context([])
         )

@@ -7,8 +7,9 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from fw_context_mcp.utils import cc_output_path, resolve_build_dir, run_build_command
+from fw_context_mcp.utils import cc_output_path, run_build_command
 
+from ..build_layout import BuildLayout
 from . import registry
 from .protocol import BuildIssue
 
@@ -64,7 +65,7 @@ class ArduinoBuildSystem:
                 '  [build]\n  fqbn = "arduino:avr:uno"'
             )
 
-        build_dir = resolve_build_dir(project_root, cfg, "build")
+        build_dir = BuildLayout(project_root).out_dir(cfg.variant_name)
         if cfg.clean and build_dir.exists():
             shutil.rmtree(build_dir)
 
@@ -87,22 +88,20 @@ class ArduinoBuildSystem:
             build_cfg=cfg,
         )
 
-        cc_in_build = build_dir / "compile_commands.json"
-        if not cc_in_build.exists():
+        # The database stays in the build directory when arduino-cli writes
+        # it there.  An arduino-cli that writes it into the sketch directory
+        # gets a copy in the build directory, so the index never reads a file
+        # that the next build of the user can replace.
+        target_cc = build_dir / "compile_commands.json"
+        if not target_cc.exists():
             cc_in_root = project_root / "compile_commands.json"
-            if cc_in_root.exists():
-                cc_in_build = cc_in_root
-            else:
+            if not cc_in_root.exists():
                 raise RuntimeError(
                     "compile_commands.json not generated. Ensure arduino-cli supports --only-compilation-database."
                 )
-
-        # Copy to the gitignored fw-context build dir for consistency BEFORE
-        # the real compile, which may overwrite build/compile_commands.json
-        # (or not — but without --only-compilation-database it typically won't).
-        target_cc = cc_output_path(project_root, cfg)
-        shutil.copy2(cc_in_build, target_cc)
-        log.info("Copied %s → %s", cc_in_build, target_cc)
+            target_cc = cc_output_path(project_root, cfg)
+            shutil.copy2(cc_in_root, target_cc)
+            log.info("Copied %s → %s", cc_in_root, target_cc)
 
         # ── Pass 2: real compile to produce .d dependency files ──
         log.info("arduino build (compile): %s", " ".join(base_cmd))
@@ -117,7 +116,7 @@ class ArduinoBuildSystem:
         return target_cc
 
     def background_build_safe(self, cfg: BuildConfig) -> bool:
-        """Safe — ``arduino-cli compile --build-path`` puts artifacts there."""
+        """Safe — ``--build-path`` puts every artifact in the output directory of fw-context."""
         return True
 
     # ── Build dir patterns ──

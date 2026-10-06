@@ -20,23 +20,45 @@ capabilities and your configuration. You do not need to know which path
 `fw-context` uses. Just configure the relevant parameters, and `fw-context`
 does the rest.
 
-The generated `compile_commands.json` is written to
-`.fw-context/build/compile_commands.json` — a gitignored subdirectory of the
-project config dir, so the build artifact stays out of the repository root.
+### Where the build goes
 
-A build does not write that file directly. It writes a staging file in the
-same directory, `.compile_commands.<pid>@<tag>.json`, and one rename then
-gives `compile_commands.json` the new content. Thus a build that fails keeps
-the file that the last good build wrote. A reader never gets a database that
-a build still writes.
+Each build that fw-context runs writes into one tree that fw-context owns:
 
-A multi-variant project writes one file for each build, in the same
-directory. A variant without sysbuild writes
-`compile_commands.<variant>.json`, with the same staging rename. A Zephyr
-sysbuild image gets `compile_commands.<variant>.<image>.json`, which
-fw-context copies from the build directory of the image. The copy goes to
-a temporary file first, and one rename then replaces the target, thus a
-reader never gets a part of it.
+```text
+.fw-context/build/
+├── .gitignore            "*"
+└── <variant>/            one run of the build system; "default" without variants
+    ├── out/              the output directory of the build system
+    └── platformio_link.json
+```
+
+`<variant>` is the name of a `[[build.variants]]` entry. A project without
+variants uses `default`. The build system owns `out/`: a pristine build, a
+clean, or a PlatformIO checksum change can remove it as a whole. Thus a file
+that fw-context writes for a build sits beside `out/`, not in it.
+
+fw-context never reads the build directory of your own build (`build/`,
+`.pio/build/`, `BUILD/`). WHY: your next build in an IDE, with `pio run`, or
+in a CI script replaces that output, and the index would change without a
+word. Also, the check for a missing build is the same for each build
+system: the output directory is there, or it is not.
+
+The index reads `compile_commands.json` where the build system writes it in
+`out/`. The database stays beside `build.ninja`, which the linker pass reads:
+
+| Build | Database |
+|-------|----------|
+| One program (CMake, ESP-IDF, Arduino, Mbed OS, Makefile, Keil, IAR, manual) | `out/compile_commands.json` |
+| Zephyr without `sysbuild = true` | `out/compile_commands.json`, or `out/zephyr/compile_commands.json` when NCS builds with sysbuild by default |
+| Zephyr sysbuild, one per image | `out/<image>/compile_commands.json` |
+
+A tool that fw-context gives the output path to (bear, compiledb,
+keil2clangd, the manual backend) does not write the file directly. It writes
+a staging file in the directory of the variant,
+`<variant>/.compile_commands.<pid>@<tag>.json`, and one rename then gives
+`out/compile_commands.json` the new content. Thus a reader never gets a
+database that a build still writes. The staging file is beside `out/` and
+not in it, because `mbed compile --clean` removes `out/` while bear writes.
 
 Only a build that a signal stops leaves a staging file. The next build in
 that directory deletes it when its process no longer runs. The `<tag>` is
@@ -44,7 +66,13 @@ the host name and the PID namespace of the build. A PID of a container
 names no process on the host, thus a build deletes only the files of its
 own PID namespace.
 
-`fw-context init` writes the rules for it into `.gitignore` automatically:
+A variant name is a directory name. It must not be empty, it must not start
+with `.`, and it must not hold `/ \ : * ? " < > |` or a control character.
+Two names that differ only in case are an error, because they are one
+directory on macOS and Windows.
+
+`fw-context init` writes the rules for the build tree into `.gitignore`
+automatically:
 
 ```gitignore
 **/.fw-context/*
@@ -89,25 +117,27 @@ A `fw-context index` run without `--build` can start a build on its own.
 
 At the start of each run, fw-context makes sure that the build is there.
 The build is not there when `compile_commands.json` does not exist, or when
-a `directory` of its entries does not exist (for example after
-`rm -rf build` or `idf.py fullclean`). WHY: fw-context asks the compiler of
-each unit for its system headers in that directory, as the build runs it.
-Without the build, each unit would get wrong system headers and macros.
+a `directory` of its entries does not exist. The database is in the output
+directory of the build, thus `rm -rf .fw-context/build` removes the two
+together. WHY: fw-context asks the compiler of each unit for its system
+headers in that directory, as the build runs it. Without the build, each
+unit would get wrong system headers and macros.
 
-- A run that you start builds as `--build` does, in your build directory.
-- A background run builds into an isolated directory (see below).
+- A run that you start builds as `--build` does.
+- A background run builds when the backend can build on its own (see
+  below).
 - When fw-context cannot run the build, the run stops with an error and
-  does not index. This is true for STM32CubeIDE and TI CCS, and for a
-  background run of a backend that cannot build in isolation. Run the
-  build yourself (in the IDE, or with `fw-context index --build`), then run
-  `fw-context index`.
+  does not index. This is true for STM32CubeIDE and TI CCS, for a
+  `[build] command` in a background run, and for a background run of a
+  backend that compiles in your tree. Run the build yourself (in the IDE,
+  or with `fw-context index --build`), then run `fw-context index`.
 
 A run with an explicit `compile_commands.json`, or a project with
 `[[build.variants]]`, does not do this check. `get_active_build` does not
 do it for such an index either.
 
-A run builds into an isolated directory when an index exists and a build
-can repair something that a reindex cannot:
+A run builds when an index exists and a build can repair something that a
+reindex cannot:
 
 - The build is not there. This applies to a background run.
 - Source files are on disk that `compile_commands.json` does not cover.
@@ -124,40 +154,37 @@ that run when a C/C++ file changes; a change of a build file only (for
 example `CMakeLists.txt`) starts no run. For the triggers of the background runs, see
 [`fw-context index`](tools.md#fw-context-index).
 
-fw-context starts the build only for a backend that cannot damage the
-output of your own build. Such a backend puts its artifacts into a
-directory of its own, or it compiles nothing:
+fw-context starts the build on its own only for a backend that cannot
+damage the output of your own build. Such a backend puts its artifacts into
+the output directory of fw-context, or it compiles nothing:
 
-| Backend | Automatic build | Why |
-|---------|-----------------|-----|
-| Mbed OS | yes | `mbed compile --build <dir>` |
-| PlatformIO | yes | `PLATFORMIO_BUILD_DIR` |
-| Zephyr | yes | `west build -d <dir>` |
-| ESP-IDF | yes | `idf.py -B <dir>` |
-| Arduino | yes | `arduino-cli compile --build-path <dir>` |
-| Generic CMake | yes | configure and build use the chosen build directory |
+| Backend | Automatic build | Output directory |
+|---------|-----------------|------------------|
+| Mbed OS | yes | `mbed compile --build <out>` |
+| PlatformIO | yes | `PLATFORMIO_BUILD_DIR=<out>` |
+| Zephyr | yes | `west build -d <out>` |
+| ESP-IDF | yes | `idf.py -B <out>` |
+| Arduino | yes | `arduino-cli compile --build-path <out>` |
+| Generic CMake | yes | `cmake -B <out>` |
 | Keil MDK, IAR EWARM | yes | convert only, no compilation |
-| Manual / bare | yes | `.d` files go to a directory of fw-context |
+| Manual / bare | yes | the `.d` files go to `<out>/deps` |
 | Makefile | only with `make_dry_run = true` (default) | a real `make` owns its output directory |
 | STM32CubeIDE, TI CCS | never | fw-context cannot build these projects |
 
-The automatic build writes into `.fw-context/autobuild/<variant>`, or
-`.fw-context/autobuild/default` for a project without variants. fw-context
-writes `.fw-context/autobuild/.gitignore` with the line `*`, thus the
-output stays out of git also in a project that `fw-context init` set up
-before this directory existed.
+A build that you start with `--build` uses the same output directory.
+fw-context writes `.fw-context/build/.gitignore` with the line `*`, thus the
+output stays out of git also in a project that `fw-context init` did not
+set up.
 
 Exceptions:
 
 - PlatformIO: `pio run -t compiledb` also rewrites
-  `<project>/compile_commands.json`. fw-context cannot move that file
-  without a change to `platformio.ini`.
+  `<project>/compile_commands.json`. The index reads the copy in `<out>`.
 - ESP-IDF: fw-context runs `idf.py set-target` only when the project has
   no `sdkconfig`. `set-target` renames `<project>/sdkconfig`, and `-B`
   does not move that file.
-- Manual / bare: the `.d` files go to the isolated build directory. In a
-  build that you start, they go to `.fw-context/build/deps`. They never go
-  next to the source.
+- Makefile: with `make_dry_run = false`, `make` writes its objects where the
+  Makefile says.
 
 ## Configuration reference
 
@@ -287,7 +314,7 @@ build. You do not need one checkout per board.
 | `name` | `str` | — | **Required.** A unique key. The query tools and the CLI reference this key. |
 | `board` | `str` | — | The board, target, or chip label for this variant. This value overrides `[build] board`. |
 | `description` | `str` | — | A human-readable description. |
-| `build_dir` | `str` | `build/<name>` | The build output directory for this variant. |
+| `build_dir` | — | — | Retired, here and in `[build]`. Each variant builds into `.fw-context/build/<name>/out`. An index run stops with an error while the key is in the config. |
 | `env` | `dict` | — | Build environment variables. fw-context folds these variables into the `config_hash`. |
 | `images` | `list` | — | The sysbuild images (Zephyr only). |
 | *(any other `[build]` key)* | — | — | Overrides the shared `[build]` value for this variant only. |
@@ -325,15 +352,18 @@ fw-context index --image app                      # one image only
 fw-context index --exclude-image mcuboot          # skip one image
 ```
 
-With `--build`, a variant without sysbuild writes
-`.fw-context/build/compile_commands.<variant>.json`. A Zephyr sysbuild
-variant writes `.fw-context/build/compile_commands.<variant>.<image>.json`
-for each image. A later run without `--build` reuses the files: the file of
-each variant without sysbuild, and `<build_dir>/<image>/compile_commands.json`
-for each sysbuild image.
+With `--build`, each variant builds into `.fw-context/build/<variant>/out`.
+A variant without sysbuild gives `out/compile_commands.json`. A Zephyr
+sysbuild variant gives `out/<image>/compile_commands.json` for each image
+that the build makes, thus the images of each variant are the images of its
+build. A later run without `--build` reads the same files.
 
-A variant name that cannot be part of a file name, for example a name with
-`/`, fails that variant only. The other variants build and index.
+`--variant` and `--variants` limit the build too: a Zephyr sysbuild run
+builds only the variants that you name. `--image` limits the index only,
+because sysbuild builds all images of a variant in one run.
+
+A variant name that cannot be a directory name, for example a name with
+`/`, stops the run before any build. See [Where the build goes](#where-the-build-goes).
 
 ### Manage the variants
 
@@ -365,7 +395,7 @@ options from it: the linker scripts (`-T`, `--default-script`) and the
 `--defsym` values. SCons writes no file that holds the link command, thus
 this step is the only source of the memory map and of the linker-script
 symbols of a PlatformIO build. fw-context records the result in
-`.fw-context/build/platformio_link.json`.
+`.fw-context/build/<variant>/platformio_link.json`, beside `out/`.
 
 Each `pio run` also runs the `extra_scripts` of the project, thus the
 `envdump` step runs them one more time. An index run without `--build`
@@ -654,7 +684,6 @@ default_variant = "nrf52840-dev"
 [[build.variants]]
 name = "nrf52840-dev"
 board = "nrf52840dk/nrf52840"
-build_dir = "build/nrf52840_sysbuild"
 env = { BOARD_ENV = "DEV" }
 images = [
   { name = "app",      dir = "proj/app",                  type = "project" },

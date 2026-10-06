@@ -65,6 +65,33 @@ def background_build_safe(builder: BuildSystem | None, cfg) -> bool:
         return False
 
 
+def output_compile_commands(builder: BuildSystem | None, out_dir: Path, cfg) -> dict[str, Path]:
+    """Return the compilation databases that the build in *out_dir* produced.
+
+    The key is the image name, and "" names the only program of a build that
+    makes one.  Only files that exist are in the result, thus an empty result
+    means that the build is not there.  *cfg* is the ``BuildConfig`` of the
+    build, because the configuration selects the command, and the command
+    selects where the database is (``west build`` or ``west build
+    --sysbuild``).
+
+    ``output_compile_commands`` is an OPTIONAL method of a backend, for a
+    build system that puts the database somewhere else than
+    ``out/compile_commands.json``: one database per image (Zephyr sysbuild),
+    or one per environment (PlatformIO).  A backend without the method writes
+    ``out/compile_commands.json``.  The concrete classes implement the
+    ``BuildSystem`` protocol structurally, thus a default on the protocol
+    would never reach them.
+    """
+    from ..build_layout import COMPILE_COMMANDS_NAME
+
+    probe = getattr(builder, "output_compile_commands", None) if builder is not None else None
+    if probe is not None:
+        return dict(probe(out_dir, cfg))
+    single = out_dir / COMPILE_COMMANDS_NAME
+    return {"": single} if single.is_file() else {}
+
+
 def linker_scripts(
     builder: BuildSystem | None,
     project_root: Path,
@@ -114,9 +141,9 @@ def link_record(
     None means "the backend does not know", and the pass then keeps the
     rows of an earlier run.  A record with no script means "the link names
     no script", and the pass removes them.  `get_linker_scripts` cannot
-    give that difference: its empty list means both.  Measured on a Zephyr
-    sysbuild project, the copy of the database in `.fw-context/build/` has
-    no `build.ninja` next to it, and an empty list there is "do not know".
+    give that difference: its empty list means both.  A database whose
+    build directory holds no `build.ninja` gives an empty list that means
+    "do not know".
 
     ``get_link_record`` is an OPTIONAL method with the arguments of
     ``get_linker_scripts``.  It is not on the ``BuildSystem`` protocol, for

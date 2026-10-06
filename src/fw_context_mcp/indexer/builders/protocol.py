@@ -100,8 +100,9 @@ class BuildSystem(Protocol):
 
         Answer True only when one of these holds:
 
-        * The backend writes every artifact under
-          ``cfg.isolated_build_dir``, thus the two builds cannot meet.
+        * The backend writes every artifact under the output directory of
+          the variant, ``.fw-context/build/<variant>/out`` (see
+          ``build_layout``), thus the two builds cannot meet.
         * The backend compiles nothing (a converter, or a dry run), thus
           there is no artifact to corrupt.
 

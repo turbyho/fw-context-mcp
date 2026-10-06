@@ -28,6 +28,7 @@ from types import SimpleNamespace
 import pytest
 
 from fw_context_mcp.exit_codes import EXIT_SUPERSEDED
+from fw_context_mcp.indexer.build import BuildVariant
 
 # ── Fix 1: the ping loop must start the daemon again ─────────────────────────
 
@@ -144,6 +145,7 @@ class _FakeIndexCfg:
 @dataclass
 class _FakeBuildCfg:
     system: str | None = "makefile"
+    build_dir: str | None = None
     variants: list = field(default_factory=list)
 
 
@@ -334,7 +336,7 @@ class TestCmdIndexWiring:
 
         cfg = _FakeCfg(
             index=_FakeIndexCfg(db_dir=tmp_path / "index"),
-            build=_FakeBuildCfg(variants=[object()]),
+            build=_FakeBuildCfg(variants=[BuildVariant(name="v")]),
         )
         started = self._patch_cmd_index(monkeypatch, tmp_path, cfg)
         monkeypatch.setattr(index_mod, "_run_multi", lambda *a, **kw: 0)
@@ -348,7 +350,7 @@ class TestCmdIndexWiring:
 
         cfg = _FakeCfg(
             index=_FakeIndexCfg(db_dir=tmp_path / "index"),
-            build=_FakeBuildCfg(variants=[object()]),
+            build=_FakeBuildCfg(variants=[BuildVariant(name="v")]),
         )
         started = self._patch_cmd_index(monkeypatch, tmp_path, cfg)
         monkeypatch.setattr(index_mod, "_run_multi", lambda *a, **kw: 1)
@@ -356,7 +358,7 @@ class TestCmdIndexWiring:
         assert cmd_index(self._args()) == 1
         assert started == []
 
-    @pytest.mark.parametrize("variants", [[], [object()]], ids=["single", "variants"])
+    @pytest.mark.parametrize("variants", [[], [BuildVariant(name="v")]], ids=["single", "variants"])
     def test_a_refused_run_builds_nothing(self, monkeypatch, tmp_path: Path, variants: list):
         """The index is owned BEFORE the build, on both paths.
 

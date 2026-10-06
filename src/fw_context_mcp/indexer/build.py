@@ -26,7 +26,6 @@ from fw_context_mcp.utils import (
     build_cfg_env,
     cc_output_path,
     cc_staging_path,
-    ignore_autobuild_dir,
     owner_is_dead,
     run_in_process_group,
     staging_owner,
@@ -35,6 +34,8 @@ from fw_context_mcp.utils import (
 # Import builders package so the registry is populated with all registered
 # build system backends before ``detect_build_system()`` is called.
 from . import builders  # noqa: F401 — side-effect import
+from .build_layout import COMPILE_COMMANDS_NAME, BuildLayout
+from .builders import output_compile_commands
 from .builders import registry as _builder_registry
 
 log = logging.getLogger(__name__)
@@ -100,7 +101,11 @@ class BuildConfig:
     # ── Zephyr sysbuild (multi-image) + multi-variant ──
     source_dir: str | None = None  # sysbuild source app dir (e.g. "proj/app")
     sysbuild: bool = False  # use `west build --sysbuild`
-    build_dir: str | None = None  # build output dir override (default "build")
+    # A retired key.  Each build goes to .fw-context/build/<variant>/out (see
+    # build_layout), thus the value has no effect.  It stays parsed only so
+    # that the index run can refuse it (retired_build_dir_keys) instead of
+    # ignoring it without a word.
+    build_dir: str | None = None
 
     # Multi-variant build configuration (opt-in).  When empty, every builder
     # produces a single compile_commands.json (variant='' image='' board='').
@@ -132,37 +137,22 @@ class BuildConfig:
     make_vars: dict[str, str] = field(default_factory=dict)  # extra vars for make
     make_dry_run: bool = True  # use compiledb -n (dry-run, no real build)
 
-    # ── Isolated build directory ──
-    # Set only for a build that fw-context starts on its own, after it finds
-    # a source file that compile_commands.json does not cover.  The build
-    # then writes to this directory instead of the usual one, thus it cannot
-    # corrupt the object files of a build that the user runs in an IDE at the
-    # same time.  fw-context cannot lock that build: the IDE knows nothing
-    # about fw-context, so separation is the only defence.
-    #
-    # A relative path resolves against the project root.  None keeps the
-    # default directory of the build system.
-    #
-    # The price is one more set of artifacts (192 MB on the Mbed project) and a
-    # first build with no shared object cache.  Measured at 15-30 s there,
-    # which is nothing against an index run of over an hour.
-    isolated_build_dir: str | None = None
-
     # ── Staging file for the compilation database ──
     # generate_compile_commands sets this, and no user configuration does.
     # The backend then writes the compilation database to this file instead
-    # of the canonical compile_commands.json, and the caller renames it when
-    # the build ends.  A reader of the canonical file thus never gets a
-    # database that a build still writes.
+    # of the final compile_commands.json, and the caller renames it when the
+    # build ends.  A reader of the final file thus never gets a database that
+    # a build still writes.
     #
-    # None means the canonical path — see utils.cc_output_path.
+    # None means the final path — see utils.cc_output_path.
     cc_output: Path | None = None
 
     # ── Name of the variant this config builds ──
-    # build_variant_config sets this, and no user configuration does.  A
-    # backend that records a property of its build next to the database, as
-    # the PlatformIO backend records its link, needs it: every variant builds
-    # before the first one is indexed.  "" is the build with no variants.
+    # build_variant_config sets this, and no user configuration does.  It
+    # selects the output directory of the build,
+    # .fw-context/build/<variant>/out (see build_layout), and a backend that
+    # records a property of its build beside that directory needs it too.
+    # "" is the build with no variants.
     variant_name: str = ""
 
     # ── Toolchain (shared by Keil, IAR, Makefile) ──
@@ -235,7 +225,7 @@ class BuildVariant:
     name: str
     description: str = ""
     board: str | None = None
-    build_dir: str | None = None
+    build_dir: str | None = None  # retired, see BuildConfig.build_dir
     env: dict[str, str] = field(default_factory=dict)
     images: list[BuildImage] = field(default_factory=list)
     overrides: dict = field(default_factory=dict)
@@ -259,7 +249,7 @@ _SCALAR_FIELDS: frozenset[str] = frozenset({
     "iar_project", "iar_target", "makefile", "make_target",
     "make_dry_run", "toolchain_path", "toolchain_prefix", "compiler",
     "activate", "python", "pre_build", "timeout",
-    "source_dir", "sysbuild", "build_dir",
+    "source_dir", "sysbuild",
 })
 _LIST_FIELDS: frozenset[str] = frozenset({
     "extra_profiles", "defines", "include_dirs", "system_include_dirs",
@@ -268,6 +258,26 @@ _LIST_FIELDS: frozenset[str] = frozenset({
 _DICT_FIELDS: frozenset[str] = frozenset({
     "env", "make_vars", "extra_env",
 })
+
+
+def retired_build_dir_keys(cfg: BuildConfig) -> list[str]:
+    """Return where the config still sets the retired ``build_dir``.
+
+    Each build goes to ``.fw-context/build/<variant>/out`` (see
+    ``build_layout``), never to a directory of the user, thus ``build_dir``
+    has no effect.  The index run refuses such a config with the list that
+    this function gives: a key that the config shows and the build ignores
+    lets the user think that the build goes somewhere else.
+    """
+    found: list[str] = []
+    if cfg.build_dir is not None:
+        found.append("[build] build_dir")
+    found.extend(
+        f"[[build.variants]] {variant.name!r} build_dir"
+        for variant in cfg.variants
+        if variant.build_dir is not None
+    )
+    return found
 
 
 def build_variant_config(base: BuildConfig, variant: BuildVariant) -> BuildConfig:
@@ -297,13 +307,12 @@ def build_variant_config(base: BuildConfig, variant: BuildVariant) -> BuildConfi
             val = dict(val)
         setattr(cfg, f.name, val)
 
-    # Explicit variant fields (board/build_dir) are scalar overrides; env is
-    # a dict merge.  images/default_* are not part of the effective build.
+    # The explicit variant field board is a scalar override; env is a dict
+    # merge.  images/default_* are not part of the effective build, and
+    # neither is the retired build_dir (see retired_build_dir_keys).
     cfg.variant_name = variant.name
     if variant.board is not None:
         cfg.board = variant.board
-    if variant.build_dir is not None:
-        cfg.build_dir = variant.build_dir
     if variant.env:
         merged_env = dict(base.env)
         merged_env.update(variant.env)
@@ -498,27 +507,21 @@ def clear_dead_staging_files(staging: Path) -> None:
             log.debug("Cannot remove the dead staging file %s: %s", candidate, exc)
 
 
-def generate_compile_commands(
-    project_root: Path,
-    cfg: BuildConfig,
-    output: Path | None = None,
-) -> Path:
-    """Generate a fresh compile_commands.json and return its path.
+def generate_compile_commands(project_root: Path, cfg: BuildConfig) -> Path:
+    """Run the build of the variant that *cfg* names, and return its compilation database.
 
-    *output* is the file that gets the result, and None means the canonical
-    ``compile_commands.json``.  A build of one variant of
-    ``[[build.variants]]`` gives ``compile_commands.<variant>.json``: the
-    variants all build before the first one is indexed, thus one shared file
-    gave every variant the database of the last one.  *output* must be in
-    the directory of the canonical file, because only there is the rename
-    atomic.
+    The build writes into ``.fw-context/build/<variant>/out`` (see
+    ``build_layout``), the variant from ``cfg.variant_name``.  The result is
+    the database that the build system wrote there, or
+    ``out/compile_commands.json`` for a tool that fw-context gives the
+    output path to.
 
-    The build writes a staging file, and one atomic rename then gives the
-    canonical ``compile_commands.json`` the new content.  WHY: on 2026-09-23
-    two builds of one project wrote that one file at the same time and each
-    destroyed the output of the other.  The index lock in ``cli/_index`` keeps
-    two builds apart, and this rename keeps a reader from getting a database
-    that a build still writes.
+    Such a tool writes a staging file, and one atomic rename then gives
+    ``out/compile_commands.json`` the new content.  WHY: on 2026-09-23 two
+    builds of one project wrote one database at the same time and each
+    destroyed the output of the other.  The index lock in ``cli/_index``
+    keeps two builds apart, and this rename keeps a reader from getting a
+    database that a build still writes.
 
     WHY four paths: different build systems produce compile_commands.json
     differently.  Some require a full build (PlatformIO), others can convert
@@ -536,10 +539,14 @@ def generate_compile_commands(
     Raises ``RuntimeError`` when detection or generation fails.
     """
     root = project_root.resolve()
-    staging = cc_staging_path(root)
-    final = cc_output_path(root) if output is None else output
-    if final.parent.resolve() != staging.parent.resolve():
-        raise ValueError(f"{final} is not in {staging.parent}, thus the rename is not atomic")
+    layout = BuildLayout(root)
+    final = layout.out_dir(cfg.variant_name) / COMPILE_COMMANDS_NAME
+    # The staging file sits in the directory of the variant, beside out/ and
+    # not in it: `mbed compile --clean`, `pio run` after a change of
+    # project.checksum and a pristine build remove out/ while the build runs,
+    # and bear keeps its intermediate file beside its output.  The rename
+    # into out/ stays in one file system, thus it stays atomic.
+    staging = cc_staging_path(layout.variant_dir(cfg.variant_name))
     clear_dead_staging_files(staging)
     # A file with the name of this run can already exist: a run that SIGKILL
     # stopped left it, and this run got the same PID again.  A backend that
@@ -549,10 +556,10 @@ def generate_compile_commands(
     try:
         produced = _generate_into(root, replace(cfg, cc_output=staging))
         if produced != staging:
-            # A backend that names its own output keeps it.  No backend does
-            # this now — each one writes through cc_output_path(root, cfg).
-            # The Zephyr multi-image build writes one file for each image, but
-            # cli/_index calls build_multi directly, not through this function.
+            # The database that the build system wrote in the output
+            # directory (CMake, Zephyr, ESP-IDF, Arduino).  It stays where it
+            # is: it is the input of the index, and its directory holds the
+            # build.ninja that the linker pass reads.
             return produced
         if not staging.exists():
             # A backend that returns its output path without writing the file.
@@ -561,6 +568,7 @@ def generate_compile_commands(
             raise RuntimeError(
                 f"The build reported success and wrote no compilation database to {staging}"
             )
+        final.parent.mkdir(parents=True, exist_ok=True)
         os.replace(staging, final)
         return final
     finally:
@@ -576,6 +584,11 @@ def _generate_into(root: Path, cfg: BuildConfig) -> Path:
     backend writes through :func:`cc_output_path` — see
     :func:`generate_compile_commands`, the only caller.
     """
+    # Every path below writes into the build tree of fw-context, and a
+    # builder creates its directory itself, so the rule that keeps it out of
+    # git has to be in place before any of them runs.  One point covers the
+    # custom command, convert, generate and build alike.
+    BuildLayout(root).ensure_ignored()
 
     # Full command override — highest priority
     if cfg.command:
@@ -593,7 +606,8 @@ def _generate_into(root: Path, cfg: BuildConfig) -> Path:
             raise RuntimeError(f"Build command failed with exit code {result.returncode}")
         # A custom command runs an arbitrary build tool in the project root;
         # its native output lands at ``compile_commands.json``.  Copy it to
-        # the gitignored fw-context build dir for a stable, reusable location.
+        # the output directory of the variant, where every other build puts
+        # its database.
         native_cc = root / "compile_commands.json"
         if not native_cc.exists():
             raise RuntimeError("compile_commands.json was not generated")
@@ -603,7 +617,7 @@ def _generate_into(root: Path, cfg: BuildConfig) -> Path:
         # record by the hash of the database, and a change of the link alone
         # keeps that hash, thus an old record would describe another link.
         from .builders._platformio_link import forget, sidecar_path
-        forget(sidecar_path(cc_path.parent))
+        forget(sidecar_path(BuildLayout(root).variant_dir(cfg.variant_name)))
         return cc_path
 
     # Detect or validate
@@ -624,13 +638,6 @@ def _generate_into(root: Path, cfg: BuildConfig) -> Path:
 
     log.info("Detected build system: %s (clean=%s)", system, cfg.clean)
     builder = builder_cls()
-
-    # Every path below can write into the autobuild directory, and a builder
-    # creates it itself, so the rule that keeps it out of git has to be in
-    # place before any of them runs.  One point covers convert, generate and
-    # build alike.
-    if cfg.isolated_build_dir:
-        ignore_autobuild_dir(root)
 
     # Run pre-build hook before any generation path
     _run_pre_build(cfg, root)
@@ -670,9 +677,11 @@ def checked_compile_commands(project_root: Path, cfg, indexed: Path | None) -> P
     """Give the compile_commands.json whose build an index run checks, or None.
 
     It is the file that a run without an explicit file reads
-    (:func:`resolve_reuse_compile_commands`), and only when the index came
-    from it.  *indexed* is the file of the active index, or None when there
-    is no index yet.  WHY the second condition: an index of another file (an
+    (:func:`default_compile_commands`), and only when the index came
+    from it.  For the build of fw-context, "came from it" means that the
+    index read a database in the output directory of the build.
+    *indexed* is the file of the active index, or None when there is no
+    index yet.  WHY the second condition: an index of another file (an
     explicit file of the user, or a file that an earlier config named) is
     not the build of this file.  A check of it would replace an explicit
     file with a build, or start a build that never repairs what it checks.
@@ -685,38 +694,93 @@ def checked_compile_commands(project_root: Path, cfg, indexed: Path | None) -> P
     """
     if cfg.build.variants:
         return None
-    cc = resolve_reuse_compile_commands(project_root, cfg.index.compile_commands)
-    if indexed is not None and cc.resolve() != indexed.resolve():
+    explicit = explicit_compile_commands(project_root, cfg)
+    if explicit is not None:
+        if indexed is not None and explicit != indexed.resolve():
+            return None
+        return explicit
+    if indexed is None:
+        return build_compile_commands(project_root, cfg.build, "")
+    # The database of the build is where the build system put it in the
+    # output directory: out/compile_commands.json, or deeper, as
+    # out/zephyr/compile_commands.json.  When the build is gone, the path of
+    # the index is the only record of where it was, thus the test is "in the
+    # output directory", and not one fixed path that a removed build cannot
+    # give any more.
+    out_dir = BuildLayout(project_root.resolve()).out_dir("")
+    if not indexed.resolve().is_relative_to(out_dir.resolve()):
         return None
-    return cc
+    return indexed
 
 
-def resolve_reuse_compile_commands(project_root: Path, configured: Path) -> Path:
-    """Return the compile_commands.json to reuse when not rebuilding.
+# The values of ``[index] compile_commands`` that name no file of the user:
+# the project-root file that ``fw-context init`` wrote before 2026-08, and the
+# copy in .fw-context/build/ that fw-context kept before the build layout.
+# For a project that fw-context builds, each of the two means "the database
+# of the build", which is now in the output directory of the build.
+_BUILD_DATABASE_VALUES: tuple[Path, ...] = (
+    Path("compile_commands.json"),
+    Path(".fw-context") / "build" / "compile_commands.json",
+)
 
-    WHY this self-heal: every builder writes the generated database to the
-    canonical fw-context-owned location ``cc_output_path()``
-    (``.fw-context/build/compile_commands.json``).  Projects initialised
-    before that location was introduced still carry a legacy
-    ``[index] compile_commands = "compile_commands.json"`` value that points
-    at the project root — a file ``--build`` no longer produces.  Reusing that
-    stale root file instead of the freshly generated one changes the
-    config_hash and silently drops the injected ``-D`` defines (e.g.
-    ``KEY_INIT_BASE64``) and any newly listed translation units.
 
-    When the configured path is exactly the legacy root file and the canonical
-    file exists, prefer the canonical file.  All other configured paths
-    (explicit user overrides) are returned unchanged.
+def explicit_compile_commands(project_root: Path, cfg) -> Path | None:
+    """Return the compile_commands.json that ``[index] compile_commands`` names, or None.
+
+    None means that the index reads the database of the build that
+    fw-context runs (:func:`build_compile_commands`).  That is the case
+    when the value is one of ``_BUILD_DATABASE_VALUES`` and fw-context can
+    run the build of the project.
+
+    A project whose build fw-context cannot run (a stub such as
+    STM32CubeIDE, see :func:`can_run_build`) gets the configured file in all
+    cases: the user makes that file outside of fw-context, often in the
+    project root.
+
+    The result is resolved, an absolute value too: a caller that compares it
+    must not see /var and /private/var.
     """
     root = project_root.resolve()
-    # An absolute path is resolved too: every other path here is, and a
-    # caller that compares the result must not see /var and /private/var.
-    configured = (root / configured).resolve()
-    legacy = root / "compile_commands.json"
-    canonical = cc_output_path(root)
-    if configured == legacy and canonical.exists():
-        return canonical
+    configured = (root / cfg.index.compile_commands).resolve()
+    if not can_run_build(cfg.build, cfg.build.system or detect_build_system(root)):
+        return configured
+    if any(configured == (root / value).resolve() for value in _BUILD_DATABASE_VALUES):
+        return None
     return configured
+
+
+def default_compile_commands(project_root: Path, cfg) -> Path:
+    """Return the compile_commands.json that a run without an explicit file reads.
+
+    The file that ``[index] compile_commands`` names when it names a file of
+    the user (:func:`explicit_compile_commands`), else the database of the
+    build without variants (:func:`build_compile_commands`).  The file can
+    be missing: the caller then runs the build.
+    """
+    explicit = explicit_compile_commands(project_root, cfg)
+    if explicit is not None:
+        return explicit
+    return build_compile_commands(project_root, cfg.build, "")
+
+
+def build_compile_commands(project_root: Path, build_cfg: BuildConfig, variant: str) -> Path:
+    """Return the database of the only program that the build of *variant* makes.
+
+    The backend says where its build system put the database in the output
+    directory (``builders.output_compile_commands``).  When the build is not
+    there, the answer is ``out/compile_commands.json``, the file that the
+    build writes, thus the caller sees a missing file and runs the build.
+    """
+    root = project_root.resolve()
+    out_dir = BuildLayout(root).out_dir(variant)
+    system = build_cfg.system or detect_build_system(root)
+    builder_cls = _builder_registry.get(system) if system else None
+    found = output_compile_commands(builder_cls() if builder_cls else None, out_dir, build_cfg)
+    if "" in found:
+        return found[""]
+    if len(found) == 1:
+        return next(iter(found.values()))
+    return out_dir / COMPILE_COMMANDS_NAME
 
 
 def _can_convert(cfg: BuildConfig, system: str) -> bool:

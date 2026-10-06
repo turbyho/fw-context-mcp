@@ -38,9 +38,7 @@ from typing import TYPE_CHECKING
 from ..indexer import autobuild
 from ..mcp.shared.pid_file import PidFile
 from ..utils import (
-    CC_OUTPUT_REL,
     SAFE_EXCEPT,
-    autobuild_dir,
     build_dir_patterns_with_fw_context,
     process_start_time,
     record_build_groups,
@@ -116,13 +114,17 @@ def _build_if_missing(
 
 def _refuse_without_build(
     project_root: Path, cfg, detected_system: str | None, indexed: Path | None,
+    *, at_the_end: bool = False,
 ) -> str:
     """Give the error that stops a run whose build is not there, or "".
 
     Called when the run builds nothing, and at the end of a run that ended
-    well.  *indexed* is the file of the active index.  A missing
-    compile_commands.json is left to ``_resolve_compile_commands``, which
-    builds or gives its own error.  The text names what the user must do: a
+    well (*at_the_end*).  *indexed* is the file of the active index.  Before
+    the run, a missing compile_commands.json is left to
+    ``_resolve_compile_commands``, which builds or gives its own error.  At
+    the end, nothing builds any more, and a build of fw-context keeps its
+    database in its output directory, thus a missing database is a build
+    that went away during the run.  The text names what the user must do: a
     build that fw-context can run is ``fw-context index --build``; any other
     build runs outside of fw-context (an IDE), and ``fw-context index``
     follows it.
@@ -130,7 +132,7 @@ def _refuse_without_build(
     from ..indexer.build import can_run_build, checked_compile_commands
 
     cc = checked_compile_commands(project_root, cfg, indexed)
-    if cc is None or not cc.exists():
+    if cc is None or (not at_the_end and not cc.exists()):
         return ""
     reason = autobuild.build_missing_reason(cc)
     if not reason:
@@ -178,8 +180,8 @@ def _plan_auto_build(
        * The build is gone: compile_commands.json or a ``directory`` of its
          entries does not exist (``autobuild.build_missing_reason``).  Only
          for a *background* run: a run of the user builds as ``--build``
-         does, in the build directory of the user (``_build_if_missing``
-         and the default path of ``_resolve_compile_commands``).
+         does (``_build_if_missing`` and the default path of
+         ``_resolve_compile_commands``).
        * Source files sit on disk that compile_commands.json does not cover.
          Such a file has no translation unit, so a reindex skips it.
        * The tree is on a different branch than the index.
@@ -189,8 +191,9 @@ def _plan_auto_build(
          left two generated zcbor sources listed in it and absent from the
          tree; a reindex reads the same file again.
 
-    3. The backend may build in the background — it isolates its output, or
-       it compiles nothing.  See ``builders.background_build_safe``.
+    3. The backend may build in the background — it writes its output into
+       the build tree of fw-context, or it compiles nothing.  See
+       ``builders.background_build_safe``.
 
     The KEYS name the trigger: ``"build-missing"``, the source paths, or
     ``"branch:<name>"``.  An earlier failure does not block the build: the
@@ -202,31 +205,22 @@ def _plan_auto_build(
     possibly while an IDE builds the same project, and fw-context cannot
     lock the build of the IDE.
 
-    WHY the config comes back instead of being set on *cfg*: the contract of
-    ``background_build_safe`` says the answer MAY depend on
-    ``cfg.isolated_build_dir`` (protocol.py), thus the question has to be
-    asked with the value the build would really use.  Setting it on *cfg*
-    before asking would leave it behind on every path that then answers "do
-    not build", so the candidate is built with ``replace()`` and the caller
-    applies it only when there is something to do.
+    The config that comes back is ``cfg.build``, the config the build uses.
     """
     if not db_path.exists():
         return [], None, ""
 
-    from dataclasses import replace
-
     from ..indexer.build import checked_compile_commands
-    from ..indexer.builders import background_build_safe, registry
+    from ..indexer.build_layout import BuildLayout
     from ..indexer.git_context import branch_moved_since
     from ..mcp.shared.stale import find_unindexed_sources
 
-    system = cfg.build.system or detected_system
-    builder_cls = registry.get(system) if system else None
-    if builder_cls is None:
+    if not _may_build_in_background(cfg, detected_system):
         return [], None, ""
-    candidate = replace(cfg.build, isolated_build_dir=autobuild_dir())
-    if not background_build_safe(builder_cls(), candidate):
-        return [], None, ""
+    candidate = cfg.build
+    # Where the build goes, for the log line.  A project with variants
+    # builds each of them, each into its own directory.
+    target = BuildLayout(project_root).root if candidate.variants else BuildLayout(project_root).out_dir("")
 
     from ..config import derive_project_id
     from ..indexer.db import get_active_config, open_db
@@ -247,7 +241,7 @@ def _plan_auto_build(
         missing = autobuild.build_missing_reason(checked) if checked is not None else ""
         if missing:
             return ["build-missing"], candidate, (
-                f"{missing} — running a build into {candidate.isolated_build_dir}"
+                f"{missing} — running a build into {target}"
             )
         new_sources = find_unindexed_sources(
             conn,
@@ -269,7 +263,7 @@ def _plan_auto_build(
         return [f"branch:{live_branch}"], candidate, (
             f"branch changed from {indexed_branch} to {live_branch} — "
             f"compile_commands.json belongs to the old branch, "
-            f"running a build into {candidate.isolated_build_dir}"
+            f"running a build into {target}"
         )
 
     if not new_sources:
@@ -279,8 +273,25 @@ def _plan_auto_build(
     return new_sources, candidate, (
         f"{len(new_sources)} source file(s) are missing from "
         f"compile_commands.json ({listed}{more}) — running a build into "
-        f"{candidate.isolated_build_dir}"
+        f"{target}"
     )
+
+
+def _may_build_in_background(cfg, detected_system: str | None) -> bool:
+    """Say if a background run may start the build of this project.
+
+    The backend decides, see ``builders.background_build_safe``: it must
+    write its output into the build tree of fw-context, or compile nothing.
+    A ``[build] command`` never may: it runs a build that the user wrote,
+    and fw-context does not know where that build puts its output.
+    """
+    from ..indexer.builders import background_build_safe, registry
+
+    if cfg.build.command:
+        return False
+    system = cfg.build.system or detected_system
+    builder_cls = registry.get(system) if system else None
+    return builder_cls is not None and background_build_safe(builder_cls(), cfg.build)
 
 
 def _resolve_compile_commands(
@@ -309,16 +320,12 @@ def _resolve_compile_commands(
     explicit_cc = bool(args.compile_commands)
 
     if args.build:
-        # `--background` means "skip the build" for a run that a user did not
-        # ask for, because a build competes for the CPU and for the output
-        # directory.  One case earns an exception: fw-context turned the
-        # build on itself, after it found a missing build, a source file that
-        # compile_commands.json does not cover, or another branch, and only a
-        # build can repair that.  It is allowed only with an isolated output
-        # directory, which
-        # `_plan_auto_build` grants to a backend that keeps its artifacts
-        # apart from the ones of the build of the user.
-        if bg and not cfg.build.isolated_build_dir:
+        # A background run builds only with a backend that may build on its
+        # own (`builders.background_build_safe`): fw-context turned the build
+        # on itself, after it found a missing build, a source file that
+        # compile_commands.json does not cover, or another branch, and the
+        # user did not ask for it.
+        if bg and not _may_build_in_background(cfg, detected_system):
             print("error: --build and --background are mutually exclusive", file=sys.stderr)
             return None, False
         from ..indexer.build import generate_compile_commands
@@ -348,15 +355,15 @@ def _resolve_compile_commands(
     # Default: reuse existing, build only if missing
     from ..indexer.build import (
         check_completeness,
+        default_compile_commands,
         generate_compile_commands,
-        resolve_reuse_compile_commands,
     )
 
-    cc = resolve_reuse_compile_commands(project_root, cfg.index.compile_commands)
+    cc = default_compile_commands(project_root, cfg)
     if not cc.exists():
-        if bg:
+        if bg and not _may_build_in_background(cfg, detected_system):
             print(f"error: compile_commands.json not found at {cc}", file=sys.stderr)
-            print("  Background reindex requires an existing compile_commands.json.", file=sys.stderr)
+            print("  fw-context cannot run this build in the background.", file=sys.stderr)
             print("  Run 'fw-context index --build' first to set up the project.", file=sys.stderr)
             return None, False
         print("compile_commands.json not found, running build...", file=sys.stderr)
@@ -973,11 +980,6 @@ def _effective_board(build_cfg, variant, image: str) -> str:
     return variant.board or build_cfg.board or ""
 
 
-def _variant_build_dir(variant, build_cfg) -> str:
-    """Return the per-variant build output directory (relative)."""
-    return variant.build_dir or build_cfg.build_dir or f"build/{variant.name}"
-
-
 def _filter_images(cc_list: list, args: argparse.Namespace) -> list:
     """Apply --image (inclusive) and --exclude-image (exclusive) index filters."""
     include = getattr(args, "image", None)
@@ -993,35 +995,28 @@ def _filter_images(cc_list: list, args: argparse.Namespace) -> list:
     return out
 
 
-def _variant_cc_path(project_root: Path, variant_name: str) -> Path:
-    """Return the compilation database of one variant that builds without sysbuild.
+def _discover_existing_cc(project_root, variants: list, build_cfg, builder) -> list:
+    """Return ``(variant, image, database, board)`` of each build that is on disk.
 
-    One name for the two sides: ``_run_multi`` writes this file, and
-    ``_discover_existing_cc`` reads it in a later run without ``--build``.
-    It sits beside the canonical file, because only there is the rename in
-    ``generate_compile_commands`` atomic.
+    Each variant has its output directory, ``.fw-context/build/<variant>/out``
+    (see ``build_layout``), and the backend says which databases its build
+    left there (``builders.output_compile_commands``).  A variant without a
+    build gets an error line and no entry.
     """
-    return (project_root / CC_OUTPUT_REL).with_name(f"compile_commands.{variant_name}.json")
+    from ..indexer.build import build_variant_config
+    from ..indexer.build_layout import BuildLayout
+    from ..indexer.builders import output_compile_commands
 
-
-def _discover_existing_cc(project_root, variants: list, build_cfg) -> list:
-    """Discover existing ``compile_commands.<variant>[.<image>].json`` copies."""
+    layout = BuildLayout(project_root)
     found: list = []
     for variant in variants:
-        build_dir = _variant_build_dir(variant, build_cfg)
-        bd = project_root / build_dir
-        # per-image layout: <build_dir>/<image>/compile_commands.json (NCS 3.2.3)
-        if bd.is_dir():
-            for sub in sorted(bd.iterdir()):
-                cc = sub / "compile_commands.json"
-                if cc.exists():
-                    found.append((variant.name, sub.name, cc, _effective_board(build_cfg, variant, sub.name)))
-        # non-sysbuild single-image layout: compile_commands.<variant>.json
-        single = _variant_cc_path(project_root, variant.name)
-        if single.exists():
-            found.append((variant.name, "", single, _effective_board(build_cfg, variant, "")))
-        if not bd.is_dir() and not single.exists():
+        vcfg = build_variant_config(build_cfg, variant)
+        databases = output_compile_commands(builder, layout.out_dir(variant.name), vcfg)
+        if not databases:
             print(f"error: no build artifacts for variant '{variant.name}' — run 'fw-context index --build'", file=sys.stderr)
+            continue
+        for image, cc in sorted(databases.items()):
+            found.append((variant.name, image, cc, _effective_board(build_cfg, variant, image)))
     return found
 
 
@@ -1043,6 +1038,7 @@ def _run_multi(
     """
     from ..indexer._postprocess import cleanup_old_builds_multi
     from ..indexer.build import build_variant_config, generate_compile_commands
+    from ..indexer.build_layout import InvalidVariantName, check_variant_names
     from ..indexer.builders import registry as builder_registry
     from ..indexer.db import open_db, rebuild_files_fts, rebuild_fts, rebuild_macros_fts
     from ..indexer.runner import IndexStopped, run
@@ -1059,41 +1055,44 @@ def _run_multi(
 
     cc_list: list[tuple[str, str, Path, str]] = []
 
+    # Each variant names one directory, .fw-context/build/<variant> (see
+    # build_layout), thus a name that cannot be a directory stops the run
+    # before any build, and so do two names of one directory.
+    try:
+        check_variant_names(v.name for v in build_cfg.variants)
+    except InvalidVariantName as exc:
+        print(f"error: [[build.variants]]: {exc}", file=sys.stderr)
+        return 1
+
     if args.build:
-        if builder is not None and hasattr(builder, "build_multi") and build_cfg.sysbuild:
-            for variant, image, path in builder.build_multi(project_root, build_cfg):
+        # sysbuild is a [build] key that a variant can override, thus the
+        # choice of the build command is made for each variant, with the
+        # config that the build of that variant uses.  The discovery of its
+        # images (builders.output_compile_commands) reads the same config.
+        build_multi = getattr(builder, "build_multi", None)
+        multi = [
+            v for v in variants
+            if build_multi is not None and build_variant_config(build_cfg, v).sysbuild
+        ]
+        if build_multi is not None and multi:
+            for variant, image, path in build_multi(project_root, build_cfg, multi):
                 v = _find_variant(variants, variant)
                 board = _effective_board(build_cfg, v, image) if v else ""
                 cc_list.append((variant, image, path, board))
-        else:
-            for variant in variants:
-                vcfg = build_variant_config(build_cfg, variant)
-                if build_cfg.isolated_build_dir:
-                    # One directory per variant.  Every variant has its own
-                    # output directory, thus a shared one would make the
-                    # variants overwrite each other.
-                    vcfg.isolated_build_dir = autobuild_dir(variant.name)
-                # Each variant gets its own file.  All variants build before
-                # the first one is indexed, thus one shared file gave each
-                # variant the database of the last one.
-                try:
-                    output = _variant_cc_path(project_root, variant.name)
-                except ValueError:
-                    # A name with "/" cannot be a part of a file name.  One bad
-                    # variant must not stop the others, as a failed build does not.
-                    print(
-                        f"error: variant '{variant.name}': the name cannot be a part of a file name",
-                        file=sys.stderr,
-                    )
-                    continue
-                try:
-                    path = generate_compile_commands(project_root, vcfg, output=output)
-                except RuntimeError as exc:
-                    print(f"error: variant '{variant.name}': {exc}", file=sys.stderr)
-                    continue
-                cc_list.append((variant.name, "", path, _effective_board(build_cfg, variant, "")))
+        for variant in variants:
+            if variant.name in {v.name for v in multi}:
+                continue
+            # Each variant builds into its own output directory, thus the
+            # variants cannot overwrite each other.
+            vcfg = build_variant_config(build_cfg, variant)
+            try:
+                path = generate_compile_commands(project_root, vcfg)
+            except RuntimeError as exc:
+                print(f"error: variant '{variant.name}': {exc}", file=sys.stderr)
+                continue
+            cc_list.append((variant.name, "", path, _effective_board(build_cfg, variant, "")))
     else:
-        cc_list = _discover_existing_cc(project_root, variants, build_cfg)
+        cc_list = _discover_existing_cc(project_root, variants, build_cfg, builder)
 
     cc_list = _filter_images(cc_list, args)
 
@@ -1111,10 +1110,9 @@ def _run_multi(
         env = dict(build_cfg.env)
         if v is not None:
             env.update(v.env)
-        build_dir_patterns = (
-            build_dir_patterns_with_fw_context([f"{_variant_build_dir(v, build_cfg)}/"])
-            if v is not None else None
-        )
+        # The build of each variant is in the build tree of fw-context, thus
+        # the fw-context directory is the whole build output.
+        build_dir_patterns = build_dir_patterns_with_fw_context([]) if v is not None else None
         # The path layers are summed per build, not once for the command:
         # two variants may vendor different in-tree trees.  run_kwargs holds
         # the [index] layer (or the CLI flag, which replaces it).
@@ -1391,8 +1389,9 @@ def _cmd_index(args: argparse.Namespace, outside: _SigtermOutsideTheLock) -> int
     if detected_system:
         print(f"Project: {project_root.name}  path={project_root}  build={detected_system}")
     elif bg:
-        cc_fallback = project_root / CC_OUTPUT_REL
-        if cc_fallback.exists():
+        from ..indexer.build import default_compile_commands
+
+        if default_compile_commands(project_root, cfg).exists():
             print(f"Project: {project_root.name}  path={project_root}  build=unknown (bg, reusing cc)")
         else:
             print(f"error: No build system detected and no compile_commands.json for {project_root}.", file=sys.stderr)
@@ -1403,6 +1402,24 @@ def _cmd_index(args: argparse.Namespace, outside: _SigtermOutsideTheLock) -> int
 
     project_id = derive_project_id(project_root)
     db_path = cfg.index.db_dir / project_id / "index.db"
+
+    # A retired key stops the run before any build.  Each build goes to
+    # .fw-context/build/<variant>/out, and a config that still names another
+    # directory says something that the build does not do.  The marker gives
+    # the same text to each MCP answer, because a background run has no
+    # terminal.
+    from ..indexer.build import retired_build_dir_keys
+
+    retired = retired_build_dir_keys(cfg.build)
+    if retired:
+        text = (
+            f"{', '.join(retired)} in .fw-context/config.toml has no effect: each build "
+            "goes to .fw-context/build/<variant>/out. Remove the key, then run "
+            "'fw-context index --build'."
+        )
+        print(f"error: {text}", file=sys.stderr)
+        autobuild.record_problem(db_path.parent, text)
+        return 1
 
     # A compile_commands.json that the user names is the input of this run.
     # No automatic build may replace it: `--build` comes before the explicit
@@ -1415,17 +1432,16 @@ def _cmd_index(args: argparse.Namespace, outside: _SigtermOutsideTheLock) -> int
     # ── A run of the user without a build: build first ──
     # The run asks the compiler of each unit in the build directory, thus a
     # missing build gives units without the answer of the compiler.  The
-    # user started this run, thus it builds as `--build` does, in the build
-    # directory of the user.  A background run takes the path below, which
-    # builds only into an isolated directory.
+    # user started this run, thus it builds as `--build` does.  A background
+    # run takes the path below, which builds only with a backend that may
+    # build on its own.
     if not bg and not getattr(args, "build", False) and not explicit_cc and not cfg.build.variants:
         _build_if_missing(args, project_root, cfg, detected_system, indexed_cc)
 
     # ── Automatic build: a missing build, a source that the build never saw,
     # or another branch ──
     # A plain reindex cannot repair any of them.  `_plan_auto_build` returns
-    # a non-empty list only when the backend can build without touching the
-    # output of the build of the user.
+    # a non-empty list only when the backend may build on its own.
     auto_build_sources: list[str] = []
     if not getattr(args, "build", False) and not explicit_cc:
         auto_build_sources, auto_build_cfg, auto_build_reason = _plan_auto_build(
@@ -1435,12 +1451,6 @@ def _cmd_index(args: argparse.Namespace, outside: _SigtermOutsideTheLock) -> int
         # type checker see that, and it costs nothing.
         if auto_build_sources and auto_build_cfg is not None:
             args.build = True
-            # The candidate that _plan_auto_build asked the backend about.
-            # Applying it here, and nowhere else, keeps every "do not build"
-            # path from leaving an isolated directory behind on cfg.  It also
-            # carries `isolated_build_dir`, which is what makes `--build`
-            # legal on a `--background` run — see the check in
-            # `_resolve_compile_commands`.
             cfg.build = auto_build_cfg
             log.info("%s", auto_build_reason)
 
@@ -1531,7 +1541,8 @@ def _cmd_index(args: argparse.Namespace, outside: _SigtermOutsideTheLock) -> int
     # then remove a true warning.  The file of the index is read again,
     # because this run wrote it.
     refusal = "" if explicit_cc else _refuse_without_build(
-        project_root, cfg, detected_system, _indexed_compile_commands(project_root, db_path)
+        project_root, cfg, detected_system, _indexed_compile_commands(project_root, db_path),
+        at_the_end=True,
     )
     if refusal:
         autobuild.record_problem(db_path.parent, refusal, build_missing=True)

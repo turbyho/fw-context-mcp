@@ -12,15 +12,9 @@ from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from fw_context_mcp.utils import (
-    atomic_copy,
-    cc_output_path,
-    cc_staging_path,
-    resolve_build_dir,
-    resolve_real_binary,
-    run_build_command,
-)
+from fw_context_mcp.utils import resolve_real_binary, run_build_command
 
+from ..build_layout import COMPILE_COMMANDS_NAME, BuildLayout
 from . import _linker, registry
 from .protocol import BuildIssue
 
@@ -237,7 +231,7 @@ class ZephyrBuildSystem:
                 'Zephyr requires a board name.  Set it in .fw-context/config.toml:\n  [build]\n  board = "your_board"'
             )
 
-        build_dir = resolve_build_dir(project_root, cfg, cfg.build_dir or "build")
+        build_dir = BuildLayout(project_root).out_dir(cfg.variant_name)
 
         _, env = self._prepare_ninja_wrapper(project_root)
 
@@ -265,25 +259,39 @@ class ZephyrBuildSystem:
         # timeout would break long builds.  Network-filesystem stalls remain a risk.
         run_build_command(cmd, cwd=project_root, description="west build", env=env, build_cfg=cfg)
 
-        cc_in_build = build_dir / "compile_commands.json"
-        if not cc_in_build.exists():
-            # Sysbuild (NCS ≥2.0) puts cc.json one level deeper:
-            #   build/zephyr/compile_commands.json
-            cc_sysbuild = build_dir / "zephyr" / "compile_commands.json"
-            if cc_sysbuild.exists():
-                cc_in_build = cc_sysbuild
-            else:
-                raise RuntimeError(
-                    "compile_commands.json not found in build directory. "
-                    "Ensure CMAKE_EXPORT_COMPILE_COMMANDS is enabled."
-                )
+        # The database stays beside build.ninja, which the linker pass reads.
+        found = self._single_compile_commands(build_dir)
+        if found is None:
+            raise RuntimeError(
+                f"compile_commands.json not found in {build_dir}. "
+                "Ensure CMAKE_EXPORT_COMPILE_COMMANDS is enabled."
+            )
+        return found
 
-        # Copy to the gitignored fw-context build dir for a stable location
-        target_cc = cc_output_path(project_root, cfg)
-        shutil.copy2(cc_in_build, target_cc)
-        log.info("Copied %s → %s", cc_in_build, target_cc)
+    @staticmethod
+    def _single_compile_commands(build_dir: Path) -> Path | None:
+        """Return the database of a ``west build`` without ``--sysbuild``, or None.
 
-        return target_cc
+        Plain Zephyr writes it in the build directory.  Sysbuild (NCS ≥2.0)
+        puts it one level deeper, ``zephyr/compile_commands.json``.
+        """
+        for candidate in (build_dir / COMPILE_COMMANDS_NAME, build_dir / "zephyr" / COMPILE_COMMANDS_NAME):
+            if candidate.is_file():
+                return candidate
+        return None
+
+    def output_compile_commands(self, out_dir: Path, cfg: BuildConfig) -> dict[str, Path]:
+        """Return the databases of the build in *out_dir*, one per image for sysbuild.
+
+        ``cfg.sysbuild`` selects ``west build --sysbuild`` (see
+        ``build_multi``), which makes one database per image in
+        ``out/<image>/``.  Without it the build makes one program, and its
+        database has the key "".
+        """
+        if cfg.sysbuild:
+            return {name: out_dir / name / COMPILE_COMMANDS_NAME for name in self._discover_images(out_dir)}
+        single = self._single_compile_commands(out_dir)
+        return {"": single} if single is not None else {}
 
     # ── Multi-variant (sysbuild) ──
 
@@ -361,28 +369,30 @@ class ZephyrBuildSystem:
         ]
 
     def build_multi(
-        self, project_root: Path, cfg: BuildConfig
+        self, project_root: Path, cfg: BuildConfig, variants: list | None = None,
     ) -> list[tuple[str, str, Path]]:
-        """Build all variants × images via sysbuild, return per-image cc paths.
+        """Build each variant via sysbuild, return the database of each image.
 
         Returns a list of ``(variant, image, compile_commands_path)`` — one
-        entry per (variant, image) pair, with the per-image compile_commands
-        copied to ``.fw-context/build/compile_commands.<variant>.<image>.json``.
+        entry per (variant, image) pair.  Each variant builds into
+        ``.fw-context/build/<variant>/out`` (see ``build_layout``), and the
+        database of each image stays where west writes it,
+        ``out/<image>/compile_commands.json``, beside the ``build.ninja``
+        of that image.
 
-        WHY per-image copies: each image is a separate Zephyr CMake project
-        with its own ``compile_commands.json``; the per-(variant, image) file
-        lets ``config_hash`` and the manifest stay per-image (§5.3.3).
+        WHY one database per image: each image is a separate Zephyr CMake
+        project with its own ``compile_commands.json``; the per-(variant,
+        image) file lets ``config_hash`` and the manifest stay per-image.
+
+        *variants* limits the build to those entries of ``cfg.variants``;
+        None builds each of them.  ``fw-context index --variant`` gives the
+        list, and a variant that the user did not ask for must not build.
 
         Clean is deliberately suppressed — indexing only needs
         ``compile_commands.json``, so ``--pristine=auto`` (incremental) is used
-        instead of ``--pristine`` (always), keeping re-builds fast (§5.8).
+        instead of ``--pristine`` (always), keeping re-builds fast.
         """
-        from ..build import build_variant_config, clear_dead_staging_files
-
-        # This path does not go through generate_compile_commands, which does
-        # the cleanup for the other builds.  A copy below that SIGKILL stops
-        # leaves its temporary file in the same directory.
-        clear_dead_staging_files(cc_staging_path(project_root))
+        from ..build import build_variant_config
 
         if not shutil.which("west"):
             raise RuntimeError("west is required for Zephyr builds.  Install the Zephyr SDK and west tool.")
@@ -390,9 +400,11 @@ class ZephyrBuildSystem:
             raise RuntimeError("build_multi() requires [[build.variants]] in config.")
 
         _, env = self._prepare_ninja_wrapper(project_root)
+        layout = BuildLayout(project_root)
+        layout.ensure_ignored()
         results: list[tuple[str, str, Path]] = []
 
-        for variant in cfg.variants:
+        for variant in cfg.variants if variants is None else variants:
             vcfg = build_variant_config(cfg, variant)
             if not vcfg.board:
                 raise RuntimeError(
@@ -401,7 +413,7 @@ class ZephyrBuildSystem:
                 )
             board = self._normalize_board(vcfg.board)
             source_dir = vcfg.source_dir or "."
-            build_dir = project_root / (vcfg.build_dir or f"build/{variant.name}")
+            build_dir = layout.out_dir(variant.name)
 
             cmd: list[str] = [
                 "west", "build", "--sysbuild",
@@ -424,20 +436,8 @@ class ZephyrBuildSystem:
                 build_cfg=vcfg,
             )
 
-            for image_name in self._discover_images(build_dir):
-                cc_src = build_dir / image_name / "compile_commands.json"
-                if not cc_src.exists():
-                    continue
-                target = cc_output_path(project_root).with_name(
-                    f"compile_commands.{variant.name}.{image_name}.json"
-                )
-                # Atomic, as the single build.  The index stores this path,
-                # and the MCP server reads the file from there (the staleness
-                # check, reindex_file) while a later build writes it again.
-                # An in-place copy lets that reader get a truncated file.
-                atomic_copy(cc_src, target)
-                results.append((variant.name, image_name, target))
-                log.info("Copied %s → %s", cc_src, target)
+            for image_name, cc_path in self.output_compile_commands(build_dir, vcfg).items():
+                results.append((variant.name, image_name, cc_path))
 
         return results
 

@@ -10,8 +10,9 @@ from fw_context_mcp.indexer.build import (
     _parse_mbed_dotfile,
     build_variant_config,
     check_completeness,
+    default_compile_commands,
     detect_build_system,
-    resolve_reuse_compile_commands,
+    explicit_compile_commands,
 )
 
 
@@ -134,34 +135,70 @@ class TestCheckCompleteness:
         assert len(warnings) >= 1
 
 
-class TestResolveReuseCompileCommands:
-    def test_legacy_root_value_self_heals_to_canonical(self, tmpdir):
-        # Legacy config: compile_commands = "compile_commands.json" (root).
-        # A previous --build produced the canonical file.
-        canonical = tmpdir / ".fw-context" / "build" / "compile_commands.json"
-        canonical.parent.mkdir(parents=True)
-        canonical.write_text("[]")
+class TestDefaultCompileCommands:
+    """The database that a run without an explicit file reads."""
 
-        result = resolve_reuse_compile_commands(tmpdir, Path("compile_commands.json"))
-        assert result == canonical.resolve()
+    @staticmethod
+    def _cfg(compile_commands: Path, system: str = "cmake", **build):
+        from types import SimpleNamespace
 
-    def test_legacy_root_value_without_canonical_keeps_root(self, tmpdir):
-        result = resolve_reuse_compile_commands(tmpdir, Path("compile_commands.json"))
-        assert result == (tmpdir / "compile_commands.json").resolve()
+        return SimpleNamespace(
+            index=SimpleNamespace(compile_commands=compile_commands),
+            build=BuildConfig(system=system, **build),
+        )
 
-    def test_custom_relative_path_unchanged(self, tmpdir):
-        result = resolve_reuse_compile_commands(tmpdir, Path("cmake_build/compile_commands.json"))
-        assert result == (tmpdir / "cmake_build" / "compile_commands.json").resolve()
+    @staticmethod
+    def _out(root: Path) -> Path:
+        from fw_context_mcp.indexer.build_layout import BuildLayout
 
-    def test_absolute_path_unchanged(self, tmpdir):
-        custom = tmpdir / "ci" / "cc.json"
-        result = resolve_reuse_compile_commands(tmpdir, custom)
-        assert result == custom.resolve()
+        return BuildLayout(root.resolve()).out_dir("")
 
-    def test_default_canonical_path_unchanged(self, tmpdir):
-        default = Path(".fw-context") / "build" / "compile_commands.json"
-        result = resolve_reuse_compile_commands(tmpdir, default)
-        assert result == (tmpdir / default).resolve()
+    def test_the_legacy_root_value_means_the_database_of_the_build(self, tmp_path: Path):
+        # Configs that `fw-context init` wrote before 2026-08 name the
+        # project-root file.  For a build that fw-context runs, the database
+        # is in the output directory of that build.
+        (tmp_path / "compile_commands.json").write_text("[]", encoding="utf-8")
+
+        result = default_compile_commands(tmp_path, self._cfg(Path("compile_commands.json")))
+
+        assert result == self._out(tmp_path) / "compile_commands.json"
+
+    def test_the_old_canonical_value_means_the_database_of_the_build(self, tmp_path: Path):
+        old = Path(".fw-context") / "build" / "compile_commands.json"
+
+        result = default_compile_commands(tmp_path, self._cfg(old))
+
+        assert result == self._out(tmp_path) / "compile_commands.json"
+
+    def test_the_database_that_the_build_system_wrote_is_found(self, tmp_path: Path):
+        # Zephyr sysbuild of one program puts it one level deeper.
+        nested = self._out(tmp_path) / "zephyr" / "compile_commands.json"
+        nested.parent.mkdir(parents=True)
+        nested.write_text("[]", encoding="utf-8")
+
+        result = default_compile_commands(
+            tmp_path, self._cfg(Path("compile_commands.json"), system="zephyr", board="b")
+        )
+
+        assert result == nested
+
+    def test_a_custom_relative_path_is_the_users_file(self, tmp_path: Path):
+        result = default_compile_commands(tmp_path, self._cfg(Path("cmake_build/compile_commands.json")))
+        assert result == (tmp_path / "cmake_build" / "compile_commands.json").resolve()
+
+    def test_an_absolute_path_is_the_users_file(self, tmp_path: Path):
+        custom = tmp_path / "ci" / "cc.json"
+        assert default_compile_commands(tmp_path, self._cfg(custom)) == custom.resolve()
+
+    def test_a_build_that_fw_context_cannot_run_keeps_the_root_file(self, tmp_path: Path):
+        # An STM32CubeIDE project makes its database outside of fw-context.
+        result = default_compile_commands(
+            tmp_path, self._cfg(Path("compile_commands.json"), system="stm32cubeide")
+        )
+        assert result == (tmp_path / "compile_commands.json").resolve()
+
+    def test_explicit_compile_commands_says_none_for_the_build_database(self, tmp_path: Path):
+        assert explicit_compile_commands(tmp_path, self._cfg(Path("compile_commands.json"))) is None
 
 
 class TestBuildConfig:
@@ -253,17 +290,15 @@ class TestBuildVariantConfig:
         assert cfg.profile == "release"
         assert caplog.text == ""
 
-    def test_the_build_dir_pattern_is_per_variant(self):
-        """``build_dir`` IS per-variant, and this is the boundary that measurement supports.
+    def test_the_output_directory_is_per_variant(self):
+        """Each variant builds into its own output directory, from its name."""
+        from fw_context_mcp.indexer.build_layout import BuildLayout
 
-        Measured on the Zephyr project: 9 builds and 2 different build_dir values.
-        The vendor patterns have no such measured trigger, so do not read this
-        test as evidence for a per-variant vendor set.
-        """
-        base = BuildConfig(system="zephyr", build_dir="build")
-        dev = build_variant_config(base, BuildVariant(name="dev", build_dir="build/dev"))
-        rel = build_variant_config(base, BuildVariant(name="rel", build_dir="build/rel"))
+        base = BuildConfig(system="zephyr")
+        dev = build_variant_config(base, BuildVariant(name="dev"))
+        rel = build_variant_config(base, BuildVariant(name="rel"))
+        layout = BuildLayout(Path("/proj"))
 
-        assert dev.build_dir == "build/dev"
-        assert rel.build_dir == "build/rel"
-        assert base.build_dir == "build"
+        assert layout.out_dir(dev.variant_name) == Path("/proj/.fw-context/build/dev/out")
+        assert layout.out_dir(rel.variant_name) == Path("/proj/.fw-context/build/rel/out")
+        assert base.variant_name == ""

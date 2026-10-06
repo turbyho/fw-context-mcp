@@ -144,16 +144,16 @@ def _auto_build_if_possible(
 
     A pre-existing cc.json is reused (never rebuilt) and preserved on a
     failed build: only a file that did not exist before the failed build is
-    deleted.  ``cc_path`` resolves against ``cfg.index.compile_commands``
-    (identical to ``_resolve_compile_commands`` — not hardcoded).
+    deleted.  ``cc_path`` comes from ``default_compile_commands`` (identical
+    to ``_resolve_compile_commands`` — not hardcoded).
     """
     from ..indexer.build import (
         check_completeness,
+        default_compile_commands,
         generate_compile_commands,
-        resolve_reuse_compile_commands,
     )
 
-    cc = resolve_reuse_compile_commands(project_root, cfg.index.compile_commands)
+    cc = default_compile_commands(project_root, cfg)
 
     if cc.exists():
         print(f"  [ok] compile_commands.json already exists ({_count_cc_entries(cc)} entries)")

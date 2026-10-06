@@ -71,13 +71,13 @@ Without `--build`, a run can build by itself.
 A run that you start builds as `--build` does when the build is not there:
 `compile_commands.json` does not exist, or a `directory` of its entries does
 not exist. fw-context asks the compiler of each unit in that directory.
-When fw-context cannot run the build (STM32CubeIDE, TI CCS, or a background
-run of a backend that cannot build in isolation), the run stops with an
-error and does not index. A run with an explicit `compile_commands.json`, or
-a project with `[[build.variants]]`, does not do this check.
+When fw-context cannot run the build (STM32CubeIDE, TI CCS, a
+`[build] command` in a background run, or a background run of a backend
+that compiles in your tree), the run stops with an error and does not
+index. A run with an explicit `compile_commands.json`, or a project with
+`[[build.variants]]`, does not do this check.
 
-A run also builds into an isolated directory when an index exists and one
-of these conditions is true:
+A run also builds when an index exists and one of these conditions is true:
 
 - The build is not there (a background run).
 - A source file on disk is not in `compile_commands.json`. Such a file has
@@ -85,11 +85,12 @@ of these conditions is true:
 - The tree is on a different git branch than the index.
   `compile_commands.json` belongs to the old branch.
 
-The run builds only when the backend can build in isolation (see
-[Build Configuration](build.md)). The output goes to
-`.fw-context/autobuild/<variant>`, or `.fw-context/autobuild/default` for a
-single build. `--build` and `--background` are mutually exclusive, except
-for this automatic build.
+The run builds only when the backend can build on its own (see
+[Build Configuration](build.md#automatic-build)). Each build, this one and
+one that you start, goes to `.fw-context/build/<variant>/out`, or
+`.fw-context/build/default/out` for a project without variants.
+`--build` and `--background` are mutually exclusive, except for this
+automatic build.
 
 When a run stops without an index (the build is not there, or the run
 failed), fw-context writes the reason to `build_problem.json` next to the
@@ -385,7 +386,6 @@ variants, without re-running the agent and dependency provisioning.
 fw-context init-variants list                          # list declared variants
 fw-context init-variants add --name <name> --board <board>
 fw-context init-variants add --name <name> --board <board> --description "text"
-fw-context init-variants add --name <name> --build-dir build/<name>
 fw-context init-variants add --name <name> --env BOARD_ENV=DEV
 fw-context init-variants remove <name>
 ```

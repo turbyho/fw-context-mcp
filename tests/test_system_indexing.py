@@ -53,8 +53,12 @@ def _project_root() -> Path:
 
 
 def _cc_path(proj: Path) -> Path:
-    """Return the generated compile_commands.json location for a project."""
-    return proj / ".fw-context" / "build" / "compile_commands.json"
+    """Return the generated compile_commands.json location for a project.
+
+    The build without variants writes into ``.fw-context/build/default/out``
+    (see ``indexer/build_layout.py``).
+    """
+    return proj / ".fw-context" / "build" / "default" / "out" / "compile_commands.json"
 
 
 def _cli(
@@ -961,13 +965,23 @@ class TestESPIDFInitAndIndex:
 class TestConfigHashStability:
     """Verify config_hash is stable across repeated indexing of the same project."""
 
-    def test_same_project_same_config_hash(self):
+    def test_same_project_same_config_hash(self, tmp_path):
+        """Two parses of one database give one hash.
+
+        The database is written here, and not taken from a build that an
+        earlier test left in ``tests/builds``: that made the result depend
+        on the order of the tests and on the leftovers of an earlier run.
+        """
         from fw_context_mcp.indexer.compile_commands import parse as parse_cc
         from fw_context_mcp.indexer.manifest import compute_structural_hash
 
         project_root = _BUILDS / "generic_cmake"
-        cc = _cc_path(project_root)
-        assert cc.exists(), "Run CMake init+index test first to generate cc.json"
+        cc = tmp_path / "compile_commands.json"
+        cc.write_text(json.dumps([{
+            "directory": str(project_root),
+            "file": str(project_root / "src" / "main.c"),
+            "arguments": ["cc", "-DFOO=1", "-std=c11", "-c", "src/main.c"],
+        }]), encoding="utf-8")
         units1 = list(parse_cc(cc))
         units2 = list(parse_cc(cc))
         h1 = compute_structural_hash(cc, project_root, units1)

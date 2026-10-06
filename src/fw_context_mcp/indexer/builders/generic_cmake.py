@@ -10,8 +10,9 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from fw_context_mcp.utils import cc_output_path, resolve_build_dir, run_build_command
+from fw_context_mcp.utils import run_build_command
 
+from ..build_layout import BuildLayout
 from . import _linker, registry
 from .protocol import BuildIssue
 
@@ -63,7 +64,7 @@ class GenericCMakeBuildSystem:
         if not shutil.which("cmake"):
             raise RuntimeError("cmake is required.  Install it:  sudo pacman -S cmake")
 
-        build_dir = resolve_build_dir(project_root, cfg, "build")
+        build_dir = BuildLayout(project_root).out_dir(cfg.variant_name)
 
         # Configure
         configure_cmd: list[str] = [
@@ -86,21 +87,16 @@ class GenericCMakeBuildSystem:
         log.info("cmake build: %s", " ".join(build_cmd))
         run_build_command(build_cmd, cwd=project_root, description="cmake build", build_cfg=cfg)
 
+        # The database stays beside build.ninja, which the linker pass reads.
         cc_in_build = build_dir / "compile_commands.json"
         if not cc_in_build.exists():
             raise RuntimeError(
-                "compile_commands.json not found in build/ directory. Ensure CMAKE_EXPORT_COMPILE_COMMANDS is enabled."
+                f"compile_commands.json not found in {build_dir}. Ensure CMAKE_EXPORT_COMPILE_COMMANDS is enabled."
             )
-
-        # Copy to the gitignored fw-context build dir for a stable location
-        target_cc = cc_output_path(project_root, cfg)
-        shutil.copy2(cc_in_build, target_cc)
-        log.info("Copied %s → %s", cc_in_build, target_cc)
-
-        return target_cc
+        return cc_in_build
 
     def background_build_safe(self, cfg: BuildConfig) -> bool:
-        """Safe — configure and build both take the chosen directory."""
+        """Safe — configure and build both take the output directory of fw-context."""
         return True
 
     # ── Build dir patterns ──

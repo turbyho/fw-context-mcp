@@ -112,15 +112,15 @@ def _autobuild_state(root: Path, proj_cfg, new_sources: list[str]) -> AutobuildS
     if not new_sources:
         return AutobuildState.WILL_BUILD  # unused — no file to report
 
-    from dataclasses import replace
-
     from ...indexer.builders import registry
-    from ...utils import autobuild_dir
 
+    # A `[build] command` is a build that the user wrote, and the index run
+    # never starts it on its own (`cli._index._may_build_in_background`).
+    if proj_cfg.build.command:
+        return AutobuildState.UNSUPPORTED
     system = proj_cfg.build.system or _detect_build_system(root)
     builder_cls = registry.get(system) if system else None
-    candidate = replace(proj_cfg.build, isolated_build_dir=autobuild_dir())
-    return autobuild_state(builder_cls, candidate)
+    return autobuild_state(builder_cls, proj_cfg.build)
 
 
 def _build_missing_advice(reason: str, root: Path, proj_cfg) -> str:
@@ -169,30 +169,27 @@ def _expand_dir_placeholder(dir_str: str, root: Path) -> str:
 def _background_build_allowed(root: Path, proj_cfg: Config) -> bool:
     """Say whether fw-context may run a build of this project on its own.
 
-    The same question `daemon._branch_needs_build` asks, and the same
-    answer: `background_build_safe` refuses where a build of fw-context
-    would reach the object files of the build of the user.  Asked here only
-    to word the advice — a project the daemon will handle should not read
-    like one that needs a command typed.
+    The same question the background index run asks
+    (`cli._index._may_build_in_background`), and the same answer:
+    `background_build_safe` refuses where a build of fw-context would reach
+    the object files of the build of the user, and a `[build] command` never
+    builds on its own.  Asked here only to word the advice — a project the
+    daemon will handle should not read like one that needs a command typed.
 
     Any failure to decide answers no, which keeps the command in the advice.
     """
-    from dataclasses import replace
-
     from ...indexer.build import detect_build_system
     from ...indexer.builders import background_build_safe, registry
-    from ...utils import SAFE_EXCEPT, autobuild_dir
+    from ...utils import SAFE_EXCEPT
 
+    if proj_cfg.build.command:
+        return False
     try:
         key = proj_cfg.build.system or detect_build_system(root)
         builder_cls = registry.get(key) if key else None
         if builder_cls is None:
             return False
-        candidate = replace(
-            proj_cfg.build,
-            isolated_build_dir=autobuild_dir(proj_cfg.build.default_variant or ""),
-        )
-        return background_build_safe(builder_cls(), candidate)
+        return background_build_safe(builder_cls(), proj_cfg.build)
     except SAFE_EXCEPT:
         return False
 
@@ -795,13 +792,14 @@ def get_active_build(
         # (``checked_compile_commands``), and only when the index came from
         # it: an index of an explicit file, or of build variants, gets no
         # check, as `fw-context index` does none, and its advice `--build`
-        # would replace the explicit file.  A missing compile_commands.json
-        # is `cc_changed` below, thus the check reads only a file that exists.
+        # would replace the explicit file.  A build of fw-context keeps its
+        # database in its output directory, thus a missing database is a
+        # missing build, and it gets the advice of one.
         checked_cc = checked_compile_commands(
             root, proj_cfg, Path(cfg["compile_commands_path"])
         )
-        build_checked = checked_cc is not None and checked_cc.exists()
-        build_missing = build_missing_reason(checked_cc) if build_checked else ""
+        build_checked = checked_cc is not None
+        build_missing = build_missing_reason(checked_cc) if checked_cc is not None else ""
         problem = read_build_problem(db_path.parent)
         if problem is not None and problem.build_missing:
             if build_missing:
@@ -911,7 +909,11 @@ def get_active_build(
                 f"{CURRENT_ROW_FORMAT} — {row_format_effect(stored_row_format)}. "
                 f"Run `fw-context index`"
             )
-        if cc_changed:
+        # A missing database of a build of fw-context is the missing build,
+        # and the build reason above (or the marker of the run that found
+        # it) already names it with its command.
+        database_gone = checked_cc is not None and not checked_cc.exists()
+        if cc_changed and not database_gone:
             reindex_reasons.append(stale_reason or "compile_commands_changed")
         if new_sources:
             listed = ", ".join(new_sources[:3])
@@ -2623,9 +2625,9 @@ def get_environment_status(
     else:
         dep_results = run_full_check(project_root=str(root))
         cfg = load_config(root)
-        from ...indexer.build import resolve_reuse_compile_commands
+        from ...indexer.build import default_compile_commands
 
-        cc = resolve_reuse_compile_commands(root, cfg.index.compile_commands)
+        cc = default_compile_commands(root, cfg)
         compile_db = {"exists": cc.exists(), "path": str(cc) if cc.exists() else None, "entry_count": None}
         if cc.exists():
             compile_db["entry_count"] = _cc_entry_count(cc)

@@ -49,14 +49,11 @@ from fw_context_mcp import _stdlib_sqlite3
 log = logging.getLogger(__name__)
 
 __all__ = [
-    "AUTOBUILD_REL",
-    "CC_OUTPUT_REL",
     "CC_STAGING_GLOB",
     "CPP_EXTENSIONS",
     "CPP_HEADER_EXTENSIONS",
     "CPP_SOURCE_EXTENSIONS",
     "C_SOURCE_EXTENSIONS",
-    "DEPS_REL",
     "FW_CONTEXT_REL",
     "HEADER_EXTENSIONS",
     "MTIME_TOLERANCE_S",
@@ -64,8 +61,6 @@ __all__ = [
     "TU_EXTENSIONS",
     "BuildTimeoutError",
     "abs_path",
-    "atomic_copy",
-    "autobuild_dir",
     "build_dir_patterns_with_fw_context",
     "build_env",
     "cc_output_path",
@@ -75,7 +70,6 @@ __all__ = [
     "compute_source_hash",
     "fmt_count",
     "format_number_ranges",
-    "ignore_autobuild_dir",
     "is_compile_commands_stale",
     "is_db_exception",
     "is_fatal",
@@ -86,7 +80,6 @@ __all__ = [
     "process_start_time",
     "read_file_lines",
     "record_build_groups",
-    "resolve_build_dir",
     "resolve_project_root",
     "resolve_real_binary",
     "run_in_process_group",
@@ -139,41 +132,27 @@ CPP_EXTENSIONS: frozenset[str] = CPP_SOURCE_EXTENSIONS | CPP_HEADER_EXTENSIONS
 # new-source scan skips it wholesale.
 FW_CONTEXT_REL: Path = Path(".fw-context")
 
-# Relative location (from the project root) of the generated
-# compile_commands.json.  Kept out of the project root so the build artifact
-# does not pollute the repository.
-CC_OUTPUT_REL: Path = FW_CONTEXT_REL / "build" / "compile_commands.json"
+# The file name of a compilation database, and the parts that the names of
+# its staging files are made of.
+_CC_STEM = "compile_commands"
+_CC_SUFFIX = ".json"
 
 # Glob that finds every staging file of :func:`cc_staging_path`.  A build that
 # a signal stopped leaves its staging file behind, thus the next build in the
 # same directory removes what it finds.
-CC_STAGING_GLOB: str = ".compile_commands.*.json"
-
-# Output directory of a build that fw-context starts on its own, one
-# subdirectory per variant.  It sits apart from the directory of the build
-# that the user runs: fw-context cannot lock that build, thus separation is
-# the only defence against two builds in one directory.
-AUTOBUILD_REL: Path = FW_CONTEXT_REL / "autobuild"
-
-# Where a backend puts dependency (.d) files when no isolated build
-# directory is set.  They must never land beside the source: there they sit
-# where the build of the user reads them, and a compiler does not write them
-# atomically, thus a concurrent make can read a truncated file.
-DEPS_REL: Path = FW_CONTEXT_REL / "build" / "deps"
+CC_STAGING_GLOB: str = f".{_CC_STEM}.*{_CC_SUFFIX}"
 
 
 def build_dir_patterns_with_fw_context(patterns: list[str]) -> list[str]:
     """Add the fw-context directory to the build-output patterns of a backend.
 
     Everything fw-context writes into a project sits under FW_CONTEXT_REL,
-    and an isolated automatic build puts the generated configuration headers
-    there — mbed_config.h, sdkconfig.h, autoconf.h.  The patterns of the
-    backend do not reach them.  Measured against the real manifests:
-    mbed-os gives ``BUILD/``, platformio ``.pio/build/``, zephyr
-    ``build/nrf52840_sysbuild/``, and none of the three matches.  The
-    backends whose pattern is ``build/`` match only because
-    ".fw-context/autobuild/" happens to hold that substring, which is not a
-    rule anything should rest on.
+    and each build that fw-context runs puts its output there, the generated
+    configuration headers included — mbed_config.h, sdkconfig.h, autoconf.h.
+    The patterns of the backend do not reach them.  Measured against the
+    real manifests: mbed-os gives ``BUILD/``, platformio ``.pio/build/``,
+    zephyr ``build/nrf52840_sysbuild/``, and none of the three matches
+    ``.fw-context/build/<variant>/out/``.
 
     A header the pipeline does not know is generated is re-hashed on every
     index run, and a generated header changes with every build without a
@@ -182,16 +161,6 @@ def build_dir_patterns_with_fw_context(patterns: list[str]) -> list[str]:
     staleness tiers are for.
     """
     return [*patterns, f"{FW_CONTEXT_REL}/"]
-
-
-def autobuild_dir(variant: str = "") -> str:
-    """Return the isolated build directory for *variant*, relative to the root.
-
-    An empty *variant* names the single-build case.  The name goes into the
-    path because every variant has its own output directory, thus one shared
-    directory would make the variants overwrite each other.
-    """
-    return str(AUTOBUILD_REL / (variant or "default"))
 
 
 def format_number_ranges(numbers: Sequence[int]) -> str:
@@ -217,38 +186,6 @@ def format_number_ranges(numbers: Sequence[int]) -> str:
         start = previous = number
     parts.append(str(start) if start == previous else f"{start}-{previous}")
     return ", ".join(parts)
-
-
-def ignore_autobuild_dir(project_root: Path) -> None:
-    """Keep the autobuild output out of the project's git status.
-
-    fw-context builds into ``.fw-context/autobuild/`` when it starts a build
-    of its own, and that output is a build artifact of a tool, never
-    something to commit.  The project's ``.gitignore`` cannot be relied on
-    for it: ``fw-context init`` is the only writer of that file, so a
-    project initialised before this directory existed lists
-    ``.fw-context/build/`` and nothing more, and the autobuild output then
-    shows up as untracked — measured on the Mbed project.
-
-    Writing the rule INSIDE the directory fixes that without touching a
-    file the user owns, and it covers a project that will never run ``init``
-    again.  ``*`` also hides this ``.gitignore`` itself, which is what we
-    want: nothing here belongs in a commit.
-
-    Silent on failure.  A build artifact that stays visible in git status
-    is untidy; refusing to build over it would be worse.
-    """
-    marker = project_root / AUTOBUILD_REL / ".gitignore"
-    if marker.exists():
-        return
-    try:
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text("# Build output of fw-context. Not for committing.\n*\n",
-                          encoding="utf-8")
-    except OSError:
-        logging.getLogger(__name__).debug(
-            "could not write %s", marker, exc_info=True,
-        )
 
 
 # Standard exception tuple for non-fatal recoverable errors.
@@ -900,26 +837,28 @@ def abs_path(root: Path, path: str) -> str:
     return str(root / p)
 
 
-def cc_output_path(project_root: Path, cfg: BuildConfig | None = None) -> Path:
-    """Return the compile_commands.json output path for a project.
+def cc_output_path(project_root: Path, cfg: BuildConfig) -> Path:
+    """Return the file that a backend writes its compilation database to.
 
-    Ensures the parent directory exists.  Every builder writes the generated
-    compilation database here so fw-context owns one stable, gitignored
-    location regardless of where the native build system produces its file.
+    Ensures the parent directory exists.  A backend calls this when the tool
+    that it runs takes the output path as an argument (bear, compiledb,
+    keil2clangd), or when it copies a database that the build system cannot
+    put into the output directory.
 
-    A builder that runs under ``generate_compile_commands`` gets a *cfg* whose
-    ``cc_output`` names the staging file of that run, and writes there
-    instead.  One atomic rename at the end of the build gives the canonical
-    file its new content.  WHY: a reader of the canonical file must never get
-    the half-written output of a build that still runs — measured on
-    2026-09-23, when a background run read a file that stopped in mid-line.
-
-    A caller that wants the canonical path passes no *cfg*.
+    Under ``generate_compile_commands`` *cfg* has ``cc_output``, the staging
+    file of that run, and one atomic rename at the end of the build gives
+    the final file its new content.  WHY: a reader of the final file must
+    never get the half-written output of a build that still runs — measured
+    on 2026-09-23, when a background run read a file that stopped in
+    mid-line.  Without ``cc_output`` the answer is the final file,
+    ``out/compile_commands.json`` of the variant that *cfg* builds.
     """
-    if cfg is not None and cfg.cc_output is not None:
+    from fw_context_mcp.indexer.build_layout import COMPILE_COMMANDS_NAME, BuildLayout
+
+    if cfg.cc_output is not None:
         target = cfg.cc_output
     else:
-        target = project_root / CC_OUTPUT_REL
+        target = BuildLayout(project_root).out_dir(cfg.variant_name) / COMPILE_COMMANDS_NAME
     target.parent.mkdir(parents=True, exist_ok=True)
     return target
 
@@ -1043,20 +982,18 @@ def _windows_process_is_gone(pid: int) -> bool:
         kernel32.CloseHandle(handle)
 
 
-def cc_staging_path(project_root: Path) -> Path:
-    """Return the file that one build writes before the canonical file gets it.
+def cc_staging_path(directory: Path) -> Path:
+    """Return the file in *directory* that one build writes before the final database gets it.
 
     The name holds the owner token of this process (see :func:`owner_token`),
     thus two runs cannot write one staging file, also when they run in two
-    PID namespaces.  The leading dot keeps the file out of the two scans that
-    look for ``compile_commands.*``: the variant discovery in ``cli/_index``
-    and the orphan cleanup in ``indexer/_embedding``.
+    PID namespaces.  The leading dot keeps the file out of each scan that
+    looks for ``compile_commands.*``.
 
-    The staging file sits in the directory of the canonical file, thus
-    ``os.replace`` between the two is atomic.
+    The caller puts *directory* on the file system of the final database,
+    thus ``os.replace`` between the two is atomic.
     """
-    canonical = project_root / CC_OUTPUT_REL
-    staging = canonical.with_name(f".{canonical.stem}.{owner_token()}{canonical.suffix}")
+    staging = directory / f".{_CC_STEM}.{owner_token()}{_CC_SUFFIX}"
     staging.parent.mkdir(parents=True, exist_ok=True)
     return staging
 
@@ -1064,21 +1001,20 @@ def cc_staging_path(project_root: Path) -> Path:
 def staging_owner(path: Path) -> str | None:
     """Return the owner token in the name of a staging file, or None.
 
-    The inverse of the names that :func:`cc_staging_path` and
-    :func:`atomic_copy` make: ``.compile_commands.[<name>.]<token>.json``.
-    The token is at the end, because a variant name before it can hold dots
-    and digits.  The host name in the token holds dots too, thus the token
-    is found by its form, ``<digits>@<tag>``, after a dot or at the start.
+    The inverse of the names that :func:`cc_staging_path` makes:
+    ``.compile_commands.<token>.json``.  The token is found by its form,
+    ``<digits>@<tag>``, after a dot or at the start, because the host name in
+    the token holds dots too (see :func:`temporary_owner`).
     """
-    return temporary_owner(path, CC_OUTPUT_REL.stem, CC_OUTPUT_REL.suffix)
+    return temporary_owner(path, _CC_STEM, _CC_SUFFIX)
 
 
 def temporary_owner(path: Path, stem: str, suffix: str) -> str | None:
     """Return the owner token in the name of a temporary file, or None.
 
     The name of a temporary file of ``<stem><suffix>`` is
-    ``.<stem>.[<name>.]<token><suffix>``, as :func:`atomic_copy` and the
-    other atomic writers make it with :func:`owner_token`.
+    ``.<stem>.[<name>.]<token><suffix>``, as the atomic writers make it with
+    :func:`owner_token`.
     """
     prefix = f".{stem}."
     name = path.name
@@ -1115,49 +1051,6 @@ def clear_dead_temporaries(directory: Path, stem: str, suffix: str) -> int:
 # The owner token at the end of the middle part of a staging name.  The tag
 # holds only the characters that _owner_tag keeps.
 _OWNER_TOKEN_AT_END = re.compile(r"(?:^|\.)(\d+@[A-Za-z0-9._-]+)$")
-
-
-def atomic_copy(source: Path, target: Path) -> None:
-    """Copy *source* to *target* so that a reader of *target* never gets a part.
-
-    ``shutil.copy2`` writes the target in place, thus a reader during the
-    copy gets a truncated file, and a copy that fails leaves one.  This
-    function copies to a temporary file beside *target* and then renames it
-    with ``os.replace``, which is atomic in one directory.  The metadata,
-    the mtime included, comes from *source* as with ``copy2``: the staleness
-    check compares that mtime.
-
-    The temporary name is ``.<stem>.<owner token><suffix>``.  The leading dot
-    keeps it out of each scan for ``compile_commands.*``, and the owner token
-    (see :func:`owner_token`) keeps two processes from one temporary file.
-    For a compilation database the name also matches ``CC_STAGING_GLOB``:
-    a copy that SIGKILL stops leaves the file, and the dead-owner cleanup of
-    the next build removes it.  A copy that fails removes its temporary file.
-    """
-    temporary = target.with_name(f".{target.stem}.{owner_token()}{target.suffix}")
-    try:
-        shutil.copy2(source, temporary)
-        os.replace(temporary, target)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def resolve_build_dir(project_root: Path, cfg, default: str) -> Path:
-    """Return the directory that the build must write to.
-
-    ``cfg.isolated_build_dir`` wins when it is set.  fw-context sets it for a
-    build that it starts on its own, so that the artifacts stay apart from
-    the ones of a build that the user runs in an IDE at the same time —
-    fw-context cannot lock that build, thus separation is the only defence.
-
-    A relative value resolves against *project_root*.  Without the setting
-    the backend keeps *default*, its usual directory.
-    """
-    isolated = getattr(cfg, "isolated_build_dir", None)
-    if isolated:
-        candidate = Path(isolated)
-        return candidate if candidate.is_absolute() else project_root / candidate
-    return project_root / default
 
 
 # Content LRU cache — mtime-keyed to auto-invalidate on file changes.

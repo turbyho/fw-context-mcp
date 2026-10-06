@@ -193,7 +193,7 @@ _PROJECT_DEFAULTS_TEMPLATE = """\
 # [[build.variants]]
 # name   = "nrf52840-dev"                     # unique key, referenced by tools
 # board  = "nrf52840dk/nrf52840"              # build-system-specific label
-# build_dir = "build/nrf52840_sysbuild"       # per-variant output (default build/<name>)
+# (the build goes to .fw-context/build/<name>/out)
 # env    = { BOARD_ENV = "DEV" }               # build env vars (folded into config_hash)
 # images = [                                  # sysbuild images (Zephyr only)
 #   { name = "app",      dir = "proj/app",      type = "project" },
@@ -459,8 +459,11 @@ class IndexConfig:
     Attributes:
         db_dir: Directory where per-project SQLite databases are stored.
         compile_commands: Path to compile_commands.json (relative to project root).
-            Defaults to ``.fw-context/build/compile_commands.json`` — a gitignored
-            subdirectory of the project config dir.
+            The default ``.fw-context/build/compile_commands.json``, and the
+            older ``compile_commands.json``, name no file of the user: for a
+            build that fw-context runs they mean the database of that build,
+            in ``.fw-context/build/<variant>/out`` (see
+            ``build.explicit_compile_commands``).
         config_header: Path to a build-generated configuration header (e.g.
             ``config.h``) for projects whose build system does not emit
             ``-include`` flags in compile_commands.json.  When set, the file

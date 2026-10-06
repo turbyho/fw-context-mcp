@@ -8,8 +8,9 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from fw_context_mcp.utils import CC_OUTPUT_REL, BuildTimeoutError, cc_output_path, run_build_command
+from fw_context_mcp.utils import BuildTimeoutError, cc_output_path, run_build_command
 
+from ..build_layout import BuildLayout
 from . import _link_command, _platformio_link, registry
 from ._linker import LinkRecord
 from .protocol import BuildIssue
@@ -120,9 +121,9 @@ class PlatformIOBuildSystem:
         # override is the environment variable, which beats build_dir in
         # platformio.ini.  run_build_command merges this into the child
         # environment, thus every pio call below writes to it.
-        build_env: dict[str, str] | None = None
-        if cfg.isolated_build_dir:
-            build_env = {"PLATFORMIO_BUILD_DIR": cfg.isolated_build_dir}
+        build_env: dict[str, str] = {
+            "PLATFORMIO_BUILD_DIR": str(BuildLayout(project_root).out_dir(cfg.variant_name)),
+        }
 
         if cfg.clean:
             clean_cmd = pio_prefix + ["run", "--project-dir", str(project_root), "--target", "clean"]
@@ -136,8 +137,8 @@ class PlatformIOBuildSystem:
         run_build_command(cmd, cwd=project_root, description="pio run --target compiledb", build_cfg=cfg, env=build_env)
 
         # PlatformIO writes compile_commands.json natively to the project
-        # root; copy it to the gitignored fw-context build dir for a stable
-        # location that survives a clean of the project root.
+        # root; copy it to the output directory of the variant, where the
+        # next build of the user cannot replace it.
         native_cc = project_root / "compile_commands.json"
         if not native_cc.exists():
             raise RuntimeError("compile_commands.json was not generated — pio run may have failed silently")
@@ -171,13 +172,15 @@ class PlatformIOBuildSystem:
         project_root: Path,
         cfg: BuildConfig,
         pio_prefix: list[str],
-        build_env: dict[str, str] | None,
+        build_env: dict[str, str],
         cc_path: Path,
     ) -> None:
         """Record the link inputs of each environment for *cc_path*.
 
-        The sidecar is in the fw-context build directory.  Its entry holds
-        the build variant and the hash of *cc_path*, which can be the staging
+        The sidecar is in the directory of the variant, beside ``out/``:
+        PlatformIO removes its build directory when ``project.checksum``
+        changes, and a file inside it would go too.  Its entry holds the
+        build variant and the hash of *cc_path*, which can be the staging
         file of this build.  The rename of the staging file keeps the
         content, thus the hash stays correct for the published database.
 
@@ -192,8 +195,8 @@ class PlatformIOBuildSystem:
         build.  A change of the link alone keeps the hash of the database,
         thus an old entry would give the old link to the new build.
         """
-        target = _platformio_link.sidecar_path((project_root / CC_OUTPUT_REL).parent)
-        envs = self._dump_links(project_root, cfg, pio_prefix, {**(build_env or {}), "PLATFORMIO_NO_ANSI": "true"})
+        target = _platformio_link.sidecar_path(BuildLayout(project_root).variant_dir(cfg.variant_name))
+        envs = self._dump_links(project_root, cfg, pio_prefix, {**build_env, "PLATFORMIO_NO_ANSI": "true"})
         for name, link in sorted((envs or {}).items()):
             if link.unknown:
                 log.info("PlatformIO environment %s: the link cannot be read: %s", name, link.unknown)
@@ -314,14 +317,14 @@ class PlatformIOBuildSystem:
         or a script that the link names is not on disk.  The index then
         keeps the memory map it has, see ``builders.link_record``.
 
-        The sidecar is in the fw-context build directory, where ``build()``
+        The sidecar is in the directory of the variant, where ``build()``
         writes it, and not next to *compile_commands*.  A database that the
         user gives explicitly, such as the ``compile_commands.json`` that
         PlatformIO writes in the project root, has the same content and thus
         the same hash, but another directory.
         """
         envs = _platformio_link.read_link(
-            _platformio_link.sidecar_path((project_root / CC_OUTPUT_REL).parent),
+            _platformio_link.sidecar_path(BuildLayout(project_root).variant_dir(variant)),
             variant,
             compile_commands,
         )

@@ -464,7 +464,7 @@ def record_link(
     costs the memory maps of the other variants until their next build.
 
     The write is atomic.  The temporary name starts with a dot and holds the
-    owner token, as in `utils.atomic_copy`, so that two processes never
+    owner token (see `utils.owner_token`), so that two processes never
     share it.
     """
     sha = file_sha256(compile_commands)

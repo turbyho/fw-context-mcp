@@ -3,7 +3,7 @@
 ``.fw-context/`` holds one file the team shares — ``config.toml``, the
 build configuration that gives every developer the same index — and
 several that must stay out: ``local.toml`` (paths and API keys of one
-developer), ``build/`` and ``autobuild/`` (generated output).
+developer) and ``build/`` (generated output).
 
 The rule turns on one character.  ``.fw-context/`` excludes the
 DIRECTORY, and git does not descend into an excluded directory, thus no
@@ -126,13 +126,12 @@ def test_git_agrees(tmp_path):
     """Ask git, and not this test file, whether the rules are right."""
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)  # noqa: S603,S607
     fw = tmp_path / ".fw-context"
-    (fw / "build").mkdir(parents=True)
-    (fw / "autobuild" / "default").mkdir(parents=True)
+    (fw / "build" / "default" / "out").mkdir(parents=True)
     for path in (
         fw / "config.toml",
         fw / "local.toml",
-        fw / "build" / "compile_commands.json",
-        fw / "autobuild" / "default" / ".link_script.ld",
+        fw / "build" / "default" / "out" / "compile_commands.json",
+        fw / "build" / "default" / "out" / ".link_script.ld",
     ):
         path.write_text("", encoding="utf-8")
 
@@ -148,8 +147,8 @@ def test_git_agrees(tmp_path):
 
     assert not ignored(".fw-context/config.toml"), "the shared config must be committable"
     assert ignored(".fw-context/local.toml")
-    assert ignored(".fw-context/build/compile_commands.json")
-    assert ignored(".fw-context/autobuild/default/.link_script.ld")
+    assert ignored(".fw-context/build/default/out/compile_commands.json")
+    assert ignored(".fw-context/build/default/out/.link_script.ld")
 
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
@@ -162,10 +161,10 @@ def test_git_agrees_about_a_project_below_the_root(tmp_path):
     """
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)  # noqa: S603,S607
     fw = tmp_path / "sub" / "bootloader" / ".fw-context"
-    (fw / "autobuild" / "default").mkdir(parents=True)
+    (fw / "build" / "default" / "out").mkdir(parents=True)
     (fw / "config.toml").write_text("", encoding="utf-8")
     (fw / "local.toml").write_text("", encoding="utf-8")
-    (fw / "autobuild" / "default" / "app.elf").write_text("", encoding="utf-8")
+    (fw / "build" / "default" / "out" / "app.elf").write_text("", encoding="utf-8")
 
     _ensure_gitignore(tmp_path, fix=True)
 
@@ -177,4 +176,4 @@ def test_git_agrees_about_a_project_below_the_root(tmp_path):
 
     assert not ignored("sub/bootloader/.fw-context/config.toml")
     assert ignored("sub/bootloader/.fw-context/local.toml")
-    assert ignored("sub/bootloader/.fw-context/autobuild/default/app.elf")
+    assert ignored("sub/bootloader/.fw-context/build/default/out/app.elf")

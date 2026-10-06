@@ -330,7 +330,6 @@ def main() -> None:
     p_iv_add.add_argument("--name", metavar="NAME", help="Variant name (unique key)")
     p_iv_add.add_argument("--board", metavar="BOARD", help="Board/target/chip qualifier")
     p_iv_add.add_argument("--description", metavar="TEXT", help="Human-readable description")
-    p_iv_add.add_argument("--build-dir", metavar="DIR", help="Per-variant build output dir")
     p_iv_add.add_argument("--env", metavar="K=V", action="append", default=None,
                           help="Build env var (repeatable)")
     p_iv_add.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")

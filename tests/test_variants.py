@@ -35,11 +35,22 @@ class TestBuildVariantConfig:
         assert base.defines == ["A=1"]
         assert base.env == {"BOARD_ENV": "DEV"}
 
-    def test_build_dir_override(self):
-        base = BuildConfig(build_dir="build/")
+    def test_the_retired_build_dir_does_not_reach_the_build(self):
+        """Each build goes to .fw-context/build/<variant>/out; build_dir has no effect."""
+        base = BuildConfig()
         v = BuildVariant(name="v", build_dir="build/nrf52840_sysbuild")
         c = build_variant_config(base, v)
-        assert c.build_dir == "build/nrf52840_sysbuild"
+        assert c.build_dir is None
+
+    def test_the_retired_build_dir_is_found_everywhere(self):
+        from fw_context_mcp.indexer.build import retired_build_dir_keys
+
+        cfg = BuildConfig(
+            build_dir="build/",
+            variants=[BuildVariant(name="a", build_dir="build/a"), BuildVariant(name="b")],
+        )
+        assert retired_build_dir_keys(cfg) == ["[build] build_dir", "[[build.variants]] 'a' build_dir"]
+        assert retired_build_dir_keys(BuildConfig(variants=[BuildVariant(name="b")])) == []
 
 
 class TestVariantConfigParsing:

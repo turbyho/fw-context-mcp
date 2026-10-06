@@ -278,7 +278,7 @@ Use this build system for any CMake project that is not Zephyr or ESP-IDF.
 This mode needs no build system. Configure `source_dirs`, `include_dirs`, and
 `defines` in `.fw-context/config.toml`. `fw-context` scans the sources and
 generates `compile_commands.json`. The `.d` files go to
-`.fw-context/build/deps`, not next to the sources.
+`.fw-context/build/default/out/deps`, not next to the sources.
 
 ### STM32CubeIDE (Manual Setup)
 

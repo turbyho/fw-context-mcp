@@ -24,12 +24,12 @@ from pathlib import Path
 
 import pytest
 
+from fw_context_mcp.indexer.build_layout import BuildLayout
 from fw_context_mcp.indexer.builders import _link_command as lc
 from fw_context_mcp.indexer.builders import _platformio_link as pl
 from fw_context_mcp.indexer.builders import link_record, linker_scripts
 from fw_context_mcp.indexer.builders._linker import LinkRecord
 from fw_context_mcp.indexer.builders.platformio import PlatformIOBuildSystem
-from fw_context_mcp.utils import CC_OUTPUT_REL
 
 
 @dataclass
@@ -712,14 +712,14 @@ class TestResolve:
 
 
 def _database(tmp_path: Path, content: str = "[]", name: str = "compile_commands.json") -> Path:
-    path = (tmp_path / CC_OUTPUT_REL).with_name(name)
+    path = BuildLayout(tmp_path).out_dir("") / name
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
     return path
 
 
-def _target(tmp_path: Path) -> Path:
-    return pl.sidecar_path((tmp_path / CC_OUTPUT_REL).parent)
+def _target(tmp_path: Path, variant: str = "") -> Path:
+    return pl.sidecar_path(BuildLayout(tmp_path).variant_dir(variant))
 
 
 class TestSidecar:
@@ -728,8 +728,9 @@ class TestSidecar:
         envs = pl.parse_envdump(_stm32_block(tmp_path))
         pl.record_link(_target(tmp_path), "", database, envs)
         assert pl.read_link(_target(tmp_path), "", database) == envs
-        # The temporary file is gone.
-        assert {p.name for p in database.parent.iterdir()} == {"compile_commands.json", pl.SIDECAR_NAME}
+        # The temporary file is gone.  The sidecar sits beside out/, which
+        # PlatformIO can remove as a whole.
+        assert {p.name for p in _target(tmp_path).parent.iterdir()} == {"out", pl.SIDECAR_NAME}
 
     def test_another_database_has_no_entry(self, tmp_path):
         database = _database(tmp_path)
@@ -911,7 +912,7 @@ class TestBuilder:
 
     def _recorded(self, tmp_path, text, variant=""):
         database = _database(tmp_path)
-        pl.record_link(_target(tmp_path), variant, database, pl.parse_envdump(text))
+        pl.record_link(_target(tmp_path, variant), variant, database, pl.parse_envdump(text))
         return database
 
     def test_a_record_with_scripts_and_defsyms(self, tmp_path):
@@ -978,9 +979,8 @@ class TestLinkRecordProbe:
         )
 
     def test_an_empty_list_is_unknown(self, tmp_path):
-        # Measured on a Zephyr sysbuild project: the copy of the database in
-        # .fw-context/build/ has no build.ninja next to it.  That is "not
-        # known", and it must not remove a correct map.
+        # A database whose directory holds no build.ninja gives an empty
+        # list.  That is "not known", and it must not remove a correct map.
         assert link_record(self.ScriptsOnly([]), tmp_path) is None
 
     def test_a_backend_that_raises_is_unknown(self, tmp_path):
@@ -1085,7 +1085,7 @@ class TestBuildRecordsTheLink:
         cc_path, calls = self._run(tmp_path, monkeypatch, _stm32_block(tmp_path), variant="v1")
         envdump_env = next(env for cmd, env in calls if "envdump" in cmd)
         assert envdump_env["PLATFORMIO_NO_ANSI"] == "true"
-        assert list(pl.read_link(_target(tmp_path), "v1", cc_path) or {}) == ["nucleo"]
+        assert list(pl.read_link(_target(tmp_path, "v1"), "v1", cc_path) or {}) == ["nucleo"]
 
     def test_a_failed_envdump_does_not_stop_the_build(self, tmp_path, monkeypatch, caplog):
         with caplog.at_level("WARNING"):

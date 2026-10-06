@@ -31,12 +31,15 @@ class TestESPIDFValidation:
         issues = builder.validate_artifacts(cc, tmp_path)
         assert len(issues) == 1
         assert "build" in issues[0].message.lower()
+        assert issues[0].severity == "warning", "an explicit database still indexes"
 
     def test_build_dir_exists_no_issues(self, tmp_path):
+        # build() leaves the database in its build directory, beside build.ninja.
         build_dir = tmp_path / "build"
         build_dir.mkdir()
-        cc = tmp_path / "compile_commands.json"
-        cc.write_text(json.dumps([{"file": "main.c", "directory": str(tmp_path), "arguments": ["gcc", "-c", "main.c"]}]))
+        (build_dir / "build.ninja").write_text("", encoding="utf-8")
+        cc = build_dir / "compile_commands.json"
+        cc.write_text(json.dumps([{"file": "main.c", "directory": str(build_dir), "arguments": ["gcc", "-c", "main.c"]}]))
         builder = ESPIDFBuildSystem()
         issues = builder.validate_artifacts(cc, tmp_path)
         assert len(issues) == 0
