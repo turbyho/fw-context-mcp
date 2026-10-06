@@ -679,3 +679,15 @@ class TestEveryUncoveredFileIsRecorded:
             f"the recorder must lift the report cap; it passed {seen!r}"
         )
         assert seen.get("apply_exclusions") is False
+
+
+class TestNoIndexFileIsMade:
+    def test_a_project_without_an_index_gets_no_index_file(self, tmp_path):
+        """A run with --no-index records nothing, and get_active_build keeps "no_index"."""
+        from fw_context_mcp.cli._index import _record_still_uncovered
+
+        db_path = tmp_path / "index" / "index.db"
+
+        _record_still_uncovered(tmp_path, db_path)
+
+        assert not db_path.exists()
