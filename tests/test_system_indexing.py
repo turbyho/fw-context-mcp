@@ -56,9 +56,15 @@ def _cc_path(proj: Path) -> Path:
     """Return the generated compile_commands.json location for a project.
 
     The build without variants writes into ``.fw-context/build/default/out``
-    (see ``indexer/build_layout.py``).
+    (see ``indexer/build_layout.py``), and the build system decides where
+    in it: ``out/<env>/`` for PlatformIO, ``out/zephyr/`` for a Zephyr build
+    with sysbuild.  The index run reads the file that
+    ``build.default_compile_commands`` names, thus the test asks the same.
     """
-    return proj / ".fw-context" / "build" / "default" / "out" / "compile_commands.json"
+    from fw_context_mcp.config import load as load_config
+    from fw_context_mcp.indexer.build import default_compile_commands
+
+    return default_compile_commands(proj, load_config(project_root=proj))
 
 
 def _cli(
