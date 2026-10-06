@@ -829,6 +829,7 @@ _BUILD_FIELDS: list[tuple[str, str, str]] = [
     ("timeout", "timeout", "float(7200)"),
     ("source_dir", "source_dir", "str"),
     ("sysbuild", "sysbuild", "bool"),
+    ("environment", "environment", "str"),
     ("build_dir", "build_dir", "str"),
     ("default_variant", "default_variant", "str"),
     ("default_image", "default_image", "str"),

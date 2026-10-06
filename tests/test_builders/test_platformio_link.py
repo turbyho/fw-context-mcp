@@ -1018,7 +1018,7 @@ class TestLinkRecordProbe:
 
 
 class TestBuildRecordsTheLink:
-    """`build()` records the link, and a failure of `envdump` stops nothing."""
+    """`build()` records the link of its environment, and a failed `envdump` stops nothing."""
 
     def _run(
         self,
@@ -1026,18 +1026,13 @@ class TestBuildRecordsTheLink:
         monkeypatch,
         envdump_stdout: str | None,
         variant: str = "",
-        config_stdout: str | None = None,
-        per_env: dict[str, str | None] | None = None,
+        environment: str = "nucleo",
         envdump_times_out: bool = False,
-        times_out_for: tuple[str, ...] = (),
     ):
-        """Run `build()` with a fake `pio`.
+        """Run `build()` of *environment* with a fake `pio`.
 
-        None for *envdump_stdout*, for *config_stdout* (`pio project
-        config`) or for an environment of *per_env* (`pio run -e`) is a run
-        that fails.  *envdump_times_out* makes the one run for all the
-        environments time out.  *times_out_for* names the environments
-        whose own run times out.
+        None for *envdump_stdout* is a dump that fails, and
+        *envdump_times_out* makes it time out.
         """
         from fw_context_mcp.indexer.build import BuildConfig
         from fw_context_mcp.indexer.builders import platformio as module
@@ -1059,15 +1054,9 @@ class TestBuildRecordsTheLink:
         def fake_run(cmd, cwd, description="", build_cfg=None, env=None, **_):
             calls.append((cmd, env))
             if "compiledb" in cmd:
-                (tmp_path / "compile_commands.json").write_text("[]", encoding="utf-8")
-            if cmd[1:3] == ["project", "config"]:
-                return Done(config_stdout) if config_stdout is not None else fail("pio project config")
-            if "envdump" in cmd and "--environment" in cmd:
-                name = cmd[cmd.index("--environment") + 1]
-                if name in times_out_for:
-                    raise BuildTimeoutError(f"Build command timed out after 1s: pio run -e {name}")
-                stdout = (per_env or {}).get(name)
-                return Done(stdout) if stdout is not None else fail("pio run -e x --target envdump")
+                out = Path(env["PLATFORMIO_BUILD_DIR"]) / cmd[cmd.index("--environment") + 1]
+                out.mkdir(parents=True, exist_ok=True)
+                (out / "compile_commands.json").write_text("[]", encoding="utf-8")
             if "envdump" in cmd and envdump_times_out:
                 raise BuildTimeoutError("Build command timed out after 1s: pio run --target envdump")
             if "envdump" in cmd:
@@ -1076,7 +1065,7 @@ class TestBuildRecordsTheLink:
 
         monkeypatch.setattr(module, "run_build_command", fake_run)
         monkeypatch.setattr(module.shutil, "which", lambda name: "/usr/bin/pio" if name == "pio" else None)
-        cfg = BuildConfig(system="platformio", clean=False)
+        cfg = BuildConfig(system="platformio", clean=False, environment=environment)
         cfg.variant_name = variant
         cc_path = PlatformIOBuildSystem().build(tmp_path, cfg)
         return cc_path, calls
@@ -1086,6 +1075,12 @@ class TestBuildRecordsTheLink:
         envdump_env = next(env for cmd, env in calls if "envdump" in cmd)
         assert envdump_env["PLATFORMIO_NO_ANSI"] == "true"
         assert list(pl.read_link(_target(tmp_path, "v1"), "v1", cc_path) or {}) == ["nucleo"]
+
+    def test_the_dump_asks_for_the_environment_of_the_build(self, tmp_path, monkeypatch):
+        """A variant builds one environment, thus the dump of the others is not its link."""
+        _, calls = self._run(tmp_path, monkeypatch, _stm32_block(tmp_path))
+        [dump] = [cmd for cmd, _ in calls if "envdump" in cmd]
+        assert dump[dump.index("--environment") + 1] == "nucleo"
 
     def test_a_failed_envdump_does_not_stop_the_build(self, tmp_path, monkeypatch, caplog):
         with caplog.at_level("WARNING"):
@@ -1097,6 +1092,11 @@ class TestBuildRecordsTheLink:
         assert "SECRET_TOKEN" not in caplog.text
         assert "envdump failed" in caplog.text
 
+    def test_a_timeout_does_not_stop_the_build(self, tmp_path, monkeypatch):
+        cc_path, _ = self._run(tmp_path, monkeypatch, None, envdump_times_out=True)
+        assert cc_path.is_file()
+        assert pl.read_link(_target(tmp_path), "", cc_path) is None
+
     def test_a_failed_envdump_removes_the_entry_of_an_earlier_build(self, tmp_path, monkeypatch):
         cc_path, _ = self._run(tmp_path, monkeypatch, _stm32_block(tmp_path))
         assert pl.read_link(_target(tmp_path), "", cc_path) is not None
@@ -1104,7 +1104,7 @@ class TestBuildRecordsTheLink:
         assert pl.read_link(_target(tmp_path), "", cc_path) is None
 
     def test_a_dump_with_no_linkflags(self, tmp_path, monkeypatch):
-        cc_path, _ = self._run(tmp_path, monkeypatch, "Processing x (y)\n")
+        cc_path, _ = self._run(tmp_path, monkeypatch, "Processing x (y)\n", environment="x")
         assert cc_path.is_file()
         assert pl.read_link(_target(tmp_path), "", cc_path)["x"].unknown
         assert link_record(PlatformIOBuildSystem(), tmp_path, compile_commands=cc_path) is None
@@ -1114,78 +1114,17 @@ class TestBuildRecordsTheLink:
         cc_path, _ = self._run(tmp_path, monkeypatch, None)
         assert cc_path.is_file()
 
-    def test_a_dump_with_no_environment(self, tmp_path, monkeypatch):
+    def test_a_dump_with_no_dict_of_the_environment(self, tmp_path, monkeypatch):
         cc_path, _ = self._run(tmp_path, monkeypatch, "no header at all\n")
         assert pl.read_link(_target(tmp_path), "", cc_path) is None
 
-    TWO_ENVS = json.dumps([
-        ["platformio", [["default_envs", ["good", "bad"]]]],
-        ["env:good", [["board", "x"]]], ["env:bad", [["board", "y"]]], ["env:other", [["board", "z"]]],
-    ])
-
-    def test_one_failed_environment_keeps_the_others(self, tmp_path, monkeypatch, caplog):
-        # The run of every environment fails for one of them.  Each
-        # environment is then dumped alone, and only the bad one is unknown.
+    def test_the_recorded_link_gives_the_map(self, tmp_path, monkeypatch):
         system, variant = _stm32_files(tmp_path)
-        with caplog.at_level("WARNING"):
-            cc_path, calls = self._run(
-                tmp_path, monkeypatch, None, config_stdout=self.TWO_ENVS,
-                per_env={"good": _stm32_block(tmp_path, "good"), "bad": None},
-            )
-        envs = pl.read_link(_target(tmp_path), "", cc_path) or {}
-        assert sorted(envs) == ["bad", "good"]
-        assert envs["bad"].unknown and not envs["good"].unknown
-        # `default_envs` names the environments; `other` is not built.
-        dumped = [cmd[cmd.index("--environment") + 1] for cmd, _ in calls if "--environment" in cmd]
-        assert dumped == ["good", "bad"]
-        assert "SECRET_TOKEN" not in caplog.text
-        units = [FakeUnit(tmp_path, {"output": ".pio/build/good/a.o"})]
+        cc_path, _ = self._run(tmp_path, monkeypatch, _stm32_block(tmp_path))
+        units = [FakeUnit(tmp_path, {"output": ".pio/build/nucleo/a.o"})]
         record = link_record(PlatformIOBuildSystem(), tmp_path, compile_commands=cc_path, units=units)
         assert record is not None
         assert record.scripts == [system.resolve(), variant.resolve()]
-
-    def test_the_failed_environment_gives_no_map(self, tmp_path, monkeypatch):
-        _stm32_files(tmp_path)
-        cc_path, _ = self._run(
-            tmp_path, monkeypatch, None, config_stdout=self.TWO_ENVS,
-            per_env={"good": _stm32_block(tmp_path, "good"), "bad": None},
-        )
-        # No unit names an object file: the database can be of either one.
-        assert link_record(PlatformIOBuildSystem(), tmp_path, compile_commands=cc_path, units=[]) is None
-
-    def test_one_environment_is_not_dumped_again(self, tmp_path, monkeypatch):
-        one = json.dumps([["env:only", [["board", "x"]]]])
-        cc_path, calls = self._run(tmp_path, monkeypatch, None, config_stdout=one, per_env={"only": "x"})
-        assert not any("--environment" in cmd for cmd, _ in calls)
-        assert pl.read_link(_target(tmp_path), "", cc_path) is None
-
-    def test_a_timeout_is_not_dumped_again(self, tmp_path, monkeypatch):
-        # A dump that hangs would hang once per environment, each time up to
-        # the timeout of the build.
-        cc_path, calls = self._run(
-            tmp_path, monkeypatch, None, config_stdout=self.TWO_ENVS,
-            per_env={"good": _stm32_block(tmp_path, "good"), "bad": None},
-            envdump_times_out=True,
-        )
-        assert not any("--environment" in cmd or cmd[1:3] == ["project", "config"] for cmd, _ in calls)
-        assert pl.read_link(_target(tmp_path), "", cc_path) is None
-
-    def test_a_timeout_of_one_environment_stops_the_retry(self, tmp_path, monkeypatch):
-        three = json.dumps([["env:a", []], ["env:b", []], ["env:c", []]])
-        cc_path, calls = self._run(
-            tmp_path, monkeypatch, None, config_stdout=three,
-            per_env={"a": None, "c": _stm32_block(tmp_path, "c")}, times_out_for=("b",),
-        )
-        dumped = [cmd[cmd.index("--environment") + 1] for cmd, _ in calls if "--environment" in cmd]
-        assert dumped == ["a", "b"]
-        envs = pl.read_link(_target(tmp_path), "", cc_path) or {}
-        assert sorted(envs) == ["a", "b", "c"]
-        assert all(link.unknown for link in envs.values())
-
-    def test_a_failed_project_config_gives_no_map(self, tmp_path, monkeypatch):
-        cc_path, calls = self._run(tmp_path, monkeypatch, None)
-        assert not any("--environment" in cmd for cmd, _ in calls)
-        assert pl.read_link(_target(tmp_path), "", cc_path) is None
 
 
 class TestRunEnvironments:

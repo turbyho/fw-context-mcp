@@ -1462,9 +1462,17 @@ def _cleanup_old_for_pair(
            ORDER BY created_at DESC, rowid DESC""",
         (project_id, variant, image, keep_hash),
     ).fetchall()
+    return _delete_builds(conn, db_dir, [row["config_hash"] for row in old_rows])
+
+
+def _delete_builds(conn: sqlite3.Connection, db_dir: Path, hashes: list[str]) -> list[str]:
+    """Delete the rows and the on-disk artifacts of each build in *hashes*.
+
+    Returns *hashes*.  One transaction for each build, as the retention of
+    one pair does.
+    """
     deleted: list[str] = []
-    for row in old_rows:
-        old_ch = row["config_hash"]
+    for old_ch in hashes:
         with transaction(conn):
             delete_build_data(conn, old_ch)
         deleted.append(old_ch)
@@ -1527,6 +1535,53 @@ def cleanup_old_builds_multi(
             _cleanup_old_for_pair(conn, project_id, db_dir, variant, image, row["config_hash"])
         )
     return deleted
+
+
+def cleanup_retired_builds(
+    conn: sqlite3.Connection,
+    project_id: str,
+    db_dir: Path,
+    variants: set[str],
+    built: set[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    """Delete the builds of each ``(variant, image)`` that the project no longer makes.
+
+    Call this only after a run over the WHOLE set of builds of the project,
+    never after a run that ``--variant`` or ``--image`` narrowed: such a run
+    does not know the other builds.
+
+    *variants* is the set of the run, ``{""}`` for a project without
+    variants.  *built* is the pairs that this run built and indexed.  A pair
+    is retired when its variant is not in *variants* (the config or
+    platformio.ini dropped it, or the project changed between one build and
+    variants), or when its variant built in this run and that build made no
+    such image (a sysbuild that stopped making ``app_slot1_variant``).  A
+    variant of the set whose build failed in this run keeps its builds: the
+    failure says nothing about the images that it makes.
+
+    WHY: ``resolve_build`` reads the variants of the index, thus a retired
+    variant stayed queryable with old data, and a project that went from
+    two environments to one could not reach its new build without
+    ``variant``.  Returns the retired pairs.
+    """
+    if PidFile.is_active_other(db_dir / "reindex.pause"):
+        return []
+    built_variants = {variant for variant, _ in built}
+    retired: list[tuple[str, str]] = []
+    for row in conn.execute(
+        "SELECT DISTINCT variant, image FROM build_configs WHERE project_id = ? ORDER BY variant, image",
+        (project_id,),
+    ).fetchall():
+        pair = (row["variant"] or "", row["image"] or "")
+        if pair[0] not in variants or (pair[0] in built_variants and pair not in built):
+            retired.append(pair)
+    for variant, image in retired:
+        hashes = conn.execute(
+            "SELECT config_hash FROM build_configs WHERE project_id = ? AND variant = ? AND image = ?",
+            (project_id, variant, image),
+        ).fetchall()
+        _delete_builds(conn, db_dir, [row["config_hash"] for row in hashes])
+    return retired
 
 
 def _step_cleanup_old_builds(conn: sqlite3.Connection, ctx: dict) -> None:

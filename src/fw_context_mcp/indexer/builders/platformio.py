@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import configparser
 import logging
+import os
 import shutil
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from fw_context_mcp.utils import BuildTimeoutError, cc_output_path, run_build_command
+from fw_context_mcp.utils import run_build_command
 
-from ..build_layout import BuildLayout
+from ..build_layout import COMPILE_COMMANDS_NAME, BuildLayout
 from . import _link_command, _platformio_link, registry
 from ._linker import LinkRecord
 from .protocol import BuildIssue
@@ -21,6 +23,21 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 _PIO_MARKERS = ["platformio.ini"]
+
+# The SCons script that each build of fw-context adds through
+# PLATFORMIO_EXTRA_SCRIPTS, see PlatformIOBuildSystem.build.
+# COMPILATIONDB_PATH is the construction variable of the compiledb tool, and
+# $BUILD_DIR is the build directory of the environment.
+_COMPILEDB_SCRIPT_NAME = "fw_context_compiledb.py"
+_BUILD_DIR_VARIABLE = "PLATFORMIO_BUILD_DIR"
+_EXTRA_SCRIPTS_VARIABLE = "PLATFORMIO_EXTRA_SCRIPTS"
+_COMPILEDB_SCRIPT = (
+    "# Written by fw-context. PlatformIO runs it before each build of fw-context.\n"
+    "# It puts compile_commands.json into the build directory of the environment,\n"
+    "# thus the file in the project root stays as the build of the user wrote it.\n"
+    'Import("env")\n'
+    'env.Replace(COMPILATIONDB_PATH="$BUILD_DIR/compile_commands.json")\n'
+)
 
 
 def _libdeps_dir(project_root: Path) -> str:
@@ -97,64 +114,137 @@ class PlatformIOBuildSystem:
 
     # ── Build ──
 
-    def build(self, project_root: Path, cfg: BuildConfig) -> Path:
-        """Generate compile_commands.json via ``pio run --target compiledb``
-        and then run a full build to generate ``.d`` dependency files.
-
-        The ``compiledb`` target captures compile commands from SCons
-        internals but may not invoke GCC — ``.d`` files are only emitted
-        during actual compilation.  A subsequent ``pio run`` ensures they
-        exist for header-change detection.
-        """
+    @staticmethod
+    def _pio_prefix(cfg: BuildConfig) -> list[str]:
+        """Return the command that runs the PlatformIO CLI, or raise."""
         if cfg.python:
-            pio_prefix = [cfg.python, "-m", "platformio"]
-        elif shutil.which("pio"):
-            pio_prefix = ["pio"]
-        elif shutil.which("platformio"):
-            pio_prefix = ["platformio"]
-        else:
-            raise RuntimeError("PlatformIO CLI is required.  Install it:  pip install platformio")
+            return [cfg.python, "-m", "platformio"]
+        if shutil.which("pio"):
+            return ["pio"]
+        if shutil.which("platformio"):
+            return ["platformio"]
+        raise RuntimeError("PlatformIO CLI is required.  Install it:  pip install platformio")
 
-        cmd: list[str] = pio_prefix + ["run", "--project-dir", str(project_root), "--target", "compiledb"]
+    def environments(self, project_root: Path, cfg: BuildConfig) -> list[str]:
+        """Return the environments that ``pio run`` builds, or raise RuntimeError.
 
-        # PlatformIO has no CLI flag for the build directory; the documented
-        # override is the environment variable, which beats build_dir in
-        # platformio.ini.  run_build_command merges this into the child
-        # environment, thus every pio call below writes to it.
-        build_env: dict[str, str] = {
-            "PLATFORMIO_BUILD_DIR": str(BuildLayout(project_root).out_dir(cfg.variant_name)),
-        }
+        The answer comes from PlatformIO itself (``pio project config``), not
+        from a read of ``platformio.ini``: ``extends``, ``extra_configs`` and
+        ``default_envs`` decide the set, and only PlatformIO applies them as
+        its build does.  See ``_platformio_link.run_environments``.
+        """
+        cmd = self._pio_prefix(cfg) + ["project", "config", "--project-dir", str(project_root), "--json-output"]
+        result = run_build_command(cmd, cwd=project_root, description="pio project config", build_cfg=cfg)
+        names = _platformio_link.run_environments(result.stdout or "")
+        if not names:
+            raise RuntimeError("pio project config names no environment that pio run builds")
+        return names
+
+    def implicit_variants(self, project_root: Path, cfg: BuildConfig) -> list:
+        """Return one variant for each environment, or [] for a project with one.
+
+        Each environment of ``platformio.ini`` is a build of its own (its
+        board, its flags), thus each one is a variant, named as the
+        environment.  A project with one environment stays a project
+        without variants, and this method sets that environment on *cfg*:
+        its queries then need no ``variant``.  ``[build] environment``
+        selects one environment, thus it asks for no variant either.
+        """
+        from ..build import BuildVariant
+
+        if cfg.environment:
+            return []
+        names = self.environments(project_root, cfg)
+        if len(names) == 1:
+            cfg.environment = names[0]
+            return []
+        return [BuildVariant(name=name, overrides={"environment": name}) for name in names]
+
+    def _environment(self, project_root: Path, cfg: BuildConfig) -> str:
+        """Return the one environment that the build of *cfg* builds.
+
+        Each environment is a variant: ``cfg.environment``, or the name of
+        the variant.  A project without variants builds its only
+        environment.  ``cli._index`` makes a variant of each environment of
+        a project that has more than one, thus that case does not reach this
+        point through an index run.
+        """
+        if cfg.environment:
+            return cfg.environment
+        if cfg.variant_name:
+            return cfg.variant_name
+        names = self.environments(project_root, cfg)
+        if len(names) != 1:
+            raise RuntimeError(
+                f"platformio.ini builds {len(names)} environments ({', '.join(names)}), and each "
+                "is a variant of its own. Name one with [build] environment, or declare "
+                "[[build.variants]]."
+            )
+        return names[0]
+
+    def build(self, project_root: Path, cfg: BuildConfig) -> Path:
+        """Build one environment with ``pio run -e <env>`` and return its database.
+
+        Three steps, each with ``-e <env>``:
+
+        1. ``--target compiledb`` writes the compilation database.
+        2. ``--target envdump`` records the link (see ``_record_link``).
+        3. A full ``pio run`` compiles, thus the ``.d`` files exist for the
+           header-change detection.
+
+        Every call gets two environment variables.  ``PLATFORMIO_BUILD_DIR``
+        sends the build to ``out/`` of the variant (PlatformIO adds the
+        directory ``<env>``).  ``PLATFORMIO_EXTRA_SCRIPTS`` adds a script that
+        moves ``compile_commands.json`` into that build directory: PlatformIO
+        appends the value to the ``extra_scripts`` of ``platformio.ini``
+        (``ProjectConfigBase.getraw``), thus the scripts of the user still
+        run, and the file in the project root, which the clangd of the user
+        reads, stays as the build of the user wrote it.  Measured on two
+        projects: the root file kept its mtime, and the database was in
+        ``out/<env>/``.
+        """
+        pio_prefix = self._pio_prefix(cfg)
+        env_name = self._environment(project_root, cfg)
+        layout = BuildLayout(project_root)
+        out_dir = layout.out_dir(cfg.variant_name)
+        cfg, build_env = self._build_environment(
+            cfg, out_dir, self._compiledb_script(layout.variant_dir(cfg.variant_name)),
+        )
+        self._remove_other_environments(out_dir, env_name)
+        run = pio_prefix + ["run", "--project-dir", str(project_root), "--environment", env_name]
 
         if cfg.clean:
-            clean_cmd = pio_prefix + ["run", "--project-dir", str(project_root), "--target", "clean"]
+            clean_cmd = run + ["--target", "clean"]
             log.info("platformio clean: %s", " ".join(clean_cmd))
             try:
                 run_build_command(clean_cmd, cwd=project_root, description="pio run --target clean", build_cfg=cfg, env=build_env)
             except RuntimeError:
                 pass  # clean is best-effort — build dir may not exist yet
 
+        # The database of an earlier build goes first: a compiledb that
+        # writes elsewhere (a script of the user that sets
+        # COMPILATIONDB_PATH after ours) must give an error, and not leave
+        # the old file to read as the new one.
+        cc_path = out_dir / env_name / COMPILE_COMMANDS_NAME
+        cc_path.unlink(missing_ok=True)
+        cmd = run + ["--target", "compiledb"]
         log.info("platformio build: %s", " ".join(cmd))
         run_build_command(cmd, cwd=project_root, description="pio run --target compiledb", build_cfg=cfg, env=build_env)
 
-        # PlatformIO writes compile_commands.json natively to the project
-        # root; copy it to the output directory of the variant, where the
-        # next build of the user cannot replace it.
-        native_cc = project_root / "compile_commands.json"
-        if not native_cc.exists():
-            raise RuntimeError("compile_commands.json was not generated — pio run may have failed silently")
+        if not cc_path.exists():
+            raise RuntimeError(
+                f"pio run --target compiledb wrote no {cc_path}; an extra_script that sets "
+                "COMPILATIONDB_PATH sends the database elsewhere"
+            )
 
-        cc_path = cc_output_path(project_root, cfg)
-        shutil.copy2(native_cc, cc_path)
-        log.info("Copied %s → %s", native_cc, cc_path)
-
-        self._record_link(project_root, cfg, pio_prefix, build_env, cc_path)
+        self._record_link(project_root, cfg, pio_prefix, env_name, build_env, cc_path)
 
         # ── Full build for .d file generation ──
         # compiledb only writes compile_commands.json — GCC may not have
         # run.  A full pio run compiles and emits .d files that the indexer
         # uses for header-change staleness detection.  When the build is
         # already up-to-date, pio run exits quickly (no-op).
-        build_cmd = pio_prefix + ["run", "--project-dir", str(project_root)]
+        build_cmd = run
         log.info("platformio compile: %s", " ".join(build_cmd))
         try:
             run_build_command(build_cmd, cwd=project_root, description="pio run (full build for .d files)", build_cfg=cfg, env=build_env)
@@ -167,15 +257,121 @@ class PlatformIOBuildSystem:
 
         return cc_path
 
+    @staticmethod
+    def _build_environment(cfg: BuildConfig, out_dir: Path, script: str) -> tuple[BuildConfig, dict[str, str]]:
+        """Return the config and the environment variables of each pio call.
+
+        ``run_build_command`` puts ``[build] env`` and ``extra_env`` over
+        the variables that a backend gives, thus a ``PLATFORMIO_EXTRA_SCRIPTS``
+        of the user there would remove the script of fw-context, and the
+        one of fw-context would remove a script that the user adds through
+        the process environment (a CI job).  The two are joined instead,
+        with a newline as PlatformIO joins the option of the ini and the
+        variable.  The config that comes back holds the variable no more.
+
+        ``PLATFORMIO_BUILD_DIR`` in the config is an error: the build of
+        fw-context goes to its output directory, and a value of the user
+        would send it to another one without a word.
+        """
+        user_sources = [cfg.env, cfg.extra_env]
+        if any(_BUILD_DIR_VARIABLE in source for source in user_sources):
+            raise RuntimeError(
+                f"{_BUILD_DIR_VARIABLE} in [build] env or extra_env: fw-context builds into "
+                f"{out_dir}. Remove the variable from .fw-context/config.toml or local.toml."
+            )
+        user_scripts = (
+            cfg.extra_env.get(_EXTRA_SCRIPTS_VARIABLE)
+            or cfg.env.get(_EXTRA_SCRIPTS_VARIABLE)
+            or os.environ.get(_EXTRA_SCRIPTS_VARIABLE, "")
+        )
+        joined = f"{user_scripts.rstrip()}\n{script}" if user_scripts.strip() else script
+        run_cfg = replace(
+            cfg,
+            env={k: v for k, v in cfg.env.items() if k != _EXTRA_SCRIPTS_VARIABLE},
+            extra_env={k: v for k, v in cfg.extra_env.items() if k != _EXTRA_SCRIPTS_VARIABLE},
+        )
+        return run_cfg, {_BUILD_DIR_VARIABLE: str(out_dir), _EXTRA_SCRIPTS_VARIABLE: joined}
+
+    @staticmethod
+    def _compiledb_script(variant_dir: Path) -> str:
+        """Write the script that moves the database, and return the value of ``PLATFORMIO_EXTRA_SCRIPTS``.
+
+        The script sits beside ``out/``: PlatformIO removes its build
+        directory when ``project.checksum`` changes.  The value ends with a
+        newline because ``ProjectConfigBase.parse_multi_values`` splits a
+        value without a newline at ``", "``, thus a project path with a
+        comma and a space would break into two items.  A ``;`` starts an
+        inline comment there, and PlatformIO and SCons expand a ``$`` as a
+        variable, thus no form of the value can hold one of the two.
+        """
+        script = variant_dir / _COMPILEDB_SCRIPT_NAME
+        bad = sorted({char for char in str(script) if char in ";$"})
+        if bad:
+            raise RuntimeError(
+                f"PlatformIO cannot run a script whose path holds {' or '.join(repr(c) for c in bad)}: "
+                f"{script}. Move the project to a path without it."
+            )
+        variant_dir.mkdir(parents=True, exist_ok=True)
+        if not script.is_file() or script.read_text(encoding="utf-8") != _COMPILEDB_SCRIPT:
+            script.write_text(_COMPILEDB_SCRIPT, encoding="utf-8")
+        return f"pre:{script}\n"
+
+    @staticmethod
+    def _remove_other_environments(out_dir: Path, env_name: str) -> None:
+        """Remove the build directories of other environments from *out_dir*.
+
+        A variant builds one environment, and ``output_compile_commands``
+        reads the database of the environment that is in ``out/``.  An
+        environment that the variant built before (platformio.ini renamed
+        it, or ``[build] environment`` changed) would leave a second
+        database there, and the answer would be ambiguous.  ``out/`` belongs
+        to the build tree of fw-context, thus nothing of the user goes.  A
+        symbolic link is not followed: it is no build that PlatformIO made
+        here.
+        """
+        if not out_dir.is_dir():
+            return
+        for child in out_dir.iterdir():
+            if child.is_dir() and not child.is_symlink() and child.name != env_name \
+                    and (child / COMPILE_COMMANDS_NAME).is_file():
+                log.info("Removing the build of environment %s from %s", child.name, out_dir)
+                shutil.rmtree(child)
+
+    def output_compile_commands(self, out_dir: Path, cfg: BuildConfig) -> dict[str, Path]:
+        """Return the database of the environment that the build in *out_dir* built.
+
+        PlatformIO puts the build of an environment into ``<out>/<env>/``,
+        and the script of ``build()`` puts the database there.  A variant
+        names its environment (see ``_environment``).  The build without
+        variants does not name it in the config, but it builds one, and
+        ``build()`` removes the directories of other ones, thus one database
+        is the answer.  Two databases mean an ``out/`` that a build of
+        fw-context did not leave, and no answer is given: the caller then
+        runs the build.
+        """
+        named = cfg.environment or cfg.variant_name
+        if named:
+            single = out_dir / named / COMPILE_COMMANDS_NAME
+            return {"": single} if single.is_file() else {}
+        if not out_dir.is_dir():
+            return {}
+        found = sorted(
+            child / COMPILE_COMMANDS_NAME
+            for child in out_dir.iterdir()
+            if child.is_dir() and (child / COMPILE_COMMANDS_NAME).is_file()
+        )
+        return {"": found[0]} if len(found) == 1 else {}
+
     def _record_link(
         self,
         project_root: Path,
         cfg: BuildConfig,
         pio_prefix: list[str],
+        env_name: str,
         build_env: dict[str, str],
         cc_path: Path,
     ) -> None:
-        """Record the link inputs of each environment for *cc_path*.
+        """Record the link inputs of the environment *env_name* for *cc_path*.
 
         The sidecar is in the directory of the variant, beside ``out/``:
         PlatformIO removes its build directory when ``project.checksum``
@@ -196,7 +392,7 @@ class PlatformIOBuildSystem:
         thus an old entry would give the old link to the new build.
         """
         target = _platformio_link.sidecar_path(BuildLayout(project_root).variant_dir(cfg.variant_name))
-        envs = self._dump_links(project_root, cfg, pio_prefix, {**build_env, "PLATFORMIO_NO_ANSI": "true"})
+        envs = self._dump_link(project_root, cfg, pio_prefix, env_name, {**build_env, "PLATFORMIO_NO_ANSI": "true"})
         for name, link in sorted((envs or {}).items()):
             if link.unknown:
                 log.info("PlatformIO environment %s: the link cannot be read: %s", name, link.unknown)
@@ -210,96 +406,41 @@ class PlatformIOBuildSystem:
             _platformio_link.forget(target)
             return
         if envs is not None:
-            log.info("Recorded the link inputs of %d PlatformIO environment(s) in %s", len(envs), target)
+            log.info("Recorded the link inputs of PlatformIO environment %s in %s", env_name, target)
 
-    def _dump_links(
+    def _dump_link(
         self,
         project_root: Path,
         cfg: BuildConfig,
         pio_prefix: list[str],
+        env_name: str,
         dump_env: dict[str, str],
     ) -> dict[str, _platformio_link.EnvLink] | None:
-        """Return the link inputs of each environment from ``envdump``, or None.
+        """Return the link inputs of *env_name* from ``envdump``, or None.
 
-        One ``pio run --target envdump`` dumps every environment.  When it
-        fails, the dump of each environment is asked for again with ``-e``,
-        but only for a project with more than one environment, and not after
-        a timeout, which could repeat once per environment.  WHY: the
-        exit code of the first run is the exit code of the worst
-        environment, and its output can then hold a dict that an
-        ``extra_script`` printed before the failure.  A separate run gives
-        each environment its own exit code.  An environment that fails
-        stays in the result as unknown, see ``EnvLink.unknown``.
+        One ``pio run -e <env> --target envdump`` dumps the one environment
+        that the variant builds.  None when the dump fails or holds no dict
+        of that environment: the index then gets no memory map, and the
+        build goes on.
         """
-        cmd = pio_prefix + ["run", "--project-dir", str(project_root), "--target", "envdump"]
+        cmd = pio_prefix + [
+            "run", "--project-dir", str(project_root), "--environment", env_name, "--target", "envdump",
+        ]
         log.info("platformio link inputs: %s", " ".join(cmd))
         try:
             result = run_build_command(
-                cmd, cwd=project_root, description="pio run --target envdump", build_cfg=cfg, env=dump_env,
+                cmd, cwd=project_root, description=f"pio run -e {env_name} --target envdump",
+                build_cfg=cfg, env=dump_env,
             )
-        except BuildTimeoutError as exc:
-            # A dump that hung would hang again for each environment.
+        except RuntimeError as exc:
+            # BuildTimeoutError is a RuntimeError too.
             log.warning("pio run --target envdump failed, thus the index gets no memory map: %s", _first_line(exc))
             return None
-        except RuntimeError as exc:
-            log.warning("pio run --target envdump failed: %s", _first_line(exc))
-            return self._dump_each_link(project_root, cfg, pio_prefix, dump_env)
-        envs = _platformio_link.parse_envdump(result.stdout or "")
-        if not envs:
-            log.warning("pio run --target envdump gave no environment, thus the index gets no memory map")
+        link = _platformio_link.parse_envdump(result.stdout or "").get(env_name)
+        if link is None:
+            log.warning("pio run --target envdump gave no dict of %s, thus the index gets no memory map", env_name)
             return None
-        return envs
-
-    def _dump_each_link(
-        self,
-        project_root: Path,
-        cfg: BuildConfig,
-        pio_prefix: list[str],
-        dump_env: dict[str, str],
-    ) -> dict[str, _platformio_link.EnvLink] | None:
-        """Return the link inputs from one ``envdump`` run per environment, or None.
-
-        None when the project has fewer than two environments, or when
-        ``pio project config`` cannot name them.  With one environment, the
-        run that failed was the run of that environment.
-        """
-        config_cmd = pio_prefix + ["project", "config", "--project-dir", str(project_root), "--json-output"]
-        try:
-            config = run_build_command(
-                config_cmd, cwd=project_root, description="pio project config", build_cfg=cfg, env=dump_env,
-            )
-        except RuntimeError as exc:
-            log.warning("pio project config failed, thus the index gets no memory map: %s", _first_line(exc))
-            return None
-        names = _platformio_link.run_environments(config.stdout or "")
-        if not names or len(names) < 2:
-            log.warning("pio run --target envdump failed, thus the index gets no memory map")
-            return None
-        envs: dict[str, _platformio_link.EnvLink] = {}
-        for position, name in enumerate(names):
-            cmd = pio_prefix + [
-                "run", "--project-dir", str(project_root), "--environment", name, "--target", "envdump",
-            ]
-            try:
-                result = run_build_command(
-                    cmd, cwd=project_root, description=f"pio run -e {name} --target envdump",
-                    build_cfg=cfg, env=dump_env,
-                )
-            except BuildTimeoutError as exc:
-                # The next environments could hang the same way, each for
-                # the whole timeout.  They stay in the result as unknown.
-                log.warning("pio run -e %s --target envdump failed, thus no more are run: %s", name, _first_line(exc))
-                for rest in names[position:]:
-                    envs[rest] = _platformio_link.EnvLink(unknown="pio run --target envdump timed out")
-                break
-            except RuntimeError as exc:
-                log.warning("pio run -e %s --target envdump failed: %s", name, _first_line(exc))
-                envs[name] = _platformio_link.EnvLink(unknown="pio run --target envdump failed for this environment")
-                continue
-            envs[name] = _platformio_link.parse_envdump(result.stdout or "").get(
-                name, _platformio_link.EnvLink(unknown="the dump holds no dict of this environment"),
-            )
-        return envs
+        return {env_name: link}
 
     def get_link_record(
         self,
@@ -317,11 +458,10 @@ class PlatformIOBuildSystem:
         or a script that the link names is not on disk.  The index then
         keeps the memory map it has, see ``builders.link_record``.
 
-        The sidecar is in the directory of the variant, where ``build()``
-        writes it, and not next to *compile_commands*.  A database that the
-        user gives explicitly, such as the ``compile_commands.json`` that
-        PlatformIO writes in the project root, has the same content and thus
-        the same hash, but another directory.
+        The sidecar is in the directory of the variant, beside ``out/``,
+        where ``build()`` writes it.  The entry is keyed by the hash of the
+        database, thus a database that the user gives explicitly matches an
+        entry only when it has the content of the build that recorded it.
         """
         envs = _platformio_link.read_link(
             _platformio_link.sidecar_path(BuildLayout(project_root).variant_dir(variant)),
@@ -340,38 +480,18 @@ class PlatformIOBuildSystem:
         return LinkRecord(scripts=scripts, defsyms=_link_command.defsyms_from_flags(link.linkflags))
 
     def background_build_safe(self, cfg: BuildConfig) -> bool:
-        """Safe — ``PLATFORMIO_BUILD_DIR`` keeps the object files apart.
+        """Safe — every artifact goes to the output directory of fw-context.
 
-        The variable wins over ``build_dir`` in platformio.ini, and every
-        pio call of this backend gets it, thus the artifacts stay out of
-        ``.pio/build/``.  That is what the contract asks for.
+        ``PLATFORMIO_BUILD_DIR`` wins over ``build_dir`` in platformio.ini,
+        and every pio call of this backend gets it, thus the object files
+        stay out of ``.pio/build/``.  The script that
+        ``PLATFORMIO_EXTRA_SCRIPTS`` adds moves ``compile_commands.json`` into
+        that directory too, thus the file in the project root, which the
+        clangd of the user reads, is not written either.
 
-        ``pio run -t compiledb`` ALSO rewrites
-        ``<project>/compile_commands.json``, and that cannot be redirected
-        from outside.  Three ways were checked and none exists:
-        ``COMPILATIONDB_PATH`` is a SCons construction variable that
-        ``clivars`` does not declare (builder/main.py:39-47,78), PlatformIO
-        has no project option for it, and the SCons tool takes the path from
-        the argument main.py passes.  Only an ``extra_scripts`` pre-script
-        could move it, which means editing the platformio.ini of the user.
-
-        That write is deliberately NOT repaired, and this paragraph is here
-        so nobody repairs it.  Measured over 209 entries, the file differs
-        from the one the build of the user produces in exactly one token per
-        entry — the ``.o`` output path — with no difference in -I, -D, -std,
-        -isystem or directory.  clangd does not read -o; config_hash and
-        flags_hash normalise it away (config_hash.py:_normalize_entry), so
-        alternating between an automatic and an explicit build neither
-        splits the index nor reparses one translation unit; and
-        ``fw-context init`` gitignores the file.
-
-        Both repairs that suggest themselves are worse than the write.  A
-        save/restore can leave the file missing or truncated, and on a real
-        project it is the ONLY compile_commands.json the user has — removing
-        it takes away what their clangd reads.  A generated second
-        platformio.ini works, but it has to reproduce the whole resolved
-        configuration, and getting that wrong feeds fw-context the wrong
-        flags in silence.  See plans/review_8d98343_fixes.md, finding 9.
+        ``.pio/libdeps`` is shared: ``pio run`` installs the ``lib_deps`` of
+        the project there, as the build of the user does.  That is the
+        source of the libraries, not build output.
         """
         return True
 

@@ -92,6 +92,23 @@ def output_compile_commands(builder: BuildSystem | None, out_dir: Path, cfg) -> 
     return {"": single} if single.is_file() else {}
 
 
+def implicit_variants(builder: BuildSystem | None, project_root: Path, cfg) -> list:
+    """Return the variants that the project file of the build system declares.
+
+    ``implicit_variants`` is an OPTIONAL method of a backend whose project
+    file holds more than one build: each ``[env:<name>]`` of
+    ``platformio.ini`` is a build of its own.  The caller asks only for a
+    project without ``[[build.variants]]``.  The method returns a list of
+    ``BuildVariant``, an empty list for one build, and it raises
+    RuntimeError when the build system cannot answer.  It may also set the
+    one build on *cfg*, as the PlatformIO backend sets ``environment``.
+    """
+    probe = getattr(builder, "implicit_variants", None) if builder is not None else None
+    if probe is None:
+        return []
+    return list(probe(project_root, cfg))
+
+
 def linker_scripts(
     builder: BuildSystem | None,
     project_root: Path,

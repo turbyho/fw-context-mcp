@@ -206,10 +206,10 @@ class TestPlatformIOIsolatesObjectFiles:
     """The invariant the contract actually rests on.
 
     background_build_safe() promises that an automatic build cannot damage
-    the build of the user.  For PlatformIO that means the object files, and
-    PLATFORMIO_BUILD_DIR is what secures them — the compilation database in
-    the project root is a gitignored artifact and is left alone on purpose
-    (see the docstring of platformio.background_build_safe).
+    the build of the user.  For PlatformIO that means the object files,
+    which PLATFORMIO_BUILD_DIR secures, and the compile_commands.json of the
+    project root, which the script of PLATFORMIO_EXTRA_SCRIPTS keeps
+    untouched (see platformio.build).
     """
 
     @staticmethod
@@ -224,7 +224,11 @@ class TestPlatformIOIsolatesObjectFiles:
 
         def fake_run(cmd, cwd=None, description="", env=None, build_cfg=None, timeout=None):
             envs.append(dict(env or {}))
-            (root / "compile_commands.json").write_text("[]", encoding="utf-8")
+            if "compiledb" in cmd:
+                env_name = cmd[cmd.index("--environment") + 1]
+                out = Path(env["PLATFORMIO_BUILD_DIR"]) / env_name
+                out.mkdir(parents=True, exist_ok=True)
+                (out / "compile_commands.json").write_text("[]", encoding="utf-8")
 
             class _Result:
                 returncode = 0
@@ -244,7 +248,7 @@ class TestPlatformIOIsolatesObjectFiles:
         from fw_context_mcp.indexer.build import BuildConfig
         from fw_context_mcp.indexer.build_layout import BuildLayout
 
-        cfg = replace(BuildConfig(), clean=True)
+        cfg = replace(BuildConfig(), clean=True, environment="x")
         envs = self._run(cfg, tmp_path, monkeypatch)
 
         assert envs, "the backend must invoke pio at least once"
@@ -253,10 +257,14 @@ class TestPlatformIOIsolatesObjectFiles:
                 "every pio call has to carry it, the clean included, or one of "
                 "them writes into .pio/build while the user is building there"
             )
+            assert env.get("PLATFORMIO_EXTRA_SCRIPTS", "").startswith("pre:"), (
+                "every pio call has to carry the script, or compiledb writes "
+                "the compile_commands.json of the project root"
+            )
 
 
 class TestObjectPathStaysOutOfTheHashes:
-    """Why the project-root compile_commands.json rewrite costs nothing.
+    """Why a build of fw-context and a build of the user give one index.
 
     A build of fw-context differs from the build of the user in one token per
     entry — the `.o` output path.  If that reached config_hash the two

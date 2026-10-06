@@ -271,20 +271,6 @@ class TestEveryBackendBuildsIntoTheOutputDirectory:
         assert cmd[cmd.index("--build") + 1] == str(_out(tmp_path))
         assert result == _out(tmp_path) / "compile_commands.json"
 
-    def test_platformio(self, tmp_path: Path, monkeypatch):
-        import fw_context_mcp.indexer.builders.platformio as mod
-
-        def on_call(cmd, env, cwd):
-            if "compiledb" in cmd:
-                (tmp_path / "compile_commands.json").write_text("[]", encoding="utf-8")
-
-        calls = self._record(monkeypatch, mod, on_call)
-
-        result = mod.PlatformIOBuildSystem().build(tmp_path, BuildConfig(clean=False))
-
-        assert {env.get("PLATFORMIO_BUILD_DIR") for cmd, env in calls if "run" in cmd} == {str(_out(tmp_path))}
-        assert result == _out(tmp_path) / "compile_commands.json"
-
     def test_manual_writes_its_dependency_files_there(self, tmp_path: Path, monkeypatch):
         import fw_context_mcp.indexer.builders.manual as mod
 
@@ -297,3 +283,173 @@ class TestEveryBackendBuildsIntoTheOutputDirectory:
         [(cmd, _env)] = calls
         assert cmd[cmd.index("-MF") + 1] == str(_out(tmp_path) / "deps" / "src" / "main.d")
         assert result == _out(tmp_path) / "compile_commands.json"
+
+
+class TestPlatformIO:
+    """One environment for each build, and the database in its build directory.
+
+    The project root keeps the compile_commands.json of the user: the script
+    that PLATFORMIO_EXTRA_SCRIPTS adds moves the database of the build of
+    fw-context into ``out/<env>/``.  Measured with PlatformIO 6 on two
+    projects before this backend used it.
+    """
+
+    @staticmethod
+    def _fake_pio(monkeypatch, root: Path, environments: list[str]) -> list[tuple[list[str], dict]]:
+        import json
+
+        import fw_context_mcp.indexer.builders.platformio as mod
+
+        calls: list[tuple[list[str], dict]] = []
+
+        def fake_run(cmd, cwd=None, description="", env=None, build_cfg=None, timeout=None, **kw):
+            command = [str(c) for c in cmd]
+            calls.append((command, dict(env or {})))
+            result = _Result()
+            if "config" in command:
+                result.stdout = json.dumps([[f"env:{name}", []] for name in environments])
+            elif "compiledb" in command:
+                env_name = command[command.index("--environment") + 1]
+                out = Path(env["PLATFORMIO_BUILD_DIR"]) / env_name
+                out.mkdir(parents=True, exist_ok=True)
+                (out / "compile_commands.json").write_text("[]", encoding="utf-8")
+            return result
+
+        monkeypatch.setattr(mod, "run_build_command", fake_run)
+        monkeypatch.setattr(mod.shutil, "which", lambda n: f"/usr/bin/{n}")
+        return calls
+
+    def test_the_only_environment_builds_into_out(self, tmp_path: Path, monkeypatch):
+        from fw_context_mcp.indexer.builders.platformio import PlatformIOBuildSystem
+
+        calls = self._fake_pio(monkeypatch, tmp_path, ["esp32dev"])
+
+        result = PlatformIOBuildSystem().build(tmp_path, BuildConfig(clean=False))
+
+        assert result == _out(tmp_path) / "esp32dev" / "compile_commands.json"
+        assert not (tmp_path / "compile_commands.json").exists(), "the file of the user stays as it was"
+        runs = [(cmd, env) for cmd, env in calls if "run" in cmd]
+        assert runs and all(cmd[cmd.index("--environment") + 1] == "esp32dev" for cmd, _ in runs)
+        assert {env["PLATFORMIO_BUILD_DIR"] for _, env in runs} == {str(_out(tmp_path))}
+
+    def test_the_script_is_written_beside_out_and_named_with_a_newline(self, tmp_path: Path, monkeypatch):
+        """A value without a newline splits at ", ", thus a path with a comma would break."""
+        from fw_context_mcp.indexer.builders.platformio import PlatformIOBuildSystem
+
+        calls = self._fake_pio(monkeypatch, tmp_path, ["esp32dev"])
+
+        PlatformIOBuildSystem().build(tmp_path, BuildConfig(clean=False))
+
+        script = BuildLayout(tmp_path).variant_dir("") / "fw_context_compiledb.py"
+        assert 'COMPILATIONDB_PATH="$BUILD_DIR/compile_commands.json"' in script.read_text(encoding="utf-8")
+        assert {env["PLATFORMIO_EXTRA_SCRIPTS"] for cmd, env in calls if "run" in cmd} == {f"pre:{script}\n"}
+
+    def test_a_variant_builds_its_environment(self, tmp_path: Path, monkeypatch):
+        from fw_context_mcp.indexer.builders.platformio import PlatformIOBuildSystem
+
+        calls = self._fake_pio(monkeypatch, tmp_path, ["a", "b"])
+
+        result = PlatformIOBuildSystem().build(tmp_path, BuildConfig(clean=False, variant_name="b"))
+
+        assert result == _out(tmp_path, "b") / "b" / "compile_commands.json"
+        assert not any("config" in cmd for cmd, _ in calls), "the variant names its environment"
+
+    def test_two_environments_without_variants_are_refused(self, tmp_path: Path, monkeypatch):
+        from fw_context_mcp.indexer.builders.platformio import PlatformIOBuildSystem
+
+        self._fake_pio(monkeypatch, tmp_path, ["a", "b"])
+
+        with pytest.raises(RuntimeError, match="2 environments"):
+            PlatformIOBuildSystem().build(tmp_path, BuildConfig(clean=False))
+
+    def test_the_build_of_another_environment_goes(self, tmp_path: Path, monkeypatch):
+        """platformio.ini renamed the environment: two databases would be no answer."""
+        from fw_context_mcp.indexer.builders.platformio import PlatformIOBuildSystem
+
+        old = _out(tmp_path) / "old_name"
+        old.mkdir(parents=True)
+        (old / "compile_commands.json").write_text("[]", encoding="utf-8")
+        self._fake_pio(monkeypatch, tmp_path, ["esp32dev"])
+
+        PlatformIOBuildSystem().build(tmp_path, BuildConfig(clean=False))
+
+        assert not old.exists()
+        assert PlatformIOBuildSystem().output_compile_commands(_out(tmp_path), BuildConfig()) == {
+            "": _out(tmp_path) / "esp32dev" / "compile_commands.json"
+        }
+
+    def test_one_environment_is_no_variant(self, tmp_path: Path, monkeypatch):
+        from fw_context_mcp.indexer.builders.platformio import PlatformIOBuildSystem
+
+        self._fake_pio(monkeypatch, tmp_path, ["esp32dev"])
+        cfg = BuildConfig()
+
+        assert PlatformIOBuildSystem().implicit_variants(tmp_path, cfg) == []
+        assert cfg.environment == "esp32dev"
+
+    def test_each_of_two_environments_is_a_variant(self, tmp_path: Path, monkeypatch):
+        from fw_context_mcp.indexer.build import build_variant_config
+        from fw_context_mcp.indexer.builders.platformio import PlatformIOBuildSystem
+
+        self._fake_pio(monkeypatch, tmp_path, ["nucleo", "native"])
+        cfg = BuildConfig()
+
+        variants = PlatformIOBuildSystem().implicit_variants(tmp_path, cfg)
+
+        assert [v.name for v in variants] == ["nucleo", "native"]
+        assert build_variant_config(cfg, variants[1]).environment == "native"
+
+    def test_the_scripts_of_the_user_stay(self, tmp_path: Path, monkeypatch):
+        """A script that the user adds through the variable runs too, before ours."""
+        from fw_context_mcp.indexer.builders.platformio import PlatformIOBuildSystem
+
+        calls = self._fake_pio(monkeypatch, tmp_path, ["esp32dev"])
+        monkeypatch.setenv("PLATFORMIO_EXTRA_SCRIPTS", "pre:ci.py")
+        cfg = BuildConfig(clean=False, extra_env={"PLATFORMIO_EXTRA_SCRIPTS": "post:local.py"})
+
+        PlatformIOBuildSystem().build(tmp_path, cfg)
+
+        script = BuildLayout(tmp_path).variant_dir("") / "fw_context_compiledb.py"
+        values = {env["PLATFORMIO_EXTRA_SCRIPTS"] for cmd, env in calls if "run" in cmd}
+        assert values == {f"post:local.py\npre:{script}\n"}, "the config wins over the process, and ours is added"
+
+    def test_a_build_dir_of_the_user_is_refused(self, tmp_path: Path, monkeypatch):
+        from fw_context_mcp.indexer.builders.platformio import PlatformIOBuildSystem
+
+        self._fake_pio(monkeypatch, tmp_path, ["esp32dev"])
+
+        with pytest.raises(RuntimeError, match="PLATFORMIO_BUILD_DIR"):
+            PlatformIOBuildSystem().build(tmp_path, BuildConfig(env={"PLATFORMIO_BUILD_DIR": "x"}))
+
+    @pytest.mark.parametrize("name", ["semi;colon", "dollar$sign"])
+    def test_a_path_that_platformio_cannot_read_is_refused(self, tmp_path: Path, monkeypatch, name: str):
+        from fw_context_mcp.indexer.builders.platformio import PlatformIOBuildSystem
+
+        root = tmp_path / name
+        root.mkdir()
+        self._fake_pio(monkeypatch, root, ["esp32dev"])
+
+        with pytest.raises(RuntimeError, match="Move the project"):
+            PlatformIOBuildSystem().build(root, BuildConfig(clean=False))
+
+    def test_a_database_of_an_earlier_build_is_not_taken(self, tmp_path: Path, monkeypatch):
+        """A compiledb that writes elsewhere must not leave the old file to read as new."""
+        import fw_context_mcp.indexer.builders.platformio as mod
+
+        old = _out(tmp_path) / "esp32dev" / "compile_commands.json"
+        old.parent.mkdir(parents=True)
+        old.write_text("[]", encoding="utf-8")
+        monkeypatch.setattr(mod, "run_build_command", lambda *a, **kw: _Result())
+        monkeypatch.setattr(mod.shutil, "which", lambda n: f"/usr/bin/{n}")
+
+        with pytest.raises(RuntimeError, match="COMPILATIONDB_PATH"):
+            mod.PlatformIOBuildSystem().build(tmp_path, BuildConfig(clean=False, environment="esp32dev"))
+
+    def test_two_environment_builds_are_no_answer(self, tmp_path: Path):
+        from fw_context_mcp.indexer.builders.platformio import PlatformIOBuildSystem
+
+        for env_name in ("a", "b"):
+            (_out(tmp_path) / env_name).mkdir(parents=True)
+            (_out(tmp_path) / env_name / "compile_commands.json").write_text("[]", encoding="utf-8")
+
+        assert PlatformIOBuildSystem().output_compile_commands(_out(tmp_path), BuildConfig()) == {}

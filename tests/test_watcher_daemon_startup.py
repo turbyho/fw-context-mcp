@@ -138,6 +138,7 @@ class TestPingLoopRevival:
 @dataclass
 class _FakeIndexCfg:
     db_dir: Path
+    compile_commands: Path = Path(".fw-context") / "build" / "compile_commands.json"
     vendor_paths: list = field(default_factory=list)
     project_paths: list = field(default_factory=list)
 
@@ -146,6 +147,7 @@ class _FakeIndexCfg:
 class _FakeBuildCfg:
     system: str | None = "makefile"
     build_dir: str | None = None
+    command: str | None = None
     variants: list = field(default_factory=list)
 
 

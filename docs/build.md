@@ -178,8 +178,9 @@ set up.
 
 Exceptions:
 
-- PlatformIO: `pio run -t compiledb` also rewrites
-  `<project>/compile_commands.json`. The index reads the copy in `<out>`.
+- PlatformIO: `pio run` installs the `lib_deps` into `.pio/libdeps`, as your
+  build does. That directory holds the source of the libraries, not build
+  output.
 - ESP-IDF: fw-context runs `idf.py set-target` only when the project has
   no `sdkconfig`. `set-target` renames `<project>/sdkconfig`, and `-B`
   does not move that file.
@@ -228,7 +229,36 @@ the build runs: the builder commands, the `pre_build` hook, and the
 
 ### PlatformIO
 
-This build system needs no extra parameters. Everything is in `platformio.ini`.
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `environment` | `str` | the variant name, or the only environment | The `[env:<name>]` of `platformio.ini` that the build builds with `pio run -e`. |
+
+Each environment of `platformio.ini` is a build of its own, with its own
+board and flags. Thus each environment is a variant:
+
+- A project with one environment (the `default_envs`, or the only
+  `[env:<name>]`) is a project without variants. Its queries need no
+  `variant`.
+- A project with more than one environment and no `[[build.variants]]`
+  gets one variant for each environment, with the name of the environment.
+  A query without `variant` then needs `[build] default_variant`.
+- A `[[build.variants]]` entry builds the environment that `environment`
+  names (in the entry, or in `[build]`), or else the environment with the
+  name of the variant.
+- A `compile_commands.json` that you name (on the command line, or in
+  `[index] compile_commands`) and a `[build] command` make no variants: they
+  name their build themselves.
+
+A variant that has no build yet gets one in each run, also without
+`--build`. A background run builds it only when the backend can build on
+its own. A run over all variants (no `--variant`, `--image`) removes from
+the index the builds that the project no longer makes: a variant that the
+config or `platformio.ini` dropped, or an image that a variant no longer
+builds. Thus a project that goes from two environments to one gets its new
+build, and the queries of the old variants stop.
+
+PlatformIO decides the set (`pio project config`), thus `extends`,
+`extra_configs` and `default_envs` apply as in your build.
 
 ### ESP-IDF
 
@@ -356,7 +386,9 @@ With `--build`, each variant builds into `.fw-context/build/<variant>/out`.
 A variant without sysbuild gives `out/compile_commands.json`. A Zephyr
 sysbuild variant gives `out/<image>/compile_commands.json` for each image
 that the build makes, thus the images of each variant are the images of its
-build. A later run without `--build` reads the same files.
+build. A later run without `--build` reads the same files, and it builds a
+variant that has no build yet. A run over all variants removes from the
+index the builds that the project no longer makes (see [PlatformIO](#platformio)).
 
 `--variant` and `--variants` limit the build too: a Zephyr sysbuild run
 builds only the variants that you name. `--image` limits the index only,
@@ -386,10 +418,21 @@ Most PlatformIO projects need no configuration. fw-context detects everything au
 clean = false              # incremental build is faster
 ```
 
-`fw-context index --build` runs `pio run --target compiledb`. fw-context
-configures dependency tracking (`-MMD`) automatically.
+`fw-context index --build` runs `pio run -e <env> --target compiledb` with
+two environment variables:
 
-The build also runs `pio run --target envdump`. This target compiles
+- `PLATFORMIO_BUILD_DIR` sends the build to `.fw-context/build/<variant>/out`.
+  PlatformIO adds the directory `<env>`.
+- `PLATFORMIO_EXTRA_SCRIPTS` adds the script
+  `.fw-context/build/<variant>/fw_context_compiledb.py`. The script puts
+  `compile_commands.json` into `out/<env>/`. PlatformIO adds it to the
+  `extra_scripts` of `platformio.ini`, thus your scripts still run, and the
+  `compile_commands.json` in the project root, which your clangd reads,
+  stays as your build wrote it.
+
+fw-context configures dependency tracking (`-MMD`) automatically.
+
+The build also runs `pio run -e <env> --target envdump`. This target compiles
 nothing. It prints the SCons environment, and fw-context reads the link
 options from it: the linker scripts (`-T`, `--default-script`) and the
 `--defsym` values. SCons writes no file that holds the link command, thus
@@ -398,8 +441,10 @@ symbols of a PlatformIO build. fw-context records the result in
 `.fw-context/build/<variant>/platformio_link.json`, beside `out/`.
 
 Each `pio run` also runs the `extra_scripts` of the project, thus the
-`envdump` step runs them one more time. An index run without `--build`
-reads the record of the last build and does not run `pio`.
+`envdump` step runs them one more time. Each index run asks
+`pio project config` for the environments, also without `--build`, because
+the environments decide the variants. An index run without `--build` reads
+the link record of the last build.
 
 ### 2. Zephyr (nRF52840)
 

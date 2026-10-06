@@ -136,7 +136,7 @@ def test_sysbuild_is_chosen_for_each_variant(monkeypatch, tmp_path: Path, board_
     assert sorted(seen) == [("multi", "app"), ("single", "")]
 
 
-def test_a_variant_without_a_build_is_reported(tmp_path: Path, board_backend, capsys):
+def test_a_variant_without_a_build_gets_no_entry(tmp_path: Path, board_backend):
     from fw_context_mcp.cli import _index as index_mod
 
     variant = BuildVariant(name="alpha", board="a")
@@ -145,7 +145,42 @@ def test_a_variant_without_a_build_is_reported(tmp_path: Path, board_backend, ca
     )
 
     assert found == []
-    assert "no build artifacts for variant 'alpha'" in capsys.readouterr().err
+
+
+def _run_without_build(monkeypatch, tmp_path: Path, background: bool, may_build: bool) -> list[str]:
+    """Run ``_run_multi`` without --build: alpha was built before, beta never was."""
+    import fw_context_mcp.indexer.runner as runner_mod
+    from fw_context_mcp.cli import _index as index_mod
+
+    seen: list[str] = []
+    monkeypatch.setattr(runner_mod, "run", lambda **kw: seen.append(kw["variant"]) or "0" * 64)
+    monkeypatch.setattr(index_mod, "_may_build_in_background", lambda cfg, system: may_build)
+    generate_compile_commands(tmp_path, BuildConfig(system="fake", board="a", variant_name="alpha"))
+    build = BuildConfig(
+        system="fake",
+        variants=[BuildVariant(name="alpha", board="a"), BuildVariant(name="beta", board="b")],
+    )
+    index_mod._run_multi(
+        SimpleNamespace(build=False, no_index=False, background=background), SimpleNamespace(build=build),
+        tmp_path, "pid", tmp_path / "index.db", "fake", {"vendor_paths": [], "project_paths": []},
+    )
+    return seen
+
+
+def test_a_run_without_build_builds_the_variant_with_no_build(monkeypatch, tmp_path: Path, board_backend):
+    """The single build does the same (`_resolve_compile_commands`); the index needs the build."""
+    seen = _run_without_build(monkeypatch, tmp_path, background=False, may_build=False)
+
+    assert sorted(seen) == ["alpha", "beta"]
+    assert (BuildLayout(tmp_path).out_dir("beta") / "compile_commands.json").is_file()
+
+
+def test_a_background_run_builds_only_when_the_backend_may(monkeypatch, tmp_path: Path, board_backend, capsys):
+    seen = _run_without_build(monkeypatch, tmp_path, background=True, may_build=False)
+
+    assert seen == ["alpha"]
+    assert "no build for variant 'beta'" in capsys.readouterr().err
+    assert not (BuildLayout(tmp_path).out_dir("beta") / "compile_commands.json").exists()
 
 
 def test_the_build_without_variants_has_its_own_directory(tmp_path: Path, board_backend):

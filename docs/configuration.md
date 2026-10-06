@@ -67,6 +67,7 @@ Shared `[build]` keys for multi-variant projects:
 | `default_image` | *(none)* | project | The image that `get_active_build` reports as `active_image`. A query does not use this key: when a variant has more than one image, the query must name `image`. |
 | `sysbuild` | `false` | project | Use `west build --sysbuild` (Zephyr). |
 | `source_dir` | *(none)* | project | The sysbuild input application directory (Zephyr). |
+| `environment` | *(none)* | project | The `[env:<name>]` of `platformio.ini` that the build builds (PlatformIO). A variant can override it; its default is the variant name. In a project without `[[build.variants]]`, each of two or more environments becomes a variant, see [Build Configuration](build.md#platformio). |
 | `env` | *(none)* | project | Build environment variables, shared by every variant. |
 
 Each `[[build.variants]]` table:

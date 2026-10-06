@@ -76,6 +76,82 @@ class TestCleanupRetention:
         assert remaining == {"hash-a", "hash-b"}
 
 
+class TestRetiredBuilds:
+    """A run over the whole set removes the builds that the project no longer makes.
+
+    ``resolve_build`` reads the variants of the index, thus a retired
+    variant stayed queryable with old data, and a project that went from two
+    PlatformIO environments to one could not reach its new build.
+    """
+
+    @staticmethod
+    def _seed(temp_db, rows: list[tuple[str, str, str]]) -> None:
+        from fw_context_mcp.indexer.db import transaction, upsert_build_config, upsert_project
+
+        with transaction(temp_db):
+            upsert_project(temp_db, "proj-001", "test", "/tmp/test")
+            for config_hash, variant, image in rows:
+                upsert_build_config(temp_db, config_hash, "proj-001", f"/tmp/{config_hash}.json",
+                                    variant=variant, image=image)
+
+    @staticmethod
+    def _remaining(temp_db) -> set[str]:
+        return {
+            r["config_hash"]
+            for r in temp_db.execute("SELECT config_hash FROM build_configs WHERE project_id='proj-001'").fetchall()
+        }
+
+    def test_a_variant_out_of_the_set_goes(self, temp_db, tmp_path):
+        from fw_context_mcp.indexer._postprocess import cleanup_retired_builds
+
+        self._seed(temp_db, [("h-a", "a", ""), ("h-b", "b", "")])
+
+        retired = cleanup_retired_builds(temp_db, "proj-001", tmp_path, {"a"}, {("a", "")})
+
+        assert retired == [("b", "")]
+        assert self._remaining(temp_db) == {"h-a"}
+
+    def test_two_environments_become_one_build(self, temp_db, tmp_path):
+        """The variants go, and the build without variants is the one left."""
+        from fw_context_mcp.indexer._postprocess import cleanup_retired_builds
+
+        self._seed(temp_db, [("h-a", "a", ""), ("h-b", "b", ""), ("h-single", "", "")])
+
+        cleanup_retired_builds(temp_db, "proj-001", tmp_path, {""}, {("", "")})
+
+        assert self._remaining(temp_db) == {"h-single"}
+
+    def test_an_image_that_the_build_no_longer_makes_goes(self, temp_db, tmp_path):
+        from fw_context_mcp.indexer._postprocess import cleanup_retired_builds
+
+        self._seed(temp_db, [("h-app", "dev", "app"), ("h-slot1", "dev", "app_slot1_variant")])
+
+        cleanup_retired_builds(temp_db, "proj-001", tmp_path, {"dev"}, {("dev", "app")})
+
+        assert self._remaining(temp_db) == {"h-app"}
+
+    def test_a_variant_whose_build_failed_keeps_its_builds(self, temp_db, tmp_path):
+        """The failure says nothing about the images that the variant makes."""
+        from fw_context_mcp.indexer._postprocess import cleanup_retired_builds
+
+        self._seed(temp_db, [("h-a", "a", "app"), ("h-b-app", "b", "app"), ("h-b-boot", "b", "boot")])
+
+        cleanup_retired_builds(temp_db, "proj-001", tmp_path, {"a", "b"}, {("a", "app")})
+
+        assert self._remaining(temp_db) == {"h-a", "h-b-app", "h-b-boot"}
+
+    def test_the_artifacts_of_a_retired_build_go(self, temp_db, tmp_path):
+        from fw_context_mcp.indexer._postprocess import cleanup_retired_builds
+
+        self._seed(temp_db, [("h-a", "a", ""), ("h-b", "b", "")])
+        artifact = tmp_path / "compile_commands.h-b.json"
+        artifact.write_text("[]", encoding="utf-8")
+
+        cleanup_retired_builds(temp_db, "proj-001", tmp_path, {"a"}, {("a", "")})
+
+        assert not artifact.exists()
+
+
 class TestVariantDiscovery:
     def _make_cfg(self):
         from fw_context_mcp.config.settings import Config

@@ -980,6 +980,19 @@ def _effective_board(build_cfg, variant, image: str) -> str:
     return variant.board or build_cfg.board or ""
 
 
+def _is_narrowed(args: argparse.Namespace) -> bool:
+    """Say if ``--variant``, ``--variants``, ``--image`` or ``--exclude-image`` limits the run."""
+    return bool(
+        getattr(args, "variant", None) or getattr(args, "variants", None)
+        or getattr(args, "image", None) or getattr(args, "exclude_image", None)
+    )
+
+
+def _pair_names(pairs: list[tuple[str, str]]) -> str:
+    """Give ``variant/image`` for each pair, and "(no variant)" for the build without variants."""
+    return ", ".join("/".join(part for part in pair if part) or "(no variant)" for pair in pairs)
+
+
 def _filter_images(cc_list: list, args: argparse.Namespace) -> list:
     """Apply --image (inclusive) and --exclude-image (exclusive) index filters."""
     include = getattr(args, "image", None)
@@ -1001,7 +1014,7 @@ def _discover_existing_cc(project_root, variants: list, build_cfg, builder) -> l
     Each variant has its output directory, ``.fw-context/build/<variant>/out``
     (see ``build_layout``), and the backend says which databases its build
     left there (``builders.output_compile_commands``).  A variant without a
-    build gets an error line and no entry.
+    build gets no entry; the caller builds it or reports it.
     """
     from ..indexer.build import build_variant_config
     from ..indexer.build_layout import BuildLayout
@@ -1012,11 +1025,47 @@ def _discover_existing_cc(project_root, variants: list, build_cfg, builder) -> l
     for variant in variants:
         vcfg = build_variant_config(build_cfg, variant)
         databases = output_compile_commands(builder, layout.out_dir(variant.name), vcfg)
-        if not databases:
-            print(f"error: no build artifacts for variant '{variant.name}' — run 'fw-context index --build'", file=sys.stderr)
-            continue
         for image, cc in sorted(databases.items()):
             found.append((variant.name, image, cc, _effective_board(build_cfg, variant, image)))
+    return found
+
+
+def _build_variants(project_root: Path, build_cfg, builder, variants: list) -> list:
+    """Build *variants* and return ``(variant, image, database, board)`` of each build.
+
+    sysbuild is a [build] key that a variant can override, thus the choice
+    of the build command is made for each variant, with the config that the
+    build of that variant uses.  The discovery of its images
+    (``builders.output_compile_commands``) reads the same config.  A
+    variant whose build fails gets an error line and no entry: one failed
+    build does not stop the others.
+    """
+    from ..indexer.build import build_variant_config, generate_compile_commands
+
+    found: list = []
+    build_multi = getattr(builder, "build_multi", None)
+    multi = [
+        v for v in variants
+        if build_multi is not None and build_variant_config(build_cfg, v).sysbuild
+    ]
+    if build_multi is not None and multi:
+        for variant, image, path in build_multi(project_root, build_cfg, multi):
+            v = _find_variant(variants, variant)
+            board = _effective_board(build_cfg, v, image) if v else ""
+            found.append((variant, image, path, board))
+    multi_names = {v.name for v in multi}
+    for variant in variants:
+        if variant.name in multi_names:
+            continue
+        # Each variant builds into its own output directory, thus the
+        # variants cannot overwrite each other.
+        vcfg = build_variant_config(build_cfg, variant)
+        try:
+            path = generate_compile_commands(project_root, vcfg)
+        except RuntimeError as exc:
+            print(f"error: variant '{variant.name}': {exc}", file=sys.stderr)
+            continue
+        found.append((variant.name, "", path, _effective_board(build_cfg, variant, "")))
     return found
 
 
@@ -1036,8 +1085,7 @@ def _run_multi(
     then runs the FTS rebuild and per-(variant, image) retention once at the
     end (§5.8).  A failure in one build does not abort the others.
     """
-    from ..indexer._postprocess import cleanup_old_builds_multi
-    from ..indexer.build import build_variant_config, generate_compile_commands
+    from ..indexer._postprocess import cleanup_old_builds_multi, cleanup_retired_builds
     from ..indexer.build_layout import InvalidVariantName, check_variant_names
     from ..indexer.builders import registry as builder_registry
     from ..indexer.db import open_db, rebuild_files_fts, rebuild_fts, rebuild_macros_fts
@@ -1061,38 +1109,30 @@ def _run_multi(
     try:
         check_variant_names(v.name for v in build_cfg.variants)
     except InvalidVariantName as exc:
-        print(f"error: [[build.variants]]: {exc}", file=sys.stderr)
+        print(f"error: {exc}", file=sys.stderr)
         return 1
 
     if args.build:
-        # sysbuild is a [build] key that a variant can override, thus the
-        # choice of the build command is made for each variant, with the
-        # config that the build of that variant uses.  The discovery of its
-        # images (builders.output_compile_commands) reads the same config.
-        build_multi = getattr(builder, "build_multi", None)
-        multi = [
-            v for v in variants
-            if build_multi is not None and build_variant_config(build_cfg, v).sysbuild
-        ]
-        if build_multi is not None and multi:
-            for variant, image, path in build_multi(project_root, build_cfg, multi):
-                v = _find_variant(variants, variant)
-                board = _effective_board(build_cfg, v, image) if v else ""
-                cc_list.append((variant, image, path, board))
-        for variant in variants:
-            if variant.name in {v.name for v in multi}:
-                continue
-            # Each variant builds into its own output directory, thus the
-            # variants cannot overwrite each other.
-            vcfg = build_variant_config(build_cfg, variant)
-            try:
-                path = generate_compile_commands(project_root, vcfg)
-            except RuntimeError as exc:
-                print(f"error: variant '{variant.name}': {exc}", file=sys.stderr)
-                continue
-            cc_list.append((variant.name, "", path, _effective_board(build_cfg, variant, "")))
+        cc_list = _build_variants(project_root, build_cfg, builder, variants)
     else:
+        # A variant without a build is built here, as the build without
+        # variants is (`_resolve_compile_commands`): the index needs the
+        # build, and a run without `--build` must not stop where one with it
+        # goes on.  A background run builds only with a backend that may
+        # build on its own.
         cc_list = _discover_existing_cc(project_root, variants, build_cfg, builder)
+        found_names = {name for name, _, _, _ in cc_list}
+        missing = [v for v in variants if v.name not in found_names]
+        if missing and getattr(args, "background", False) and not _may_build_in_background(cfg, detected_system):
+            for variant in missing:
+                print(
+                    f"error: no build for variant '{variant.name}', and fw-context cannot run it "
+                    "in the background — run 'fw-context index --build'",
+                    file=sys.stderr,
+                )
+        elif missing:
+            print(f"No build for variant(s) {', '.join(v.name for v in missing)} — running the build")
+            cc_list += _build_variants(project_root, build_cfg, builder, missing)
 
     cc_list = _filter_images(cc_list, args)
 
@@ -1172,6 +1212,16 @@ def _run_multi(
         deleted = cleanup_old_builds_multi(conn, project_id, db_path.parent, touched_pairs)
         if deleted:
             print(f"Cleaned up {deleted} stale build(s)")
+        # Only a run over the whole set knows which builds the project no
+        # longer makes; a narrowed run does not see the other builds.
+        if not _is_narrowed(args):
+            retired = cleanup_retired_builds(
+                conn, project_id, db_path.parent,
+                {v.name for v in variants},
+                {(variant, image) for variant, image, _, _ in cc_list},
+            )
+            if retired:
+                print(f"Removed the builds that the project no longer makes: {_pair_names(retired)}")
     finally:
         conn.close()
 
@@ -1421,6 +1471,41 @@ def _cmd_index(args: argparse.Namespace, outside: _SigtermOutsideTheLock) -> int
         autobuild.record_problem(db_path.parent, text)
         return 1
 
+    # A project file that holds more than one build (each [env:<name>] of
+    # platformio.ini) gives one variant for each, when the config declares
+    # none.  The build system answers, thus the set is the set that its
+    # build makes.  An explicit compile_commands.json (on the command line,
+    # or in [index] compile_commands) and a [build] command name their build
+    # themselves.
+    from ..indexer.build import explicit_compile_commands
+
+    if (
+        not cfg.build.variants and not cfg.build.command
+        and not getattr(args, "compile_commands", None)
+        and explicit_compile_commands(project_root, cfg) is None
+    ):
+        from ..indexer.builders import implicit_variants
+        from ..indexer.builders import registry as builder_registry
+
+        builder_cls = builder_registry.get(detected_system) if detected_system else None
+        try:
+            found = implicit_variants(builder_cls() if builder_cls else None, project_root, cfg.build)
+        except (RuntimeError, OSError) as exc:
+            # OSError: the program of [build] python or of pio is not there.
+            text = f"cannot list the builds of the project: {exc}"
+            print(f"error: {text}", file=sys.stderr)
+            autobuild.record_problem(db_path.parent, text)
+            return 1
+        if found:
+            cfg.build.variants = found
+            print(f"The project builds {len(found)} variants: {', '.join(v.name for v in found)}")
+            if not cfg.build.default_variant:
+                print(
+                    "  A query without `variant` needs [build] default_variant in "
+                    ".fw-context/config.toml, for example: default_variant = "
+                    f'"{found[0].name}"'
+                )
+
     # A compile_commands.json that the user names is the input of this run.
     # No automatic build may replace it: `--build` comes before the explicit
     # file in `_resolve_compile_commands`, thus a build would drop the file.
@@ -1595,6 +1680,20 @@ def _run_single(
         **run_kwargs,
     )
     print(f"Indexed. config_hash={config_hash[:16]}…  db={db_path}")
+
+    # The project has one build now, thus the builds of variants that an
+    # earlier config (or an earlier platformio.ini) made are retired.  The
+    # set of this run is the build without variants, and it built.
+    from ..indexer._postprocess import cleanup_retired_builds
+    from ..indexer.db import open_db
+
+    conn = open_db(db_path)
+    try:
+        retired = cleanup_retired_builds(conn, project_id, db_path.parent, {""}, {("", "")})
+    finally:
+        conn.close()
+    if retired:
+        print(f"Removed the builds that the project no longer makes: {_pair_names(retired)}")
 
     _post_index_optimize(db_path, project_root, project_id, detected_system, args)
     return 0

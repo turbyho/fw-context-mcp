@@ -585,6 +585,26 @@ def _init_one_tool(
     return ok, warnings
 
 
+def _implicit_variant_names(project_root: Path, build_system: str | None, proj_cfg) -> list[str]:
+    """Return the names of the variants that the project file declares, or [].
+
+    See ``builders.implicit_variants``: each environment of a
+    ``platformio.ini`` with more than one is a variant.  A build system
+    that cannot answer gives [], and the build of ``init`` then reports its
+    own error, which names the cause.
+    """
+    from ..indexer.builders import implicit_variants
+    from ..indexer.builders import registry as builder_registry
+
+    builder_cls = builder_registry.get(build_system) if build_system else None
+    try:
+        found = implicit_variants(builder_cls() if builder_cls else None, project_root, proj_cfg.build)
+    except (RuntimeError, OSError):
+        logging.getLogger(__name__).debug("cannot list the builds of %s", project_root, exc_info=True)
+        return []
+    return [variant.name for variant in found]
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     """Register fw-context with AI assistants and provision the project.
 
@@ -738,6 +758,10 @@ def cmd_init(args: argparse.Namespace) -> int:
         print("  [build] multi-variant project — build via 'fw-context index --build'")
     elif skip_build:
         print("  [build] skipped (--skip-build)")
+    elif implicit := _implicit_variant_names(project_root, build_system, _proj_cfg):
+        # Each environment of platformio.ini is a variant, as `fw-context
+        # index` makes them; one build here would not be the build of any.
+        print(f"  [build] {len(implicit)} variants ({', '.join(implicit)}) — build via 'fw-context index --build'")
     else:
         from ._init_build import _auto_build_if_possible
 

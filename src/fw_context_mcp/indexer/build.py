@@ -113,6 +113,12 @@ class BuildConfig:
     default_image: str | None = None  # name of default image within default_variant
     variants: list[BuildVariant] = field(default_factory=list)
 
+    # PlatformIO: the environment ([env:<name>] of platformio.ini) that this
+    # build builds with `pio run -e`.  None means the name of the variant,
+    # or the only environment of a project without variants.  Each
+    # environment is a build of its own, thus each one is a variant.
+    environment: str | None = None
+
     # ESP-IDF (optional — auto-detected from environment)
     idf_path: str | None = None  # Path to ESP-IDF install (usually $IDF_PATH)
 
@@ -249,7 +255,7 @@ _SCALAR_FIELDS: frozenset[str] = frozenset({
     "iar_project", "iar_target", "makefile", "make_target",
     "make_dry_run", "toolchain_path", "toolchain_prefix", "compiler",
     "activate", "python", "pre_build", "timeout",
-    "source_dir", "sysbuild",
+    "source_dir", "sysbuild", "environment",
 })
 _LIST_FIELDS: frozenset[str] = frozenset({
     "extra_profiles", "defines", "include_dirs", "system_include_dirs",

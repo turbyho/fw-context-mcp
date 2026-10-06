@@ -578,11 +578,13 @@ def _env_from_json(raw: object) -> EnvLink | None:
 def select_env(envs: dict[str, EnvLink], units: list | None, project_root: Path) -> str | None:
     """Return the environment whose object files the units name, or None.
 
-    Measured with two environments: each `compiledb` run writes
-    `compile_commands.json` again, thus the file holds the LAST environment
-    only.  The first environment, or `default_envs`, would give the memory
-    map of another chip.  The object file path of a unit is in the build
-    directory of its environment, and that is the evidence here.
+    A build of fw-context records the one environment that its variant
+    builds, but a sidecar can hold more: a database that the user gives
+    explicitly, built for several environments in one `pio run`, holds the
+    LAST environment only (measured with two).  The first environment, or
+    `default_envs`, would then give the memory map of another chip.  The
+    object file path of a unit is in the build directory of its
+    environment, and that is the evidence here.
 
     Every object file that the units name must be in the build directory of
     one and the same environment.  With no unit that names an object file,
