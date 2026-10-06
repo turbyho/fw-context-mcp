@@ -918,6 +918,23 @@ def _already_defined(conn, config_hash: str, names: list[str]) -> set[str]:
     return found
 
 
+def _mtime(path: Path) -> float:
+    """Return the mtime of *path*, or 0.0 when it cannot be read (as the assembly pass)."""
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _text(path: Path) -> str:
+    """Return the text of the script as ``parse`` reads it, or "" when it cannot be read."""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        log.debug("cannot read linker script %s", path, exc_info=True)
+        return ""
+
+
 def store_scripts(
     conn,
     config_hash: str,
@@ -967,6 +984,7 @@ def store_scripts(
         upsert_file,
     )
     from fw_context_mcp.indexer.ops import _normalize_file_path
+    from fw_context_mcp.utils import compute_source_hash
 
     vendor = list(vendor_patterns or [])
     project = list(project_patterns or [])
@@ -996,8 +1014,24 @@ def store_scripts(
         # A linker script is not C.  The column takes 'c' or 'cpp', and the
         # assembly pass registers a .S file the same way — a third value
         # would reach every filter that tests for those two.
-        file_id = upsert_file(conn, config_hash, db_path, "c")
+        file_id = upsert_file(
+            conn, config_hash, db_path, "c",
+            mtime=_mtime(path), source_hash=compute_source_hash(path),
+        )
         is_project = _is_project_file(str(path), project_root, vendor, project)
+        # The text of the script is its content, as the assembly pass stores
+        # the text of a .S file.  A script has no #if that the reader
+        # evaluates: a build gives ld the script after its preprocessor.
+        # WHY: a file of the project with an empty content keeps the content
+        # backfill of the index run on (runner.py), and that pass parses
+        # each unchanged TU with libclang.  The script of a build in the
+        # project was such a file.  Measured on a Mbed project: 878 TUs
+        # parsed in each run, 9 of its 11 minutes.  read_file also gets the
+        # text from the index then.
+        conn.execute(
+            "UPDATE files SET content=?, is_project=MAX(is_project, ?) WHERE id=?",
+            (_text(path), int(is_project), file_id),
+        )
 
         regions.extend(
             {

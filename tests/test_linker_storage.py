@@ -406,3 +406,42 @@ class TestSeveralScripts:
             conn.close()
         assert result.files == 1
         assert names == {"_x"}
+
+
+class TestTheContentOfTheScript:
+    """The script gets its text as content, as a .S file of the assembly pass does.
+
+    A file of the project with an empty content kept the content backfill of
+    the index run on, and that pass parses each unchanged TU with libclang.
+    The script of a build in the project was such a file: measured on a Mbed
+    project, 878 TUs parsed in each run, 9 of its 11 minutes.
+    """
+
+    def test_the_file_row_holds_the_text_and_its_hash(self, tmp_path):
+        from fw_context_mcp.utils import compute_source_hash
+
+        conn = _db(tmp_path)
+        script = _script(tmp_path)
+        try:
+            with transaction(conn):
+                store_scripts(conn, "ch", [script], tmp_path)
+            row = conn.execute(
+                "SELECT content, source_hash FROM files WHERE config_hash='ch' AND path='app.ld'"
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row["content"] == SCRIPT
+        assert row["source_hash"] == compute_source_hash(script)
+
+    def test_no_file_of_the_project_keeps_the_backfill_on(self, tmp_path):
+        """The query of runner.py that turns the content backfill on finds nothing."""
+        conn = _db(tmp_path)
+        try:
+            with transaction(conn):
+                store_scripts(conn, "ch", [_script(tmp_path)], tmp_path)
+            empty = conn.execute(
+                "SELECT 1 FROM files WHERE config_hash = 'ch' AND content = '' AND path NOT LIKE '/%' LIMIT 1"
+            ).fetchone()
+        finally:
+            conn.close()
+        assert empty is None
