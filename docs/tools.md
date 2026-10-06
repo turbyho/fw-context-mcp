@@ -2352,10 +2352,22 @@ instead of naming a command.
 - A source file on disk is missing from compile_commands.json, and
   fw-context will not build it by itself. The reason says why.
 - The tree is on another git branch than the index.
+- Another build of the project (`build <variant>/<image>: …`) has a changed
+  or missing database.
 
-The last two need `fw-context index --build`, because only a build
-regenerates compile_commands.json. The others need `fw-context index`.
+A missing source file and a branch change need `fw-context index --build`,
+because only a build regenerates compile_commands.json. The others need
+`fw-context index`.
 Read the reason text: it names the command.
+
+**`stale_builds`** lists the other builds of the project — each
+`(variant, image)` — that are stale, as
+`{variant, image, reindex_needed, reasons}`. A query names one build, thus
+another build can be stale while the build of a query without `variant`
+and `image` is current: a change in a file that only the bootloader
+compiles. A changed or missing database of such a build sets
+`reindex_needed`. Modified files and changed headers make it stale, and
+set `stale`.
 
 One reason does not set `"reindex_needed"`: a new source file that is
 missing from compile_commands.json, when fw-context will build it by

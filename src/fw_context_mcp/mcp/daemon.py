@@ -247,7 +247,8 @@ async def daemon_main(project_root: Path) -> None:
         force_refs = False
         if needs and not _bg_paused(project_root):
             dlog.info("Initial index needed (%s)", ", ".join(reasons))
-            force_refs = "refs missing" in reasons
+            # A reason of a build carries its variant/image in front.
+            force_refs = any(reason.endswith("refs missing") for reason in reasons)
             pending.set()
 
         def _set_index_proc(proc: asyncio.subprocess.Process | None) -> None:
@@ -566,6 +567,11 @@ def _staleness_check(project_root: Path) -> tuple[bool, list[str]]:
     The row-format check is the reason a daemon can ask for a reindex over
     an index whose files did not change: the columns are the same, but the
     text in them carries an older meaning.  See ``CURRENT_ROW_FORMAT``.
+
+    Every build of the project is checked, each ``(variant, image)``, and
+    not only the newest one: an edit to a file that only another image
+    compiles made that build stale, and the check of the newest build did
+    not see it.  A reason of a build carries its ``variant/image``.
     """
     from .shared.context import _db_path, _quick_open_readonly
     from .shared.stale import _count_modified_files, check_structural_staleness
@@ -585,25 +591,25 @@ def _staleness_check(project_root: Path) -> tuple[bool, list[str]]:
         return False, []
     reasons: list[str] = []
     try:
-        from ..indexer.db import get_active_config
+        from .shared.stale import build_label, latest_builds
 
         project_id = derive_project_id(project_root)
-        cfg = get_active_config(conn, project_id)
-        if not cfg:
-            return False, []
+        for cfg in latest_builds(conn, project_id):
+            config_hash = cfg["config_hash"]
+            label = build_label(cfg)
+            prefix = f"{label}: " if label else ""
 
-        config_hash = cfg["config_hash"]
+            # 1-4. Structural checks (shared with background._fast_staleness_check):
+            #      compile_commands.json, schema version, row format, refs.
+            found = check_structural_staleness(conn, config_hash, dict(cfg), project_root)
 
-        # 1-4. Structural checks (shared with background._fast_staleness_check):
-        #      compile_commands.json, schema version, row format, refs.
-        reasons.extend(check_structural_staleness(conn, config_hash, dict(cfg), project_root))
-
-        # 5. Modified source files — files changed before daemon started.
-        #    watchfiles only detects NEW events, so without this check
-        #    already-stale files would never be reindexed.
-        modified = _count_modified_files(conn, config_hash, project_root, use_cache=True)
-        if modified > 0:
-            reasons.append(f"{modified} modified files")
+            # 5. Modified source files — files changed before daemon started.
+            #    watchfiles only detects NEW events, so without this check
+            #    already-stale files would never be reindexed.
+            modified = _count_modified_files(conn, config_hash, project_root, use_cache=True)
+            if modified > 0:
+                found.append(f"{modified} modified files")
+            reasons.extend(prefix + reason for reason in found)
     finally:
         conn.close()
 

@@ -574,7 +574,12 @@ def get_active_build(
         compile_commands.json belongs to the OLD branch and carries its file
         list and its compiler flags, so only a build regenerates it.  Read
         the reason text — it names the command it needs),
-        stale (bool — True when reindex_needed or header_affected_tus > 0),
+        stale (bool — True when reindex_needed, header_affected_tus > 0, or
+        stale_builds is not empty),
+        stale_builds (list[dict] — the other (variant, image) builds of the
+        project that are stale, each {variant, image, reindex_needed,
+        reasons}; a changed or missing database of a build needs a reindex,
+        modified files and headers make it stale),
         _warning (str, optional — when manifest verification is not "full"),
         vec_available (bool), vec_error (str, optional),
         index_message (str — human-readable summary of index state),
@@ -876,9 +881,19 @@ def get_active_build(
             cfg["description"] if "description" in cfg.keys() else "", root
         )
         branch_moved = bool(indexed_branch)
+        # ── The other builds of the project ──
+        # Each query names one build, thus a build that a query does not
+        # reach without a selector can be stale while this one is current:
+        # a change in a file that only the bootloader compiles.  The same
+        # rules as above: a changed or missing database needs a reindex,
+        # modified files and headers make the build stale.
+        from ..shared.stale import build_label, other_stale_builds
+
+        stale_builds = other_stale_builds(conn, project_id, root, config_hash, use_cache=fast)
         needs_reindex = bool(
             cc_changed or schema_old or row_format_old or blocked_sources or branch_moved
             or build_problem or build_missing
+            or any(build["reindex_needed"] for build in stale_builds)
         )
 
         # Asked once, because the call reaches the build backend and is not
@@ -962,6 +977,12 @@ def get_active_build(
         database_gone = checked_cc is not None and not checked_cc.exists()
         if cc_changed and not database_gone:
             reindex_reasons.append(stale_reason or "compile_commands_changed")
+        for build in stale_builds:
+            if build["reindex_needed"]:
+                reindex_reasons.append(
+                    f"build {build_label(build)}: {', '.join(build['reasons'])} — "
+                    f"run `fw-context index`"
+                )
         if new_sources:
             listed = ", ".join(new_sources[:3])
             more = f" and {len(new_sources) - 3} more" if len(new_sources) > 3 else ""
@@ -1178,7 +1199,10 @@ def get_active_build(
             "status": status,
             "reindex_needed": needs_reindex,
             "reindex_reasons": reindex_reasons,
-            "stale": needs_reindex or header_affected_tus > 0,
+            "stale": needs_reindex or header_affected_tus > 0 or bool(stale_builds),
+            # No leading underscore: the builds a caller must not read as
+            # current.  Empty when every other build of the project is.
+            "stale_builds": stale_builds,
             "index_message": index_message,
         }
         if default_refusal:
