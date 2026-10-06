@@ -1277,7 +1277,7 @@ def store_symbols_for_unit(
     hashes=None,
     build_dir_patterns: list[str] | None = None,
     skip_files: frozenset[str] | None = None,
-) -> tuple[int, int, list[dict]]:
+) -> tuple[int, int, list[dict] | None]:
     """Parse one translation unit and store its symbols + refs in the DB.
 
     Handles:
@@ -1291,7 +1291,10 @@ def store_symbols_for_unit(
 
     Returns ``(symbols_added, refs_added, headers)`` where *headers* is a
     list of ``{path, hash, generated}`` dicts for included header files,
-    collected during the ifdef-filtered content pass.
+    collected during the ifdef-filtered content pass.  The list can be
+    empty: a TU can include no header that this pass records.  *headers*
+    is None when the TU failed to parse: then nothing is known about its
+    headers, and its manifest entry must not say that the TU is current.
 
     *conn* must be open; the caller is responsible for transactions.
 
@@ -1392,7 +1395,10 @@ def store_symbols_for_unit(
                 log.error("Fatal DB error parsing %s: %s — stopping indexer", unit.file.name, exc)
                 raise
             log.warning("skip TU %s: %s", unit.file.name, exc)
-            return 0, 0, []
+            # None and not []: an empty list says "no header", and the
+            # manifest then records this TU as current, thus no later run
+            # would parse it again.
+            return 0, 0, None
 
     # ── Lines the preprocessor skipped, for every file of this TU ──
     # The stored body of a symbol must hold only the code that compiles.

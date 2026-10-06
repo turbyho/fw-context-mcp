@@ -827,7 +827,12 @@ def run(
                 # Only a re-parsed TU may refresh its manifest entry — its
                 # symbols now match the headers it just read.
                 reparsed_tus.add(tu_key)
-                if tu_headers_list:
+                # An empty list too: a TU with no recorded header still gets
+                # its entry, with its source hash.  Without one, the entry of
+                # the preliminary manifest stayed, with an empty source hash,
+                # and the TU read as stale after each run.  Measured on one
+                # project: 63 of 215 TUs.  None is a TU that failed to parse.
+                if tu_headers_list is not None:
                     tu_headers[tu_key] = tu_headers_list
                 log.info(
                     "[%d/%d] %s: %d syms, %d refs, %.1fs",
