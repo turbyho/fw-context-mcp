@@ -27,10 +27,15 @@ import hashlib
 import json
 import logging
 import time
+from collections.abc import Collection
 from pathlib import Path
 
 from fw_context_mcp.indexer.compile_commands import _DROP_WITH_ARG
-from fw_context_mcp.indexer.config_hash import _TRANSIENT_DROP, compute_flags_hash
+from fw_context_mcp.indexer.config_hash import (
+    _TRANSIENT_DROP,
+    compute_flags_hash,
+    drop_transient_defines,
+)
 from fw_context_mcp.utils import compute_source_hash
 
 log = logging.getLogger(__name__)
@@ -285,6 +290,8 @@ def generate(
     config_hash: str = "",
     scope: list[str] | None = None,
     vendor_patterns: list[str] | None = None,
+    *,
+    transient_defines: Collection[str],
 ) -> str:
     """Generate ``manifest.json`` from compile_commands + libclang token stream.
 
@@ -301,6 +308,8 @@ def generate(
         vendor_patterns: The effective vendor/SDK set this build used.  Stored
             so the query layer reads the same boundary the indexer applied
             instead of deriving its own.
+        transient_defines: ``[index] transient_defines``, for the flags hash
+            of each entry and for the fallback config_hash.
 
     Returns:
         The ``config_hash`` — SHA-256 of the structural part of the manifest.
@@ -331,7 +340,10 @@ def generate(
             "arg_set": _intern_arguments(unit.clang_args, arg_sets),
             "source_hash": source_hash,
             "headers": headers,
-            "flags_hash": compute_flags_hash(unit.raw_entry) if unit.raw_entry else "",
+            "flags_hash": (
+                compute_flags_hash(unit.raw_entry, transient_defines=transient_defines)
+                if unit.raw_entry else ""
+            ),
         }
         entries.append(entry)
 
@@ -360,7 +372,10 @@ def generate(
         # New callers should pass config_hash computed from the normalized
         # compile_commands.json instead.
         project_id = derive_project_id(project_root)
-        config_hash = compute_config_hash(units, project_root, project_id, build_dir_patterns, scope=scope, db_dir=db_dir)
+        config_hash = compute_config_hash(
+            units, project_root, project_id, build_dir_patterns, scope=scope, db_dir=db_dir,
+            transient_defines=transient_defines,
+        )
 
     manifest["config_hash"] = config_hash
     manifest_json = json.dumps(manifest, sort_keys=True, indent=2, ensure_ascii=False)
@@ -557,6 +572,8 @@ def compute_structural_hash(
     build_dir_patterns: list[str] | None = None,
     project_id: str = "",
     scope: list[str] | None = None,
+    *,
+    transient_defines: Collection[str],
 ) -> str:
     """Compute the config_hash from structural build identity — no I/O, no libclang.
 
@@ -571,7 +588,10 @@ def compute_structural_hash(
 
     if not project_id:
         project_id = derive_project_id(project_root)
-    return compute_config_hash(units, project_root, project_id, build_dir_patterns, scope=scope)
+    return compute_config_hash(
+        units, project_root, project_id, build_dir_patterns, scope=scope,
+        transient_defines=transient_defines,
+    )
 
 
 def build_preliminary(
@@ -582,6 +602,8 @@ def build_preliminary(
     build_dir_patterns: list[str] | None = None,
     project_id: str = "",
     scope: list[str] | None = None,
+    *,
+    transient_defines: Collection[str],
 ) -> str:
     """Build a preliminary ``manifest.json`` from structural data only — no libclang.
 
@@ -606,7 +628,10 @@ def build_preliminary(
     if not project_id:
         project_id = derive_project_id(project_root)
 
-    config_hash = compute_config_hash(units, project_root, project_id, build_dir_patterns, scope=scope, db_dir=db_dir)
+    config_hash = compute_config_hash(
+        units, project_root, project_id, build_dir_patterns, scope=scope, db_dir=db_dir,
+        transient_defines=transient_defines,
+    )
 
     # Build entries for the manifest file
     entries: list[dict] = []
@@ -705,6 +730,8 @@ def compute_config_hash(
     build_dir_patterns: list[str] | None = None,
     scope: list[str] | None = None,
     db_dir: Path | None = None,
+    *,
+    transient_defines: Collection[str],
 ) -> str:
     """Return SHA-256 of the build's **compilation dialect**.
 
@@ -737,8 +764,10 @@ def compute_config_hash(
     list comes back into the hash through the side door.
     - **Build-output paths**, whether they arrive as a path flag or embedded
       in another flag, detected via *build_dir_patterns*.
-    - **Transient ``-D`` macros** (timestamps, build counters) — they change
-      every build without changing semantics.
+    - **The ``-D`` macros of *transient_defines*** (``[index]
+      transient_defines``: build times, build counters).  Their value changes
+      in each build, and each build would get a new identity.  The same list
+      goes to compute_flags_hash, see :func:`drop_transient_defines`.
 
     Flag order and TU order do not matter: both accumulate into sets.
 
@@ -767,18 +796,6 @@ def compute_config_hash(
     # Build-output directory patterns from the build system.
     # When no patterns are provided, no arguments are filtered.
     _markers: tuple[str, ...] = tuple(build_dir_patterns) if build_dir_patterns else ()
-
-    # ``-D`` macros that contain per-build transient values (timestamps,
-    # build counter, etc.) — their presence destabilizes the config_hash
-    # without changing compilation semantics.  Drop them during normalization.
-    _TRANSIENT_DEFINES: frozenset[str] = frozenset({
-        "MBED_BUILD_TIMESTAMP",  # Mbed OS — Python time.time() float
-        "BUILD_TIMESTAMP",       # generic timestamp
-        "BUILD_TIME",            # generic build time
-        "BUILD_DATE",            # generic build date
-        "BUILD_ID",              # CI build number
-        "BUILD_NUMBER",          # CI build counter
-    })
 
     def _is_build_output(arg_value: str) -> bool:
         return any(marker in arg_value for marker in _markers)
@@ -855,8 +872,7 @@ def compute_config_hash(
     for unit in units:
         # ── Pre-pass: collapse space-separated -D NAME=VALUE → -DNAME=VALUE ──
         # Sorting alphabetically (next step) would separate "-D" from its value
-        # token — join them first so the sort is semantically safe.  Also
-        # drops transient -D macros in the same pass.
+        # token — join them first so the sort is semantically safe.
         raw_args = unit.clang_args
         # The unit's own source file, by basename.  The join below must not
         # take it for the value of the flag in front of it: "-c main.c" would
@@ -877,23 +893,9 @@ def compute_config_hash(
                 j += 2 if (j + 1 < len(raw_args) and not raw_args[j + 1].startswith("-")) else 1
                 continue
             if a == "-D" and j + 1 < len(raw_args):
-                val = raw_args[j + 1]
-                eq_idx = val.find("=")
-                name = val[:eq_idx] if eq_idx != -1 else val
-                if name in _TRANSIENT_DEFINES:
-                    j += 2
-                    continue
-                collapsed_args.append(f"-D{val}")
+                collapsed_args.append(f"-D{raw_args[j + 1]}")
                 j += 2
             elif a.startswith("-D") and len(a) > 2:
-                name_part = a[2:]
-                if "=" in name_part:
-                    name = name_part.split("=", 1)[0]
-                else:
-                    name = name_part
-                if name in _TRANSIENT_DEFINES:
-                    j += 1
-                    continue
                 collapsed_args.append(a)
                 j += 1
             # Join ANY flag with a following non-flag token, before the sort.
@@ -928,6 +930,13 @@ def compute_config_hash(
             else:
                 collapsed_args.append(a)
                 j += 1
+
+        # The macros of transient_defines go AFTER the pre-pass, which made
+        # each of them one -DNAME token.  Before the pre-pass, a removed
+        # macro no longer separates its two neighbours, and the join puts
+        # them into one token: "-mthumb -DBUILD_ID=1 x.c" became
+        # "-mthumbx.c", and the config_hash of the build changed.
+        collapsed_args = drop_transient_defines(collapsed_args, transient_defines)
 
         # Normalize arguments: sort, then process path-bearing flags
         args = sorted(collapsed_args)

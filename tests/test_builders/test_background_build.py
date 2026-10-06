@@ -31,6 +31,7 @@ from fw_context_mcp.indexer.builders.mbed_os import MbedOSBuildSystem
 from fw_context_mcp.indexer.builders.platformio import PlatformIOBuildSystem
 from fw_context_mcp.indexer.builders.stubs import STM32CubeIDEStub, TICCSStub
 from fw_context_mcp.indexer.builders.zephyr import ZephyrBuildSystem
+from fw_context_mcp.indexer.config_hash import DEFAULT_TRANSIENT_DEFINES
 
 # Every backend, with the answer it must give for a default configuration.
 # A new backend that reaches the registry without a decision here fails
@@ -290,7 +291,7 @@ class TestObjectPathStaysOutOfTheHashes:
         user = self._entry(".pio/build/x/main.c.o")
         ours = self._entry(".fw-context/build/default/out/x/main.c.o")
 
-        assert compute_flags_hash(user) == compute_flags_hash(ours), (
+        assert compute_flags_hash(user, transient_defines=DEFAULT_TRANSIENT_DEFINES) == compute_flags_hash(ours, transient_defines=DEFAULT_TRANSIENT_DEFINES), (
             "a differing flags_hash marks the unit changed and reparses it"
         )
 
@@ -301,7 +302,7 @@ class TestObjectPathStaysOutOfTheHashes:
         def _hash(obj: str) -> str:
             cc = tmp_path / f"cc_{obj.count('/')}_{len(obj)}.json"
             cc.write_text(json.dumps([self._entry(obj)]), encoding="utf-8")
-            return compute_config_hash(list(parse_cc(cc)), tmp_path, "pid")
+            return compute_config_hash(list(parse_cc(cc)), tmp_path, "pid", transient_defines=DEFAULT_TRANSIENT_DEFINES)
 
         assert _hash(".pio/build/x/main.c.o") == _hash(
             ".fw-context/build/default/out/x/main.c.o"

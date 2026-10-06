@@ -1376,6 +1376,7 @@ def _build_run_kwargs(
         ),
         purge_max_missing_percent=cfg.index.purge_max_missing_percent,
         build_system=cfg.build.system or detect_build_system(project_root),
+        transient_defines=cfg.index.transient_defines,
     )
 
 
@@ -1550,6 +1551,17 @@ def _cmd_index(args: argparse.Namespace, outside: _SigtermOutsideTheLock) -> int
             "goes to .fw-context/build/<variant>/out. Remove the key, then run "
             "'fw-context index --build'."
         )
+        print(f"error: {text}", file=sys.stderr)
+        autobuild.record_problem(db_path.parent, text)
+        return 1
+
+    # A wrong [index] transient_defines also stops the run before any build:
+    # an entry that matches no macro makes each build parse each unit again.
+    from ..config.settings import transient_defines_problems
+
+    problems = transient_defines_problems(cfg)
+    if problems:
+        text = "; ".join(problems) + ". Correct .fw-context/config.toml or the global config."
         print(f"error: {text}", file=sys.stderr)
         autobuild.record_problem(db_path.parent, text)
         return 1

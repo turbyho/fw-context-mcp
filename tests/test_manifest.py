@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 
+from fw_context_mcp.indexer.config_hash import DEFAULT_TRANSIENT_DEFINES
 from fw_context_mcp.indexer.manifest import MANIFEST_FORMAT
 
 
@@ -74,8 +75,8 @@ class TestComputeConfigHash:
         from fw_context_mcp.indexer.manifest import compute_config_hash
 
         units = []
-        h1 = compute_config_hash(units, tmp_path, "test-project")
-        h2 = compute_config_hash(units, tmp_path, "test-project")
+        h1 = compute_config_hash(units, tmp_path, "test-project", transient_defines=DEFAULT_TRANSIENT_DEFINES)
+        h2 = compute_config_hash(units, tmp_path, "test-project", transient_defines=DEFAULT_TRANSIENT_DEFINES)
         assert h1 == h2
         assert len(h1) == 64
 
@@ -91,8 +92,8 @@ class TestComputeConfigHash:
 
         u1 = [self._make_unit(str(tmp_path / "a.cpp"))]
         u2 = [self._make_unit(str(tmp_path / "b.cpp"))]
-        h1 = compute_config_hash(u1, tmp_path, "test")
-        h2 = compute_config_hash(u2, tmp_path, "test")
+        h1 = compute_config_hash(u1, tmp_path, "test", transient_defines=DEFAULT_TRANSIENT_DEFINES)
+        h2 = compute_config_hash(u2, tmp_path, "test", transient_defines=DEFAULT_TRANSIENT_DEFINES)
         assert h1 == h2
 
     def test_different_flags_produce_different_hash(self, tmp_path: Path):
@@ -100,8 +101,8 @@ class TestComputeConfigHash:
 
         u1 = [self._make_unit(str(tmp_path / "a.cpp"), ["gcc", "-O2", "-c", "a.cpp"])]
         u2 = [self._make_unit(str(tmp_path / "a.cpp"), ["gcc", "-Os", "-c", "a.cpp"])]
-        h1 = compute_config_hash(u1, tmp_path, "test")
-        h2 = compute_config_hash(u2, tmp_path, "test")
+        h1 = compute_config_hash(u1, tmp_path, "test", transient_defines=DEFAULT_TRANSIENT_DEFINES)
+        h2 = compute_config_hash(u2, tmp_path, "test", transient_defines=DEFAULT_TRANSIENT_DEFINES)
         assert h1 != h2
 
     def test_flag_order_independent(self, tmp_path: Path):
@@ -109,14 +110,14 @@ class TestComputeConfigHash:
 
         u1 = [self._make_unit(str(tmp_path / "a.cpp"), ["gcc", "-O2", "-DFOO=1", "-c", "a.cpp"])]
         u2 = [self._make_unit(str(tmp_path / "a.cpp"), ["gcc", "-DFOO=1", "-O2", "-c", "a.cpp"])]
-        h1 = compute_config_hash(u1, tmp_path, "test")
-        h2 = compute_config_hash(u2, tmp_path, "test")
+        h1 = compute_config_hash(u1, tmp_path, "test", transient_defines=DEFAULT_TRANSIENT_DEFINES)
+        h2 = compute_config_hash(u2, tmp_path, "test", transient_defines=DEFAULT_TRANSIENT_DEFINES)
         assert h1 == h2  # arguments are sorted alphabetically
 
     def test_hash_is_hex_string(self, tmp_path: Path):
         from fw_context_mcp.indexer.manifest import compute_config_hash
 
-        h = compute_config_hash([], tmp_path, "test")
+        h = compute_config_hash([], tmp_path, "test", transient_defines=DEFAULT_TRANSIENT_DEFINES)
         assert len(h) == 64
         assert all(c in "0123456789abcdef" for c in h)
 
@@ -130,8 +131,8 @@ class TestComputeConfigHash:
         u2 = [self._make_unit(str(tmp_path / "a.cpp"),
               ["gcc", "-c", str(tmp_path / "a.cpp"),
                "-DMBED_BUILD_TIMESTAMP=1784145526.0657399"])]
-        h1 = compute_config_hash(u1, tmp_path, "test")
-        h2 = compute_config_hash(u2, tmp_path, "test")
+        h1 = compute_config_hash(u1, tmp_path, "test", transient_defines=DEFAULT_TRANSIENT_DEFINES)
+        h2 = compute_config_hash(u2, tmp_path, "test", transient_defines=DEFAULT_TRANSIENT_DEFINES)
         assert h1 == h2  # timestamp value differs but macro should be stripped
 
     def test_transient_mbed_build_timestamp_space_form(self, tmp_path: Path):
@@ -144,8 +145,8 @@ class TestComputeConfigHash:
         u2 = [self._make_unit(str(tmp_path / "a.cpp"),
               ["gcc", "-c", str(tmp_path / "a.cpp"),
                "-D", "MBED_BUILD_TIMESTAMP=9999999999.0"])]
-        h1 = compute_config_hash(u1, tmp_path, "test")
-        h2 = compute_config_hash(u2, tmp_path, "test")
+        h1 = compute_config_hash(u1, tmp_path, "test", transient_defines=DEFAULT_TRANSIENT_DEFINES)
+        h2 = compute_config_hash(u2, tmp_path, "test", transient_defines=DEFAULT_TRANSIENT_DEFINES)
         assert h1 == h2  # space-separated form is also stripped
 
     def test_transient_mbed_build_timestamp_value_only(self, tmp_path: Path):
@@ -157,8 +158,8 @@ class TestComputeConfigHash:
                "-DMBED_BUILD_TIMESTAMP"])]
         u2 = [self._make_unit(str(tmp_path / "a.cpp"),
               ["gcc", "-c", str(tmp_path / "a.cpp")])]
-        h1 = compute_config_hash(u1, tmp_path, "test")
-        h2 = compute_config_hash(u2, tmp_path, "test")
+        h1 = compute_config_hash(u1, tmp_path, "test", transient_defines=DEFAULT_TRANSIENT_DEFINES)
+        h2 = compute_config_hash(u2, tmp_path, "test", transient_defines=DEFAULT_TRANSIENT_DEFINES)
         assert h1 == h2  # with and without the transient define must match
 
     def test_other_defines_preserved(self, tmp_path: Path):
@@ -170,8 +171,8 @@ class TestComputeConfigHash:
         u2 = [self._make_unit(str(tmp_path / "a.cpp"),
               ["gcc", "-c", str(tmp_path / "a.cpp"),
                "-DNDEBUG"])]
-        h1 = compute_config_hash(u1, tmp_path, "test")
-        h2 = compute_config_hash(u2, tmp_path, "test")
+        h1 = compute_config_hash(u1, tmp_path, "test", transient_defines=DEFAULT_TRANSIENT_DEFINES)
+        h2 = compute_config_hash(u2, tmp_path, "test", transient_defines=DEFAULT_TRANSIENT_DEFINES)
         assert h1 != h2  # different non-transient defines → different hash
 
     def test_generic_transient_defines_stripped(self, tmp_path: Path):
@@ -189,10 +190,10 @@ class TestComputeConfigHash:
             "-DBUILD_NUMBER=42",
         ]:
             u = [self._make_unit(str(tmp_path / "a.cpp"), base_args + [dflag])]
-            hashes.add(compute_config_hash(u, tmp_path, "test"))
+            hashes.add(compute_config_hash(u, tmp_path, "test", transient_defines=DEFAULT_TRANSIENT_DEFINES))
         # Without any transient macros
         u_base = [self._make_unit(str(tmp_path / "a.cpp"), base_args)]
-        hashes.add(compute_config_hash(u_base, tmp_path, "test"))
+        hashes.add(compute_config_hash(u_base, tmp_path, "test", transient_defines=DEFAULT_TRANSIENT_DEFINES))
         assert len(hashes) == 1  # all produce the same hash
 
 
@@ -225,7 +226,7 @@ class TestSaveAndLoad:
         mock_unit = MagicMock()
         mock_unit.file.resolve.return_value = Path(str(tmp_path / "src/main.cpp"))
         mock_unit.clang_args = ["gcc", "-c", "src/main.cpp"]
-        config_hash = compute_config_hash([mock_unit], tmp_path, "test")
+        config_hash = compute_config_hash([mock_unit], tmp_path, "test", transient_defines=DEFAULT_TRANSIENT_DEFINES)
         config_hash = save(manifest, tmp_path, config_hash)
         assert len(config_hash) == 64
 
@@ -795,6 +796,7 @@ class TestVendorPatternCarrier:
             vendor_patterns=vendor_patterns,
             config_hash="deadbeef",
             reparsed_tus={"src/main.cpp"},
+            transient_defines=DEFAULT_TRANSIENT_DEFINES,
         )
 
     @staticmethod
@@ -937,6 +939,7 @@ class TestManifestEntryRefreshGuard:
             tu_headers={"src/main.cpp": [{"path": "src/config.h", "hash": "FRESH", "generated": False}]},
             config_hash="deadbeef",
             reparsed_tus=reparsed,
+            transient_defines=DEFAULT_TRANSIENT_DEFINES,
         )
 
     @staticmethod
@@ -1333,6 +1336,7 @@ class TestNeedsReparse:
             },
             config_hash="deadbeef",
             reparsed_tus=reparsed,
+            transient_defines=DEFAULT_TRANSIENT_DEFINES,
         )
 
     @staticmethod
@@ -1400,6 +1404,7 @@ class TestNeedsReparse:
             tu_headers={},
             config_hash="deadbeef",
             reparsed_tus=set(),
+            transient_defines=DEFAULT_TRANSIENT_DEFINES,
         )
 
         assert result is not None

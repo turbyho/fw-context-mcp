@@ -28,6 +28,7 @@ import pytest
 
 from fw_context_mcp.indexer.build import detect_build_system
 from fw_context_mcp.indexer.builders import registry as builder_registry
+from fw_context_mcp.indexer.config_hash import DEFAULT_TRANSIENT_DEFINES
 from fw_context_mcp.indexer.db import open_db
 
 pytestmark = pytest.mark.system
@@ -1018,8 +1019,8 @@ class TestConfigHashStability:
         }]), encoding="utf-8")
         units1 = list(parse_cc(cc))
         units2 = list(parse_cc(cc))
-        h1 = compute_structural_hash(cc, project_root, units1)
-        h2 = compute_structural_hash(cc, project_root, units2)
+        h1 = compute_structural_hash(cc, project_root, units1, transient_defines=DEFAULT_TRANSIENT_DEFINES)
+        h2 = compute_structural_hash(cc, project_root, units2, transient_defines=DEFAULT_TRANSIENT_DEFINES)
         assert h1 == h2
 
     def _hash_for(self, tmp_path, name: str, entries: list[dict]) -> str:
@@ -1031,7 +1032,7 @@ class TestConfigHashStability:
         project_root = Path(__file__).parent / "builds" / "bare"
         cc = tmp_path / name
         cc.write_text(json.dumps(entries))
-        return compute_structural_hash(cc, project_root, list(parse_cc(cc)))
+        return compute_structural_hash(cc, project_root, list(parse_cc(cc)), transient_defines=DEFAULT_TRANSIENT_DEFINES)
 
     def test_config_hash_changes_with_different_dialect(self, tmp_path):
         """A different macro or standard is a different build."""

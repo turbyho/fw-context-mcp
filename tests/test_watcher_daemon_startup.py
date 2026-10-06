@@ -141,6 +141,7 @@ class _FakeIndexCfg:
     compile_commands: Path = Path(".fw-context") / "build" / "compile_commands.json"
     vendor_paths: list = field(default_factory=list)
     project_paths: list = field(default_factory=list)
+    transient_defines: list = field(default_factory=list)
 
 
 @dataclass
@@ -390,5 +391,29 @@ class TestCmdIndexWiring:
         # process, not an fw-context index run, so nothing may be signalled.
         with index_run_lock(tmp_path / "index" / "pid"):
             assert cmd_index(self._args()) == EXIT_ALREADY_RUNNING
+        assert built == []
+        assert started == []
+
+    @pytest.mark.parametrize("variants", [[], [BuildVariant(name="v")]], ids=["single", "variants"])
+    def test_a_wrong_transient_defines_entry_builds_nothing(
+        self, monkeypatch, tmp_path: Path, capsys, variants: list,
+    ):
+        """An entry that names no macro would let each build parse every unit again."""
+        from fw_context_mcp.cli import _index as index_mod
+        from fw_context_mcp.cli._index import cmd_index
+
+        cfg = _FakeCfg(
+            index=_FakeIndexCfg(db_dir=tmp_path / "index", transient_defines=["-DBUILD_ID"]),
+            build=_FakeBuildCfg(variants=variants),
+        )
+        started = self._patch_cmd_index(monkeypatch, tmp_path, cfg)
+        built: list[str] = []
+        monkeypatch.setattr(
+            index_mod, "_resolve_compile_commands", lambda *a, **kw: built.append("single") or (None, False)
+        )
+        monkeypatch.setattr(index_mod, "_run_multi", lambda *a, **kw: built.append("multi") or 0)
+
+        assert cmd_index(self._args()) == 1
+        assert "'-DBUILD_ID' is not a macro name" in capsys.readouterr().err
         assert built == []
         assert started == []

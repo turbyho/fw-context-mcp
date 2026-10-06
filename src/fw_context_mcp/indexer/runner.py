@@ -16,6 +16,7 @@ import os
 import sqlite3
 import threading
 import time
+from collections.abc import Collection
 from pathlib import Path
 
 from ..config.settings import derive_project_id
@@ -51,6 +52,7 @@ from ._unit_processor import (
 )
 from .compile_commands import parse as parse_compile_commands
 from .compile_commands import validate_include_files
+from .config_hash import DEFAULT_TRANSIENT_DEFINES
 from .db import (
     drop_fts_triggers,
     get_file_hashes,
@@ -373,6 +375,7 @@ def run(
     build_env: dict[str, str] | None = None,
     defer_fts: bool = False,
     defer_cleanup: bool = False,
+    transient_defines: Collection[str] = DEFAULT_TRANSIENT_DEFINES,
 ) -> str:
     """Index a project: parse translation units, extract symbols, and store to SQLite.
 
@@ -419,6 +422,10 @@ def run(
         llm_config: Configuration dataclass for Ollama connection (URL,
             model names, enabled flag).  Required when any ``index_*`` or
             ``analyze_*`` option is enabled.
+        transient_defines: ``[index] transient_defines`` — the ``-D`` macros
+            that the config_hash and the flags hash of each unit ignore.  The
+            CLI passes the value of the config.  The default is the default
+            of the config, for a caller without a config.
 
     Returns:
         The ``config_hash`` string — a content-addressable fingerprint of the
@@ -428,6 +435,8 @@ def run(
         project_root = compile_commands.parent.resolve()
     else:
         project_root = project_root.resolve()
+    # One set for the whole run: each unit tests each argument against it.
+    transient_defines = frozenset(transient_defines)
 
     # Normalize patterns without % wildcard to match subdirectories.  The
     # vendor set waits for the translation units — see below.
@@ -529,6 +538,7 @@ def run(
         build_dir_patterns,
         project_id=project_id,
         scope=scope,
+        transient_defines=transient_defines,
     )
     manifest = load_manifest(db_path.parent, expected_hash)
     if manifest is not None:
@@ -542,6 +552,7 @@ def run(
             build_dir_patterns,
             project_id=project_id,
             scope=scope,
+            transient_defines=transient_defines,
         )
         # Reload manifest from disk — build_preliminary may have written a
         # preliminary (empty source_hash) manifest.  The in-memory manifest
@@ -761,6 +772,7 @@ def run(
             header_stale_tus=header_stale_tus,
             hash_cache=header_hash_cache,
             header_table=manifest_header_table,
+            transient_defines=transient_defines,
         )
 
         # Snapshot the skip set BEFORE folding in this TU's own files.
@@ -939,6 +951,7 @@ def run(
         defer_cleanup=defer_cleanup,
         header_hash_cache=header_hash_cache,
         reparsed_tus=reparsed_tus,
+        transient_defines=transient_defines,
     )
 
     elapsed = time.monotonic() - t0

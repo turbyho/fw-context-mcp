@@ -64,6 +64,7 @@ class _FakeIndexCfg:
     compile_commands: Path = Path("compile_commands.json")
     vendor_paths: list = field(default_factory=list)
     project_paths: list = field(default_factory=list)
+    transient_defines: list = field(default_factory=list)
 
 
 @dataclass

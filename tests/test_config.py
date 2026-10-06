@@ -11,7 +11,9 @@ from fw_context_mcp.config.settings import (
     _from_dict,
     derive_project_id,
     load,
+    transient_defines_problems,
 )
+from fw_context_mcp.indexer.config_hash import DEFAULT_TRANSIENT_DEFINES
 
 
 class TestDeepMerge:
@@ -359,6 +361,87 @@ class TestVendorProjectPaths:
         })
         assert cfg.index.vendor_paths == ["lib"]
         assert cfg.index.project_paths == ["lib/muj_modul"]
+
+
+class TestTransientDefines:
+    """``[index] transient_defines``: one list for config_hash and flags_hash."""
+
+    _load = TestMalformedSection._load
+
+    def test_the_default_is_the_list_of_six_names(self):
+        assert _from_dict({}).index.transient_defines == list(DEFAULT_TRANSIENT_DEFINES)
+        assert len(DEFAULT_TRANSIENT_DEFINES) == 6
+
+    def test_the_global_template_holds_the_default(self):
+        """``init`` writes the active keys of the template into the global config."""
+        import tomllib
+
+        from fw_context_mcp.config.settings import _GLOBAL_DEFAULTS
+
+        template = tomllib.loads(_GLOBAL_DEFAULTS)
+        assert template["index"]["transient_defines"] == list(DEFAULT_TRANSIENT_DEFINES)
+
+    def test_a_project_list_replaces_the_global_list(self, tmpdir, monkeypatch):
+        cfg = self._load(
+            tmpdir, monkeypatch,
+            global_text='[index]\ntransient_defines = ["MBED_BUILD_TIMESTAMP", "BUILD_NUMBER"]\n',
+            committed='[index]\ntransient_defines = ["MY_BUILD_STAMP"]\n',
+        )
+        assert cfg.index.transient_defines == ["MY_BUILD_STAMP"]
+
+    def test_an_empty_project_list_makes_every_macro_count(self, tmpdir, monkeypatch):
+        cfg = self._load(
+            tmpdir, monkeypatch,
+            global_text='[index]\ntransient_defines = ["MBED_BUILD_TIMESTAMP"]\n',
+            committed="[index]\ntransient_defines = []\n",
+        )
+        assert cfg.index.transient_defines == []
+
+    def test_a_correct_config_has_no_problem(self):
+        cfg = _from_dict({"index": {"transient_defines": ["MBED_BUILD_TIMESTAMP", "_X1"]}})
+        assert transient_defines_problems(cfg) == []
+
+    @pytest.mark.parametrize("entry", ["-DMBED_BUILD_TIMESTAMP", "BUILD_NUMBER=1", "1ABC", "", 5])
+    def test_an_entry_that_is_not_a_macro_name_is_a_problem(self, entry):
+        """Such an entry matches no -D, and each build would parse every unit again."""
+        cfg = _from_dict({"index": {"transient_defines": ["BUILD_ID", entry]}})
+        problems = transient_defines_problems(cfg)
+        assert len(problems) == 1
+        assert repr(entry) in problems[0]
+
+    def test_the_key_in_a_variant_is_a_problem(self):
+        """The variant table would drop the key without a word."""
+        cfg = _from_dict({
+            "build": {"variants": [
+                {"name": "dev", "transient_defines": ["X"]},
+                {"name": "rel"},
+            ]},
+        })
+        problems = transient_defines_problems(cfg)
+        assert len(problems) == 1
+        assert "'dev'" in problems[0]
+
+    def test_the_index_run_gets_the_list_of_the_config(self, tmp_path):
+        """runner.run has a default for callers without a config; the CLI must override it."""
+        from types import SimpleNamespace
+
+        from fw_context_mcp.cli._index import _build_run_kwargs
+
+        cfg = _from_dict({"build": {"system": "makefile"}, "index": {"transient_defines": ["MY_STAMP"]}})
+        args = SimpleNamespace(name=None, no_refs=False, force=False)
+        kwargs = _build_run_kwargs(args, cfg, tmp_path, "pid", [], [], None)
+        assert kwargs["transient_defines"] == ["MY_STAMP"]
+
+    @pytest.mark.parametrize("value", ["{ X = 1 }", "5", "true"])
+    def test_a_value_that_is_not_a_list_keeps_the_default(self, tmpdir, monkeypatch, caplog, value):
+        """``list(value)`` made ``["X"]`` of a table, and a number stopped the load."""
+        cfg = self._load(tmpdir, monkeypatch, committed=f"[index]\ntransient_defines = {value}\n")
+        assert cfg.index.transient_defines == list(DEFAULT_TRANSIENT_DEFINES)
+        assert "[index] transient_defines must be a list or a string" in caplog.text
+
+    def test_a_string_is_a_list_of_one_name(self):
+        cfg = _from_dict({"index": {"transient_defines": "MY_STAMP"}})
+        assert cfg.index.transient_defines == ["MY_STAMP"]
 
 
 class TestLoadCreatesNoProjectFile:

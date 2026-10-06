@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from fw_context_mcp.indexer.config_hash import _normalize_entry
+from fw_context_mcp.indexer.config_hash import DEFAULT_TRANSIENT_DEFINES, _normalize_entry
 from fw_context_mcp.indexer.manifest import build_scope, compute_config_hash
 
 
@@ -12,7 +12,7 @@ class TestNormalizeEntry:
             "file": "src/main.cpp",
             "arguments": ["arm-none-eabi-g++", "-std=c++14", "-DFOO=1", "src/main.cpp"],
         }
-        result = _normalize_entry(entry)
+        result = _normalize_entry(entry, transient_defines=DEFAULT_TRANSIENT_DEFINES)
         assert "-std=c++14" in result["args"]
         assert "-DFOO=1" in result["args"]
         assert "arm-none-eabi-g++" not in result["args"]
@@ -22,7 +22,7 @@ class TestNormalizeEntry:
             "file": "src/main.cpp",
             "arguments": ["g++", "-std=c++14", "-MD", "-MP", "-o", "build/main.o", "src/main.cpp"],
         }
-        result = _normalize_entry(entry)
+        result = _normalize_entry(entry, transient_defines=DEFAULT_TRANSIENT_DEFINES)
         assert "-MD" not in result["args"]
         assert "-MP" not in result["args"]
         assert "-o" not in result["args"]
@@ -33,7 +33,7 @@ class TestNormalizeEntry:
             "file": "src/main.cpp",
             "arguments": ["g++", "-std=c++14", "-DFOO=1", "-Wall", "-Os", "src/main.cpp"],
         }
-        result = _normalize_entry(entry)
+        result = _normalize_entry(entry, transient_defines=DEFAULT_TRANSIENT_DEFINES)
         assert "-std=c++14" in result["args"]
         assert "-DFOO=1" in result["args"]
         assert "-Wall" in result["args"]
@@ -45,12 +45,12 @@ class TestNormalizeEntry:
             "file": "src/main.cpp",
             "arguments": ["g++", "-c", "-b", "-a", "src/main.cpp"],
         }
-        result = _normalize_entry(entry)
+        result = _normalize_entry(entry, transient_defines=DEFAULT_TRANSIENT_DEFINES)
         assert result["args"] == sorted(result["args"])
 
     def test_normalizes_file_path(self):
         entry = {"file": "./src/main.cpp", "arguments": ["g++", "src/main.cpp"]}
-        result = _normalize_entry(entry)
+        result = _normalize_entry(entry, transient_defines=DEFAULT_TRANSIENT_DEFINES)
         assert result["file"] == "src/main.cpp"
 
     def test_handles_command_string(self):
@@ -58,7 +58,7 @@ class TestNormalizeEntry:
             "file": "main.c",
             "command": "gcc -std=c11 -O2 -o build/main.o main.c",
         }
-        result = _normalize_entry(entry)
+        result = _normalize_entry(entry, transient_defines=DEFAULT_TRANSIENT_DEFINES)
         assert "-std=c11" in result["args"]
         assert "-O2" in result["args"]
 
@@ -69,7 +69,7 @@ class TestNormalizeEntry:
             "file": "main.cpp",
             "arguments": ["g++", f"@{rsp}", "-std=c++14", "main.cpp"],
         }
-        result = _normalize_entry(entry)
+        result = _normalize_entry(entry, transient_defines=DEFAULT_TRANSIENT_DEFINES)
         assert "-DEXTRA=1" in result["args"]
 
 
@@ -85,7 +85,7 @@ _ROOT = Path("/tmp/proj")
 
 
 def _cfg_hash(units: list[_FakeUnit]) -> str:
-    return compute_config_hash(units, _ROOT, "projid", None)
+    return compute_config_hash(units, _ROOT, "projid", None, transient_defines=DEFAULT_TRANSIENT_DEFINES)
 
 
 class TestConfigHashIdentity:
@@ -186,8 +186,8 @@ class TestConfigHashIdentity:
         """Build output is not identity, wherever it sits."""
         base = [_FakeUnit("/tmp/proj/src/main.c", ["-DFOO=1", "-I/elsewhere/BUILD/gen"])]
         moved = [_FakeUnit("/tmp/proj/src/main.c", ["-DFOO=1", "-I/elsewhere/BUILD/other"])]
-        assert compute_config_hash(moved, _ROOT, "projid", ["BUILD/"]) == \
-            compute_config_hash(base, _ROOT, "projid", ["BUILD/"])
+        assert compute_config_hash(moved, _ROOT, "projid", ["BUILD/"], transient_defines=DEFAULT_TRANSIENT_DEFINES) == \
+            compute_config_hash(base, _ROOT, "projid", ["BUILD/"], transient_defines=DEFAULT_TRANSIENT_DEFINES)
 
     def test_adding_a_tu_with_a_new_sdk_include_keeps_the_hash(self):
         """Out-of-project paths go in as the INTERSECTION, not the union.
@@ -252,7 +252,7 @@ class TestConfigHashIdentity:
                 "arguments": ["g++", "-DFOO=1", "-I/inc", "src/main.c"]}
         moved = {"file": "src/main.c",
                  "arguments": ["g++", "-DFOO=1", "-I/other/inc", "src/main.c"]}
-        assert compute_flags_hash(moved) != compute_flags_hash(base)
+        assert compute_flags_hash(moved, transient_defines=DEFAULT_TRANSIENT_DEFINES) != compute_flags_hash(base, transient_defines=DEFAULT_TRANSIENT_DEFINES)
 
     def test_per_tu_flag_variance_does_not_multiply_the_hash(self):
         """One TU carrying an extra -I must not change build identity.
@@ -332,7 +332,7 @@ class TestBuildScope:
 class TestConfigHashScope:
     def _hash(self, scope=None):
         unit = _FakeUnit("/tmp/proj/src/main.c")
-        return compute_config_hash([unit], Path("/tmp/proj"), "projid", None, scope=scope)
+        return compute_config_hash([unit], Path("/tmp/proj"), "projid", None, scope=scope, transient_defines=DEFAULT_TRANSIENT_DEFINES)
 
     def test_scope_changes_hash(self):
         base = self._hash()
@@ -488,7 +488,7 @@ class TestResponseFileExpansion:
             "file": "src/main.c",
             "directory": str(tmp_path),
             "arguments": ["gcc", "@./BUILD/flags.rsp", "src/main.c"],
-        })
+        }, transient_defines=DEFAULT_TRANSIENT_DEFINES)
 
         assert "-DFROM_RSP=1" in norm["args"]
         assert "-I/opt/sdk/inc" in norm["args"]
@@ -506,9 +506,9 @@ class TestResponseFileExpansion:
         }
 
         monkeypatch.chdir(tmp_path)
-        from_project = compute_flags_hash(entry)
+        from_project = compute_flags_hash(entry, transient_defines=DEFAULT_TRANSIENT_DEFINES)
         monkeypatch.chdir(tmp_path.parent)
-        from_elsewhere = compute_flags_hash(entry)
+        from_elsewhere = compute_flags_hash(entry, transient_defines=DEFAULT_TRANSIENT_DEFINES)
 
         assert from_project == from_elsewhere
 
@@ -523,7 +523,7 @@ class TestResponseFileExpansion:
             "file": "src/main.c",
             "directory": str(tmp_path / "other"),
             "arguments": ["gcc", f"@{rsp}", "src/main.c"],
-        })
+        }, transient_defines=DEFAULT_TRANSIENT_DEFINES)
 
         assert "-DABS=1" in norm["args"]
 
@@ -537,6 +537,103 @@ class TestResponseFileExpansion:
         norm = _normalize_entry({
             "file": "src/main.c",
             "arguments": ["gcc", f"@{rsp}", "src/main.c"],
-        })
+        }, transient_defines=DEFAULT_TRANSIENT_DEFINES)
 
         assert "-DABS=1" in norm["args"]
+
+
+class TestTransientDefines:
+    """``[index] transient_defines`` acts the same in config_hash and in flags_hash.
+
+    Mbed OS writes the time of the build into MBED_BUILD_TIMESTAMP on each
+    unit.  The flags hash held it, thus each build changed the flags hash of
+    each unit, and a decision by hash parsed the whole project again.
+    """
+
+    @staticmethod
+    def _entry(*defines: str) -> dict:
+        return {
+            "file": "src/main.c",
+            "directory": "/tmp",
+            "arguments": ["gcc", "-std=c11", *defines, "-c", "src/main.c"],
+        }
+
+    def test_both_forms_of_a_define_are_dropped(self):
+        from fw_context_mcp.indexer.config_hash import drop_transient_defines
+
+        args = ["-DMBED_BUILD_TIMESTAMP=1.5", "-D", "BUILD_ID=7", "-DFOO=1", "-D", "BAR", "-Os"]
+        assert drop_transient_defines(args, DEFAULT_TRANSIENT_DEFINES) == ["-DFOO=1", "-D", "BAR", "-Os"]
+
+    def test_a_define_without_a_value_is_dropped_by_its_name(self):
+        from fw_context_mcp.indexer.config_hash import drop_transient_defines
+
+        assert drop_transient_defines(["-DBUILD_DATE", "-DBUILD_DATES"], ["BUILD_DATE"]) == ["-DBUILD_DATES"]
+
+    def test_a_new_timestamp_keeps_the_flags_hash(self):
+        from fw_context_mcp.indexer.config_hash import compute_flags_hash
+
+        first = compute_flags_hash(
+            self._entry("-DMBED_BUILD_TIMESTAMP=1791274230.0483081"),
+            transient_defines=DEFAULT_TRANSIENT_DEFINES,
+        )
+        second = compute_flags_hash(
+            self._entry("-DMBED_BUILD_TIMESTAMP=1791301862.9208605"),
+            transient_defines=DEFAULT_TRANSIENT_DEFINES,
+        )
+        assert first == second
+
+    def test_another_define_still_changes_the_flags_hash(self):
+        from fw_context_mcp.indexer.config_hash import compute_flags_hash
+
+        before = compute_flags_hash(self._entry("-DFOO=1"), transient_defines=DEFAULT_TRANSIENT_DEFINES)
+        after = compute_flags_hash(self._entry("-DFOO=2"), transient_defines=DEFAULT_TRANSIENT_DEFINES)
+        assert before != after
+
+    def test_an_empty_list_makes_the_timestamp_count(self):
+        from fw_context_mcp.indexer.config_hash import compute_flags_hash
+
+        first = compute_flags_hash(self._entry("-DMBED_BUILD_TIMESTAMP=1"), transient_defines=[])
+        second = compute_flags_hash(self._entry("-DMBED_BUILD_TIMESTAMP=2"), transient_defines=[])
+        assert first != second
+
+    def test_a_define_in_a_response_file_is_dropped(self, tmp_path):
+        rsp = tmp_path / "flags.rsp"
+        rsp.write_text("-DBUILD_NUMBER=42 -DKEEP=1\n")
+        norm = _normalize_entry(
+            {"file": "src/main.c", "directory": str(tmp_path), "arguments": ["gcc", f"@{rsp}", "src/main.c"]},
+            transient_defines=DEFAULT_TRANSIENT_DEFINES,
+        )
+        assert "-DKEEP=1" in norm["args"]
+        assert not any("BUILD_NUMBER" in a for a in norm["args"])
+
+    def test_config_hash_and_flags_hash_use_the_same_list(self):
+        """A name that the user adds acts in the two hashes, not in one of them."""
+        from fw_context_mcp.indexer.config_hash import compute_flags_hash
+
+        names = ["MY_STAMP"]
+        a = _FakeUnit("/tmp/proj/a.c", ["-std=c11", "-DMY_STAMP=1"])
+        b = _FakeUnit("/tmp/proj/a.c", ["-std=c11", "-DMY_STAMP=2"])
+        assert compute_config_hash([a], _ROOT, "projid", None, transient_defines=names) == \
+            compute_config_hash([b], _ROOT, "projid", None, transient_defines=names)
+        assert compute_flags_hash(self._entry("-DMY_STAMP=1"), transient_defines=names) == \
+            compute_flags_hash(self._entry("-DMY_STAMP=2"), transient_defines=names)
+        assert compute_config_hash([a], _ROOT, "projid", None, transient_defines=[]) != \
+            compute_config_hash([b], _ROOT, "projid", None, transient_defines=[])
+
+    def test_a_dropped_define_still_separates_its_neighbours(self, tmp_path):
+        """The macros go after the join of a flag with its value, not before.
+
+        Dropped before it, the macro no longer separated "-mthumb" from the
+        next token, the join made "-mthumbother.c", and the config_hash with
+        the default list was not the hash of the release before.
+        """
+        import json
+
+        unit = _FakeUnit("/tmp/proj/main.c", ["-mthumb", "-DMBED_BUILD_TIMESTAMP=1.5", "other.c"])
+        config_hash = compute_config_hash(
+            [unit], _ROOT, "projid", None, db_dir=tmp_path, transient_defines=DEFAULT_TRANSIENT_DEFINES,
+        )
+        canonical = json.loads((tmp_path / f"compile_commands.{config_hash}.json").read_text(encoding="utf-8"))
+        assert "-mthumb" in canonical["dialect"]
+        assert not any("other.c" in token for token in canonical["dialect"])
+        assert canonical["defines"] == []

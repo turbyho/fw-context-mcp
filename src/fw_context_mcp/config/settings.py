@@ -48,6 +48,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from ..indexer.build import BuildConfig, BuildImage, BuildVariant
+from ..indexer.config_hash import DEFAULT_TRANSIENT_DEFINES
 
 log = logging.getLogger(__name__)
 
@@ -61,6 +62,7 @@ __all__ = [
     "derive_project_id",
     "generate_project_id",
     "load",
+    "transient_defines_problems",
     "update_global_config",
 ]
 
@@ -109,6 +111,11 @@ _PROJECT_LOCAL_CONFIG_NAME = "local.toml"
 _GLOBAL_DEFAULTS = """\
 [index]
 db_dir = "~/.fw-context/index"
+# -D macros whose value makes each build unique (a build time, a build
+# counter).  The index ignores them when it compares two builds, thus a new
+# build with only a new value parses no file again.  A project config can
+# give its own list; that list replaces this one.
+transient_defines = ["MBED_BUILD_TIMESTAMP", "BUILD_TIMESTAMP", "BUILD_TIME", "BUILD_DATE", "BUILD_ID", "BUILD_NUMBER"]
 
 [llm]
 # enabled = false   # uncomment to disable Ollama — LLM-calling tools will return raw prompts
@@ -229,6 +236,11 @@ _PROJECT_DEFAULTS_TEMPLATE = """\
 #project_paths = ["src/old_hal", "lib/muj_modul"]
 #  Pro cesty MIMO project_root používejte ABSOLUTNÍ cesty:
 #  project_paths = ["/home/user/esp/components/muj_fork"]
+
+# transient_defines: -D macros whose value makes each build unique.  The
+#   index ignores them when it compares two builds.  This list replaces the
+#   list of the global config.  Remove a name that your code reads in an #if.
+# transient_defines = ["MBED_BUILD_TIMESTAMP", "BUILD_NUMBER"]
 
 # index_refs: build a cross-reference / call graph.
 #   On by default — enables find_callers, find_call_path, find_dead_code, etc.
@@ -513,6 +525,14 @@ class IndexConfig:
     rerank_top_k: int = 50
     min_dense_count: int = 3
     max_symbol_body_lines: int = 1000
+    transient_defines: list[str] = field(default_factory=lambda: list(DEFAULT_TRANSIENT_DEFINES))
+    """The ``-D`` macros whose value makes each build unique (a build time, a
+    build counter).  compute_config_hash and compute_flags_hash ignore them,
+    thus a build that changes only such a value parses no unit again.  A
+    later layer (project, local) replaces the list of an earlier one
+    (``_deep_merge`` replaces lists),
+    and ``[]`` makes every macro count.  See
+    :data:`~fw_context_mcp.indexer.config_hash.DEFAULT_TRANSIENT_DEFINES`."""
     purge_max_missing_percent: int = 20
     """Abort the automatic ghost-file purge when more than this percent of
     indexed files are missing from disk — guards against an offline network
@@ -644,7 +664,15 @@ def _apply_section(
     if section := data.get(section_name, {}):
         for key, attr, conv in fields:
             if key in section:
-                setattr(target, attr, _convert(section[key], conv))
+                try:
+                    setattr(target, attr, _convert(section[key], conv))
+                except _InvalidListValue:
+                    # The same rule as _safe_int: the key keeps its default,
+                    # and the warning names the key that the user must correct.
+                    log.warning(
+                        "[%s] %s must be a list or a string, not %r — using the default",
+                        section_name, key, section[key],
+                    )
 
 
 def _build_cache_server_config(data: dict) -> CacheServerConfig | None:
@@ -777,13 +805,23 @@ def _convert_bool(value) -> bool:
     return bool(value)
 
 
+class _InvalidListValue(TypeError):
+    """A list key holds a value that is neither a list nor a string."""
+
+
 def _convert_list(value) -> list:
-    """Coerce *value* to list — wraps scalar values."""
+    """Coerce *value* to list — wraps a string in a list.
+
+    Any other type raises :class:`_InvalidListValue`, and the caller keeps
+    the default.  ``list(value)`` made a list of the keys of a TOML table
+    (``key = {X = 1}`` became ``["X"]``) without a word, and stopped the
+    load with a TypeError on a number.
+    """
     if isinstance(value, list):
         return value
     if isinstance(value, str):
         return [value]
-    return list(value)
+    raise _InvalidListValue(value)
 
 
 # Dispatch table for exact-match converters — dict lookup is O(1) and
@@ -860,6 +898,7 @@ _INDEX_FIELDS: list[tuple[str, str, str]] = [
     ("min_dense_count", "min_dense_count", "int(3)"),
     ("max_symbol_body_lines", "max_symbol_body_lines", "int(1000)"),
     ("purge_max_missing_percent", "purge_max_missing_percent", "int(20)"),
+    ("transient_defines", "transient_defines", "list"),
 ]
 
 _LLM_FIELDS: list[tuple[str, str, str]] = [
@@ -998,6 +1037,41 @@ def _validate_variant_names(build: BuildConfig) -> None:
                 "[build] default_image '%s' not found in images of variant '%s'",
                 build.default_image, build.default_variant,
             )
+
+
+# The name of a C macro.  A -D name of another form cannot occur in a
+# compile command, thus an entry of another form is a mistake of the user.
+_MACRO_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def transient_defines_problems(cfg: Config) -> list[str]:
+    """Return the mistakes in ``[index] transient_defines``, one text for each.
+
+    The index run refuses a config with a mistake here, and does not ignore
+    the entry: an entry that never matches lets each build parse every unit
+    again, and the user sees no reason for it.
+
+    Two kinds of mistake:
+
+    * An entry that is not a string, or not the name of a C macro (for
+      example ``-DMBED_BUILD_TIMESTAMP`` or ``NAME=1``).  The list holds names.
+    * The key in a ``[[build.variants]]`` table.  The list applies to the
+      whole project, and the variant table would drop it without a word
+      (``index_overrides`` reads only the vendor and project paths).
+    """
+    problems = [
+        f"[index] transient_defines entry {entry!r} is not a macro name "
+        "(write NAME, not -DNAME or NAME=value)"
+        for entry in cfg.index.transient_defines
+        if not isinstance(entry, str) or not _MACRO_NAME.fullmatch(entry)
+    ]
+    problems.extend(
+        f"[[build.variants]] {variant.name!r} sets transient_defines: "
+        "the list applies to the whole project, set it in [index]"
+        for variant in cfg.build.variants
+        if "transient_defines" in variant.index_overrides
+    )
+    return problems
 
 
 def _ensure_config_file(path: Path, template: str, label: str) -> Path:

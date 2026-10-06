@@ -122,6 +122,7 @@ and multi-image builds](build.md).
 | `index_refs` | `true` | project | Build the cross-reference and call graph data. This key is on by default, and it enables tools such as `find_callers`, `find_call_path`, and `find_dead_code`. Set this key to `false`, or pass `--no-refs`, for faster indexing on very large projects. |
 | `index_embeddings` | `true` | project | Generate vector embeddings during indexing. An Ollama `embed_model` requires Ollama; a sentence-transformers or `ft://` model runs locally. The embeddings power semantic search and hybrid FTS5+vector re-ranking. Disable this key with `false`, or with `--no-embeddings`. |
 | `max_symbol_body_lines` | `1000` | project | The maximum number of lines of one symbol body. The index stores at most this number of lines, and `get_source` and `get_symbol_context` return at most this number. A body that a cap cut carries `_source_truncated`. |
+| `transient_defines` | `["MBED_BUILD_TIMESTAMP", "BUILD_TIMESTAMP", "BUILD_TIME", "BUILD_DATE", "BUILD_ID", "BUILD_NUMBER"]` | global, project, local | The names of the `-D` macros whose value makes each build unique, for example a build time or a build counter. When fw-context compares two builds, it ignores these macros: in the identity of the build (`config_hash`) and in the flags of each translation unit. Thus a new build that changes only such a value parses no file again. Mbed OS writes the time of the build into `MBED_BUILD_TIMESTAMP` on each unit. Write names only (`NAME`, not `-DNAME` or `NAME=1`). A project list replaces the global list, and `[]` makes every macro count. Remove a name that your code reads in an `#if`, because then a new value must change the index. A change of the list can change `config_hash` and start a full reindex. An entry that is not a macro name, or the key in a `[[build.variants]]` table, stops `fw-context index` with an error. |
 
 fw-context asks each GCC compiler that `compile_commands.json` names for its system include directories and its predefined macros, as clangd `--query-driver` does. It runs the compiler with `-E -v` and `-dM -E` on an empty input. This is the compiler that the build of the project runs too, thus no configuration selects it. When a compiler does not answer, its units get the flags of `compile_commands.json`, a target from the compiler name, and toolchain directories that fw-context guesses from the layout of the toolchain.
 
@@ -258,6 +259,7 @@ For setup, deployment, and management instructions, see **[Cache Server →](cac
 ```toml
 [index]
 db_dir = "~/.fw-context/index"
+transient_defines = ["MBED_BUILD_TIMESTAMP", "BUILD_TIMESTAMP", "BUILD_TIME", "BUILD_DATE", "BUILD_ID", "BUILD_NUMBER"]
 
 [llm]
 # enabled = true   # set false to disable Ollama entirely

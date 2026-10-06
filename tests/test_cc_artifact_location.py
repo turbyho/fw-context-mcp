@@ -14,6 +14,7 @@ from pathlib import Path
 
 from fw_context_mcp.indexer._embedding import _cleanup_orphaned_cc_artifacts
 from fw_context_mcp.indexer._postprocess import cleanup_old_builds_multi
+from fw_context_mcp.indexer.config_hash import DEFAULT_TRANSIENT_DEFINES
 from fw_context_mcp.indexer.db import open_db, transaction, upsert_build_config, upsert_project
 from fw_context_mcp.indexer.manifest import compute_config_hash
 
@@ -24,7 +25,7 @@ NEW = "b" * 64
 def test_the_artifact_is_next_to_the_manifest(tmp_path):
     # db_dir is the database directory of the project, where the manifest
     # of the same hash goes (`manifest._manifest_path`).
-    config_hash = compute_config_hash([], tmp_path, "pid", [], db_dir=tmp_path)
+    config_hash = compute_config_hash([], tmp_path, "pid", [], db_dir=tmp_path, transient_defines=DEFAULT_TRANSIENT_DEFINES)
     assert (tmp_path / f"compile_commands.{config_hash}.json").is_file()
     assert not (tmp_path / "pid").exists()
 

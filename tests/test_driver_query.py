@@ -33,6 +33,7 @@ from fw_context_mcp.indexer._driver_query import (
     query_gcc_driver,
     resolve_compiler,
 )
+from fw_context_mcp.indexer.config_hash import DEFAULT_TRANSIENT_DEFINES
 
 #: The real function; the autouse fixture replaces the module attribute.
 _REAL_CLANG_RESOURCE_INCLUDE = _driver_query.clang_resource_include
@@ -540,12 +541,12 @@ class TestParseUsesTheDriver:
         monkeypatch.setattr(_driver_query, "libclang_supports", lambda triple: False)
         driver, _ = _stub_driver(tmp_path, "xtensa-esp32-elf-gcc")
         cc = _cc(tmp_path, str(driver))
-        first = compute_config_hash(list(parse(cc)), tmp_path / "proj", "pid")
+        first = compute_config_hash(list(parse(cc)), tmp_path / "proj", "pid", transient_defines=DEFAULT_TRANSIENT_DEFINES)
         clear_query_cache()
-        second = compute_config_hash(list(parse(cc)), tmp_path / "proj", "pid")
+        second = compute_config_hash(list(parse(cc)), tmp_path / "proj", "pid", transient_defines=DEFAULT_TRANSIENT_DEFINES)
         # A driver that does not answer gives the flags of the build alone.
         silent, _ = _stub_driver(tmp_path / "silent", "xtensa-esp32-elf-gcc", exit_code=1)
-        without = compute_config_hash(list(parse(_cc(tmp_path, str(silent)))), tmp_path / "proj", "pid")
+        without = compute_config_hash(list(parse(_cc(tmp_path, str(silent)))), tmp_path / "proj", "pid", transient_defines=DEFAULT_TRANSIENT_DEFINES)
         assert first == second
         assert first != without, "the driver flags are a different build identity"
 

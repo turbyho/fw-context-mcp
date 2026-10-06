@@ -60,7 +60,7 @@ import sqlite3
 import time
 import tomllib
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from pathlib import Path
@@ -729,6 +729,7 @@ def _step_update_manifest(conn: sqlite3.Connection, ctx: dict) -> None:
          config_hash=config_hash,
          scope=ctx.get("scope"),
          reparsed_tus=ctx.get("reparsed_tus"),
+         transient_defines=ctx["transient_defines"],
      )
     # Keep whichever manifest is now authoritative so the coverage purge does
     # not have to re-read it.  A no-op run returns None and leaves the
@@ -1791,6 +1792,7 @@ def _run_postprocess(
     defer_cleanup: bool = False,
     header_hash_cache: dict[str, str] | None = None,
     reparsed_tus: set[str] | None = None,
+    transient_defines: Collection[str],
 ) -> None:
     """Run all post-processing phases via a data-driven pipeline.
 
@@ -1818,6 +1820,7 @@ def _run_postprocess(
         "compile_commands": compile_commands,
         "updated": updated,
         "build_dir_patterns": build_dir_patterns,
+        "transient_defines": transient_defines,
         "vendor_patterns": vendor_patterns,
         "project_patterns_list": project_patterns_list,
         "project_id": project_id,

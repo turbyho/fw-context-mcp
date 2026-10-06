@@ -22,6 +22,7 @@ that trigger unnecessary background reindexes.
 from __future__ import annotations
 
 import logging
+from collections.abc import Collection
 from pathlib import Path
 
 from ..utils import compute_source_hash
@@ -186,6 +187,7 @@ def _update_manifest_after_index(
     config_hash: str = "",
     scope: list[str] | None = None,
     reparsed_tus: set[str] | None = None,
+    transient_defines: Collection[str],
 ) -> dict | None:
     """Update ``manifest.json`` after an indexing run.
 
@@ -216,6 +218,9 @@ def _update_manifest_after_index(
     ``-fmacro-prefix-map`` in the compiler flags, and only the indexer has
     those.  A consumer that derives its own set answers with a different one,
     and the staleness check then re-hashes headers the indexer trusted.
+
+    *transient_defines* is ``[index] transient_defines``: the flags hash of
+    each new entry and the fallback config_hash use it, as the runner does.
 
     Returns the updated manifest dict, or ``None`` when no update needed.
     """
@@ -343,7 +348,10 @@ def _update_manifest_after_index(
                     "arg_set": _intern_arguments(unit.clang_args, arg_sets),
                     "source_hash": source_hash,
                     "headers": fold_headers(tu_headers[tu_rel], header_table),
-                    "flags_hash": compute_flags_hash(unit.raw_entry) if unit.raw_entry else "",
+                    "flags_hash": (
+                        compute_flags_hash(unit.raw_entry, transient_defines=transient_defines)
+                        if unit.raw_entry else ""
+                    ),
                 }
                 updated += 1
             elif tu_rel in old_entries:
@@ -360,7 +368,10 @@ def _update_manifest_after_index(
                     "arg_set": _intern_arguments(unit.clang_args, arg_sets),
                     "source_hash": source_hash,
                     "headers": headers,
-                    "flags_hash": compute_flags_hash(unit.raw_entry) if unit.raw_entry else "",
+                    "flags_hash": (
+                        compute_flags_hash(unit.raw_entry, transient_defines=transient_defines)
+                        if unit.raw_entry else ""
+                    ),
                 }
                 updated += 1
 
@@ -384,7 +395,7 @@ def _update_manifest_after_index(
         gen_hash = generate_manifest(
             compile_commands, db_dir, project_root, units,
             build_dir_patterns=build_dir_patterns, scope=scope,
-            vendor_patterns=vendor_patterns,
+            vendor_patterns=vendor_patterns, transient_defines=transient_defines,
         )
         return reload_manifest(db_dir, gen_hash)
     else:
@@ -416,7 +427,10 @@ def _update_manifest_after_index(
                     "arg_set": _intern_arguments(unit.clang_args, arg_sets),
                     "source_hash": source_hash,
                     "headers": headers,
-                    "flags_hash": compute_flags_hash(unit.raw_entry) if unit.raw_entry else "",
+                    "flags_hash": (
+                        compute_flags_hash(unit.raw_entry, transient_defines=transient_defines)
+                        if unit.raw_entry else ""
+                    ),
                 }
                 updated += 1
 
@@ -467,7 +481,10 @@ def _update_manifest_after_index(
 
         from .manifest import compute_config_hash as _compute_cc_hash
 
-        config_hash = _compute_cc_hash(units, project_root, _derive_id(project_root), build_dir_patterns, scope=scope, db_dir=db_dir)
+        config_hash = _compute_cc_hash(
+            units, project_root, _derive_id(project_root), build_dir_patterns, scope=scope,
+            db_dir=db_dir, transient_defines=transient_defines,
+        )
     config_hash = save(manifest_data, db_dir, config_hash)
     log.info(
         "manifest.json saved: %d TUs, %d distinct headers (%d references), config_hash=%s",

@@ -51,6 +51,7 @@ import logging
 import os
 import sqlite3
 import time
+from collections.abc import Collection
 from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 
@@ -84,6 +85,8 @@ def _check_and_parse_unit(
     header_stale_tus: frozenset[str] = frozenset(),
     hash_cache: dict[str, str] | None = None,
     header_table: dict[str, dict] | None = None,
+    *,
+    transient_defines: Collection[str],
 ):
     """Check whether *unit* needs re-parsing and parse it if so.
 
@@ -165,7 +168,7 @@ def _check_and_parse_unit(
         source_hash = ""
 
     if unit.raw_entry is not None:
-        flags_hash = compute_flags_hash(unit.raw_entry)
+        flags_hash = compute_flags_hash(unit.raw_entry, transient_defines=transient_defines)
     else:
         flags_hash = ""
 
