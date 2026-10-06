@@ -229,7 +229,7 @@ class TestESPIDFValidation:
 
         assert ESPIDFBuildSystem().validate_artifacts(cc, root) == [], (
             "an isolated build produced artifacts; reporting them missing "
-            "aborts the index run and arms the autobuild backoff"
+            "aborts the index run with a false error"
         )
 
     def test_a_project_that_was_never_built_still_fails(self, tmp_path: Path):

@@ -263,6 +263,9 @@ class TestCmdIndexWiring:
         monkeypatch.setattr(config_mod, "derive_project_id", lambda root: "pid")
         monkeypatch.setattr(build_mod, "detect_build_system", lambda root: "makefile")
         monkeypatch.setattr(index_mod, "_build_run_kwargs", lambda *a, **kw: {})
+        # The checks for a missing build are steps of their own (test_build_missing.py).
+        monkeypatch.setattr(index_mod, "_build_if_missing", lambda *a, **kw: None)
+        monkeypatch.setattr(index_mod, "_refuse_without_build", lambda *a, **kw: "")
         monkeypatch.setattr(
             index_mod, "_resolve_compile_commands", lambda *a, **kw: (cc_path, True)
         )

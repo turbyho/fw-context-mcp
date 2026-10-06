@@ -485,10 +485,13 @@ class TestModifiedCountInFastMode:
         assert result["status"] == "reindex_needed"
         assert "fw-context index --build" in result["index_message"]
 
-    def test_a_failed_automatic_build_says_to_read_the_error(
-        self, tmp_path: Path, monkeypatch
-    ):
-        from fw_context_mcp.indexer.autobuild import AutobuildState
+    def test_a_failed_index_run_comes_first(self, tmp_path: Path, monkeypatch):
+        """The text of the failed run outranks the "builds on its own" advice.
+
+        Without it the message said that fw-context builds the new file on
+        its own, while the last build had failed.
+        """
+        from fw_context_mcp.indexer.autobuild import AutobuildState, record_problem
         from fw_context_mcp.mcp.handlers import maintenance
 
         root, _ = self._project_with_one_indexed_file(tmp_path)
@@ -496,13 +499,16 @@ class TestModifiedCountInFastMode:
             maintenance, "find_unindexed_sources", lambda *a, **k: ["src/added.c"]
         )
         monkeypatch.setattr(
-            maintenance, "_autobuild_state", lambda *a, **k: AutobuildState.BACKOFF
+            maintenance, "_autobuild_state", lambda *a, **k: AutobuildState.WILL_BUILD
         )
+        db_dir = _load_cfg(root).index.db_dir / _load_cfg(root).project.id
+        record_problem(db_dir, "The last index run failed (exit code 1).")
 
         result = get_active_build(project_root=str(root))
 
         assert result["status"] == "reindex_needed"
-        assert "failed recently" in result["index_message"]
+        assert result["index_message"].startswith("The last index run failed (exit code 1).")
+        assert "The last index run failed (exit code 1)." in result["reindex_reasons"]
 
     def test_changed_file_is_counted_in_fast_mode(self, tmp_path: Path):
         import os

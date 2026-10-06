@@ -52,6 +52,11 @@ class BuildSystem(Protocol):
     config_key: str
     """Key used in ``[build] system = "..."`` config and registry lookups."""
 
+    # An optional class attribute ``can_build: bool`` (default True) says if
+    # fw-context can run the build.  A stub that only detects a project sets
+    # it False; ``build.can_run_build`` reads it.  WHY not a protocol member:
+    # each backend would then have to declare it, and only the stubs differ.
+
     # ── Classmethods (called without an instance) ──
 
     @classmethod

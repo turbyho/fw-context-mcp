@@ -44,6 +44,8 @@ class STM32CubeIDEStub:
     name: str = "STM32CubeIDE"
     config_key: str = "stm32cubeide"
     markers: list[str] = [".cproject", ".project"]
+    #: fw-context cannot run this build; see ``build.can_run_build``.
+    can_build: bool = False
 
     @classmethod
     def detect(cls, project_root: Path) -> bool:
@@ -136,6 +138,8 @@ class TICCSStub:
     name: str = "TI Code Composer Studio"
     config_key: str = "ti-ccs"
     markers: list[str] = [".projectspec"]
+    #: fw-context cannot run this build; see ``build.can_run_build``.
+    can_build: bool = False
 
     @classmethod
     def detect(cls, project_root: Path) -> bool:

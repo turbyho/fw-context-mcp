@@ -104,7 +104,12 @@ _PAUSE_WAIT_S = 120.0  # How long to wait for a manual operation to release
 # Extension-less headers stay out: the compiler has no rule for them, so
 # they belong to the derived set of the project rather than here.
 _SOURCE_EXTS_WATCH: frozenset[str] = TU_EXTENSIONS | HEADER_EXTENSIONS
-_EXCLUDE_RX = re.compile(r"(/\.git/|/\.pio/|/build/|/__pycache__/|/node_modules/)")
+# `.fw-context/` holds the output of the automatic build (generated
+# headers).  A file that fw-context writes itself must never start an index
+# run: a build that fails would then start the next build without end.  The
+# manifest patterns hold `.fw-context/` too, but an index older than v0.29.0
+# has no such pattern, and a daemon without a manifest has none at all.
+_EXCLUDE_RX = re.compile(r"(/\.git/|/\.pio/|/build/|/\.fw-context/|/__pycache__/|/node_modules/)")
 
 
 # ── Public helpers ───────────────────────────────────────────────────────────

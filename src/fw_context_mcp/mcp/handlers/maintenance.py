@@ -36,8 +36,11 @@ from pydantic import Field
 from ...config import derive_project_id
 from ...config import load as load_config
 from ...config.settings import Config
-from ...indexer.autobuild import AutobuildState
+from ...indexer.autobuild import AutobuildState, build_missing_reason
+from ...indexer.autobuild import clear_problem as clear_build_problem
+from ...indexer.autobuild import read_problem as read_build_problem
 from ...indexer.autobuild import state as autobuild_state
+from ...indexer.build import checked_compile_commands
 from ...indexer.compile_commands import command_line_defines
 from ...indexer.compile_commands import parse as parse_cc
 from ...indexer.db import (
@@ -84,9 +87,10 @@ from ..shared.stale import (
 log = logging.getLogger(__name__)
 
 
-# What to tell the caller for each outcome of the automatic build.  Three
-# different sentences, because the required action differs: none, run the
-# build, or look at why the build failed.
+# What to tell the caller for each outcome of the automatic build.  Two
+# different sentences, because the required action differs: none, or run the
+# build.  A build that failed is not an outcome here: the failed run writes
+# its own text (``autobuild.read_problem``), which comes first.
 _AUTOBUILD_ADVICE: dict[AutobuildState, str] = {
     AutobuildState.WILL_BUILD: (
         "fw-context builds them on its own; no command is needed"
@@ -95,16 +99,10 @@ _AUTOBUILD_ADVICE: dict[AutobuildState, str] = {
         "this build system cannot build in the background without touching "
         "the output of your own build — run `fw-context index --build`"
     ),
-    AutobuildState.BACKOFF: (
-        "an automatic build for these files failed recently — run "
-        "`fw-context index --build` and read the error"
-    ),
 }
 
 
-def _autobuild_state(
-    root: Path, proj_cfg, db_path: Path, new_sources: list[str]
-) -> AutobuildState:
+def _autobuild_state(root: Path, proj_cfg, new_sources: list[str]) -> AutobuildState:
     """Say what will happen to *new_sources*, for the message and the status.
 
     Answers UNSUPPORTED when the build system cannot be determined: without
@@ -122,7 +120,28 @@ def _autobuild_state(
     system = proj_cfg.build.system or _detect_build_system(root)
     builder_cls = registry.get(system) if system else None
     candidate = replace(proj_cfg.build, isolated_build_dir=autobuild_dir())
-    return autobuild_state(builder_cls, candidate, db_path.parent, new_sources)
+    return autobuild_state(builder_cls, candidate)
+
+
+def _build_missing_advice(reason: str, root: Path, proj_cfg) -> str:
+    """Give *reason* with the command that brings the build back.
+
+    The same two cases as the refusal of ``fw-context index``: a build that
+    fw-context can run, and a build that only the IDE can run (a stub, see
+    ``build.can_run_build``).  ``--build`` and not a plain reindex: a plain
+    run builds the missing build too (``_build_if_missing`` in the CLI), but
+    ``--build`` says what happens, and it is the same command that the
+    refusal of a run names.
+    """
+    from ...indexer.build import can_run_build
+
+    system = proj_cfg.build.system or _detect_build_system(root)
+    if can_run_build(proj_cfg.build, system):
+        return f"{reason}. Run `fw-context index --build`."
+    return (
+        f"{reason}, and fw-context cannot run the build of this project. Run the "
+        "build outside of fw-context (for example in the IDE), then run `fw-context index`."
+    )
 
 
 def _expand_dir_placeholder(dir_str: str, root: Path) -> str:
@@ -762,10 +781,41 @@ def get_active_build(
         # What will happen to those files decides both the status and the
         # wording.  fw-context builds them on its own where the backend can
         # isolate its output, and then the caller has nothing to do; where it
-        # cannot, or where a build already failed, the caller must act.
-        auto_state = _autobuild_state(root, proj_cfg, db_path, new_sources)
+        # cannot, the caller must act.
+        auto_state = _autobuild_state(root, proj_cfg, new_sources)
 
-        # Three conditions force a reindex:
+        # ── The build: what the last run found, and what is there now ──
+        # The marker is the text of the last index run that stopped without
+        # an index (``autobuild.record_problem``); each query tool answer
+        # carries it.  The check of the build runs here too, because this
+        # tool is the first call of a session: a build that went away after
+        # the last run has no marker yet.
+        #
+        # The check reads the file that an index run checks
+        # (``checked_compile_commands``), and only when the index came from
+        # it: an index of an explicit file, or of build variants, gets no
+        # check, as `fw-context index` does none, and its advice `--build`
+        # would replace the explicit file.  A missing compile_commands.json
+        # is `cc_changed` below, thus the check reads only a file that exists.
+        checked_cc = checked_compile_commands(
+            root, proj_cfg, Path(cfg["compile_commands_path"])
+        )
+        build_checked = checked_cc is not None and checked_cc.exists()
+        build_missing = build_missing_reason(checked_cc) if build_checked else ""
+        problem = read_build_problem(db_path.parent)
+        if problem is not None and problem.build_missing:
+            if build_missing:
+                # The marker says the same, with the command of the run.
+                build_missing = ""
+            elif build_checked:
+                # The check ran and found the build (built outside of
+                # fw-context): the text is out of date for every answer,
+                # not only here.  Without a check the marker stays.
+                clear_build_problem(db_path.parent)
+                problem = None
+        build_problem = problem.text if problem is not None else ""
+
+        # Four conditions force a reindex:
         #   1. Schema version in DB is older than current code expects.
         #   2. compile_commands.json was modified since indexing
         #      (detected via mtime comparison in _is_stale).
@@ -773,6 +823,7 @@ def get_active_build(
         #      fw-context will not build it on its own.  When it will, the
         #      state is "reindexing" below — work is under way, and telling
         #      the caller to run a command would only duplicate it.
+        #   4. The build is not there, or the last index run failed.
         # Modified source files are handled per-query via auto-reindex
         # and do NOT cause reindex_needed=True.
         blocked_sources = bool(new_sources) and auto_state is not AutobuildState.WILL_BUILD
@@ -788,8 +839,9 @@ def get_active_build(
             cfg["description"] if "description" in cfg.keys() else "", root
         )
         branch_moved = bool(indexed_branch)
-        needs_reindex = (
+        needs_reindex = bool(
             cc_changed or schema_old or row_format_old or blocked_sources or branch_moved
+            or build_problem or build_missing
         )
 
         # Asked once, because the call reaches the build backend and is not
@@ -798,6 +850,10 @@ def get_active_build(
 
         # Build reindex_reasons — only when reindex is actually needed
         reindex_reasons: list[str] = []
+        if build_problem:
+            reindex_reasons.append(build_problem)
+        if build_missing:
+            reindex_reasons.append(_build_missing_advice(build_missing, root, proj_cfg))
         if branch_moved:
             # Always names `--build`, never a plain reindex: that would reuse
             # compile_commands.json, which belongs to the branch the index
@@ -860,9 +916,15 @@ def get_active_build(
         if new_sources:
             listed = ", ".join(new_sources[:3])
             more = f" and {len(new_sources) - 3} more" if len(new_sources) > 3 else ""
+            # "No command is needed" is false while the last run failed: the
+            # build that adds them is the one that must be repaired first.
+            advice = (
+                "repair the build first, see the first reason"
+                if build_problem or build_missing else _AUTOBUILD_ADVICE[auto_state]
+            )
             reindex_reasons.append(
                 f"{len(new_sources)} source file(s) not in compile_commands.json "
-                f"({listed}{more}) — {_AUTOBUILD_ADVICE[auto_state]}"
+                f"({listed}{more}) — {advice}"
             )
 
         # Determine status — single value that drives LLM decision-making.
@@ -908,6 +970,13 @@ def get_active_build(
                 index_message = (
                     "Index is usable — background reindex in progress. All queries return accurate results."
                 )
+        elif build_problem or build_missing:
+            # First among the reasons: without the build each unit gets no
+            # answer of its compiler, and no other repair helps before it.
+            index_message = (
+                (build_problem or _build_missing_advice(build_missing, root, proj_cfg))
+                + " Queries still work on the data of the last finished index run."
+            )
         elif new_sources:
             # Checked before the other reindex reasons: `--build` is the only
             # command that repairs this one, and a message that says plain
@@ -1439,12 +1508,12 @@ def reset_index(
         for suffix in ("-wal", "-shm", "-journal"):
             p = db_path.with_name(db_path.name + suffix)
             p.unlink(missing_ok=True)
-        # Both autobuild markers describe the index that just went away: a
-        # build that failed for a file list, and the files a build ran for
-        # and did not cover.  Left behind they would suppress or delay work
-        # on a fresh index that knows nothing about either.
-        from ...indexer.autobuild import clear_excluded, clear_failure
-        clear_failure(db_path.parent)
+        # Both autobuild markers describe the index that just went away: why
+        # its last run stopped, and the files a build ran for and did not
+        # cover.  Left behind they would warn about, or hide, work on a
+        # fresh index that knows nothing about either.
+        from ...indexer.autobuild import clear_excluded, clear_problem
+        clear_problem(db_path.parent)
         clear_excluded(db_path.parent)
         from ...mcp.shared.stale import _invalidate_modified_cache
         _invalidate_modified_cache()  # clear all entries — DB is gone

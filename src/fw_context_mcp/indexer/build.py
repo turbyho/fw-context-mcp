@@ -649,6 +649,48 @@ def _generate_into(root: Path, cfg: BuildConfig) -> Path:
     return builder.build(root, cfg)
 
 
+def can_run_build(cfg: BuildConfig, system: str | None) -> bool:
+    """Say if :func:`generate_compile_commands` can make compile_commands.json for *system*.
+
+    A ``[build] command`` runs in all cases.  Otherwise the builder of
+    *system* decides: a builder that only detects a project (a stub, such
+    as STM32CubeIDE) sets ``can_build = False``, because its ``build()``
+    only raises with instructions.  Such a build must run outside of
+    fw-context, and the caller tells the user or the LLM so.
+    """
+    if cfg.command:
+        return True
+    builder_cls = _builder_registry.get(system) if system else None
+    if builder_cls is None:
+        return False
+    return bool(getattr(builder_cls, "can_build", True))
+
+
+def checked_compile_commands(project_root: Path, cfg, indexed: Path | None) -> Path | None:
+    """Give the compile_commands.json whose build an index run checks, or None.
+
+    It is the file that a run without an explicit file reads
+    (:func:`resolve_reuse_compile_commands`), and only when the index came
+    from it.  *indexed* is the file of the active index, or None when there
+    is no index yet.  WHY the second condition: an index of another file (an
+    explicit file of the user, or a file that an earlier config named) is
+    not the build of this file.  A check of it would replace an explicit
+    file with a build, or start a build that never repairs what it checks.
+
+    None for a project with ``[[build.variants]]``: each variant has a file
+    of its own, and this check does not cover them.
+
+    The CLI and ``get_active_build`` both ask here, thus the two cannot
+    disagree about which build is missing.
+    """
+    if cfg.build.variants:
+        return None
+    cc = resolve_reuse_compile_commands(project_root, cfg.index.compile_commands)
+    if indexed is not None and cc.resolve() != indexed.resolve():
+        return None
+    return cc
+
+
 def resolve_reuse_compile_commands(project_root: Path, configured: Path) -> Path:
     """Return the compile_commands.json to reuse when not rebuilding.
 

@@ -4,12 +4,15 @@ A source file that the build system never saw has no translation unit: it is
 absent from compile_commands.json, and only a build writes it there.  A plain
 reindex skips it and reports success, thus fw-context runs the build itself.
 
-Three things guard that build:
+Two things guard that build:
 
 * The backend must be able to build without touching the output of the build
   that the user runs — see ``builders.background_build_safe``.
 * ``--background`` keeps refusing ``--build``, except for this one case.
-* A failure must not repeat on every daemon cycle.
+
+A failure does not block the next build for a time.  The failed run writes
+its text for each MCP answer (``autobuild.record_problem``), and the user
+repairs the build when the answers say so.
 """
 
 from __future__ import annotations
@@ -17,9 +20,13 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from fw_context_mcp.indexer.autobuild import blocked as _autobuild_blocked
-from fw_context_mcp.indexer.autobuild import clear_failure as _clear_autobuild_failure
-from fw_context_mcp.indexer.autobuild import record_failure as _record_autobuild_failure
+from fw_context_mcp.indexer.autobuild import (
+    PROBLEM_MARKER,
+    BuildProblem,
+    clear_problem,
+    read_problem,
+    record_problem,
+)
 from fw_context_mcp.utils import AUTOBUILD_REL, autobuild_dir
 
 
@@ -40,49 +47,49 @@ class TestAutobuildDir:
         assert autobuild_dir("x").startswith(".fw-context/")
 
 
-class TestFailureBackoff:
-    """A failed build leaves compile_commands.json untouched.
+class TestProblemMarker:
+    """The text of the last index run that stopped, for each MCP answer."""
 
-    The trigger therefore stays armed, and without a marker the next daemon
-    cycle would run the same failing build again.
-    """
+    def test_no_marker_reads_as_no_problem(self, tmp_path: Path):
+        assert read_problem(tmp_path) is None
 
-    def test_nothing_is_blocked_without_a_marker(self, tmp_path: Path):
-        assert _autobuild_blocked(tmp_path, ["src/a.c"]) is False
+    def test_a_round_trip_keeps_the_text_and_the_kind(self, tmp_path: Path):
+        record_problem(tmp_path, "the build directory /x does not exist.\n", build_missing=True)
 
-    def test_the_same_file_list_is_blocked(self, tmp_path: Path):
-        _record_autobuild_failure(tmp_path, ["src/a.c", "src/b.c"])
+        assert read_problem(tmp_path) == BuildProblem(
+            text="the build directory /x does not exist.", build_missing=True
+        )
 
-        assert _autobuild_blocked(tmp_path, ["src/a.c", "src/b.c"]) is True
+    def test_a_failed_run_is_not_a_missing_build(self, tmp_path: Path):
+        """Only a missing build can go out of date when the build comes back."""
+        record_problem(tmp_path, "The last index run failed (exit code 1).")
 
-    def test_a_different_file_list_is_allowed(self, tmp_path: Path):
-        """The tree moved on, thus the next attempt is worth one more try."""
-        _record_autobuild_failure(tmp_path, ["src/a.c"])
+        problem = read_problem(tmp_path)
+        assert problem is not None and problem.build_missing is False
 
-        assert _autobuild_blocked(tmp_path, ["src/a.c", "src/c.c"]) is False
+    def test_a_missing_directory_is_made(self, tmp_path: Path):
+        """The first run of a project can stop before the index directory exists."""
+        record_problem(tmp_path / "index" / "pid", "text")
 
-    def test_the_block_expires(self, tmp_path: Path):
-        _record_autobuild_failure(tmp_path, ["src/a.c"])
-        marker = tmp_path / "autobuild.failed"
-        old = time.time() - 3600  # older than the backoff window
-        marker.write_text(f"{old}\nsrc/a.c", encoding="utf-8")
+        problem = read_problem(tmp_path / "index" / "pid")
+        assert problem is not None and problem.text == "text"
 
-        assert _autobuild_blocked(tmp_path, ["src/a.c"]) is False
+    def test_a_run_that_ends_well_clears_it(self, tmp_path: Path):
+        record_problem(tmp_path, "text")
+        clear_problem(tmp_path)
 
-    def test_a_success_clears_the_block(self, tmp_path: Path):
-        _record_autobuild_failure(tmp_path, ["src/a.c"])
-        _clear_autobuild_failure(tmp_path)
-
-        assert _autobuild_blocked(tmp_path, ["src/a.c"]) is False
+        assert not (tmp_path / PROBLEM_MARKER).exists()
 
     def test_clearing_a_missing_marker_is_quiet(self, tmp_path: Path):
-        _clear_autobuild_failure(tmp_path)  # must not raise
+        clear_problem(tmp_path)  # must not raise
 
-    def test_a_damaged_marker_does_not_block(self, tmp_path: Path):
-        """An unreadable marker must not disable the build for ever."""
-        (tmp_path / "autobuild.failed").write_text("not-a-timestamp\n", encoding="utf-8")
+    def test_a_damaged_marker_reads_as_no_problem(self, tmp_path: Path):
+        """A warning must never fail the answer that carries it."""
+        (tmp_path / PROBLEM_MARKER).write_bytes(b"\xff\xfe\x00broken")
+        assert read_problem(tmp_path) is None
 
-        assert _autobuild_blocked(tmp_path, ["src/a.c"]) is False
+        (tmp_path / PROBLEM_MARKER).write_text('{"text": 3}', encoding="utf-8")
+        assert read_problem(tmp_path) is None
 
 
 class TestBackgroundBuildGate:
@@ -140,7 +147,7 @@ def _resolve_compile_commands_with(args, root, cfg, system, bg):
 
 
 class TestAutobuildState:
-    """The three answers that decide both the status and the wording."""
+    """The two answers that decide both the status and the wording."""
 
     @staticmethod
     def _cfg(isolated: str | None = ".fw-context/autobuild/default"):
@@ -148,17 +155,13 @@ class TestAutobuildState:
 
         return BuildConfig(isolated_build_dir=isolated)
 
-    def test_a_backend_that_isolates_will_build(self, tmp_path: Path):
+    def test_a_backend_that_isolates_will_build(self):
         from fw_context_mcp.indexer.autobuild import AutobuildState, state
         from fw_context_mcp.indexer.builders.mbed_os import MbedOSBuildSystem
 
-        assert state(
-            MbedOSBuildSystem, self._cfg(), tmp_path, ["src/a.c"]
-        ) is AutobuildState.WILL_BUILD
+        assert state(MbedOSBuildSystem, self._cfg()) is AutobuildState.WILL_BUILD
 
-    def test_a_backend_that_compiles_without_isolation_is_unsupported(
-        self, tmp_path: Path
-    ):
+    def test_a_backend_that_compiles_without_isolation_is_unsupported(self):
         """makefile compiles for real once the dry run is off."""
         from fw_context_mcp.indexer.autobuild import AutobuildState, state
         from fw_context_mcp.indexer.build import BuildConfig
@@ -166,45 +169,13 @@ class TestAutobuildState:
 
         cfg = BuildConfig(make_dry_run=False)
 
-        assert state(
-            MakefileBuildSystem, cfg, tmp_path, ["src/a.c"]
-        ) is AutobuildState.UNSUPPORTED
+        assert state(MakefileBuildSystem, cfg) is AutobuildState.UNSUPPORTED
 
-    def test_no_backend_is_unsupported(self, tmp_path: Path):
+    def test_no_backend_is_unsupported(self):
         """Without a build system nothing can build on its own."""
         from fw_context_mcp.indexer.autobuild import AutobuildState, state
 
-        assert state(
-            None, self._cfg(), tmp_path, ["src/a.c"]
-        ) is AutobuildState.UNSUPPORTED
-
-    def test_a_fresh_failure_for_the_same_files_is_backoff(self, tmp_path: Path):
-        from fw_context_mcp.indexer.autobuild import (
-            AutobuildState,
-            record_failure,
-            state,
-        )
-        from fw_context_mcp.indexer.builders.mbed_os import MbedOSBuildSystem
-
-        record_failure(tmp_path, ["src/a.c"])
-
-        assert state(
-            MbedOSBuildSystem, self._cfg(), tmp_path, ["src/a.c"]
-        ) is AutobuildState.BACKOFF
-
-    def test_a_failure_for_other_files_does_not_block(self, tmp_path: Path):
-        from fw_context_mcp.indexer.autobuild import (
-            AutobuildState,
-            record_failure,
-            state,
-        )
-        from fw_context_mcp.indexer.builders.mbed_os import MbedOSBuildSystem
-
-        record_failure(tmp_path, ["src/a.c"])
-
-        assert state(
-            MbedOSBuildSystem, self._cfg(), tmp_path, ["src/b.c"]
-        ) is AutobuildState.WILL_BUILD
+        assert state(None, self._cfg()) is AutobuildState.UNSUPPORTED
 
 
 class TestExcludedMarker:
@@ -263,7 +234,7 @@ class TestPlanAutoBuild:
         missing_db = tmp_path / "index" / "index.db"
 
         assert _plan_auto_build(
-            tmp_path, missing_db, self._cfg("makefile"), None
+            tmp_path, missing_db, self._cfg("makefile"), None, background=True
         ) == ([], None, "")
 
     def test_a_backend_that_cannot_isolate_is_refused(self, tmp_path: Path):
@@ -274,7 +245,7 @@ class TestPlanAutoBuild:
         db.write_text("", encoding="utf-8")
 
         assert _plan_auto_build(
-            tmp_path, db, self._cfg("stm32cubeide"), None
+            tmp_path, db, self._cfg("stm32cubeide"), None, background=True
         ) == ([], None, "")
 
     def test_an_unknown_build_system_is_refused(self, tmp_path: Path):
@@ -284,7 +255,7 @@ class TestPlanAutoBuild:
         db.write_text("", encoding="utf-8")
 
         assert _plan_auto_build(
-            tmp_path, db, self._cfg("no-such-system"), None
+            tmp_path, db, self._cfg("no-such-system"), None, background=True
         ) == ([], None, "")
 
     def test_the_backend_is_asked_with_the_isolated_directory(
@@ -312,7 +283,7 @@ class TestPlanAutoBuild:
 
         db = tmp_path / "index.db"
         db.write_text("", encoding="utf-8")
-        _index._plan_auto_build(tmp_path, db, self._cfg("makefile"), None)
+        _index._plan_auto_build(tmp_path, db, self._cfg("makefile"), None, background=True)
 
         assert seen == [".fw-context/autobuild/default"]
 
@@ -324,81 +295,33 @@ class TestPlanAutoBuild:
         db.write_text("", encoding="utf-8")
         cfg = self._cfg("stm32cubeide")
 
-        _plan_auto_build(tmp_path, db, cfg, None)
+        _plan_auto_build(tmp_path, db, cfg, None, background=True)
 
         assert cfg.build.isolated_build_dir is None
 
 
-class TestFailureMarkerFormat:
-    """The marker is JSON because a path may hold a newline.
+class TestTheProblemOfAMultiRun:
+    """The exit of a multi-variant run decides the MCP warning.
 
-    It used to store the stamp and the file list as newline-delimited text.
-    A path containing a newline — a legal file name on Linux — split into
-    two entries, the list comparison never matched, and the backoff never
-    took effect: the same failing build ran on every daemon cycle.
-    """
-
-    def test_a_path_with_a_newline_still_blocks(self, tmp_path: Path):
-        from fw_context_mcp.indexer.autobuild import blocked, record_failure
-
-        sources = ["src/ok.c", "src/we\nird.c"]
-        record_failure(tmp_path, sources)
-
-        assert blocked(tmp_path, sources) is True, (
-            "the newline split the entry in two and the comparison never "
-            "matched, so nothing was ever blocked"
-        )
-
-    def test_a_different_list_is_still_allowed(self, tmp_path: Path):
-        from fw_context_mcp.indexer.autobuild import blocked, record_failure
-
-        record_failure(tmp_path, ["src/we\nird.c"])
-
-        assert blocked(tmp_path, ["src/other.c"]) is False, (
-            "a changed list means the tree moved on and earns another try"
-        )
-
-    def test_a_marker_in_the_old_text_format_does_not_block(self, tmp_path: Path):
-        """Reading as 'not blocked' is the safe direction: one more attempt."""
-        import time
-
-        from fw_context_mcp.indexer.autobuild import FAILED_MARKER, blocked
-
-        (tmp_path / FAILED_MARKER).write_text(
-            f"{time.time()}\nsrc/a.c\nsrc/b.c", encoding="utf-8"
-        )
-
-        assert blocked(tmp_path, ["src/a.c", "src/b.c"]) is False
-
-    def test_a_marker_holding_json_of_the_wrong_shape_does_not_block(self, tmp_path: Path):
-        from fw_context_mcp.indexer.autobuild import FAILED_MARKER, blocked
-
-        (tmp_path / FAILED_MARKER).write_text('{"stamp": "not a number"}',
-                                              encoding="utf-8")
-
-        assert blocked(tmp_path, ["src/a.c"]) is False
-
-
-class TestATakenOverMultiRunIsNoFailedBuild:
-    """``cmd_index`` wrote the backoff marker for every non-zero multi exit.
-
-    A multi-variant run that another run takes over exits EXIT_SUPERSEDED.
-    The daemon retries such a run, but the marker blocked the automatic build
-    for 30 minutes, thus the retry indexed without the build.  The files that
-    only a build can cover then stayed out of the index.
+    A run that another run took over (EXIT_SUPERSEDED), or that a SIGTERM
+    stopped, did not fail: the run that follows decides.  A failed run
+    writes its text, and a run that ends well removes it.
     """
 
     @staticmethod
     def _run(
-        monkeypatch, tmp_path: Path, multi_exit: int, *, sigterm_self: bool = False
-    ) -> list[list[str]]:
+        monkeypatch, tmp_path: Path, multi_exit: int, *, sigterm_self: bool = False,
+        error: Exception | None = None,
+    ) -> list[str]:
         """Run ``cmd_index`` with a multi run that ends in *multi_exit*.
 
         With *sigterm_self* the multi run gets a SIGTERM that no index run
         sent, the way a CI timeout stops it, and *multi_exit* is the exit
-        code that ``cmd_index`` must give.
+        code that ``cmd_index`` must give.  With *error* the multi run
+        raises it, and ``cmd_index`` must raise it again.
 
-        Returns the lists that ``autobuild.record_failure`` got.
+        Returns the texts that ``autobuild.record_problem`` got, and
+        "cleared" for each ``autobuild.clear_problem``.
         """
         from dataclasses import dataclass, field
         from types import SimpleNamespace
@@ -426,7 +349,7 @@ class TestATakenOverMultiRunIsNoFailedBuild:
             cache_server: None = None
 
         cfg = _Cfg(index=_Index(db_dir=tmp_path / "index"))
-        recorded: list[list[str]] = []
+        recorded: list[str] = []
 
         monkeypatch.setattr(utils_mod, "resolve_project_root", lambda arg: tmp_path)
         monkeypatch.setattr(config_mod, "load", lambda project_root=None: cfg)
@@ -445,36 +368,65 @@ class TestATakenOverMultiRunIsNoFailedBuild:
                 os.kill(os.getpid(), signal.SIGTERM)
                 time.sleep(5)  # the handler raises before this ends
                 raise AssertionError("the SIGTERM handler did not stop the run")
+            if error is not None:
+                raise error
             return multi_exit
 
         monkeypatch.setattr(index_mod, "_run_multi", _multi)
         monkeypatch.setattr(
-            index_mod.autobuild, "record_failure",
-            lambda db_dir, sources: recorded.append(list(sources)),
+            index_mod.autobuild, "record_problem",
+            lambda db_dir, text, **kw: recorded.append(text),
         )
+        monkeypatch.setattr(
+            index_mod.autobuild, "clear_problem",
+            lambda db_dir: recorded.append("cleared"),
+        )
+        monkeypatch.setattr(index_mod, "_ensure_watcher_after_index", lambda root: None)
 
         args = SimpleNamespace(
             verbose=False, project=None, background=True, build=False,
             no_clean=False, force=False, takeover=False,
             vendor_paths=None, project_paths=None,
         )
-        assert index_mod.cmd_index(args) == multi_exit
+        if error is None:
+            assert index_mod.cmd_index(args) == multi_exit
+        else:
+            import pytest
+
+            with pytest.raises(type(error)):
+                index_mod.cmd_index(args)
         return recorded
 
-    def test_a_superseded_run_records_no_failure(self, monkeypatch, tmp_path: Path):
+    def test_a_superseded_run_records_no_problem(self, monkeypatch, tmp_path: Path):
         from fw_context_mcp.exit_codes import EXIT_SUPERSEDED
 
         assert self._run(monkeypatch, tmp_path, EXIT_SUPERSEDED) == []
 
-    def test_a_terminated_run_exits_143_and_records_no_failure(
+    def test_a_terminated_run_exits_143_and_records_no_problem(
         self, monkeypatch, tmp_path: Path, capsys
     ):
-        """A foreign SIGTERM is not a takeover and not a failed build."""
+        """A foreign SIGTERM is not a takeover and not a failed run."""
         from fw_context_mcp.exit_codes import EXIT_TERMINATED
 
         assert self._run(monkeypatch, tmp_path, EXIT_TERMINATED, sigterm_self=True) == []
         assert "Terminated:" in capsys.readouterr().err
 
-    def test_a_failed_run_still_records_the_failure(self, monkeypatch, tmp_path: Path):
-        """The marker is still what stops a broken build on each daemon cycle."""
-        assert self._run(monkeypatch, tmp_path, 1) == [["src/new.c"]]
+    def test_a_failed_run_records_where_its_error_is(self, monkeypatch, tmp_path: Path):
+        """A background run has no terminal, thus the text names reindex.log."""
+        recorded = self._run(monkeypatch, tmp_path, 1)
+
+        assert len(recorded) == 1
+        assert "The last index run failed (exit code 1)" in recorded[0]
+        assert str(tmp_path / "index" / "pid" / "reindex.log") in recorded[0]
+
+    def test_a_run_that_ends_well_clears_the_problem(self, monkeypatch, tmp_path: Path):
+        assert self._run(monkeypatch, tmp_path, 0) == ["cleared"]
+
+    def test_an_exception_records_the_problem_and_goes_on(self, monkeypatch, tmp_path: Path):
+        """cli/__init__ makes the exit 1 of it; the MCP answers must say so too."""
+        recorded = self._run(
+            monkeypatch, tmp_path, 1, error=RuntimeError("config_header not found")
+        )
+
+        assert len(recorded) == 1
+        assert "RuntimeError: config_header not found" in recorded[0]

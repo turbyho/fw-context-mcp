@@ -126,3 +126,16 @@ class TestTheWatcherUsesTheSameRules:
         from fw_context_mcp.mcp.daemon import _is_source_file
 
         assert not _is_source_file(f"/proj/src/file{ext}")
+
+    @pytest.mark.parametrize("patterns", [None, [], ["BUILD/"]])
+    def test_the_output_of_the_automatic_build_is_not_watched(self, patterns):
+        """A header that the automatic build writes must not start the next run.
+
+        A failed build would otherwise start the next build without end.  The
+        patterns of a manifest older than v0.29.0 hold no `.fw-context/`.
+        """
+        from fw_context_mcp.mcp.daemon import _is_source_file
+
+        assert not _is_source_file(
+            "/proj/.fw-context/autobuild/default/mbed_config.h", patterns
+        )

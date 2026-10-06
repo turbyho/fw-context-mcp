@@ -86,16 +86,43 @@ detection or to force a specific builder.
 ## Automatic build
 
 A `fw-context index` run without `--build` can start a build on its own.
-It does this only when an index exists and a build can repair something
-that a reindex cannot:
 
+At the start of each run, fw-context makes sure that the build is there.
+The build is not there when `compile_commands.json` does not exist, or when
+a `directory` of its entries does not exist (for example after
+`rm -rf build` or `idf.py fullclean`). WHY: fw-context asks the compiler of
+each unit for its system headers in that directory, as the build runs it.
+Without the build, each unit would get wrong system headers and macros.
+
+- A run that you start builds as `--build` does, in your build directory.
+- A background run builds into an isolated directory (see below).
+- When fw-context cannot run the build, the run stops with an error and
+  does not index. This is true for STM32CubeIDE and TI CCS, and for a
+  background run of a backend that cannot build in isolation. Run the
+  build yourself (in the IDE, or with `fw-context index --build`), then run
+  `fw-context index`.
+
+A run with an explicit `compile_commands.json`, or a project with
+`[[build.variants]]`, does not do this check. `get_active_build` does not
+do it for such an index either.
+
+A run builds into an isolated directory when an index exists and a build
+can repair something that a reindex cannot:
+
+- The build is not there. This applies to a background run.
 - Source files are on disk that `compile_commands.json` does not cover.
 - The tree is on a different git branch than the index.
 
-A build that fw-context starts and that fails stops the automatic build
-for the same files, or the same branch, for 30 minutes. An explicit
-`fw-context index --build` ignores this backoff. For the triggers of the
-background runs, see [`fw-context index`](tools.md#fw-context-index).
+When a run stops without an index (the build is not there, or the run
+failed), fw-context keeps the reason next to the index. Each answer of a
+query tool of the project then carries it, and `get_active_build` gives it
+as a reason. The next run that ends well with the build there removes it.
+When you build outside of fw-context, `get_active_build` finds the build
+and removes a reason that said it is not there. A failed automatic build
+is not paused: the next background run builds again. The daemon starts
+that run when a C/C++ file changes; a change of a build file only (for
+example `CMakeLists.txt`) starts no run. For the triggers of the background runs, see
+[`fw-context index`](tools.md#fw-context-index).
 
 fw-context starts the build only for a backend that cannot damage the
 output of your own build. Such a backend puts its artifacts into a

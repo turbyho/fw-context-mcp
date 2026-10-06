@@ -92,6 +92,14 @@ limits:
 Never conclude that code is live because you saw it in a file. Cite
 fw-context, and check `source_origin` when the answer carries one.
 
+### A missing or failed build
+
+When the last index run stopped because the build is not there or the
+run failed, each query answer says so: a dict gets `build_warning`, a list gets
+a leading `warning` row. The answers then come from the last index run
+that ended well. Give the text to the operator: it names the command that
+repairs it.
+
 ### Code review — use fw-review skill
 
 For C/C++ code review, invoke the `fw-review` skill via the Skill tool.

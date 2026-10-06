@@ -66,9 +66,20 @@ fw-context index --source-roots src lib drivers
 
 **Automatic build:**
 
-Without `--build`, a run can build by itself. It does this when an index
-exists and one of these conditions is true:
+Without `--build`, a run can build by itself.
 
+A run that you start builds as `--build` does when the build is not there:
+`compile_commands.json` does not exist, or a `directory` of its entries does
+not exist. fw-context asks the compiler of each unit in that directory.
+When fw-context cannot run the build (STM32CubeIDE, TI CCS, or a background
+run of a backend that cannot build in isolation), the run stops with an
+error and does not index. A run with an explicit `compile_commands.json`, or
+a project with `[[build.variants]]`, does not do this check.
+
+A run also builds into an isolated directory when an index exists and one
+of these conditions is true:
+
+- The build is not there (a background run).
 - A source file on disk is not in `compile_commands.json`. Such a file has
   no translation unit, thus a reindex skips it.
 - The tree is on a different git branch than the index.
@@ -77,10 +88,18 @@ exists and one of these conditions is true:
 The run builds only when the backend can build in isolation (see
 [Build Configuration](build.md)). The output goes to
 `.fw-context/autobuild/<variant>`, or `.fw-context/autobuild/default` for a
-single build. When an automatic build fails, it is not tried again for the
-same files (or the same branch) for 30 minutes. An explicit `--build`
-ignores this backoff. `--build` and `--background` are mutually exclusive,
-except for this automatic build.
+single build. `--build` and `--background` are mutually exclusive, except
+for this automatic build.
+
+When a run stops without an index (the build is not there, or the run
+failed), fw-context writes the reason to `build_problem.json` next to the
+index. Each answer of a query tool of the project carries it: a list gets
+a leading `warning` row, a dict gets `build_warning`. The maintenance tools
+do not carry it. `get_active_build` gives it as a reason, with the status
+`reindex_needed`. The next run that ends well with the build there removes
+the file. `get_active_build` removes a reason that said the build is not
+there when it finds the build again. A failed automatic build is not
+paused: the next background run builds again.
 
 **When another index run is in progress:**
 
@@ -2517,7 +2536,7 @@ Input:  {"project_root?": "/path/to/project", "confirm": true}      → {"action
 ```
 
 The delete removes the database with its `-wal`, `-shm`, and `-journal`
-files. It also removes the automatic-build markers `autobuild.failed` and
+files. It also removes the automatic-build markers `build_problem.json` and
 `excluded_sources.json` next to the database, because they describe the
 index that is gone.
 

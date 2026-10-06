@@ -92,6 +92,7 @@ from ..utils import AmbiguousProjectError, resolve_project_root
 from .background import _ensure_daemon_running
 from .handlers import callgraph, inheritance, maintenance, search, source, variables
 from .shared.context import _check_server_ready, _integrity_checked
+from .shared.stale import annotate_build_problem
 
 log = logging.getLogger(__name__)
 
@@ -158,6 +159,11 @@ def _wrap_tool(fn):
     the server process.  ``BrokenPipeError`` on the async path is treated
     as a clean exit (client disconnected mid-query) — the server exits 0.
 
+    Each answer of the handler gets the text of the last index run that
+    stopped without an index (``annotate_build_problem``).  It goes here,
+    and not into each handler, because every query tool passes through
+    this wrapper, and a handler that someone adds later gets it too.
+
     **Why two code paths (sync vs async)?**  Sync handlers execute
     blocking SQLite queries and libclang traversal.  Running them on
     the event loop would freeze all other coroutines (ping thread,
@@ -217,7 +223,9 @@ def _wrap_tool(fn):
                         sys.exit(0)
                     log.exception("Tool %s crashed", fn.__name__)
                     return [{"error": f"Internal server error in {fn.__name__}: {exception}"}]
-                return task.result()
+                return await asyncio.to_thread(
+                    annotate_build_problem, task.result(), kw.get("project_root")
+                )
             finally:
                 _SERVER_LOCK.release()
         return _wrapper
@@ -272,7 +280,9 @@ def _wrap_tool(fn):
                     sys.exit(0)
                 log.exception("Tool %s crashed", fn.__name__)
                 return [{"error": f"Internal server error in {fn.__name__}: {exception}"}]
-            return task.result()
+            return await asyncio.to_thread(
+                annotate_build_problem, task.result(), kw.get("project_root")
+            )
         finally:
             _SERVER_LOCK.release()
     return _wrapper
@@ -608,6 +618,11 @@ mcp = FastMCP(
         "• A file can come back with every line blank.  read_file marks it\n"
         "  with all_lines_inactive and a warning.  Such a file holds code,\n"
         "  and the active build compiles none of it — NOT an empty file.\n\n"
+        "A MISSING OR FAILED BUILD.  When the last index run stopped because\n"
+        "the build is not there or the run failed, each query answer says so: a\n"
+        "dict gets `build_warning`, a list gets a leading `warning` row.  The\n"
+        "answers then come from the last index run that ended well.  Give\n"
+        "the text to the operator: it names the command that repairs it.\n\n"
         "TOOL SELECTION (pick the right one):\n"
         '• Symbol by exact/prefix name _____ → lookup_symbol (e.g. "uart_", "main")\n'
         '• Symbols by concept/topic _________ → search_code (e.g. "interrupt handler")\n'

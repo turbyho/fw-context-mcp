@@ -51,6 +51,7 @@ from fw_context_mcp.utils import (
 @dataclass
 class _FakeIndexCfg:
     db_dir: Path
+    compile_commands: Path = Path("compile_commands.json")
     vendor_paths: list = field(default_factory=list)
     project_paths: list = field(default_factory=list)
 

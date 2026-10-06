@@ -13,33 +13,47 @@ boundary that CLAUDE.md draws; ``indexer/`` sits below both.
 
 Two markers live next to the index database:
 
-* ``autobuild.failed`` — a build that fw-context started and that failed.
-  Without it the same build would run on every daemon cycle: a failure
-  leaves compile_commands.json untouched, thus the file stays "newer" than
-  it and the trigger stays armed.
+* ``build_problem.json`` — why the last index run stopped without an index:
+  the build is not there, or the run failed.  Each query tool answer of
+  the project carries this text as a warning, and ``get_active_build``
+  names it as a reason.  A file and not a check per query: the check reads
+  compile_commands.json, and the index run already did it.  The next run
+  that ends well with the build there removes the file.
 * ``excluded_sources.json`` — files that a build ran for and still did not
   cover.  The build system does not want them, thus reporting them again
   only tells the caller to run a command that changes nothing.
+
+A failed automatic build is not blocked for a time.  The daemon starts a
+run only on a change of a C/C++ file, and only one run at a time, thus a
+build that fails again costs one build per edit.  A pause hid the error
+from the user and kept a repaired build off for no reason.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import time
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-FAILED_MARKER = "autobuild.failed"
+PROBLEM_MARKER = "build_problem.json"
 EXCLUDED_MARKER = "excluded_sources.json"
 
-# How long a failure keeps the automatic build off.  Long enough that a
-# broken tree does not burn the CPU, short enough that a repair takes effect
-# within one working session.  An explicit `fw-context index --build`
-# ignores the marker.
-BACKOFF_S = 1800.0
+
+@dataclass(frozen=True)
+class BuildProblem:
+    """The content of the problem marker."""
+
+    text: str
+    """The sentence for the caller; it names the command that repairs it."""
+
+    build_missing: bool
+    """True when the run stopped because the build is not there.  A reader
+    that finds the build there again knows that the text is out of date;
+    the text of a failed run stays true until a run ends well."""
 
 
 class AutobuildState(Enum):
@@ -51,62 +65,47 @@ class AutobuildState(Enum):
     UNSUPPORTED = "unsupported"
     """The backend cannot build in the background; the caller must act."""
 
-    BACKOFF = "backoff"
-    """A build was tried for these files and failed; the caller must act."""
 
+def record_problem(db_dir: Path, text: str, *, build_missing: bool = False) -> None:
+    """Remember why the last index run stopped, for each MCP answer.
 
-def blocked(db_dir: Path, new_sources: list[str]) -> bool:
-    """Tell whether a previous automatic build failed for the same files.
-
-    The marker holds the file list of the attempt.  A different list means
-    that the tree moved on, thus the next attempt is worth one more try; the
-    same list within the backoff window means that nothing changed and the
-    build would fail again.
-
-    JSON, not newline-delimited text.  A path may hold a newline — it is a
-    legal file name on Linux — and the split then produced two entries, the
-    comparison never matched, and the backoff this marker exists for never
-    took effect: the same failing build ran on every daemon cycle.  The
-    excluded-sources marker beside it is JSON for the same reason.
-
-    A marker in the old text format fails to parse and reads as "not
-    blocked", which is the safe direction: one more build attempt, not a
-    permanent block.
+    A marker that cannot be written costs the warning, never the run, thus
+    the error goes to the debug log only.
     """
     try:
-        data = json.loads((db_dir / FAILED_MARKER).read_text(encoding="utf-8"))
-        age = time.time() - float(data["stamp"])
-        recorded = data["sources"]
-    except (OSError, ValueError, KeyError, TypeError):
-        # ValueError covers json.JSONDecodeError, which subclasses it.
-        return False
-    if age > BACKOFF_S:
-        return False
-    return recorded == new_sources
-
-
-def record_failure(db_dir: Path, new_sources: list[str]) -> None:
-    """Remember a failed automatic build, so the next run does not repeat it."""
-    try:
         db_dir.mkdir(parents=True, exist_ok=True)
-        (db_dir / FAILED_MARKER).write_text(
-            json.dumps({"stamp": time.time(), "sources": list(new_sources)}, indent=2),
+        (db_dir / PROBLEM_MARKER).write_text(
+            json.dumps({"text": text, "build_missing": build_missing}, indent=2),
             encoding="utf-8",
         )
     except OSError:
-        log.debug("could not write the autobuild failure marker", exc_info=True)
+        log.debug("could not write the build problem marker", exc_info=True)
 
 
-def clear_failure(db_dir: Path) -> None:
-    """Drop the marker after a build that worked."""
+def clear_problem(db_dir: Path) -> None:
+    """Drop the marker after an index run that ended well."""
     try:
-        (db_dir / FAILED_MARKER).unlink(missing_ok=True)
+        (db_dir / PROBLEM_MARKER).unlink(missing_ok=True)
     except OSError:
-        log.debug("could not remove the autobuild failure marker", exc_info=True)
+        log.debug("could not remove the build problem marker", exc_info=True)
 
 
-def state(builder_cls, build_cfg, db_dir: Path, new_sources: list[str]) -> AutobuildState:
-    """Say what will happen to *new_sources* on this project.
+def read_problem(db_dir: Path) -> BuildProblem | None:
+    """Give the content of the marker, or None when there is none."""
+    try:
+        data = json.loads((db_dir / PROBLEM_MARKER).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        # ValueError covers UnicodeDecodeError and json.JSONDecodeError.  A
+        # damaged marker reads as no marker; the next index run writes or
+        # removes it again.
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("text"), str) or not data["text"].strip():
+        return None
+    return BuildProblem(text=data["text"].strip(), build_missing=data.get("build_missing") is True)
+
+
+def state(builder_cls, build_cfg) -> AutobuildState:
+    """Say what will happen to a source file that compile_commands.json misses.
 
     *builder_cls* is the class from the registry, or None when no build
     system was detected.  The question goes to the backend with the config
@@ -117,8 +116,6 @@ def state(builder_cls, build_cfg, db_dir: Path, new_sources: list[str]) -> Autob
 
     if builder_cls is None or not background_build_safe(builder_cls(), build_cfg):
         return AutobuildState.UNSUPPORTED
-    if blocked(db_dir, new_sources):
-        return AutobuildState.BACKOFF
     return AutobuildState.WILL_BUILD
 
 
@@ -166,3 +163,37 @@ def clear_excluded(db_dir: Path) -> None:
         (db_dir / EXCLUDED_MARKER).unlink(missing_ok=True)
     except OSError:
         log.debug("could not remove the excluded-sources marker", exc_info=True)
+
+
+def build_missing_reason(compile_commands: Path) -> str:
+    """Say why the build of *compile_commands* is not there, or give "".
+
+    The build is not there when compile_commands.json does not exist, or
+    when a ``directory`` of its entries does not exist (``rm -rf build``,
+    ``idf.py fullclean``, while a builder kept a copy of the file in
+    ``.fw-context/``).  WHY it matters: the parse asks the compiler of each
+    unit in that directory, as the build runs it (``_driver_query``), and the
+    build makes its generated headers there.  Without the directory, each
+    unit gets no answer of its compiler.
+
+    A file that does not parse gives "": the run that reads it reports the
+    real error.  A ``directory`` is read as compile_commands.json gives it,
+    as ``compile_commands.parse`` reads it.
+    """
+    if not compile_commands.exists():
+        return f"compile_commands.json {compile_commands} does not exist"
+    try:
+        entries = json.loads(compile_commands.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(entries, list):
+        return ""
+    directories = {
+        str(entry["directory"]) for entry in entries
+        if isinstance(entry, dict) and entry.get("directory")
+    }
+    missing = sorted(d for d in directories if not Path(d).is_dir())
+    if not missing:
+        return ""
+    more = f" and {len(missing) - 1} more" if len(missing) > 1 else ""
+    return f"the build directory {missing[0]}{more} of {compile_commands} does not exist"

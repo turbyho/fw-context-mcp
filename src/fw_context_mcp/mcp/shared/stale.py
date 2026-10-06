@@ -1069,6 +1069,42 @@ def annotate_stale(
     return result
 
 
+def annotate_build_problem(result, project_root: str | None):
+    """Add the text of the last index run that stopped without an index.
+
+    The index run writes the text when the build is not there or the run
+    fails (``autobuild.record_problem``), and removes it when a run ends
+    well.  Each query tool answer carries it, because the caller must not
+    read the answers of an old index as current, and a background run has
+    no other way to reach the caller.  The cost per answer is the project
+    lookup that the handler did too (cached, see ``_check_server_ready``)
+    and one stat of a file that is usually absent, measured at 0.04 ms.
+    The check of compile_commands.json itself stays in the index run.
+
+    The shapes are those of ``annotate_stale``: a list gets a leading
+    ``{"warning": ...}`` record, a dict gets ``build_warning``.  A project
+    that cannot be resolved gets no warning: the handler already gave the
+    error that explains it, and a warning must never fail the answer.
+    """
+    from ...indexer.autobuild import read_problem
+    from ...utils import resolve_project_root
+    from .context import _db_path
+
+    try:
+        db_dir = _db_path(resolve_project_root(project_root)).parent
+    except (RuntimeError, ValueError, OSError):
+        return result
+    problem = read_problem(db_dir)
+    if problem is None:
+        return result
+    message = problem.text
+    if isinstance(result, list):
+        return [{"warning": message}, *result]
+    if isinstance(result, dict):
+        return {**result, "build_warning": message}
+    return result
+
+
 def diagnose_empty_result(conn, config_hash: str, root: Path) -> tuple[int, list[str]]:
     """Explain an empty result: ``(changed_file_count, unindexed_sources)``.
 

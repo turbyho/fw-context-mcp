@@ -424,10 +424,17 @@ class TestThePlanTakesTheBranch:
 
     def _project(self, repo: Path, tmp_path: Path, description: str,
                  system: str = "cmake"):
-        """A project with an index that records *description*."""
+        """A project with an index that records *description*.
+
+        compile_commands.json is where a run reads it
+        (``build.checked_compile_commands``); a file elsewhere reads as a
+        missing build, which outranks the branch.
+        """
         import json
 
-        (repo / "compile_commands.json").write_text(
+        cc = repo / ".fw-context" / "build" / "compile_commands.json"
+        cc.parent.mkdir(parents=True, exist_ok=True)
+        cc.write_text(
             json.dumps([{
                 "directory": str(repo), "file": "main.c",
                 "arguments": ["cc", "-c", "main.c"],
@@ -444,7 +451,7 @@ class TestThePlanTakesTheBranch:
                 )
                 upsert_build_config(
                     conn, "ch", "0123456789abcdef0123456789abcdef",
-                    str(repo / "compile_commands.json"),
+                    str(cc),
                     description=description,
                     manifest_verification="full",
                 )
@@ -467,7 +474,7 @@ class TestThePlanTakesTheBranch:
         from fw_context_mcp.config import load as load_config
 
         cfg = load_config(project_root=repo)
-        return _plan_auto_build(repo, db_path, cfg, None)
+        return _plan_auto_build(repo, db_path, cfg, None, background=True)
 
     def test_the_same_branch_plans_no_build(self, repo, tmp_path):
         db_path = self._project(repo, tmp_path, "branch: main")
@@ -504,34 +511,14 @@ class TestThePlanTakesTheBranch:
         keys, config, reason = self._plan(repo, db_path)
         assert (keys, config, reason) == ([], None, "")
 
-    def test_a_recent_failure_for_the_same_branch_blocks(self, repo, tmp_path):
-        # A branch that does not build would otherwise start a build on every
-        # index run.
-        from fw_context_mcp.indexer.autobuild import record_failure
+    def test_an_earlier_failure_does_not_block_the_build(self, repo, tmp_path):
+        # The failed run told the caller through each MCP answer.  The next
+        # run builds again: a repaired branch must not wait for a timer.
+        from fw_context_mcp.indexer.autobuild import record_problem
 
         db_path = self._project(repo, tmp_path, "branch: main")
         _switch_to(repo, "release/4.15.1")
-        record_failure(db_path.parent, ["branch:release/4.15.1"])
-        keys, config, reason = self._plan(repo, db_path)
-        assert (keys, config, reason) == ([], None, "")
-
-    def test_a_failure_for_another_branch_does_not_block(self, repo, tmp_path):
-        from fw_context_mcp.indexer.autobuild import record_failure
-
-        db_path = self._project(repo, tmp_path, "branch: main")
-        _switch_to(repo, "release/4.15.1")
-        record_failure(db_path.parent, ["branch:some/other"])
-        keys, _config, _reason = self._plan(repo, db_path)
-        assert keys == ["branch:release/4.15.1"]
-
-    def test_a_source_failure_does_not_block_a_branch_build(self, repo, tmp_path):
-        # One marker file serves both triggers, and `blocked` compares the
-        # list contents, thus they do not interfere.
-        from fw_context_mcp.indexer.autobuild import record_failure
-
-        db_path = self._project(repo, tmp_path, "branch: main")
-        _switch_to(repo, "release/4.15.1")
-        record_failure(db_path.parent, ["src/new_file.c"])
+        record_problem(db_path.parent, "The last index run failed (exit code 1).")
         keys, _config, _reason = self._plan(repo, db_path)
         assert keys == ["branch:release/4.15.1"]
 
