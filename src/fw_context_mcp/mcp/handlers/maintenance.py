@@ -288,13 +288,27 @@ def _build_variant_discovery(cfg: Config, builds: list, root: Path) -> dict:
                 seen_images.add(image_name)
                 images.append({"name": image_name, "description": "", "dir": "", "type": "project"})
 
+    # The image of a query that names none, as resolve_build chooses it: the
+    # build system can name it when the config does not.  For a project with
+    # variants, the image of the default variant.  Completed builds only, as
+    # resolve_build reads them: a build that is still indexing answers no
+    # query.
+    from ..shared.variants import default_image
+
+    active_variant = (build_cfg.default_variant or "") if multi else ""
+    completed = [
+        b for b in builds
+        if (b["variant"] or "") == active_variant and b.get("manifest_verification") != "indexing"
+    ]
+    active_image = default_image(cfg, root, active_variant, completed) or None
+
     return {
         "multi": multi,
         "variants": variants,
         "images": images,
         "variant_images": variant_images,
         "active_variant": build_cfg.default_variant,
-        "active_image": build_cfg.default_image,
+        "active_image": active_image,
     }
 
 
@@ -308,7 +322,9 @@ def list_variants(
     Read-only diagnostic — shows what is actually indexed, not what the config
     declares.  Each row is one ``(variant, image)`` build with its own
     ``config_hash`` and symbol count.  For single-project indexes this returns
-    one row with ``variant``/``image`` empty.
+    one row with ``variant``/``image`` empty, and one row for each image when
+    the build makes several programs (ESP-IDF: the application and
+    ``bootloader``).
 
     This and ``get_active_build`` are the two tools that say what a query can
     choose from.  Both read the index, thus a build written by
@@ -329,7 +345,7 @@ def list_variants(
         declares variants or a build has a non-empty variant name)}.
 
         Each build dict holds: variant (str — empty for a single-project
-        index), image (str — empty for a single-project index), board (str),
+        index), image (str — empty for a build of one program), board (str),
         config_hash (str), symbol_count (int), file_count (int),
         manifest_verification (str — "full" or "none"),
         entry_point (str — the `ENTRY()` of the linker script of this build,
@@ -567,7 +583,12 @@ def get_active_build(
         images (list[dict] — {name, description, dir, type}),
         variant_images (dict — variant name to its image names),
         active_variant (str or None — [build] default_variant),
-        active_image (str or None — [build] default_image),
+        active_image (str or None — the image that a query without
+        `image` gets: [build] default_image, or the application that the
+        build system names),
+        default_build_error (str — only when no build answers a query
+        without `image`, for example while the application is not
+        indexed; the other fields then describe the newest build),
         entry_point (str — the `ENTRY()` of the linker script of the build
         that the other fields describe, empty when no script names one),
         memory (list[dict] — the `MEMORY` regions of that build:
@@ -670,7 +691,17 @@ def get_active_build(
     conn = _quick_open_readonly(db_path)
     try:
         project_id = derive_project_id(root)
-        cfg = get_active_config(conn, project_id)
+        # The build of a query without `variant` and `image`, and not the
+        # newest build: see active_build.
+        from ..shared.variants import active_build
+
+        cfg, default_refusal = active_build(conn, project_id, fw_cfg, root)
+        if cfg is None and default_refusal:
+            # No build answers a query without `image` (the application is
+            # not indexed yet).  This tool still reports the health of the
+            # index, from the newest build, and says why in
+            # `default_build_error`.
+            cfg = get_active_config(conn, project_id)
         if not cfg:
             return {"error": f"No build config indexed for project at {root}."}
         config_hash = cfg["config_hash"]
@@ -1150,6 +1181,10 @@ def get_active_build(
             "stale": needs_reindex or header_affected_tus > 0,
             "index_message": index_message,
         }
+        if default_refusal:
+            # No leading underscore: the caller must name `image` until the
+            # application is indexed.
+            result["default_build_error"] = default_refusal
         if client_restart_reason:
             # No leading underscore: this is an answer to act on, and not a
             # note about where an answer came from.
@@ -1177,13 +1212,11 @@ def get_active_build(
             result["symbol_count"] = sum(b["symbol_count"] for b in builds)
             result["file_count"] = sum(b["file_count"] for b in builds)
             result["reference_count"] = sum(b["reference_count"] for b in builds)
-            # config_hash/compile_commands reflect the default build only; empty
-            # without [build] default_variant (the LLM must pick a variant).
-            default_build = None
-            if discovery["active_variant"]:
-                default_build = get_active_config(
-                    conn, project_id, discovery["active_variant"], discovery["active_image"] or ""
-                )
+            # config_hash/compile_commands reflect the default build only: the
+            # build of a query without `variant` and `image` (active_build).
+            # Empty without [build] default_variant (the LLM must pick a
+            # variant), and when no build of the default variant answers.
+            default_build = cfg if discovery["active_variant"] and not default_refusal else None
             result["config_hash"] = default_build["config_hash"] if default_build else ""
             result["compile_commands"] = (
                 default_build["compile_commands_path"] if default_build else ""
@@ -1330,7 +1363,7 @@ def list_projects(
         reindex_needed (bool), status (str — "ready" or "reindex_needed"),
         db (path to SQLite database file),
         variant_count (int — number of build variants),
-        image_count (int — number of sysbuild images),
+        image_count (int — number of images),
         analysis (dict — LLM-analysis coverage
         {project: {analyzed, skipped, total},
         vendor: {analyzed, skipped, total}}, or None when no build is

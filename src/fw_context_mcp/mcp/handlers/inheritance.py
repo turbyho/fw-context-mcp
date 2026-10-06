@@ -156,7 +156,7 @@ def get_inheritance_chain(
     limit: Annotated[int, Field(description="Maximum classes in all_bases and in all_derived on one page (default 100, max 500). Only with transitive=True.", ge=1)] = 100,
     offset: Annotated[int, Field(description="Skip this many classes in all_bases and in all_derived. Reads the next page of a large hierarchy. Only with transitive=True.", ge=0)] = 0,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
+    image: Annotated[str | None, Field(description="Image of the build (Zephyr sysbuild, ESP-IDF). Each image is a separate program. When omitted: [build] default_image, else the application that the build names (ESP-IDF, Zephyr sysbuild), else the only image, else an error that lists the images.")] = None,
 ) -> dict:
     """Return the C++ inheritance chain for a class or struct —
     libclang-aware hierarchy. Resolves base/derived class relationships
@@ -191,8 +191,11 @@ def get_inheritance_chain(
             ``all_derived``.  One offset pages the two lists together.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
-        image: Sysbuild image within the variant. Required when the
-            variant holds several: each image is a separate program.
+        image: Image of the build (Zephyr sysbuild, ESP-IDF). Each image
+            is a separate program. When omitted: [build] default_image,
+            else the application that the build names (ESP-IDF,
+            Zephyr sysbuild), else the only image, else an error that
+            lists the images.
 
     Returns:
         dict: {
@@ -330,7 +333,7 @@ def get_class_members(
     limit: Annotated[int, Field(description="Maximum members on one page (default 200, max 500).", ge=1)] = 200,
     offset: Annotated[int, Field(description="Skip this many members. Reads the next page of a large class.", ge=0)] = 0,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
+    image: Annotated[str | None, Field(description="Image of the build (Zephyr sysbuild, ESP-IDF). Each image is a separate program. When omitted: [build] default_image, else the application that the build names (ESP-IDF, Zephyr sysbuild), else the only image, else an error that lists the images.")] = None,
 ) -> dict:
     """Return all methods, fields, and nested types of a C/C++ class/struct —
     libclang-powered member table. Groups members by kind (method,
@@ -355,8 +358,11 @@ def get_class_members(
             names the offset to use.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
-        image: Sysbuild image within the variant. Required when the
-            variant holds several: each image is a separate program.
+        image: Image of the build (Zephyr sysbuild, ESP-IDF). Each image
+            is a separate program. When omitted: [build] default_image,
+            else the application that the build names (ESP-IDF,
+            Zephyr sysbuild), else the only image, else an error that
+            lists the images.
 
     Returns:
         dict: {name, qualified_name, kind, file, line, members: {kind:
@@ -443,7 +449,7 @@ def get_template_instances(
     limit: Annotated[int, Field(description="Maximum results (default 50, max 200).", ge=1)] = 50,
     offset: Annotated[int, Field(description="Skip this many instances. Reads the next page of a template with many instances.", ge=0)] = 0,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
+    image: Annotated[str | None, Field(description="Image of the build (Zephyr sysbuild, ESP-IDF). Each image is a separate program. When omitted: [build] default_image, else the application that the build names (ESP-IDF, Zephyr sysbuild), else the only image, else an error that lists the images.")] = None,
 ) -> list[dict]:
     """Find all template instantiations for a C/C++ class or function
     template — libclang template-aware lookup. Finds concrete
@@ -478,8 +484,11 @@ def get_template_instances(
             notice names the offset to use.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
-        image: Sysbuild image within the variant. Required when the
-            variant holds several: each image is a separate program.
+        image: Image of the build (Zephyr sysbuild, ESP-IDF). Each image
+            is a separate program. When omitted: [build] default_image,
+            else the application that the build names (ESP-IDF,
+            Zephyr sysbuild), else the only image, else an error that
+            lists the images.
 
     Returns:
         list[dict]: the page notice ``{total, offset, shown, more, hint}``
@@ -561,7 +570,7 @@ def get_method_overrides(
     method_name: Annotated[str, Field(description="Method name to get override information for. Use qualified name for disambiguation, e.g. 'UART_DRIVER::write'.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
+    image: Annotated[str | None, Field(description="Image of the build (Zephyr sysbuild, ESP-IDF). Each image is a separate program. When omitted: [build] default_image, else the application that the build names (ESP-IDF, Zephyr sysbuild), else the only image, else an error that lists the images.")] = None,
 ) -> dict:
     """Return C++ virtual method override information — libclang-powered
     vtable analysis. Resolves virtual dispatch across class hierarchies:
@@ -586,8 +595,11 @@ def get_method_overrides(
         project_root: Project root. Auto-detected if omitted.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
-        image: Sysbuild image within the variant. Required when the
-            variant holds several: each image is a separate program.
+        image: Image of the build (Zephyr sysbuild, ESP-IDF). Each image
+            is a separate program. When omitted: [build] default_image,
+            else the application that the build names (ESP-IDF,
+            Zephyr sysbuild), else the only image, else an error that
+            lists the images.
 
     Returns:
         dict: {

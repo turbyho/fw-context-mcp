@@ -533,7 +533,7 @@ def find_callers(
     limit: Annotated[int, Field(description="Maximum results of one page (default 50, max 200).", ge=1)] = 50,
     offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a symbol with many call sites.", ge=0)] = 0,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
+    image: Annotated[str | None, Field(description="Image of the build (Zephyr sysbuild, ESP-IDF). Each image is a separate program. When omitted: [build] default_image, else the application that the build names (ESP-IDF, Zephyr sysbuild), else the only image, else an error that lists the images.")] = None,
 ) -> list[dict]:
     """Find who calls a C/C++ function — direct calls AND indirect via
     function pointers, callbacks, and struct/array init lists (such as a
@@ -578,8 +578,11 @@ def find_callers(
             with many call sites; the page notice names the offset to use.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
-        image: Sysbuild image within the variant. Required when the
-            variant holds several: each image is a separate program.
+        image: Image of the build (Zephyr sysbuild, ESP-IDF). Each image
+            is a separate program. When omitted: [build] default_image,
+            else the application that the build names (ESP-IDF,
+            Zephyr sysbuild), else the only image, else an error that
+            lists the images.
 
     Returns:
         The page notice first — ``total``, ``offset``, ``shown``, ``more``
@@ -620,7 +623,7 @@ def find_references(
     limit: Annotated[int, Field(description="Maximum results of one page (default 50, max 200).", ge=1)] = 50,
     offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a symbol with many references.", ge=0)] = 0,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
+    image: Annotated[str | None, Field(description="Image of the build (Zephyr sysbuild, ESP-IDF). Each image is a separate program. When omitted: [build] default_image, else the application that the build names (ESP-IDF, Zephyr sysbuild), else the only image, else an error that lists the images.")] = None,
 ) -> list[dict]:
     """Find ALL references to a C/C++ symbol — calls, reads, member accesses,
     function pointer registrations, vector table slots, and macro
@@ -649,8 +652,11 @@ def find_references(
             with many references; the page notice names the offset to use.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
-        image: Sysbuild image within the variant. Required when the
-            variant holds several: each image is a separate program.
+        image: Image of the build (Zephyr sysbuild, ESP-IDF). Each image
+            is a separate program. When omitted: [build] default_image,
+            else the application that the build names (ESP-IDF,
+            Zephyr sysbuild), else the only image, else an error that
+            lists the images.
 
     Returns:
         The page notice first — ``total``, ``offset``, ``shown``, ``more``
@@ -700,7 +706,7 @@ def find_indirect_call_sites(
     limit: Annotated[int, Field(description="Maximum results (default 50, max 200).", ge=1)] = 50,
     offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a long answer.", ge=0)] = 0,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
+    image: Annotated[str | None, Field(description="Image of the build (Zephyr sysbuild, ESP-IDF). Each image is a separate program. When omitted: [build] default_image, else the application that the build names (ESP-IDF, Zephyr sysbuild), else the only image, else an error that lists the images.")] = None,
 ) -> list[dict]:
     """Find indirect call sites where a C/C++ function pointer field or
     variable is invoked. libclang-powered: resolves calls through
@@ -733,8 +739,11 @@ def find_indirect_call_sites(
             notice names the offset to use.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
-        image: Sysbuild image within the variant. Required when the
-            variant holds several: each image is a separate program.
+        image: Image of the build (Zephyr sysbuild, ESP-IDF). Each image
+            is a separate program. When omitted: [build] default_image,
+            else the application that the build names (ESP-IDF,
+            Zephyr sysbuild), else the only image, else an error that
+            lists the images.
 
     Returns:
         list of dicts, each with: file, line, expr_text (the callee
@@ -810,7 +819,7 @@ def find_indirect_targets(
     limit: Annotated[int, Field(description="Maximum results (default 50, max 200).", ge=1)] = 50,
     offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a long answer.", ge=0)] = 0,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
+    image: Annotated[str | None, Field(description="Image of the build (Zephyr sysbuild, ESP-IDF). Each image is a separate program. When omitted: [build] default_image, else the application that the build names (ESP-IDF, Zephyr sysbuild), else the only image, else an error that lists the images.")] = None,
 ) -> list[dict]:
     """Find functions assigned to a C/C++ function pointer field or
     variable. libclang-powered: links assignment sites to call sites
@@ -845,8 +854,11 @@ def find_indirect_targets(
             notice names the offset to use.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
-        image: Sysbuild image within the variant. Required when the
-            variant holds several: each image is a separate program.
+        image: Image of the build (Zephyr sysbuild, ESP-IDF). Each image
+            is a separate program. When omitted: [build] default_image,
+            else the application that the build names (ESP-IDF,
+            Zephyr sysbuild), else the only image, else an error that
+            lists the images.
 
     Returns:
         list of dicts, each with: rhs_name (assigned function),
@@ -1024,7 +1036,7 @@ def find_call_path(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     max_depth: Annotated[int, Field(description="Maximum BFS depth from each end of the search (default 10). A path can hold up to 2 x max_depth edges.", ge=1)] = 10,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
+    image: Annotated[str | None, Field(description="Image of the build (Zephyr sysbuild, ESP-IDF). Each image is a separate program. When omitted: [build] default_image, else the application that the build names (ESP-IDF, Zephyr sysbuild), else the only image, else an error that lists the images.")] = None,
 ) -> list[dict]:
     """Find call paths between two C/C++ functions via BFS in the libclang
     call graph, including function-pointer edges, ISR vector
@@ -1091,8 +1103,11 @@ def find_call_path(
             depth gives up on that budget and not on the depth.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
-        image: Sysbuild image within the variant. Required when the
-            variant holds several: each image is a separate program.
+        image: Image of the build (Zephyr sysbuild, ESP-IDF). Each image
+            is a separate program. When omitted: [build] default_image,
+            else the application that the build names (ESP-IDF,
+            Zephyr sysbuild), else the only image, else an error that
+            lists the images.
 
     Returns:
         At most 5 paths, each a dict with: depth (edge count, int), chain (str —
@@ -1170,7 +1185,7 @@ def find_all_callers_recursive(
     limit: Annotated[int, Field(description="Maximum results (default 50).", ge=1)] = 50,
     offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a deep call tree.", ge=0)] = 0,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
+    image: Annotated[str | None, Field(description="Image of the build (Zephyr sysbuild, ESP-IDF). Each image is a separate program. When omitted: [build] default_image, else the application that the build names (ESP-IDF, Zephyr sysbuild), else the only image, else an error that lists the images.")] = None,
 ) -> list[dict]:
     """Find all transitive C/C++ callers — who calls *name*, directly or
     indirectly, through the libclang call graph including
@@ -1211,8 +1226,11 @@ def find_all_callers_recursive(
             call tree; the page notice names the offset to use.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
-        image: Sysbuild image within the variant. Required when the
-            variant holds several: each image is a separate program.
+        image: Image of the build (Zephyr sysbuild, ESP-IDF). Each image
+            is a separate program. When omitted: [build] default_image,
+            else the application that the build names (ESP-IDF,
+            Zephyr sysbuild), else the only image, else an error that
+            lists the images.
 
     Returns:
         list of dicts, each with: name (str — the caller),
@@ -1320,7 +1338,7 @@ def find_callees_recursive(
     limit: Annotated[int, Field(description="Maximum results (default 50).", ge=1)] = 50,
     offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a deep call tree.", ge=0)] = 0,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
+    image: Annotated[str | None, Field(description="Image of the build (Zephyr sysbuild, ESP-IDF). Each image is a separate program. When omitted: [build] default_image, else the application that the build names (ESP-IDF, Zephyr sysbuild), else the only image, else an error that lists the images.")] = None,
 ) -> list[dict]:
     """Find all transitive C/C++ callees — what *name* calls, directly or
     indirectly, through the libclang call graph including
@@ -1359,8 +1377,11 @@ def find_callees_recursive(
             call tree; the page notice names the offset to use.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
-        image: Sysbuild image within the variant. Required when the
-            variant holds several: each image is a separate program.
+        image: Image of the build (Zephyr sysbuild, ESP-IDF). Each image
+            is a separate program. When omitted: [build] default_image,
+            else the application that the build names (ESP-IDF,
+            Zephyr sysbuild), else the only image, else an error that
+            lists the images.
 
     Returns:
         list of dicts, each with: name (str — the callee),
@@ -1410,7 +1431,7 @@ def find_dead_code(
     exclude_paths: Annotated[list[str] | None, Field(description="LIKE patterns on the project-relative file path to exclude, on top of project_only. E.g. ['lib/%'].")] = None,
     project_only: Annotated[bool, Field(description="When True (default), keeps only project code (is_project, from the vendor_paths/project_paths config and SDK detection). Set False to see all results.")] = True,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
+    image: Annotated[str | None, Field(description="Image of the build (Zephyr sysbuild, ESP-IDF). Each image is a separate program. When omitted: [build] default_image, else the application that the build names (ESP-IDF, Zephyr sysbuild), else the only image, else an error that lists the images.")] = None,
 ) -> list[dict]:
     """Find C/C++ functions that are defined but never called —
     libclang-powered dead code detection across the entire indexed
@@ -1473,8 +1494,11 @@ def find_dead_code(
             symbols. Set False to see all results.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
-        image: Sysbuild image within the variant. Required when the
-            variant holds several: each image is a separate program.
+        image: Image of the build (Zephyr sysbuild, ESP-IDF). Each image
+            is a separate program. When omitted: [build] default_image,
+            else the application that the build names (ESP-IDF,
+            Zephyr sysbuild), else the only image, else an error that
+            lists the images.
 
     Returns:
         The page notice first — ``total``, ``offset``, ``shown``, ``more``
@@ -1542,7 +1566,7 @@ def find_wrapper_callers(
     limit: Annotated[int, Field(description="Maximum wrapper classes on one page (default 20, max 100).", ge=1)] = 20,
     offset: Annotated[int, Field(description="Skip this many wrapper classes. Reads the next page.", ge=0)] = 0,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
+    image: Annotated[str | None, Field(description="Image of the build (Zephyr sysbuild, ESP-IDF). Each image is a separate program. When omitted: [build] default_image, else the application that the build names (ESP-IDF, Zephyr sysbuild), else the only image, else an error that lists the images.")] = None,
 ) -> list[dict]:
     """Find C/C++ wrapper classes that call methods of a driver class —
     libclang-powered adapter pattern detection. Traces method ownership
@@ -1577,8 +1601,11 @@ def find_wrapper_callers(
             page notice names the offset to use.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
-        image: Sysbuild image within the variant. Required when the
-            variant holds several: each image is a separate program.
+        image: Image of the build (Zephyr sysbuild, ESP-IDF). Each image
+            is a separate program. When omitted: [build] default_image,
+            else the application that the build names (ESP-IDF,
+            Zephyr sysbuild), else the only image, else an error that
+            lists the images.
 
     Returns:
         list of dicts, each with: wrapper_class (str — ``"(global)"`` for a
@@ -1754,7 +1781,7 @@ def trace_data_flow(
     timeout_ms: Annotated[int, Field(description="Maximum total execution time in "
         "milliseconds (default 30000).", ge=1)] = _DEFAULT_TRACE_TIMEOUT_MS,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
+    image: Annotated[str | None, Field(description="Image of the build (Zephyr sysbuild, ESP-IDF). Each image is a separate program. When omitted: [build] default_image, else the application that the build names (ESP-IDF, Zephyr sysbuild), else the only image, else an error that lists the images.")] = None,
 ) -> list[dict]:
     """Trace how C/C++ data of a given type flows to a target function via
     libclang call paths. libclang-powered: finds functions by type
@@ -1790,8 +1817,11 @@ def trace_data_flow(
             one page.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
-        image: Sysbuild image within the variant. Required when the
-            variant holds several: each image is a separate program.
+        image: Image of the build (Zephyr sysbuild, ESP-IDF). Each image
+            is a separate program. When omitted: [build] default_image,
+            else the application that the build names (ESP-IDF,
+            Zephyr sysbuild), else the only image, else an error that
+            lists the images.
 
     Returns:
         The page notice ``{total, offset, shown, more, hint}`` comes
@@ -1964,7 +1994,7 @@ def find_hotspots(
     project_only: Annotated[bool, Field(description="When True (default), auto-excludes SDK/vendor paths so hotspots reflect project code.")] = True,
     exclude_paths: Annotated[list[str] | None, Field(description="LIKE patterns on the project-relative file path to exclude, on top of project_only. E.g. ['lib/%'].")] = None,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
+    image: Annotated[str | None, Field(description="Image of the build (Zephyr sysbuild, ESP-IDF). Each image is a separate program. When omitted: [build] default_image, else the application that the build names (ESP-IDF, Zephyr sysbuild), else the only image, else an error that lists the images.")] = None,
 ) -> list[dict]:
     """Find the most-called C/C++ functions ranked by caller count —
     libclang call-graph hotspot detection. Identifies functions with
@@ -1997,8 +2027,11 @@ def find_hotspots(
             tool parameter). E.g. ``['lib/%']``.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
-        image: Sysbuild image within the variant. Required when the
-            variant holds several: each image is a separate program.
+        image: Image of the build (Zephyr sysbuild, ESP-IDF). Each image
+            is a separate program. When omitted: [build] default_image,
+            else the application that the build names (ESP-IDF,
+            Zephyr sysbuild), else the only image, else an error that
+            lists the images.
 
     Returns:
         The page notice first — ``total``, ``offset``, ``shown``, ``more``
@@ -2370,7 +2403,7 @@ def get_vector_table(
     limit: Annotated[int, Field(description="Maximum slots (default 400, max 1000).", ge=1)] = 400,
     offset: Annotated[int, Field(description="Skip this many slots. Reads the next page of a long table.", ge=0)] = 0,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
+    image: Annotated[str | None, Field(description="Image of the build (Zephyr sysbuild, ESP-IDF). Each image is a separate program. When omitted: [build] default_image, else the application that the build names (ESP-IDF, Zephyr sysbuild), else the only image, else an error that lists the images.")] = None,
 ) -> list[dict]:
     """Read the interrupt vector table, and say what services each interrupt.
 
@@ -2526,8 +2559,11 @@ def get_vector_table(
             notice names the offset to use.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
-        image: Sysbuild image within the variant. Required when the
-            variant holds several: each image is a separate program.
+        image: Image of the build (Zephyr sysbuild, ESP-IDF). Each image
+            is a separate program. When omitted: [build] default_image,
+            else the application that the build names (ESP-IDF,
+            Zephyr sysbuild), else the only image, else an error that
+            lists the images.
 
     Returns:
         The page notice ``{total, offset, shown, more, hint}`` comes

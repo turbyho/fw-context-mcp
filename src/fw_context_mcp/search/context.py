@@ -138,7 +138,7 @@ class PipelineContext:
         ``ensure_schema`` write transaction for a two-field read.  All
         phase queries go through the shared ``executor``.
         """
-        from fw_context_mcp.indexer.db import get_active_config
+        from fw_context_mcp.mcp.shared.variants import active_build
 
         root = resolve_project_root(project_root)
         cfg = load_config(project_root=root)
@@ -150,7 +150,11 @@ class PipelineContext:
 
         conn = _quick_open_readonly(db_path)
         try:
-            build_cfg = get_active_config(conn, project_id)
+            # The build that get_active_build reports, because a search tool
+            # without `variant` and `image` answers for that build.
+            build_cfg, refusal = active_build(conn, project_id, cfg, root)
+            if refusal:
+                raise ValueError(refusal)
             if not build_cfg:
                 raise ValueError(f"No build config indexed for {root}.")
             config_hash = build_cfg["config_hash"]

@@ -59,12 +59,14 @@ as a **variant**, with an array-of-tables entry. Each `(variant, image)`
 pair becomes one indexed build, with its own `config_hash`. This feature
 works for every build system, not only Zephyr.
 
-Shared `[build]` keys for multi-variant projects:
+Shared `[build]` keys for multi-variant projects. `default_image` also
+applies to a project without variants whose build makes several images
+(ESP-IDF):
 
 | Key | Default | Scope | Description |
 |-----|---------|-------|-------------|
 | `default_variant` | *(none)* | project | The variant that a query uses when it omits `variant`. Without this key, a query without `variant` fails closed. |
-| `default_image` | *(none)* | project | The image that `get_active_build` reports as `active_image`. A query does not use this key: when a variant has more than one image, the query must name `image`. |
+| `default_image` | *(none)* | project | The image that a query gets when it does not name `image` and the build holds more than one image. The key applies to each variant that holds an image of this name. Without the key, the query gets the application that the build system names: an ESP-IDF build names its application, and a Zephyr sysbuild names its default image in `domains.yaml`. A build with one image gives that image. In all other cases, the query must name `image`. `get_active_build` reports the result as `active_image`. |
 | `sysbuild` | `false` | project | Use `west build --sysbuild` (Zephyr). |
 | `source_dir` | *(none)* | project | The sysbuild input application directory (Zephyr). |
 | `environment` | *(none)* | project | The `[env:<name>]` of `platformio.ini` that the build builds (PlatformIO). A variant can override it; its default is the variant name. In a project without `[[build.variants]]`, each of two or more environments becomes a variant, see [Build Configuration](build.md#platformio). |

@@ -204,7 +204,7 @@ _PROJECT_DEFAULTS_TEMPLATE = """\
 # source_dir = "proj/app"        # sysbuild input app (Zephyr)
 # sysbuild   = true              # use `west build --sysbuild`
 # default_variant = "nrf52840-dev"  # default when a query omits variant
-# default_image   = "app"           # default image within default_variant
+# default_image   = "app"           # image of a query that names no image
 
 # ── PlatformIO ───────────────────────────────────────────────────────────
 # Usually needs no extra config.  Each [env:<name>] of platformio.ini is a

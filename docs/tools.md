@@ -58,8 +58,8 @@ fw-context index --source-roots src lib drivers
 | `--force` | off | Force re-index of all files, embeddings, LLM analysis, overrides, PageRank, and hotspot cache (bypasses mtime checks) |
 | `--variant NAME` | all variants | Restrict indexing to one build variant (name from `[[build.variants]]`) |
 | `--variants A,B` | all variants | Comma-separated list of build variants to index |
-| `--image NAME` | all images | Restrict indexing to one sysbuild image |
-| `--exclude-image NAME` | none | Exclude a sysbuild image from indexing (repeatable) |
+| `--image NAME` | all images | Index only this image of the build (Zephyr sysbuild, ESP-IDF). The build stays complete. |
+| `--exclude-image NAME` | none | Do not index this image of the build (repeatable) |
 | `--no-prune` | off | Keep the global-registry rows that nothing on disk confirms |
 | `--takeover` | off | Terminate another running foreground index run of this project instead of refusing |
 | `-v` | off | Verbose progress output |
@@ -712,12 +712,17 @@ for the active build. Both selectors fail closed:
 - When the project has variants, name a `variant`. When you omit it,
   fw-context uses `[build] default_variant`, or returns an error that lists
   the valid names.
-- When the variant holds more than one image, name an `image`. Each image
-  is a separate program, for example a bootloader and the application. An
-  omitted `image` causes an error that lists the images.
+- When the build holds more than one image, name an `image`. Each image
+  is a separate program, for example a bootloader and the application. When
+  you omit it, fw-context uses `[build] default_image` if the build holds
+  that image. Else the build gives the application that its build system
+  names (ESP-IDF, Zephyr sysbuild). Else a build with one image gives that
+  image. Else the query returns an error that lists the images.
 - `variant="*"` is refused. To learn whether a symbol is in two builds, ask
   once for each build.
-- A project with one build and no variants refuses `variant` and `image`.
+- A project with one build and no variants refuses `variant`. It refuses
+  `image` too, unless the build makes more than one program (ESP-IDF, a
+  Zephyr sysbuild).
 
 The valid variants are the declared variants (`[[build.variants]]`) and
 the variants in the index. Call `get_active_build` or `list_variants` to
@@ -2434,11 +2439,20 @@ newer than `indexed_at`. To find modified files, use `modified_files_count`.
 - `variants` — a list of `{name, description, board}`: the declared
   variants, plus the indexed variants that the config does not declare
 - `images` — a list of `{name, description, dir, type, board?}`
-- `variant_images` — a map of variant name to its image names
+- `variant_images` — a map of variant name to its image names. It is empty
+  for a project without variants. The images of its build are in `images`
 - `active_variant` — the `[build] default_variant` value
-- `active_image` — the `[build] default_image` value. A query tool does
-  not use it to select an image; pass `image` instead. This tool uses it
-  only to pick the build that `config_hash` names
+- `active_image` — the image that a query without `image` gets, in the
+  default variant: the `[build] default_image` value when the build holds
+  it, or the application that the build names. `config_hash` and the other
+  fields describe the build of a query without `variant` and `image`, and
+  `smart_search` and `semantic_search` answer for that build. A project
+  with several variants and no `default_variant` has no such build: then
+  the two tools answer for the newest build
+- `default_build_error` — only when no build answers a query without
+  `image`, for example while the bootloader is indexed and the application
+  is not. The other fields then describe the newest build. Name `image`
+  until the application is indexed
 
 #### `list_variants`
 

@@ -17,11 +17,12 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from ...config import derive_project_id
-from ...indexer.db import get_active_config
+from ...config import load as load_config
 from ...utils import abs_path
 from .context import _is_stale, _quick_open_readonly, get_executor
 from .paging import page_hint, page_notice, past_end_info
 from .stale import _stale_files
+from .variants import active_build
 
 
 def _fallback_to_search_code(
@@ -52,7 +53,11 @@ def _fallback_to_search_code(
         return [{"error": f"Cannot open index database {db_path}: {e}. Run 'fw-context index' first."}]
     try:
         project_id = derive_project_id(root)
-        cfg = get_active_config(conn, project_id)
+        # The build of semantic_search, which takes no selector: the build
+        # that its main path reads (see active_build), and not the newest.
+        cfg, refusal = active_build(conn, project_id, load_config(root), root)
+        if refusal:
+            return [{"error": refusal}]
         if not cfg:
             return [{"error": "No build config indexed."}]
         config_hash = cfg["config_hash"]

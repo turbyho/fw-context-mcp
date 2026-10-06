@@ -44,7 +44,7 @@ from pydantic import Field
 
 from ...config import derive_project_id
 from ...config import load as load_config
-from ...indexer.db import _expand_query, get_active_config
+from ...indexer.db import _expand_query
 from ...indexer.db._symbols import _RE_COL_FILTER, _sanitize_body_query
 from ...llm._diag import check_setup
 from ...llm.embedder_factory import uses_ollama
@@ -95,7 +95,7 @@ def _resolve_build_for_search(
     cfg = load_config(root)
     conn = _quick_open_readonly(db_path)
     try:
-        return resolve_build(conn, project_id, cfg, variant or "", image or "")
+        return resolve_build(conn, project_id, cfg, variant or "", image or "", project_root=root)
     finally:
         conn.close()
 
@@ -180,7 +180,7 @@ def _with_search_context(root: Path, tool_name: str, do_search, variant: str = "
 # ── moved from server.py ──
 
 def _append_staleness_warning(
-    results: list[dict], db_path: Path, project_root: Path,
+    results: list[dict], db_path: Path, config_hash: str,
 ) -> list[dict]:
     """Check compile_commands staleness and append a warning if the index is stale.
 
@@ -197,15 +197,18 @@ def _append_staleness_warning(
     Args:
         results: Existing result list to append the warning to (mutated in place).
         db_path: Path to the project's SQLite index database file.
-        project_root: Project root directory, used to derive the project_id
-            for the config lookup.
+        config_hash: The build that the results come from.  The check reads
+            that build, and not the newest one: a build of several programs
+            indexes them one after the other.
 
     Returns:
         The results list, possibly extended with a ``warning`` dict.
     """
     conn = _quick_open_readonly(db_path)
     try:
-        cfg_data = get_active_config(conn, derive_project_id(project_root))
+        cfg_data = conn.execute(
+            "SELECT * FROM build_configs WHERE config_hash = ?", (config_hash,),
+        ).fetchone()
         if cfg_data and _is_stale(cfg_data, cfg_data["compile_commands_path"])[0]:
             results.append({
                 "warning": "Index may be stale — compile_commands.json changed since last index.",
@@ -224,7 +227,7 @@ def search_code(
      offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a topic that many symbols carry.", ge=0)] = 0,
      project_only: Annotated[bool, Field(description="Exclude vendor SDK code. When True, only application code. Default False.")] = False,
      variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
-     image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
+     image: Annotated[str | None, Field(description="Image of the build (Zephyr sysbuild, ESP-IDF). Each image is a separate program. When omitted: [build] default_image, else the application that the build names (ESP-IDF, Zephyr sysbuild), else the only image, else an error that lists the images.")] = None,
  ) -> list[dict]:
     """Find C/C++ symbols by name — searches function/class/enum NAMES.
 
@@ -314,8 +317,11 @@ def search_code(
             application code. Default False.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
-        image: Sysbuild image within the variant. Required when the
-            variant holds several: each image is a separate program.
+        image: Image of the build (Zephyr sysbuild, ESP-IDF). Each image
+            is a separate program. When omitted: [build] default_image,
+            else the application that the build names (ESP-IDF,
+            Zephyr sysbuild), else the only image, else an error that
+            lists the images.
 
     Returns:
         list of dicts.  The page notice leads the answer — ``total``,
@@ -552,7 +558,7 @@ async def smart_search(
     # Append staleness warning unless the LLM setup itself failed — in that
     # case the meta rows already carry a warning.
     if not answer.llm_failed:
-        results = _append_staleness_warning(results, ctx.db_path, ctx.project_root)
+        results = _append_staleness_warning(results, ctx.db_path, ctx.config_hash)
     return results
 
 
@@ -954,7 +960,7 @@ async def semantic_search(
             ]
 
         # Add staleness warning if applicable
-        results = _append_staleness_warning(results, ctx.db_path, ctx.project_root)
+        results = _append_staleness_warning(results, ctx.db_path, ctx.config_hash)
         return results
 
     except (sqlite3.Error, OSError, RuntimeError) as e:
@@ -1100,7 +1106,7 @@ def search_bodies(
     offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a pattern with many hits.", ge=0)] = 0,
     project_only: Annotated[bool, Field(description="Exclude vendor SDK code. When True, only application code. Default False.")] = False,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
+    image: Annotated[str | None, Field(description="Image of the build (Zephyr sysbuild, ESP-IDF). Each image is a separate program. When omitted: [build] default_image, else the application that the build names (ESP-IDF, Zephyr sysbuild), else the only image, else an error that lists the images.")] = None,
 ) -> list[dict]:
     """Find patterns in the TEXT OF A DEFINITION — the code inside its extent.
 
@@ -1203,8 +1209,11 @@ def search_bodies(
             application code. Default False.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
-        image: Sysbuild image within the variant. Required when the
-            variant holds several: each image is a separate program.
+        image: Image of the build (Zephyr sysbuild, ESP-IDF). Each image
+            is a separate program. When omitted: [build] default_image,
+            else the application that the build names (ESP-IDF,
+            Zephyr sysbuild), else the only image, else an error that
+            lists the images.
 
     Returns:
         list of dicts.  The page notice leads the answer — ``total``,
@@ -1434,7 +1443,7 @@ def search_content(
     offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a topic that many files touch.", ge=0)] = 0,
     project_only: Annotated[bool, Field(description="Exclude vendor SDK code. When True, only application code. Default False.")] = False,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
+    image: Annotated[str | None, Field(description="Image of the build (Zephyr sysbuild, ESP-IDF). Each image is a separate program. When omitted: [build] default_image, else the application that the build names (ESP-IDF, Zephyr sysbuild), else the only image, else an error that lists the images.")] = None,
 ) -> list[dict]:
     """Find patterns in FULL file content — the whole file, not only the
     text that belongs to a definition.
@@ -1490,8 +1499,11 @@ def search_content(
         project_only: When True, filter to project code only (files with is_project = 1).
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
-        image: Sysbuild image within the variant. Required when the
-            variant holds several: each image is a separate program.
+        image: Image of the build (Zephyr sysbuild, ESP-IDF). Each image
+            is a separate program. When omitted: [build] default_image,
+            else the application that the build names (ESP-IDF,
+            Zephyr sysbuild), else the only image, else an error that
+            lists the images.
 
     Returns:
         list of dicts.  The page notice leads the answer — ``total``,

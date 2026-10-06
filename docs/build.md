@@ -48,9 +48,10 @@ The index reads `compile_commands.json` where the build system writes it in
 
 | Build | Database |
 |-------|----------|
-| One program (CMake, ESP-IDF, Arduino, Mbed OS, Makefile, Keil, IAR, manual) | `out/compile_commands.json` |
-| Zephyr without `sysbuild = true` | `out/compile_commands.json`, or `out/zephyr/compile_commands.json` when NCS builds with sysbuild by default |
-| Zephyr sysbuild, one per image | `out/<image>/compile_commands.json` |
+| One program (CMake, Arduino, Mbed OS, Makefile, Keil, IAR, manual) | `out/compile_commands.json` |
+| ESP-IDF, two images | `out/compile_commands.json` (the application), `out/bootloader/compile_commands.json` (the bootloader) |
+| Zephyr without sysbuild (upstream Zephyr, or `west build --no-sysbuild`) | `out/compile_commands.json` |
+| Zephyr sysbuild, one per image | `out/<image>/compile_commands.json`, for each image that `out/domains.yaml` names |
 
 A tool that fw-context gives the output path to (bear, compiledb,
 keil2clangd, the manual backend) does not write the file directly. It writes
@@ -227,6 +228,20 @@ the build runs: the builder commands, the `pre_build` hook, and the
 |-----------|------|---------|-------------|
 | `board` | `str` | — | **Required.** The board name, for example `"nrf52840dk_nrf52840"` |
 
+NCS builds with sysbuild also without `--sysbuild`, and `sysbuild = true`
+adds the flag for upstream Zephyr. A sysbuild writes `out/domains.yaml`,
+which names each image and the default image. fw-context indexes each image
+in that file. Each image has its database in `out/<image>/`. The application
+image has the name of the application directory, not the name in
+`project()`, and it is the default image: a query without `image` gets it.
+For example, `hello_world` with `SB_CONFIG_BOOTLOADER_MCUBOOT=y` gives the
+images `hello_world` and `mcuboot`. Without `domains.yaml`, the build made
+one program, and its database is `out/compile_commands.json`.
+
+While a pristine build has removed `domains.yaml`, a query without `image`
+on a build of several images gets an error. Set `[build] default_image` to
+remove this gap.
+
 ### PlatformIO
 
 | Parameter | Type | Default | Description |
@@ -265,6 +280,14 @@ PlatformIO decides the set (`pio project config`), thus `extends`,
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `idf_path` | `str` | (from `$IDF_PATH`) | The path to the ESP-IDF installation |
+
+`idf.py build` makes two programs: the application and the second-stage
+bootloader. fw-context indexes each one as an image of the build. The name
+of an image is the `project_name` in the `project_description.json` of its
+build directory: the project name for the application, and `bootloader`
+for the bootloader. A query without `image` gets the application, unless
+`[build] default_image` names the other image. Use `--image` or
+`--exclude-image` to index one of the two.
 
 ### Arduino
 
@@ -335,8 +358,10 @@ build. You do not need one checkout per board.
 ### Concepts
 
 - **Variant** — one build configuration, for one board, target, or environment.
-- **Image** — one sysbuild image inside a variant (Zephyr only). An
-  example is the `app` image and the `mcuboot` bootloader image.
+- **Image** — one program that one build makes. A Zephyr sysbuild makes,
+  for example, the `app` image and the `mcuboot` bootloader image. An
+  ESP-IDF build makes the application and the `bootloader` image. A build
+  without variants can make several images too.
 
 ### `[[build.variants]]` reference
 
@@ -359,14 +384,16 @@ The `images` sub-table:
 | `type` | `str` | `"project"` | `"project"` or `"sdk"`. |
 | `board` | `str` | — | A per-image board override. |
 
-Shared `[build]` keys for multi-variant projects:
+Shared `[build]` keys for multi-variant projects. `default_image` also
+applies to a project without variants whose build makes several images
+(ESP-IDF):
 
 | Key | Default | Description |
 |-----|---------|-------------|
 | `default_variant` | — | The variant that a query uses when it omits `variant`. |
-| `default_image` | — | The image that `get_active_build` reports as `active_image`. A query does not use this key: when a variant has more than one image, the query must name `image`. |
+| `default_image` | — | The image that a query gets when it does not name `image` and the build holds more than one image. The key applies to each variant that holds an image of this name. Without the key, the query gets the application that the build system names: an ESP-IDF build names its application, and a Zephyr sysbuild names its default image in `domains.yaml`. A build with one image gives that image. In all other cases, the query must name `image`. `get_active_build` reports the result as `active_image`. |
 | `sysbuild` | `false` | Use `west build --sysbuild` (Zephyr). |
-| `source_dir` | — | The sysbuild input application directory (Zephyr). |
+| `source_dir` | — | The application directory that `west build` builds (Zephyr), relative to the project root. Without it, west builds the project root. |
 
 Variant overrides merge with the shared `[build]` section by type. A
 scalar value (such as `board`) replaces the shared value. A list value
@@ -386,14 +413,14 @@ fw-context index --exclude-image mcuboot          # skip one image
 With `--build`, each variant builds into `.fw-context/build/<variant>/out`.
 A variant without sysbuild gives `out/compile_commands.json`. A Zephyr
 sysbuild variant gives `out/<image>/compile_commands.json` for each image
-that the build makes, thus the images of each variant are the images of its
-build. A later run without `--build` reads the same files, and it builds a
+that `out/domains.yaml` names, thus the images of each variant are the
+images of its build. A later run without `--build` reads the same files, and it builds a
 variant that has no build yet. A run over all variants removes from the
 index the builds that the project no longer makes (see [PlatformIO](#platformio)).
 
 `--variant` and `--variants` limit the build too: a Zephyr sysbuild run
 builds only the variants that you name. `--image` limits the index only,
-because sysbuild builds all images of a variant in one run.
+because one build makes all images of a variant (Zephyr sysbuild, ESP-IDF).
 
 A variant name that cannot be a directory name, for example a name with
 `/`, stops the run before any build. See [Where the build goes](#where-the-build-goes).

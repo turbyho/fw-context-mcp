@@ -66,7 +66,7 @@ def find_variables(
     offset: Annotated[int, Field(description="Skip this many variables. "
         "Reads the next page of a name that many variables share.", ge=0)] = 0,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
+    image: Annotated[str | None, Field(description="Image of the build (Zephyr sysbuild, ESP-IDF). Each image is a separate program. When omitted: [build] default_image, else the application that the build names (ESP-IDF, Zephyr sysbuild), else the only image, else an error that lists the images.")] = None,
 ) -> list[dict]:
     """Find C/C++ variables by name or part of it and trace who reads or
     writes them through the call graph.  libclang-powered: splits
@@ -111,8 +111,11 @@ def find_variables(
             notice names the offset to use.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
-        image: Sysbuild image within the variant. Required when the
-            variant holds several: each image is a separate program.
+        image: Image of the build (Zephyr sysbuild, ESP-IDF). Each image
+            is a separate program. When omitted: [build] default_image,
+            else the application that the build names (ESP-IDF,
+            Zephyr sysbuild), else the only image, else an error that
+            lists the images.
 
     Returns:
         list of dicts, each with: name (str), qualified_name (str),

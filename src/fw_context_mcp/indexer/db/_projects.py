@@ -283,7 +283,8 @@ def upsert_build_config(
             ``get_active_config`` then matched no row for a build that names
             a variant — every tool called with an explicit variant failed on
             an index that is fully present.
-        image: Sysbuild image name (``''`` for non-sysbuild builds).
+        image: The image name, the program of a build of several programs
+            (``''`` for a build of one program).
             ``None`` keeps the stored value, as with ``variant``.
         row_format: Which meaning the stored text of this build carries —
             pass ``CURRENT_ROW_FORMAT``.  ``None`` keeps whatever the row
@@ -417,13 +418,13 @@ def get_builds_for_scope(
     - ``variant="*"`` → all variants (all builds), newest first.
     - ``variant`` set, ``image=""`` → every image of that variant.
     - ``variant`` set, ``image`` set → that one (variant, image) build.
-    - both empty → the newest single build (single-project default).
+    - ``variant=""`` → every build of the project, newest first.
 
     These are the semantics of THIS query and not of the MCP protocol, which
-    is narrower: ``resolve_build`` refuses ``variant="*"`` and refuses an
-    omitted image when the variant holds several, because one query about
-    code answers for one build.  It calls the wider forms here to LIST what
-    a project holds, and then names one build itself.
+    is narrower: ``resolve_build`` refuses ``variant="*"``, and for an
+    omitted image it chooses the default image or refuses, because one
+    query about code answers for one build.  It calls the wider forms here
+    to LIST what a project holds, and then names one build itself.
 
     Completed builds only (``manifest_verification != 'indexing'``).
     """

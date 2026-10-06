@@ -61,6 +61,24 @@ log = logging.getLogger(__name__)
 # will happen, and it cannot import from cli/.
 
 
+def _checked_build(conn, project_root: Path, cfg):
+    """Return the build that the checks of an index run read, or None without one.
+
+    The build of a query without ``variant`` and ``image``, as
+    ``get_active_build`` reports it (``active_build``), thus the CLI and the
+    MCP server check one build.  The newest build only when no build
+    answers such a query: the newest one is the program that the last run
+    did last, a bootloader after a failed application.
+    """
+    from ..config import derive_project_id
+    from ..indexer.db import get_active_config
+    from ..mcp.shared.variants import active_build
+
+    project_id = derive_project_id(project_root)
+    row, _refusal = active_build(conn, project_id, cfg, project_root)
+    return row if row is not None else get_active_config(conn, project_id)
+
+
 def _indexed_compile_commands(project_root: Path, db_path: Path) -> Path | None:
     """Give the compile_commands.json of the active index, or None without one.
 
@@ -70,8 +88,8 @@ def _indexed_compile_commands(project_root: Path, db_path: Path) -> Path | None:
     """
     if not db_path.exists():
         return None
-    from ..config import derive_project_id
-    from ..indexer.db import get_active_config, open_db
+    from ..config import load as load_config
+    from ..indexer.db import open_db
 
     try:
         conn = open_db(db_path)
@@ -79,7 +97,7 @@ def _indexed_compile_commands(project_root: Path, db_path: Path) -> Path | None:
         log.debug("could not read the active compile_commands.json", exc_info=True)
         return None
     try:
-        active = get_active_config(conn, derive_project_id(project_root))
+        active = _checked_build(conn, project_root, load_config(project_root=project_root))
     finally:
         conn.close()
     if not active or not active["compile_commands_path"]:
@@ -222,12 +240,11 @@ def _plan_auto_build(
     # builds each of them, each into its own directory.
     target = BuildLayout(project_root).root if candidate.variants else BuildLayout(project_root).out_dir("")
 
-    from ..config import derive_project_id
-    from ..indexer.db import get_active_config, open_db
+    from ..indexer.db import open_db
 
     conn = open_db(db_path)
     try:
-        active = get_active_config(conn, derive_project_id(project_root))
+        active = _checked_build(conn, project_root, cfg)
         if not active or not active["compile_commands_path"]:
             return [], None, ""
         # The build is gone as a whole: no file list and no compiler answer
@@ -1033,6 +1050,23 @@ def _filter_images(cc_list: list, args: argparse.Namespace) -> list:
     return out
 
 
+def _unknown_images(cc_list: list, args: argparse.Namespace) -> str:
+    """Return an error line for an --image or --exclude-image name that no build makes, or "".
+
+    A name that the build does not make is a typo or a stale command line.
+    --exclude-image ignored it without a word, and --image indexed nothing.
+    """
+    known = sorted({image for _, image, _, _ in cc_list if image})
+    asked = [getattr(args, "image", None) or "", *(getattr(args, "exclude_image", None) or [])]
+    unknown = sorted({name for name in asked if name and name not in known})
+    if not unknown:
+        return ""
+    return (
+        f"error: no build makes the image(s) {', '.join(unknown)}. "
+        f"The images are: {', '.join(known) or '(none)'}."
+    )
+
+
 def _discover_existing_cc(project_root, variants: list, build_cfg, builder) -> list:
     """Return ``(variant, image, database, board)`` of each build that is on disk.
 
@@ -1043,14 +1077,18 @@ def _discover_existing_cc(project_root, variants: list, build_cfg, builder) -> l
     """
     from ..indexer.build import build_variant_config
     from ..indexer.build_layout import BuildLayout
-    from ..indexer.builders import output_compile_commands
+    from ..indexer.builders import application_database, output_compile_commands
 
     layout = BuildLayout(project_root)
     found: list = []
     for variant in variants:
         vcfg = build_variant_config(build_cfg, variant)
-        databases = output_compile_commands(builder, layout.out_dir(variant.name), vcfg)
-        for image, cc in sorted(databases.items()):
+        out_dir = layout.out_dir(variant.name)
+        databases = output_compile_commands(builder, out_dir, vcfg)
+        application = application_database(builder, out_dir)
+        # The application last, as the run that builds orders them
+        # (`_images_of_build`): get_active_config gives the newest build.
+        for image, cc in sorted(databases.items(), key=lambda item: (item[1] == application, item[0])):
             found.append((variant.name, image, cc, _effective_board(build_cfg, variant, image)))
     return found
 
@@ -1066,6 +1104,7 @@ def _build_variants(project_root: Path, build_cfg, builder, variants: list) -> l
     build does not stop the others.
     """
     from ..indexer.build import build_variant_config, generate_compile_commands
+    from ..indexer.build_layout import BuildLayout
 
     found: list = []
     build_multi = getattr(builder, "build_multi", None)
@@ -1090,7 +1129,14 @@ def _build_variants(project_root: Path, build_cfg, builder, variants: list) -> l
         except RuntimeError as exc:
             print(f"error: variant '{variant.name}': {exc}", file=sys.stderr)
             continue
-        found.append((variant.name, "", path, _effective_board(build_cfg, variant, "")))
+        # One build can make several programs (ESP-IDF: the application and
+        # its bootloader).  The run without a build finds them through the
+        # same backend method, thus a variant has the same images either way.
+        images = _images_of_build(builder, BuildLayout(project_root).out_dir(variant.name), vcfg, path)
+        if images is None:
+            continue
+        for image, cc in images:
+            found.append((variant.name, image, cc, _effective_board(build_cfg, variant, image)))
     return found
 
 
@@ -1159,6 +1205,10 @@ def _run_multi(
             print(f"No build for variant(s) {', '.join(v.name for v in missing)} — running the build")
             cc_list += _build_variants(project_root, build_cfg, builder, missing)
 
+    unknown = _unknown_images(cc_list, args)
+    if unknown:
+        print(unknown, file=sys.stderr)
+        return 1
     cc_list = _filter_images(cc_list, args)
 
     if args.no_index:
@@ -1170,6 +1220,7 @@ def _run_multi(
         return 1
 
     touched_pairs: list[tuple[str, str]] = []
+    failed_variants: set[str] = set()
     for variant_name, image, cc_path, board in cc_list:
         v = _find_variant(variants, variant_name)
         env = dict(build_cfg.env)
@@ -1215,6 +1266,7 @@ def _run_multi(
             return exc.exit_code
         except Exception as exc:  # noqa: BLE001 — best-effort per-build
             print(f"error: indexing variant={variant_name} image={image}: {exc}", file=sys.stderr)
+            failed_variants.add(variant_name)
             continue
         touched_pairs.append((variant_name, image))
         print(f"Indexed variant={variant_name} image={image} config_hash={ch[:16]}…")
@@ -1238,12 +1290,18 @@ def _run_multi(
         if deleted:
             print(f"Cleaned up {deleted} stale build(s)")
         # Only a run over the whole set knows which builds the project no
-        # longer makes; a narrowed run does not see the other builds.
+        # longer makes; a narrowed run does not see the other builds.  A
+        # variant with an image that failed to index keeps all its builds,
+        # as a variant whose build failed does: its build without an image
+        # name, from before the images, can be its only complete application.
         if not _is_narrowed(args):
             retired = cleanup_retired_builds(
                 conn, project_id, db_path.parent,
                 {v.name for v in variants},
-                {(variant, image) for variant, image, _, _ in cc_list},
+                {
+                    (variant, image) for variant, image, _, _ in cc_list
+                    if variant not in failed_variants
+                },
             )
             if retired:
                 print(f"Removed the builds that the project no longer makes: {_pair_names(retired)}")
@@ -1695,7 +1753,7 @@ def _run_single(
     Called ONLY inside _owned_index — the build writes the files the index
     run reads, so it has to be excluded the same way the indexing is.
     """
-    from ..indexer.runner import run
+    from ..indexer.runner import IndexStopped, run
 
     # ── Resolve compile_commands.json ──
     cc_result = _resolve_compile_commands(args, project_root, cfg, detected_system, bg)
@@ -1712,30 +1770,141 @@ def _run_single(
         return 1
     assert compile_commands is not None  # _validate_and_fix_artifacts returns Path|None, but ok=True → non-None
 
-    config_hash = run(
-        compile_commands=compile_commands,
-        db_path=db_path,
-        build_dir_patterns=build_dir_patterns,
-        **run_kwargs,
-    )
-    print(f"Indexed. config_hash={config_hash[:16]}…  db={db_path}")
+    images = _single_build_images(project_root, cfg, detected_system, compile_commands, explicit_cc)
+    if images is None:
+        return 1
+    if (getattr(args, "image", None) or getattr(args, "exclude_image", None)) and not any(
+        image for image, _ in images
+    ):
+        print(
+            "error: the build makes one program, and its image has no name, thus "
+            "--image and --exclude-image name nothing. Run without them.",
+            file=sys.stderr,
+        )
+        return 1
+    unknown = _unknown_images([("", image, cc, "") for image, cc in images], args)
+    if unknown:
+        print(unknown, file=sys.stderr)
+        return 1
+    selected = [
+        (image, cc) for _, image, cc, _ in _filter_images([("", image, cc, "") for image, cc in images], args)
+    ]
+    if not selected:
+        print(
+            f"error: no image to index. The build makes {', '.join(image for image, _ in images)}.",
+            file=sys.stderr,
+        )
+        return 1
+
+    failed: list[str] = []
+    for image, cc in selected:
+        try:
+            config_hash = run(
+                compile_commands=cc,
+                db_path=db_path,
+                build_dir_patterns=build_dir_patterns,
+                image=image,
+                **run_kwargs,
+            )
+        except IndexStopped:
+            raise
+        except Exception as exc:  # noqa: BLE001 — one image of several, as in _run_multi
+            if len(selected) == 1:
+                raise
+            # The images are separate programs: a failure in the bootloader
+            # must not keep the application out of the index.
+            print(f"error: indexing image={image}: {exc}", file=sys.stderr)
+            failed.append(image)
+            continue
+        label = f" image={image}" if image else ""
+        print(f"Indexed{label}. config_hash={config_hash[:16]}…  db={db_path}")
 
     # The project has one build now, thus the builds of variants that an
-    # earlier config (or an earlier platformio.ini) made are retired.  The
-    # set of this run is the build without variants, and it built.
-    from ..indexer._postprocess import cleanup_retired_builds
-    from ..indexer.db import open_db
+    # earlier config (or an earlier platformio.ini) made are retired, and so
+    # are the images that this build no longer makes.  A run that --image
+    # narrowed does not see the other images.  A run with a failed image
+    # retires nothing: the build of the image without a name, from before
+    # the images, can be the only complete one.
+    if not _is_narrowed(args) and not failed:
+        from ..indexer._postprocess import cleanup_retired_builds
+        from ..indexer.db import open_db
 
-    conn = open_db(db_path)
-    try:
-        retired = cleanup_retired_builds(conn, project_id, db_path.parent, {""}, {("", "")})
-    finally:
-        conn.close()
-    if retired:
-        print(f"Removed the builds that the project no longer makes: {_pair_names(retired)}")
+        conn = open_db(db_path)
+        try:
+            retired = cleanup_retired_builds(
+                conn, project_id, db_path.parent, {""}, {("", image) for image, _ in selected},
+            )
+        finally:
+            conn.close()
+        if retired:
+            print(f"Removed the builds that the project no longer makes: {_pair_names(retired)}")
 
     _post_index_optimize(db_path, project_root, project_id, detected_system, args)
-    return 0
+    return 1 if failed else 0
+
+
+def _single_build_images(
+    project_root: Path,
+    cfg,
+    detected_system: str | None,
+    compile_commands: Path,
+    explicit_cc: bool,
+) -> list[tuple[str, Path]] | None:
+    """Return ``(image, database)`` of each program of the build without variants.
+
+    Most builds make one program, and the result is ``[("", compile_commands)]``.
+    ESP-IDF makes two, the application and its bootloader, and the backend
+    names each with its database (``builders.output_compile_commands``).
+    *compile_commands* is the database of the application, the one that this
+    run built or validated, and it comes LAST: ``get_active_config`` gives the
+    build that the index run did last, and the daemon and the staleness
+    checks read that build.  A file that the user names is one program.
+
+    None, with an error line, when the build names images and
+    *compile_commands* is none of them: the output directory holds another
+    build than the one that this run validated.
+    """
+    if explicit_cc:
+        return [("", compile_commands)]
+
+    from ..indexer.build_layout import BuildLayout
+    from ..indexer.builders import registry as builder_registry
+
+    builder_cls = builder_registry.get(detected_system) if detected_system else None
+    return _images_of_build(
+        builder_cls() if builder_cls else None, BuildLayout(project_root).out_dir(""), cfg.build, compile_commands,
+    )
+
+
+def _images_of_build(builder, out_dir: Path, build_cfg, compile_commands: Path) -> list[tuple[str, Path]] | None:
+    """Return ``(image, database)`` of each program of the build in *out_dir*, the application last.
+
+    *compile_commands* is the database that the build returned, the one of
+    its application.  A build of one program gives ``[("", compile_commands)]``.
+    The backend names the images of a build of several programs
+    (``builders.output_compile_commands``).  The build without variants and
+    each variant without sysbuild use this function after the build, and the
+    run without a build reads the same backend method, thus the image names
+    do not change with the kind of run.
+
+    None, with an error line, when the backend names images and
+    *compile_commands* is none of them: the output directory holds another
+    build than the one that this run made or validated.
+    """
+    from ..indexer.builders import output_compile_commands
+
+    named = {image: cc for image, cc in output_compile_commands(builder, out_dir, build_cfg).items() if image}
+    if not named:
+        return [("", compile_commands)]
+    main = [image for image, cc in named.items() if cc.resolve() == compile_commands.resolve()]
+    if not main:
+        print(
+            f"error: the build in {out_dir} makes the images {', '.join(sorted(named))}, and "
+            f"{compile_commands} is the database of none of them. Run 'fw-context index --build'.",
+            file=sys.stderr,
+        )
+        return None
+    return [(image, named[image]) for image in sorted(named) if image != main[0]] + [(main[0], named[main[0]])]
 
 
 def _record_still_uncovered(project_root: Path, db_path: Path) -> None:

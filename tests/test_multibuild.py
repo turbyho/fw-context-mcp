@@ -18,20 +18,6 @@ class TestZephyrHelpers:
             == "nrf54lm20dk/nrf54lm20a/cpuapp"
         )
 
-    def test_discover_images(self, tmpdir):
-        build_dir = Path(tmpdir)
-        (build_dir / "app").mkdir()
-        (build_dir / "app" / "compile_commands.json").write_text("[]")
-        (build_dir / "stage0").mkdir()
-        (build_dir / "stage0" / "compile_commands.json").write_text("[]")
-        # Non-image directories must be excluded by the M4 predicate.
-        (build_dir / "_sysbuild").mkdir()
-        (build_dir / "CMakeFiles").mkdir()
-        (build_dir / "zephyr").mkdir()
-        (build_dir / "CMakeCache.txt").write_text("")
-        images = ZephyrBuildSystem._discover_images(build_dir)
-        assert images == ["app", "stage0"]
-
 
 class TestCleanupRetention:
     def test_keeps_newest_per_pair(self, temp_db):

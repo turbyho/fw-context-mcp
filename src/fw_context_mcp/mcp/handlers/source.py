@@ -706,7 +706,7 @@ async def explain_symbol(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     context_lines: Annotated[int, Field(description="Lines of source context around the symbol definition (1-200).", ge=0)] = 40,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
+    image: Annotated[str | None, Field(description="Image of the build (Zephyr sysbuild, ESP-IDF). Each image is a separate program. When omitted: [build] default_image, else the application that the build names (ESP-IDF, Zephyr sysbuild), else the only image, else an error that lists the images.")] = None,
 ) -> dict:
     """Explain what a C/C++ symbol does in plain English — libclang-aware
     analysis. Uses pre-computed LLM analysis when available (instant),
@@ -729,8 +729,11 @@ async def explain_symbol(
             (default 40, max 200). Only used when no pre-computed analysis exists.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
-        image: Sysbuild image within the variant. Required when the
-            variant holds several: each image is a separate program.
+        image: Image of the build (Zephyr sysbuild, ESP-IDF). Each image
+            is a separate program. When omitted: [build] default_image,
+            else the application that the build names (ESP-IDF,
+            Zephyr sysbuild), else the only image, else an error that
+            lists the images.
 
     Returns:
         dict: {name, kind, file, line, signature, explanation, llm_analysis
@@ -925,7 +928,7 @@ def get_source(
     name: Annotated[str, Field(description="Symbol name, or qualified name (Class::method) to select one symbol. Returns exact function body via libclang extent.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
+    image: Annotated[str | None, Field(description="Image of the build (Zephyr sysbuild, ESP-IDF). Each image is a separate program. When omitted: [build] default_image, else the application that the build names (ESP-IDF, Zephyr sysbuild), else the only image, else an error that lists the images.")] = None,
 ) -> dict:
     """Read a C/C++ function/method/enum/macro body using libclang exact
     extents — no guessing line numbers. Uses AST-precise {start, end}
@@ -962,8 +965,11 @@ def get_source(
         project_root: Project root. Auto-detected if omitted.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
-        image: Sysbuild image within the variant. Required when the
-            variant holds several: each image is a separate program.
+        image: Image of the build (Zephyr sysbuild, ESP-IDF). Each image
+            is a separate program. When omitted: [build] default_image,
+            else the application that the build names (ESP-IDF,
+            Zephyr sysbuild), else the only image, else an error that
+            lists the images.
 
     Returns:
         dict: {name, qualified_name, kind, file, line, signature,
@@ -1102,7 +1108,7 @@ def get_file_map(
     kind: Annotated[str | None, Field(description="One symbol kind, e.g. 'function' or 'enum_constant'. Gives one page of the items of that kind.")] = None,
     offset: Annotated[int, Field(description="With kind: skip this many items of that kind. Reads the next page.", ge=0)] = 0,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
+    image: Annotated[str | None, Field(description="Image of the build (Zephyr sysbuild, ESP-IDF). Each image is a separate program. When omitted: [build] default_image, else the application that the build names (ESP-IDF, Zephyr sysbuild), else the only image, else an error that lists the images.")] = None,
 ) -> dict:
     """Fast structural map of all C/C++ symbols in a file grouped by kind —
     libclang-powered table of contents. Like a table of contents before
@@ -1146,8 +1152,11 @@ def get_file_map(
             the next page; ``page`` names the offset to use.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
-        image: Sysbuild image within the variant. Required when the
-            variant holds several: each image is a separate program.
+        image: Image of the build (Zephyr sysbuild, ESP-IDF). Each image
+            is a separate program. When omitted: [build] default_image,
+            else the application that the build names (ESP-IDF,
+            Zephyr sysbuild), else the only image, else an error that
+            lists the images.
 
     Returns:
         dict: {file, total_symbols, symbols: {kind: {count, items[],
@@ -1589,7 +1598,7 @@ def get_symbol_context(
     name: Annotated[str, Field(description="Symbol name. Returns body, signature, the direct callers and callees (each list with its total).", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
+    image: Annotated[str | None, Field(description="Image of the build (Zephyr sysbuild, ESP-IDF). Each image is a separate program. When omitted: [build] default_image, else the application that the build names (ESP-IDF, Zephyr sysbuild), else the only image, else an error that lists the images.")] = None,
 ) -> dict:
     """Rich one-shot context for a C/C++ symbol: body, signature, the direct
     callers and callees. Answers "what does this do and how does it fit in
@@ -1621,8 +1630,11 @@ def get_symbol_context(
         project_root: Project root. Auto-detected if omitted.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
-        image: Sysbuild image within the variant. Required when the
-            variant holds several: each image is a separate program.
+        image: Image of the build (Zephyr sysbuild, ESP-IDF). Each image
+            is a separate program. When omitted: [build] default_image,
+            else the application that the build names (ESP-IDF,
+            Zephyr sysbuild), else the only image, else an error that
+            lists the images.
 
     Returns:
         dict with: name, qualified_name, kind, file, line, signature,
@@ -1859,7 +1871,7 @@ def read_file(
     start_line: Annotated[int, Field(description="First line to return, 1-based inclusive. 0 = from the start of the file.", ge=0)] = 0,
     end_line: Annotated[int, Field(description="Last line to return, 1-based inclusive. 0 = one page of at most 2000 lines.", ge=0)] = 0,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
+    image: Annotated[str | None, Field(description="Image of the build (Zephyr sysbuild, ESP-IDF). Each image is a separate program. When omitted: [build] default_image, else the application that the build names (ESP-IDF, Zephyr sysbuild), else the only image, else an error that lists the images.")] = None,
 ) -> dict:
     """Read a C/C++ source file, one page at a time, with **ifdef-filtered** content —
     only code that actually compiles for the current build configuration.
@@ -1925,8 +1937,11 @@ def read_file(
             at most 2000 lines.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
-        image: Sysbuild image within the variant. Required when the
-            variant holds several: each image is a separate program.
+        image: Image of the build (Zephyr sysbuild, ESP-IDF). Each image
+            is a separate program. When omitted: [build] default_image,
+            else the application that the build names (ESP-IDF,
+            Zephyr sysbuild), else the only image, else an error that
+            lists the images.
 
     Returns:
         dict: {file (str), language (str — ``"c"`` or ``"cpp"``),

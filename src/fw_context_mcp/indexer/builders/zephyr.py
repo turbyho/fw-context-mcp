@@ -9,8 +9,10 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from functools import lru_cache
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import TYPE_CHECKING
+
+import yaml
 
 from fw_context_mcp.utils import resolve_real_binary, run_build_command
 
@@ -24,6 +26,87 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 _ZEPHYR_MARKERS = ["west.yml", "zephyr"]
+
+# Sysbuild writes this file in the top build directory: the name and the
+# build directory of each image (a "domain"), and the default image.  `west
+# flash` and `west debug` read it too.
+_DOMAINS_FILE = "domains.yaml"
+
+
+@dataclass(frozen=True)
+class _Domains:
+    """The images of one sysbuild, as ``domains.yaml`` gives them.
+
+    ``directories`` maps each image name to its build directory, relative
+    to the top build directory.  ``default`` is the image that sysbuild
+    names the application: the name of the application directory
+    (``share/sysbuild/cmake/modules/sysbuild_images.cmake`` in Zephyr).
+    """
+
+    default: str
+    directories: dict[str, PurePath]
+
+
+class _InvalidDomains(ValueError):
+    """``domains.yaml`` exists and does not have the form that sysbuild writes."""
+
+
+def _read_domains(out_dir: Path) -> _Domains | None:
+    """Return the images that ``out_dir/domains.yaml`` gives, or None without the file.
+
+    No file means a build without sysbuild (upstream Zephyr, or ``west
+    build --no-sysbuild``): one program.  The paths in the file are
+    absolute, thus each one is made relative to the ``build_dir`` of the
+    file itself: a project that moved keeps the directories of its images.
+    The name of the application image is the name of the application
+    directory, thus a checkout in a directory of another name gives
+    another name.
+
+    Raises ``_InvalidDomains`` for a file that sysbuild did not write in
+    this form.
+    """
+    try:
+        text = (out_dir / _DOMAINS_FILE).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError) as exc:
+        raise _InvalidDomains(f"{out_dir / _DOMAINS_FILE}: {exc}") from exc
+    try:
+        # BaseLoader gives every scalar as a string.  safe_load turns an
+        # application directory named `2024` or `yes` into a number or a
+        # bool, and the file then reads as invalid.  Like safe_load, it makes
+        # no Python objects.  The loader is used directly because bandit
+        # flags every call of yaml.load, whichever loader it gets.
+        loader = yaml.BaseLoader(text)
+        try:
+            data = loader.get_single_data()
+        finally:
+            loader.dispose()
+    except yaml.YAMLError as exc:
+        raise _InvalidDomains(f"{out_dir / _DOMAINS_FILE}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise _InvalidDomains(f"{out_dir / _DOMAINS_FILE}: not a mapping")
+    top = data.get("build_dir")
+    default = data.get("default")
+    entries = data.get("domains")
+    if not isinstance(top, str) or not isinstance(default, str) or not isinstance(entries, list):
+        raise _InvalidDomains(f"{out_dir / _DOMAINS_FILE}: no build_dir, default or domains")
+    directories: dict[str, PurePath] = {}
+    for entry in entries:
+        name = entry.get("name") if isinstance(entry, dict) else None
+        build_dir = entry.get("build_dir") if isinstance(entry, dict) else None
+        if not isinstance(name, str) or not isinstance(build_dir, str):
+            raise _InvalidDomains(f"{out_dir / _DOMAINS_FILE}: a domain without name or build_dir")
+        try:
+            directories[name] = PurePath(build_dir).relative_to(top)
+        except ValueError as exc:
+            raise _InvalidDomains(
+                f"{out_dir / _DOMAINS_FILE}: domain {name!r} is outside {top}"
+            ) from exc
+    if default not in directories:
+        raise _InvalidDomains(f"{out_dir / _DOMAINS_FILE}: the default {default!r} is no domain")
+    return _Domains(default=default, directories=directories)
+
 
 # The flag Zephyr CMake uses to name the two SDK roots.  See
 # _prefix_map_roots() for what each name means.
@@ -243,9 +326,16 @@ class ZephyrBuildSystem:
             "-d",
             str(build_dir),
         ]
+        # The application directory, as build_multi gives it.  Without it
+        # west builds the current directory, the project root.
+        if cfg.source_dir:
+            cmd.append(cfg.source_dir)
 
         if cfg.clean:
             cmd.append("--pristine")
+        # NCS builds with sysbuild without this flag; upstream Zephyr needs it.
+        if cfg.sysbuild:
+            cmd.append("--sysbuild")
 
         cmd.append("--")
         cmd.append("-DCMAKE_EXPORT_COMPILE_COMMANDS=ON")
@@ -259,39 +349,68 @@ class ZephyrBuildSystem:
         # timeout would break long builds.  Network-filesystem stalls remain a risk.
         run_build_command(cmd, cwd=project_root, description="west build", env=env, build_cfg=cfg)
 
-        # The database stays beside build.ninja, which the linker pass reads.
-        found = self._single_compile_commands(build_dir)
-        if found is None:
+        # The database of the application stays beside its build.ninja,
+        # which the linker pass reads.
+        database = self.application_database(build_dir) or build_dir / COMPILE_COMMANDS_NAME
+        if database not in self.output_compile_commands(build_dir, cfg).values():
             raise RuntimeError(
-                f"compile_commands.json not found in {build_dir}. "
+                f"compile_commands.json not found at {database}. "
                 "Ensure CMAKE_EXPORT_COMPILE_COMMANDS is enabled."
             )
-        return found
-
-    @staticmethod
-    def _single_compile_commands(build_dir: Path) -> Path | None:
-        """Return the database of a ``west build`` without ``--sysbuild``, or None.
-
-        Plain Zephyr writes it in the build directory.  Sysbuild (NCS ≥2.0)
-        puts it one level deeper, ``zephyr/compile_commands.json``.
-        """
-        for candidate in (build_dir / COMPILE_COMMANDS_NAME, build_dir / "zephyr" / COMPILE_COMMANDS_NAME):
-            if candidate.is_file():
-                return candidate
-        return None
+        return database
 
     def output_compile_commands(self, out_dir: Path, cfg: BuildConfig) -> dict[str, Path]:
-        """Return the databases of the build in *out_dir*, one per image for sysbuild.
+        """Return the database of each image that the build in *out_dir* made.
 
-        ``cfg.sysbuild`` selects ``west build --sysbuild`` (see
-        ``build_multi``), which makes one database per image in
-        ``out/<image>/``.  Without it the build makes one program, and its
-        database has the key "".
+        A sysbuild names its images in ``domains.yaml``, and each image has
+        its database in its own build directory.  NCS builds with sysbuild
+        also without ``--sysbuild``.  Measured with NCS v3.4.0 on
+        ``hello_world``: ``west build`` gave ``out/hello_world/``, with
+        ``SB_CONFIG_BOOTLOADER_MCUBOOT=y`` also ``out/mcuboot/``, and
+        ``--no-sysbuild`` gave ``out/compile_commands.json``.  The name of an
+        image is the name of its directory, and the application image is
+        named after the application directory, not after ``project()``.
+
+        WHY the file and not the subdirectories: a directory of an image
+        that the build no longer makes stays in ``out/`` until a pristine
+        build.  Measured on one project, ``domains.yaml`` named four images
+        and five subdirectories held a database.
+
+        Without ``domains.yaml`` the build made one program, and its
+        database is ``out/compile_commands.json`` with the key "".  An
+        invalid ``domains.yaml`` gives no database: the build is not
+        complete, and the caller builds again.
         """
-        if cfg.sysbuild:
-            return {name: out_dir / name / COMPILE_COMMANDS_NAME for name in self._discover_images(out_dir)}
-        single = self._single_compile_commands(out_dir)
-        return {"": single} if single is not None else {}
+        try:
+            domains = _read_domains(out_dir)
+        except _InvalidDomains as exc:
+            log.warning("zephyr: %s", exc)
+            return {}
+        if domains is None:
+            single = out_dir / COMPILE_COMMANDS_NAME
+            return {"": single} if single.is_file() else {}
+        found: dict[str, Path] = {}
+        for name, directory in domains.directories.items():
+            database = out_dir / directory / COMPILE_COMMANDS_NAME
+            if database.is_file():
+                found[name] = database
+        return found
+
+    def application_database(self, out_dir: Path) -> Path | None:
+        """Return the database of the default image of a sysbuild in *out_dir*, or None.
+
+        The default image of ``domains.yaml`` is the application.  None
+        without the file: the build made one program, or it is not there.
+        While a pristine build has removed the file, a query must name the
+        image or use ``[build] default_image``.
+        """
+        try:
+            domains = _read_domains(out_dir)
+        except _InvalidDomains:
+            return None
+        if domains is None:
+            return None
+        return out_dir / domains.directories[domains.default] / COMPILE_COMMANDS_NAME
 
     # ── Multi-variant (sysbuild) ──
 
@@ -345,28 +464,6 @@ class ZephyrBuildSystem:
             "PATH": f"{wrapper_dir}{os.pathsep}{os.environ.get('PATH', '')}",
         }
         return str(wrapper_dir), env
-
-    @staticmethod
-    def _discover_images(build_dir: Path) -> list[str]:
-        """Return sysbuild image names from the build directory structure.
-
-        An image is a subdir of *build_dir* that contains a
-        ``compile_commands.json`` directly (verified on NCS 3.2.3 — the
-        per-image compile_commands lives at ``<build_dir>/<image>/compile_commands.json``,
-        not one level deeper).  This predicate excludes non-image directories
-        that sysbuild also creates (``_sysbuild/``, ``CMakeFiles/``,
-        ``CMakeCache.txt``, the top-level ``zephyr/``).  Image names are a
-        discovery trigger + fallback label, not a stable identity — the durable
-        label is ``images[].name`` from config and the durable identity is the
-        per-image ``config_hash``.
-        """
-        if not build_dir.is_dir():
-            return []
-        return [
-            sub.name
-            for sub in sorted(build_dir.iterdir())
-            if sub.is_dir() and (sub / "compile_commands.json").exists()
-        ]
 
     def build_multi(
         self, project_root: Path, cfg: BuildConfig, variants: list | None = None,
@@ -436,7 +533,13 @@ class ZephyrBuildSystem:
                 build_cfg=vcfg,
             )
 
-            for image_name, cc_path in self.output_compile_commands(build_dir, vcfg).items():
+            # The application last, as `cli._index._images_of_build` orders
+            # the images of one build: get_active_config gives the newest.
+            application = self.application_database(build_dir)
+            databases = self.output_compile_commands(build_dir, vcfg)
+            for image_name, cc_path in sorted(
+                databases.items(), key=lambda item: (item[1] == application, item[0]),
+            ):
                 results.append((variant.name, image_name, cc_path))
 
         return results

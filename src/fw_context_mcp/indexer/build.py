@@ -35,7 +35,7 @@ from fw_context_mcp.utils import (
 # build system backends before ``detect_build_system()`` is called.
 from . import builders  # noqa: F401 — side-effect import
 from .build_layout import COMPILE_COMMANDS_NAME, BuildLayout
-from .builders import output_compile_commands
+from .builders import application_database, output_compile_commands
 from .builders import registry as _builder_registry
 
 log = logging.getLogger(__name__)
@@ -720,8 +720,9 @@ def checked_compile_commands(project_root: Path, cfg, indexed: Path | None) -> P
     if indexed is None:
         return build_compile_commands(project_root, cfg.build, "")
     # The database of the build is where the build system put it in the
-    # output directory: out/compile_commands.json, or deeper, as
-    # out/zephyr/compile_commands.json.  When the build is gone, the path of
+    # output directory: out/compile_commands.json, or deeper, as the
+    # database of a Zephyr sysbuild image, out/<image>/compile_commands.json.
+    # When the build is gone, the path of
     # the index is the only record of where it was, thus the test is "in the
     # output directory", and not one fixed path that a removed build cannot
     # give any more.
@@ -802,20 +803,25 @@ def default_compile_commands(project_root: Path, cfg) -> Path:
 
 
 def build_compile_commands(project_root: Path, build_cfg: BuildConfig, variant: str) -> Path:
-    """Return the database of the only program that the build of *variant* makes.
+    """Return the database of the program of the build of *variant*, or of its application.
 
     The backend says where its build system put the database in the output
-    directory (``builders.output_compile_commands``).  When the build is not
-    there, the answer is ``out/compile_commands.json``, the file that the
-    build writes, thus the caller sees a missing file and runs the build.
+    directory (``builders.output_compile_commands``).  A build of several
+    programs gives the database of its application
+    (``builders.application_database``).  When the build is not there, the
+    answer is a file that does not exist, thus the caller runs the build.
     """
     root = project_root.resolve()
     out_dir = BuildLayout(root).out_dir(variant)
     system = build_cfg.system or detect_build_system(root)
     builder_cls = _builder_registry.get(system) if system else None
-    found = output_compile_commands(builder_cls() if builder_cls else None, out_dir, build_cfg)
+    builder = builder_cls() if builder_cls else None
+    found = output_compile_commands(builder, out_dir, build_cfg)
     if "" in found:
         return found[""]
+    application = application_database(builder, out_dir)
+    if application is not None:
+        return application
     if len(found) == 1:
         return next(iter(found.values()))
     return out_dir / COMPILE_COMMANDS_NAME

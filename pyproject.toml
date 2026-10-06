@@ -28,6 +28,9 @@ dependencies = [
     # running.  Lift this together with the migration, not before it.
     "mcp[cli]>=1.0.0,<2",
     "pysqlite3>=0.5.0",
+    # Zephyr sysbuild writes the images of a build and the default image
+    # into domains.yaml, the file that `west flash` reads too.
+    "PyYAML>=6.0",
     "sqlite-vec>=0.1.0",
     "tomli-w>=1.2.0",
     "watchfiles>=0.21",

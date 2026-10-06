@@ -947,6 +947,34 @@ class TestESPIDFInitAndIndex:
         finally:
             conn.close()
 
+    def test_the_bootloader_is_a_second_image(self, indexed):
+        """idf.py builds the application and its bootloader, and each is an image of the build.
+
+        The application is indexed last, thus it is the newest build, and a
+        query without ``image`` gets it.
+        """
+        from fw_context_mcp.config import derive_project_id
+        from fw_context_mcp.config import load as load_config
+        from fw_context_mcp.mcp.shared.variants import resolve_build
+
+        conn = open_db(_db_path_for_project(indexed))
+        try:
+            project_id = derive_project_id(indexed)
+            rows = conn.execute(
+                "SELECT variant, image, config_hash FROM build_configs WHERE project_id = ?",
+                (project_id,),
+            ).fetchall()
+            assert {(r["variant"], r["image"]) for r in rows} == {
+                ("", "fwctx_test_esp_idf"), ("", "bootloader"),
+            }
+            app = next(r["config_hash"] for r in rows if r["image"] == "fwctx_test_esp_idf")
+            assert _config_hash(conn, indexed) == app
+            chosen, err = resolve_build(conn, project_id, load_config(indexed), project_root=indexed)
+            assert err is None, err
+            assert chosen == app
+        finally:
+            conn.close()
+
     def test_manifest_verification(self, indexed):
         db_path = _db_path_for_project(indexed)
         conn = open_db(db_path)

@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 
 from fw_context_mcp.utils import resolve_real_binary, run_build_command
 
-from ..build_layout import BuildLayout
+from ..build_layout import COMPILE_COMMANDS_NAME, BuildLayout
 from . import _linker, registry
 from .protocol import BuildIssue
 
@@ -21,18 +21,29 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
-def _app_elf(build_dir: Path) -> str | None:
-    """Return the ELF of the application that ``project_description.json`` names, or None.
+def _description_field(build_dir: Path, key: str) -> str | None:
+    """Return one string field of ``project_description.json`` in *build_dir*, or None.
 
-    ESP-IDF writes the file in each build directory.  None when the file is
-    missing or has no ``app_elf`` string.
+    ESP-IDF writes the file in each build directory, the directory of the
+    application and the directory of the bootloader alike.  None when the
+    file is missing or the field is not a non-empty string.
     """
     try:
         description = json.loads((build_dir / "project_description.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    app_elf = description.get("app_elf") if isinstance(description, dict) else None
-    return app_elf if isinstance(app_elf, str) and app_elf else None
+    value = description.get(key) if isinstance(description, dict) else None
+    return value if isinstance(value, str) and value else None
+
+
+def _app_elf(build_dir: Path) -> str | None:
+    """Return the ELF of the program that ``project_description.json`` names, or None."""
+    return _description_field(build_dir, "app_elf")
+
+
+# The bootloader of ESP-IDF is a CMake project of its own, and idf.py builds
+# it in this subdirectory of the build directory of the application.
+_BOOTLOADER_DIR = "bootloader"
 
 
 class ESPIDFBuildSystem:
@@ -213,6 +224,39 @@ class ESPIDFBuildSystem:
     def background_build_safe(self, cfg: BuildConfig) -> bool:
         """Safe — ``idf.py -B <dir>`` puts every artifact in the output directory of fw-context."""
         return True
+
+    def output_compile_commands(self, out_dir: Path, cfg: BuildConfig) -> dict[str, Path]:
+        """Return the database of each image that the build in *out_dir* made.
+
+        ``idf.py build`` makes two programs, the application and the
+        second-stage bootloader.  Each has a build directory of its own, with
+        its compile_commands.json, build.ninja and project_description.json:
+        the application in *out_dir*, the bootloader in ``out_dir/bootloader``.
+
+        The image name is the ``project_name`` of the description beside each
+        database: the project name for the application, ``bootloader`` for
+        the bootloader.  WHY that name and not a fixed one: it is the name
+        that the build system gives the program, and the name of its ELF.
+        A database without a description with a name gets no entry, because
+        the build that wrote it is not complete.  The two names cannot be
+        equal: ESP-IDF has a build target ``bootloader``, and a project of
+        that name does not build.
+        """
+        found: dict[str, Path] = {}
+        for build_dir in (out_dir, out_dir / _BOOTLOADER_DIR):
+            cc = build_dir / COMPILE_COMMANDS_NAME
+            name = _description_field(build_dir, "project_name")
+            if name is not None and cc.is_file():
+                found[name] = cc
+        return found
+
+    def application_database(self, out_dir: Path) -> Path:
+        """Return the database of the application, the program that a query without ``image`` is about.
+
+        ``idf.py build`` writes it in *out_dir*, and the database of the
+        bootloader in ``out_dir/bootloader``.
+        """
+        return out_dir / COMPILE_COMMANDS_NAME
 
     # ── Build dir patterns ──
 

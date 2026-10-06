@@ -245,14 +245,14 @@ def main() -> None:
     p_index.add_argument(
         "--image",
         metavar="NAME",
-        help="Restrict indexing to one sysbuild image (build-scope stays full)",
+        help="Index only this image of the build (Zephyr sysbuild, ESP-IDF). The build stays complete.",
     )
     p_index.add_argument(
         "--exclude-image",
         metavar="NAME",
         action="append",
         default=[],
-        help="Exclude a sysbuild image from indexing (repeatable)",
+        help="Do not index this image of the build (repeatable)",
     )
     p_index.add_argument(
         "--no-index",

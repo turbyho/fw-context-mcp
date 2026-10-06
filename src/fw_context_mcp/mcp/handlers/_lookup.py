@@ -103,7 +103,7 @@ def lookup_symbol(
     limit: Annotated[int, Field(description="Maximum results returned (capped at 100, default 50).", ge=1)] = 50,
     offset: Annotated[int, Field(description="Skip this many results. Pages through a name that many classes share, such as 'read' or 'write'.", ge=0)] = 0,
     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
-    image: Annotated[str | None, Field(description="Sysbuild image within the variant. Required when the variant holds several: each image is a separate program.")] = None,
+    image: Annotated[str | None, Field(description="Image of the build (Zephyr sysbuild, ESP-IDF). Each image is a separate program. When omitted: [build] default_image, else the application that the build names (ESP-IDF, Zephyr sysbuild), else the only image, else an error that lists the images.")] = None,
 ) -> list[dict]:
     """Look up a C/C++ symbol by name via libclang index — exact or prefix
     matching. Finds symbols text-based search can miss: build-conditional
@@ -136,8 +136,11 @@ def lookup_symbol(
             thus two pages never overlap and never skip a symbol.
         variant: Build variant (multi-build project). Omit to use
             default_variant. One query answers for ONE build.
-        image: Sysbuild image within the variant. Required when the
-            variant holds several: each image is a separate program.
+        image: Image of the build (Zephyr sysbuild, ESP-IDF). Each image
+            is a separate program. When omitted: [build] default_image,
+            else the application that the build names (ESP-IDF,
+            Zephyr sysbuild), else the only image, else an error that
+            lists the images.
 
     Returns:
         list[dict]: The page notice leads the answer — ``total``, ``offset``,

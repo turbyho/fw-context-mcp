@@ -171,16 +171,35 @@ class TestDefaultCompileCommands:
         assert result == self._out(tmp_path) / "compile_commands.json"
 
     def test_the_database_that_the_build_system_wrote_is_found(self, tmp_path: Path):
-        # Zephyr sysbuild of one program puts it one level deeper.
-        nested = self._out(tmp_path) / "zephyr" / "compile_commands.json"
+        # A Zephyr sysbuild puts the database of the application in the
+        # directory of the default image of domains.yaml.  NCS builds with
+        # sysbuild also without --sysbuild.
+        out_dir = self._out(tmp_path)
+        nested = out_dir / "myapp" / "compile_commands.json"
         nested.parent.mkdir(parents=True)
         nested.write_text("[]", encoding="utf-8")
+        (out_dir / "domains.yaml").write_text(
+            f"default: myapp\nbuild_dir: {out_dir}\ndomains:\n"
+            f"  - name: myapp\n    build_dir: {out_dir / 'myapp'}\n",
+            encoding="utf-8",
+        )
 
         result = default_compile_commands(
             tmp_path, self._cfg(Path("compile_commands.json"), system="zephyr", board="b")
         )
 
         assert result == nested
+
+    def test_a_zephyr_build_without_sysbuild_is_one_program(self, tmp_path: Path):
+        database = self._out(tmp_path) / "compile_commands.json"
+        database.parent.mkdir(parents=True)
+        database.write_text("[]", encoding="utf-8")
+
+        result = default_compile_commands(
+            tmp_path, self._cfg(Path("compile_commands.json"), system="zephyr", board="b")
+        )
+
+        assert result == database
 
     def test_a_custom_relative_path_is_the_users_file(self, tmp_path: Path):
         result = default_compile_commands(tmp_path, self._cfg(Path("cmake_build/compile_commands.json")))

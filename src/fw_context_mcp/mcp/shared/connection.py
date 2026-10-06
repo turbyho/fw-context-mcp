@@ -173,7 +173,7 @@ def _resolve_handler_context(
         # One build answers, because a question about code is a question
         # about one program.  That one hash IS the hash of this request,
         # thus nothing downstream has to carry a selection to find it.
-        config_hash, err = resolve_build(conn, project_id, cfg, variant or "", image or "")
+        config_hash, err = resolve_build(conn, project_id, cfg, variant or "", image or "", project_root=root)
         if err:
             return None, [{"error": err}]
         if config_hash is None:
