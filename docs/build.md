@@ -168,7 +168,7 @@ the output directory of fw-context, or it compiles nothing:
 | Generic CMake | yes | `cmake -B <out>` |
 | Keil MDK, IAR EWARM | yes | convert only, no compilation |
 | Manual / bare | yes | the `.d` files go to `<out>/deps` |
-| Makefile | only with `make_dry_run = true` (default) | a real `make` owns its output directory |
+| Makefile | with `make_dry_run = true` (default), or with `out_dir_var` | `make <out_dir_var>=<out>`; a dry run compiles nothing |
 | STM32CubeIDE, TI CCS | never | fw-context cannot build these projects |
 
 A build that you start with `--build` uses the same output directory.
@@ -184,8 +184,8 @@ Exceptions:
 - ESP-IDF: fw-context runs `idf.py set-target` only when the project has
   no `sdkconfig`. `set-target` renames `<project>/sdkconfig`, and `-B`
   does not move that file.
-- Makefile: with `make_dry_run = false`, `make` writes its objects where the
-  Makefile says.
+- Makefile: a real `make` (`make_dry_run = false`) needs `out_dir_var`, the
+  variable that names the output directory in your Makefile.
 
 ## Configuration reference
 
@@ -300,7 +300,8 @@ PlatformIO decides the set (`pio project config`), thus `extends`,
 | `makefile` | `str` | `"Makefile"` | The path to the Makefile, relative to the project root |
 | `make_target` | `str` | `"all"` | The build target |
 | `make_vars` | `dict[str,str]` | `{}` | Extra variables, for example `{V: "1"}` |
-| `make_dry_run` | `bool` | `true` | Use `make -n`. This setting runs no real compilation |
+| `make_dry_run` | `bool` | `true` | Use `make -n`. This setting runs no real compilation. `false` runs a real `make`, and it needs `out_dir_var` |
+| `out_dir_var` | `str` | — | The variable of the Makefile that names its output directory, for example `"BUILD_DIR"`. A real build gets `<out_dir_var>=<project>/.fw-context/build/<variant>/out`, as an absolute path, thus a recursive `$(MAKE) -C` gets it too. fw-context does not guess the name: without it, `make_dry_run = false` stops the build with an error. Every output of the Makefile must come from this variable: a Makefile that sets it with `override`, or that writes nothing into it, stops the build with an error. A generated file that the Makefile writes elsewhere (for example into `src/`) still goes there. The project path must hold no space and no `$` |
 
 ### Manual / bare mode (generate from flags)
 
@@ -548,7 +549,8 @@ make_dry_run = true
 
 This example runs `compiledb -n make -C <root> V=1 CROSS_COMPILE=arm-none-eabi- all`.
 Dry-run mode runs no real compilation. Set `make_dry_run = false` when the
-project needs generated headers first. This build system requires
+project needs generated headers first, and name the output variable of the
+Makefile in `out_dir_var`. This build system requires
 `pip install compiledb`.
 
 ### 8. ESP-IDF with explicit path
@@ -743,7 +745,7 @@ images = [
 The build produced no compilation units. Try:
 - Set `clean = true`, and re-run the build
 - Check that the project actually compiles with the configured toolchain
-- For Makefile projects, try `make_dry_run = false` if the project needs
+- For Makefile projects, try `make_dry_run = false` with `out_dir_var` if the project needs
   a real build to generate headers
 
 ### `Keil project not found`

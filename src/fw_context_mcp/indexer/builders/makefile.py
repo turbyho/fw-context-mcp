@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 
 from fw_context_mcp.utils import cc_output_path, run_build_command
 
+from ..build_layout import BuildLayout
 from . import registry
 from .protocol import BuildIssue
 
@@ -117,12 +118,25 @@ class MakefileBuildSystem:
     def generate(self, project_root: Path, cfg: BuildConfig) -> Path:
         """Generate compile_commands.json via ``compiledb make``.
 
-        Runs ``compiledb make [target] [vars...]`` in *project_root*.
+        Runs ``compiledb make [vars...] [target]`` in *project_root*.
         When ``make_dry_run`` is True (the default), ``-n`` is passed
         to make so no actual compilation occurs — only the command
         database is generated.
+
+        A Makefile names its output directory in a variable of its own, and
+        no name is common to all of them.  ``[build] out_dir_var`` names it.
+        The build gets ``<VAR>=<out>``, the absolute output directory of
+        the variant (see ``build_layout``).  The path is absolute, thus it
+        stays correct in a recursive ``$(MAKE) -C <subdir>``.  Without the
+        name, a real build writes where the Makefile says, into the build
+        directory of the user.  Thus ``make_dry_run = false`` without
+        ``out_dir_var`` is an error.  fw-context does not guess the name
+        from the Makefile.
         """
         root = project_root.resolve()
+        out_var = cfg.out_dir_var
+        out_dir = BuildLayout(root).out_dir(cfg.variant_name)
+        self._check_output_variable(cfg, out_dir)
 
         compiledb_prefix = _resolve_compiledb(cfg.python)
 
@@ -150,6 +164,8 @@ class MakefileBuildSystem:
         # Pass extra vars like V=1 CROSS_COMPILE=arm-none-eabi-
         for k, v in cfg.make_vars.items():
             cmd.append(f"{k}={v}")
+        if out_var:
+            cmd.append(f"{out_var}={out_dir}")
 
         cmd.append(target)
 
@@ -159,7 +175,50 @@ class MakefileBuildSystem:
         if not cc_path.exists():
             raise RuntimeError("compile_commands.json was not generated — compiledb may have failed silently")
 
+        # A real make that wrote nothing into out/ did not use the variable:
+        # a typo in out_dir_var, or `override` in the Makefile.  Its output
+        # then went into the build directory of the user.  The database of
+        # compiledb is no output of make, thus it does not count.
+        made = [p for p in out_dir.iterdir() if p != cc_path] if out_dir.is_dir() else []
+        if not cfg.make_dry_run and not made:
+            raise RuntimeError(
+                f"make wrote nothing into {out_dir}: the Makefile does not use {out_var} for its "
+                "output, or it sets it with 'override'. Name the right variable in "
+                "[build] out_dir_var."
+            )
+
         return cc_path
+
+    @staticmethod
+    def _check_output_variable(cfg: BuildConfig, out_dir: Path) -> None:
+        """Refuse a configuration in which a real make cannot reach the output directory.
+
+        make splits a target name and a recipe at whitespace, and it expands
+        ``$``, thus an output directory with one of them breaks the build
+        and can create directories outside the project (measured with a
+        space).  A variable name with whitespace, ``=``, ``:`` or ``#`` is no
+        assignment that make reads as one.
+        """
+        out_var = cfg.out_dir_var
+        if not cfg.make_dry_run and not out_var:
+            raise RuntimeError(
+                "make_dry_run = false runs a real make into the output directory of fw-context. "
+                'Name the output variable of the Makefile in [build] out_dir_var, for example "BUILD_DIR".'
+            )
+        if not out_var:
+            return
+        if any(char.isspace() or char in "=:#" for char in out_var):
+            raise RuntimeError(f"[build] out_dir_var {out_var!r} is not the name of a make variable")
+        if out_var in cfg.make_vars:
+            raise RuntimeError(
+                f"[build] make_vars sets {out_var}, and out_dir_var names it. "
+                "fw-context gives it the output directory. Remove it from make_vars."
+            )
+        if any(char.isspace() or char == "$" for char in str(out_dir)):
+            raise RuntimeError(
+                f"make cannot build into {out_dir}: the path holds a space or '$'. "
+                "Move the project, or rename the variant."
+            )
 
     def validate_artifacts(self, compile_commands: Path, project_root: Path) -> list[BuildIssue]:
         return []
@@ -184,15 +243,14 @@ class MakefileBuildSystem:
         )
 
     def background_build_safe(self, cfg: BuildConfig) -> bool:
-        """Safe only in dry-run mode, which is the default.
+        """Safe in dry-run mode (the default), and with ``out_dir_var``.
 
         ``compiledb -n make`` reads what make would do and compiles nothing,
-        thus no artifact exists to collide with.  With ``make_dry_run`` off
-        the backend runs a real build, and the Makefile owns the output
-        directory: fw-context cannot move it, thus it must not start that
-        build on its own.
+        thus no artifact exists to collide with.  A real build is safe when
+        ``out_dir_var`` sends it to the output directory of fw-context; a
+        real build without it is refused in ``generate``.
         """
-        return bool(cfg.make_dry_run)
+        return bool(cfg.make_dry_run or cfg.out_dir_var)
 
     # ── Build dir patterns ──
 

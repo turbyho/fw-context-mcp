@@ -1,9 +1,11 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -std=c11 -MMD -MP
+# The output directory.  fw-context gives it with out_dir_var = "BUILD_DIR".
+BUILD_DIR ?= .
 SRC = src/main.c
-OBJ = $(SRC:.c=.o)
+OBJ = $(SRC:%.c=$(BUILD_DIR)/%.o)
 DEP = $(OBJ:.o=.d)
-TARGET = test_app
+TARGET = $(BUILD_DIR)/test_app
 
 .PHONY: all
 all: $(TARGET)
@@ -11,7 +13,8 @@ all: $(TARGET)
 $(TARGET): $(OBJ)
 	$(CC) $(CFLAGS) -o $@ $^
 
-%.o: %.c
+$(BUILD_DIR)/%.o: %.c
+	mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 -include $(DEP)

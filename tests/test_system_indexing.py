@@ -535,7 +535,7 @@ class TestMakefileInitAndIndex:
     def indexed(cls):
         proj = _init_and_index(
             _BUILDS / "makefile",
-            replacements={"[build] make_dry_run": "false"},
+            replacements={"[build] make_dry_run": "false", "[build] out_dir_var": '"BUILD_DIR"'},
             clean_db=True,
         )
         yield proj

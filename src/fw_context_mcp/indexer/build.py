@@ -73,6 +73,8 @@ class BuildConfig:
         make_target: Make build target (default: ``"all"``).
         make_vars: Extra variables passed to make (e.g. ``{V: "1"}``).
         make_dry_run: Use ``compiledb -n`` dry-run instead of real build.
+        out_dir_var: The Makefile variable of the output directory; a real build needs it.
+        environment: The PlatformIO environment of the build (``pio run -e``).
         toolchain_path: Path to toolchain binaries (shared by Keil, IAR, Makefile).
         toolchain_prefix: Toolchain prefix (e.g. ``"arm-none-eabi-"``).
         include_dirs: Directories added via ``-I`` (manual/bare mode).
@@ -142,6 +144,11 @@ class BuildConfig:
     make_target: str = "all"  # build target
     make_vars: dict[str, str] = field(default_factory=dict)  # extra vars for make
     make_dry_run: bool = True  # use compiledb -n (dry-run, no real build)
+    # The variable of the Makefile that names its output directory.  A real
+    # build (make_dry_run = false) gets <out_dir_var>=<the absolute output
+    # directory of the variant>, and it needs the name, because no variable
+    # name is common to all Makefiles.
+    out_dir_var: str | None = None
 
     # ── Staging file for the compilation database ──
     # generate_compile_commands sets this, and no user configuration does.
@@ -253,7 +260,7 @@ _SCALAR_FIELDS: frozenset[str] = frozenset({
     "app_config", "board", "idf_path", "fqbn", "cmake_generator",
     "keil_project", "keil_target", "keil_cmsis_path",
     "iar_project", "iar_target", "makefile", "make_target",
-    "make_dry_run", "toolchain_path", "toolchain_prefix", "compiler",
+    "make_dry_run", "out_dir_var", "toolchain_path", "toolchain_prefix", "compiler",
     "activate", "python", "pre_build", "timeout",
     "source_dir", "sysbuild", "environment",
 })

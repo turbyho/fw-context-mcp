@@ -816,6 +816,7 @@ _BUILD_FIELDS: list[tuple[str, str, str]] = [
     ("make_target", "make_target", "str"),
     ("make_vars", "make_vars", "dict"),
     ("make_dry_run", "make_dry_run", "bool"),
+    ("out_dir_var", "out_dir_var", "str"),
     ("toolchain_path", "toolchain_path", "str"),
     ("toolchain_prefix", "toolchain_prefix", "str"),
     ("include_dirs", "include_dirs", "list"),

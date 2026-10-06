@@ -103,3 +103,101 @@ class TestMakefileBuildSystem:
         """detect_environment returns safe defaults."""
         result = MakefileBuildSystem.detect_environment(tmp_path)
         assert result == {"python": None, "activate": None}
+
+
+class TestTheOutputDirectoryOfARealMake:
+    """A real make builds into the output directory of fw-context, through out_dir_var.
+
+    A Makefile names its output directory in a variable of its own, thus the
+    config names that variable.  Without it a real make would write into the
+    tree of the build of the user.
+    """
+
+    _MAKEFILE = (
+        "BUILD_DIR ?= build\n"
+        "all: $(BUILD_DIR)/hello.o\n\n"
+        "$(BUILD_DIR)/hello.o: hello.c\n"
+        "\tmkdir -p $(BUILD_DIR)\n"
+        "\t$(CC) -c hello.c -o $(BUILD_DIR)/hello.o\n"
+    )
+
+    def test_a_real_make_writes_into_out(self, tmp_path):
+        import json
+
+        from fw_context_mcp.indexer.build_layout import BuildLayout
+
+        (tmp_path / "hello.c").write_text("int main(void) { return 0; }\n", encoding="utf-8")
+        (tmp_path / "Makefile").write_text(self._MAKEFILE, encoding="utf-8")
+        cfg = BuildConfig(system="makefile", make_dry_run=False, out_dir_var="BUILD_DIR")
+
+        cc_path = MakefileBuildSystem().generate(tmp_path, cfg)
+
+        out = BuildLayout(tmp_path.resolve()).out_dir("")
+        assert (out / "hello.o").is_file()
+        assert not (tmp_path / "build").exists(), "the directory of the build of the user stays untouched"
+        data = json.loads(cc_path.read_text(encoding="utf-8"))
+        assert any(str(out) in " ".join(entry.get("arguments", [])) or str(out) in entry.get("command", "")
+                   for entry in data)
+
+    def test_a_real_make_without_the_variable_is_refused(self, tmp_path):
+
+        (tmp_path / "Makefile").write_text(self._MAKEFILE, encoding="utf-8")
+
+        with pytest.raises(RuntimeError, match="out_dir_var"):
+            MakefileBuildSystem().generate(tmp_path, BuildConfig(system="makefile", make_dry_run=False))
+
+    def test_the_variable_in_make_vars_is_refused(self, tmp_path):
+
+        cfg = BuildConfig(system="makefile", out_dir_var="BUILD_DIR", make_vars={"BUILD_DIR": "x"})
+
+        with pytest.raises(RuntimeError, match="make_vars"):
+            MakefileBuildSystem().generate(tmp_path, cfg)
+
+    def test_a_real_make_with_the_variable_may_build_in_the_background(self):
+        from fw_context_mcp.indexer.builders import background_build_safe
+
+        cfg = BuildConfig(make_dry_run=False, out_dir_var="BUILD_DIR")
+
+        assert background_build_safe(MakefileBuildSystem(), cfg) is True
+
+    def test_a_path_with_a_space_is_refused_before_make_runs(self, tmp_path):
+        """make splits at whitespace; measured: the build made directories outside the project."""
+        root = tmp_path / "my proj"
+        root.mkdir()
+        (root / "Makefile").write_text(self._MAKEFILE, encoding="utf-8")
+
+        with pytest.raises(RuntimeError, match="space"):
+            MakefileBuildSystem().generate(root, BuildConfig(make_dry_run=False, out_dir_var="BUILD_DIR"))
+        assert not (tmp_path / "my").exists()
+
+    def test_a_makefile_that_ignores_the_variable_is_reported(self, tmp_path):
+        """`override` keeps the build in the directory of the user; an empty out/ shows it."""
+        (tmp_path / "hello.c").write_text("int main(void) { return 0; }\n", encoding="utf-8")
+        (tmp_path / "Makefile").write_text(
+            "override BUILD_DIR := build\n" + self._MAKEFILE.replace("BUILD_DIR ?= build\n", ""),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(RuntimeError, match="override"):
+            MakefileBuildSystem().generate(tmp_path, BuildConfig(make_dry_run=False, out_dir_var="BUILD_DIR"))
+
+    @pytest.mark.parametrize("name", ["BUILD DIR", "A=B", "X:Y", "#X"])
+    def test_a_name_that_is_no_make_variable_is_refused(self, tmp_path, name):
+        with pytest.raises(RuntimeError, match="not the name of a make variable"):
+            MakefileBuildSystem().generate(tmp_path, BuildConfig(out_dir_var=name))
+
+    def test_a_dry_run_passes_the_variable_too(self, tmp_path):
+        """The -o paths of the database then name out/, as a real build would write them."""
+        import json
+
+        from fw_context_mcp.indexer.build_layout import BuildLayout
+
+        (tmp_path / "hello.c").write_text("int main(void) { return 0; }\n", encoding="utf-8")
+        (tmp_path / "Makefile").write_text(self._MAKEFILE, encoding="utf-8")
+
+        cc_path = MakefileBuildSystem().generate(tmp_path, BuildConfig(out_dir_var="BUILD_DIR", variant_name="dev"))
+
+        out = BuildLayout(tmp_path.resolve()).out_dir("dev")
+        entries = json.loads(cc_path.read_text(encoding="utf-8"))
+        assert any(str(out) in " ".join(e.get("arguments", [])) or str(out) in e.get("command", "") for e in entries)
+        assert not (out / "hello.o").exists(), "a dry run compiles nothing"

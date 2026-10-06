@@ -110,7 +110,8 @@ def state(builder_cls, build_cfg) -> AutobuildState:
     *builder_cls* is the class from the registry, or None when no build
     system was detected.  The question goes to the backend with the config
     the build would really use — ``protocol.py`` states that the answer may
-    depend on it, as the makefile backend answers by ``make_dry_run``.
+    depend on it, as the makefile backend answers by ``make_dry_run`` and
+    ``out_dir_var``.
     """
     from .builders import background_build_safe
 
