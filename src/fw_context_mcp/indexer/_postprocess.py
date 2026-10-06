@@ -632,6 +632,8 @@ def _step_purge_missing_files(conn: sqlite3.Connection, ctx: dict) -> None:
         conn, config_hash, missing,
         db_dir=ctx["db_dir"],
     )
+    # The macros step reads it: see _needs_macros.
+    ctx["removed_files"] = ctx.get("removed_files", 0) + len(missing)
     preview = ", ".join(p for _, p in missing[:5])
     if len(missing) > 5:
         preview += f", … (+{len(missing) - 5} more)"
@@ -843,6 +845,8 @@ def _step_purge_files_outside_build(conn: sqlite3.Connection, ctx: dict) -> None
     from .db import purge_missing_files_batch
 
     removed = purge_missing_files_batch(conn, config_hash, stale, db_dir=ctx["db_dir"])
+    # The macros step reads it: see _needs_macros.
+    ctx["removed_files"] = ctx.get("removed_files", 0) + len(stale)
     preview = ", ".join(p for _, p in stale[:5])
     if len(stale) > 5:
         preview += f", … (+{len(stale) - 5} more)"
@@ -978,6 +982,21 @@ def _step_resolve_dispatches(conn: sqlite3.Connection, ctx: dict) -> None:
 
     if resolved:
         log.info("Dispatch edges resolved: %d synthetic edges created", resolved)
+
+
+def _needs_macros(ctx: dict) -> bool:
+    """Say if the expanded values of the macros can differ from the last run.
+
+    They come from the units (``clang -dM -E`` of each one), and a value
+    goes to every row of its name, thus the last unit that defines a name
+    gives the value.  The values change only when a unit was re-parsed (its
+    source, its headers or its flags changed, or the build is new) or when
+    a file left the index.  Otherwise the step gives the stored values
+    again: measured on a Mbed project of 878 units, 104 s in each run that
+    changed nothing.  A partial step over the re-parsed units would give
+    another last unit, thus the step runs over all units or not at all.
+    """
+    return bool(ctx.get("updated")) or bool(ctx.get("removed_files"))
 
 
 def _step_expand_macros(conn: sqlite3.Connection, ctx: dict) -> None:
@@ -1722,7 +1741,7 @@ _STEPS: list[tuple[str, Callable[..., None], Callable[..., bool] | None]] = [
     ("manifest",         _step_update_manifest,    None),
     ("generated_flag",   _step_reconcile_generated, None),
     ("coverage_purge",   _step_purge_files_outside_build, None),
-    ("macros",           _step_expand_macros,      lambda c: c["index_macros_expanded"] and c["units"]),
+    ("macros",           _step_expand_macros,      lambda c: c["index_macros_expanded"] and c["units"] and _needs_macros(c)),
     ("dispatch_edges",   _step_resolve_dispatches,  lambda c: c["index_refs"]),
     ("llm_analysis",     _step_llm_analysis,       lambda c: c["analyze_symbols"] and c["llm_config"] is not None and c["llm_config"].enabled),
     ("embeddings",       _step_build_embeddings,   lambda c: c["index_embeddings"] and c["llm_config"] is not None and c["llm_config"].enabled),
