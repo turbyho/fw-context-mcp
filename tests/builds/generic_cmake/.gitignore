@@ -2,3 +2,7 @@
 # fw-context
 compile_commands.json
 .fw-context/local.toml
+
+# fw-context
+**/.fw-context/*
+!**/.fw-context/config.toml
