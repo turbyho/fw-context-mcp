@@ -65,6 +65,10 @@ class AutobuildState(Enum):
     UNSUPPORTED = "unsupported"
     """The backend cannot build in the background; the caller must act."""
 
+    USER_DATABASE = "user_database"
+    """The index reads a database of the user (``build.user_database``),
+    and no build of fw-context changes it; the user makes it again."""
+
 
 def record_problem(db_dir: Path, text: str, *, build_missing: bool = False) -> None:
     """Remember why the last index run stopped, for each MCP answer.

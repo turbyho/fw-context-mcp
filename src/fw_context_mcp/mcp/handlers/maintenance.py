@@ -40,7 +40,7 @@ from ...indexer.autobuild import AutobuildState, build_missing_reason
 from ...indexer.autobuild import clear_problem as clear_build_problem
 from ...indexer.autobuild import read_problem as read_build_problem
 from ...indexer.autobuild import state as autobuild_state
-from ...indexer.build import checked_compile_commands
+from ...indexer.build import checked_compile_commands, user_database
 from ...indexer.compile_commands import command_line_defines
 from ...indexer.compile_commands import parse as parse_cc
 from ...indexer.db import (
@@ -99,6 +99,10 @@ _AUTOBUILD_ADVICE: dict[AutobuildState, str] = {
         "this build system cannot build in the background without touching "
         "the output of your own build — run `fw-context index --build`"
     ),
+    AutobuildState.USER_DATABASE: (
+        "the index reads the database that [index] compile_commands names, and "
+        "fw-context does not build it — make that file again, then run `fw-context index`"
+    ),
 }
 
 
@@ -114,6 +118,10 @@ def _autobuild_state(root: Path, proj_cfg, new_sources: list[str]) -> AutobuildS
 
     from ...indexer.builders import registry
 
+    # The index run builds nothing for a database of the user
+    # (`build.user_database`), and the advice must not promise a build.
+    if user_database(root, proj_cfg) is not None:
+        return AutobuildState.USER_DATABASE
     # A `[build] command` is a build that the user wrote, and the index run
     # never starts it on its own (`cli._index._may_build_in_background`).
     if proj_cfg.build.command:
@@ -182,7 +190,7 @@ def _background_build_allowed(root: Path, proj_cfg: Config) -> bool:
     from ...indexer.builders import background_build_safe, registry
     from ...utils import SAFE_EXCEPT
 
-    if proj_cfg.build.command:
+    if proj_cfg.build.command or user_database(root, proj_cfg) is not None:
         return False
     try:
         key = proj_cfg.build.system or detect_build_system(root)
@@ -876,7 +884,15 @@ def get_active_build(
             # compile_commands.json, thus a plain run leaves this reason
             # standing, and a promise that the run clears it would be a
             # guess.
-            if bg_running:
+            #
+            # A database of the user gets no build of fw-context, thus
+            # `--build` is no repair there: the user makes the file again.
+            if user_database(root, proj_cfg) is not None:
+                branch_advice = (
+                    "; the index reads the database that [index] compile_commands names — "
+                    "make it again on this branch, then run `fw-context index`"
+                )
+            elif bg_running:
                 branch_advice = (
                     "; an index run is in progress — wait for it rather than "
                     "start a second one, and run `fw-context index --build` "

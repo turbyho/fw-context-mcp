@@ -419,6 +419,53 @@ class TestTheRunOfTheUser:
         problem = read_problem(db_path.parent)
         assert problem is not None and "[[build.variants]] 'dev' build_dir" in problem.text
 
+    def test_a_missing_database_of_the_user_is_an_error_and_no_build(self, tmp_path: Path, capsys) -> None:
+        """A build of fw-context writes another file; it cannot give the file that the config names."""
+        from types import SimpleNamespace
+
+        from fw_context_mcp.cli._index import _resolve_compile_commands
+
+        root = tmp_path / "proj"
+        cfg = self._cfg(root, 'system = "cmake"\n[index]\ncompile_commands = "ci/cc.json"')
+        args = SimpleNamespace(build=False, compile_commands=None, no_clean=False)
+
+        assert _resolve_compile_commands(args, root, cfg, "cmake", False) == (None, False)
+        assert "[index] compile_commands names it" in capsys.readouterr().err
+
+    def test_a_database_of_the_user_is_indexed_and_never_rebuilt(self, tmp_path: Path, monkeypatch) -> None:
+        """Its build directory is gone, and still no build replaces the file in the index."""
+        from types import SimpleNamespace
+
+        import fw_context_mcp.indexer.build as build_mod
+        import fw_context_mcp.indexer.runner as runner_mod
+        from fw_context_mcp.cli import _index as index_mod
+
+        root = tmp_path / "proj"
+        root.mkdir()
+        user_cc = _write_cc(root / "ci" / "cc.json", tmp_path / "ci-machine" / "build")
+        _project(root, tmp_path / "index", user_cc)
+        config = root / ".fw-context" / "config.toml"
+        config.write_text(config.read_text(encoding="utf-8") + '[index]\ncompile_commands = "ci/cc.json"\n',
+                          encoding="utf-8")
+        indexed: list[Path] = []
+
+        def _no_build(*a, **kw):
+            raise AssertionError("a build replaced the database of the user")
+
+        monkeypatch.setattr(build_mod, "generate_compile_commands", _no_build)
+        monkeypatch.setattr(runner_mod, "run", lambda **kw: indexed.append(Path(kw["compile_commands"])) or "0" * 64)
+        monkeypatch.setattr(index_mod, "_build_run_kwargs", lambda *a, **kw: {})
+        monkeypatch.setattr(index_mod, "_post_index_optimize", lambda *a, **kw: None)
+        monkeypatch.setattr(index_mod, "_ensure_watcher_after_index", lambda root: None)
+        args = SimpleNamespace(
+            verbose=False, project=str(root), background=False, build=False,
+            compile_commands=None, no_clean=False, force=False, takeover=False,
+            vendor_paths=None, project_paths=None,
+        )
+
+        assert index_mod.cmd_index(args) == 0
+        assert indexed == [user_cc.resolve()]
+
     def test_a_missing_file_is_left_to_the_default_path(self, tmp_path: Path) -> None:
         """Before the run, ``_resolve_compile_commands`` builds then, or gives its own error."""
         from fw_context_mcp.cli._index import _build_if_missing, _refuse_without_build
@@ -612,3 +659,101 @@ class TestTheMcpAnswers:
 
         assert index_mod.cmd_index(args) == 0
         assert read_problem(db_path.parent) is None
+
+
+@pytest.mark.usefixtures("global_config")
+class TestTheDatabaseOfTheUser:
+    """[index] compile_commands names a database of the user: the CLI and MCP give one answer.
+
+    fw-context runs no build for it (``build.user_database``), thus no
+    check of its build, no advice ``--build``, and no promise of a build in
+    the background.
+    """
+
+    @staticmethod
+    def _project_with_user_database(tmp_path: Path, extra: str = "") -> tuple[Path, Path]:
+        root = tmp_path / "proj"
+        root.mkdir()
+        user_cc = _write_cc(root / "ci" / "cc.json", tmp_path / "ci-machine" / "build")
+        db_path = _project(root, tmp_path / "index", user_cc)
+        config = root / ".fw-context" / "config.toml"
+        config.write_text(
+            config.read_text(encoding="utf-8") + extra + '[index]\ncompile_commands = "ci/cc.json"\n',
+            encoding="utf-8",
+        )
+        return root, db_path
+
+    def test_no_build_of_it_is_checked(self, tmp_path: Path) -> None:
+        from fw_context_mcp.config import load as load_config
+        from fw_context_mcp.indexer.build import checked_compile_commands
+
+        root, _ = self._project_with_user_database(tmp_path)
+        cfg = load_config(project_root=root)
+
+        assert checked_compile_commands(root, cfg, (root / "ci" / "cc.json").resolve()) is None
+
+    def test_get_active_build_reports_no_missing_build(self, tmp_path: Path) -> None:
+        """The directory of a CI database is on the CI machine; that is no missing build."""
+        from fw_context_mcp.mcp.handlers.maintenance import get_active_build
+
+        root, _ = self._project_with_user_database(tmp_path)
+
+        result = get_active_build(project_root=str(root))
+        assert not any("build directory" in r or "--build" in r for r in result.get("reindex_reasons", []))
+
+    def test_new_sources_get_the_advice_of_a_database_of_the_user(self, tmp_path: Path) -> None:
+        from fw_context_mcp.config import load as load_config
+        from fw_context_mcp.indexer.autobuild import AutobuildState
+        from fw_context_mcp.mcp.handlers.maintenance import _autobuild_state
+
+        root, _ = self._project_with_user_database(tmp_path)
+
+        state = _autobuild_state(root, load_config(project_root=root), ["src/new.c"])
+        assert state is AutobuildState.USER_DATABASE
+
+    def test_build_with_it_is_refused(self, tmp_path: Path, capsys) -> None:
+        """--build writes another file; the index would change from one database to the other."""
+        from types import SimpleNamespace
+
+        from fw_context_mcp.cli._index import _resolve_compile_commands
+        from fw_context_mcp.config import load as load_config
+
+        root, _ = self._project_with_user_database(tmp_path)
+        args = SimpleNamespace(build=True, compile_commands=None, no_clean=False)
+
+        assert _resolve_compile_commands(args, root, load_config(project_root=root), "cmake", False) == (None, False)
+        assert "--build would index the build of fw-context" in capsys.readouterr().err
+
+    def test_variants_with_it_are_refused(self, tmp_path: Path, capsys) -> None:
+        from types import SimpleNamespace
+
+        from fw_context_mcp.cli import _index as index_mod
+
+        root, _ = self._project_with_user_database(
+            tmp_path, extra='[[build.variants]]\nname = "dev"\nboard = "b"\n',
+        )
+        args = SimpleNamespace(
+            verbose=False, project=str(root), background=False, build=False,
+            compile_commands=None, no_clean=False, force=False, takeover=False,
+            vendor_paths=None, project_paths=None,
+        )
+
+        assert index_mod.cmd_index(args) == 1
+        assert "[[build.variants]] build their own databases" in capsys.readouterr().err
+
+    def test_init_does_not_build_a_missing_one(self, tmp_path: Path, monkeypatch) -> None:
+        import fw_context_mcp.indexer.build as build_mod
+        from fw_context_mcp.cli._init_build import _auto_build_if_possible
+        from fw_context_mcp.config import load as load_config
+
+        root, _ = self._project_with_user_database(tmp_path)
+        (root / "ci" / "cc.json").unlink()
+
+        def _no_build(*a, **kw):
+            raise AssertionError("init built a database that the index does not read")
+
+        monkeypatch.setattr(build_mod, "generate_compile_commands", _no_build)
+        ok, path, error = _auto_build_if_possible(root, "cmake", load_config(project_root=root))
+
+        assert (ok, path) == (False, None)
+        assert "[index] compile_commands names it" in (error or "")

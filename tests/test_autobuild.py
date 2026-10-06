@@ -86,7 +86,9 @@ class TestBackgroundBuildGate:
         class _Cfg:
             def __init__(self) -> None:
                 self.build = BuildConfig(**build)
-                self.index = None
+                from fw_context_mcp.config.settings import IndexConfig
+
+                self.index = IndexConfig()
 
         return _Cfg()
 
@@ -321,26 +323,20 @@ class TestTheProblemOfAMultiRun:
         import fw_context_mcp.indexer.build as build_mod
         import fw_context_mcp.utils as utils_mod
         from fw_context_mcp.cli import _index as index_mod
+        from fw_context_mcp.config.settings import IndexConfig
+        from fw_context_mcp.indexer.build import BuildConfig
 
-        @dataclass
-        class _Index:
-            db_dir: Path
-            vendor_paths: list = field(default_factory=list)
-            project_paths: list = field(default_factory=list)
-
-        @dataclass
-        class _Build:
-            system: str | None = "zephyr"
-            build_dir: str | None = None
-            variants: list = field(default_factory=lambda: [BuildVariant(name="one")])
-
+        # The real config classes: cmd_index reads more of them with each
+        # change, and a stub with a few fields broke each time.
         @dataclass
         class _Cfg:
-            index: _Index
-            build: _Build = field(default_factory=_Build)
+            index: IndexConfig
+            build: BuildConfig = field(
+                default_factory=lambda: BuildConfig(system="zephyr", variants=[BuildVariant(name="one")])
+            )
             cache_server: None = None
 
-        cfg = _Cfg(index=_Index(db_dir=tmp_path / "index"))
+        cfg = _Cfg(index=IndexConfig(db_dir=tmp_path / "index"))
         recorded: list[str] = []
 
         monkeypatch.setattr(utils_mod, "resolve_project_root", lambda arg: tmp_path)

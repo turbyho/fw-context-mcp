@@ -309,15 +309,29 @@ def _resolve_compile_commands(
     Three resolution strategies, tried in order:
     1. ``--build`` — force a fresh build, ignoring any existing file.
     2. Explicit path (positional arg) — use the provided file.
-    3. Default — reuse existing cc.json from config; build if missing.
+    3. Default — the database of the build of fw-context, built when it is
+       missing; or the database of the user that ``[index]
+       compile_commands`` names (``build.user_database``), never built.
 
     WHY: Users should not need to know where their build system stores
-    compile_commands.json.  The default path is discovered from the
-    detected build system and stored in config.  The explicit path
-    option exists for edge cases (CI pipelines, unsupported build
-    systems) where the user manages cc.json themselves.
+    compile_commands.json.  The explicit path option exists for edge cases
+    (CI pipelines, unsupported build systems) where the user manages
+    cc.json themselves.
     """
+    from ..indexer.build import user_database
+
     explicit_cc = bool(args.compile_commands)
+
+    # `--build` writes the database of the build of fw-context, and a run
+    # with a database of the user reads the other file: the index would
+    # change from one database to the other with each run.
+    if args.build and not explicit_cc and user_database(project_root, cfg) is not None:
+        print(
+            "error: [index] compile_commands names a database of your own, and --build would "
+            "index the build of fw-context instead. Remove the key, or run without --build.",
+            file=sys.stderr,
+        )
+        return None, False
 
     if args.build:
         # A background run builds only with a backend that may build on its
@@ -360,6 +374,12 @@ def _resolve_compile_commands(
     )
 
     cc = default_compile_commands(project_root, cfg)
+    if not cc.exists() and user_database(project_root, cfg) is not None:
+        # A build of fw-context writes another file, thus it cannot give
+        # the user the file that the config names.
+        print(f"error: {cc} not found — [index] compile_commands names it", file=sys.stderr)
+        print("  Make the file, or remove the key to index the build of fw-context.", file=sys.stderr)
+        return None, False
     if not cc.exists():
         if bg and not _may_build_in_background(cfg, detected_system):
             print(f"error: compile_commands.json not found at {cc}", file=sys.stderr)
@@ -375,7 +395,9 @@ def _resolve_compile_commands(
 
     for warning in check_completeness(cc, project_root):
         print(f"warning: {warning}", file=sys.stderr)
-    return cc, False
+    # A database of the user is explicit: `_validate_and_fix_artifacts` must
+    # not rebuild it, as it does not rebuild a file on the command line.
+    return cc, user_database(project_root, cfg) is not None
 
 
 def _validate_and_fix_artifacts(
@@ -459,7 +481,10 @@ def _validate_and_fix_artifacts(
         if errors:
             for e in errors:
                 print(f"error: {e.message}", file=sys.stderr)
-            if bg:
+            if explicit_cc:
+                # `--build` would replace the file of the user in the index.
+                print("Repair the compile_commands.json that you gave, then run 'fw-context index'.", file=sys.stderr)
+            elif bg:
                 print("Run 'fw-context index' to resolve issues.", file=sys.stderr)
             else:
                 print("Run 'fw-context index --build' to rebuild and fix issues.", file=sys.stderr)
@@ -1471,14 +1496,26 @@ def _cmd_index(args: argparse.Namespace, outside: _SigtermOutsideTheLock) -> int
         autobuild.record_problem(db_path.parent, text)
         return 1
 
+    # Each variant builds its own database, thus [index] compile_commands
+    # with a database of the user would have no effect for them: an error,
+    # and not a file that the run ignores without a word.
+    from ..indexer.build import explicit_compile_commands, user_database
+
+    if cfg.build.variants and user_database(project_root, cfg) is not None:
+        text = (
+            "[index] compile_commands names a database of your own, and [[build.variants]] build "
+            "their own databases. Remove one of the two from .fw-context/config.toml."
+        )
+        print(f"error: {text}", file=sys.stderr)
+        autobuild.record_problem(db_path.parent, text)
+        return 1
+
     # A project file that holds more than one build (each [env:<name>] of
     # platformio.ini) gives one variant for each, when the config declares
     # none.  The build system answers, thus the set is the set that its
     # build makes.  An explicit compile_commands.json (on the command line,
     # or in [index] compile_commands) and a [build] command name their build
     # themselves.
-    from ..indexer.build import explicit_compile_commands
-
     if (
         not cfg.build.variants and not cfg.build.command
         and not getattr(args, "compile_commands", None)
@@ -1509,7 +1546,9 @@ def _cmd_index(args: argparse.Namespace, outside: _SigtermOutsideTheLock) -> int
     # A compile_commands.json that the user names is the input of this run.
     # No automatic build may replace it: `--build` comes before the explicit
     # file in `_resolve_compile_commands`, thus a build would drop the file.
-    explicit_cc = bool(getattr(args, "compile_commands", None))
+    # The user names it on the command line, or in [index] compile_commands
+    # for a build that fw-context can run (`build.user_database`).
+    explicit_cc = bool(getattr(args, "compile_commands", None)) or user_database(project_root, cfg) is not None
     # The file of the active index: only the build of that file is checked
     # (`build.checked_compile_commands`).
     indexed_cc = _indexed_compile_commands(project_root, db_path)

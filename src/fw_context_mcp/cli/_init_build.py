@@ -159,6 +159,13 @@ def _auto_build_if_possible(
         print(f"  [ok] compile_commands.json already exists ({_count_cc_entries(cc)} entries)")
         return True, cc, None
 
+    # A database of the user is never built: a build of fw-context writes
+    # another file, which `fw-context index` would not read.
+    from ..indexer.build import user_database
+
+    if user_database(project_root, cfg) is not None:
+        return False, None, f"{cc} not found — [index] compile_commands names it, and fw-context does not build it"
+
     print("  [build] Generating compile_commands.json...")
     try:
         result_path = generate_compile_commands(project_root, cfg.build)

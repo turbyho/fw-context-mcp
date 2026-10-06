@@ -707,6 +707,11 @@ def checked_compile_commands(project_root: Path, cfg, indexed: Path | None) -> P
     """
     if cfg.build.variants:
         return None
+    # A database of the user has no build that fw-context runs, thus there is
+    # no build to check: a missing `directory` of a CI database is the CI
+    # machine, and the advice `--build` would replace the file in the index.
+    if user_database(project_root, cfg) is not None:
+        return None
     explicit = explicit_compile_commands(project_root, cfg)
     if explicit is not None:
         if indexed is not None and explicit != indexed.resolve():
@@ -760,6 +765,26 @@ def explicit_compile_commands(project_root: Path, cfg) -> Path | None:
     if any(configured == (root / value).resolve() for value in _BUILD_DATABASE_VALUES):
         return None
     return configured
+
+
+def user_database(project_root: Path, cfg) -> Path | None:
+    """Return the database of the user that ``[index] compile_commands`` names, or None.
+
+    It is a file that the config names for a build that fw-context CAN run
+    (a CI database, a copy for clangd).  fw-context indexes it as it is and
+    runs no build for it: a build of fw-context writes another file, and it
+    would replace the file of the user in the index.  For a build that
+    fw-context cannot run (a stub), the configured file is the only
+    database there is, thus it is no database "of the user" here, and the
+    checks of its build stay.
+
+    The CLI and ``get_active_build`` both ask here, thus the two cannot
+    disagree about what fw-context builds.
+    """
+    root = project_root.resolve()
+    if not can_run_build(cfg.build, cfg.build.system or detect_build_system(root)):
+        return None
+    return explicit_compile_commands(root, cfg)
 
 
 def default_compile_commands(project_root: Path, cfg) -> Path:

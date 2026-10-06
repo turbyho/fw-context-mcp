@@ -593,9 +593,14 @@ def _implicit_variant_names(project_root: Path, build_system: str | None, proj_c
     that cannot answer gives [], and the build of ``init`` then reports its
     own error, which names the cause.
     """
+    from ..indexer.build import explicit_compile_commands
     from ..indexer.builders import implicit_variants
     from ..indexer.builders import registry as builder_registry
 
+    # The same gate as in `fw-context index`: a database of the user and a
+    # [build] command name their build themselves.
+    if proj_cfg.build.command or explicit_compile_commands(project_root, proj_cfg) is not None:
+        return []
     builder_cls = builder_registry.get(build_system) if build_system else None
     try:
         found = implicit_variants(builder_cls() if builder_cls else None, project_root, proj_cfg.build)

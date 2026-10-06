@@ -207,12 +207,23 @@ _PROJECT_DEFAULTS_TEMPLATE = """\
 # default_image   = "app"           # default image within default_variant
 
 # ── PlatformIO ───────────────────────────────────────────────────────────
-# Usually needs no extra config — pio run --target compiledb is enough.
+# Usually needs no extra config.  Each [env:<name>] of platformio.ini is a
+# build; two or more environments become variants, named as the environment.
 # system = "platformio"
+# environment = "esp32dev"   # build this one environment only
+
+# ── Makefile ─────────────────────────────────────────────────────────────
+# A real make (make_dry_run = false) needs the Makefile variable of its
+# output directory; the build goes to .fw-context/build/<variant>/out.
+# make_dry_run = false
+# out_dir_var = "BUILD_DIR"
+
+# Each build goes to .fw-context/build/<variant>/out ("default" without
+# variants), and the index reads its compile_commands.json from there.
 
 [index]
-compile_commands = ".fw-context/build/compile_commands.json"
-# Generate it with:  fw-context index --build  (auto-detects build system)
+# compile_commands = "ci/compile_commands.json"   # a database of your own; no build of fw-context
+# Generate the build with:  fw-context index --build  (auto-detects build system)
 # config_header = "config/my_build_config.h"   # path to config.h for custom build systems
 #vendor_paths = ["third_party", "vendor_libs"]
 #project_paths = ["src/old_hal", "lib/muj_modul"]
