@@ -1555,7 +1555,7 @@ def cleanup_retired_builds(
     is retired when its variant is not in *variants* (the config or
     platformio.ini dropped it, or the project changed between one build and
     variants), or when its variant built in this run and that build made no
-    such image (a sysbuild that stopped making ``app_slot1_variant``).  A
+    such image (a sysbuild that stopped making ``app_alt``).  A
     variant of the set whose build failed in this run keeps its builds: the
     failure says nothing about the images that it makes.
 

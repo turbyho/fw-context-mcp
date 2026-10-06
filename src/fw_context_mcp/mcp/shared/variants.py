@@ -8,13 +8,13 @@ into ONE concrete build scope (``config_hash`` + identity).
 A project can hold several builds, and they are not variations of one answer.
 Measured on one Zephyr project, nine builds sit on two axes: two boards
 (``nrf52840-dev``, ``nrf54lm20a-dev``) and, inside each, several images —
-``app``, ``mcuboot``, ``stage0``, ``app_slot1_variant``.  An image is a
+``app``, ``mcuboot``, ``stage0``, ``app_alt``.  An image is a
 separate firmware binary: a bootloader is not the application.
 
 Nobody reasons about code across two programs or two boards at once, thus a
 merged answer serves no question and carries two hazards.  It blends symbols
 of different binaries, and where two builds ARE near-identical it duplicates
-almost every row: ``app`` and ``app_slot1_variant`` of that project share
+almost every row: ``app`` and ``app_alt`` of that project share
 10585 of about 11000 names.
 
 Both selectors are therefore fail-closed:

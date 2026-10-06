@@ -110,7 +110,7 @@ class TestRetiredBuilds:
     def test_an_image_that_the_build_no_longer_makes_goes(self, temp_db, tmp_path):
         from fw_context_mcp.indexer._postprocess import cleanup_retired_builds
 
-        self._seed(temp_db, [("h-app", "dev", "app"), ("h-slot1", "dev", "app_slot1_variant")])
+        self._seed(temp_db, [("h-app", "dev", "app"), ("h-alt", "dev", "app_alt")])
 
         cleanup_retired_builds(temp_db, "proj-001", tmp_path, {"dev"}, {("dev", "app")})
 
