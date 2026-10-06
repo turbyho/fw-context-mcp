@@ -691,3 +691,72 @@ class TestNoIndexFileIsMade:
         _record_still_uncovered(tmp_path, db_path)
 
         assert not db_path.exists()
+
+
+class TestEveryBuildOfTheProjectCounts:
+    """A file that another build of the project indexes is not a new source.
+
+    A file that only the bootloader compiles is not in the index of the
+    application.  An edit to it made it a "source missing from
+    compile_commands.json", and that started a build of each variant for a
+    file that every build already had.
+    """
+
+    @staticmethod
+    def _second_build(conn, root: Path, cc_of_first: Path, relative: str) -> Path:
+        """Add a build of the same project that indexes *relative*; its database is the newest."""
+        from fw_context_mcp.indexer.db import transaction, upsert_build_config, upsert_file
+        from fw_context_mcp.indexer.ops import _normalize_file_path
+
+        project_id = conn.execute(
+            "SELECT project_id FROM build_configs WHERE config_hash=?", (_CONFIG_HASH,)
+        ).fetchone()["project_id"]
+        source = _add_file(root, relative)
+        cc = root / "boot.json"
+        cc.write_text(json.dumps([{"file": str(source)}]))
+        reference = os.path.getmtime(cc_of_first)
+        os.utime(source, (reference + 50, reference + 50))
+        os.utime(cc, (reference + 100, reference + 100))
+        with transaction(conn):
+            upsert_build_config(conn, "hash-boot", project_id, str(cc), variant="", image="boot")
+            upsert_file(conn, "hash-boot", _normalize_file_path(str(source), root), "c",
+                        mtime=os.path.getmtime(source))
+            conn.execute("UPDATE files SET is_project=1 WHERE config_hash='hash-boot'")
+        return source
+
+    def test_a_file_of_another_build_is_covered(self, project):
+        conn, root, cc = project
+        self._second_build(conn, root, cc, "boot/flash.c")
+
+        assert find_unindexed_sources(conn, _CONFIG_HASH, root, cc) == []
+
+    def test_a_file_that_no_build_indexes_is_new(self, project):
+        conn, root, cc = project
+        self._second_build(conn, root, cc, "boot/flash.c")
+        _add_file(root, "src/new.c", newer_than=root / "boot.json")
+
+        assert find_unindexed_sources(conn, _CONFIG_HASH, root, cc) == ["src/new.c"]
+
+    def test_a_file_that_one_build_has_not_seen_is_new(self, project):
+        """A run that --variant narrowed wrote only the newest database.
+
+        The build of the application ran before the file existed, thus the
+        file is new for it, though the newest database is younger.
+        """
+        conn, root, cc = project
+        self._second_build(conn, root, cc, "boot/flash.c")
+        new = _add_file(root, "src/new.c", newer_than=cc)
+        boot_mtime = os.path.getmtime(root / "boot.json")
+        os.utime(new, (boot_mtime - 10, boot_mtime - 10))
+
+        assert find_unindexed_sources(conn, _CONFIG_HASH, root, cc) == ["src/new.c"]
+
+    def test_a_file_older_than_every_database_was_seen_by_every_build(self, project):
+        """Each build ran after the file was written, and no build system took it."""
+        conn, root, cc = project
+        self._second_build(conn, root, cc, "boot/flash.c")
+        new = _add_file(root, "src/new.c")
+        first = os.path.getmtime(cc)
+        os.utime(new, (first - 10, first - 10))
+
+        assert find_unindexed_sources(conn, _CONFIG_HASH, root, cc) == []

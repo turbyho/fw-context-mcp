@@ -586,6 +586,19 @@ def find_unindexed_sources(
     older than the regenerated compile_commands.json, thus a file that the
     build system never accepts is reported once, not forever.
 
+    Each build of the project counts, each ``(variant, image)``: a file that
+    one of them indexes is covered, and the reference time is the OLDEST of
+    their compile_commands.json — a build whose database is older than the
+    file never saw it.  The newest would miss a file after a run that
+    ``--variant`` narrowed: that run writes only the database of its variant.
+    A build of each variant makes every database newer than the file, thus
+    the loop still stops.  A file that only the bootloader compiles
+    is not in the index of the application, and an edit to it made it a
+    "source missing from compile_commands.json" — a build of each variant
+    for a file that every build already had.  A file that no build indexes
+    is new, and the build of each variant gives it to the builds that
+    compile it.
+
     Args:
         conn: Open connection to the index database.
         config_hash: Active build configuration.
@@ -619,6 +632,14 @@ def find_unindexed_sources(
         return []
 
     known, scan_roots = _indexed_paths(conn, config_hash)
+    for other_hash, other_cc in _other_builds(conn, config_hash):
+        other_known, other_roots = _indexed_paths(conn, other_hash)
+        known |= other_known
+        scan_roots |= other_roots
+        try:
+            cc_mtime = min(cc_mtime, os.path.getmtime(other_cc))
+        except OSError:
+            continue  # a build without its database is the missing-build check
     tu_exts = load_tu_extensions(db_dir_of(conn), config_hash) or TU_EXTENSIONS
     db_path = Path(conn.execute("PRAGMA database_list").fetchone()["file"])
     # The directory fw-context writes into is not a place to look for the
@@ -696,6 +717,25 @@ def _tu_candidates(
     for scan_root in sorted(_project_scan_roots(scan_roots, build_patterns)):
         start = root if scan_root == "." else root / scan_root
         yield from _walk_tu_candidates(start, scan_root == ".", build_patterns, tu_exts)
+
+
+def _other_builds(conn, config_hash: str) -> list[tuple[str, Path]]:
+    """Return ``(config_hash, compile_commands.json)`` of the other current builds of the project.
+
+    The project is the one of *config_hash*; the builds are the newest
+    completed build of each other ``(variant, image)``, see
+    :func:`latest_builds`.
+    """
+    row = conn.execute(
+        "SELECT project_id FROM build_configs WHERE config_hash = ?", (config_hash,),
+    ).fetchone()
+    if row is None:
+        return []
+    return [
+        (build["config_hash"], Path(build["compile_commands_path"]))
+        for build in latest_builds(conn, row["project_id"])
+        if build["config_hash"] != config_hash and build["compile_commands_path"]
+    ]
 
 
 def _indexed_paths(conn, config_hash: str) -> tuple[set[str], set[str]]:
