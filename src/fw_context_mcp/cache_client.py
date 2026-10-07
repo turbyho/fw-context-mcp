@@ -3,8 +3,8 @@
 ``CacheClient`` communicates with a remote ``fw-cache-server`` instance
 via HTTP, providing batch get/put operations with retry logic and
 graceful offline fallback.  It also manages a local SQLite cache
-(``~/.fw-context/llm_cache.db``) that serves as a first-tier lookup
-before hitting the network.
+(``llm_cache.db`` in ``$FW_CONTEXT_HOME``, else in ``~/.fw-context``)
+that serves as a first-tier lookup before hitting the network.
 
 Why a local + remote two-tier cache?
 ------------------------------------
@@ -62,12 +62,25 @@ from typing import Any
 import httpx
 
 from fw_context_mcp.cache_limits import MAX_BATCH_ENTRIES, MAX_BODY_BYTES
-from fw_context_mcp.utils import SAFE_EXCEPT, is_fatal
+from fw_context_mcp.utils import SAFE_EXCEPT, fw_context_home, is_fatal
 
 logger = logging.getLogger(__name__)
 
-_LOCAL_CACHE_DIR = Path.home() / ".fw-context"
-_LOCAL_CACHE_PATH = _LOCAL_CACHE_DIR / "llm_cache.db"
+
+def _local_cache_path() -> Path:
+    """Return the path of the local LLM cache: ``llm_cache.db`` in the global directory.
+
+    The function reads ``$FW_CONTEXT_HOME`` at each call, not at import.
+    A module constant took the home of the operator before the test session
+    set the variable, and the tests wrote their rows into the real cache.
+
+    The path is absolute, because :func:`get_local_cache_db` puts it into a
+    ``file://`` URI.  SQLite reads a relative ``$FW_CONTEXT_HOME`` there as
+    the URI authority and stops with ``invalid uri authority``.
+    """
+    return (fw_context_home() / "llm_cache.db").absolute()
+
+
 _SERVER_MAX_BATCH = MAX_BATCH_ENTRIES
 """The most hashes/entries the server takes from one request.
 
@@ -189,7 +202,7 @@ def _get_retry_after(resp, default: float) -> float:
 def get_local_cache_db(readonly: bool = False) -> sqlite3.Connection:
     """Open (or create) the local cross-project LLM analysis cache.
 
-    Returns a SQLite connection to ``~/.fw-context/llm_cache.db``.
+    Returns a SQLite connection to the file of :func:`_local_cache_path`.
     The database and schema are created on first access.
 
     Why WAL journal mode?
@@ -214,13 +227,14 @@ def get_local_cache_db(readonly: bool = False) -> sqlite3.Connection:
     switch to ``rwc`` mode so the file is created and schema is
     initialized.  Subsequent calls can use ``mode=ro`` normally.
     """
-    _LOCAL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    if readonly and not _LOCAL_CACHE_PATH.exists():
+    cache_path = _local_cache_path()
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    if readonly and not cache_path.exists():
         readonly = False
-    uri = f"file://{_LOCAL_CACHE_PATH}?mode={'ro' if readonly else 'rwc'}"
+    uri = f"file://{cache_path}?mode={'ro' if readonly else 'rwc'}"
     conn = sqlite3.connect(uri, uri=True)
     try:
-        _LOCAL_CACHE_PATH.chmod(0o600)
+        cache_path.chmod(0o600)
     except OSError:
         pass
     conn.execute("PRAGMA journal_mode=WAL")
@@ -318,9 +332,10 @@ def local_cache_clear() -> int:
     On next access, ``get_local_cache_db()`` recreates the file with
     a fresh schema.
     """
-    if _LOCAL_CACHE_PATH.exists():
+    cache_path = _local_cache_path()
+    if cache_path.exists():
         try:
-            _LOCAL_CACHE_PATH.unlink()
+            cache_path.unlink()
             return 0
         except OSError:
             return 1
@@ -337,12 +352,13 @@ def local_cache_stats() -> dict[str, Any]:
     the filesystem — including the path in stats output gives the
     operator a direct handle to the file.
     """
-    if not _LOCAL_CACHE_PATH.exists():
-        return {"total_entries": 0, "path": str(_LOCAL_CACHE_PATH)}
+    cache_path = _local_cache_path()
+    if not cache_path.exists():
+        return {"total_entries": 0, "path": str(cache_path)}
     conn = get_local_cache_db(readonly=True)
     try:
         total = conn.execute("SELECT COUNT(*) FROM llm_analysis_cache").fetchone()[0]
-        return {"total_entries": total, "path": str(_LOCAL_CACHE_PATH)}
+        return {"total_entries": total, "path": str(cache_path)}
     finally:
         conn.close()
 

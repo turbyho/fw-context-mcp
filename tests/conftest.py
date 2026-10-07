@@ -155,7 +155,8 @@ def _isolate_index_dir():
     the operator.
 
     A fourth: ``FW_CONTEXT_HOME``, the global directory (the global config,
-    and the files that ``housekeeping.clean`` removes there).  A test that
+    the local LLM cache ``llm_cache.db``, and the files that
+    ``housekeeping.clean`` removes there).  A test that
     ran ``fw-context index`` as a process removed a file from
     ``~/.fw-context`` of the operator.  The global config of the operator
     is copied in, so that a test that asks Ollama uses the models of the

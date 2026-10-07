@@ -21,7 +21,7 @@ fw-context merges three levels of TOML files, in this order. A later file overri
 
 `local.toml` holds settings that are specific to each developer. Examples are which Ollama model you have installed, where your index database is, and whether you want LLM analysis enabled. Keep `local.toml` out of git.
 
-The environment variable `FW_CONTEXT_HOME` moves the global `config.toml` and the global files that the cleanup removes (see [Obsolete keys and files](#obsolete-keys-and-files)). Without it, they are in `~/.fw-context`. It does not move the index, the project registry or the clang headers: these have their own variables (`FW_CONTEXT_INDEX_DIR`, `FW_CONTEXT_PROJECTS_DB`, `FW_CONTEXT_CLANG_RESOURCE_DIR`). The test suite of fw-context sets all four, thus a test cannot change the files of the operator.
+The environment variable `FW_CONTEXT_HOME` moves the global `config.toml`, the local LLM cache `llm_cache.db`, and the global files that the cleanup removes (see [Obsolete keys and files](#obsolete-keys-and-files)). Without it, they are in `~/.fw-context`. It does not move the index, the project registry or the clang headers: these have their own variables (`FW_CONTEXT_INDEX_DIR`, `FW_CONTEXT_PROJECTS_DB`, `FW_CONTEXT_CLANG_RESOURCE_DIR`). The test suite of fw-context sets all four, thus a test cannot change the files of the operator.
 
 Run `fw-context init` to create the project config files with commented-out default values. This command also adds the necessary entries to `.gitignore`. On first use, fw-context creates only the global `~/.fw-context/config.toml`. The MCP tools and `fw-context index` create no config file in a project that `init` did not set up, and read a missing project file as empty.
 

@@ -1994,7 +1994,7 @@ class TestStoreSymbolsForUnitAnalysisRestore:
 
         conn.close()
 
-    def test_analysis_columns_synced_on_restore(self, store_db, tmp_path: Path):
+    def test_analysis_columns_synced_on_restore(self, store_db, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         """Phase 3: when analysis is restored, symbols.summary/inputs/outputs are updated."""
         from fw_context_mcp.indexer.ops import store_symbols_for_unit
 
@@ -2056,27 +2056,20 @@ class TestStoreSymbolsForUnitAnalysisRestore:
             "int calc(void)",
             "",
         )
-        import os as _os2
+        # The local LLM cache follows FW_CONTEXT_HOME, not HOME.  A change of
+        # HOME left this row in the cache of the operator.
+        monkeypatch.setenv("FW_CONTEXT_HOME", str(tmp_path))
+        from fw_context_mcp.cache_client import get_local_cache_db as _get_db2
 
-        _saved_home2 = _os2.environ.get("HOME")
-        _os2.environ["HOME"] = str(tmp_path)
-        try:
-            from fw_context_mcp.cache_client import get_local_cache_db as _get_db2
-
-            global_db2 = _get_db2()
-            global_db2.execute(
-                """INSERT OR REPLACE INTO llm_analysis_cache
-                   (content_hash, summary, inputs, outputs, model, analyzed_at)
-                   VALUES (?, 'Returns magic number.', 'none', '42', 'test', datetime('now'))""",
-                (content_hash,),
-            )
-            global_db2.commit()
-            global_db2.close()
-        finally:
-            if _saved_home2 is None:
-                _os2.environ.pop("HOME", None)
-            else:
-                _os2.environ["HOME"] = _saved_home2
+        global_db2 = _get_db2()
+        global_db2.execute(
+            """INSERT OR REPLACE INTO llm_analysis_cache
+               (content_hash, summary, inputs, outputs, model, analyzed_at)
+               VALUES (?, 'Returns magic number.', 'none', '42', 'test', datetime('now'))""",
+            (content_hash,),
+        )
+        global_db2.commit()
+        global_db2.close()
 
         from fw_context_mcp.indexer.compile_commands import CompilationUnit
         from fw_context_mcp.indexer.symbols import ExtractionResult, Symbol

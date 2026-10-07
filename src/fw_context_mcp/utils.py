@@ -898,7 +898,8 @@ FW_CONTEXT_HOME_ENV = "FW_CONTEXT_HOME"
 def fw_context_home() -> Path:
     """Return the global directory of fw-context: ``$FW_CONTEXT_HOME``, else ``~/.fw-context``.
 
-    The global config and the cleanup of the global files read it.  The
+    The global config, the local LLM cache (``llm_cache.db``) and the
+    cleanup of the global files read it.  The
     test session sets it, so that a test, and each CLI process that a test
     starts, cannot change the directory of the user: the cleanup removes
     files there.  The index, the registry and the clang headers have their

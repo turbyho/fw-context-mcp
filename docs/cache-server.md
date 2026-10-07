@@ -36,6 +36,9 @@ fw-context uses a two-tier lookup. Each tier caches the answer, for next time:
 | 1 | `~/.fw-context/llm_cache.db` | All projects, same machine | SQLite (fast) |
 | 2 | Remote cache server (PostgreSQL) | All developers, all machines | HTTPS (network) |
 
+When you set the environment variable `FW_CONTEXT_HOME`, the tier 1 file is
+`$FW_CONTEXT_HOME/llm_cache.db`.
+
 fw-context computes each content hash from the function body and the
 signature. Identical code produces identical hashes, regardless of the
 project. So an analysis that fw-context generates for *the second Mbed project* is also

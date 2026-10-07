@@ -202,38 +202,85 @@ class TestLocalCacheDbReadonly:
     """Regression for F20 — get_local_cache_db readonly path must not
     run PRAGMAs or CREATE TABLE on the read-only connection."""
 
-    def test_readonly_does_not_crash_on_fresh_db(self, tmp_path: Path) -> None:
+    def test_readonly_does_not_crash_on_fresh_db(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """get_local_cache_db(readonly=True) on a nonexistent DB creates it first."""
         import fw_context_mcp.cache_client as cc_mod
 
-        original = cc_mod._LOCAL_CACHE_PATH
-        try:
-            cache_path = tmp_path / "fresh_cache.db"
-            cc_mod._LOCAL_CACHE_PATH = cache_path
-            conn = cc_mod.get_local_cache_db(readonly=True)
-            assert conn is not None
-            conn.close()
-            assert cache_path.exists()
-        finally:
-            cc_mod._LOCAL_CACHE_PATH = original
+        monkeypatch.setenv("FW_CONTEXT_HOME", str(tmp_path))
+        conn = cc_mod.get_local_cache_db(readonly=True)
+        assert conn is not None
+        conn.close()
+        assert (tmp_path / "llm_cache.db").exists()
 
-    def test_readonly_on_existing_db_works(self, tmp_path: Path) -> None:
+    def test_readonly_on_existing_db_works(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """After a write path initializes the DB, readonly opens cleanly."""
         import fw_context_mcp.cache_client as cc_mod
 
-        original = cc_mod._LOCAL_CACHE_PATH
-        try:
-            cache_path = tmp_path / "existing_cache.db"
-            cc_mod._LOCAL_CACHE_PATH = cache_path
+        monkeypatch.setenv("FW_CONTEXT_HOME", str(tmp_path))
+        conn_rw = cc_mod.get_local_cache_db(readonly=False)
+        conn_rw.close()
 
-            conn_rw = cc_mod.get_local_cache_db(readonly=False)
-            conn_rw.close()
+        conn_ro = cc_mod.get_local_cache_db(readonly=True)
+        count = conn_ro.execute(
+            "SELECT COUNT(*) FROM llm_analysis_cache"
+        ).fetchone()[0]
+        assert count == 0
+        conn_ro.close()
 
-            conn_ro = cc_mod.get_local_cache_db(readonly=True)
-            count = conn_ro.execute(
-                "SELECT COUNT(*) FROM llm_analysis_cache"
-            ).fetchone()[0]
-            assert count == 0
-            conn_ro.close()
-        finally:
-            cc_mod._LOCAL_CACHE_PATH = original
+
+class TestLocalCachePath:
+    """The local LLM cache is in ``$FW_CONTEXT_HOME``, read at each call.
+
+    The path was a module constant from ``Path.home()``, set at import.
+    The test session sets ``FW_CONTEXT_HOME``, but a test that wrote to the
+    cache wrote to ``~/.fw-context/llm_cache.db`` of the operator: rows with
+    the model ``test`` were found there, next to real analyses.  An indexer
+    run reads that cache, thus such a row can give a false analysis to a
+    real symbol with the same content.
+    """
+
+    def test_cache_follows_fw_context_home_set_after_import(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A change of ``FW_CONTEXT_HOME`` after the import moves the cache."""
+        import fw_context_mcp.cache_client as cc_mod
+
+        monkeypatch.setenv("FW_CONTEXT_HOME", str(tmp_path))
+        conn = cc_mod.get_local_cache_db()
+        conn.close()
+
+        assert (tmp_path / "llm_cache.db").is_file()
+        assert cc_mod.local_cache_stats()["path"] == str(tmp_path / "llm_cache.db")
+        assert cc_mod.local_cache_clear() == 0
+        assert not (tmp_path / "llm_cache.db").exists()
+
+    def test_relative_fw_context_home_opens_the_cache(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A relative ``FW_CONTEXT_HOME`` is relative to the current directory.
+
+        SQLite reads ``file://relhome/llm_cache.db`` as a URI with the
+        authority ``relhome`` and stops with ``invalid uri authority``.
+        """
+        import fw_context_mcp.cache_client as cc_mod
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("FW_CONTEXT_HOME", "relhome")
+        conn = cc_mod.get_local_cache_db()
+        conn.close()
+
+        assert (tmp_path / "relhome" / "llm_cache.db").is_file()
+
+    def test_session_cache_is_not_in_the_home_of_the_operator(self) -> None:
+        """The session isolation of ``conftest.py`` covers the cache too."""
+        import os
+
+        import fw_context_mcp.cache_client as cc_mod
+
+        cache_path = Path(cc_mod.local_cache_stats()["path"])
+        assert cache_path.parent == Path(os.environ["FW_CONTEXT_HOME"])
+        assert cache_path.parent != Path.home() / ".fw-context"
