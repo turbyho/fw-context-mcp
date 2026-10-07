@@ -18,7 +18,8 @@ compare the stored hashes against current on-disk content.
 ``config_hash`` is ``SHA-256`` of the **structural** part of the manifest
 (file, directory, arguments, macros — excluding source_hash, headers, and
 build_dir_patterns).  This means a header content change triggers per-TU
-reparsing (Tier 2) but NOT a full reindex (config_hash stays the same).
+reparsing (the hashes of the manifest entry) but NOT a full reindex
+(config_hash stays the same).
 """
 
 from __future__ import annotations
@@ -772,15 +773,14 @@ def compute_config_hash(
     Flag order and TU order do not matter: both accumulate into sets.
 
     What detects real change is therefore split by scope: this hash for the
-    dialect, ``files.source_hash`` for content, ``files.flags_hash`` for a
-    TU's own flags, and the manifest entry list for which files belong to the
-    build at all.
+    dialect, and the manifest entry of each listing for the rest — the hash
+    of the source, of each header, and of the flags of that listing — and
+    the manifest entry list for which files belong to the build at all.
 
-    ``files.flags_hash`` only counts for a TU that already got past Tier 1.
-    Tier 1 compares the source file mtime and stops there, and a change of
-    flags alone moves no mtime.  A statement that flags_hash catches a
-    changed include path is therefore wrong on its own, which is why the
-    out-of-project paths belong in THIS hash.
+    The flags hash of an entry holds every include path, thus it sees a
+    changed include path too.  The out-of-project paths belong in THIS hash
+    for another reason: they name the toolchain, and two toolchains must be
+    two builds (see the path pass below).
 
     The canonical JSON is written to
     ``<db_dir>/<project_id>/compile_commands.<hash>.json``
@@ -973,9 +973,8 @@ def compute_config_hash(
             #
             # Detection is a separate question, answered elsewhere: the
             # staleness pass hashes every header the units include, so it
-            # sees a content change at an unchanged path.  Tier 1 sees
-            # neither — it compares the source file mtime, and a toolchain
-            # update moves no source file.
+            # sees a content change at an unchanged path, and the flags hash
+            # of each manifest entry sees a changed path.
             for prefix in _PATH_PREFIXES:
                 if arg == prefix:
                     # Dangling: the pre-pass joined every real pair, so a
@@ -1153,8 +1152,13 @@ def check_tu_staleness(
     *,
     hash_cache: dict[str, str] | None = None,
     headers: list[dict] | None = None,
+    source_hash: str | None = None,
 ) -> tuple[bool, str | None]:
     """Check whether a translation unit's source or project headers have changed.
+
+    *source_hash* is the current hash of the source file when the caller
+    read it already: the index run hashes each source for its decision, and
+    a second read of each source here doubled that work.
 
     *headers* are the entry's resolved header records from
     :func:`tu_headers`.  It is a required argument in practice: the entry
@@ -1200,7 +1204,7 @@ def check_tu_staleness(
     if not source_file.is_absolute():
         source_file = (project_root / entry["file"]).resolve()
 
-    current_source_hash = compute_source_hash(source_file)
+    current_source_hash = source_hash if source_hash is not None else compute_source_hash(source_file)
     if current_source_hash != entry.get("source_hash", ""):
         return True, current_source_hash
 
@@ -1231,10 +1235,10 @@ def collect_stale_headers(
     """Return the manifest header paths whose on-disk content has changed.
 
     WHY this pre-pass exists: a header is not a translation unit, so editing
-    one never moves the mtime of any TU.  The per-TU mtime fast-path would
-    therefore report every dependent TU as unchanged and the header's symbols
-    would stay frozen at their first-index state.  Collecting the changed
-    headers up front lets the runner mark the dependent TUs for re-parsing.
+    one changes the hash of no TU source.  Collecting the changed headers up
+    front lets the runner mark each file with a dependent listing for
+    re-parsing, every listing of it, and log how many it marked.  The check
+    of each entry (check_tu_staleness) reads the same hashes.
 
     Every header is re-read, as :func:`check_tu_staleness` re-reads it.
 
@@ -1387,64 +1391,3 @@ def save(manifest: dict, db_dir: Path, config_hash: str) -> str:
     manifest_json = json.dumps(manifest, sort_keys=True, indent=2, ensure_ascii=False)
     _manifest_path(db_dir, config_hash).write_text(manifest_json, encoding="utf-8")
     return config_hash
-
-
-def get_manifest_entry_hash(entry: dict, headers: list[dict] | None = None) -> str:
-    """Return SHA-256 hash of a single manifest entry (source + headers).
-
-    Used as the per-TU staleness hash (replaces the old deps_hash-based
-    ``content_hash`` for Tier 2 checks).
-
-    *headers* are the entry's resolved records from :func:`tu_headers`.
-    Passing None hashes the source alone, which no longer detects a header
-    change — the entry stores paths, not hashes.
-    """
-    header_hashes = "".join(
-        h.get("hash", "")
-        for h in sorted(headers or (), key=lambda x: x.get("path", ""))
-    )
-    source = entry.get("source_hash", "")
-    return hashlib.sha256(f"{source}|{header_hashes}".encode()).hexdigest()
-
-
-def compute_current_entry_hash(
-    entry: dict,
-    project_root: Path,
-    *,
-    new_source_hash: str | None = None,
-    hash_cache: dict[str, str] | None = None,
-    headers: list[dict] | None = None,
-) -> str:
-    """Return the manifest entry hash computed from CURRENT disk content.
-
-    When *entry* is stale (headers or source changed), this function reads
-    the actual on-disk hashes rather than trusting the stored values.
-    Every header is re-read: a STORED hash for a header the run just re-read
-    would write a files.content_hash that describes no text at all.
-
-    *new_source_hash* overrides ``entry["source_hash"]`` when the source
-    file content has also changed.
-
-    *headers* are the entry's resolved records from :func:`tu_headers`.
-    """
-    source = new_source_hash if new_source_hash else entry.get("source_hash", "")
-
-    current_headers: list[dict] = []
-    for h in headers or ():
-        header_path = h["path"]
-        p = Path(header_path)
-        if not p.is_absolute():
-            p = (project_root / header_path).resolve()
-
-        current_hash = _hash_with_cache(p, hash_cache)
-        current_headers.append(
-            {"path": h["path"], "hash": current_hash, "generated": h.get("generated", False)}
-        )
-
-    header_hashes = "".join(
-        h.get("hash", "")
-        for h in sorted(current_headers, key=lambda x: x.get("path", ""))
-    )
-    return hashlib.sha256(f"{source}|{header_hashes}".encode()).hexdigest()
-
-

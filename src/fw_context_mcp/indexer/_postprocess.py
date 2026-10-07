@@ -60,7 +60,7 @@ import sqlite3
 import time
 import tomllib
 from collections import deque
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from pathlib import Path
@@ -1791,7 +1791,7 @@ def _run_postprocess(
     defer_fts: bool = False,
     defer_cleanup: bool = False,
     header_hash_cache: dict[str, str] | None = None,
-    reparsed_tus: set[str] | None = None,
+    reparsed_tus: Mapping[str, str] | None = None,
     transient_defines: Collection[str],
 ) -> None:
     """Run all post-processing phases via a data-driven pipeline.

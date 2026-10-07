@@ -59,7 +59,6 @@ if TYPE_CHECKING:
     # import time, and ops is imported on paths that never parse.
     from fw_context_mcp.indexer.symbols import ExtractionResult
 
-from fw_context_mcp.indexer.config_hash import compute_tu_content_hash
 from fw_context_mcp.indexer.db import (
     get_file_mtimes,
     insert_fp_assignments_batch,
@@ -1440,19 +1439,15 @@ def store_symbols_for_unit(
     _delete_old_for_tu(conn, config_hash, normalized_tu_path, known, syms, owned_paths=owned_paths)
 
     # Upsert the TU file record and capture its id.
-    # When the caller provides hashes (bulk-indexing path with pre-computed
-    # content/stability hashes), we store them in the files row.  These
-    # hashes power the manifest verification step, which detects whether
-    # a TU needs re-parsing by comparing current hashes to stored hashes.
-    # Without hashes (reindex_file path), we still compute source_hash —
-    # see the else branch for why it cannot be left out.
+    # The index run gives the hashes that its decision computed
+    # (source_hash, flags_hash), and the row stores them.  Without hashes
+    # (reindex_file path), we still compute source_hash — see the else
+    # branch for why it cannot be left out.
     if hashes is not None:
-        source_hash, flags_hash, manifest_entry_hash = hashes
-        content_hash_val = compute_tu_content_hash(source_hash, flags_hash, manifest_entry_hash)
+        source_hash, flags_hash = hashes
         tu_file_id = upsert_file(
             conn, config_hash, normalized_tu_path, unit.language,
-            mtime=current_mtime, content_hash=content_hash_val,
-            source_hash=source_hash, flags_hash=flags_hash,
+            mtime=current_mtime, source_hash=source_hash, flags_hash=flags_hash,
         )
     else:
         # This call moves mtime forward, thus it MUST move source_hash too.
@@ -1464,10 +1459,8 @@ def store_symbols_for_unit(
         # mcp/shared/stale.py then reports the file as changed forever,
         # although its symbols are current.
         #
-        # content_hash and flags_hash stay as they are: they feed the
-        # manifest shortcut in _check_and_parse_unit, which compares them
-        # against freshly computed values and reparses on a mismatch.  A
-        # stale value there costs one parse, never a wrong answer.
+        # flags_hash stays as it is.  Nothing decides by it: the index run
+        # compares the flags hash of the manifest entry.
         tu_file_id = upsert_file(
             conn, config_hash, normalized_tu_path, unit.language,
             mtime=current_mtime,

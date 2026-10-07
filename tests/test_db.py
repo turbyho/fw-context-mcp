@@ -2603,7 +2603,7 @@ class TestOrphanFileCleanup:
         conn = self._conn(tmp_path)
         try:
             upsert_file(conn, "cafe", str(empty), "c", mtime=1.0,
-                        content_hash="CH", source_hash="SH", flags_hash="FH")
+                        source_hash="SH", flags_hash="FH")
 
             delete_orphan_files(conn, "cafe", tmp_path)
 
@@ -2725,16 +2725,9 @@ class TestHashColumnsAreNotErased:
 
     Four of the five callers of upsert_file() pass no hashes.  reindex_file
     is one of them: it re-parses one translation unit through
-    store_symbols_for_unit() without them, and that erased content_hash,
-    source_hash and flags_hash for that row.
-
-    Erasing them was never a WRONG answer.  Tier 1 compares the mtime, which
-    a re-parse does not move, so the next run never read the cleared value —
-    measured on the Zephyr project, where a reindex_file of proj/app/src/main.c
-    left 254 of 257 units unchanged on the following run.  The cost came
-    later: once something moved the mtime without changing the text, Tier 2
-    found an empty content_hash, could not take its shortcut, and paid one
-    libclang parse to rebuild what was already known.
+    store_symbols_for_unit() without them, and that erased source_hash and
+    flags_hash for that row.  The staleness checks of the query side read
+    source_hash, and an empty one there reads every file as changed.
     """
 
     @staticmethod
@@ -2749,7 +2742,7 @@ class TestHashColumnsAreNotErased:
     @staticmethod
     def _row(conn):
         return dict(conn.execute(
-            "SELECT mtime, content_hash, source_hash, flags_hash FROM files "
+            "SELECT mtime, source_hash, flags_hash FROM files "
             "WHERE config_hash='cafe' AND path='src/main.c'").fetchone())
 
     def test_a_caller_without_hashes_keeps_the_stored_ones(self, tmp_path: Path):
@@ -2758,12 +2751,11 @@ class TestHashColumnsAreNotErased:
         conn = self._conn(tmp_path)
         try:
             upsert_file(conn, "cafe", "src/main.c", "c", mtime=10.0,
-                        content_hash="CH", source_hash="SH", flags_hash="FH")
+                        source_hash="SH", flags_hash="FH")
             # exactly what _reindex_parse_and_store does
             upsert_file(conn, "cafe", "src/main.c", "c", mtime=20.0)
 
             row = self._row(conn)
-            assert row["content_hash"] == "CH"
             assert row["source_hash"] == "SH"
             assert row["flags_hash"] == "FH"
         finally:
@@ -2775,7 +2767,7 @@ class TestHashColumnsAreNotErased:
 
         conn = self._conn(tmp_path)
         try:
-            upsert_file(conn, "cafe", "src/main.c", "c", mtime=10.0, content_hash="CH")
+            upsert_file(conn, "cafe", "src/main.c", "c", mtime=10.0, source_hash="SH")
             upsert_file(conn, "cafe", "src/main.c", "c", mtime=20.0)
 
             assert self._row(conn)["mtime"] == 20.0
@@ -2789,29 +2781,26 @@ class TestHashColumnsAreNotErased:
         conn = self._conn(tmp_path)
         try:
             upsert_file(conn, "cafe", "src/main.c", "c", mtime=10.0,
-                        content_hash="OLD", source_hash="OLDS", flags_hash="OLDF")
+                        source_hash="OLDS", flags_hash="OLDF")
             upsert_file(conn, "cafe", "src/main.c", "c", mtime=20.0,
-                        content_hash="NEW", source_hash="NEWS", flags_hash="NEWF")
+                        source_hash="NEWS", flags_hash="NEWF")
 
             row = self._row(conn)
-            assert row["content_hash"] == "NEW"
             assert row["source_hash"] == "NEWS"
             assert row["flags_hash"] == "NEWF"
         finally:
             conn.close()
 
     def test_each_column_is_protected_on_its_own(self, tmp_path: Path):
-        """A caller that knows one hash must not erase the other two."""
+        """A caller that knows one hash must not erase the other."""
         from fw_context_mcp.indexer.db import upsert_file
 
         conn = self._conn(tmp_path)
         try:
-            upsert_file(conn, "cafe", "src/main.c", "c",
-                        content_hash="CH", source_hash="SH", flags_hash="FH")
+            upsert_file(conn, "cafe", "src/main.c", "c", source_hash="SH", flags_hash="FH")
             upsert_file(conn, "cafe", "src/main.c", "c", source_hash="NEWS")
 
             row = self._row(conn)
-            assert row["content_hash"] == "CH"
             assert row["source_hash"] == "NEWS"
             assert row["flags_hash"] == "FH"
         finally:
@@ -2827,7 +2816,6 @@ class TestHashColumnsAreNotErased:
             upsert_file(conn, "cafe", "src/main.c", "c", mtime=5.0)
 
             row = self._row(conn)
-            assert row["content_hash"] == ""
             assert row["source_hash"] == ""
             assert row["flags_hash"] == ""
         finally:

@@ -22,7 +22,7 @@ that trigger unnecessary background reindexes.
 from __future__ import annotations
 
 import logging
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from pathlib import Path
 
 from ..utils import compute_source_hash
@@ -239,7 +239,7 @@ def _update_manifest_after_index(
     vendor_patterns: list[str] | None = None,
     config_hash: str = "",
     scope: list[str] | None = None,
-    reparsed_tus: set[str] | None = None,
+    reparsed_tus: Mapping[str, str] | None = None,
     transient_defines: Collection[str],
 ) -> dict | None:
     """Update ``manifest.json`` after an indexing run.
@@ -258,12 +258,21 @@ def _update_manifest_after_index(
     hashes from the main indexing loop (``tu_headers``), avoiding a second
     libclang parse for unchanged TUs.
 
-    *reparsed_tus* names the TUs that were actually re-parsed in this run.
-    Only those may contribute fresh header hashes: an entry rewritten for a
-    TU that kept its previous symbols would claim the index is current while
-    it still holds data parsed from the old header text.  Every other TU
-    keeps its stored entry verbatim.  ``None`` disables the filter (used by
-    callers with no run bookkeeping, e.g. a first index).
+    *reparsed_tus* maps each TU that was actually re-parsed in this run to
+    the hash of its source that the decision read BEFORE the parse.  Only
+    those may contribute fresh header hashes: an entry rewritten for a TU
+    that kept its previous symbols would claim the index is current while it
+    still holds data parsed from the old header text.  Every other TU keeps
+    its stored entry verbatim.  ``None`` disables the filter (used by callers
+    with no run bookkeeping, e.g. a first index).
+
+    The source hash of a fresh entry is the one of *reparsed_tus*, and not
+    a hash read now.  An index run takes hours on a large project, and a
+    file saved after its parse had the hash of the NEW text in its entry,
+    while the index held the symbols of the old one: the next run found the
+    entry current and never parsed the file again.  A file saved between the
+    decision and the parse gets the old hash, and the next run parses it
+    once more, which is the safe direction.
 
     *vendor_patterns* is the EFFECTIVE set this run used — what the builder
     derived plus what the config added.  It is stored so the query layer can
@@ -398,7 +407,10 @@ def _update_manifest_after_index(
             # Fresh hashes only from TUs that were really re-parsed —
             # see *reparsed_tus* in the docstring.
             if tu_rel in tu_headers and (reparsed_tus is None or tu_rel in reparsed_tus):
-                source_hash = compute_source_hash(unit.file.resolve())
+                source_hash = (
+                    reparsed_tus[tu_rel] if reparsed_tus is not None
+                    else compute_source_hash(unit.file.resolve())
+                )
                 entry_slots[idx] = {
                     "file": tu_rel,
                     "directory": str(unit.directory) if unit.directory else str(project_root),

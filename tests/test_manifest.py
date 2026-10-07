@@ -10,52 +10,14 @@ import pytest
 
 from fw_context_mcp.indexer.config_hash import DEFAULT_TRANSIENT_DEFINES
 from fw_context_mcp.indexer.manifest import MANIFEST_FORMAT
+from fw_context_mcp.utils import compute_source_hash
 
 
-class TestManifestEntryHash:
-    def test_empty_entry(self):
-        from fw_context_mcp.indexer.manifest import get_manifest_entry_hash
-
-        h = get_manifest_entry_hash({"source_hash": "", "headers": []})
-        assert len(h) == 64  # SHA-256 hex
-        assert h != ""
-
-    def test_with_source_only(self):
-        from fw_context_mcp.indexer.manifest import get_manifest_entry_hash
-
-        entry = {"source_hash": "abc123", "headers": []}
-        h1 = get_manifest_entry_hash(entry)
-        h2 = get_manifest_entry_hash(entry)
-        assert h1 == h2  # deterministic
-
-    def test_different_headers_produce_different_hash(self):
-        from fw_context_mcp.indexer.manifest import get_manifest_entry_hash
-
-        entry = {"source_hash": "abc", "headers": ["a.h"]}
-        h1 = get_manifest_entry_hash(entry, [{"path": "a.h", "hash": "111"}])
-        h2 = get_manifest_entry_hash(entry, [{"path": "a.h", "hash": "222"}])
-        assert h1 != h2
-
-    def test_resolved_headers_are_what_the_hash_sees(self):
-        """The entry alone cannot distinguish two header states.
-
-        Entries store paths; the hashes live in the manifest's shared table.
-        Hashing the entry without its resolved records would make every header
-        change invisible, so this asserts the resolved form is what counts.
-        """
-        from fw_context_mcp.indexer.manifest import (
-            get_manifest_entry_hash,
-            tu_headers,
-        )
-
-        entry = {"source_hash": "abc", "headers": ["a.h"]}
-        before = {"headers": {"a.h": {"hash": "111", "generated": False}}}
-        after = {"headers": {"a.h": {"hash": "222", "generated": False}}}
-        assert get_manifest_entry_hash(entry, tu_headers(before, entry)) != (
-            get_manifest_entry_hash(entry, tu_headers(after, entry))
-        )
-        # Without the records the two states collapse into one hash.
-        assert get_manifest_entry_hash(entry) == get_manifest_entry_hash(entry)
+def _parsed(root: Path, tus: set[str] | None) -> dict[str, str] | None:
+    """``reparsed_tus`` as the runner gives it: each re-parsed TU with its source hash."""
+    if tus is None:
+        return None
+    return {tu: compute_source_hash(root / tu) for tu in tus}
 
 
 class TestComputeConfigHash:
@@ -807,7 +769,7 @@ class TestVendorPatternCarrier:
             ]},
             vendor_patterns=vendor_patterns,
             config_hash="deadbeef",
-            reparsed_tus={"src/main.cpp"},
+            reparsed_tus=_parsed(tmp_path, {"src/main.cpp"}),
             transient_defines=DEFAULT_TRANSIENT_DEFINES,
         )
 
@@ -950,7 +912,7 @@ class TestManifestEntryRefreshGuard:
             updated_count=updated_count,
             tu_headers={"src/main.cpp": [{"path": "src/config.h", "hash": "FRESH", "generated": False}]},
             config_hash="deadbeef",
-            reparsed_tus=reparsed,
+            reparsed_tus=_parsed(tmp_path, reparsed),
             transient_defines=DEFAULT_TRANSIENT_DEFINES,
         )
 
@@ -1065,7 +1027,7 @@ class TestOneEntryForEachListing:
             updated_count=1,
             tu_headers={"src/main.c": []} if with_tu_headers else None,
             config_hash="deadbeef",
-            reparsed_tus={"src/main.c"},
+            reparsed_tus=_parsed(tmp_path, {"src/main.c"}),
             transient_defines=DEFAULT_TRANSIENT_DEFINES,
         )
         assert result is not None
@@ -1440,7 +1402,7 @@ class TestNoHeaderIsTrusted:
         )
 
     def test_the_vendor_patterns_parameter_is_gone(self):
-        """The four staleness signatures must not take a vendor set again.
+        """The staleness signatures must not take a vendor set again.
 
         A signature that still accepts it states a rule the body no longer
         applies, and the next caller passes one and believes it matters.
@@ -1451,13 +1413,11 @@ class TestNoHeaderIsTrusted:
         from fw_context_mcp.indexer.manifest import (
             check_tu_staleness,
             collect_stale_headers,
-            compute_current_entry_hash,
         )
 
         for fn in (
             check_tu_staleness,
             collect_stale_headers,
-            compute_current_entry_hash,
             _mtime_bump_is_safe,
         ):
             assert "vendor_patterns" not in inspect.signature(fn).parameters, fn.__name__
@@ -1519,7 +1479,7 @@ class TestNeedsReparse:
                 "src/b.c": [{"path": "src/shared.h", "hash": "FRESH", "generated": generated}],
             },
             config_hash="deadbeef",
-            reparsed_tus=reparsed,
+            reparsed_tus=_parsed(tmp_path, reparsed),
             transient_defines=DEFAULT_TRANSIENT_DEFINES,
         )
 
@@ -1587,7 +1547,7 @@ class TestNeedsReparse:
             updated_count=1,
             tu_headers={},
             config_hash="deadbeef",
-            reparsed_tus=set(),
+            reparsed_tus={},
             transient_defines=DEFAULT_TRANSIENT_DEFINES,
         )
 

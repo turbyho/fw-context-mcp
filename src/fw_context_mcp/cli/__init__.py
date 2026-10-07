@@ -216,7 +216,7 @@ def main() -> None:
     p_index.add_argument(
         "--force",
         action="store_true",
-        help="Force re-index of all files, embeddings, LLM analysis, overrides, and caches (skip mtime/checksum checks)",
+        help="Force re-index of all files, embeddings, LLM analysis, overrides, and caches (skip the hash checks)",
     )
     p_index.add_argument(
         "--background",

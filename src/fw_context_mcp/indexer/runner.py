@@ -46,9 +46,10 @@ from ._postprocess import (
     _run_postprocess,
 )
 from ._unit_processor import (
-    _check_and_parse_unit,
     _handle_unchanged,
+    _parse_unit,
     _process_unit,
+    decide_units,
 )
 from .compile_commands import parse as parse_compile_commands
 from .compile_commands import validate_include_files
@@ -138,14 +139,14 @@ def raise_if_superseded(db_dir: Path) -> None:
     ``reindex_file`` or ``reset_index``.  An indexing run used to block here
     until the marker cleared and then carry on from the same translation unit
     — which is not safe.  Everything the loop decides with was captured
-    before the pause: ``existing_files`` (the mtime and hash snapshot), the
-    manifest lookup, the stale-header set, and the header ownership built up
-    TU by TU.  After a manual operation those all describe an index that no
-    longer exists.
+    before the pause: ``existing_files`` (the snapshot of the rows), the
+    decision for each unit, the manifest lookup, the stale-header set, and
+    the header ownership built up TU by TU.  After a manual operation those
+    all describe an index that no longer exists.
 
     The damage is concrete.  ``reset_index`` empties the database; a resumed
-    run then reads its pre-pause ``existing_files``, takes the mtime
-    fast-path for translation units whose rows are gone, and finishes by
+    run then reads its pre-pause decisions, keeps as unchanged the
+    translation units whose rows are gone, and finishes by
     stamping a manifest over a half-built index.  A ``reindex_file`` is
     subtler but the same shape: the manual parse re-assigned header
     ownership, and the resumed run's ``replace_file_data`` deletes rows it
@@ -179,7 +180,7 @@ def _tus_to_requeue(
     stale_headers: set[str],
     project_root: Path,
 ) -> frozenset[str]:
-    """Return the normalized TU paths that must skip the cheap staleness tiers.
+    """Return the normalized TU paths that are parsed again whatever their entry says.
 
     Two sources, and the union of them:
 
@@ -638,12 +639,15 @@ def run(
 
     existing_files = get_file_hashes(conn, config_hash)
 
-    # Pre-build lookup dict for O(1) manifest entry access during Tier 2 checks.
+    # The entries of the manifest by file, for the decision about each unit.
+    # A list, because compile_commands.json can list one file more than once
+    # with other flags, and each listing has its own entry.
     # *manifest* was loaded above (before config_hash computation) — reuse it.
-    manifest_lookup: dict[str, dict] = {}
+    manifest_lookup: dict[str, list[dict]] | None = None
     if manifest is not None:
+        manifest_lookup = {}
         for e in manifest.get("entries", []):
-            manifest_lookup[e.get("file", "")] = e
+            manifest_lookup.setdefault(e.get("file", ""), []).append(e)
     # The entries hold header paths; their hashes live in this shared map.
     # Both travel together into the staleness checks.
     manifest_header_table: dict[str, dict] = (
@@ -651,11 +655,12 @@ def run(
     )
 
     # ── Header staleness pre-pass ──
-    # A header is not a translation unit, so editing one leaves the mtime and
-    # source hash of every dependent TU untouched — the per-TU mtime fast-path
-    # would report them all as unchanged and the header's symbols would stay
-    # frozen at their first-index state.  Hash the project headers once here
-    # and mark every TU that includes a changed one for re-parsing.
+    # A header is not a translation unit, so editing one leaves the source
+    # hash of every dependent TU untouched.  Hash the headers once here and
+    # mark every TU that includes a changed one for re-parsing.  The check of
+    # each entry in decide_units reads the same hashes (one cache), and gives
+    # the same answer for each listing.  This pass logs how many units the
+    # headers sent.
     #
     # ALL dependent TUs are marked, not a subset: symbols from a shared header
     # are claimed by whichever TU stores them first, and a TU that keeps its
@@ -706,10 +711,12 @@ def run(
     # Collect headers during tokenization for incremental manifest update.
     # Maps file_path → list of {path, hash, generated} header dicts.
     tu_headers: dict[str, list[dict]] = {}
-    # TUs actually re-parsed in this run.  The manifest may only take fresh
+    # TUs actually re-parsed in this run, with the source hash that the
+    # decision read before the parse.  The manifest may only take fresh
     # header hashes from these — an entry refreshed for a TU that kept its
-    # previous symbols would erase the evidence that the index is behind.
-    reparsed_tus: set[str] = set()
+    # previous symbols would erase the evidence that the index is behind —
+    # and it takes this source hash, not one read at the end of the run.
+    reparsed_tus: dict[str, str] = {}
     t0 = time.monotonic()
 
     # Is any PROJECT file still missing its ifdef-filtered content?  One query
@@ -738,6 +745,15 @@ def run(
     # persist-stored skip set from a previous index run.
     skip_files: set[str] = set()
 
+    # Every unit is decided before the first parse: hashes only, no write.
+    # A file whose listing changed is parsed in each of its listings, and
+    # that needs the answer for all of them — see decide_units.
+    decisions = decide_units(
+        units, project_root, existing_files, manifest_lookup, header_stale_tus,
+        force=force, hash_cache=header_hash_cache, header_table=manifest_header_table,
+        transient_defines=transient_defines,
+    )
+
     log.info("", extra={"phase": f"Parsing ({len(units)} TUs)"})
 
     # Single sequential loop with per-TU write lock for responsiveness.
@@ -755,25 +771,19 @@ def run(
         fname = unit.file.name
         processed = i + 1
 
-        # ── Phase 1: staleness check + libclang parse (no lock) ──
+        # ── Phase 1: libclang parse of a changed unit (no lock) ──
         # WHY outside lock: libclang parsing can take seconds to minutes per
         # TU on large codebases (mbed-os, Zephyr).  Holding the write lock
         # during parsing starves other indexers (bg reindex, concurrent
         # ``fw-context index --force``) and causes WriteLockTimeout errors.
-        check_status, parsed_data, parse_timing, hashes = _check_and_parse_unit(
-            unit,
-            config_hash,
-            project_root,
-            index_refs,
-            existing_files,
-            force=force,
-            manifest=manifest_lookup,
-            skip_files=skip_files,
-            header_stale_tus=header_stale_tus,
-            hash_cache=header_hash_cache,
-            header_table=manifest_header_table,
-            transient_defines=transient_defines,
-        )
+        decision = decisions[i]
+        hashes = decision.hashes
+        if decision.unchanged:
+            check_status, parsed_data, parse_timing = "unchanged", None, None
+        else:
+            check_status, parsed_data, parse_timing, _ = _parse_unit(
+                unit, index_refs, skip_files, hashes,
+            )
 
         # Snapshot the skip set BEFORE folding in this TU's own files.
         # Content fill must skip only headers already processed by EARLIER
@@ -788,10 +798,9 @@ def run(
 
         if check_status == "unchanged":
             result = _handle_unchanged(
-                unit, check_status, hashes, conn, config_hash, project_root,
+                unit, hashes, decision.mtime, conn, config_hash, project_root,
                 build_dir_patterns, db_path, existing_files,
                 skip_files=skip_before,
-                manifest_lookup=manifest_lookup,
                 content_backfill_needed=content_backfill_needed,
             )
             unchanged += 1
@@ -818,7 +827,6 @@ def run(
                 db_path,
                 existing_files,
                 conn=conn,
-                force=force,
                 pre_parsed=parsed_data,
                 parse_timing=parse_timing,
                 hashes=hashes,
@@ -838,7 +846,7 @@ def run(
                     tu_key = str(unit.file.resolve())
                 # Only a re-parsed TU may refresh its manifest entry — its
                 # symbols now match the headers it just read.
-                reparsed_tus.add(tu_key)
+                reparsed_tus[tu_key] = hashes[0]
                 # An empty list too: a TU with no recorded header still gets
                 # its entry, with its source hash.  Without one, the entry of
                 # the preliminary manifest stayed, with an empty source hash,

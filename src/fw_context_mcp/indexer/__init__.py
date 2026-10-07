@@ -22,8 +22,9 @@ the following pipeline:
    with FTS5 for full-text search.
 
 The runner (``runner.py``) orchestrates these phases and handles
-incremental updates: it skips files whose mtime or content hash
-has not changed since the last index run.
+incremental updates: it skips a translation unit whose source file,
+headers and flags have the hashes that the manifest recorded at the last
+index run.
 
 Design notes:
 * All extraction is single-threaded by default because libclang

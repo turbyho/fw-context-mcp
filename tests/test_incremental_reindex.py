@@ -94,7 +94,7 @@ def _isolate_index_db(project_root: Path, tmp_dir: Path) -> None:
 
 
 def _advance_mtime(path: Path, seconds: float = 2.0) -> None:
-    """Set file mtime to current time + seconds to bypass MTIME_TOLERANCE_S."""
+    """Move the file time forward by *seconds*, as an edit or a git checkout does."""
     now = path.stat().st_mtime
     os.utime(path, (now + seconds, now + seconds))
 def _write_file(path: Path, content: str) -> None:
@@ -3170,105 +3170,169 @@ class TestModifiedFilesCache:
             _invalidate_modified_cache(ch)
 
 
-class TestForceRefindex:
-    """Verify ``FW_CONTEXT_FORCE_REFINDEX`` makes ``_process_unit`` skip mtime check."""
+class TestTheDecisionIsByHash:
+    """The index run decides about a unit by hashes, and by no file time.
 
-    def test_force_refindex_skips_mtime_check(self, indexed_project: Path):
-        """With FW_CONTEXT_FORCE_REFINDEX=1, unchanged files are still processed."""
-        import os as _os
+    The source, each header and the flags of the listing are compared with
+    the manifest entry.  The decision by time saw an edit that kept an old
+    time as no change (``cp -p``, a restore from a backup), and a change of
+    the flags of a unit with no edit of its source as no change too.
+    """
 
-        from fw_context_mcp.indexer.compile_commands import parse as parse_cc
-        from fw_context_mcp.indexer.db import get_file_mtimes
-        from fw_context_mcp.indexer.runner import _process_unit
+    @staticmethod
+    def _summary(result) -> str:
+        """Return the "N updated, M unchanged, K skipped" line of the run."""
+        assert result.returncode == 0, result.stderr
+        for line in result.stderr.splitlines():
+            if " updated, " in line and " unchanged, " in line and "config_hash=" in line:
+                return line
+        raise AssertionError("no summary line\n" + result.stderr[-2000:])
 
-        db_path = _db_path_for_project(indexed_project)
-        cc_json = indexed_project / "compile_commands.json"
+    @staticmethod
+    def _edit_compile_commands(project: Path, change) -> None:
+        """Apply *change* to each entry of compile_commands.json."""
+        import json
 
-        conn = open_db(db_path)
+        cc = project / "compile_commands.json"
+        entries = json.loads(cc.read_text(encoding="utf-8"))
+        for entry in entries:
+            change(entry)
+        cc.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+
+    def test_a_new_time_without_an_edit_parses_nothing(self, indexed_project: Path):
+        for src in (indexed_project / "src").glob("*.c"):
+            _advance_mtime(src, 30.0)
+
+        assert "0 updated, 3 unchanged" in self._summary(_index_cli(indexed_project))
+
+    def test_an_edit_with_the_old_time_is_parsed(self, indexed_project: Path):
+        """A copy that keeps its time (cp -p) changes the file and not the time."""
+        utils = indexed_project / "src" / "utils.c"
+        before = utils.stat()
+        utils.write_text(utils.read_text(encoding="utf-8") + "\nint utils_late_symbol(void) { return 1; }\n",
+                         encoding="utf-8")
+        os.utime(utils, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+        assert "1 updated, 2 unchanged" in self._summary(_index_cli(indexed_project))
+
+        conn = open_db(_db_path_for_project(indexed_project))
         try:
-            ch = _config_hash(conn)
-            existing = get_file_mtimes(conn, ch)
+            assert _symbol_row(conn, _config_hash(conn), "utils_late_symbol") is not None
         finally:
             conn.close()
 
-        # Use the real compilation unit from compile_commands.json
-        units = list(parse_cc(cc_json))
-        modem_unit = [u for u in units if u.file.name == "modem.c"]
-        assert modem_unit, "modem.c must be in compile_commands.json"
+    def test_a_change_of_the_flags_of_one_unit_parses_that_unit(self, indexed_project: Path):
+        """An include path in the project is not in config_hash, but it is in the flags hash."""
+        def add_include(entry: dict) -> None:
+            if entry["file"] == "modem.c":
+                entry["arguments"].insert(1, "-Iextra")
 
-        # ── Without env var: should return "unchanged" ──
-        _os.environ.pop("FW_CONTEXT_FORCE_REFINDEX", None)
-        status, _, _, _, _ = _process_unit(
-            modem_unit[0],
-            ch,
-            indexed_project,
-            [],
-            [],
-            False,
-            db_path,
-            existing_files=existing,
+        self._edit_compile_commands(indexed_project, add_include)
+
+        assert "1 updated, 2 unchanged" in self._summary(_index_cli(indexed_project))
+
+    def test_a_transient_macro_parses_nothing(self, indexed_project: Path):
+        """A build time in each unit, and then a new one, as an Mbed OS build writes it."""
+        def stamp(value: str):
+            def change(entry: dict) -> None:
+                args = [a for a in entry["arguments"] if not a.startswith("-DMBED_BUILD_TIMESTAMP=")]
+                args.insert(1, f"-DMBED_BUILD_TIMESTAMP={value}")
+                entry["arguments"] = args
+            return change
+
+        self._edit_compile_commands(indexed_project, stamp("1791274230.0483081"))
+        assert "0 updated, 3 unchanged" in self._summary(_index_cli(indexed_project))
+
+        self._edit_compile_commands(indexed_project, stamp("1791301862.9208605"))
+        assert "0 updated, 3 unchanged" in self._summary(_index_cli(indexed_project))
+
+    @staticmethod
+    def _run_in_process(project: Path) -> None:
+        from fw_context_mcp.indexer.runner import run
+
+        run(
+            compile_commands=project / "compile_commands.json",
+            db_path=_db_path_for_project(project),
+            vendor_paths=[],
+            project_paths=[],
+            project_root=project,
+            index_refs=False,
+            index_embeddings=False,
+            analyze_symbols=False,
+            analyze_overrides=False,
         )
-        assert status == "unchanged", (
-            f"Without FORCE_REFINDEX, unchanged file should return 'unchanged', got '{status}'"
-        )
 
-        # ── With env var: should NOT return "unchanged" ──
-        _os.environ["FW_CONTEXT_FORCE_REFINDEX"] = "1"
+    def test_a_save_after_the_parse_is_seen_by_the_next_run(self, indexed_project: Path, monkeypatch):
+        """An index run takes hours on a large project, and the user saves files meanwhile.
+
+        The manifest took the source hash at the end of the run, thus the
+        hash of the text saved AFTER the parse.  The next run found the
+        entry current, and the index kept the symbols of the old text.
+        """
+        from fw_context_mcp.indexer import runner
+
+        utils = indexed_project / "src" / "utils.c"
+        utils.write_text(utils.read_text(encoding="utf-8") + "\nint utils_first_edit(void) { return 1; }\n",
+                         encoding="utf-8")
+        original = runner._parse_unit
+
+        def parse_then_save(unit, *args, **kwargs):
+            result = original(unit, *args, **kwargs)
+            if unit.file.name == "utils.c":
+                utils.write_text(
+                    utils.read_text(encoding="utf-8") + "\nint utils_second_edit(void) { return 2; }\n",
+                    encoding="utf-8",
+                )
+            return result
+
+        monkeypatch.setattr(runner, "_parse_unit", parse_then_save)
+        self._run_in_process(indexed_project)
+
+        assert "1 updated, 2 unchanged" in self._summary(_index_cli(indexed_project))
+        conn = open_db(_db_path_for_project(indexed_project))
         try:
-            status_forced, syms, _, _, _ = _process_unit(
-                modem_unit[0],
-                ch,
-                indexed_project,
-            [],
-                [],
-                False,
-                db_path,
-                existing_files=existing,
-            )
-            assert status_forced == "updated", (
-                f"With FORCE_REFINDEX, unchanged file should return 'updated', got '{status_forced}'"
-            )
-            assert syms > 0, "FORCE_REFINDEX should extract symbols from the file"
-        finally:
-            _os.environ.pop("FW_CONTEXT_FORCE_REFINDEX", None)
-
-    def test_force_refindex_0_does_not_skip(self, indexed_project: Path):
-        """FW_CONTEXT_FORCE_REFINDEX=0 behaves same as unset (normal mtime check)."""
-        import os as _os
-
-        from fw_context_mcp.indexer.compile_commands import parse as parse_cc
-        from fw_context_mcp.indexer.db import get_file_mtimes
-        from fw_context_mcp.indexer.runner import _process_unit
-
-        db_path = _db_path_for_project(indexed_project)
-        cc_json = indexed_project / "compile_commands.json"
-
-        conn = open_db(db_path)
-        try:
-            ch = _config_hash(conn)
-            existing = get_file_mtimes(conn, ch)
+            assert _symbol_row(conn, _config_hash(conn), "utils_second_edit") is not None
         finally:
             conn.close()
 
-        units = list(parse_cc(cc_json))
-        modem_unit = [u for u in units if u.file.name == "modem.c"]
-        assert modem_unit, "modem.c must be in compile_commands.json"
+    def test_a_save_after_the_decision_is_not_hidden(self, indexed_project: Path, monkeypatch):
+        """The decision runs before the loop.  A save before the loop reaches the unit is a change.
 
-        _os.environ["FW_CONTEXT_FORCE_REFINDEX"] = "0"
+        The row got the time of the file at the write, beside the hash of
+        the decision, and the query side does not hash a file whose time is
+        the stored one: it reported no modified file.
+        """
+        from fw_context_mcp.indexer import runner
+        from fw_context_mcp.mcp.shared.stale import _count_modified_files
+
+        utils = indexed_project / "src" / "utils.c"
+        original = runner.decide_units
+
+        def decide_then_save(*args, **kwargs):
+            decisions = original(*args, **kwargs)
+            utils.write_text(utils.read_text(encoding="utf-8") + "\nint utils_late(void) { return 3; }\n",
+                             encoding="utf-8")
+            _advance_mtime(utils, 30.0)
+            return decisions
+
+        monkeypatch.setattr(runner, "decide_units", decide_then_save)
+        self._run_in_process(indexed_project)
+
+        conn = open_db(_db_path_for_project(indexed_project))
         try:
-            status, _, _, _, _ = _process_unit(
-                modem_unit[0],
-                ch,
-                indexed_project,
-            [],
-                [],
-                False,
-                db_path,
-                existing_files=existing,
-            )
-            assert status == "unchanged", f"FORCE_REFINDEX=0 should still do mtime check, got '{status}'"
+            assert _count_modified_files(conn, _config_hash(conn), indexed_project) == 1
         finally:
-            _os.environ.pop("FW_CONTEXT_FORCE_REFINDEX", None)
+            conn.close()
+
+    def test_force_refindex_parses_every_unit(self, indexed_project: Path, monkeypatch):
+        monkeypatch.setenv("FW_CONTEXT_FORCE_REFINDEX", "1")
+
+        assert "3 updated, 0 unchanged" in self._summary(_index_cli(indexed_project))
+
+    def test_force_refindex_0_is_no_force(self, indexed_project: Path, monkeypatch):
+        monkeypatch.setenv("FW_CONTEXT_FORCE_REFINDEX", "0")
+
+        assert "0 updated, 3 unchanged" in self._summary(_index_cli(indexed_project))
 
 
 class TestBgReindexEndToEnd:

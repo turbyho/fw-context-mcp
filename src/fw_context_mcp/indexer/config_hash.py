@@ -165,27 +165,3 @@ def compute_flags_hash(entry: dict, *, transient_defines: Collection[str]) -> st
     args = " ".join(norm["args"])
     return hashlib.sha256(args.encode()).hexdigest()
 
-
-def compute_tu_content_hash(source_hash: str, flags_hash: str, manifest_entry_hash: str) -> str:
-    """Return combined SHA-256 of the three per-TU component hashes.
-
-    WHY three components: a translation unit's index validity depends on
-    three independent factors:
-    1. Source file content (source_hash)
-    2. Compiler flags (flags_hash)
-    3. Included headers (manifest_entry_hash, replacing old deps_hash)
-
-    Any one of these changing invalidates the TU's indexed symbols.
-    This hash is stored in ``files.content_hash`` — when it matches the
-    stored hash, the TU can be skipped even if mtime has changed (mtime
-    false-positives from git checkout, touch, etc.).
-
-    Tier 1 compares the source file mtime only, so nothing reads this hash
-    when the mtime is unchanged.  A change of flags_hash alone therefore
-    invalidates nothing through this path — config_hash must hold what a
-    toolchain change moves.  See compute_config_hash.
-
-    *manifest_entry_hash* is the hash of the TU's manifest entry
-    (source + headers), replacing the old ``deps_hash`` from ``.d`` files.
-    """
-    return hashlib.sha256(f"{source_hash}|{flags_hash}|{manifest_entry_hash}".encode()).hexdigest()

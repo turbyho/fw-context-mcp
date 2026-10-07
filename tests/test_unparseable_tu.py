@@ -5,7 +5,7 @@ TranslationUnitLoadError: transient parse failures (corrupt PCH, missing
 include path, OOM during parse) — log and skip this TU; the indexer continues
 with the remaining TUs."
 
-`_unit_processor._check_and_parse_unit` is the newer pre-parse path and
+`_unit_processor._parse_unit` is the newer pre-parse path and
 catches `SAFE_EXCEPT`, which is
 `(ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error, OSError)`.
 `clang.cindex.TranslationUnitLoadError` derives straight from `Exception`, so

@@ -12,7 +12,7 @@ Build or update the symbol index from `compile_commands.json`.
 > `compile_commands.json`, and re-parses only the changed files. Use
 > `--build` to force a clean build and a full re-index when needed, for
 > example after an SDK update or a build system change. Use `--force` to
-> bypass the mtime checks and force a re-index of all files, embeddings,
+> skip the hash checks and force a re-index of all files, embeddings,
 > LLM analysis, overrides, and caches, without rebuilding, for example
 > after a schema change or a tool update.
 
@@ -24,7 +24,7 @@ fw-context index
 fw-context index --build
 
 # Force full re-index of all files, embeddings, analysis, and caches
-# (skips mtime checks — use after schema changes or tool updates):
+# (skips the hash checks — use after schema changes or tool updates):
 fw-context index --force
 
 # Explicit path, verbose
@@ -55,7 +55,7 @@ fw-context index --source-roots src lib drivers
 | `--no-embeddings` | off | Skip embedding generation |
 | `--no-analyze` | off | Skip LLM symbol analysis |
 | `--analyze` | on | Force LLM symbol analysis (negates --no-analyze) |
-| `--force` | off | Force re-index of all files, embeddings, LLM analysis, overrides, PageRank, and hotspot cache (bypasses mtime checks) |
+| `--force` | off | Force re-index of all files, embeddings, LLM analysis, overrides, PageRank, and hotspot cache (skips the hash checks) |
 | `--variant NAME` | all variants | Restrict indexing to one build variant (name from `[[build.variants]]`) |
 | `--variants A,B` | all variants | Comma-separated list of build variants to index |
 | `--image NAME` | all images | Index only this image of the build (Zephyr sysbuild, ESP-IDF). The build stays complete. |

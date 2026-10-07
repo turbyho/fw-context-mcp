@@ -7,16 +7,18 @@ Every translation unit and header seen by libclang has a row in the
 
   • ``language`` — ``"c"`` or ``"cpp"``, set during compilation-database
     parsing.  Determines which parser flags libclang uses on re-parse.
-  • ``mtime`` — last-modified time; used for fast staleness checks.
-  • ``content_hash`` — SHA-256 hash of source + compiler flags +
-    manifest entry.  Enables content-addressable staleness: even when
-    mtime differs, a matching hash means the TU can be skipped.
+  • ``mtime`` — the time of the file when the index read it.  The
+    staleness checks of the query side skip the hash of a file whose time
+    is the stored one.  The index run does not read it.
+  • ``content_hash`` — no longer written or read.  It held a hash of the
+    source, the flags and the manifest entry, for a decision that the
+    manifest entry now makes.  The column stays, so that the schema does
+    not change.
   • ``source_hash`` — SHA-256 of the raw source file (without flags).
-    Used to detect purely cosmetic changes (whitespace, comment edits)
-    that do not affect symbols.
-  • ``flags_hash`` — SHA-256 of normalized compiler flags.  Detects
-    when a TU's include-path or define set changes without touching
-    the source file itself.
+    The staleness checks of the query side compare it with the file.
+  • ``flags_hash`` — SHA-256 of normalized compiler flags of the last
+    listing of the file that the index read.  Nothing decides by it: the
+    manifest holds one flags hash for each listing.
 
 Content storage
 ───────────────
@@ -90,7 +92,6 @@ def upsert_file(
     language: str,
     generated: bool = False,
     mtime: float = 0.0,
-    content_hash: str = "",
     source_hash: str = "",
     flags_hash: str = "",
 ) -> int:
@@ -127,23 +128,16 @@ def upsert_file(
     in-project paths anyway.  _step_reconcile_generated() is what makes the
     column right again, and it is the authoritative write.
 
-    The three hash columns follow the same rule for the same reason: an
+    The two hash columns follow the same rule for the same reason: an
     EMPTY hash never overwrites a stored one.  Four of the five callers pass
     no hashes at all, and reindex_file is one of them — it re-parses one
     translation unit through store_symbols_for_unit() without them, and that
-    used to erase content_hash, source_hash and flags_hash for that row.
+    used to erase source_hash and flags_hash for that row.  source_hash has
+    readers: the staleness checks in mcp/shared/stale.py compare it against
+    the file to tell a real change from one where git only rewrote the
+    mtime.  flags_hash has none.
 
-    The cost of erasing them was NOT a wrong answer.  Tier 1 compares the
-    mtime, which a re-parse does not move, so the next run never even read
-    the cleared value.  It surfaced only later: once something moved the
-    mtime without changing the text, Tier 2 found an empty content_hash,
-    could not take its shortcut, and paid one libclang parse to rebuild what
-    was already known.  files.content_hash has exactly one reader,
-    _check_and_parse_unit.  source_hash has two: the staleness checks in
-    mcp/shared/stale.py compare it against the file to tell a real change
-    from one where git only rewrote the mtime.  flags_hash still has none.
-
-    That second reader is why source_hash may no longer ride on this rule
+    That reader is why source_hash may no longer ride on this rule
     alone.  A caller that MOVES mtime and knows the content must also pass
     source_hash, or the row ends with the hash of the old text beside the
     stamp of the new one, and the staleness checks then call the file
@@ -159,7 +153,6 @@ def upsert_file(
         language: ``"c"`` or ``"cpp"`` — set during compilation database parsing.
         generated: Whether the file is auto-generated (default False).
         mtime: Last-modified timestamp (float, seconds since epoch).
-        content_hash: SHA-256 hash of source + flags + manifest_entry content (default "").
         source_hash: SHA-256 hash of the source file content.
         flags_hash: SHA-256 hash of normalized compiler flags for this TU.
 
@@ -168,13 +161,11 @@ def upsert_file(
     """
     cur = conn.execute(
         """INSERT INTO files(config_hash, path, language, generated, mtime,
-                             content_hash, source_hash, flags_hash)
-           VALUES (?,?,?,?,?,?,?,?)
+                             source_hash, flags_hash)
+           VALUES (?,?,?,?,?,?,?)
            ON CONFLICT(config_hash, path) DO UPDATE SET
                language=excluded.language,
                mtime=excluded.mtime,
-               content_hash=CASE WHEN excluded.content_hash = ''
-                            THEN files.content_hash ELSE excluded.content_hash END,
                source_hash=CASE WHEN excluded.source_hash = ''
                            THEN files.source_hash ELSE excluded.source_hash END,
                flags_hash=CASE WHEN excluded.flags_hash = ''
@@ -187,7 +178,6 @@ def upsert_file(
             language,
             int(generated),
             mtime,
-            content_hash,
             source_hash,
             flags_hash,
         ),
@@ -212,19 +202,18 @@ def upsert_file(
 def get_file_mtimes(conn: sqlite3.Connection, config_hash: str) -> dict[str, tuple[int, float]]:
     """Return {path: (file_id, mtime)} for all files under config_hash.
 
-    .. deprecated::
-        Use :func:`get_file_hashes` instead — it returns content hashes
-        needed for content-addressable staleness detection.
+    reindex_file and the store of a unit read the ``file_id`` of each row
+    from it.  The index run uses :func:`get_file_hashes`, which returns the
+    same rows with their hashes.
     """
     rows = conn.execute("SELECT id, path, mtime FROM files WHERE config_hash=?", (config_hash,)).fetchall()
     return {r["path"]: (r["id"], r["mtime"]) for r in rows}
 
 
 class FileHashRecord(NamedTuple):
-    """Stored file metadata for content-addressable staleness detection."""
+    """The ``files`` row of a path: its id, and what the row says about the file."""
     file_id: int
     mtime: float
-    content_hash: str
     source_hash: str
     flags_hash: str
 
@@ -240,16 +229,14 @@ FileIdLookup = Mapping[str, "tuple[int, float] | FileHashRecord"]
 
 
 def get_file_hashes(conn: sqlite3.Connection, config_hash: str) -> dict[str, FileHashRecord]:
-    """Return ``{path: FileHashRecord}`` for content-addressable staleness detection.
+    """Return ``{path: FileHashRecord}`` for every ``files`` row of the build.
 
-    Used by the runner for content-addressable staleness detection — even
-    when mtime differs, a matching content_hash means the TU can be skipped.
-
-    The old ``deps_hash`` and ``deps_exist`` columns are deprecated and no
-    longer populated — staleness is now determined from ``manifest.json``.
+    The runner reads which paths have a row (an unchanged unit needs one)
+    and the ``file_id`` of each.  Whether a unit changed is decided from
+    ``manifest.json``, by hashes.
     """
     rows = conn.execute(
-        """SELECT id, path, mtime, content_hash, source_hash, flags_hash
+        """SELECT id, path, mtime, source_hash, flags_hash
            FROM files WHERE config_hash=?""",
         (config_hash,),
     ).fetchall()
@@ -257,7 +244,6 @@ def get_file_hashes(conn: sqlite3.Connection, config_hash: str) -> dict[str, Fil
         r["path"]: FileHashRecord(
             r["id"],
             r["mtime"],
-            r["content_hash"],
             r["source_hash"],
             r["flags_hash"],
         )
@@ -287,7 +273,7 @@ def delete_orphan_files(
     is kept.  Zephyr compiles ``misc/empty_file.c`` — a 0-byte placeholder —
     three times per build, and a 0-byte source yields no symbols, no macros
     and no content, so it matched all three conditions.  Its row went away
-    on every run, Tier 1 needs a row to skip a translation unit, and the
+    on every run, an unchanged translation unit needs a row, and the
     next run parsed it again: measured on the Zephyr project, all 9 builds
     reported "3 updated" for ever and never reached "0 updated".
 
