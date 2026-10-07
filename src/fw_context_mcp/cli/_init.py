@@ -935,7 +935,7 @@ def _pair_is_ordered(lines: list[str]) -> bool:
     """
     exclude = negation = None
     for index, line in enumerate(lines):
-        text = line.strip()
+        text = _git_key(line)
         if text == FW_CONTEXT_IGNORE_PAIR[0]:
             exclude = index
         elif text == FW_CONTEXT_IGNORE_PAIR[1]:
@@ -966,6 +966,10 @@ def plan_gitignore(
     line goes.  A pair in the wrong order goes for the same reason, and
     comes back in the correct order.  No other line is touched.
 
+    A line is compared as git reads it (``_git_key``): git keeps a leading
+    space, thus `` .fw-context/`` names another directory and stays.
+    ``str.strip()`` took it for the superseded line and removed it.
+
     Args:
         raw: Lines of the current ``.gitignore``, with the line ends
             removed.  An empty list stands for a file that is not there.
@@ -984,9 +988,9 @@ def plan_gitignore(
     if needs_pair:
         drop.update(FW_CONTEXT_IGNORE_PAIR)
 
-    removed = sorted({line.strip() for line in raw if line.strip() in drop})
-    kept = [line for line in raw if line.strip() not in drop]
-    present = {line.strip() for line in kept if line.strip() and not line.strip().startswith("#")}
+    removed = sorted({_git_key(line) for line in raw if _git_key(line) in drop})
+    kept = [line for line in raw if _git_key(line) not in drop]
+    present = {_git_key(line) for line in kept if _git_key(line) and not _git_key(line).startswith("#")}
 
     plain = ["compile_commands.json"]
     if build_system == "mbed-os":
@@ -1058,6 +1062,14 @@ def _move_conflicts(
     safe when no line that it passes has the other polarity.  The lines of
     the blocks keep their order among themselves, thus only the lines
     outside the blocks can conflict.
+
+    The rule is conservative on purpose: it does not ask whether the two
+    patterns can match one path.  ``!**/.fw-context/config.toml`` and
+    ``LEAN-CTX.md`` never do, and a move of the one past the other is still
+    a conflict.  An exact answer is the intersection of two gitignore
+    globs (``**``, directories, anchors), and an error in that code changes
+    what git ignores.  The cost of the rule is a block at the end of the
+    file, or blocks that stay apart with a warning.
     """
     in_blocks = {index for start, end in ranges for index in range(start, end)}
     target_start, target_end = ranges[target] if target is not None else (len(kept), len(kept))
@@ -1200,7 +1212,10 @@ def _ensure_gitignore(project_root: Path, *, fix: bool = False, build_system: st
     ``"\\r"``, and a new line takes the line end of most lines.  The lines
     are split at ``"\\n"`` only, as git splits them; ``str.splitlines()``
     also splits at a form feed and at a lone ``"\\r"``, and a rewrite then
-    broke such a line in two.
+    broke such a line in two.  A UTF-8 byte order mark stays at the start
+    of the file and out of the lines: git skips it, and with it in the
+    first line a ``# fw-context`` header there was no header, and a second
+    block came.
 
     Args:
         project_root: Directory that holds the ``.gitignore``.
@@ -1218,6 +1233,8 @@ def _ensure_gitignore(project_root: Path, *, fix: bool = False, build_system: st
         # A rewrite would change bytes that this function cannot read.
         print(f"  [warn] {gitignore}: not UTF-8, left as it is — add {', '.join(FW_CONTEXT_IGNORE_PAIR)} by hand")
         return
+    bom = "\ufeff" if text.startswith("\ufeff") else ""
+    text = text[len(bom) :]
     raw = text.split("\n")
     if raw[-1] == "":
         raw.pop()
@@ -1248,6 +1265,6 @@ def _ensure_gitignore(project_root: Path, *, fix: bool = False, build_system: st
         return
 
     try:
-        gitignore.write_text("\n".join(lines) + "\n" if lines else "", encoding="utf-8", newline="")
+        gitignore.write_text(bom + ("\n".join(lines) + "\n" if lines else ""), encoding="utf-8", newline="")
     except (OSError, PermissionError) as e:
         logging.getLogger(__name__).warning("Could not update %s: %s", gitignore, e)

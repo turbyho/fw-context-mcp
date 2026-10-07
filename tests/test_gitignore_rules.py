@@ -299,6 +299,26 @@ def test_lines_that_git_reads_as_different_stay_different(tmp_path):
     assert _git_ignores(tmp_path, "keep.o")
 
 
+def test_a_line_with_a_leading_space_is_not_a_superseded_line():
+    """Git keeps a leading space: `` .fw-context/`` names another directory."""
+    kept, removed, _ = plan_gitignore([" .fw-context/", EXCLUDE, NEGATION])
+    assert removed == []
+    assert " .fw-context/" in kept
+
+
+def test_a_file_with_a_byte_order_mark_keeps_one_block(tmp_path):
+    """Git skips a UTF-8 BOM at the start of the file; the header on line 1 is a header."""
+    gitignore = tmp_path / ".gitignore"
+    gitignore.write_bytes(
+        ("\ufeff# fw-context\ncompile_commands.json\n" + f"{EXCLUDE}\n{NEGATION}\n").encode("utf-8")
+    )
+    _ensure_gitignore(tmp_path, fix=True, build_system="mbed-os")
+    data = gitignore.read_bytes()
+    assert data.startswith(b"\xef\xbb\xbf# fw-context\n"), "the BOM stays, the header stays first"
+    assert data.count(b"# fw-context") == 1
+    assert b"mbed_config.h" in data
+
+
 def test_a_line_is_split_only_at_a_newline(tmp_path):
     """git splits a .gitignore at "\\n" only; a form feed is part of a pattern."""
     gitignore = tmp_path / ".gitignore"
