@@ -891,6 +891,23 @@ def _owner_tag() -> str:
     return f"{host}-{inode}" if inode else host
 
 
+#: The environment variable that moves the global directory of fw-context.
+FW_CONTEXT_HOME_ENV = "FW_CONTEXT_HOME"
+
+
+def fw_context_home() -> Path:
+    """Return the global directory of fw-context: ``$FW_CONTEXT_HOME``, else ``~/.fw-context``.
+
+    The global config reads it.  The test session sets it, so that a test,
+    and each CLI process that a test starts, cannot change the global
+    config of the user.  The index, the registry and the clang headers
+    have their own variables (``FW_CONTEXT_INDEX_DIR``, ``FW_CONTEXT_PROJECTS_DB``,
+    ``FW_CONTEXT_CLANG_RESOURCE_DIR``).
+    """
+    value = os.environ.get(FW_CONTEXT_HOME_ENV)
+    return Path(value).expanduser() if value else Path.home() / ".fw-context"
+
+
 def owner_token() -> str:
     """Return ``<pid>@<tag>``, the owner of a file that this process writes.
 

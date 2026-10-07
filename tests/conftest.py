@@ -154,19 +154,36 @@ def _isolate_index_dir():
     ``doctor --fix`` or a parse wrote ``~/.fw-context/clang-resource`` of
     the operator.
 
+    A fourth: ``FW_CONTEXT_HOME``, the global directory with the global
+    config.  A CLI process that a test starts reads it, and a write there
+    changed the config of the operator.  The global config of the operator
+    is copied in, so that a test that asks Ollama uses the models of the
+    operator, and a write goes to the copy.
+
     All variables are inherited by any subprocess a test spawns, thus a
     CLI invocation stays isolated too.  The temp dir is removed at session
     end.
     """
-    names = ("FW_CONTEXT_INDEX_DIR", "FW_CONTEXT_PROJECTS_DB", "FW_CONTEXT_CLANG_RESOURCE_DIR")
+    import fw_context_mcp.config.settings as settings
+
+    names = ("FW_CONTEXT_INDEX_DIR", "FW_CONTEXT_PROJECTS_DB", "FW_CONTEXT_CLANG_RESOURCE_DIR", "FW_CONTEXT_HOME")
     prev = {name: os.environ.get(name) for name in names}
+    prev_global = settings._GLOBAL_CONFIG_PATH
     with tempfile.TemporaryDirectory(prefix="fw-context-index-") as d:
+        home = Path(d) / "home"
+        home.mkdir()
+        if prev_global.is_file():
+            shutil.copy2(prev_global, home / "config.toml")
         os.environ["FW_CONTEXT_INDEX_DIR"] = d
         os.environ["FW_CONTEXT_PROJECTS_DB"] = str(Path(d) / "projects.db")
         os.environ["FW_CONTEXT_CLANG_RESOURCE_DIR"] = str(Path(d) / "clang-resource")
+        os.environ["FW_CONTEXT_HOME"] = str(home)
+        # The module computed the path at import, before this fixture.
+        settings._GLOBAL_CONFIG_PATH = home / "config.toml"
         try:
             yield d
         finally:
+            settings._GLOBAL_CONFIG_PATH = prev_global
             for name in names:
                 if prev[name] is None:
                     os.environ.pop(name, None)

@@ -49,6 +49,7 @@ from urllib.parse import urlparse
 
 from ..indexer.build import BuildConfig, BuildImage, BuildVariant
 from ..indexer.config_hash import DEFAULT_TRANSIENT_DEFINES
+from ..utils import fw_context_home
 
 log = logging.getLogger(__name__)
 
@@ -93,7 +94,7 @@ class ProjectNotInitializedError(RuntimeError):
         )
 
 
-_GLOBAL_CONFIG_PATH = Path.home() / ".fw-context" / "config.toml"
+_GLOBAL_CONFIG_PATH = fw_context_home() / "config.toml"
 _PROJECT_CONFIG_DIR = ".fw-context"
 _PROJECT_CONFIG_NAME = "config.toml"
 _PROJECT_LOCAL_CONFIG_NAME = "local.toml"
