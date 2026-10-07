@@ -206,6 +206,24 @@ def test_init_covers_the_build_tree_for_a_new_project(tmp_path: Path):
 
 
 
+def _removed_paths(root: Path, keep=()) -> list[Path]:
+    """Run the cleanup on *root*; return the removed paths of the project."""
+    from fw_context_mcp.housekeeping import clean
+
+    return [path for path in clean(root, keep=keep).removed_paths if root in path.parents or path == root]
+
+
+def _cmake_marker(root: Path) -> None:
+    """Make *root* a CMake project, a build that fw-context runs.
+
+    Without a build that fw-context runs, ``[index] compile_commands``
+    names the database of the project, and its default is the old flat
+    copy: that copy then stays.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "CMakeLists.txt").write_text("project(p)\n", encoding="utf-8")
+
+
 class TestRemoveLegacyOutput:
     """The output of the layout before .fw-context/build/<variant>/out goes, with a log line each."""
 
@@ -226,16 +244,18 @@ class TestRemoveLegacyOutput:
         for path in paths.values():
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("x", encoding="utf-8")
+        # A config that cannot be read keeps the old output (the index is
+        # not known), thus the config must be valid TOML.
+        paths["config"].write_text("# x\n", encoding="utf-8")
+        _cmake_marker(root)
         return paths
 
     def test_the_old_output_goes_and_the_new_stays(self, tmp_path, caplog):
         import logging
 
-        from fw_context_mcp.indexer.build_layout import remove_legacy_output
-
         paths = self._legacy(tmp_path)
-        with caplog.at_level(logging.INFO, logger="fw_context_mcp.indexer.build_layout"):
-            removed = remove_legacy_output(tmp_path)
+        with caplog.at_level(logging.INFO, logger="fw_context_mcp.housekeeping"):
+            removed = _removed_paths(tmp_path)
 
         fw = tmp_path / ".fw-context"
         assert set(removed) == {
@@ -243,34 +263,29 @@ class TestRemoveLegacyOutput:
         }
         for name in ("new", "ignore", "config"):
             assert paths[name].exists(), name
-        assert len([r for r in caplog.records if "older fw-context" in r.getMessage()]) == len(removed)
+        assert len([r for r in caplog.records if "removed obsolete" in r.getMessage()]) == len(removed)
 
     def test_a_second_run_removes_nothing(self, tmp_path):
-        from fw_context_mcp.indexer.build_layout import remove_legacy_output
-
         self._legacy(tmp_path)
-        remove_legacy_output(tmp_path)
+        _removed_paths(tmp_path)
 
-        assert remove_legacy_output(tmp_path) == []
+        assert _removed_paths(tmp_path) == []
 
     @pytest.mark.parametrize("name", ["deps", "platformio_link.json", "compile_commands.x.json"])
     def test_a_variant_directory_stays_whatever_its_name(self, tmp_path, name):
         """A directory of the build root that holds out/ is a variant, also when its name is an old name."""
-        from fw_context_mcp.indexer.build_layout import remove_legacy_output
 
         database = tmp_path / BUILD_ROOT_REL / name / "out" / "compile_commands.json"
         database.parent.mkdir(parents=True)
         database.write_text("[]", encoding="utf-8")
 
-        assert remove_legacy_output(tmp_path) == []
+        assert _removed_paths(tmp_path) == []
         assert database.exists()
 
     def test_a_database_that_the_index_reads_stays(self, tmp_path):
         """The old index reads the old copies until a run indexes the build again."""
-        from fw_context_mcp.indexer.build_layout import remove_legacy_output
-
         paths = self._legacy(tmp_path)
-        remove_legacy_output(tmp_path, keep=[paths["flat"], paths["autobuild"]])
+        _removed_paths(tmp_path, keep=[paths["flat"], paths["autobuild"]])
 
         assert paths["flat"].exists()
         assert paths["autobuild"].exists(), "a directory that holds a kept file stays"
@@ -278,25 +293,21 @@ class TestRemoveLegacyOutput:
 
     def test_a_kept_file_through_another_path_stays(self, tmp_path):
         """The file system decides if two paths are one file: a link, or another case on macOS and Windows."""
-        from fw_context_mcp.indexer.build_layout import remove_legacy_output
-
         paths = self._legacy(tmp_path)
         alias = tmp_path / "alias"
         alias.symlink_to(tmp_path / BUILD_ROOT_REL, target_is_directory=True)
 
-        remove_legacy_output(tmp_path, keep=[alias / "compile_commands.json"])
+        _removed_paths(tmp_path, keep=[alias / "compile_commands.json"])
 
         assert paths["flat"].exists()
 
     def test_a_symbolic_link_goes_and_not_its_target(self, tmp_path):
-        from fw_context_mcp.indexer.build_layout import remove_legacy_output
-
         target = tmp_path / "elsewhere"
         (target / "default").mkdir(parents=True)
         (tmp_path / ".fw-context").mkdir()
         (tmp_path / ".fw-context" / "autobuild").symlink_to(target, target_is_directory=True)
 
-        remove_legacy_output(tmp_path)
+        _removed_paths(tmp_path)
 
         assert not (tmp_path / ".fw-context" / "autobuild").is_symlink()
         assert (target / "default").is_dir()
@@ -304,29 +315,27 @@ class TestRemoveLegacyOutput:
     def test_a_path_that_cannot_go_gives_a_warning_and_the_rest_goes(self, tmp_path, monkeypatch, caplog):
         import logging
 
-        from fw_context_mcp.indexer import build_layout
+        from fw_context_mcp import housekeeping
 
         paths = self._legacy(tmp_path)
 
         def refuse(path, *a, **k):
             raise PermissionError(13, "Permission denied", str(path))
 
-        monkeypatch.setattr(build_layout.shutil, "rmtree", refuse)
-        with caplog.at_level(logging.WARNING, logger="fw_context_mcp.indexer.build_layout"):
-            removed = build_layout.remove_legacy_output(tmp_path)
+        monkeypatch.setattr(housekeeping.shutil, "rmtree", refuse)
+        with caplog.at_level(logging.WARNING, logger="fw_context_mcp.housekeeping"):
+            removed = _removed_paths(tmp_path)
 
         assert paths["autobuild"].exists() and paths["deps"].exists()
         assert not paths["flat"].exists() and paths["flat"] in removed
-        assert any("Cannot remove" in r.getMessage() for r in caplog.records)
+        assert any("Cannot clean" in r.getMessage() for r in caplog.records)
 
     def test_a_project_without_old_output_is_untouched(self, tmp_path):
-        from fw_context_mcp.indexer.build_layout import remove_legacy_output
-
-        assert remove_legacy_output(tmp_path) == []
+        assert _removed_paths(tmp_path) == []
 
 
 class TestIndexRemovesLegacyOutput:
-    """`fw-context index` removes the old output after a run that ends well."""
+    """`fw-context index` removes the old output at its start, and after a run that ends well."""
 
     def _run(
         self, tmp_path: Path, monkeypatch, *, compile_commands: str | None = None,
@@ -385,62 +394,59 @@ class TestIndexRemovesLegacyOutput:
         assert not self._run(tmp_path, monkeypatch).exists()
 
     @staticmethod
-    def _direct(tmp_path: Path, db_path: Path) -> Path:
-        """Call ``_remove_legacy_output`` on a project with an old flat copy; return the copy."""
-        from types import SimpleNamespace
+    def _direct(root: Path) -> Path:
+        """Run the cleanup on a project with an old flat copy; return the copy."""
+        from fw_context_mcp.housekeeping import clean
 
-        from fw_context_mcp.cli._index import _remove_legacy_output
-
-        flat = tmp_path / BUILD_ROOT_REL / "compile_commands.json"
+        flat = root / BUILD_ROOT_REL / "compile_commands.json"
         flat.parent.mkdir(parents=True, exist_ok=True)
         flat.write_text("[]", encoding="utf-8")
-        _remove_legacy_output(SimpleNamespace(compile_commands=None), tmp_path, "proj", db_path)
+        _cmake_marker(root)
+        clean(root)
         return flat
 
     def test_a_project_without_an_index_gets_no_index_file(self, tmp_path):
         """A run with --no-index leaves a project without an index as it was: get_active_build says no_index."""
-        db_path = tmp_path / "db" / "index.db"
+        import os
 
-        assert not self._direct(tmp_path, db_path).exists()
-        assert not db_path.exists()
+        index_dir = Path(os.environ["FW_CONTEXT_INDEX_DIR"])
+        before = sorted(index_dir.rglob("index.db"))
+
+        assert not self._direct(tmp_path).exists()
+        assert sorted(index_dir.rglob("index.db")) == before
 
     def test_a_project_without_old_output_does_not_open_the_index(self, tmp_path, monkeypatch):
-        """An open of the index costs an integrity check, and the removal runs after each index run."""
-        from types import SimpleNamespace
-
-        from fw_context_mcp.cli._index import _remove_legacy_output
+        """An open of the index costs an integrity check, and the cleanup runs in each index run."""
+        from fw_context_mcp.housekeeping import clean
         from fw_context_mcp.indexer import db as db_module
 
-        db_path = tmp_path / "index.db"
-        db_path.write_bytes(b"")
         monkeypatch.setattr(db_module, "open_db", lambda *a, **k: pytest.fail("the index was opened"))
 
-        _remove_legacy_output(SimpleNamespace(compile_commands=None), tmp_path, "proj", db_path)
+        clean(tmp_path)
 
     def test_an_index_that_cannot_be_read_keeps_the_old_output(self, tmp_path, monkeypatch):
         """Without the list of the databases that the index reads, nothing can go."""
-        import sqlite3
+        from fw_context_mcp import housekeeping
 
-        from fw_context_mcp.indexer import db as db_module
+        monkeypatch.setattr(housekeeping, "databases_in_use", lambda root: None)
 
-        db_path = tmp_path / "db" / "index.db"
-        db_module.open_db(db_path).close()
-
-        def fail(*a, **k):
-            raise sqlite3.OperationalError("disk I/O error")
-
-        monkeypatch.setattr(db_module, "get_builds_for_scope", fail)
-
-        assert self._direct(tmp_path, db_path).exists()
+        assert self._direct(tmp_path).exists()
 
     def test_a_relative_path_in_the_index_is_relative_to_the_project(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         flat = self._run(tmp_path, monkeypatch, indexed=BUILD_ROOT_REL / "compile_commands.json")
         assert flat.exists()
 
-    def test_a_failed_run_keeps_the_old_output(self, tmp_path, monkeypatch):
+    def test_a_failed_run_keeps_a_copy_that_the_old_index_reads(self, tmp_path, monkeypatch):
         """The old index stays, and it reads the old copy."""
-        assert self._run(tmp_path, monkeypatch, exit_code=1).exists()
+        flat = self._run(
+            tmp_path, monkeypatch, exit_code=1, indexed=tmp_path / "proj" / BUILD_ROOT_REL / "compile_commands.json",
+        )
+        assert flat.exists()
+
+    def test_a_copy_that_nothing_reads_goes_also_in_a_run_that_fails(self, tmp_path, monkeypatch):
+        """The cleanup runs at the start of the run, and the copy is read by no build."""
+        assert not self._run(tmp_path, monkeypatch, exit_code=1).exists()
 
     def test_a_copy_that_a_build_of_the_index_reads_stays(self, tmp_path, monkeypatch):
         """A run that --variant narrowed leaves the other variants on their old copies."""

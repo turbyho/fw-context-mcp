@@ -619,10 +619,32 @@ fw-context doctor --project /path    # audit specific project
 - Index database integrity and schema compatibility
 - Configuration file syntax and key validity
 - File permissions for the index directory and config files
+- The files, directories and config keys of an older fw-context
+  (`obsolete-files`). `--fix` removes them.
 
 When you run this command with `--fix`, it attempts to repair fixable
 issues automatically. The command reports issues that it cannot fix, and
 tells you how to fix them manually.
+
+### `fw-context cleanup`
+
+Remove the files, directories and config keys that an older fw-context
+wrote and that no release reads now. The list is in
+[Obsolete keys and files](configuration.md#obsolete-keys-and-files).
+`fw-context index` and `fw-context doctor --fix` do the same cleanup, thus
+you need this command only to see the list, or to clean now.
+
+```bash
+fw-context cleanup --dry-run         # show the list, change nothing
+fw-context cleanup                   # remove the items in the list
+fw-context cleanup --project /path   # clean a specific project
+```
+
+The command gives one line for each item. Exit code 1 means that a path
+could not be read or changed.
+
+`fw-context db cleanup` is a different command: it removes the per-build
+files of the index that no build uses.
 
 ### `fw-context watch`
 

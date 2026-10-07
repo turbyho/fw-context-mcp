@@ -21,6 +21,8 @@ fw-context merges three levels of TOML files, in this order. A later file overri
 
 `local.toml` holds settings that are specific to each developer. Examples are which Ollama model you have installed, where your index database is, and whether you want LLM analysis enabled. Keep `local.toml` out of git.
 
+The environment variable `FW_CONTEXT_HOME` moves the global `config.toml` and the global files that the cleanup removes (see [Obsolete keys and files](#obsolete-keys-and-files)). Without it, they are in `~/.fw-context`. It does not move the index, the project registry or the clang headers: these have their own variables (`FW_CONTEXT_INDEX_DIR`, `FW_CONTEXT_PROJECTS_DB`, `FW_CONTEXT_CLANG_RESOURCE_DIR`). The test suite of fw-context sets all four, thus a test cannot change the files of the operator.
+
 Run `fw-context init` to create the project config files with commented-out default values. This command also adds the necessary entries to `.gitignore`. On first use, fw-context creates only the global `~/.fw-context/config.toml`. The MCP tools and `fw-context index` create no config file in a project that `init` did not set up, and read a missing project file as empty.
 
 ## Settings reference
@@ -79,7 +81,7 @@ Each `[[build.variants]]` table:
 | `name` | *(required)* | A unique key. The query tools and the CLI reference this key. |
 | `board` | *(none)* | The board, target, or chip label for this variant. This value overrides `[build] board`. |
 | `description` | *(none)* | A human-readable description. |
-| `build_dir` | — | Retired, here and in `[build]`. Each variant builds into `.fw-context/build/<name>/out`. An index run stops with an error while the key is in the config. |
+| `build_dir` | — | Retired, here and in `[build]`. Each variant builds into `.fw-context/build/<name>/out`. `fw-context index` removes the key from the config at its start (see [Obsolete keys and files](configuration.md#obsolete-keys-and-files)). When it cannot write the config, the run stops with an error. |
 | `env` | *(none)* | Build environment variables. fw-context folds these variables into the `config_hash`. |
 | `images` | *(none)* | The sysbuild images (Zephyr only). Each image has `name`, `dir`, `type` (`"project"` or `"sdk"`), and an optional `board`. |
 | *(any other `[build]` key)* | — | Overrides the shared `[build]` value for this variant only. |
@@ -126,7 +128,7 @@ and multi-image builds](build.md).
 
 fw-context asks each GCC compiler that `compile_commands.json` names for its system include directories and its predefined macros, as clangd `--query-driver` does. It runs the compiler with `-E -v` and `-dM -E` on an empty input. This is the compiler that the build of the project runs too, thus no configuration selects it. When a compiler does not answer, its units get the flags of `compile_commands.json`, a target from the compiler name, and toolchain directories that fw-context guesses from the layout of the toolchain.
 
-Earlier releases read the keys `query_driver`, `query_driver_extra` and `query_driver_auto`, and wrote `.fw-context/toolchains.toml`. fw-context ignores these keys and this file now, and a warning names the file that still has them. You can remove them.
+Earlier releases read the keys `query_driver`, `query_driver_extra` and `query_driver_auto`, and wrote `.fw-context/toolchains.toml`. fw-context ignores these keys and this file now. The next `fw-context index` removes them, see [Obsolete keys and files](#obsolete-keys-and-files). Until then, a warning names the file that still has them.
 
 The parse also needs the clang compiler headers (`stddef.h`, `arm_acle.h`) of the same major version as libclang, because the libclang wheel does not include them. fw-context ships these headers for the libclang version that it pins, and unpacks them to `~/.fw-context/clang-resource/<major>-<hash>/` at the first parse (one directory for each archive, thus two installations of fw-context do not share one copy), or when `fw-context doctor --fix`, `fw-context init` or `make install` runs. This needs no network and no administrator rights, and works on Linux, macOS and Windows. `fw-context doctor` reports the state as the `clang-resource` check.
 
@@ -251,6 +253,34 @@ token = "<your-token>"
 ```
 
 For setup, deployment, and management instructions, see **[Cache Server →](cache-server.md)**.
+
+## Obsolete keys and files
+
+fw-context removes the config keys and the files that an older release wrote and that no release reads now. The list is in `src/fw_context_mcp/housekeeping.py`, with the commit that retired each item.
+
+| Item | Where |
+|------|-------|
+| `[index] query_driver`, `query_driver_extra`, `query_driver_auto` | each config file, also in `[[build.variants]]` |
+| `[llm] allow_external_llm` | each config file |
+| `[build] build_dir` | each config file, also in `[[build.variants]]` |
+| `[index] compile_commands` with the value `compile_commands.json` or `.fw-context/build/compile_commands.json` | `config.toml` and `local.toml` of the project, when two conditions are true. fw-context runs the build of the project: for a stub build (for example STM32CubeIDE), the value names the database of the project. And the files below it give such a value too, or none: else the removal brings up the value of a lower file. The global config keeps the key, because it applies to each project, a stub project too. |
+| `.fw-context/toolchains.toml` | the project |
+| The build output of the older layout (`.fw-context/autobuild/`, the files directly in `.fw-context/build/`), see [build.md](build.md) | the project. A database that a build of the index reads stays. |
+| `platformio-shared.ini` | the global directory |
+
+The cleanup changes only the lines of a removed key. A comment on the same line as the key goes with it. The other comments, the order of the keys and the line ends (LF or CRLF) of the file stay. A config file without an obsolete key is not written. The cleanup writes a new file and renames it over the old one, as the other config writers of fw-context do. Thus a stop of the process leaves the old file or the new one, never a cut file. The new file gets the mode of the old one (a config of mode 0600 that holds a token stays 0600). A symbolic link stays a link: the cleanup writes the target. A file whose mode gives the owner no write permission stays as it is, also when root runs fw-context, and the cleanup reports it. `config.toml` is in git, thus a removed key shows as a change there: commit it.
+
+The report gives each removed key as a full line with its value, for example `[index] query_driver = ["/opt/gcc/*"] in .fw-context/local.toml`. Thus you can write a key back. `local.toml` and the global config are not in git: before the cleanup changes one of them, it writes the old text to `local.toml.bak` or `config.toml.bak` beside the file. A later cleanup replaces that copy. `fw-context init` keeps `local.toml.bak` out of git. You can delete the copy.
+
+`.fw-context/build/` belongs to fw-context. For a project whose build fw-context runs, the cleanup removes `.fw-context/build/compile_commands.json` when no build of the index reads it, also when you made the file. Keep a database of your own in another directory, and name it with `[index] compile_commands`.
+
+These commands do the cleanup:
+
+- `fw-context index`, at the start of each run, and again after a run that ends well
+- `fw-context cleanup` (`--dry-run` shows the list and changes nothing)
+- `fw-context doctor --fix`, and `fw-context init`, which runs the same fixes. `fw-context doctor` shows the list as the check `obsolete-files`.
+
+The MCP server and the watcher daemon remove nothing. The background runs of the daemon are `fw-context index` runs, thus the cleanup runs in them too. When the cleanup cannot read or write a file, it logs a warning and continues: the index run does not stop for it. When the index cannot be read (for example an index of an older schema), the old build output stays until an index run migrates the index.
 
 ## Examples
 

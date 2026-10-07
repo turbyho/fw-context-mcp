@@ -390,12 +390,48 @@ class TestTheRunOfTheUser:
         assert problem is not None and problem.build_missing
         assert f"{_default_cc(root)} does not exist" in problem.text
 
-    def test_a_retired_build_dir_stops_the_run_before_any_build(self, tmp_path: Path, monkeypatch) -> None:
-        """The config names a directory that the build does not use, thus the run refuses it."""
+    def test_a_retired_build_dir_goes_from_the_config_and_the_run_goes_on(self, tmp_path: Path, monkeypatch) -> None:
+        """The cleanup at the start of the run removes the key; the run stopped on it before."""
         from types import SimpleNamespace
 
         from fw_context_mcp.cli import _index as index_mod
+
+        root = tmp_path / "proj"
+        root.mkdir()
+        _project(root, tmp_path / "index", _built(root))
+        config = root / ".fw-context" / "config.toml"
+        config.write_text(
+            config.read_text(encoding="utf-8")
+            + '[[build.variants]]\nname = "dev"\nboard = "b"\nbuild_dir = "build/dev"  # old\n',
+            encoding="utf-8",
+        )
+        built: list[str] = []
+        monkeypatch.setattr(index_mod, "_run_multi", lambda *a, **kw: built.append("multi") or 0)
+        monkeypatch.setattr(index_mod, "_build_run_kwargs", lambda *a, **kw: {})
+        monkeypatch.setattr(index_mod, "_ensure_watcher_after_index", lambda root: None)
+        args = SimpleNamespace(
+            verbose=False, project=str(root), background=False, build=True,
+            compile_commands=None, no_clean=False, force=False, takeover=False,
+            vendor_paths=None, project_paths=None,
+        )
+
+        assert index_mod.cmd_index(args) == 0
+        assert built == ["multi"]
+        text = config.read_text(encoding="utf-8")
+        assert "build_dir" not in text and 'board = "b"' in text
+
+    def test_a_retired_build_dir_that_stays_stops_the_run_before_any_build(self, tmp_path: Path, monkeypatch) -> None:
+        """The cleanup could not write the config: the refusal is the fallback."""
+        from types import SimpleNamespace
+
+        from fw_context_mcp import housekeeping
+        from fw_context_mcp.cli import _index as index_mod
         from fw_context_mcp.indexer.autobuild import read_problem
+
+        def refuse(path, *a, **k):
+            raise PermissionError(13, "Permission denied", str(path))
+
+        monkeypatch.setattr(housekeeping, "write_text_atomic", refuse)
 
         root = tmp_path / "proj"
         root.mkdir()

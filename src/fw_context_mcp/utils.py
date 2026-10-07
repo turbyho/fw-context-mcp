@@ -898,10 +898,11 @@ FW_CONTEXT_HOME_ENV = "FW_CONTEXT_HOME"
 def fw_context_home() -> Path:
     """Return the global directory of fw-context: ``$FW_CONTEXT_HOME``, else ``~/.fw-context``.
 
-    The global config reads it.  The test session sets it, so that a test,
-    and each CLI process that a test starts, cannot change the global
-    config of the user.  The index, the registry and the clang headers
-    have their own variables (``FW_CONTEXT_INDEX_DIR``, ``FW_CONTEXT_PROJECTS_DB``,
+    The global config and the cleanup of the global files read it.  The
+    test session sets it, so that a test, and each CLI process that a test
+    starts, cannot change the directory of the user: the cleanup removes
+    files there.  The index, the registry and the clang headers have their
+    own variables (``FW_CONTEXT_INDEX_DIR``, ``FW_CONTEXT_PROJECTS_DB``,
     ``FW_CONTEXT_CLANG_RESOURCE_DIR``).
     """
     value = os.environ.get(FW_CONTEXT_HOME_ENV)
@@ -955,7 +956,7 @@ def owner_is_dead(token: str) -> bool:
 _TMP_OWNER = re.compile(r"\.(\d+@[A-Za-z0-9.-]+)\.tmp$")
 
 
-def write_text_atomic(path: Path, text: str) -> None:
+def write_text_atomic(path: Path, text: str, *, mode: int | None = None) -> None:
     """Write *text* to *path* through a file in the same directory and a rename.
 
     A process that stops during a plain write leaves a cut file, and the
@@ -969,10 +970,32 @@ def write_text_atomic(path: Path, text: str) -> None:
     The temporary name holds :func:`owner_token`, thus two writers never
     share one, and :func:`remove_stale_tmp` removes the file of a writer
     that a kill stopped between the write and the rename.
+
+    The text goes to the file as it is (``newline=""``): a config file of
+    the user keeps its line ends, and on Windows a text-mode write made
+    each "\\r\\n" of a CRLF file "\\r\\r\\n".
+
+    *mode* gives the new file these permission bits.  Without it, the file
+    gets the default of the process (0644 with the usual umask), and a
+    rewrite of a config of mode 0600 that holds a token made the token
+    readable for all users.  With *mode*, the temporary file starts as
+    0600, thus the text is never readable for more users than *mode* lets.
     """
     tmp = path.with_name(f".{path.name}.{owner_token()}.tmp")
     try:
-        tmp.write_text(text, encoding="utf-8")
+        if mode is None:
+            tmp.write_text(text, encoding="utf-8", newline="")
+        else:
+            # A file with this name is from this process, or from a dead
+            # process whose PID came back: garbage in the two cases.
+            # O_EXCL then makes sure that the file is new and of mode 0600,
+            # not a file or a link that someone put there after the unlink.
+            # O_BINARY: on Windows a text-mode descriptor changes each "\n".
+            tmp.unlink(missing_ok=True)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+            with os.fdopen(os.open(tmp, flags, 0o600), "w", encoding="utf-8", newline="") as handle:
+                handle.write(text)
+            os.chmod(tmp, mode)
         os.replace(tmp, path)
     finally:
         tmp.unlink(missing_ok=True)

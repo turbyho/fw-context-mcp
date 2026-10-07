@@ -243,24 +243,24 @@ class TestRetiredQueryDriverKeys:
         assert not hasattr(Config().index, "query_driver")
 
     @pytest.mark.parametrize("layer", ["committed", "local", "global_text"])
-    def test_a_retired_key_is_ignored_with_a_warning(self, tmpdir, monkeypatch, capsys, layer):
+    def test_a_retired_key_is_ignored_with_a_warning(self, tmpdir, monkeypatch, caplog, layer):
         files = {layer: '[index]\nquery_driver = ["**"]\nquery_driver_auto = false\nvendor_paths = ["x"]\n'}
         cfg = load(self._project(tmpdir, monkeypatch, **files))
         assert cfg.index.vendor_paths == ["x"], "the other [index] keys of the file stay"
-        err = capsys.readouterr().err
+        err = caplog.text
         assert "query_driver, query_driver_auto" in err
         assert "has no effect" in err
 
-    def test_the_warning_is_given_once_per_file(self, tmpdir, monkeypatch, capsys):
+    def test_the_warning_is_given_once_per_file(self, tmpdir, monkeypatch, caplog):
         import fw_context_mcp.config.settings as settings
 
         proj = self._project(tmpdir, monkeypatch, local='[index]\nquery_driver_extra = ["~/x/**"]\n')
         load(proj)
         settings._config_cache.clear()  # force a second parse of the same file
         load(proj)
-        assert capsys.readouterr().err.count("query_driver_extra") == 1
+        assert caplog.text.count("query_driver_extra") == 1
 
-    def test_a_retired_key_in_a_variant_is_not_an_unknown_build_key(self, tmpdir, monkeypatch, capsys):
+    def test_a_retired_key_in_a_variant_is_not_an_unknown_build_key(self, tmpdir, monkeypatch, caplog):
         """A variant copies a non-[index] key into its [build] overrides.
 
         Without the removal, ``build_variant_config`` said "unknown [build]
@@ -270,7 +270,7 @@ class TestRetiredQueryDriverKeys:
         cfg = load(self._project(tmpdir, monkeypatch, committed))
         variant = cfg.build.variants[0]
         assert "query_driver" not in variant.overrides
-        assert "has no effect" in capsys.readouterr().err
+        assert "has no effect" in caplog.text
 
     def test_a_malformed_build_table_does_not_crash_the_removal(self, tmp_path, monkeypatch):
         """``build = "x"`` is a typo; the removal must leave it to the rest of the loader."""
@@ -281,15 +281,15 @@ class TestRetiredQueryDriverKeys:
         settings._drop_retired_keys(data, tmp_path / "local.toml")
         assert data == {"build": "x", "index": {}}
 
-    def test_an_old_toolchains_file_gets_a_warning_and_stays(self, tmpdir, monkeypatch, capsys):
+    def test_an_old_toolchains_file_gets_a_warning_and_stays(self, tmpdir, monkeypatch, caplog):
         proj = self._project(tmpdir, monkeypatch)
         toolchains = proj / ".fw-context" / "toolchains.toml"
         toolchains.write_text('[index]\nquery_driver_extra = ["~/x/bin/gcc"]\n')
         load(proj)
-        assert "toolchains.toml" in capsys.readouterr().err
-        assert toolchains.is_file(), "fw-context does not delete a file of the user"
+        assert "toolchains.toml" in caplog.text
+        assert toolchains.is_file(), "a load of the config removes nothing; the cleanup does"
 
-    def test_a_committed_pre_build_gives_no_warning(self, tmpdir, monkeypatch, capsys):
+    def test_a_committed_pre_build_gives_no_warning(self, tmpdir, monkeypatch, caplog):
         """The build runs the code of the repository in all cases.
 
         Thus a warning on a committed ``pre_build`` or ``command`` protected
@@ -297,12 +297,12 @@ class TestRetiredQueryDriverKeys:
         """
         committed = '[build]\npre_build = "make gen"\ncommand = "make"\n'
         load(self._project(tmpdir, monkeypatch, committed))
-        assert "SECURITY" not in capsys.readouterr().err
+        assert "SECURITY" not in caplog.text
 
-    def test_a_committed_remote_ollama_url_still_warns(self, tmpdir, monkeypatch, capsys):
+    def test_a_committed_remote_ollama_url_still_warns(self, tmpdir, monkeypatch, caplog):
         committed = '[llm]\nollama_url = "http://198.51.100.7:11434"\n'
         load(self._project(tmpdir, monkeypatch, committed))
-        assert "SECURITY: ollama_url" in capsys.readouterr().err
+        assert "SECURITY: ollama_url" in caplog.text
 
 
 class TestMalformedSection:
@@ -329,13 +329,13 @@ class TestMalformedSection:
 
     @pytest.mark.parametrize("layer", ["committed", "local", "global_text"])
     @pytest.mark.parametrize("bad", ['build = "x"', "build = []", "index = 3", 'llm = "x"', 'cache_server = "x"'])
-    def test_a_section_that_is_not_a_table_is_ignored(self, tmpdir, monkeypatch, capsys, layer, bad):
+    def test_a_section_that_is_not_a_table_is_ignored(self, tmpdir, monkeypatch, caplog, layer, bad):
         good = '[project]\nname = "kept"\n'
         files = {"committed": "", "local": "", "global_text": ""}
         files[layer] = bad + "\n" + good
         cfg = self._load(tmpdir, monkeypatch, **files)
         assert cfg.project.name == "kept", "the other sections of the file still apply"
-        assert "must be a table" in capsys.readouterr().err
+        assert "must be a table" in caplog.text
 
     def test_a_string_section_is_not_read_as_a_substring(self, tmpdir, monkeypatch):
         """``_apply_section`` tested ``key in section``; on a string that is a substring test."""

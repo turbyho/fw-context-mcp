@@ -102,7 +102,7 @@ def main() -> None:
     """Entry point for the ``fw-context`` CLI — dispatches subcommands.
 
     Subcommands: index, search, list, status, init, export, cache, db,
-    watch, finetune, analyze, doctor, version.  Parses arguments via
+    watch, finetune, analyze, doctor, cleanup, version.  Parses arguments via
     argparse and calls the corresponding ``cmd_*`` handler.
 
     WHY: All CLI subcommands share common setup (pre-flight checks,
@@ -495,6 +495,15 @@ def main() -> None:
         help="Run only these checks (comma-separated names, e.g. clang-resource)",
     )
     p_doctor.set_defaults(func=cmd_doctor)
+
+    from ._cleanup import cmd_cleanup  # noqa: I001
+    p_cleanup = sub.add_parser(
+        "cleanup",
+        help="Remove the files, directories and config keys of an older fw-context",
+    )
+    p_cleanup.add_argument("--dry-run", action="store_true", help="Only list what would go")
+    p_cleanup.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
+    p_cleanup.set_defaults(func=cmd_cleanup)
 
     args = parser.parse_args()
     if not hasattr(args, "func"):

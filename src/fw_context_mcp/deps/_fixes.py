@@ -318,6 +318,27 @@ def fix_clang_resource(_result, _project_root=None) -> tuple[bool, str]:
     return True, f"clang {major} headers installed in {include}"
 
 
+def fix_obsolete_files(_result, project_root=None) -> tuple[bool, str]:
+    """Remove what an older fw-context wrote and no version uses (``housekeeping.clean``)."""
+    from ..housekeeping import clean
+    from ..utils import resolve_project_root
+
+    try:
+        root: Path | None = resolve_project_root(str(project_root) if project_root else None)
+    except OSError:
+        root = None
+    report = clean(root, quiet=True)
+    removed = f"removed {len(report.lines())} item(s) of an older fw-context"
+    if report.lines():
+        removed += ": " + "; ".join(report.lines())
+    if report.failures:
+        # The message names what went too: doctor shows only "fix failed"
+        # and this text, and a removed key in config.toml needs a commit.
+        failed = "; ".join(f"cannot clean {path}: {reason}" for path, reason in report.failures)
+        return False, f"{removed}; {failed}" if report.lines() else failed
+    return True, removed
+
+
 def _extract_model_name(result, default_url: str) -> str:
     """Extract model name from fix_cmd like 'ollama pull <model>'."""
     if result.fix_cmd and result.fix_cmd.startswith("ollama pull "):
@@ -339,6 +360,7 @@ FIXABLE: dict[str, Any] = {
     "embed-model": fix_embed_model,
     "sqlite-ext": fix_sqlite_ext,
     "clang-resource": fix_clang_resource,
+    "obsolete-files": fix_obsolete_files,
 }
 
 

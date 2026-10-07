@@ -56,9 +56,10 @@ The index reads `compile_commands.json` where the build system writes it in
 An older fw-context wrote its build output into `.fw-context/autobuild/`
 and directly into `.fw-context/build/`: a copy of each database
 (`compile_commands.json`, `compile_commands.<variant>.<image>.json`),
-`platformio_link.json` and `deps/`. Each `fw-context index` run that
-ends well removes that output, and it logs one line for each path that it
-removes. A database that a build of the index reads stays, until a run
+`platformio_link.json` and `deps/`. Each `fw-context index` run removes
+that output at its start, and again when it ends well, and it logs one
+line for each path that it removes (see
+[Obsolete keys and files](configuration.md#obsolete-keys-and-files)). A database that a build of the index reads stays, until a run
 indexes that build again: a run that `--variant` narrows leaves the other
 variants on their old copies. The file on the command line stays too. A
 directory of the build root that holds `out/` is the directory of a
@@ -383,7 +384,7 @@ build. You do not need one checkout per board.
 | `name` | `str` | — | **Required.** A unique key. The query tools and the CLI reference this key. |
 | `board` | `str` | — | The board, target, or chip label for this variant. This value overrides `[build] board`. |
 | `description` | `str` | — | A human-readable description. |
-| `build_dir` | — | — | Retired, here and in `[build]`. Each variant builds into `.fw-context/build/<name>/out`. An index run stops with an error while the key is in the config. |
+| `build_dir` | — | — | Retired, here and in `[build]`. Each variant builds into `.fw-context/build/<name>/out`. `fw-context index` removes the key from the config at its start (see [Obsolete keys and files](configuration.md#obsolete-keys-and-files)). When it cannot write the config, the run stops with an error. |
 | `env` | `dict` | — | Build environment variables. fw-context folds these variables into the `config_hash`. |
 | `images` | `list` | — | The sysbuild images (Zephyr only). |
 | *(any other `[build]` key)* | — | — | Overrides the shared `[build]` value for this variant only. |

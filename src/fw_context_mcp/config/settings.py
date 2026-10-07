@@ -1171,8 +1171,9 @@ def _validate_config_safety(proj_data: dict, proj_path: Path) -> None:
             f"LLM prompts would be sent to that host.  Use localhost or move "
             f"ollama_url to .fw-context/local.toml (gitignored) instead."
         )
+        # The log only, as _warn_retired_once: a CLI run logs to stderr, and
+        # a second print showed the warning two times.
         log.warning(msg)
-        print(f"⚠ {msg}", file=sys.stderr)
 
 def _drop_malformed_sections(layer: dict, path: Path) -> None:
     """Remove a known section that is not a table from one config file, and warn.
@@ -1191,8 +1192,8 @@ def _drop_malformed_sections(layer: dict, path: Path) -> None:
                 f"{path}: '{name}' must be a table ([{name}]), not a "
                 f"{type(layer[name]).__name__}; fw-context ignores it."
             )
+            # The log only, see _validate_config_safety.
             log.warning(msg)
-            print(f"⚠ {msg}", file=sys.stderr)
             del layer[name]
 
 
@@ -1212,18 +1213,22 @@ _RETIRED_TOOLCHAINS_FILE = "toolchains.toml"
 _retired_warned: set[Path] = set()
 
 
-def _warn_retired_once(path: Path, what: str) -> None:
-    """Warn one time for each *path* in this process that fw-context ignores *what*."""
+def _warn_retired_once(path: Path, what: str, remedy: str = "You can remove it.") -> None:
+    """Warn one time for each *path* in this process that fw-context ignores *what*.
+
+    The warning goes to the log only.  It went to stderr too, and a CLI run
+    logs to stderr, thus the user saw each warning two times.  A process
+    without a log handler still shows it: the ``logging`` module writes a
+    warning to stderr when no handler is set.
+    """
     if path in _retired_warned:
         return
     _retired_warned.add(path)
-    msg = (
-        f"{path}: {what} has no effect. fw-context asks the compiler of the build "
-        f"for its system headers and macros in all cases, as the build runs it too. "
-        f"You can remove it."
+    log.warning(
+        "%s: %s has no effect. fw-context asks the compiler of the build for its system "
+        "headers and macros in all cases, as the build runs it too. %s",
+        path, what, remedy,
     )
-    log.warning(msg)
-    print(f"⚠ {msg}", file=sys.stderr)
 
 
 def _drop_retired_keys(layer: dict, path: Path) -> None:
@@ -1250,18 +1255,22 @@ def _drop_retired_keys(layer: dict, path: Path) -> None:
         for key in _RETIRED_INDEX_KEYS:
             table.pop(key, None)
     if found:
-        _warn_retired_once(path, "[index] " + ", ".join(found))
+        _warn_retired_once(
+            path, "[index] " + ", ".join(found), "The next 'fw-context index' removes it from the file.",
+        )
 
 
 def _warn_retired_toolchains_file(project_root: Path) -> None:
     """Warn when the project still has the retired ``toolchains.toml``.
 
-    WHY not delete it: the file belongs to the project directory of the
-    user, and fw-context does not remove a file that it does not use.
+    The next ``fw-context index``, ``fw-context cleanup`` or ``doctor --fix``
+    removes the file (``housekeeping.clean``): fw-context wrote it, and no
+    version reads it.  Until then, a process that only loads the config
+    says so.
     """
     path = project_root / _PROJECT_CONFIG_DIR / _RETIRED_TOOLCHAINS_FILE
     if path.is_file():
-        _warn_retired_once(path, "this file")
+        _warn_retired_once(path, "this file", "The next 'fw-context index' removes it.")
 
 
 def _is_loopback_url(url: str) -> bool:

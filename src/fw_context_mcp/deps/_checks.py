@@ -486,6 +486,43 @@ def check_ollama_embed_model(cfg) -> DepCheckResult:
     )
 
 
+def check_obsolete_files(project_root: str | Path | None = None) -> DepCheckResult:
+    """List what an older fw-context wrote and no version uses, see ``housekeeping``.
+
+    The check removes nothing: ``doctor`` and the MCP tool
+    ``get_environment_status`` only read.  ``doctor --fix`` removes the list.
+    Not critical: such a file or key takes space and gives a warning, and
+    no answer changes.
+    """
+    from ..housekeeping import clean
+    from ..utils import resolve_project_root
+
+    try:
+        root: Path | None = resolve_project_root(str(project_root) if project_root else None)
+    except OSError:
+        root = None
+    report = clean(root, dry_run=True, quiet=True)
+    if report.empty and not report.failures:
+        return DepCheckResult(
+            name="obsolete-files", status="ok",
+            message="no file or config key of an older fw-context", critical=False,
+        )
+    parts = []
+    if not report.empty:
+        parts.append(f"{len(report.lines())} item(s) of an older fw-context: " + "; ".join(report.lines()))
+    parts += [f"cannot clean {path}: {reason}" for path, reason in report.failures]
+    # Without an item to remove, the fix cannot do more than this check:
+    # a config that does not parse, a read-only config, or an index that
+    # cannot be read needs the user, thus no fix command.
+    return DepCheckResult(
+        name="obsolete-files",
+        status="degraded",
+        message="; ".join(parts),
+        fix_cmd=None if report.empty else "fw-context doctor --fix",
+        critical=False,
+    )
+
+
 def check_db_integrity(project_root: str | Path | None = None) -> DepCheckResult:
     """Verify the index database is not corrupt."""
     platform_ctx = get_platform_info()
@@ -641,5 +678,6 @@ CHECK_ORDER: list[tuple[str, Any]] = [
     ("chat-model", check_ollama_chat_model),
     ("embed-model", check_ollama_embed_model),
     ("db-integrity", check_db_integrity),
+    ("obsolete-files", check_obsolete_files),
     ("disk-space", check_disk_space),
 ]

@@ -33,6 +33,10 @@ dependencies = [
     "PyYAML>=6.0",
     "sqlite-vec>=0.1.0",
     "tomli-w>=1.2.0",
+    # The cleanup of retired config keys (housekeeping.py) edits a
+    # config.toml that is in the git of the user: tomlkit keeps its comments,
+    # order and format, and tomli-w writes the file again from the data.
+    "tomlkit>=0.13",
     "watchfiles>=0.21",
 ]
 

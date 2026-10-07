@@ -1511,6 +1511,9 @@ def _cmd_index(args: argparse.Namespace, outside: _SigtermOutsideTheLock) -> int
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
     project_root = resolve_project_root(args.project)
+    # Before the config loads: a retired key such as build_dir goes from the
+    # file, and the run does not stop on it.
+    _clean_obsolete(args, project_root)
     cfg = load_config(project_root=project_root)
     bg = getattr(args, "background", False)
     # The config wins over the markers, the same form _run_multi already
@@ -1701,11 +1704,12 @@ def _cmd_index(args: argparse.Namespace, outside: _SigtermOutsideTheLock) -> int
                     args, cfg, project_root, project_id, db_path,
                     detected_system, bg, run_kwargs,
                 )
-            # The output of an older fw-context goes after a run that ended
-            # well, under the index lock: a run that fails leaves the old
-            # index, and the old index reads the old copies.
+            # Again after a run that ended well, under the index lock: the
+            # builds of this run replaced the builds that read an old copy,
+            # thus that copy goes now.  A run that fails leaves the old index,
+            # and the old index reads the old copies.
             if exit_code == 0:
-                _remove_legacy_output(args, project_root, project_id, db_path)
+                _clean_obsolete(args, project_root)
     except IndexRunLocked as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_ALREADY_RUNNING
@@ -1755,51 +1759,20 @@ def _cmd_index(args: argparse.Namespace, outside: _SigtermOutsideTheLock) -> int
     return 0
 
 
-def _remove_legacy_output(args: argparse.Namespace, project_root: Path, project_id: str, db_path: Path) -> None:
-    """Remove the build output of the layout before ``.fw-context/build/<variant>/out``.
+def _clean_obsolete(args: argparse.Namespace, project_root: Path) -> None:
+    """Remove what an older fw-context wrote and no version uses, see ``housekeeping.clean``.
 
-    Each database that a build of the index reads stays: a run that
-    ``--variant`` narrowed leaves the other variants on their old copies,
-    and the MCP server reads the database of each build.  The file on the
-    command line stays too.  See ``build_layout.remove_legacy_output``.
-
-    The index is read only when there is old output: the run calls this
-    after each run that ends well, and an open of the index costs an
-    integrity check.  A project without ``index.db`` has no build that
-    reads a database, and this function does not make the file: a run
-    with ``--no-index`` must leave a project without an index as it was.
+    The file on the command line stays, with each database that the index
+    or the config reads.  The cleanup never stops the run: a path that
+    cannot go gives a warning.
     """
-    from ..indexer.build_layout import has_legacy_output, remove_legacy_output
-    from ..indexer.db import get_builds_for_scope, open_db
+    from ..housekeeping import clean
 
-    if not has_legacy_output(project_root):
-        return
     keep: list[Path] = []
     if getattr(args, "compile_commands", None):
         given = Path(args.compile_commands)
         keep.append(given if given.is_absolute() else project_root / given)
-    if db_path.exists():
-        try:
-            # This run checked the database when it opened it.
-            conn = open_db(db_path, skip_integrity_check=True)
-            try:
-                stored = [
-                    Path(row["compile_commands_path"])
-                    for row in get_builds_for_scope(conn, project_id)
-                    if row["compile_commands_path"]
-                ]
-            finally:
-                conn.close()
-        except SAFE_EXCEPT:
-            # Without the list of the databases that the index reads,
-            # nothing can go: an old copy can be the only database of a
-            # build.
-            log.warning("Cannot read the index, thus the build output of an older fw-context stays", exc_info=True)
-            return
-        # The index stores absolute paths; a relative one is relative to the
-        # project root, as the file on the command line is.
-        keep += [path if path.is_absolute() else project_root / path for path in stored]
-    remove_legacy_output(project_root, keep)
+    clean(project_root, keep=keep)
 
 
 def _run_single(
