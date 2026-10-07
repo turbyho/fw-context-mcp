@@ -173,6 +173,59 @@ def _refresh_header_mtimes_from_manifest(
 
 
 
+class _OldEntries:
+    """The entries of the previous manifest, by file, for the carry-over.
+
+    compile_commands.json can list one source file more than once, each time
+    with other flags: Zephyr compiles ``misc/empty_file.c`` three times in
+    one image, with two sets of flags.  Each listing has its own entry.  A
+    lookup by file alone gave each listing the LAST entry of the file, thus
+    the listings A, A, B became B, B, B, and the flags of A were lost: on
+    each later run the flags of two listings matched no entry.
+
+    :meth:`take` gives a listing the entry with its own flags hash.  An
+    entry goes to a second listing only when no unused entry fits: see the
+    order of preference there.
+    """
+
+    def __init__(self, manifest: dict | None) -> None:
+        self._all: dict[str, list[dict]] = {}
+        for entry in (manifest or {}).get("entries", []):
+            self._all.setdefault(entry.get("file", ""), []).append(entry)
+        self._unused: dict[str, list[dict]] = {f: list(es) for f, es in self._all.items()}
+
+    def __contains__(self, file: str) -> bool:
+        return file in self._all
+
+    def take(self, file: str, flags_hash: str) -> dict:
+        """Return the old entry for one listing of *file* with *flags_hash*.
+
+        The order of preference:
+
+        1. An unused entry with the same flags hash.
+        2. A used entry with the same flags hash: compile_commands.json now
+           lists the file with these flags more often than before.
+        3. An unused entry with other flags.
+        4. The first entry of the file.
+
+        In cases 3 and 4 the flags changed.  The entry keeps its old flags
+        hash, thus it records the flags that the index parsed, and a check
+        that compares the flags hash of the listing with it sees the change.
+        The caller copies the entry (``carry_over``), thus one entry can go
+        to two listings (cases 2 and 4).
+        """
+        unused = self._unused[file]
+        for i, entry in enumerate(unused):
+            if entry.get("flags_hash") == flags_hash:
+                return unused.pop(i)
+        for entry in self._all[file]:
+            if entry.get("flags_hash") == flags_hash:
+                return entry
+        if unused:
+            return unused.pop(0)
+        return self._all[file][0]
+
+
 def _update_manifest_after_index(
     *,
     manifest: dict | None,
@@ -299,6 +352,12 @@ def _update_manifest_after_index(
         }
     arg_sets: list[list[str]] = []
 
+    def _flags_hash(unit) -> str:
+        """Return the flags hash of *unit*, as each writer of an entry stores it."""
+        if not unit.raw_entry:
+            return ""
+        return compute_flags_hash(unit.raw_entry, transient_defines=transient_defines)
+
     def carry_over(old_entry: dict) -> dict:
         """Re-point a reused entry at THIS manifest's arg_sets table.
 
@@ -318,9 +377,7 @@ def _update_manifest_after_index(
         # Avoids a second libclang parse — tu_headers was populated during
         # the main TU loop for every unchanged/updated TU.
         log.info("Building manifest.json from %d pre-collected TU headers...", len(tu_headers))
-        old_entries: dict[str, dict] = {}
-        if manifest is not None:
-            old_entries = {e.get("file", ""): e for e in manifest.get("entries", [])}
+        old_entries = _OldEntries(manifest)
         # A shallow copy is enough: fold_headers and update_entry REPLACE a
         # record, they never change one in place.
         old_header_table = dict(header_table)
@@ -348,14 +405,11 @@ def _update_manifest_after_index(
                     "arg_set": _intern_arguments(unit.clang_args, arg_sets),
                     "source_hash": source_hash,
                     "headers": fold_headers(tu_headers[tu_rel], header_table),
-                    "flags_hash": (
-                        compute_flags_hash(unit.raw_entry, transient_defines=transient_defines)
-                        if unit.raw_entry else ""
-                    ),
+                    "flags_hash": _flags_hash(unit),
                 }
                 updated += 1
             elif tu_rel in old_entries:
-                carried.append((idx, old_entries[tu_rel]))
+                carried.append((idx, old_entries.take(tu_rel, _flags_hash(unit))))
                 reused += 1
             else:
                 headers = _collect_headers_from_tokens(
@@ -368,10 +422,7 @@ def _update_manifest_after_index(
                     "arg_set": _intern_arguments(unit.clang_args, arg_sets),
                     "source_hash": source_hash,
                     "headers": headers,
-                    "flags_hash": (
-                        compute_flags_hash(unit.raw_entry, transient_defines=transient_defines)
-                        if unit.raw_entry else ""
-                    ),
+                    "flags_hash": _flags_hash(unit),
                 }
                 updated += 1
 
@@ -400,7 +451,7 @@ def _update_manifest_after_index(
         return reload_manifest(db_dir, gen_hash)
     else:
         # ── Incremental update (tu_headers=None, manifest exists) ──
-        old_entries = {e.get("file", ""): e for e in manifest.get("entries", [])}
+        old_entries = _OldEntries(manifest)
         old_header_table = dict(header_table)
         entry_slots = [None] * len(units)
         carried = []
@@ -414,7 +465,7 @@ def _update_manifest_after_index(
                 tu_rel = str(unit.file.resolve())
 
             if tu_rel in old_entries:
-                carried.append((idx, old_entries[tu_rel]))
+                carried.append((idx, old_entries.take(tu_rel, _flags_hash(unit))))
                 reused += 1
             else:
                 headers = _collect_headers_from_tokens(
@@ -427,10 +478,7 @@ def _update_manifest_after_index(
                     "arg_set": _intern_arguments(unit.clang_args, arg_sets),
                     "source_hash": source_hash,
                     "headers": headers,
-                    "flags_hash": (
-                        compute_flags_hash(unit.raw_entry, transient_defines=transient_defines)
-                        if unit.raw_entry else ""
-                    ),
+                    "flags_hash": _flags_hash(unit),
                 }
                 updated += 1
 

@@ -6,6 +6,8 @@ import json
 import os
 from pathlib import Path
 
+import pytest
+
 from fw_context_mcp.indexer.config_hash import DEFAULT_TRANSIENT_DEFINES
 from fw_context_mcp.indexer.manifest import MANIFEST_FORMAT
 
@@ -989,6 +991,177 @@ class TestManifestEntryRefreshGuard:
         assert result is not None
         entry = result["entries"][0]
         assert tu_arguments(result, entry) == ["gcc", "-c", "src/main.cpp"]
+
+
+class TestOneEntryForEachListing:
+    """A file that compile_commands.json lists more than once keeps one entry for each listing.
+
+    Zephyr compiles ``misc/empty_file.c`` three times in one image, with two
+    sets of flags.  The carry-over looked the old entry up by file alone,
+    thus each listing got the last entry of the file: A, A, B became B, B, B.
+    """
+
+    @staticmethod
+    def _unit(tmp_path: Path, rel: str, define: str):
+        from unittest.mock import MagicMock
+
+        src = tmp_path / rel
+        src.parent.mkdir(parents=True, exist_ok=True)
+        src.write_text("int x;\n")
+        args = ["gcc", define, "-c", rel]
+        unit = MagicMock()
+        unit.file = src
+        unit.directory = tmp_path
+        unit.clang_args = args[1:]
+        unit.raw_entry = {"file": rel, "directory": str(tmp_path), "arguments": args}
+        return unit
+
+    @staticmethod
+    def _flags(unit) -> str:
+        from fw_context_mcp.indexer.config_hash import compute_flags_hash
+
+        return compute_flags_hash(unit.raw_entry, transient_defines=DEFAULT_TRANSIENT_DEFINES)
+
+    def _manifest(self, tmp_path: Path, units: list) -> dict:
+        """The manifest that the previous run wrote: one correct entry for each unit."""
+        arg_sets: list[list[str]] = []
+        entries = []
+        for unit in units:
+            if unit.clang_args not in arg_sets:
+                arg_sets.append(list(unit.clang_args))
+            entries.append({
+                "file": str(unit.file.relative_to(tmp_path)),
+                "directory": str(tmp_path),
+                "arg_set": arg_sets.index(unit.clang_args),
+                "source_hash": "stored-source",
+                "flags_hash": self._flags(unit),
+                "headers": [],
+            })
+        return {
+            "_format": MANIFEST_FORMAT, "project_root": str(tmp_path),
+            "arg_sets": arg_sets, "headers": {}, "entries": entries,
+        }
+
+    def _update(self, tmp_path: Path, manifest: dict, units: list, *, with_tu_headers: bool) -> dict:
+        from fw_context_mcp.indexer._manifest_updater import _update_manifest_after_index
+
+        (tmp_path / "index").mkdir(exist_ok=True)
+        result = _update_manifest_after_index(
+            manifest=manifest,
+            units=units,
+            project_root=tmp_path,
+            db_dir=tmp_path / "index",
+            compile_commands=tmp_path / "compile_commands.json",
+            updated_count=1,
+            tu_headers={"src/main.c": []} if with_tu_headers else None,
+            config_hash="deadbeef",
+            reparsed_tus={"src/main.c"},
+            transient_defines=DEFAULT_TRANSIENT_DEFINES,
+        )
+        assert result is not None
+        return result
+
+    @pytest.mark.parametrize("with_tu_headers", [True, False], ids=["tu_headers", "incremental"])
+    def test_each_listing_keeps_its_own_flags(self, tmp_path: Path, with_tu_headers: bool):
+        from fw_context_mcp.indexer.manifest import tu_arguments
+
+        a1 = self._unit(tmp_path, "misc/empty.c", "-DA")
+        a2 = self._unit(tmp_path, "misc/empty.c", "-DA")
+        b = self._unit(tmp_path, "misc/empty.c", "-DB")
+        main = self._unit(tmp_path, "src/main.c", "-DA")
+        units = [a1, a2, b, main]
+
+        result = self._update(tmp_path, self._manifest(tmp_path, units), units, with_tu_headers=with_tu_headers)
+
+        empty = [e for e in result["entries"] if e["file"] == "misc/empty.c"]
+        assert [e["flags_hash"] for e in empty] == [self._flags(a1), self._flags(a2), self._flags(b)]
+        assert [tu_arguments(result, e)[0] for e in empty] == ["-DA", "-DA", "-DB"]
+
+    @pytest.mark.parametrize("with_tu_headers", [True, False], ids=["tu_headers", "incremental"])
+    def test_a_new_listing_with_known_flags_gets_a_copy(self, tmp_path: Path, with_tu_headers: bool):
+        """The build now lists the file with flags A three times; B is gone."""
+        a = self._unit(tmp_path, "misc/empty.c", "-DA")
+        b = self._unit(tmp_path, "misc/empty.c", "-DB")
+        main = self._unit(tmp_path, "src/main.c", "-DA")
+        manifest = self._manifest(tmp_path, [a, b, main])
+        units = [a, self._unit(tmp_path, "misc/empty.c", "-DA"), self._unit(tmp_path, "misc/empty.c", "-DA"), main]
+
+        result = self._update(tmp_path, manifest, units, with_tu_headers=with_tu_headers)
+
+        empty = [e for e in result["entries"] if e["file"] == "misc/empty.c"]
+        assert [e["flags_hash"] for e in empty] == [self._flags(a)] * 3
+
+    @pytest.mark.parametrize("with_tu_headers", [True, False], ids=["tu_headers", "incremental"])
+    def test_an_entry_keeps_the_flags_that_the_index_parsed(self, tmp_path: Path, with_tu_headers: bool):
+        """The flags of each listing changed, and no listing was parsed again.
+
+        The entries keep the old flags hash: the index still holds what the
+        old flags gave, and the decision for the next run must see that.
+        """
+        a = self._unit(tmp_path, "misc/empty.c", "-DA")
+        b = self._unit(tmp_path, "misc/empty.c", "-DB")
+        main = self._unit(tmp_path, "src/main.c", "-DA")
+        manifest = self._manifest(tmp_path, [a, b, main])
+        units = [self._unit(tmp_path, "misc/empty.c", "-DC"), self._unit(tmp_path, "misc/empty.c", "-DD"), main]
+
+        result = self._update(tmp_path, manifest, units, with_tu_headers=with_tu_headers)
+
+        empty = [e for e in result["entries"] if e["file"] == "misc/empty.c"]
+        assert [e["flags_hash"] for e in empty] == [self._flags(a), self._flags(b)]
+
+    def test_a_manifest_that_lost_a_flag_set_keeps_what_was_parsed(self, tmp_path: Path):
+        """A manifest of the old carry-over holds B, B, B for the listings A, A, B.
+
+        Without a parse of the file, the index holds what B gave, and the
+        entries say so.  The decision by flags hash then parses the two
+        listings of A again, and their fresh entries hold A.
+        """
+        a = self._unit(tmp_path, "misc/empty.c", "-DA")
+        b = self._unit(tmp_path, "misc/empty.c", "-DB")
+        main = self._unit(tmp_path, "src/main.c", "-DA")
+        manifest = self._manifest(tmp_path, [b, b, b, main])
+        units = [a, self._unit(tmp_path, "misc/empty.c", "-DA"), b, main]
+
+        result = self._update(tmp_path, manifest, units, with_tu_headers=True)
+
+        empty = [e for e in result["entries"] if e["file"] == "misc/empty.c"]
+        assert [e["flags_hash"] for e in empty] == [self._flags(b)] * 3
+
+
+class TestOldEntriesTake:
+    """The order of preference of ``_OldEntries.take``, one case for each rule."""
+
+    @staticmethod
+    def _take_all(old: list[str], new: list[str]) -> list[int]:
+        """Return, for each new listing, the position of the old entry that it got."""
+        from fw_context_mcp.indexer._manifest_updater import _OldEntries
+
+        entries = [{"file": "f.c", "flags_hash": flags, "pos": i} for i, flags in enumerate(old)]
+        old_entries = _OldEntries({"entries": entries})
+        return [old_entries.take("f.c", flags)["pos"] for flags in new]
+
+    @pytest.mark.parametrize(
+        ("old", "new", "expected"),
+        [
+            (["A", "A", "B"], ["A", "A", "B"], [0, 1, 2]),  # 1: each listing, its own entry
+            (["A", "B"], ["B", "A"], [1, 0]),  # 1: the order of the listings changed
+            (["A"], ["A", "A"], [0, 0]),  # 2: one more listing with known flags
+            (["A", "B"], ["C", "A"], [0, 0]),  # 3 then 2: C takes the unused A first
+            (["A", "B"], ["C", "D"], [0, 1]),  # 3: the flags of each listing changed
+            (["A", "B"], ["C", "D", "E"], [0, 1, 0]),  # 4: no entry is left
+            (["A", "A", "B"], ["B"], [2]),  # fewer listings
+        ],
+    )
+    def test_the_order_of_preference(self, old, new, expected):
+        assert self._take_all(old, new) == expected
+
+    def test_a_file_without_an_entry_is_not_in_it(self):
+        from fw_context_mcp.indexer._manifest_updater import _OldEntries
+
+        old_entries = _OldEntries({"entries": [{"file": "f.c", "flags_hash": "A"}]})
+        assert "f.c" in old_entries
+        assert "g.c" not in old_entries
+        assert "f.c" not in _OldEntries(None)
 
 
 class TestLoadBuildDirPatterns:
