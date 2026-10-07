@@ -419,6 +419,9 @@ def _update_manifest_after_index(
         carried: list[tuple[int, dict]] = []
         reused = 0
         updated = 0
+        # The hash of each header as the units of this run read it: two that
+        # disagree give CONFLICTING_READS_HASH (see fold_headers).
+        read_this_run: dict[str, str] = {}
 
         # ── pass 1: entries rewritten from THIS run's parse ──
         # These are what fills header_table, so the decision for a carried
@@ -447,7 +450,7 @@ def _update_manifest_after_index(
                     "directory": str(unit.directory) if unit.directory else str(project_root),
                     "arg_set": _intern_arguments(unit.clang_args, arg_sets),
                     "source_hash": source_hash,
-                    "headers": fold_headers(tu_headers[tu_rel], header_table),
+                    "headers": fold_headers(tu_headers[tu_rel], header_table, read_this_run),
                     "flags_hash": _flags_hash(idx, unit),
                 }
                 updated += 1

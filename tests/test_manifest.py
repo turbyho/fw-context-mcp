@@ -2063,3 +2063,58 @@ def test_an_incremental_update_keeps_the_extension_sets(tmp_path: Path):
     )
 
     assert load_tu_extensions(tmp_path / "index", "deadbeef") == frozenset({".c", ".S"})
+
+
+class TestFoldHeadersOfOneRun:
+    """Two units of one run that read two texts of one header."""
+
+    @staticmethod
+    def _record(path: str, digest: str) -> dict:
+        return {"path": path, "hash": digest, "generated": False}
+
+    def test_two_texts_give_the_conflict_hash_and_it_stays(self):
+        from fw_context_mcp.indexer.manifest import CONFLICTING_READS_HASH, fold_headers
+
+        table: dict[str, dict] = {}
+        read_this_run: dict[str, str] = {}
+        fold_headers([self._record("src/a.h", "1" * 64)], table, read_this_run)
+        fold_headers([self._record("src/a.h", "2" * 64)], table, read_this_run)
+        assert table["src/a.h"]["hash"] == CONFLICTING_READS_HASH
+
+        # A third unit that read the first text again does not undo it.
+        fold_headers([self._record("src/a.h", "1" * 64)], table, read_this_run)
+        assert table["src/a.h"]["hash"] == CONFLICTING_READS_HASH
+
+    def test_one_text_keeps_its_hash(self):
+        from fw_context_mcp.indexer.manifest import fold_headers
+
+        table: dict[str, dict] = {}
+        read_this_run: dict[str, str] = {}
+        for _ in range(2):
+            fold_headers([self._record("src/a.h", "1" * 64)], table, read_this_run)
+        assert table["src/a.h"]["hash"] == "1" * 64
+
+    def test_a_deleted_header_with_the_conflict_hash_is_stale(self, tmp_path: Path):
+        """A file that cannot be read hashes to "", thus "" could not mark the conflict.
+
+        With "" in the table, a header deleted before the next run had the
+        hash of the table, and the run found the entry current.
+        """
+        from fw_context_mcp.indexer._unit_processor import _unchanged_entry
+        from fw_context_mcp.indexer.manifest import CONFLICTING_READS_HASH
+
+        source = tmp_path / "src" / "main.c"
+        source.parent.mkdir(parents=True)
+        source.write_text('#include "gone.h"\nint main(void) { return 0; }\n', encoding="utf-8")
+        entry = {
+            "file": "src/main.c",
+            "source_hash": compute_source_hash(source),
+            "flags_hash": "f" * 64,
+            "headers": ["src/gone.h"],
+        }
+        table = {"src/gone.h": {"hash": CONFLICTING_READS_HASH, "generated": False}}
+
+        assert _unchanged_entry(
+            [entry], compute_source_hash(source), "f" * 64, tmp_path,
+            hash_cache=None, header_table=table,
+        ) is None

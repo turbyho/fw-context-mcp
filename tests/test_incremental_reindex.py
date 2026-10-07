@@ -504,6 +504,21 @@ class TestBlankOutInactiveFiles:
     """
 
     @staticmethod
+    def _disk_tu(monkeypatch):
+        """Return a stand-in for a TU whose parsed text is the text on the disk now.
+
+        These tests pin which header the pass may touch, and need no
+        libclang.  The source of the text is pinned by the tests of
+        ``TestTheDecisionIsByHash`` that save a header during a run.
+        """
+        from types import SimpleNamespace
+
+        from fw_context_mcp.indexer import ops
+
+        monkeypatch.setattr(ops, "parsed_bytes", lambda tu, cx_file: Path(cx_file).read_bytes())
+        return SimpleNamespace(get_file=lambda name: name)
+
+    @staticmethod
     def _project(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
         """Return (root, db_path, changed_header, unchanged_header)."""
         from fw_context_mcp.indexer.db import (
@@ -550,7 +565,7 @@ class TestBlankOutInactiveFiles:
             conn, "ch", root, [(str(h), compute_source_hash(h)) for h in headers]
         )
 
-    def test_a_changed_header_loses_its_stale_text(self, tmp_path: Path):
+    def test_a_changed_header_loses_its_stale_text(self, tmp_path: Path, monkeypatch):
         from fw_context_mcp.indexer.db import open_db, transaction
         from fw_context_mcp.indexer.ops import _blank_out_inactive_files
 
@@ -564,6 +579,7 @@ class TestBlankOutInactiveFiles:
             with transaction(conn):
                 count = _blank_out_inactive_files(
                     conn, "ch", root, rows, set(), set(), None,
+                    tu=self._disk_tu(monkeypatch), skip_files=None,
                 )
             stored = {
                 r["path"]: r["content"]
@@ -583,7 +599,7 @@ class TestBlankOutInactiveFiles:
             "a header whose hash still matches must not be rewritten"
         )
 
-    def test_a_changed_header_with_active_code_is_left_alone(self, tmp_path: Path):
+    def test_a_changed_header_with_active_code_is_left_alone(self, tmp_path: Path, monkeypatch):
         """The regression this pass was blanking.
 
         A header can change AND still hold code.  The parse then sees active
@@ -607,6 +623,7 @@ class TestBlankOutInactiveFiles:
             with transaction(conn):
                 count = _blank_out_inactive_files(
                     conn, "ch", root, rows, set(), {"src/changed.h"}, None,
+                    tu=self._disk_tu(monkeypatch), skip_files=None,
                 )
             content = conn.execute(
                 "SELECT content FROM files WHERE config_hash='ch' AND path='src/changed.h'"
@@ -620,7 +637,7 @@ class TestBlankOutInactiveFiles:
             "produced none, whatever the content loop then did with it"
         )
 
-    def test_a_path_the_content_loop_wrote_is_left_alone(self, tmp_path: Path):
+    def test_a_path_the_content_loop_wrote_is_left_alone(self, tmp_path: Path, monkeypatch):
         from fw_context_mcp.indexer.db import open_db, transaction
         from fw_context_mcp.indexer.ops import _blank_out_inactive_files
 
@@ -633,6 +650,7 @@ class TestBlankOutInactiveFiles:
             with transaction(conn):
                 count = _blank_out_inactive_files(
                     conn, "ch", root, rows, {"src/changed.h"}, set(), None,
+                    tu=self._disk_tu(monkeypatch), skip_files=None,
                 )
             content = conn.execute(
                 "SELECT content FROM files WHERE config_hash='ch' AND path='src/changed.h'"
@@ -645,7 +663,7 @@ class TestBlankOutInactiveFiles:
             "the content loop already put the current text there"
         )
 
-    def test_a_header_with_no_stored_hash_is_left_alone(self, tmp_path: Path):
+    def test_a_header_with_no_stored_hash_is_left_alone(self, tmp_path: Path, monkeypatch):
         """Without a stored hash there is nothing to compare against.
 
         An index written before source_hash was filled for every file would
@@ -666,6 +684,37 @@ class TestBlankOutInactiveFiles:
             with transaction(conn):
                 count = _blank_out_inactive_files(
                     conn, "ch", root, rows, set(), set(), None,
+                    tu=self._disk_tu(monkeypatch), skip_files=None,
+                )
+            content = conn.execute(
+                "SELECT content FROM files WHERE config_hash='ch' AND path='src/changed.h'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        assert count == 0
+        assert content == "int gone(void);\n"
+
+    def test_a_header_that_an_earlier_unit_owns_is_left_alone(self, tmp_path: Path, monkeypatch):
+        """A header in *skip_files* was walked by an earlier unit of this run.
+
+        This parse saw no active line in it because it did not walk it.  The
+        operator saved the header between the two parses, thus its hash
+        differs from the row, and the pass blanked a header that holds code.
+        """
+        from fw_context_mcp.indexer.db import open_db, transaction
+        from fw_context_mcp.indexer.ops import _blank_out_inactive_files
+
+        root, db_path, changed, _ = self._project(tmp_path)
+        changed.write_text("#pragma once\nint gone(void);\nint added(void);\n", encoding="utf-8")
+
+        conn = open_db(db_path)
+        try:
+            rows = self._changed(conn, root, changed)
+            with transaction(conn):
+                count = _blank_out_inactive_files(
+                    conn, "ch", root, rows, set(), set(), None,
+                    tu=self._disk_tu(monkeypatch), skip_files=frozenset({str(changed)}),
                 )
             content = conn.execute(
                 "SELECT content FROM files WHERE config_hash='ch' AND path='src/changed.h'"
@@ -1445,6 +1494,42 @@ class TestReindexFileImplEdgeCases:
         result = reindex_file_impl("src/never_existed.c", str(indexed_project), with_analysis=False)
         assert "error" in result
         assert "not found" in result["error"].lower()
+
+    def test_reindex_drops_the_inactive_branch_of_a_body(self, indexed_project: Path):
+        """reindex_file parsed without the TU, thus without the skipped ranges.
+
+        The stored body then kept the lines of an inactive ``#if`` branch,
+        while the index run stored the same body without them.
+        """
+        from fw_context_mcp.indexer.db import open_db as _open_db
+        from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
+
+        db_path = _db_path_for_project(indexed_project)
+        target = indexed_project / "src" / "modem.c"
+        original = target.read_text(encoding="utf-8")
+        try:
+            _write_file(
+                target,
+                original + "\nint reindex_branch_probe(void) {\n#if 0\n    int dead_branch_line = 1;\n#endif\n"
+                "    return 7;\n}\n",
+            )
+            result = reindex_file_impl("src/modem.c", str(indexed_project), with_analysis=False)
+            assert "error" not in result, f"Reindex failed: {result.get('error')}"
+
+            conn = _open_db(db_path)
+            try:
+                row = conn.execute(
+                    "SELECT source FROM symbols WHERE name='reindex_branch_probe'"
+                ).fetchone()
+            finally:
+                conn.close()
+            assert row is not None
+            assert "return 7;" in row["source"]
+            assert "dead_branch_line" not in row["source"]
+        finally:
+            _write_file(target, original)
+            _advance_mtime(target)
+            reindex_file_impl("src/modem.c", str(indexed_project), with_analysis=False)
 
     def test_reindex_refreshes_source_hash(self, indexed_project: Path):
         """A reindexed file must not stay marked as changed forever.
@@ -3320,6 +3405,149 @@ class TestTheDecisionIsByHash:
         finally:
             conn.close()
 
+    def _run_with_a_header_save(self, project: Path, monkeypatch, *, after: str) -> Path:
+        """Edit ``utils.h``, then run the index and save it again after one parse.
+
+        ``main.c`` and ``utils.c`` include ``utils.h``.  *after* is
+        ``"first"`` or ``"last"``: the save comes after the parse of the
+        first or of the last of the two units in the order of the run.  The
+        first one owns the symbols and the content of the header.  A parse
+        before the save reads the first edit (``utils_h_parsed``), a parse
+        after it reads the second one (``utils_h_saved``).
+        """
+        from fw_context_mcp.indexer import runner
+
+        header = project / "src" / "utils.h"
+        text = header.read_text(encoding="utf-8")
+        header.write_text(text.replace("#endif", "int utils_h_parsed(void);\n#endif"), encoding="utf-8")
+        original = runner._parse_unit
+        includers = {"main.c", "utils.c"}
+        units_seen: list[str] = []
+
+        def parse_then_save(unit, *args, **kwargs):
+            result = original(unit, *args, **kwargs)
+            if unit.file.name in includers:
+                units_seen.append(unit.file.name)
+            if unit.file.name in includers and len(units_seen) == (1 if after == "first" else len(includers)):
+                current = header.read_text(encoding="utf-8")
+                header.write_text(current.replace("#endif", "int utils_h_saved(void);\n#endif"), encoding="utf-8")
+            return result
+
+        monkeypatch.setattr(runner, "_parse_unit", parse_then_save)
+        self._run_in_process(project)
+        monkeypatch.setattr(runner, "_parse_unit", original)
+        return header
+
+    def test_a_header_saved_after_its_last_parse_is_seen_by_the_next_run(self, indexed_project: Path, monkeypatch):
+        """The hash of a header came from a read of the disk after the parse.
+
+        The manifest and the files row then held the hash of the text saved
+        after the parse, beside the symbols of the text before it.  The next
+        run found every unit current, and ``get_active_build`` found no
+        change.
+        """
+        from fw_context_mcp.mcp.shared.stale import _count_modified_files
+
+        self._run_with_a_header_save(indexed_project, monkeypatch, after="last")
+
+        conn = open_db(_db_path_for_project(indexed_project))
+        try:
+            assert _count_modified_files(conn, _config_hash(conn), indexed_project) == 1
+        finally:
+            conn.close()
+
+        assert "2 updated, 1 unchanged" in self._summary(_index_cli(indexed_project))
+        conn = open_db(_db_path_for_project(indexed_project))
+        try:
+            assert _symbol_row(conn, _config_hash(conn), "utils_h_saved") is not None
+        finally:
+            conn.close()
+
+    def test_a_header_saved_between_two_units_is_seen_by_the_next_run(self, indexed_project: Path, monkeypatch):
+        """Two units of one run read two texts of one header.
+
+        The manifest holds one hash for each header, and the record of the
+        unit that came last replaced the other.  The symbols of the header
+        are the ones of the unit that walked it first, thus of the old text.
+        The later unit, which skips the header, also blanked its content and
+        gave its row the hash of the new text.
+        """
+        from fw_context_mcp.mcp.shared.stale import _count_modified_files
+
+        self._run_with_a_header_save(indexed_project, monkeypatch, after="first")
+
+        conn = open_db(_db_path_for_project(indexed_project))
+        try:
+            assert _count_modified_files(conn, _config_hash(conn), indexed_project) == 1
+        finally:
+            conn.close()
+
+        assert "2 updated, 1 unchanged" in self._summary(_index_cli(indexed_project))
+        conn = open_db(_db_path_for_project(indexed_project))
+        try:
+            assert _symbol_row(conn, _config_hash(conn), "utils_h_saved") is not None
+        finally:
+            conn.close()
+
+    def test_the_content_of_a_header_is_the_text_of_the_parse(self, indexed_project: Path, monkeypatch):
+        """``files.content`` came from a read of the disk after the parse.
+
+        ``read_file`` and ``search_content`` then gave text that no symbol
+        row describes, with active lines that the parse computed for the
+        other text.  Measured before the fix: the 9 lines of the saved text,
+        filtered with the active lines of the 8 lines of the parsed one.
+        """
+        header = self._run_with_a_header_save(indexed_project, monkeypatch, after="first")
+        parsed_text = header.read_text(encoding="utf-8").replace("int utils_h_saved(void);\n", "")
+
+        conn = open_db(_db_path_for_project(indexed_project))
+        try:
+            row = conn.execute(
+                "SELECT content FROM files WHERE config_hash=? AND path LIKE ?",
+                (_config_hash(conn), "%utils.h"),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        assert len(row["content"].splitlines()) == len(parsed_text.splitlines())
+        assert "int utils_h_parsed(void);" in row["content"].splitlines()
+
+    def test_a_save_after_the_parse_of_reindex_file_is_seen_by_the_next_run(self, indexed_project: Path, monkeypatch):
+        """reindex_file parsed a second time for the manifest, and hashed the disk.
+
+        A file saved between the parse and the manifest update gave the
+        entry the hash of the new text beside the symbols of the old one,
+        and the next index run found the unit current.
+        """
+        from fw_context_mcp.indexer import symbols
+        from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
+
+        utils = indexed_project / "src" / "utils.c"
+        utils.write_text(utils.read_text(encoding="utf-8") + "\nint utils_reindex_parsed(void) { return 1; }\n",
+                         encoding="utf-8")
+        original = symbols.extract_all
+
+        def parse_then_save(unit, *args, **kwargs):
+            result = original(unit, *args, **kwargs)
+            if unit.file.name == "utils.c":
+                utils.write_text(
+                    utils.read_text(encoding="utf-8") + "\nint utils_reindex_saved(void) { return 2; }\n",
+                    encoding="utf-8",
+                )
+            return result
+
+        monkeypatch.setattr(symbols, "extract_all", parse_then_save)
+        result = reindex_file_impl("src/utils.c", str(indexed_project), with_analysis=False)
+        monkeypatch.setattr(symbols, "extract_all", original)
+        assert "error" not in result, result
+
+        assert "1 updated, 2 unchanged" in self._summary(_index_cli(indexed_project))
+        conn = open_db(_db_path_for_project(indexed_project))
+        try:
+            assert _symbol_row(conn, _config_hash(conn), "utils_reindex_saved") is not None
+        finally:
+            conn.close()
+
     def test_every_row_has_a_hash_after_a_run(self, indexed_project: Path):
         """The query side has only the time of a row without a hash.
 
@@ -4875,6 +5103,8 @@ class TestReindexRefreshesEachListing:
         return compute_flags_hash(unit.raw_entry, transient_defines=DEFAULT_TRANSIENT_DEFINES)
 
     def _run(self, tmp_path: Path, monkeypatch, entries: list[dict], units: list) -> dict:
+        from types import SimpleNamespace
+
         from fw_context_mcp.indexer import manifest as manifest_mod
         from fw_context_mcp.indexer.manifest import MANIFEST_FORMAT
         from fw_context_mcp.mcp.handlers import maintenance
@@ -4886,16 +5116,14 @@ class TestReindexRefreshesEachListing:
             "entries": entries,
         }
 
-        def fake_collect(unit, root, build_dir_patterns, header_table):
-            # The parse reads the header again, and it changed.
-            header_table["src/h.h"] = {"hash": "NEW", "generated": False}
-            return ["src/h.h"]
-
-        monkeypatch.setattr(manifest_mod, "_collect_headers_from_tokens", fake_collect)
         monkeypatch.setattr(manifest_mod, "load", lambda db_dir, config_hash: manifest)
         monkeypatch.setattr(manifest_mod, "save", lambda data, db_dir, config_hash: saved.update(data))
+        # The parse read the header, and it changed.  No TU: the entry gets
+        # no source hash, which is not "OLD" either.
         maintenance._update_manifest_after_reindex(
-            [(unit, object()) for unit in units], tmp_path, tmp_path / "index", "deadbeef",
+            [(unit, SimpleNamespace(tu=None)) for unit in units],
+            [[{"path": "src/h.h", "hash": "NEW", "generated": False}] for _ in units],
+            tmp_path, tmp_path / "index", "deadbeef",
             transient_defines=DEFAULT_TRANSIENT_DEFINES,
         )
         return saved
@@ -5010,27 +5238,25 @@ class TestReindexKeepsTheGeneratedFlag:
         return manifest
 
     def _run(self, tmp_path: Path, *, entries, build_dir_patterns, monkeypatch):
-        """Drive _update_manifest_after_reindex with a stubbed header collector.
+        """Drive _update_manifest_after_reindex with the header record of one store.
 
-        The real collector needs libclang and a compiled TU.  What this test
-        checks is the patterns that reach it and the merge that follows, so
-        the stub records the patterns and returns the header the build
-        generates.
+        The store runs without build-output patterns, thus its record says
+        ``generated: False``.  What this test checks is the patterns that
+        decide ``generated`` here and the merge that follows, so a spy
+        records the patterns that reach ``_is_generated_header``.
         """
+        from types import SimpleNamespace
+
         from fw_context_mcp.indexer import manifest as manifest_mod
         from fw_context_mcp.mcp.handlers import maintenance
 
         saved: dict = {}
         seen: list = []
+        is_generated = manifest_mod._is_generated_header
 
-        def fake_collect(unit, root, build_dir_patterns, header_table):
+        def spy(path, build_dir_patterns):
             seen.append(build_dir_patterns)
-            path = "build/zephyr/include/generated/autoconf.h"
-            header_table[path] = {
-                "hash": "NEW",
-                "generated": manifest_mod._is_generated_header(path, build_dir_patterns),
-            }
-            return [path]
+            return is_generated(path, build_dir_patterns)
 
         def fake_load(db_dir, config_hash):
             return self._manifest(
@@ -5041,12 +5267,13 @@ class TestReindexKeepsTheGeneratedFlag:
             saved.update(data)
             return config_hash
 
-        monkeypatch.setattr(manifest_mod, "_collect_headers_from_tokens", fake_collect)
+        monkeypatch.setattr(manifest_mod, "_is_generated_header", spy)
         monkeypatch.setattr(manifest_mod, "load", fake_load)
         monkeypatch.setattr(manifest_mod, "save", fake_save)
 
         maintenance._update_manifest_after_reindex(
-            [(self._unit(tmp_path, "src/main.c"), object())],
+            [(self._unit(tmp_path, "src/main.c"), SimpleNamespace(tu=None))],
+            [[{"path": "build/zephyr/include/generated/autoconf.h", "hash": "NEW", "generated": False}]],
             tmp_path,
             tmp_path / "index",
             "deadbeef",

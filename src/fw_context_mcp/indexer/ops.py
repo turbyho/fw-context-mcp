@@ -39,6 +39,7 @@ Design decisions:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import sqlite3
@@ -50,6 +51,7 @@ try:
 except ImportError:
     TranslationUnitLoadError = RuntimeError  # clang not available — use fallback
 from collections import OrderedDict
+from collections.abc import Mapping
 from collections.abc import Set as AbstractSet
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -75,10 +77,10 @@ from fw_context_mcp.utils import (
     CPP_EXTENSIONS,
     abs_path,
     compute_content_hash,
-    compute_source_hash,
     read_file_lines,
 )
 
+from ._parsed_text import decode_lines, parsed_bytes, parsed_hash, parsed_hashes
 from .db._chunking import chunked
 from .db._files import FileIdLookup
 from .manifest import _is_generated_header
@@ -418,7 +420,10 @@ def _build_filtered_file_content(
         except ValueError:
             rel = str(resolved)
 
-        h = compute_source_hash(resolved)
+        # The hash of the text that this parse read, not of the disk now: a
+        # header saved after the parse gave the manifest the hash of the new
+        # text beside the symbols of the old one.  See _parsed_text.py.
+        h = parsed_hash(tu, inc.include)
         generated = _is_generated_header(rel, build_dir_patterns)
         headers.append({"path": rel, "hash": h, "generated": generated})
         header_files.append((str(resolved), h))
@@ -573,12 +578,15 @@ def _build_filtered_file_content(
         if not active_lines:
             continue
 
-        # Read original file
-        try:
-            with open(resolved, encoding="utf-8", errors="replace") as f:
-                original = f.readlines()
-        except OSError:
+        # The text that the parse read, and not the disk now: active_lines
+        # are lines of that text.  A file saved after the parse gave the row
+        # the new text, filtered with the active lines of the old one.
+        # Measured: a header with one line more lost that line, and read_file
+        # then showed text that no symbol row describes.
+        data = parsed_bytes(tu, tu.get_file(abs_path))
+        if data is None:
             continue
+        original = decode_lines(data)
 
         if not original:
             continue
@@ -632,7 +640,8 @@ def _build_filtered_file_content(
         # from, so that the query side sees the change.  A header takes the
         # hash of the text that this pass read: a header without symbols has
         # no other writer, and an old hash beside new text reads as changed
-        # for ever.
+        # for ever.  That text is the one of the parse (*data*), thus the
+        # content, the hash and the symbols describe one text.
         conn.execute(
             "INSERT INTO files (config_hash, path, language, content, mtime, generated, source_hash) "
             "VALUES (?, ?, ?, ?, ?, ?, ?) "
@@ -644,7 +653,7 @@ def _build_filtered_file_content(
             (
                 config_hash, db_path, lang, content, file_mtime,
                 int(_is_generated_header(db_path, build_dir_patterns)),
-                "" if resolved == unit_file else compute_source_hash(resolved),
+                "" if resolved == unit_file else hashlib.sha256(data).hexdigest(),
             ),
         )
         filled += 1
@@ -652,7 +661,7 @@ def _build_filtered_file_content(
 
     filled += _blank_out_inactive_files(
         conn, config_hash, project_root, changed_headers, written, active_paths,
-        build_dir_patterns,
+        build_dir_patterns, tu=tu, skip_files=skip_files,
     )
 
     if filled:
@@ -711,6 +720,9 @@ def _blank_out_inactive_files(
     written: set[str],
     active_paths: set[str],
     build_dir_patterns: list[str] | None,
+    *,
+    tu: Any,
+    skip_files: frozenset[str] | None,
 ) -> int:
     """Refresh a header the parse read that produced no active line.
 
@@ -748,8 +760,17 @@ def _blank_out_inactive_files(
       it is not the empty string, so the fill test on the next parse skips
       the file for ever.
 
+    A THIRD exclusion: *skip_files*, the headers that an earlier unit of
+    this run owns.  This parse did not walk such a header, thus it saw no
+    active line in it, and its hash differs from the row when the operator
+    saved the header between the two parses.  The pass then blanked a
+    header that holds code and gave its row the hash of the new text,
+    beside the symbols that the owner stored from the old one.
+
     *changed_headers* already holds only headers whose stored hash
-    disagrees with the file, so an unchanged one costs nothing here.
+    disagrees with the text of the parse, so an unchanged one costs nothing
+    here.  The line count is the one of that text, from *tu*, for the
+    reason that ``_parsed_text.py`` gives.
     """
     # Local, like the one in _build_filtered_file_content: manifest imports
     # from this module, thus a module-level import would close a cycle.
@@ -757,13 +778,15 @@ def _blank_out_inactive_files(
 
     refreshed = 0
     for db_path, (header_path, current_hash) in changed_headers.items():
-        if db_path in written or db_path in active_paths:
+        if db_path in written or db_path in active_paths or (skip_files and header_path in skip_files):
             continue
 
         resolved = Path(header_path)
+        data = parsed_bytes(tu, tu.get_file(header_path))
+        if data is None:
+            continue
+        line_count = len(decode_lines(data))
         try:
-            with open(resolved, encoding="utf-8", errors="replace") as handle:
-                line_count = sum(1 for _ in handle)
             file_mtime = resolved.stat().st_mtime
         except OSError:
             continue
@@ -798,6 +821,7 @@ def _store_symbol_rows(
     project_patterns: list[str],
     skipped: dict[Path, set[int]],
     build_dir_patterns: list[str] | None = None,
+    file_hashes: Mapping[Path, str] | None = None,
 ) -> tuple[int, dict[int, int]]:
     """Build and batch-insert symbol rows for one TU.
 
@@ -836,6 +860,11 @@ def _store_symbol_rows(
     code is project code, and the two columns answer different questions:
     ``is_project`` asks who owns the file, ``generated`` asks whether a tool
     wrote it.
+
+    *file_hashes* maps the resolved path of each file of the parse to the
+    hash of the text that the parse read (``_parsed_text.parsed_hashes``).
+    A file that is not in it gets ``""``, and ``upsert_file`` then keeps the
+    stored hash.
     """
     from .sdk_detect import _path_matches
 
@@ -855,19 +884,16 @@ def _store_symbol_rows(
             # file that git only rewrote, and a header is what git rewrites
             # most.
             #
-            # The cost is per (TU, file) pair, NOT per file: file_id_cache is
-            # built fresh for every translation unit, and compute_source_hash
-            # has no cache of its own.  A header that 200 units include is
-            # read 200 times.  Measured on the Mbed project: 1,037 unique headers
-            # but 86,686 references, an amplification of 84x.  It still costs
-            # only about 1 s over a whole index run, because the files are
-            # small and the page cache serves the repeats — the amplification
-            # is what matters to anyone sizing a change here, not the 1 s.
+            # The hash is the one of the text that the parse read, not of the
+            # disk now.  A header saved after the parse got the hash of the new
+            # text beside the symbols of the old one, and the query side then
+            # found no change.  The caller hashes the buffers of the parse once
+            # for each TU (*file_hashes*), thus this lookup reads no file.
             file_id_cache[normalized_sym_file] = upsert_file(
                 conn, config_hash, normalized_sym_file, lang,
                 generated=_is_generated_header(normalized_sym_file, build_dir_patterns),
                 mtime=sym_mtime,
-                source_hash=compute_source_hash(Path(sym_file)),
+                source_hash=(file_hashes or {}).get(Path(sym_file).resolve(), ""),
             )
         rel_path = normalized_sym_file
         # ── Compute is_project ──
@@ -1222,6 +1248,7 @@ def _store_macros_for_unit(
     tu_file_id: int,
     file_id_cache: dict[str, int],
     project_root: Path,
+    file_hashes: Mapping[Path, str] | None = None,
 ) -> None:
     """Insert macro definitions for one translation unit.
 
@@ -1259,11 +1286,10 @@ def _store_macros_for_unit(
                 pass
             # source_hash for the same reason as in _store_symbol_rows: a
             # file whose mtime moves must carry the hash of the text that
-            # moved it, or the staleness check reports it as changed for
-            # ever.  Same per-(TU, file) cost as there.
+            # the macros come from, and that is the text of the parse.
             file_id_cache[m_path] = upsert_file(
                 conn, config_hash, m_path, lang, mtime=m_mtime,
-                source_hash=compute_source_hash(Path(m_raw)),
+                source_hash=(file_hashes or {}).get(Path(m_raw).resolve(), ""),
             )
         m_file_id = file_id_cache[m_path]
         macro_rows.append(
@@ -1423,10 +1449,16 @@ def store_symbols_for_unit(
     #
     # A caller that gives an ExtractionResult without a TU (return_tu=False)
     # leaves this map empty, and the bodies then keep their inactive #ifdef
-    # blocks.  Nothing in the package does that on the index path — both
-    # branches above ask for the TU — but the fallback stays silent rather
-    # than stop the run.
+    # blocks.  Nothing in the package does that: the index run, reindex_file
+    # and the branch above ask for the TU.  reindex_file did not, until the
+    # hashes below needed it, and its bodies kept every branch.  The fallback
+    # stays silent rather than stop the run.
     skipped = collect_skipped_lines(tu) if tu is not None else {}
+    # The hash of the text that this parse read, for each file of the TU.
+    # Every row below takes its hash from here, and none from the disk: a
+    # file saved after the parse must not give its new hash to the symbols
+    # of its old text.  Without a TU nothing is known about that text.
+    file_hashes = parsed_hashes(tu, unit.file.resolve()) if tu is not None else {}
 
     # ── Resolve known files for this TU ──
     # When the caller provides *existing_files* (bulk indexing path), use it
@@ -1479,10 +1511,14 @@ def store_symbols_for_unit(
         #
         # flags_hash stays as it is.  Nothing decides by it: the index run
         # compares the flags hash of the manifest entry.
+        #
+        # The hash is the one of the text that the parse read: a save after
+        # the parse must leave the row with the old hash, so that the query
+        # side sees the change.
         tu_file_id = upsert_file(
             conn, config_hash, normalized_tu_path, unit.language,
             mtime=current_mtime,
-            source_hash=compute_source_hash(unit.file.resolve()),
+            source_hash=file_hashes.get(unit.file.resolve(), ""),
         )
 
     syms_added = 0
@@ -1493,6 +1529,7 @@ def store_symbols_for_unit(
         syms_added, file_proj = _store_symbol_rows(
             conn, config_hash, syms, file_id_cache, project_root,
             vendor_patterns, project_patterns, skipped, build_dir_patterns,
+            file_hashes=file_hashes,
         )
         # Update files.is_project for all files touched by this TU.
         # Using ``is_project < ip`` ensures a file that was previously
@@ -1612,6 +1649,7 @@ def store_symbols_for_unit(
     _store_macros_for_unit(
         conn, config_hash, macros, file_path, normalized_tu_path,
         current_mtime, tu_file_id, file_id_cache, project_root,
+        file_hashes=file_hashes,
     )
     _t_macros = time.monotonic() - _t_macros
 

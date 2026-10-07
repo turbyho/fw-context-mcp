@@ -81,9 +81,20 @@ def tu_headers(manifest: dict, entry: dict) -> list[dict]:
     return resolve_headers(entry, manifest.get("headers"))
 
 
+CONFLICTING_READS_HASH = "conflicting-reads"
+"""The hash of a header that two units of one run read with two texts.
+
+No file gives this value: a hash is 64 hex digits, and a file that cannot be
+read gives ``""``.  ``""`` was not usable here, because a header deleted
+before the next run also hashes to ``""``, and that run then found the
+entry current.
+"""
+
+
 def fold_headers(
     headers: list[dict] | list[str],
     header_table: dict[str, dict],
+    read_this_run: dict[str, str] | None = None,
 ) -> list[str]:
     """Fold header records into *header_table*, return the entry's path list.
 
@@ -96,6 +107,16 @@ def fold_headers(
     previous manifest passes through without a special case at the call site.
     A record whose path is already in the table wins over the stored one: it
     was read during this run and is the newer of the two.
+
+    *read_this_run* holds the hash of each path that an earlier record of
+    the same run gave.  Two units of one run can read two texts of one
+    header, when the operator saves it between the two parses.  The table
+    holds one hash for each header, and the symbols of the header are the
+    ones of the unit that walked it first.  The record of the later unit
+    then replaced the other one, and the next run found every unit current
+    beside the symbols of the old text.  When two records of one run
+    disagree, the hash is :data:`CONFLICTING_READS_HASH`: no file has that
+    hash, thus the next run parses each unit that includes the header.
     """
     paths: list[str] = []
     for item in headers:
@@ -104,8 +125,13 @@ def fold_headers(
             continue
         path = item["path"]
         paths.append(path)
+        item_hash = item.get("hash", "")
+        if read_this_run is not None:
+            if read_this_run.setdefault(path, item_hash) != item_hash:
+                read_this_run[path] = CONFLICTING_READS_HASH
+            item_hash = read_this_run[path]
         header_table[path] = {
-            "hash": item.get("hash", ""),
+            "hash": item_hash,
             "generated": item.get("generated", False),
         }
     return paths

@@ -1702,11 +1702,17 @@ def _reindex_parse_and_store(
     # Phase 1: parse all matching TUs before acquiring the write lock.
     # Parsing is CPU-bound and does not touch the database — doing it
     # outside the lock minimises contention.
+    #
+    # return_tu: the store takes from the TU the lines that the preprocessor
+    # skipped and the text that the parse read, with its hash.  Without it,
+    # the stored bodies kept their inactive #if branches, and each row kept
+    # the hash of the text before the edit.  The TUs of one call are few:
+    # the listings of one source file, or one unit for a header.
     parsed_units: list[tuple[TU, ExtractionResult]] = []
     skipped_tus: list[str] = []
     for unit in matching:
         try:
-            parsed = extract_all(unit, with_refs=cfg_refs)
+            parsed = extract_all(unit, with_refs=cfg_refs, return_tu=True)
             parsed_units.append((unit, parsed))
         except sqlite3.Error as exc:
             return 0, {"error": f"DB error during parse of {unit.file.name}: {exc}"}
@@ -1728,9 +1734,12 @@ def _reindex_parse_and_store(
             # in a single transaction per TU.  Each TU gets its own
             # transaction so partial failures don't roll back all work.
             with db_write_lock(db_path.parent, timeout=60.0):
+                # The header records of each store, for the manifest below:
+                # their hashes are the ones of the text that the parse read.
+                unit_headers: list[list[dict] | None] = []
                 for unit, parsed in parsed_units:
                     with transaction(conn):
-                        syms_added, _, _headers = store_symbols_for_unit(
+                        syms_added, _, headers = store_symbols_for_unit(
                             conn, unit, config_hash, root,
                             vendor_patterns=vendor_patterns,
                             project_patterns=project_patterns_list,
@@ -1738,6 +1747,7 @@ def _reindex_parse_and_store(
                             pre_parsed=parsed,
                         )
                         total_symbols += syms_added
+                    unit_headers.append(headers)
 
                 # Phase 3: resolve macro definitions after all TUs are stored.
                 # Macro resolution needs the clang flags from one TU (they
@@ -1759,7 +1769,7 @@ def _reindex_parse_and_store(
                     log.debug("Orphan files cleaned up: %d", deleted_orphans)
 
                 _update_manifest_after_reindex(
-                    parsed_units, root, db_path.parent, config_hash,
+                    parsed_units, unit_headers, root, db_path.parent, config_hash,
                     transient_defines=transient_defines,
                 )
 
@@ -1826,6 +1836,7 @@ def _entries_for_listings(entries: list[dict], listings: list[tuple[str, str]]) 
 
 def _update_manifest_after_reindex(
     parsed_units: list,
+    unit_headers: list[list[dict] | None],
     root: Path,
     db_dir: Path,
     config_hash: str,
@@ -1850,14 +1861,21 @@ def _update_manifest_after_reindex(
     When the manifest does not exist (first index, or manifest not
     enabled), this is a no-op — the ``load_manifest`` guard returns
     early.
+
+    *unit_headers* holds, for each parsed unit, the header records that its
+    store returned.  Their hashes, and the source hash of the entry, are the
+    ones of the text that the parse read.  This function used to parse each
+    unit a second time and to hash the disk: a file saved between the parse
+    and this call gave the entry the hash of the new text beside the symbols
+    of the old one, and the next index run found the unit current.
     """
     try:
-        from fw_context_mcp.utils import compute_source_hash
-
+        from ...indexer._parsed_text import parsed_hash
         from ...indexer.config_hash import compute_flags_hash
         from ...indexer.manifest import (
-            _collect_headers_from_tokens,
             _intern_arguments,
+            _is_generated_header,
+            fold_headers,
             mark_entries_behind,
             merge_header_records,
             update_entry,
@@ -1900,18 +1918,31 @@ def _update_manifest_after_reindex(
                 )
                 listings.append((rel, flags))
             slots = _entries_for_listings(manifest_data.get("entries", []), listings)
-            for (unit, _parsed), (tu_rel, flags_hash), slot in zip(
-                parsed_units, listings, slots, strict=True,
+            for (unit, parsed), records, (tu_rel, flags_hash), slot in zip(
+                parsed_units, unit_headers, listings, slots, strict=True,
             ):
+                # A store without records parsed nothing: the entry keeps
+                # what it says, and its old source hash makes the next run
+                # parse the unit.
+                if records is None:
+                    continue
                 # Records go into a per-unit table and are merged by
                 # merge_header_records, so a header this re-parse is the first
                 # to see still contributes its hash to the manifest's shared
                 # map — without a downgrade of `generated` on the way.
+                # `generated` comes from the patterns of the index run (bdp):
+                # the store had none, see the comment on bdp above.
                 header_records: dict[str, dict] = {}
-                headers = _collect_headers_from_tokens(
-                    unit, root, bdp, header_records
+                headers = fold_headers(
+                    [{**record, "generated": _is_generated_header(record["path"], bdp)} for record in records],
+                    header_records,
                 )
-                source_hash = compute_source_hash(unit.file.resolve())
+                # "" when the TU is gone: an entry without a source hash
+                # proves nothing, thus the next run parses the unit.
+                source_hash = (
+                    parsed_hash(parsed.tu, parsed.tu.get_file(str(unit.file.resolve())))
+                    if parsed.tu is not None else ""
+                )
                 if slot is not None:
                     update_entry(
                         manifest_data, slot, source_hash, headers, header_records,
