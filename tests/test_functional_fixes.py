@@ -185,20 +185,37 @@ class TestResolveMethodUsr:
 
 
 class _FakeTU:
-    """Minimal stand-in for a libclang TranslationUnit (spelling only)."""
+    """Minimal stand-in for a libclang TranslationUnit (spelling and file lookup only).
+
+    The fallback scans the text that the parse read.  ``get_file`` gives the
+    path as the handle, and the fixture ``disk_buffers`` makes the parsed
+    bytes of a handle the bytes on the disk: these tests pin the scan, and
+    need no libclang.
+    """
 
     def __init__(self, path: str):
         self.spelling = path
 
+    def get_file(self, name: str) -> str:
+        return name
+
     def __getattr__(self, name: str):
         return None
+
+
+@pytest.fixture
+def disk_buffers(monkeypatch):
+    """Give each _FakeTU handle the bytes of the file on the disk as its parsed text."""
+    from fw_context_mcp.indexer import _parsed_text
+
+    monkeypatch.setattr(_parsed_text, "parsed_bytes", lambda tu, cx_file: Path(cx_file).read_bytes())
 
 
 class TestRunSourceLineFallbackSelfRef:
     """Verify the definition line does not create a self-caller edge."""
 
     @pytest.fixture(autouse=True)
-    def _import(self):
+    def _import(self, disk_buffers):
         from fw_context_mcp.indexer.symbols import _run_source_line_fallback
 
         self._fallback = _run_source_line_fallback
@@ -580,7 +597,7 @@ class TestDispatchDetectionFallback:
     """Verify dispatch PendingDispatch creation in source-line fallback."""
 
     @pytest.fixture(autouse=True)
-    def _import(self):
+    def _import(self, disk_buffers):
         from fw_context_mcp.indexer.symbols import _run_source_line_fallback
         self._fallback = _run_source_line_fallback
 

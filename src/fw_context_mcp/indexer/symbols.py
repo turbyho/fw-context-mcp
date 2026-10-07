@@ -3005,11 +3005,15 @@ def _run_source_line_fallback(
     _fn_def_lines: dict[int, str] = {
         _fn_start: _fn_usr for _fn_usr, _fn_start, _fn_end in _fn_spans
     }
-    try:
-        _source_text = Path(_tu_file).read_text(encoding="utf-8", errors="replace")
-        _source_lines = _source_text.splitlines()
-    except (ValueError, TypeError, RuntimeError, AttributeError):
-        _source_lines = []
+    # The text that the parse read, not the disk now: the line numbers below
+    # meet the extents of that parse.  A read of the disk after the parse
+    # scanned a file saved meanwhile, and a file that the build removed
+    # raised FileNotFoundError out of extract_all.  str.splitlines() splits
+    # "\r\n" and "\r" as read_text() with universal newlines did.
+    from ._parsed_text import parsed_bytes
+
+    _data = parsed_bytes(tu, tu.get_file(_tu_file))
+    _source_lines = _data.decode("utf-8", errors="replace").splitlines() if _data is not None else []
     for _lineno_0, _line in enumerate(_source_lines):
         _lineno = _lineno_0 + 1
         if _lineno in _lines_with_calls:

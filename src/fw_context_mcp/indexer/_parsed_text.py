@@ -106,9 +106,8 @@ def parsed_hashes(tu: Any, main_file: Path) -> dict[Path, str]:
     path, because one file has more than one spelling in one unit.
 
     *main_file* is the resolved path of the unit, the key of its hash and
-    the name of the lookup.  ``tu.spelling`` is the name that the parse got,
-    and it can be relative to the directory of the unit, which is not the
-    current directory: the lookup by that name found no file.
+    the name of the lookup.  The caller knows that path, and the rows that
+    read the map use the same resolved key.
     """
     hashes: dict[Path, str] = {}
     hashes[main_file] = parsed_hash(tu, tu.get_file(str(main_file)))
