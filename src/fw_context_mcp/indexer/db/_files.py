@@ -549,8 +549,10 @@ def _delete_rows_owned_by(
       USRs.
     - **The ``files`` rows themselves.** A re-parse reuses them.
     - **``overrides``.** They key on ``derived_usr``, not on a symbol id, so
-      they stay valid across a re-parse.  Deleting them here would lose them
-      for good when ``analyze_overrides`` is off and nothing rebuilds them.
+      a re-parse does not break the key.  The overrides step of the index
+      run builds the whole graph again from the parsed source.  Deleting
+      them here would lose them for good when ``analyze_overrides`` is off
+      and nothing builds them again.
 
     Order is forced: inheritance resolves USR through ``symbols``, and the
     embedding / analysis deletes select by ``symbol_id``, so both must run

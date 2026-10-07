@@ -2061,7 +2061,7 @@ def _reindex_overrides(
         return
     try:
         from ...indexer.runner import _build_overrides
-        _build_overrides(conn, config_hash, db_dir, write_lock_held=False, force=True)
+        _build_overrides(conn, config_hash, db_dir, write_lock_held=False)
         conn.commit()
     except (sqlite3.Error, RuntimeError) as exc:
         result["overrides_warning"] = f"Override analysis skipped: {exc}"

@@ -18,8 +18,12 @@ after the full symbol table is available:
    and skips optional phases based on user configuration.
 
 3. **Idempotency for resilience.**  If a step fails mid-way, the next
-   reindex run can pick up where it left off — each step checks whether
-   its output already exists before recomputing.
+   reindex run can pick up where it left off — a step with output for
+   each symbol (embeddings, LLM analysis) keeps the rows that are still
+   valid.  The three steps that derive one result from the whole graph
+   (PageRank, the hotspot cache, the overrides) compute it again in each
+   run: an incremental run changes their input, and a "skip when rows
+   exist" check then keeps a stale result.
 
 **Pipeline phases (in order)**
 
@@ -248,8 +252,24 @@ def _normalize_type_namespaces(param_types: str) -> str:
 # SECTION: Post-processing pipeline (→ postprocessor.py)
 # ═══════════════════════════════════════════════════════════════
 
+def _replace_overrides(
+    conn, config_hash: str, rows: list[tuple[str, str, str]], db_dir: Path, *, write_lock_held: bool
+) -> None:
+    """Replace all override rows of the config with *rows*.
+
+    The delete and the insert are in one transaction: a reader never sees
+    the graph removed and not yet written again.
+    """
+    from .db import insert_overrides_batch
+
+    with write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext():
+        with transaction(conn):
+            conn.execute("DELETE FROM overrides WHERE config_hash = ?", (config_hash,))
+            insert_overrides_batch(conn, rows)
+
+
 def _build_overrides(
-    conn, config_hash: str, db_dir: Path, *, write_lock_held: bool = False, force: bool = False
+    conn, config_hash: str, db_dir: Path, *, write_lock_held: bool = False
 ) -> None:
     """Build the method override graph by matching virtual methods to their
     base-class counterparts through the inheritance chain.
@@ -259,24 +279,13 @@ def _build_overrides(
     comparison provides a basic guard against accidental name collisions
     (overloads, not overrides).
 
-    Set *force* to True to recompute even when overrides already exist
-    (e.g. after incremental reindex).
+    Each call builds the graph of the config again and replaces all its
+    rows.  A re-parse of a file keeps the ``overrides`` rows, because they
+    key on USRs.  Thus a "skip when rows exist" check kept an override of
+    a method that the source no longer has, and did not add an override
+    that the source added, until a run with ``--force``.  The build takes
+    at most 0.1 s on an index of 60 000 symbols.
     """
-    from .db import insert_overrides_batch
-
-    # Idempotency: if overrides were already built for this config, skip
-    if not force:
-        row = conn.execute("SELECT COUNT(*) FROM overrides WHERE config_hash = ?", (config_hash,)).fetchone()
-        if row and row[0] > 0:
-            log.info("Override graph already built (%d relationships) — nothing to do", row[0])
-            return
-    else:
-        # Start from a clean slate — old overrides may reference removed
-        # virtual methods or changed inheritance chains.
-        conn.execute("DELETE FROM overrides WHERE config_hash = ?", (config_hash,))
-
-    total = 0
-
     # Phase 1: collect all virtual/pure-virtual project methods with parent class info.
     # Single table scan groups by parent_usr for efficient batch processing in Phase 2.
     with transaction(conn):
@@ -294,7 +303,9 @@ def _build_overrides(
         ).fetchall()
 
     if not virtual_rows:
-        log.info("No virtual methods found — skipping override analysis")
+        # The rows of an earlier run must go too.
+        _replace_overrides(conn, config_hash, [], db_dir, write_lock_held=write_lock_held)
+        log.info("No virtual methods found — no override relationships")
         return
 
     # Phase 2: for each virtual method, walk the inheritance chain up and
@@ -374,15 +385,11 @@ def _build_overrides(
             if derived_norm == base_norm:
                 override_rows.append((config_hash, vrow["usr"], bm["usr"]))
 
-    if override_rows:
-        with write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext():
-            with transaction(conn):
-                insert_overrides_batch(conn, override_rows)
-                total += len(override_rows)
+    _replace_overrides(conn, config_hash, override_rows, db_dir, write_lock_held=write_lock_held)
 
     log.info(
         "Overrides stored: %d relationships (%d virtual, %d no-base, %d no-match)",
-        total,
+        len(override_rows),
         len(virtual_rows),
         skipped_no_base,
         skipped_no_match,
@@ -1116,11 +1123,11 @@ def _step_build_overrides(conn: sqlite3.Connection, ctx: dict) -> None:
     Resolves which derived-class methods override which base-class
     virtual methods.  Used by ``get_method_overrides`` and the
     ``find_callers`` tool (to find callers through base-class pointers).
+
+    The step builds the graph in each run, not only with ``--force``: an
+    incremental run can change it too (see ``_build_overrides``).
     """
     config_hash = ctx["config_hash"]
-    if ctx["force"]:
-        conn.execute("DELETE FROM overrides WHERE config_hash = ?", (config_hash,))
-        conn.commit()
     _build_overrides(conn, config_hash, ctx["db_dir"])
     conn.commit()
 
