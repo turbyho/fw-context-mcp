@@ -2086,8 +2086,8 @@ def _reindex_pagerank(
         return
     try:
         from ...indexer.runner import _build_hotspot_cache, _build_pagerank
-        _build_pagerank(conn, config_hash, write_lock_held=False, force=True)
-        _build_hotspot_cache(conn, config_hash, force=True)
+        _build_pagerank(conn, config_hash, write_lock_held=False)
+        _build_hotspot_cache(conn, config_hash)
         conn.commit()
     except (sqlite3.Error, RuntimeError) as exc:
         result["pagerank_warning"] = f"PageRank/hotspot recompute skipped: {exc}"

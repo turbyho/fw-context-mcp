@@ -389,7 +389,14 @@ def _build_overrides(
     )
 
 
-def _build_pagerank(conn, config_hash: str, *, write_lock_held: bool = False, force: bool = False) -> None:
+#: Clears only the scores that are not 0.  Each UPDATE of a symbols row
+#: fires the trigger ``symbols_au``, which tokenizes the row again into
+#: ``symbols_fts`` with its ``source``.  A write of 0 over 0 would pay that
+#: cost for each symbol of the config and change nothing.
+_CLEAR_PAGERANK_SQL = "UPDATE symbols SET pagerank = 0.0 WHERE config_hash = ? AND pagerank != 0.0"
+
+
+def _build_pagerank(conn, config_hash: str, *, write_lock_held: bool = False) -> None:
     """Compute PageRank scores for function/method symbols from the call graph.
 
     Iterates until convergence (max 50 iterations, damping factor 0.85).
@@ -409,21 +416,14 @@ def _build_pagerank(conn, config_hash: str, *, write_lock_held: bool = False, fo
     1e-6 is sufficient for a stable ordering; higher precision adds
     iterations without changing relative rankings.
 
-    Idempotent — skips when pagerank already exists for this config.
-    Set *force* to True to recompute even when pagerank data already exists
-    (e.g. after incremental reindex).
+    Each call computes all scores of the config again, and first sets every
+    score of the config to 0.  An incremental run inserts the symbols of a
+    parsed file again with pagerank 0, thus a "skip when scores exist" check
+    kept them at 0.  A symbol that left the call graph must not keep the
+    score of an earlier run.  The computation takes at most 2 s on an index
+    of 60 000 symbols.
     Requires the reference index (``fw-context index`` — refs on by default).
     """
-    # Check already computed
-    if not force:
-        row = conn.execute(
-            "SELECT COUNT(*) FROM symbols WHERE config_hash = ? AND pagerank > 0",
-            (config_hash,),
-        ).fetchone()
-        if row and row[0] > 0:
-            log.info("PageRank already computed — nothing to do")
-            return
-
     # Load edges: only `call` ref_kind to avoid inflating scores with
     # indirect/constructor edges.  JOIN on symbols ensures both endpoints
     # are indexed functions — filters out refs to variables and macros.
@@ -457,7 +457,9 @@ def _build_pagerank(conn, config_hash: str, *, write_lock_held: bool = False, fo
 
     n = len(all_nodes)
     if n == 0:
-        log.info("No call graph edges — skipping PageRank")
+        with transaction(conn):
+            conn.execute(_CLEAR_PAGERANK_SQL, (config_hash,))
+        log.info("No call graph edges — no symbol has a PageRank score")
         return
 
     damping = 0.85
@@ -489,7 +491,10 @@ def _build_pagerank(conn, config_hash: str, *, write_lock_held: bool = False, fo
         for node in scores:
             scores[node] /= max_score
 
+    # One transaction: a reader never sees the scores cleared and not yet
+    # written again.
     with transaction(conn):
+        conn.execute(_CLEAR_PAGERANK_SQL, (config_hash,))
         conn.executemany(
             "UPDATE symbols SET pagerank = ? WHERE config_hash = ? AND usr = ?",
             [(scores[usr], config_hash, usr) for usr in scores],
@@ -498,7 +503,7 @@ def _build_pagerank(conn, config_hash: str, *, write_lock_held: bool = False, fo
     log.info("PageRank stored: %d nodes", n)
 
 
-def _build_hotspot_cache(conn, config_hash: str, *, force: bool = False,
+def _build_hotspot_cache(conn, config_hash: str, *,
                          write_lock_held: bool = False, db_dir: Path | None = None) -> None:
     """Pre-compute hotspot caller counts for instant ``find_hotspots`` queries.
 
@@ -513,21 +518,17 @@ def _build_hotspot_cache(conn, config_hash: str, *, force: bool = False,
     function-pointer callbacks and ISR vector registrations are included
     in the caller count.
 
-    Idempotent — skips when cache already exists for this config.
-    Set *force* to True to recompute even when cache data already exists
-    (e.g. after incremental reindex).
+    Each call builds the cache of the config again.  An incremental run
+    deletes the symbols of each file that it parses again, and
+    ``ON DELETE CASCADE`` removes their cache rows.  The rows of the other
+    files stay, thus a "skip when rows exist" check left the functions of
+    each changed file out of ``find_hotspots``.  The build takes at most
+    2 s on an index of 60 000 symbols.
     Requires the reference index.
     """
-    if not force:
-        row = conn.execute("SELECT COUNT(*) FROM hotspot_cache WHERE config_hash = ?", (config_hash,)).fetchone()
-        if row and row[0] > 0:
-            log.info("Hotspot cache already built — nothing to do")
-            return
-
     with write_lock(db_dir, timeout=5.0) if not write_lock_held and db_dir is not None else nullcontext():
         with transaction(conn):
-            if force:
-                conn.execute("DELETE FROM hotspot_cache WHERE config_hash = ?", (config_hash,))
+            conn.execute("DELETE FROM hotspot_cache WHERE config_hash = ?", (config_hash,))
             conn.execute(
                 """INSERT INTO hotspot_cache (config_hash, symbol_id, caller_count)
                    SELECT r.config_hash, s.id, COUNT(r.rowid)
@@ -1275,12 +1276,11 @@ def _step_pagerank_hotspot(conn: sqlite3.Connection, ctx: dict) -> None:
     Two outputs are computed sequentially from the same call-graph data:
     PageRank scores (centrality) and the pre-aggregated hotspot cache
     (caller counts for instant ``find_hotspots`` queries).
+
+    The step computes the two in each run, not only with ``--force``: the
+    call graph of an incremental run changes too (see the two builders).
     """
     config_hash = ctx["config_hash"]
-    if ctx["force"]:
-        conn.execute("UPDATE symbols SET pagerank = 0.0 WHERE config_hash = ?", (config_hash,))
-        conn.execute("DELETE FROM hotspot_cache WHERE config_hash = ?", (config_hash,))
-        conn.commit()
     _build_pagerank(conn, config_hash)
     conn.commit()
     _build_hotspot_cache(conn, config_hash, db_dir=ctx.get("db_dir"))
