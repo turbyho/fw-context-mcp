@@ -446,9 +446,9 @@ def _handle_unchanged(
         mtime: The time of the source file that :func:`decide_units` read
             with the hash.  The decision runs before the loop, hours before
             this call on a large project: the time of the file NOW can
-            belong to a text saved after the hash, and a row with the new
-            time and the old hash reads as unchanged where the query side
-            does not hash a file whose time is the stored one.
+            belong to a text saved after the hash.  The query side decides
+            by the hash; the time is the one that a row without a hash would
+            give, and it must not claim a newer text than the hash.
         conn: Open SQLite connection to the index database.
         config_hash: Active build config hash.
         project_root: Project root directory.
@@ -496,8 +496,7 @@ def _handle_unchanged(
             # The row gets the hashes that the decision read.  They are the
             # hashes that the index holds (the decision compared them), and
             # the staleness checks of mcp/shared/stale.py read source_hash.
-            # They read the time too: a file whose time is the stored one
-            # is not hashed there, thus the time is the one of the decision.
+            # The time is the one of the decision, read with the hash.
             source_hash, flags_hash = hashes
             conn.execute(
                 "UPDATE files SET mtime=?, source_hash=?, flags_hash=? WHERE id=?",

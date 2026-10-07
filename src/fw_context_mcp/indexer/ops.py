@@ -538,7 +538,8 @@ def _build_filtered_file_content(
     for spelling, rows in active.items():
         if rows:
             candidates.setdefault(Path(spelling).resolve(), set()).update(rows)
-    for path in (str(Path(unit.file).resolve()), *(header for header, _ in header_files)):
+    unit_file = Path(unit.file).resolve()
+    for path in (str(unit_file), *(header for header, _ in header_files)):
         candidates.setdefault(Path(path), set())
 
     for resolved, cursor_lines in candidates.items():
@@ -601,7 +602,7 @@ def _build_filtered_file_content(
 
         # Insert or update — file rows may not exist for headers-only files.
         lang = "cpp" if Path(db_path).suffix in CPP_EXTENSIONS else "c"
-        # Grab real mtime so _count_modified_files won't flag this as stale.
+        # The time of the file that this pass read, for the row.
         try:
             file_mtime = resolved.stat().st_mtime
         except OSError:
@@ -618,15 +619,32 @@ def _build_filtered_file_content(
         #
         # MAX for the same reason upsert_file() uses it: `generated` is a
         # property of the PATH, so it goes from 0 to 1 and never back.
+        #
+        # The hash goes with the content and the time, for the reason that
+        # upsert_file() gives: the staleness checks of the query side compare
+        # it with the file, and a row without one has only its time to tell.
+        # This INSERT wrote none: measured, 1 to 59 rows in each real index,
+        # system headers above all.
+        #
+        # The unit's own file keeps its stored hash: the store wrote the hash
+        # that the decision read before the parse, and a file saved during
+        # the parse must keep the hash of the text that the symbols come
+        # from, so that the query side sees the change.  A header takes the
+        # hash of the text that this pass read: a header without symbols has
+        # no other writer, and an old hash beside new text reads as changed
+        # for ever.
         conn.execute(
-            "INSERT INTO files (config_hash, path, language, content, mtime, generated) "
-            "VALUES (?, ?, ?, ?, ?, ?) "
+            "INSERT INTO files (config_hash, path, language, content, mtime, generated, source_hash) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT (config_hash, path) DO UPDATE SET "
             "content = excluded.content, mtime = MAX(files.mtime, excluded.mtime), "
-            "generated = MAX(files.generated, excluded.generated)",
+            "generated = MAX(files.generated, excluded.generated), "
+            "source_hash = CASE WHEN excluded.source_hash = '' "
+            "THEN files.source_hash ELSE excluded.source_hash END",
             (
                 config_hash, db_path, lang, content, file_mtime,
                 int(_is_generated_header(db_path, build_dir_patterns)),
+                "" if resolved == unit_file else compute_source_hash(resolved),
             ),
         )
         filled += 1

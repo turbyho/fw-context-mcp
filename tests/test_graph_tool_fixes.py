@@ -28,6 +28,7 @@ from fw_context_mcp.indexer.db import (
 )
 from fw_context_mcp.indexer.db._refs import find_indirect_targets as db_find_indirect_targets
 from fw_context_mcp.mcp.handlers import callgraph
+from fw_context_mcp.utils import compute_source_hash
 
 CH = "hash-graph"
 
@@ -46,7 +47,12 @@ def db(tmp_path):
     with transaction(conn):
         upsert_project(conn, "proj-001", "test", str(tmp_path))
         upsert_build_config(conn, CH, "proj-001", str(tmp_path / "compile_commands.json"))
-    fid = upsert_file(conn, CH, "src/drv.c", "c")
+    # The indexed file exists: a row of a file that is gone reads as a
+    # change, and an empty result then carries a warning.
+    drv = tmp_path / "src" / "drv.c"
+    drv.parent.mkdir()
+    drv.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    fid = upsert_file(conn, CH, "src/drv.c", "c", mtime=drv.stat().st_mtime, source_hash=compute_source_hash(drv))
     insert_symbols_batch(conn, [
         _symbol(fid, "main", "u_main"),
         _symbol(fid, "on_rx_done", "u_on_rx_done"),

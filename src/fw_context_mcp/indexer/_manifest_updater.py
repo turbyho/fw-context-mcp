@@ -31,31 +31,6 @@ from .config_hash import compute_flags_hash
 log = logging.getLogger(__name__)
 
 
-def _mtime_bump_is_safe(
-    resolved: Path,
-    header: dict,
-    hash_cache: dict[str, str] | None,
-) -> bool:
-    # *header* is a manifest ``headers`` record: {hash, generated}.  The path
-    # is passed separately as *resolved* because the record is keyed by it.
-    """Return True when the stored mtime may be moved forward for this header.
-
-    Only content-identical headers qualify.  Bumping the mtime of a header
-    whose content actually changed would hide that change from
-    ``_count_modified_files`` and from the next index run — the index would
-    keep serving symbols parsed from the old text while reporting itself as
-    up to date.
-
-    Every header is verified, the generated one too: without that, a header
-    with changed content would still get a new mtime,
-    ``_count_modified_files`` would stop seeing the change, and the staleness
-    checks of the manifest would have no effect.
-    """
-    from .manifest import _hash_with_cache
-
-    return _hash_with_cache(resolved, hash_cache) == header.get("hash", "")
-
-
 def _patterns_changed(
     manifest: dict,
     build_dir_patterns: list[str] | None,
@@ -104,7 +79,27 @@ def _headers_moved_on(entry: dict, before: dict, after: dict) -> bool:
     return False
 
 
-def _refresh_header_mtimes_from_manifest(
+def _row_text_is_disk_text(conn, config_hash: str, path: str, resolved: Path) -> bool:
+    """Say if the stored content of *path* is the file on disk, with inactive lines blank."""
+    row = conn.execute(
+        "SELECT content FROM files WHERE config_hash=? AND path=?", (config_hash, path),
+    ).fetchone()
+    if row is None or not row["content"]:
+        return False
+    try:
+        # Read as the content pass reads it (text mode, so "\r\n" is "\n"),
+        # and split on "\n" only: splitlines() also splits on a form feed,
+        # and the content pass does not.
+        disk = resolved.read_text(encoding="utf-8", errors="replace").split("\n")
+    except OSError:
+        return False
+    stored = row["content"].split("\n")
+    if len(stored) != len(disk):
+        return False
+    return all(line in (disk_line, "") for line, disk_line in zip(stored, disk, strict=True))
+
+
+def _backfill_header_source_hashes(
     conn,
     config_hash: str,
     project_root: Path,
@@ -112,61 +107,55 @@ def _refresh_header_mtimes_from_manifest(
     *,
     hash_cache: dict[str, str] | None = None,
 ) -> int:
-    """Refresh stored mtimes for headers touched by VCS operations.
+    """Give a source hash to each header row that has none, when the manifest proves it.
 
-    After ``git checkout`` / ``git merge``, header files get new mtimes
-    even when their content hasn't changed.  The stored ``files.mtime``
-    values fall behind, causing ``_count_modified_files`` to report phantom
-    modifications and spawn unnecessary background reindexes.
+    The content pass wrote header rows without a hash (fixed now), and an
+    index keeps such a row until a parse writes it again: measured, 1 to 59
+    rows in each real index.  The staleness checks of the query side have
+    only the time of such a row to tell a change.
 
-    This function scans the manifest's header entries and updates the
-    stored mtime whenever the on-disk mtime is newer but the stored mtime
-    is stale — fixing the drift without a full Tier-3 reparse.
+    The manifest records the hash of each header that the index read.  Two
+    proofs, and both are necessary:
 
-    WHY only update when on-disk mtime is newer: we use ``UPDATE ... SET
-    mtime=? WHERE mtime < ?`` — this is a one-way forward correction.
-    If the on-disk mtime is OLDER than the stored mtime (e.g., after a
-    ``git checkout`` of an older commit), we don't roll back the stored
-    mtime because that would mark the file as modified and trigger a
-    reindex.  The content hash check in the staleness detection will
-    still catch actual content changes regardless of mtime.
+    * The file on disk has that hash.  A header whose hash differs is left
+      alone: its dependent units are parsed again, and the content pass
+      then writes the hash.
+    * The text of the row is the text on disk: the same count of lines, and
+      each line of the row is the line on disk or blank (an inactive line).
+      The manifest takes the hash of a reparse, but a header that holds no
+      cursor (comments and ``#pragma once`` only) keeps the text of an older
+      run, and a hash beside it would say that the text is current.
 
-    WHY the hash check (see :func:`_mtime_bump_is_safe`): a project header
-    whose content really changed must keep its stale mtime.  Bumping it
-    would erase the last signal that the index is behind — the header is
-    not a TU of its own, so nothing else would ever notice.
-
-    Called once after the main TU loop, before the manifest update phase.
-    Returns the number of refreshed header records.
+    Returns the number of rows that got a hash.
     """
+    from .manifest import _hash_with_cache
+
     if manifest is None:
         return 0
-    refreshed = 0
-    # The manifest's headers map already holds each path once, so there is no
-    # per-TU loop and no dedup set to maintain.
-    for header_path, record in (manifest.get("headers") or {}).items():
-        # Resolve absolute path for stat() — the stored path may be relative
-        p = Path(header_path)
-        if not p.is_absolute():
-            p_resolved = (project_root / p).resolve()
-        else:
-            p_resolved = p.resolve()
-        try:
-            cur_mtime = p_resolved.stat().st_mtime
-        except OSError:
-            continue
-        if not _mtime_bump_is_safe(p_resolved, record, hash_cache):
-            continue  # content really changed — the stale signal must survive
-        # Use the manifest path directly — it already matches files.path format
-        cur_obj = conn.execute(
-            "UPDATE files SET mtime=? WHERE config_hash=? AND path=? AND mtime < ?",
-            (cur_mtime, config_hash, header_path, cur_mtime),
+    without = {
+        row["path"]
+        for row in conn.execute(
+            "SELECT path FROM files WHERE config_hash=? AND source_hash=''", (config_hash,),
         )
-        if cur_obj.rowcount:
-            refreshed += 1
-    if refreshed:
-        log.info("header mtimes refreshed from manifest: %d", refreshed)
-    return refreshed
+    }
+    filled = 0
+    for header_path, record in (manifest.get("headers") or {}).items():
+        if header_path not in without or not record.get("hash"):
+            continue
+        p = Path(header_path)
+        resolved = p if p.is_absolute() else (project_root / p).resolve()
+        if _hash_with_cache(resolved, hash_cache) != record["hash"]:
+            continue
+        if not _row_text_is_disk_text(conn, config_hash, header_path, resolved):
+            continue
+        conn.execute(
+            "UPDATE files SET source_hash=? WHERE config_hash=? AND path=? AND source_hash=''",
+            (record["hash"], config_hash, header_path),
+        )
+        filled += 1
+    if filled:
+        log.info("source hash given to %d header row(s) that had none", filled)
+    return filled
 
 
 # REMOVED: _is_excluded — no files are excluded from indexing; all are indexed

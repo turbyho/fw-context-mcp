@@ -1,4 +1,4 @@
-"""Stale detection and recovery — file mtime checks, auto-reindex, query staleness wrapping.
+"""Stale detection and recovery — file content checks, auto-reindex, query staleness wrapping.
 
 WHY stale detection cannot be a simple "compare index timestamp to latest file
 mtime": compile_commands.json changes may require a full reindex even if no source
@@ -13,12 +13,13 @@ WHY there are two staleness helpers (``_stale_files`` vs ``_count_modified_files
   files are stale overall?"  Used by ``get_active_build`` for the dashboard count
   and by the daemon's startup check.
 
-WHY mtime checks are cached: on NFS/CIFS mounts, each ``os.path.getmtime()`` may
-take 50-200 ms.  With 10K indexed files, a full scan would take seconds.  The
-``_modified_cache`` with 30-second TTL bounds this to one scan per evaluation
-interval.  The ``MAX(mtime)`` verification before serving cached values catches
-external modifications by the daemon's background reindex (which is a separate
-OS process and cannot call ``_invalidate_modified_cache``).
+WHY the project-wide count can be cached: it hashes every indexed file (0.02 to
+0.12 s on the largest test projects, and more on a network mount).  The daemon's
+check takes the ``_modified_cache`` with a 30-second TTL.  The ``MAX(mtime)``
+verification before serving cached values catches external modifications by the
+daemon's background reindex (which is a separate OS process and cannot call
+``_invalidate_modified_cache``).  get_active_build does not take the cache: an
+edit on disk leaves it valid.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ from pathlib import Path
 
 from ...config import derive_project_id
 from ...indexer.db import get_active_config
-from ...indexer.manifest import load_tu_extensions
+from ...indexer.manifest import _hash_with_cache, load_tu_extensions
 from ...utils import (
     MTIME_TOLERANCE_S,
     TU_EXTENSIONS,
@@ -43,16 +44,6 @@ from .context import _quick_open_readonly, get_executor
 from .paging import holds_past_end_info
 
 log = logging.getLogger(__name__)
-
-# How close two timestamps must be to count as the same one.  NOT a
-# tolerance for clock skew — that is MTIME_TOLERANCE_S, and it is a whole
-# second.  This is only wide enough to absorb the float round trip through
-# SQLite REAL and a filesystem that does not return a stat bit-exactly.
-#
-# It must stay small.  The rule it serves reads "an exact match is the file
-# the index hashed"; widen it and every file inside the band reads as
-# unchanged again, which is the behaviour this replaced.
-_MTIME_MATCH_EPS_S: float = 0.001
 
 # ── Mtime cache ──
 # Cache for _count_modified_files results with a 30-second TTL.
@@ -174,7 +165,7 @@ def check_structural_staleness(
 
 
 def _stale_files(conn, config_hash: str, file_paths: list[str], root: Path) -> list[str]:
-    """Return the subset of *file_paths* whose on-disk mtime is newer than the index."""
+    """Return the subset of *file_paths* whose content no longer matches the index."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     from ...indexer.manifest import load_build_dir_patterns
@@ -226,8 +217,7 @@ def _stale_files(conn, config_hash: str, file_paths: list[str], root: Path) -> l
     # most `limit` of them — 50 by default, 200 at the ceiling.  Hashing all
     # of them costs 0.67 ms at 50 files, thus the timestamp is not consulted
     # at all: it is wrong after a git checkout, and it misses a write that
-    # kept the old stamp.  The project-wide counter cannot afford the same
-    # and filters by mtime first.
+    # kept the old stamp.  The project-wide counter hashes every file too.
     stale: list[str] = []
     with ThreadPoolExecutor(max_workers=min(8, len(work_items))) as ex:
         futures = {
@@ -255,11 +245,13 @@ def _file_differs(path: str, stored_mtime: float, stored_hash: str = "") -> bool
     Without a stored hash the timestamp is all there is, and only one
     direction is readable from it: newer than the index means changed.  A
     stamp that moved backwards cannot be told from one the index never saw,
-    and a write that kept the old stamp leaves nothing to see.  The caller
-    that scans every indexed file handles both by comparing the stamps for
-    equality first — see ``_count_modified_files``.
+    and a write that kept the old stamp leaves nothing to see.  Each writer
+    of a row stores a hash now, thus only a row of an older index has none
+    (see ``_count_modified_files``).
 
-    A missing file is a change: it was deleted since indexing.
+    A missing file is a change: it was deleted since indexing.  A row with
+    neither a hash nor a time says nothing, as in ``_count_modified_files``:
+    the two helpers must give one answer for one file.
 
     This used to be three functions in a row.  ``_check_file_stale`` gated
     on the timestamp and read the content only for a file the stamp called
@@ -272,6 +264,8 @@ def _file_differs(path: str, stored_mtime: float, stored_hash: str = "") -> bool
     if differs is not None:
         return differs
     try:
+        if not stored_hash and not stored_mtime:
+            return not os.path.exists(path)
         return os.path.getmtime(path) > stored_mtime + MTIME_TOLERANCE_S
     except FileNotFoundError:
         return True
@@ -279,12 +273,16 @@ def _file_differs(path: str, stored_mtime: float, stored_hash: str = "") -> bool
         return False
 
 
-def _content_differs(path: str, stored_hash: str) -> bool | None:
+def _content_differs(path: str, stored_hash: str, hash_cache: dict[str, str] | None = None) -> bool | None:
     """Compare the file at *path* against *stored_hash*.
 
     Returns True when the bytes differ, False when they match, and None when
     the question cannot be answered — no stored hash, or the file cannot be
     read.  The caller then falls back to the timestamp.
+
+    *hash_cache* is the ``{resolved path: sha256}`` memo of the header check
+    (``_check_header_staleness``): the builds of one project share most
+    files, and one cache hashes each of them once.
 
     This is the only signal that survives git.  ``checkout``, ``pull`` and
     ``stash pop`` rewrite the mtime of every file they touch, without regard
@@ -293,7 +291,7 @@ def _content_differs(path: str, stored_hash: str) -> bool | None:
     """
     if not stored_hash:
         return None
-    current = compute_source_hash(Path(path))
+    current = _hash_with_cache(Path(path), hash_cache)
     if not current:
         return None  # unreadable — compute_source_hash swallows the OSError
     return current != stored_hash
@@ -305,14 +303,32 @@ def _count_modified_files(
     root: Path,
     *,
     use_cache: bool = False,
+    hash_cache: dict[str, str] | None = None,
 ) -> int:
-    """Count files whose on-disk mtime is newer than the stored mtime.
+    """Count the indexed files whose content no longer matches the index.
 
-    Files with mtime=0 (pre-migration databases) are skipped — their
-    mtime is unknown, not "modified".
+    The hash decides, for each file: the stored ``source_hash`` against the
+    file on disk.  No file time takes part.  The time filtered before: a
+    file whose time was the stored one was not hashed.  The index run and
+    its content pass do not always write the time of the text that the row
+    describes (a file saved during the parse), and such a row read as
+    unchanged.  To hash every file costs 0.02 to 0.12 s on the largest test
+    projects (measured: 1914 files, 26.6 MB, and 1453 files, 38.6 MB).
 
-    Deduplicates by resolved absolute path, keeping the maximum stored
-    mtime.  This prevents false positives from duplicate ``files`` rows
+    A row without a hash has only its time, and only one direction is
+    readable from it: newer than the stored time is a change.  Each writer
+    stores a hash now, and the index run gives one to an old header row
+    when the manifest proves it (``_backfill_header_source_hashes``); a row
+    with neither a hash nor a time says nothing about a file that exists.  A
+    file that is gone is a change, for every row: ``_file_differs`` gives the
+    same answers.
+
+    *hash_cache* is shared with the header check and the other builds of
+    the project (see :func:`build_staleness`): measured on a project of 7
+    builds, 5821 rows were 1483 files, and each build hashed them again.
+
+    Deduplicates by resolved absolute path, keeping the row with a hash,
+    then the one with the newest stored mtime.  This prevents false positives from duplicate ``files`` rows
     (e.g. one with an absolute path whose mtime was updated and one with
     a relative path whose mtime is stale).
 
@@ -321,7 +337,9 @@ def _count_modified_files(
     externally (verified via ``MAX(mtime)`` from the files table),
     the cached value is returned.
     Call ``_invalidate_modified_cache(config_hash)`` after any write
-    operation that changes file mtimes.
+    operation that changes file mtimes.  The cache holds a count for
+    ``_CACHE_TTL_S`` seconds: a file saved in that time shows at the next
+    count after it.
     """
     if use_cache:
         cached = _modified_cache.get(config_hash)
@@ -343,7 +361,7 @@ def _count_modified_files(
             # Cache stale — remove and recompute
             _modified_cache.pop(config_hash, None)
 
-    # Deduplicate by resolved absolute path, keeping the newest stored mtime.
+    # Deduplicate by resolved absolute path: the row with a hash, then the newest stored mtime.
     # Duplicate rows arise when the same file was indexed under different
     # path formats (absolute vs relative) — e.g. after a reindex with a
     # different working directory or compile_commands.json format.
@@ -353,15 +371,15 @@ def _count_modified_files(
     ).fetchall()
     for r in rows:
         path = r["path"]
-        stored = r["mtime"]
-        if not stored:
-            continue
+        stored = r["mtime"] or 0.0
         p = Path(path)
         if not p.is_absolute():
             p = (root / path).resolve()
         key = str(p)
-        if key not in best_mtime or stored > best_mtime[key][0]:
-            best_mtime[key] = (stored, r["source_hash"] or "")
+        candidate = (stored, r["source_hash"] or "")
+        current = best_mtime.get(key)
+        if current is None or (bool(candidate[1]), candidate[0]) > (bool(current[1]), current[0]):
+            best_mtime[key] = candidate
 
     # Load build_dir_patterns from manifest to skip build-generated files
     from ...indexer.manifest import load_build_dir_patterns
@@ -376,37 +394,18 @@ def _count_modified_files(
         if build_patterns and _path_matches_patterns(key, build_patterns):
             continue  # build-generated file — skip
         try:
-            # NOTE: individual stat() calls — O(n) for n files. On modern NVMe
-            # filesystems this is <10ms for 10K files. If slow, consider
-            # os.scandir() batch processing or caching more aggressively.
-            #
-            # The index stores the mtime it read together with the hash it
-            # computed, thus an exact match means "this is the file we
-            # hashed" and nothing needs reading.  Anything else is suspect
-            # in BOTH directions: newer is the ordinary edit, older means
-            # the file was replaced by an older copy — a restore from a
-            # backup, or a tar that kept its times.
-            #
-            # The previous rule was "newer, or inside the racy window", and
-            # that window is symmetric around the stored stamp.  An
-            # unchanged file carries exactly that stamp, so it fell inside
-            # and reached the hash: measured on the Mbed project, 1910 of 1911
-            # rows did.  The gate filtered nothing while get_active_build —
-            # the mandatory first call — hashed the whole project every
-            # time.  The one set it did exclude was the backwards stamp,
-            # which is the one case that needed reading.
-            #
-            # What this cannot see: a write that restores the stamp to the
-            # exact float the index holds.  _stale_files has no gate at
-            # all, so a query about that file still reports it.
-            file_mtime = os.path.getmtime(key)
-            if abs(file_mtime - stored_mtime) <= _MTIME_MATCH_EPS_S:
+            if not os.path.exists(key):
+                modified += 1
                 continue
-            differs = _content_differs(key, stored_hash)
+            differs = _content_differs(key, stored_hash, hash_cache)
             if differs is None:
-                # No stored hash: the timestamp is all there is, and only
-                # one direction is readable from it.
-                if file_mtime > stored_mtime + MTIME_TOLERANCE_S:
+                # No stored hash (or no readable file): the time is all
+                # there is, and only one direction is readable from it.
+                if (
+                    not stored_hash
+                    and stored_mtime
+                    and os.path.getmtime(key) > stored_mtime + MTIME_TOLERANCE_S
+                ):
                     modified += 1
             elif differs:
                 modified += 1
@@ -933,7 +932,7 @@ def build_staleness(
     database_stale, why = _is_stale(row, row["compile_commands_path"])
     if database_stale:
         reasons.append(why or "compile_commands_changed")
-    modified = _count_modified_files(conn, config_hash, root, use_cache=use_cache)
+    modified = _count_modified_files(conn, config_hash, root, use_cache=use_cache, hash_cache=hash_cache)
     if modified:
         reasons.append(f"{modified} modified file(s)")
     if row["manifest_verification"] == "full":
@@ -945,7 +944,10 @@ def build_staleness(
     return database_stale, reasons
 
 
-def other_stale_builds(conn, project_id: str, root: Path, active_hash: str, *, use_cache: bool) -> list[dict]:
+def other_stale_builds(
+    conn, project_id: str, root: Path, active_hash: str, *, use_cache: bool,
+    hash_cache: dict[str, str] | None = None,
+) -> list[dict]:
     """Return the stale builds of the project other than *active_hash*, see :func:`build_staleness`.
 
     Each item: ``{"variant", "image", "reindex_needed", "reasons"}``.  A
@@ -953,10 +955,12 @@ def other_stale_builds(conn, project_id: str, root: Path, active_hash: str, *, u
 
     One hash cache for all builds: measured on a project of 7 builds, the
     header check took 3.6 s with one cache for each build, because each
-    image hashed the same headers of the SDK again.
+    image hashed the same headers of the SDK again.  *hash_cache* lets the
+    caller share the cache of its own build too.
     """
     stale: list[dict] = []
-    hash_cache: dict[str, str] = {}
+    if hash_cache is None:
+        hash_cache = {}
     for row in latest_builds(conn, project_id):
         if row["config_hash"] == active_hash:
             continue
@@ -1255,9 +1259,9 @@ def diagnose_empty_result(conn, config_hash: str, root: Path) -> tuple[int, list
     answer would miss the very edit this check exists for.
 
     NOT cached either, for the same reason.  A cache on this answer was
-    tried and dropped: after the mtime gate was fixed the scan costs 23 ms
-    on the largest test project, and a cached diagnosis outlives the edit
-    it describes for as long as its TTL.
+    tried and dropped: the scan hashes every file, 46 to 65 ms on the
+    largest test projects, and a cached diagnosis outlives the edit it
+    describes for as long as its TTL.
     """
     dirty = _count_modified_files(conn, config_hash, root, use_cache=False)
     row = conn.execute(

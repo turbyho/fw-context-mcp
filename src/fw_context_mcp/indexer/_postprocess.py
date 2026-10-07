@@ -70,7 +70,7 @@ from ..utils import SAFE_EXCEPT, is_fatal
 from ._dispatch_bridges import _DISPATCH_ENTRY_POINTS
 from ._embedding import _build_embeddings
 from ._llm_analysis import _build_llm_analysis
-from ._manifest_updater import _refresh_header_mtimes_from_manifest, _update_manifest_after_index
+from ._manifest_updater import _backfill_header_source_hashes, _update_manifest_after_index
 from .db import (
     CURRENT_ROW_FORMAT,
     CURRENT_SCHEMA_VERSION,
@@ -736,14 +736,15 @@ def _step_update_manifest(conn: sqlite3.Connection, ctx: dict) -> None:
     # not have to re-read it.  A no-op run returns None and leaves the
     # on-disk manifest (already loaded into ctx) current.
     ctx["effective_manifest"] = updated_manifest or ctx.get("manifest")
-    if updated_manifest is not None:
-        _refresh_header_mtimes_from_manifest(
-            conn,
-            config_hash,
-            ctx["project_root"],
-            updated_manifest,
-            hash_cache=ctx.get("header_hash_cache"),
-        )
+    # Each run, also a run that parsed nothing: the rows of an older index
+    # stay without a hash until something writes them.
+    _backfill_header_source_hashes(
+        conn,
+        config_hash,
+        ctx["project_root"],
+        ctx["effective_manifest"],
+        hash_cache=ctx.get("header_hash_cache"),
+    )
 
 
 def _build_coverage_set(units: list, manifest: dict | None, project_root: Path) -> set[str] | None:

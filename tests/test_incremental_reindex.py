@@ -3295,6 +3295,55 @@ class TestTheDecisionIsByHash:
         finally:
             conn.close()
 
+    def test_a_save_during_the_parse_is_not_hidden(self, indexed_project: Path, monkeypatch):
+        """The row of a parsed unit took the time of the file at the store, after the parse.
+
+        Beside the hash of the text that the parse read, the query side read
+        that row as unchanged: it does not hash a file whose time is the
+        stored one.
+        """
+        from fw_context_mcp.indexer import runner
+        from fw_context_mcp.mcp.shared.stale import _count_modified_files
+
+        utils = indexed_project / "src" / "utils.c"
+        utils.write_text(utils.read_text(encoding="utf-8") + "\nint utils_parsed(void) { return 1; }\n",
+                         encoding="utf-8")
+        original = runner._parse_unit
+
+        def parse_then_save(unit, *args, **kwargs):
+            result = original(unit, *args, **kwargs)
+            if unit.file.name == "utils.c":
+                utils.write_text(utils.read_text(encoding="utf-8") + "\nint utils_saved(void) { return 2; }\n",
+                                 encoding="utf-8")
+                _advance_mtime(utils, 30.0)
+            return result
+
+        monkeypatch.setattr(runner, "_parse_unit", parse_then_save)
+        self._run_in_process(indexed_project)
+
+        conn = open_db(_db_path_for_project(indexed_project))
+        try:
+            assert _count_modified_files(conn, _config_hash(conn), indexed_project) == 1
+        finally:
+            conn.close()
+
+    def test_every_row_has_a_hash_after_a_run(self, indexed_project: Path):
+        """The query side has only the time of a row without a hash.
+
+        The content pass wrote the rows of the headers that no symbol
+        created (system headers above all) without one: measured, 1 to 59
+        rows in each real index.
+        """
+        conn = open_db(_db_path_for_project(indexed_project))
+        try:
+            rows = conn.execute(
+                "SELECT path FROM files WHERE config_hash=? AND source_hash=''", (_config_hash(conn),),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        assert [r["path"] for r in rows] == []
+
     def test_a_save_after_the_decision_is_not_hidden(self, indexed_project: Path, monkeypatch):
         """The decision runs before the loop.  A save before the loop reaches the unit is a change.
 

@@ -728,6 +728,9 @@ def get_active_build(
         file_count = conn.execute("SELECT COUNT(*) FROM files WHERE config_hash=?", (config_hash,)).fetchone()[0]
         ref_count = count_refs(conn, config_hash)
         manifest_verification = cfg.get("manifest_verification", "none")
+        # One cache of file hashes for this call: the count, the header check
+        # and the other builds read the same files of the SDK.
+        hash_cache: dict[str, str] = {}
         if fast:
             # The scan runs in fast mode too.  Without it this tool answered
             # "ready" while search_code on the same index warned about the
@@ -738,20 +741,23 @@ def get_active_build(
             # use_cache=False on purpose: the cache validates itself against
             # MAX(mtime) of the files table, which only a reindex moves, thus
             # a cached answer would miss the edit that just happened.
-            modified_count = _count_modified_files(conn, config_hash, root, use_cache=False)
+            modified_count = _count_modified_files(
+                conn, config_hash, root, use_cache=False, hash_cache=hash_cache,
+            )
             # NOTE: the header check is NOT cheap — it hashes every header of
             # every translation unit, which is 22,693 files and 749 ms on
             # The Mbed project.  `fast` only gives it a cache; it does not skip it.
             if manifest_verification == "full":
                 header_affected_tus, _ = _check_header_staleness(
-                    conn, config_hash, root, use_cache=True,
+                    conn, config_hash, root, use_cache=True, hash_cache=hash_cache,
                 )
             else:
                 header_affected_tus = 0
         else:
-            # Full stat scan — walks every indexed file on disk to detect
-            # mtime changes.  Slow (~100 ms for large projects) but accurate.
-            modified_count = _count_modified_files(conn, config_hash, root, use_cache=False)
+            # Full scan — hashes every indexed file on disk.
+            modified_count = _count_modified_files(
+                conn, config_hash, root, use_cache=False, hash_cache=hash_cache,
+            )
             # Check header dependencies separately (different metric: TUs, not files)
             if manifest_verification == "full":
                 header_affected_tus, _ = _check_header_staleness(
@@ -759,6 +765,7 @@ def get_active_build(
                     config_hash,
                     root,
                     use_cache=False,
+                    hash_cache=hash_cache,
                 )
             else:
                 header_affected_tus = 0
@@ -891,7 +898,9 @@ def get_active_build(
         # modified files and headers make the build stale.
         from ..shared.stale import build_label, other_stale_builds
 
-        stale_builds = other_stale_builds(conn, project_id, root, config_hash, use_cache=fast)
+        stale_builds = other_stale_builds(
+            conn, project_id, root, config_hash, use_cache=fast, hash_cache=hash_cache,
+        )
         needs_reindex = bool(
             cc_changed or schema_old or row_format_old or blocked_sources or branch_moved
             or build_problem or build_missing

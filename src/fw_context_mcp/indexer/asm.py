@@ -284,6 +284,24 @@ def _clear_previous_pass(conn, config_hash: str) -> None:
     )
 
 
+def _file_state(path: str) -> dict:
+    """Return the ``mtime`` and ``source_hash`` of *path* for its files row.
+
+    A row without them reads as changed, or as unknown, in the staleness
+    checks of the query side.  The rows that a symbol or a vector slot of
+    the assembly pass created had neither: measured, the empty rows with
+    time 0 in the real indexes.
+    """
+    from fw_context_mcp.utils import compute_source_hash
+
+    resolved = Path(path)
+    try:
+        mtime = resolved.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    return {"mtime": mtime, "source_hash": compute_source_hash(resolved)}
+
+
 def store_units(conn, config_hash: str, units: list, project_root: Path,
                 build_dir_patterns: list[str] | None = None,
                 vendor_patterns: list[str] | None = None,
@@ -709,7 +727,7 @@ def _store_symbols(conn, config_hash: str, source: AsmSource, project_root: Path
     for sym in symbols:
         db_path = _normalize_file_path(sym.file, project_root)
         if db_path not in file_ids:
-            file_ids[db_path] = upsert_file(conn, config_hash, db_path, "c")
+            file_ids[db_path] = upsert_file(conn, config_hash, db_path, "c", **_file_state(sym.file))
         rows.append((
             config_hash, file_ids[db_path], db_path, sym.name,
             f"{_ASM_USR_PREFIX}{db_path}@{sym.name}", sym.name, sym.name,
@@ -991,7 +1009,7 @@ def _declare_referenced_only(
         return None
 
     db_path = _normalize_file_path(entry.file, project_root)
-    file_id = upsert_file(conn, config_hash, db_path, "c")
+    file_id = upsert_file(conn, config_hash, db_path, "c", **_file_state(entry.file))
     usr = f"{_ASM_USR_PREFIX}@{entry.name}"
     insert_symbols_batch(conn, [(
         config_hash, file_id, db_path, entry.name, usr, entry.name, entry.name,

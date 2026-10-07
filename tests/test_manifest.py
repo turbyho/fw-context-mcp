@@ -1337,74 +1337,124 @@ class TestLoadBuildDirPatterns:
         assert len(m._BUILD_PATTERNS_CACHE) == before, "an empty list was not cached"
 
 
-class TestMtimeBumpIsSafe:
-    """The mtime may move forward only for a header the pipeline trusts.
+class TestBackfillHeaderSourceHashes:
+    """A header row without a hash gets the hash that the manifest proves."""
 
-    This is the site that is easy to forget.  It used to return True for a
-    vendor, a generated and an out-of-tree header with no check of the
-    content.  Left alone, a header with changed content would get a new
-    mtime, _count_modified_files would stop seeing the change, and the end
-    of trust in the other four callers would have no effect.
-    """
+    @staticmethod
+    def _db(tmp_path: Path, rows: list[tuple[str, str]], content: str = "int a;\n"):
+        from fw_context_mcp.indexer.db import (
+            open_db,
+            transaction,
+            upsert_build_config,
+            upsert_file,
+            upsert_project,
+        )
 
-    def test_the_mtime_bump_verifies_a_vendor_header(self, tmp_path: Path):
-        import hashlib
+        conn = open_db(tmp_path / "index.db")
+        with transaction(conn):
+            upsert_project(conn, "pid", "p", str(tmp_path))
+            upsert_build_config(conn, "ch", "pid", str(tmp_path / "cc.json"))
+            for path, source_hash in rows:
+                upsert_file(conn, "ch", path, "c", mtime=1.0, source_hash=source_hash)
+                conn.execute("UPDATE files SET content=? WHERE config_hash='ch' AND path=?", (content, path))
+        return conn
 
-        from fw_context_mcp.indexer._manifest_updater import _mtime_bump_is_safe
+    @staticmethod
+    def _hash_of(conn, path: str) -> str:
+        return conn.execute(
+            "SELECT source_hash FROM files WHERE config_hash='ch' AND path=?", (path,),
+        ).fetchone()[0]
 
-        header = tmp_path / "mbed-os" / "mbed.h"
-        header.parent.mkdir(parents=True)
-        header.write_text("// changed content")
-        stored = hashlib.sha256(b"// old content").hexdigest()
+    def test_a_header_with_the_hash_of_the_manifest_gets_it(self, tmp_path: Path):
+        from fw_context_mcp.indexer._manifest_updater import _backfill_header_source_hashes
 
-        assert _mtime_bump_is_safe(
-            header, {"hash": stored, "generated": False}, None
-        ) is False
+        header = tmp_path / "inc" / "a.h"
+        header.parent.mkdir()
+        header.write_text("int a;\n", encoding="utf-8")
+        conn = self._db(tmp_path, [("inc/a.h", "")])
+        try:
+            manifest = {"headers": {"inc/a.h": {"hash": compute_source_hash(header), "generated": False}}}
+            assert _backfill_header_source_hashes(conn, "ch", tmp_path, manifest) == 1
+            assert self._hash_of(conn, "inc/a.h") == compute_source_hash(header)
+        finally:
+            conn.close()
 
-    def test_the_mtime_bump_verifies_an_out_of_tree_header(self, tmp_path: Path):
-        import hashlib
+    def test_a_header_that_changed_since_the_manifest_stays_without(self, tmp_path: Path):
+        """The text of the row is not the text on disk: no hash would be true."""
+        from fw_context_mcp.indexer._manifest_updater import _backfill_header_source_hashes
 
-        from fw_context_mcp.indexer._manifest_updater import _mtime_bump_is_safe
+        header = tmp_path / "inc" / "a.h"
+        header.parent.mkdir()
+        header.write_text("int a;\n", encoding="utf-8")
+        conn = self._db(tmp_path, [("inc/a.h", "")])
+        try:
+            manifest = {"headers": {"inc/a.h": {"hash": "an-older-text", "generated": False}}}
+            assert _backfill_header_source_hashes(conn, "ch", tmp_path, manifest) == 0
+            assert self._hash_of(conn, "inc/a.h") == ""
+        finally:
+            conn.close()
 
-        header = tmp_path / "toolchain" / "stdint.h"
-        header.parent.mkdir(parents=True)
-        header.write_text("// changed content")
-        stored = hashlib.sha256(b"// old content").hexdigest()
+    def test_a_row_whose_text_is_older_than_the_file_stays_without(self, tmp_path: Path):
+        """A header of comments only holds no cursor, and the content pass skipped its new text.
 
-        assert _mtime_bump_is_safe(
-            header, {"hash": stored, "generated": False}, None
-        ) is False
+        The manifest took the hash of the reparse, thus the disk hash and
+        the manifest agree, while the row holds the text of an older run.
+        """
+        from fw_context_mcp.indexer._manifest_updater import _backfill_header_source_hashes
 
-    def test_an_unchanged_vendor_header_may_bump(self, tmp_path: Path):
-        """Content-identical still qualifies — this is what fixes VCS mtime drift."""
-        import hashlib
+        header = tmp_path / "inc" / "a.h"
+        header.parent.mkdir()
+        header.write_text("#pragma once\n// new comment\n", encoding="utf-8")
+        conn = self._db(tmp_path, [("inc/a.h", "")], content="#pragma once\n// old comment\n")
+        try:
+            manifest = {"headers": {"inc/a.h": {"hash": compute_source_hash(header), "generated": False}}}
+            assert _backfill_header_source_hashes(conn, "ch", tmp_path, manifest) == 0
+        finally:
+            conn.close()
 
-        from fw_context_mcp.indexer._manifest_updater import _mtime_bump_is_safe
+    def test_inactive_lines_are_blank_in_the_row(self, tmp_path: Path):
+        from fw_context_mcp.indexer._manifest_updater import _backfill_header_source_hashes
 
-        header = tmp_path / "mbed-os" / "mbed.h"
-        header.parent.mkdir(parents=True)
-        header.write_text("// same content")
-        stored = hashlib.sha256(header.read_bytes()).hexdigest()
+        header = tmp_path / "inc" / "a.h"
+        header.parent.mkdir()
+        header.write_text("#if 0\nint dead;\n#endif\nint a;\n", encoding="utf-8")
+        conn = self._db(tmp_path, [("inc/a.h", "")], content="#if 0\n\n#endif\nint a;\n")
+        try:
+            manifest = {"headers": {"inc/a.h": {"hash": compute_source_hash(header), "generated": False}}}
+            assert _backfill_header_source_hashes(conn, "ch", tmp_path, manifest) == 1
+        finally:
+            conn.close()
 
-        assert _mtime_bump_is_safe(
-            header, {"hash": stored, "generated": False}, None
-        ) is True
+    def test_a_header_outside_the_project_gets_it_too(self, tmp_path: Path):
+        """System headers are most of the rows without a hash; their paths are absolute."""
+        from fw_context_mcp.indexer._manifest_updater import _backfill_header_source_hashes
 
-    def test_a_changed_generated_header_keeps_its_stale_mtime(self, tmp_path: Path):
-        """A bump would hide the change of the configuration from the next run."""
-        import hashlib
+        header = tmp_path / "sdk" / "types.h"
+        header.parent.mkdir()
+        header.write_text("int a;\n", encoding="utf-8")
+        project = tmp_path / "proj"
+        project.mkdir()
+        conn = self._db(project, [(str(header), "")])
+        try:
+            manifest = {"headers": {str(header): {"hash": compute_source_hash(header), "generated": False}}}
+            assert _backfill_header_source_hashes(conn, "ch", project, manifest) == 1
+            assert self._hash_of(conn, str(header)) == compute_source_hash(header)
+        finally:
+            conn.close()
 
-        from fw_context_mcp.indexer._manifest_updater import _mtime_bump_is_safe
+    def test_a_stored_hash_is_not_touched(self, tmp_path: Path):
+        from fw_context_mcp.indexer._manifest_updater import _backfill_header_source_hashes
 
-        header = tmp_path / "BUILD" / "mbed_config.h"
-        header.parent.mkdir(parents=True)
-        header.write_text("// generated")
-
-        assert _mtime_bump_is_safe(
-            header, {"hash": "whatever", "generated": True}, None
-        ) is False
-        same = hashlib.sha256(header.read_bytes()).hexdigest()
-        assert _mtime_bump_is_safe(header, {"hash": same, "generated": True}, None) is True
+        header = tmp_path / "inc" / "a.h"
+        header.parent.mkdir()
+        header.write_text("int a;\n", encoding="utf-8")
+        conn = self._db(tmp_path, [("inc/a.h", "stored")])
+        try:
+            manifest = {"headers": {"inc/a.h": {"hash": compute_source_hash(header), "generated": False}}}
+            assert _backfill_header_source_hashes(conn, "ch", tmp_path, manifest) == 0
+            assert self._hash_of(conn, "inc/a.h") == "stored"
+        finally:
+            conn.close()
 
 
 class TestMergeHeaderRecords:
@@ -1528,7 +1578,6 @@ class TestNoHeaderIsTrusted:
         """
         import inspect
 
-        from fw_context_mcp.indexer._manifest_updater import _mtime_bump_is_safe
         from fw_context_mcp.indexer.manifest import (
             check_tu_staleness,
             collect_stale_headers,
@@ -1537,7 +1586,6 @@ class TestNoHeaderIsTrusted:
         for fn in (
             check_tu_staleness,
             collect_stale_headers,
-            _mtime_bump_is_safe,
         ):
             assert "vendor_patterns" not in inspect.signature(fn).parameters, fn.__name__
 
