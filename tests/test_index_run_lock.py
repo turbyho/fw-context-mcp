@@ -235,6 +235,13 @@ class TestTakeover:
         shape of an index run of *kind*, so _index_run_kind recognises it.
         With *ignore_sigterm* it plays a run stuck where the SIGTERM handler
         never gets to run.
+
+        The holder sets SIGHUP to its default action before it enters
+        _owned_index.  A child process gets the SIGHUP disposition of its
+        parent, and _owned_index keeps an ignored SIGHUP ignored (that is the
+        `nohup fw-context index` contract).  Without the reset, a pytest that
+        runs under nohup gives an ignored SIGHUP to the holder, and the
+        SIGHUP test fails on a timeout.
         """
         extra = ["-m", "fw_context_mcp.cli", "index"] + (["--background"] if kind == "background" else [])
         script = textwrap.dedent(
@@ -246,6 +253,8 @@ class TestTakeover:
             from fw_context_mcp.cli._index import _owned_index
             from fw_context_mcp.indexer.runner import IndexStopped
 
+            # Not the disposition of the caller: see the docstring of _holder.
+            signal.signal(signal.SIGHUP, signal.SIG_DFL)
             args = SimpleNamespace(background={kind == "background"!r}, takeover=False)
             try:
                 with _owned_index(Path({str(db_dir)!r}), args):
