@@ -2386,8 +2386,9 @@ the client in use). The MCP server is a child process of that client.
 the index. Both modes count it. `fast` controls only the header check:
 `fast=true` (the default) reuses the cached manifest hashes, and
 `fast=false` recomputes them, which is much slower.
-`header_affected_tus` reports how many translation units have stale
-header dependencies. This count is non-zero when headers changed since the
+`header_affected_tus` reports how many source files have stale header
+dependencies. A file that `compile_commands.json` lists more than once
+counts once. This count is non-zero when headers changed since the
 last index with `manifest_verification: "full"`.
 
 `effective_vendor_patterns` holds the SQL LIKE patterns that this build

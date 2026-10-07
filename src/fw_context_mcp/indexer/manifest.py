@@ -1283,11 +1283,19 @@ def update_entry(
     source_hash: str,
     headers: list[str],
     header_records: dict[str, dict] | None = None,
+    *,
+    flags_hash: str,
+    arguments: list[str],
 ) -> None:
     """Update a single translation unit's entry in the manifest in-place.
 
-    Called after a TU has been re-parsed — updates ``source_hash`` and the
-    entry's header path list.  *header_records* carries the ``{hash,
+    Called after a TU has been re-parsed — updates ``source_hash``, the
+    ``flags_hash`` and the ``arg_set`` of the flags that the parse used (a
+    listing whose flags changed refreshes the entry of its old flags, and
+    the two fields must describe the same flags), and the entry's header
+    path list, and removes ``needs_reparse``: the parse is the reparse that
+    the mark asked for, and check_tu_staleness reads a marked entry as stale
+    whatever its hashes say.  *header_records* carries the ``{hash,
     generated}`` records for those paths and is merged into the manifest's
     shared ``headers`` map; a re-parse that discovered a header no other TU
     has seen must contribute its record, or the path would resolve with an
@@ -1302,6 +1310,9 @@ def update_entry(
         return
     entries[entry_index]["source_hash"] = source_hash
     entries[entry_index]["headers"] = headers
+    entries[entry_index]["flags_hash"] = flags_hash
+    entries[entry_index]["arg_set"] = _intern_arguments(arguments, manifest.setdefault("arg_sets", []))
+    entries[entry_index].pop("needs_reparse", None)
     if header_records:
         merge_header_records(manifest, header_records)
 
@@ -1309,7 +1320,7 @@ def update_entry(
 def mark_entries_behind(
     manifest: dict,
     changed_paths: set[str],
-    keep: set[str],
+    keep: set[int],
 ) -> int:
     """Flag each entry that depends on a header another unit refreshed.
 
@@ -1321,16 +1332,21 @@ def mark_entries_behind(
     per-unit difference makes the second unit read what the first one just
     wrote as somebody else's change.
 
-    *keep* is the set of ``tu_rel`` paths this run really re-parsed.  Those
-    entries hold current rows and must not be flagged.
+    *keep* is the set of the INDEXES of the entries this run really
+    re-parsed.  Those entries hold current rows and must not be flagged.
+    An index, not a file: a file that compile_commands.json lists twice has
+    two entries, and a run can parse one listing only (reindex_file of a
+    header parses one unit, and a listing can fail to parse).  A set of
+    files kept the other listing too, and its rows from the old header text
+    stayed in the index with no mark that a later run could see.
 
     Returns the number of entries flagged.
     """
     if not changed_paths:
         return 0
     flagged = 0
-    for entry in manifest.get("entries", []):
-        if entry.get("file") in keep or entry.get("needs_reparse"):
+    for idx, entry in enumerate(manifest.get("entries", [])):
+        if idx in keep or entry.get("needs_reparse"):
             continue
         if any(path in changed_paths for path in entry.get("headers") or ()):
             entry["needs_reparse"] = True

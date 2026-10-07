@@ -816,9 +816,12 @@ def _check_header_staleness(
     Loads ``manifest.json`` from the index directory, compares stored
     header hashes against current on-disk content for project headers.
 
-    Returns ``(count, affected_files)`` where *count* is the number of
-    TUs with stale headers and *affected_files* is the list of source
-    file paths.
+    Returns ``(count, affected_files)`` where *affected_files* is the list
+    of source file paths with stale headers, each path once, and *count* is
+    its length.  A file that compile_commands.json lists more than once has
+    one manifest entry for each listing, and the user asks about files: a
+    file with three stale listings counted three, and stood three times in
+    the list.
 
     Performance is bounded by *max_files* (default 200).  When
     *use_cache* is True (default), results are cached for 30 seconds.
@@ -857,8 +860,8 @@ def _check_header_staleness(
     # not.  maintenance.py turned that into "stale": true and asked for a
     # reindex that could not clear it.
 
-    stale_count = 0
-    affected: list[str] = []
+    # A dict keeps the order of the entries and holds each file once.
+    affected_files: dict[str, None] = {}
 
     # Resolved per entry rather than for the whole manifest: only the first
     # *max_files* entries are examined, and on a large project that is a small
@@ -871,9 +874,10 @@ def _check_header_staleness(
             headers=resolve_headers(entry, header_table),
         )
         if stale:
-            stale_count += 1
-            affected.append(entry["file"])
+            affected_files[entry["file"]] = None
 
+    affected = list(affected_files)
+    stale_count = len(affected)
     if use_cache:
         _header_staleness_cache[cache_key] = (time.monotonic(), stale_count)
     return stale_count, affected
@@ -937,7 +941,7 @@ def build_staleness(
             conn, config_hash, root, use_cache=use_cache, hash_cache=hash_cache,
         )
         if header_tus:
-            reasons.append(f"{header_tus} TU(s) with stale header dependencies")
+            reasons.append(f"{header_tus} source file(s) with stale header dependencies")
     return database_stale, reasons
 
 

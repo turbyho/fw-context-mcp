@@ -572,16 +572,26 @@ class TestUpdateEntry:
             ]
         }
         new_headers = [{"path": "new.h", "hash": "111", "generated": False}]
-        update_entry(manifest, 0, "new_hash", new_headers)
+        update_entry(manifest, 0, "new_hash", new_headers, flags_hash="new_flags", arguments=["-DNEW"])
         assert manifest["entries"][0]["source_hash"] == "new_hash"
         assert manifest["entries"][0]["headers"] == new_headers
+        assert manifest["entries"][0]["flags_hash"] == "new_flags"
+        assert manifest["arg_sets"][manifest["entries"][0]["arg_set"]] == ["-DNEW"]
         assert manifest["entries"][1]["source_hash"] == "old"  # unchanged
+
+    def test_the_reparse_removes_the_needs_reparse_mark(self):
+        """check_tu_staleness reads a marked entry as stale whatever its hashes say."""
+        from fw_context_mcp.indexer.manifest import update_entry
+
+        manifest = {"entries": [{"file": "a.c", "source_hash": "old", "headers": [], "needs_reparse": True}]}
+        update_entry(manifest, 0, "new", [], flags_hash="f", arguments=[])
+        assert "needs_reparse" not in manifest["entries"][0]
 
     def test_update_out_of_range(self):
         from fw_context_mcp.indexer.manifest import update_entry
 
         manifest = {"entries": []}
-        update_entry(manifest, 5, "hash", [])
+        update_entry(manifest, 5, "hash", [], flags_hash="f", arguments=[])
         # Should not raise — silently no-op
         assert len(manifest["entries"]) == 0
 
@@ -1335,6 +1345,7 @@ class TestMergeHeaderRecords:
         update_entry(
             manifest, 0, "new-source", ["build/autoconf.h"],
             {"build/autoconf.h": {"hash": "NEW", "generated": False}},
+            flags_hash="f", arguments=[],
         )
 
         assert manifest["headers"]["build/autoconf.h"]["generated"] is True
@@ -1642,7 +1653,7 @@ class TestMarkEntriesBehind:
         from fw_context_mcp.indexer.manifest import mark_entries_behind
 
         manifest = self._manifest()
-        flagged = mark_entries_behind(manifest, {"src/shared.h"}, {"src/a.c"})
+        flagged = mark_entries_behind(manifest, {"src/shared.h"}, {0})
 
         assert flagged == 1
         by_file = {e["file"]: e for e in manifest["entries"]}
@@ -1654,7 +1665,7 @@ class TestMarkEntriesBehind:
         from fw_context_mcp.indexer.manifest import mark_entries_behind
 
         manifest = self._manifest()
-        assert mark_entries_behind(manifest, set(), {"src/a.c"}) == 0
+        assert mark_entries_behind(manifest, set(), {0}) == 0
         assert all("needs_reparse" not in e for e in manifest["entries"])
 
     def test_an_already_flagged_entry_is_not_counted_twice(self):
@@ -1663,7 +1674,22 @@ class TestMarkEntriesBehind:
         manifest = self._manifest()
         manifest["entries"][1]["needs_reparse"] = True
 
-        assert mark_entries_behind(manifest, {"src/shared.h"}, {"src/a.c"}) == 0
+        assert mark_entries_behind(manifest, {"src/shared.h"}, {0}) == 0
+
+    def test_a_listing_that_was_not_parsed_is_flagged(self):
+        """A file listed twice: the run parsed one listing, and the other is behind.
+
+        A set of files kept both entries, and the rows of the other listing
+        stayed from the old header text with no mark that a run could see.
+        """
+        from fw_context_mcp.indexer.manifest import mark_entries_behind
+
+        manifest = self._manifest()
+        manifest["entries"].insert(1, {"file": "src/a.c", "headers": ["src/shared.h"]})
+
+        assert mark_entries_behind(manifest, {"src/shared.h"}, {0}) == 2
+        assert "needs_reparse" not in manifest["entries"][0]
+        assert manifest["entries"][1]["needs_reparse"] is True
 
 
 class TestTheFlagReachesTheReport:
@@ -1750,6 +1776,27 @@ class TestTheFlagReachesTheReport:
         db_dir, config_hash = self._write(tmp_path, flagged_at=250, total=260)
 
         assert self._count(tmp_path, db_dir, config_hash) == 0
+
+    def test_a_file_with_two_stale_listings_counts_once(self, tmp_path: Path):
+        """The report is about files; a file listed twice has two entries."""
+        import json
+        import sqlite3
+
+        from fw_context_mcp.mcp.shared.stale import _check_header_staleness
+
+        db_dir, config_hash = self._write(tmp_path, flagged_at=3, total=10)
+        path = db_dir / f"manifest.{config_hash}.json"
+        manifest = json.loads(path.read_text())
+        manifest["entries"].insert(4, dict(manifest["entries"][3]))
+        path.write_text(json.dumps(manifest))
+
+        conn = sqlite3.connect(db_dir / "index.db")
+        conn.row_factory = sqlite3.Row
+        try:
+            count, affected = _check_header_staleness(conn, config_hash, tmp_path, use_cache=False)
+        finally:
+            conn.close()
+        assert (count, affected) == (1, ["src/u3.c"])
 
 
 class TestTusToRequeue:

@@ -25,6 +25,7 @@ from pathlib import Path
 
 import pytest
 
+from fw_context_mcp.indexer.config_hash import DEFAULT_TRANSIENT_DEFINES
 from fw_context_mcp.indexer.db import (
     insert_symbols_batch,
     open_db,
@@ -4595,6 +4596,127 @@ class TestManifestRecordsEveryInclude:
             conn.close()
 
 
+class TestReindexRefreshesEachListing:
+    """``reindex_file`` refreshes the manifest entry of each listing of a file.
+
+    compile_commands.json can list one file more than once, with other
+    flags.  reindex_file refreshed the FIRST entry of the file for each
+    listing: the first entry was written three times, and the other two kept
+    their old hashes, thus the staleness check reported the file stale after
+    the reindex.  A new entry also got no flags hash, and a decision by flags
+    hash parses such a unit in each run.
+    """
+
+    @staticmethod
+    def _unit(tmp_path: Path, rel: str, define: str):
+        from unittest.mock import MagicMock
+
+        src = tmp_path / rel
+        src.parent.mkdir(parents=True, exist_ok=True)
+        src.write_text("int x;\n")
+        unit = MagicMock()
+        unit.file = src
+        unit.directory = tmp_path
+        unit.clang_args = [define]
+        unit.raw_entry = {"file": rel, "directory": str(tmp_path), "arguments": ["gcc", define, "-c", rel]}
+        return unit
+
+    @staticmethod
+    def _flags(unit) -> str:
+        from fw_context_mcp.indexer.config_hash import compute_flags_hash
+
+        return compute_flags_hash(unit.raw_entry, transient_defines=DEFAULT_TRANSIENT_DEFINES)
+
+    def _run(self, tmp_path: Path, monkeypatch, entries: list[dict], units: list) -> dict:
+        from fw_context_mcp.indexer import manifest as manifest_mod
+        from fw_context_mcp.indexer.manifest import MANIFEST_FORMAT
+        from fw_context_mcp.mcp.handlers import maintenance
+
+        saved: dict = {}
+        manifest = {
+            "_format": MANIFEST_FORMAT, "project_root": str(tmp_path),
+            "arg_sets": [], "headers": {"src/h.h": {"hash": "OLD", "generated": False}},
+            "entries": entries,
+        }
+
+        def fake_collect(unit, root, build_dir_patterns, header_table):
+            # The parse reads the header again, and it changed.
+            header_table["src/h.h"] = {"hash": "NEW", "generated": False}
+            return ["src/h.h"]
+
+        monkeypatch.setattr(manifest_mod, "_collect_headers_from_tokens", fake_collect)
+        monkeypatch.setattr(manifest_mod, "load", lambda db_dir, config_hash: manifest)
+        monkeypatch.setattr(manifest_mod, "save", lambda data, db_dir, config_hash: saved.update(data))
+        maintenance._update_manifest_after_reindex(
+            [(unit, object()) for unit in units], tmp_path, tmp_path / "index", "deadbeef",
+            transient_defines=DEFAULT_TRANSIENT_DEFINES,
+        )
+        return saved
+
+    @staticmethod
+    def _entry(file: str, flags_hash: str) -> dict:
+        return {"file": file, "source_hash": "OLD", "headers": ["src/h.h"], "flags_hash": flags_hash}
+
+    def test_each_listing_refreshes_its_own_entry(self, tmp_path, monkeypatch):
+        a = self._unit(tmp_path, "misc/empty.c", "-DA")
+        b = self._unit(tmp_path, "misc/empty.c", "-DB")
+        entries = [self._entry("misc/empty.c", self._flags(b)), self._entry("misc/empty.c", self._flags(a))]
+
+        saved = self._run(tmp_path, monkeypatch, entries, [a, b])
+
+        assert all(e["source_hash"] != "OLD" for e in saved["entries"])
+        assert [e["flags_hash"] for e in saved["entries"]] == [self._flags(b), self._flags(a)]
+
+    def test_a_listing_with_new_flags_refreshes_the_entry_that_no_listing_matches(self, tmp_path, monkeypatch):
+        """The exact matches go first: the listing with new flags takes what is left."""
+        a = self._unit(tmp_path, "misc/empty.c", "-DA")
+        c = self._unit(tmp_path, "misc/empty.c", "-DC")
+        b = self._unit(tmp_path, "misc/empty.c", "-DB")
+        entries = [self._entry("misc/empty.c", self._flags(a)), self._entry("misc/empty.c", self._flags(b))]
+
+        saved = self._run(tmp_path, monkeypatch, entries, [c, b])
+
+        assert [e["flags_hash"] for e in saved["entries"]] == [self._flags(c), self._flags(b)]
+        assert all(e["source_hash"] != "OLD" for e in saved["entries"])
+
+    def test_a_listing_that_was_not_parsed_is_flagged(self, tmp_path, monkeypatch):
+        """reindex_file of a header parses one unit: the other listing is behind.
+
+        The header hash in the shared table is new now, thus without the
+        mark no check would see that the rows of the other listing come from
+        the old header text.
+        """
+        a = self._unit(tmp_path, "misc/empty.c", "-DA")
+        b = self._unit(tmp_path, "misc/empty.c", "-DB")
+        entries = [self._entry("misc/empty.c", self._flags(a)), self._entry("misc/empty.c", self._flags(b))]
+
+        saved = self._run(tmp_path, monkeypatch, entries, [a])
+
+        assert "needs_reparse" not in saved["entries"][0]
+        assert saved["entries"][1]["needs_reparse"] is True
+
+    def test_a_listing_with_new_flags_gets_its_own_arguments(self, tmp_path, monkeypatch):
+        """The refreshed entry describes the new flags: hash and argument list agree."""
+        from fw_context_mcp.indexer.manifest import tu_arguments
+
+        a = self._unit(tmp_path, "misc/empty.c", "-DA")
+        c = self._unit(tmp_path, "misc/empty.c", "-DC")
+        entries = [self._entry("misc/empty.c", self._flags(a))]
+        entries[0]["arg_set"] = 0
+
+        saved = self._run(tmp_path, monkeypatch, entries, [c])
+
+        assert saved["entries"][0]["flags_hash"] == self._flags(c)
+        assert tu_arguments(saved, saved["entries"][0]) == ["-DC"]
+
+    def test_a_new_entry_has_the_flags_hash(self, tmp_path, monkeypatch):
+        a = self._unit(tmp_path, "src/new.c", "-DA")
+
+        saved = self._run(tmp_path, monkeypatch, [], [a])
+
+        assert saved["entries"][0]["flags_hash"] == self._flags(a)
+
+
 class TestReindexKeepsTheGeneratedFlag:
     """``reindex_file`` must not turn a generated header into a plain one.
 
@@ -4681,6 +4803,7 @@ class TestReindexKeepsTheGeneratedFlag:
             tmp_path,
             tmp_path / "index",
             "deadbeef",
+            transient_defines=DEFAULT_TRANSIENT_DEFINES,
         )
         return saved, seen
 

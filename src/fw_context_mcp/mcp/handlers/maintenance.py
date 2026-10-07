@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import time
+from collections.abc import Collection
 from pathlib import Path
 from typing import Annotated
 
@@ -545,8 +546,9 @@ def get_active_build(
         the completion time of the last full index), symbol_count, file_count,
         reference_count, modified_files_count (int — files whose content no
         longer matches the index; counted in both modes),
-        header_affected_tus (int — number of TUs with stale header
-        dependencies), manifest_verification (str —
+        header_affected_tus (int — number of source files with stale
+        header dependencies; a file that compile_commands.json lists more
+        than once counts once), manifest_verification (str —
         "full" when manifest.json exists, "none" otherwise),
         analysis (dict — LLM-analysis coverage split by project/vendor:
         {model, analyze_vendor, project: {analyzed, skipped, total},
@@ -1137,7 +1139,7 @@ def get_active_build(
             # sentence the user is told to run 'fw-context index', and the
             # index does not clear it.
             index_message += (
-                f" | {header_affected_tus} TU(s) have stale header dependencies "
+                f" | {header_affected_tus} source file(s) have stale header dependencies "
                 "— header changes since last index, or a TU that failed to "
                 "parse (see the index log)"
             )
@@ -1661,6 +1663,7 @@ def _reindex_parse_and_store(
     target: Path,
     vendor_patterns: list[str],
     project_patterns_list: list[str],
+    transient_defines: Collection[str],
 ) -> tuple[int, dict]:
     """Parse one or more translation units with libclang and store their symbols.
 
@@ -1746,7 +1749,10 @@ def _reindex_parse_and_store(
                 if deleted_orphans:
                     log.debug("Orphan files cleaned up: %d", deleted_orphans)
 
-                _update_manifest_after_reindex(parsed_units, root, db_path.parent, config_hash)
+                _update_manifest_after_reindex(
+                    parsed_units, root, db_path.parent, config_hash,
+                    transient_defines=transient_defines,
+                )
 
                 elapsed = round(time.monotonic() - t0, 2)
                 result = {
@@ -1764,11 +1770,58 @@ def _reindex_parse_and_store(
         except (sqlite3.Error, WriteLockTimeout) as exc:
             return 0, {"error": f"DB error during reindex: {exc}"}
 
+def _entries_for_listings(entries: list[dict], listings: list[tuple[str, str]]) -> list[int | None]:
+    """Return the manifest entry that each parsed listing refreshes.
+
+    *listings* holds ``(file, flags_hash)`` for each parsed unit, in order.
+    The result holds the index of an entry for each listing, or None when
+    the file has no entry left for it, and the caller adds a new entry.
+
+    Two passes, and each entry goes to one listing only:
+
+    1. A listing takes an entry of its file with the same flags hash.
+    2. A listing that found none takes an entry of its file that no listing
+       took, thus a listing whose flags changed refreshes the entry of the
+       flags that the file had before.
+
+    The first pass runs for all listings before the second.  In one pass, a
+    listing with new flags could take the entry that a later listing
+    matches exactly.
+
+    The previous code refreshed the first entry of the file for each
+    listing.  With three listings, the first entry was written three times,
+    and the other two kept the old hashes: the staleness check reported
+    the file stale after the reindex.
+    """
+    taken: set[int] = set()
+    slots: list[int | None] = [None] * len(listings)
+    by_file: dict[str, list[int]] = {}
+    for idx, entry in enumerate(entries):
+        by_file.setdefault(entry.get("file", ""), []).append(idx)
+    for pos, (file, flags_hash) in enumerate(listings):
+        for idx in by_file.get(file, []):
+            if idx not in taken and entries[idx].get("flags_hash") == flags_hash:
+                slots[pos] = idx
+                taken.add(idx)
+                break
+    for pos, (file, _flags_hash) in enumerate(listings):
+        if slots[pos] is not None:
+            continue
+        for idx in by_file.get(file, []):
+            if idx not in taken:
+                slots[pos] = idx
+                taken.add(idx)
+                break
+    return slots
+
+
 def _update_manifest_after_reindex(
     parsed_units: list,
     root: Path,
     db_dir: Path,
     config_hash: str,
+    *,
+    transient_defines: Collection[str],
 ) -> None:
     """Update manifest.json entries for reindexed translation units.
 
@@ -1777,6 +1830,14 @@ def _update_manifest_after_reindex(
     refreshed so header-staleness detection (used by ``get_active_build``)
     reflects the file's current dependencies.
 
+    compile_commands.json can list one file more than once, each time with
+    other flags, and the manifest holds one entry for each listing.  Each
+    parsed listing refreshes its own entry: see :func:`_entries_for_listings`.
+    The entry gets the flags hash of the listing, with *transient_defines*
+    as the index run computes it: the carry-over of the index run gives a
+    listing the entry with its own flags hash, and a hash of another list
+    matches no listing.
+
     When the manifest does not exist (first index, or manifest not
     enabled), this is a no-op — the ``load_manifest`` guard returns
     early.
@@ -1784,6 +1845,7 @@ def _update_manifest_after_reindex(
     try:
         from fw_context_mcp.utils import compute_source_hash
 
+        from ...indexer.config_hash import compute_flags_hash
         from ...indexer.manifest import (
             _collect_headers_from_tokens,
             _intern_arguments,
@@ -1816,8 +1878,22 @@ def _update_manifest_after_reindex(
                 path: record.get("hash", "")
                 for path, record in (manifest_data.get("headers") or {}).items()
             }
-            reparsed_rel: set[str] = set()
+            refreshed: set[int] = set()
+            listings: list[tuple[str, str]] = []
             for unit, _parsed in parsed_units:
+                try:
+                    rel = str(unit.file.resolve().relative_to(root))
+                except ValueError:
+                    rel = str(unit.file.resolve())
+                flags = (
+                    compute_flags_hash(unit.raw_entry, transient_defines=transient_defines)
+                    if unit.raw_entry else ""
+                )
+                listings.append((rel, flags))
+            slots = _entries_for_listings(manifest_data.get("entries", []), listings)
+            for (unit, _parsed), (tu_rel, flags_hash), slot in zip(
+                parsed_units, listings, slots, strict=True,
+            ):
                 # Records go into a per-unit table and are merged by
                 # merge_header_records, so a header this re-parse is the first
                 # to see still contributes its hash to the manifest's shared
@@ -1827,17 +1903,12 @@ def _update_manifest_after_reindex(
                     unit, root, bdp, header_records
                 )
                 source_hash = compute_source_hash(unit.file.resolve())
-                try:
-                    tu_rel = str(unit.file.resolve().relative_to(root))
-                except ValueError:
-                    tu_rel = str(unit.file.resolve())
-                reparsed_rel.add(tu_rel)
-                for idx, entry in enumerate(manifest_data.get("entries", [])):
-                    if entry.get("file") == tu_rel:
-                        update_entry(
-                            manifest_data, idx, source_hash, headers, header_records
-                        )
-                        break
+                if slot is not None:
+                    update_entry(
+                        manifest_data, slot, source_hash, headers, header_records,
+                        flags_hash=flags_hash, arguments=unit.clang_args,
+                    )
+                    refreshed.add(slot)
                 else:
                     # Same merge as update_entry uses.  This branch bypasses
                     # update_entry completely, so a plain .update() here is a
@@ -1852,7 +1923,9 @@ def _update_manifest_after_reindex(
                         ),
                         "source_hash": source_hash,
                         "headers": headers,
+                        "flags_hash": flags_hash,
                     })
+                    refreshed.add(len(manifest_data["entries"]) - 1)
             # This function refreshed the SHARED header hashes, so the next
             # full index run sees no difference for the OTHER units that
             # include those headers — their rows still come from the old
@@ -1863,7 +1936,7 @@ def _update_manifest_after_reindex(
                 for path, record in (manifest_data.get("headers") or {}).items()
                 if record.get("hash", "") != table_before.get(path, "")
             }
-            behind = mark_entries_behind(manifest_data, changed, reparsed_rel)
+            behind = mark_entries_behind(manifest_data, changed, refreshed)
             if behind:
                 log.info(
                     "reindex_file: %d entr(ies) flagged needs_reparse after "
@@ -2210,6 +2283,7 @@ def reindex_file_impl(
         total_symbols, result = _reindex_parse_and_store(
             conn, matching, cfg_data, cfg.index.index_refs,
             root, db_path, target, vendor_patterns, project_patterns_list,
+            cfg.index.transient_defines,
         )
         if "error" in result:
             return result
