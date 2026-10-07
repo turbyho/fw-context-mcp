@@ -3010,9 +3010,9 @@ def _run_source_line_fallback(
     # scanned a file saved meanwhile, and a file that the build removed
     # raised FileNotFoundError out of extract_all.  str.splitlines() splits
     # "\r\n" and "\r" as read_text() with universal newlines did.
-    from ._parsed_text import parsed_bytes
+    from ._parsed_text import file_of_parse, parsed_bytes
 
-    _data = parsed_bytes(tu, tu.get_file(_tu_file))
+    _data = parsed_bytes(tu, file_of_parse(tu, _tu_file))
     _source_lines = _data.decode("utf-8", errors="replace").splitlines() if _data is not None else []
     for _lineno_0, _line in enumerate(_source_lines):
         _lineno = _lineno_0 + 1

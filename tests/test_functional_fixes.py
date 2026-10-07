@@ -185,19 +185,15 @@ class TestResolveMethodUsr:
 
 
 class _FakeTU:
-    """Minimal stand-in for a libclang TranslationUnit (spelling and file lookup only).
+    """Minimal stand-in for a libclang TranslationUnit (spelling only).
 
-    The fallback scans the text that the parse read.  ``get_file`` gives the
-    path as the handle, and the fixture ``disk_buffers`` makes the parsed
-    bytes of a handle the bytes on the disk: these tests pin the scan, and
-    need no libclang.
+    The fallback scans the text that the parse read.  The fixture
+    ``disk_buffers`` makes the path the handle of a file and the bytes on
+    the disk its parsed text: these tests pin the scan, and need no libclang.
     """
 
     def __init__(self, path: str):
         self.spelling = path
-
-    def get_file(self, name: str) -> str:
-        return name
 
     def __getattr__(self, name: str):
         return None
@@ -209,6 +205,7 @@ def disk_buffers(monkeypatch):
     from fw_context_mcp.indexer import _parsed_text
 
     monkeypatch.setattr(_parsed_text, "parsed_bytes", lambda tu, cx_file: Path(cx_file).read_bytes())
+    monkeypatch.setattr(_parsed_text, "file_of_parse", lambda tu, name: name)
 
 
 class TestRunSourceLineFallbackSelfRef:

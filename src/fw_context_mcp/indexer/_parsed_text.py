@@ -29,6 +29,7 @@ import ctypes
 import hashlib
 import io
 import logging
+import os
 from functools import cache
 from pathlib import Path
 from typing import Any
@@ -60,12 +61,34 @@ def _bind() -> Any | None:
     return get_contents
 
 
+def file_of_parse(tu: Any, name: str) -> Any | None:
+    """Return the libclang file of *name* for the parse of *tu*, or None.
+
+    None when libclang knows no such file: the file is not on the disk and
+    the parse did not load it.  A file on the disk that the parse did not
+    load gets a handle all the same, and ``parsed_bytes`` then gives None
+    for it, because libclang holds no text of it.
+
+    ``TranslationUnit.get_file`` cannot give the None: it wraps the result
+    of ``clang_getFile`` in a ``File``, whose constructor asserts a non-null
+    pointer, thus a missing file raised ``AssertionError``, and a reader
+    that falls back to the disk never got there.  This function calls
+    ``clang_getFile`` itself and tests the pointer.
+    """
+    from clang import cindex
+
+    pointer = cindex.conf.lib.clang_getFile(tu, os.fspath(name))
+    return cindex.File(pointer) if pointer else None
+
+
 def parsed_bytes(tu: Any, cx_file: Any) -> bytes | None:
     """Return the bytes of *cx_file* as the parse of *tu* read them, or None.
 
-    None when the file is not part of the parse: ``TranslationUnit.get_file``
-    gives a handle with a null pointer for a file that libclang did not load,
-    and the C function must not get it.
+    None when the parse did not load the file: libclang holds no text of
+    it.  None also when *cx_file* is None (``file_of_parse`` found no such
+    file) or holds a null pointer, which the C function must not get: the
+    assert of ``File`` that keeps a null pointer out does not run under
+    ``python -O``.
     """
     get_contents = _bind()
     if get_contents is None or not getattr(cx_file, "_as_parameter_", None):
@@ -105,12 +128,14 @@ def parsed_hashes(tu: Any, main_file: Path) -> dict[Path, str]:
     One map serves each row that one unit writes.  The key is the resolved
     path, because one file has more than one spelling in one unit.
 
-    *main_file* is the resolved path of the unit, the key of its hash and
-    the name of the lookup.  The caller knows that path, and the rows that
-    read the map use the same resolved key.
+    *main_file* is the resolved path of the unit, the key of its hash: the
+    rows that read the map use the same resolved key.  The lookup takes the
+    name that the parse got (``tu.spelling``), which libclang knows.  A
+    lookup by another path of the file (a symlink) gave a null handle for a
+    file saved by a rename after the parse.
     """
     hashes: dict[Path, str] = {}
-    hashes[main_file] = parsed_hash(tu, tu.get_file(str(main_file)))
+    hashes[main_file] = parsed_hash(tu, file_of_parse(tu, str(tu.spelling)))
     seen: set[str] = set()
     for inc in tu.get_includes():
         name = str(inc.include.name)

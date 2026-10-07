@@ -516,7 +516,8 @@ class TestBlankOutInactiveFiles:
         from fw_context_mcp.indexer import ops
 
         monkeypatch.setattr(ops, "parsed_bytes", lambda tu, cx_file: Path(cx_file).read_bytes())
-        return SimpleNamespace(get_file=lambda name: name)
+        monkeypatch.setattr(ops, "file_of_parse", lambda tu, name: name)
+        return SimpleNamespace()
 
     @staticmethod
     def _project(tmp_path: Path) -> tuple[Path, Path, Path, Path]:

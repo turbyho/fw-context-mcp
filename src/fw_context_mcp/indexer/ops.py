@@ -82,7 +82,7 @@ from fw_context_mcp.utils import (
     read_file_lines,
 )
 
-from ._parsed_text import decode_lines, parsed_bytes, parsed_hash, parsed_hashes
+from ._parsed_text import decode_lines, file_of_parse, parsed_bytes, parsed_hash, parsed_hashes
 from .db._chunking import chunked
 from .db._files import FileIdLookup
 from .manifest import _is_generated_header
@@ -125,7 +125,7 @@ def _cached_read_lines(abs_path: str, tu: Any = None) -> list[str] | None:
     if abs_path not in _body_cache:
         if len(_body_cache) >= _BODY_CACHE_MAX_ENTRIES:
             _body_cache.popitem(last=False)
-        data = parsed_bytes(tu, tu.get_file(abs_path)) if tu is not None else None
+        data = parsed_bytes(tu, file_of_parse(tu, abs_path)) if tu is not None else None
         _body_cache[abs_path] = decode_source_lines(data) if data is not None else read_file_lines(abs_path)
     else:
         _body_cache.move_to_end(abs_path)
@@ -233,11 +233,14 @@ def _normalize_file_path(file_path: str, project_root: Path) -> str:
         return str(resolved)
 
 
-def _token_lines_of_file(tu: Any, path: str) -> set[int]:
-    """Give every line that a token of *path* covers.
+def _token_lines_of_file(tu: Any, handle: Any, size: int) -> set[int]:
+    """Give every line that a token of the file of *handle* covers.
 
-    *path* must be resolved — one file has more than one spelling in one
-    translation unit, and ``_normalize_file_path`` gives the reason.
+    *handle* is the libclang file of the parse, and *size* the length of the
+    text that the parse read (``_parsed_text.parsed_bytes``).  The function
+    took a path, looked the file up by it, and took the size from the disk:
+    a file cut after the parse lost the tokens of its tail, and a header
+    reached through a symlink and saved by a rename got no handle.
 
     The caller asks for one file at a time, and only for a file it is about
     to write.  A header that already holds text needs no answer here, thus
@@ -264,24 +267,17 @@ def _token_lines_of_file(tu: Any, path: str) -> set[int]:
     and that subtraction is what separates live text from dead text.  See
     ``skipped_ranges.py``.
 
-    A file that is not on disk, an empty file, and a libclang that will not
-    answer for a file all give an empty set.  Such a file then keeps the
-    lines that the AST walk found for it, which is what it had before this
-    pass existed.
+    An empty file and a libclang that will not answer for a file give an
+    empty set.  Such a file then keeps the lines that the AST walk found
+    for it, which is what it had before this pass existed.
     """
     from clang import cindex as cx
 
-    try:
-        size = Path(path).stat().st_size
-    except OSError:
-        # A generated header that the build removed after the parse.
-        return set()
     if not size:
         return set()
 
     rows: set[int] = set()
     try:
-        handle = cx.File.from_name(tu, path)
         # The token below carries the spelling that libclang uses, which is
         # the spelling of this handle and not always the string the caller
         # gave.  Comparing against the caller string would drop every token
@@ -304,7 +300,7 @@ def _token_lines_of_file(tu: Any, path: str) -> set[int]:
         # an index run of a large project takes hours, thus a file that
         # libclang will not tokenize must cost the run only the comments of
         # that file, and not the run itself.
-        log.debug("could not tokenize %s for the content fill", path, exc_info=True)
+        log.debug("could not tokenize %s for the content fill", getattr(handle, "name", handle), exc_info=True)
         return set()
     return rows
 
@@ -414,6 +410,13 @@ def _build_filtered_file_content(
     # to tell a changed header from an unchanged one.  `headers` alone
     # cannot serve it — it stores the project-relative spelling.
     header_files: list[tuple[str, str]] = []
+    # The libclang file of each file of the parse, keyed by its resolved
+    # path.  The reads below take the text of the parse through it, and not
+    # through a lookup by the resolved path: a lookup by a path that the
+    # parse did not use found no file for a header reached through a
+    # symlink and saved by a rename after the parse.  The main file comes
+    # under the name that the parse got, which libclang knows.
+    handles: dict[Path, Any] = {Path(unit.file).resolve(): file_of_parse(tu, str(unit.file))}
 
     for inc in tu.get_includes():
         abs_path = str(inc.include.name)
@@ -422,6 +425,7 @@ def _build_filtered_file_content(
         seen_headers.add(abs_path)
 
         resolved = Path(abs_path).resolve()
+        handles.setdefault(resolved, inc.include)
         # No extension filter — see _collect_headers_from_tokens() for why.
         # Anything reached by an #include belongs in the manifest, or it can
         # neither be kept nor invalidated.
@@ -578,23 +582,25 @@ def _build_filtered_file_content(
         # Measured on one project: a header kept its multi-line comments and
         # lost its `#pragma once` and its first two comment lines.
         #
-        # Drop the lines of every inactive #if branch after the merge.
-        # `skipped` is keyed by the resolved path, which is the key of this
-        # loop, thus the two sides meet.  This subtraction is what keeps the
-        # comments of a dead branch out of the stored text.
-        active_lines = (cursor_lines | _token_lines_of_file(tu, abs_path)) - skipped.get(
-            resolved, frozenset()
-        )
-        if not active_lines:
-            continue
-
         # The text that the parse read, and not the disk now: active_lines
         # are lines of that text.  A file saved after the parse gave the row
         # the new text, filtered with the active lines of the old one.
         # Measured: a header with one line more lost that line, and read_file
-        # then showed text that no symbol row describes.
-        data = parsed_bytes(tu, tu.get_file(abs_path))
+        # then showed text that no symbol row describes.  A file of a cursor
+        # that no include names is looked up by its path.
+        handle = handles.get(resolved) or file_of_parse(tu, abs_path)
+        data = parsed_bytes(tu, handle)
         if data is None:
+            continue
+
+        # Drop the lines of every inactive #if branch after the merge.
+        # `skipped` is keyed by the resolved path, which is the key of this
+        # loop, thus the two sides meet.  This subtraction is what keeps the
+        # comments of a dead branch out of the stored text.
+        active_lines = (cursor_lines | _token_lines_of_file(tu, handle, len(data))) - skipped.get(
+            resolved, frozenset()
+        )
+        if not active_lines:
             continue
         original = decode_lines(data)
 
@@ -671,7 +677,7 @@ def _build_filtered_file_content(
 
     filled += _blank_out_inactive_files(
         conn, config_hash, project_root, changed_headers, written, active_paths,
-        build_dir_patterns, tu=tu, skip_files=skip_files,
+        build_dir_patterns, tu=tu, skip_files=skip_files, handles=handles,
     )
 
     if filled:
@@ -733,6 +739,7 @@ def _blank_out_inactive_files(
     *,
     tu: Any,
     skip_files: frozenset[str] | None,
+    handles: Mapping[Path, Any] | None = None,
 ) -> int:
     """Refresh a header the parse read that produced no active line.
 
@@ -792,7 +799,10 @@ def _blank_out_inactive_files(
             continue
 
         resolved = Path(header_path)
-        data = parsed_bytes(tu, tu.get_file(header_path))
+        # The handle of the parse (*handles*, see _build_filtered_file_content),
+        # and a lookup by the path only for a caller without the map.
+        handle = (handles or {}).get(resolved) or file_of_parse(tu, header_path)
+        data = parsed_bytes(tu, handle)
         if data is None:
             continue
         line_count = len(decode_lines(data))

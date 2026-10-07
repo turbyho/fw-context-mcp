@@ -1870,7 +1870,7 @@ def _update_manifest_after_reindex(
     of the old one, and the next index run found the unit current.
     """
     try:
-        from ...indexer._parsed_text import parsed_hash
+        from ...indexer._parsed_text import file_of_parse, parsed_hash
         from ...indexer.config_hash import compute_flags_hash
         from ...indexer.manifest import (
             _intern_arguments,
@@ -1940,7 +1940,7 @@ def _update_manifest_after_reindex(
                 # "" when the TU is gone: an entry without a source hash
                 # proves nothing, thus the next run parses the unit.
                 source_hash = (
-                    parsed_hash(parsed.tu, parsed.tu.get_file(str(unit.file.resolve())))
+                    parsed_hash(parsed.tu, file_of_parse(parsed.tu, str(parsed.tu.spelling)))
                     if parsed.tu is not None else ""
                 )
                 if slot is not None:
