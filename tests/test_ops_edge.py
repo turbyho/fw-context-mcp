@@ -8,6 +8,39 @@ from fw_context_mcp.indexer.ops import _compute_content_hash, _read_body
 from fw_context_mcp.utils import read_file_lines as _read_file_lines
 
 
+class TestDecodeSourceLines:
+    """The indexer decodes the bytes of the parse as read_file_lines decodes the disk."""
+
+    @staticmethod
+    def _open_chain(path: Path) -> list[str]:
+        """The decode that read_file_lines did before it read the bytes once."""
+        for encoding in ("utf-8", "cp1252", "latin1"):
+            try:
+                with open(path, encoding=encoding) as handle:
+                    return handle.readlines()
+            except UnicodeError:
+                continue
+        raise AssertionError("latin1 decodes every byte")
+
+    def test_each_shape_decodes_as_open_did(self, tmp_path: Path):
+        from fw_context_mcp.utils import decode_source_lines
+
+        shapes = {
+            "utf8.c": "int café;\n".encode(),
+            "bom.c": b"\xef\xbb\xbfint x;\n",
+            "crlf.c": b"int a;\r\nint b;\r\n",
+            "cr.c": b"int a;\rint b;\r",
+            "notrail.c": b"int a;",
+            "cp1252.c": b"/* \x80 euro */\nint a;\n",
+            "latin1.c": b"/* \x81 */\nint a;\n",
+            "empty.c": b"",
+        }
+        for name, data in shapes.items():
+            path = tmp_path / name
+            path.write_bytes(data)
+            assert decode_source_lines(data) == self._open_chain(path), name
+
+
 class TestReadFileLines:
     def test_reads_normal_file(self, tmp_path: Path):
         f = tmp_path / "test.c"

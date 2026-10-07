@@ -12,7 +12,8 @@ Pipeline, per TU (``store_symbols_for_unit``):
   2. Delete old symbols, refs, inheritance, indirect call sites,
      function-pointer assignments, and macro rows for this TU
   3. Insert new symbol rows — compute ``is_project`` from vendor/project
-     LIKE patterns, extract function bodies from disk via cached reads
+     LIKE patterns, extract function bodies from the text that the parse
+     read, via cached reads
   4. Detect symbols that moved between files without content changes —
      preserve LLM analysis by updating file_id instead of re-inserting
   5. Insert refs, indirect call sites, function-pointer assignments,
@@ -77,6 +78,7 @@ from fw_context_mcp.utils import (
     CPP_EXTENSIONS,
     abs_path,
     compute_content_hash,
+    decode_source_lines,
     read_file_lines,
 )
 
@@ -102,8 +104,15 @@ _body_cache: OrderedDict[str, list[str] | None] = OrderedDict()
 _BODY_CACHE_MAX_ENTRIES = 200
 
 
-def _cached_read_lines(abs_path: str) -> list[str] | None:
+def _cached_read_lines(abs_path: str, tu: Any = None) -> list[str] | None:
     """Read all lines of *abs_path*, caching the result in an LRU-like cache.
+
+    The lines are the text that the parse of *tu* read, when *tu* loaded the
+    file: a body is cut by the extents of that parse, and a read of the disk
+    after the parse cut the text of a file saved meanwhile.  A file that the
+    parse did not load (the old file of a moved symbol) has no such text,
+    and the disk is its only source.  The decode is the one of the disk
+    (``decode_source_lines``), thus an unchanged file gives the same lines.
 
     Returns ``None`` when the file cannot be read (OSError, missing file).
     The cache is per-TU — ``_clear_body_cache()`` is called at the start
@@ -116,7 +125,8 @@ def _cached_read_lines(abs_path: str) -> list[str] | None:
     if abs_path not in _body_cache:
         if len(_body_cache) >= _BODY_CACHE_MAX_ENTRIES:
             _body_cache.popitem(last=False)
-        _body_cache[abs_path] = read_file_lines(abs_path)
+        data = parsed_bytes(tu, tu.get_file(abs_path)) if tu is not None else None
+        _body_cache[abs_path] = decode_source_lines(data) if data is not None else read_file_lines(abs_path)
     else:
         _body_cache.move_to_end(abs_path)
     return _body_cache[abs_path]
@@ -822,6 +832,7 @@ def _store_symbol_rows(
     skipped: dict[Path, set[int]],
     build_dir_patterns: list[str] | None = None,
     file_hashes: Mapping[Path, str] | None = None,
+    tu: Any = None,
 ) -> tuple[int, dict[int, int]]:
     """Build and batch-insert symbol rows for one TU.
 
@@ -864,7 +875,8 @@ def _store_symbol_rows(
     *file_hashes* maps the resolved path of each file of the parse to the
     hash of the text that the parse read (``_parsed_text.parsed_hashes``).
     A file that is not in it gets ``""``, and ``upsert_file`` then keeps the
-    stored hash.
+    stored hash.  *tu* is that parse: the bodies come from the text that it
+    read (``_cached_read_lines``).
     """
     from .sdk_detect import _path_matches
 
@@ -924,14 +936,15 @@ def _store_symbol_rows(
         # function implementations).  Declarations (is_definition=False)
         # store an empty body — only definitions have executable code.
         # _cached_read_lines reuses file content across symbols in the
-        # same file, avoiding repeated disk I/O.
+        # same file, avoiding repeated disk I/O, and gives the text of the
+        # parse (*tu*): the extents below are lines of that text.
         #
         # `end_line >= s.line` takes the one-line definition too — the inline
         # accessor of an embedded header.  `_read_body` gives the reason and
         # the count.
         body = ""
         if s.is_definition and s.end_line >= s.line:
-            file_lines = _cached_read_lines(s.file)
+            file_lines = _cached_read_lines(s.file, tu)
             if file_lines is not None:
                 # resolved_sym is reused from the is_project block above:
                 # the skipped map is keyed by resolved path, and one
@@ -998,6 +1011,7 @@ def _detect_moved_symbols(
     file_id_cache: dict[str, int],
     project_root: Path,
     skipped: dict[Path, set[int]],
+    tu: Any = None,
 ) -> None:
     """Detect symbols that moved between files without content changes.
 
@@ -1051,7 +1065,8 @@ def _detect_moved_symbols(
         if old_row["file_id"] == file_id_cache[normalized_sym_file]:
             continue
 
-        lines = _cached_read_lines(s.file)
+        # The new body is the text of the parse, as _store_symbol_rows read it.
+        lines = _cached_read_lines(s.file, tu)
         if lines is None:
             continue
         # Compare content hashes — same body + signature = same symbol.
@@ -1529,7 +1544,7 @@ def store_symbols_for_unit(
         syms_added, file_proj = _store_symbol_rows(
             conn, config_hash, syms, file_id_cache, project_root,
             vendor_patterns, project_patterns, skipped, build_dir_patterns,
-            file_hashes=file_hashes,
+            file_hashes=file_hashes, tu=tu,
         )
         # Update files.is_project for all files touched by this TU.
         # Using ``is_project < ip`` ensures a file that was previously
@@ -1542,7 +1557,7 @@ def store_symbols_for_unit(
                 (ip, fid, ip),
             )
         _detect_moved_symbols(
-            conn, config_hash, syms, old_usrs, file_id_cache, project_root, skipped,
+            conn, config_hash, syms, old_usrs, file_id_cache, project_root, skipped, tu=tu,
         )
 
     # Every path written to or matched against the database goes through the

@@ -20,6 +20,7 @@ Why a single utils module instead of topic-split utility files:
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import logging
 import os
@@ -68,6 +69,7 @@ __all__ = [
     "clear_dead_temporaries",
     "compute_content_hash",
     "compute_source_hash",
+    "decode_source_lines",
     "fmt_count",
     "format_number_ranges",
     "is_compile_commands_stale",
@@ -1158,6 +1160,37 @@ _read_cache_max = 500
 _read_cache_lock = threading.Lock()
 
 
+def decode_source_lines(data: bytes) -> list[str]:
+    """Decode the bytes of a source file into lines, detecting the encoding.
+
+    The lines are the ones that ``open(path, encoding=...).readlines()``
+    gives: universal newlines, and the end of each line kept.  The indexer
+    decodes the bytes that libclang parsed with this function, and
+    :func:`read_file_lines` decodes the disk with it, thus one text gives
+    one result on the two paths.
+
+    Encoding fallback chain — ordered by coverage in embedded C/C++ projects:
+
+    1. UTF-8 — universal, handles 99%+ of source files.
+    2. cp1252 (Windows-1252) — common in legacy Windows-authored firmware;
+       characters like 0x80-0x9F decode cleanly (unlike latin1 where they
+       map to control characters that produce valid-but-garbled output).
+    3. latin1 — ISO-8859-1 never raises UnicodeDecodeError (every byte
+       maps to a valid character), so any file that survives this far
+       is readable; the content may be garbled but the caller gets
+       line-oriented access without crashing.
+
+    UTF-16 files will produce garbled content; extremely low risk in
+    embedded C/C++ projects.
+    """
+    for encoding in ("utf-8", "cp1252"):
+        try:
+            return io.TextIOWrapper(io.BytesIO(data), encoding=encoding).readlines()
+        except UnicodeError:
+            continue
+    return io.TextIOWrapper(io.BytesIO(data), encoding="latin1").readlines()
+
+
 def read_file_lines(abs_path: str) -> list[str] | None:
     """Read all lines from a source file, detecting the encoding.
 
@@ -1177,36 +1210,10 @@ def read_file_lines(abs_path: str) -> list[str] | None:
             _read_cache.move_to_end(cache_key)
             return _read_cache[cache_key]
 
-    # Encoding fallback chain — ordered by coverage in embedded C/C++ projects:
-    #
-    # 1. UTF-8 — universal, handles 99%+ of source files.
-    # 2. cp1252 (Windows-1252) — common in legacy Windows-authored firmware;
-    #    characters like 0x80-0x9F decode cleanly (unlike latin1 where they
-    #    map to control characters that produce valid-but-garbled output).
-    # 3. latin1 — ISO-8859-1 never raises UnicodeDecodeError (every byte
-    #    maps to a valid character), so any file that survives this far
-    #    is readable; the content may be garbled but the caller gets
-    #    line-oriented access without crashing.
-    #
-    # NOTE: UTF-16 files will produce garbled content; extremely low risk
-    # in embedded C/C++ projects.
-    encodings = ["utf-8", "cp1252", "latin1"]
-    for encoding in encodings:
-        try:
-            with open(abs_path, encoding=encoding) as f:
-                result = f.readlines()
-                break
-        except (UnicodeDecodeError, UnicodeError):
-            continue
-        except (FileNotFoundError, OSError):
-            return None
-    else:
-        # Last resort — replace invalid bytes
-        try:
-            with open(abs_path, encoding="utf-8", errors="replace") as f:
-                result = f.readlines()
-        except (FileNotFoundError, OSError):
-            return None
+    try:
+        result = decode_source_lines(Path(abs_path).read_bytes())
+    except OSError:
+        return None
 
     # Evict oldest entry if at capacity (LRU via OrderedDict — move_to_end on hit)
     with _read_cache_lock:

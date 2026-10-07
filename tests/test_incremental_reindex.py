@@ -3512,6 +3512,39 @@ class TestTheDecisionIsByHash:
         assert len(row["content"].splitlines()) == len(parsed_text.splitlines())
         assert "int utils_h_parsed(void);" in row["content"].splitlines()
 
+    def test_the_body_of_a_symbol_is_the_text_of_the_parse(self, indexed_project: Path, monkeypatch):
+        """The body of a symbol came from a read of the disk after the parse.
+
+        A source saved after the parse gave the row the body of the new text
+        within the extent that the parse computed for the old one.
+        """
+        from fw_context_mcp.indexer import runner
+
+        utils = indexed_project / "src" / "utils.c"
+        utils.write_text(utils.read_text(encoding="utf-8") + "\nint utils_body_probe(void) { return 11; }\n",
+                         encoding="utf-8")
+        original = runner._parse_unit
+
+        def parse_then_save(unit, *args, **kwargs):
+            result = original(unit, *args, **kwargs)
+            if unit.file.name == "utils.c":
+                utils.write_text(utils.read_text(encoding="utf-8").replace("return 11;", "return 22;"),
+                                 encoding="utf-8")
+            return result
+
+        monkeypatch.setattr(runner, "_parse_unit", parse_then_save)
+        self._run_in_process(indexed_project)
+
+        conn = open_db(_db_path_for_project(indexed_project))
+        try:
+            row = conn.execute(
+                "SELECT source FROM symbols WHERE config_hash=? AND name='utils_body_probe'", (_config_hash(conn),),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        assert "return 11;" in row["source"]
+
     def test_a_save_after_the_parse_of_reindex_file_is_seen_by_the_next_run(self, indexed_project: Path, monkeypatch):
         """reindex_file parsed a second time for the manifest, and hashed the disk.
 
