@@ -3247,7 +3247,7 @@ class TestTheDecisionIsByHash:
         assert "0 updated, 3 unchanged" in self._summary(_index_cli(indexed_project))
 
     @staticmethod
-    def _run_in_process(project: Path) -> None:
+    def _run_in_process(project: Path, *, index_refs: bool = False) -> None:
         from fw_context_mcp.indexer.runner import run
 
         run(
@@ -3256,7 +3256,7 @@ class TestTheDecisionIsByHash:
             vendor_paths=[],
             project_paths=[],
             project_root=project,
-            index_refs=False,
+            index_refs=index_refs,
             index_embeddings=False,
             analyze_symbols=False,
             analyze_overrides=False,
@@ -3323,6 +3323,147 @@ class TestTheDecisionIsByHash:
             assert _count_modified_files(conn, _config_hash(conn), indexed_project) == 1
         finally:
             conn.close()
+
+    def test_a_stopped_run_keeps_the_units_that_it_parsed(self, indexed_project: Path, monkeypatch):
+        """The manifest was written at the end of the run only.
+
+        A first index of a large project runs for hours, and a run that a
+        watchdog stopped left the preliminary manifest: the next run parsed
+        every unit again.  The checkpoint keeps the entries of the units
+        that the stopped run stored.
+        """
+        from fw_context_mcp.indexer import runner
+
+        for src in (indexed_project / "src").glob("*.c"):
+            src.write_text(src.read_text(encoding="utf-8") + "\n/* edited */\n", encoding="utf-8")
+
+        class Stop(Exception):
+            pass
+
+        original = runner._parse_unit
+
+        def parse_until_utils(unit, *args, **kwargs):
+            if unit.file.name == "utils.c":
+                raise Stop
+            return original(unit, *args, **kwargs)
+
+        monkeypatch.setattr(runner, "MANIFEST_CHECKPOINT_S", 0.0)
+        monkeypatch.setattr(runner, "_parse_unit", parse_until_utils)
+        with pytest.raises(Stop):
+            self._run_in_process(indexed_project)
+
+        assert "1 updated, 2 unchanged" in self._summary(_index_cli(indexed_project))
+
+    def test_a_run_stopped_before_its_post_processing_is_finished_by_the_next(
+        self, indexed_project: Path, monkeypatch,
+    ):
+        """Every unit was stored, the post-processing never ran.
+
+        The next run finds each unit unchanged, thus it parses nothing, and
+        the expanded values of the macros ran only after a parse.  The run
+        marker makes the next run run that step, and only that run.
+        """
+        from fw_context_mcp.indexer import _run_marker, runner
+
+        for src in (indexed_project / "src").glob("*.c"):
+            src.write_text(src.read_text(encoding="utf-8") + "\n/* edited */\n", encoding="utf-8")
+
+        class Stop(Exception):
+            pass
+
+        def no_post_processing(*args, **kwargs):
+            raise Stop
+
+        monkeypatch.setattr(runner, "MANIFEST_CHECKPOINT_S", 0.0)
+        monkeypatch.setattr(runner, "_run_postprocess", no_post_processing)
+        with pytest.raises(Stop):
+            self._run_in_process(indexed_project)
+        db_dir = _db_path_for_project(indexed_project).parent
+        assert list(db_dir.glob(f"{_run_marker.PREFIX}*{_run_marker.SUFFIX}")), "the stopped run left no marker"
+
+        finishing = _index_cli(indexed_project)
+        assert "0 updated, 3 unchanged" in self._summary(finishing)
+        assert "Post-process: macros" in finishing.stderr
+        assert not list(db_dir.glob(f"{_run_marker.PREFIX}*{_run_marker.SUFFIX}"))
+
+        quiet = _index_cli(indexed_project)
+        assert "0 updated, 3 unchanged" in self._summary(quiet)
+        assert "Post-process: macros" not in quiet.stderr
+
+    def test_a_stopped_run_parses_its_unresolved_dispatch_units_again(self, indexed_project: Path, monkeypatch):
+        """A dispatch edge waits in a TEMP table for the post-processing, and a stop loses it.
+
+        The checkpoint keeps the unit as unchanged, thus no later run gave
+        the edge again.  The marker names the unit, and the next run parses it.
+        """
+        from fw_context_mcp.indexer import runner
+        from fw_context_mcp.indexer.models import PendingDispatch
+
+        for src in (indexed_project / "src").glob("*.c"):
+            src.write_text(src.read_text(encoding="utf-8") + "\n/* edited */\n", encoding="utf-8")
+
+        class Stop(Exception):
+            pass
+
+        original = runner._parse_unit
+
+        def parse_with_a_dispatch(unit, *args, **kwargs):
+            result = original(unit, *args, **kwargs)
+            if unit.file.name == "modem.c":
+                result[1].pending_dispatches.append(PendingDispatch(
+                    callee_qn="events::EventQueue::call_every", target_qn_partial="modem_init",
+                    target_name="modem_init", file="src/modem.c", line=1, caller_usr=None,
+                ))
+            return result
+
+        def no_post_processing(*args, **kwargs):
+            raise Stop
+
+        monkeypatch.setattr(runner, "MANIFEST_CHECKPOINT_S", 0.0)
+        monkeypatch.setattr(runner, "_parse_unit", parse_with_a_dispatch)
+        monkeypatch.setattr(runner, "_run_postprocess", no_post_processing)
+        with pytest.raises(Stop):
+            self._run_in_process(indexed_project, index_refs=True)
+
+        assert "1 updated, 2 unchanged" in self._summary(_index_cli(indexed_project))
+
+    def test_a_stop_during_the_post_processing_keeps_the_dispatch_units(self, indexed_project: Path, monkeypatch):
+        """The manifest step writes the full manifest, and the macros step after it runs for minutes.
+
+        The marker held only the units of the last checkpoint, and a run
+        shorter than one checkpoint wrote none: a stop in the macros step
+        lost the dispatch edges of the units stored after it.
+        """
+        from fw_context_mcp.indexer import _postprocess, runner
+        from fw_context_mcp.indexer.models import PendingDispatch
+
+        for src in (indexed_project / "src").glob("*.c"):
+            src.write_text(src.read_text(encoding="utf-8") + "\n/* edited */\n", encoding="utf-8")
+
+        class Stop(Exception):
+            pass
+
+        original = runner._parse_unit
+
+        def parse_with_a_dispatch(unit, *args, **kwargs):
+            result = original(unit, *args, **kwargs)
+            if unit.file.name == "modem.c":
+                result[1].pending_dispatches.append(PendingDispatch(
+                    callee_qn="events::EventQueue::call_every", target_qn_partial="modem_init",
+                    target_name="modem_init", file="src/modem.c", line=1, caller_usr=None,
+                ))
+            return result
+
+        def stop(*args, **kwargs):
+            raise Stop
+
+        steps = [(name, stop if name == "macros" else fn, guard) for name, fn, guard in _postprocess._STEPS]
+        monkeypatch.setattr(runner, "_parse_unit", parse_with_a_dispatch)
+        monkeypatch.setattr(_postprocess, "_STEPS", steps)
+        with pytest.raises(Stop):
+            self._run_in_process(indexed_project, index_refs=True)
+
+        assert "1 updated, 2 unchanged" in self._summary(_index_cli(indexed_project))
 
     def test_force_refindex_parses_every_unit(self, indexed_project: Path, monkeypatch):
         monkeypatch.setenv("FW_CONTEXT_FORCE_REFINDEX", "1")

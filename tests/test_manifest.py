@@ -1100,6 +1100,125 @@ class TestOneEntryForEachListing:
         assert [e["flags_hash"] for e in empty] == [self._flags(b)] * 3
 
 
+class TestManifestCheckpoint:
+    """The write of the manifest during the run (``checkpoint_reached``)."""
+
+    def test_a_unit_without_an_entry_gets_none_and_no_tokenizing(self, tmp_path: Path, monkeypatch):
+        """The end of the run gives it an entry; a checkpoint must not parse it for one."""
+        import fw_context_mcp.indexer.manifest as manifest_mod
+
+        def no_tokenizing(*args, **kwargs):
+            raise AssertionError("a checkpoint read a unit from the token stream")
+
+        monkeypatch.setattr(manifest_mod, "_collect_headers_from_tokens", no_tokenizing)
+        listing = TestOneEntryForEachListing()
+        main = listing._unit(tmp_path, "src/main.c", "-DA")
+        new = listing._unit(tmp_path, "src/new.c", "-DA")
+        manifest = listing._manifest(tmp_path, [main])
+
+        from fw_context_mcp.indexer._manifest_updater import _update_manifest_after_index
+
+        (tmp_path / "index").mkdir()
+        result = _update_manifest_after_index(
+            manifest=manifest, units=[main, new], project_root=tmp_path, db_dir=tmp_path / "index",
+            compile_commands=tmp_path / "compile_commands.json", updated_count=1,
+            tu_headers={"src/main.c": []}, config_hash="deadbeef",
+            reparsed_tus=_parsed(tmp_path, {"src/main.c"}),
+            transient_defines=DEFAULT_TRANSIENT_DEFINES, checkpoint_reached=2,
+        )
+
+        assert result is not None
+        assert [e["file"] for e in result["entries"]] == ["src/main.c"]
+        assert result["entries"][0]["source_hash"] == compute_source_hash(main.file)
+
+    def test_a_listing_after_the_reached_position_keeps_its_old_entry(self, tmp_path: Path):
+        """A file listed twice: the run stored the first listing, and stopped before the second.
+
+        tu_headers and reparsed_tus are keyed by file, thus the second
+        listing got a fresh entry with ITS new flags, and the next run kept
+        both listings as unchanged while the rows came from the first one.
+        """
+        from fw_context_mcp.indexer._manifest_updater import _update_manifest_after_index
+
+        listing = TestOneEntryForEachListing()
+        a = listing._unit(tmp_path, "misc/empty.c", "-DA")
+        b_old = listing._unit(tmp_path, "misc/empty.c", "-DB")
+        b_new = listing._unit(tmp_path, "misc/empty.c", "-DC")
+        manifest = listing._manifest(tmp_path, [a, b_old])
+
+        (tmp_path / "index").mkdir()
+        result = _update_manifest_after_index(
+            manifest=manifest, units=[a, b_new], project_root=tmp_path, db_dir=tmp_path / "index",
+            compile_commands=tmp_path / "compile_commands.json", updated_count=1,
+            tu_headers={"misc/empty.c": []}, config_hash="deadbeef",
+            reparsed_tus=_parsed(tmp_path, {"misc/empty.c"}),
+            transient_defines=DEFAULT_TRANSIENT_DEFINES, checkpoint_reached=1,
+        )
+
+        assert result is not None
+        assert [e["flags_hash"] for e in result["entries"]] == [listing._flags(a), listing._flags(b_old)]
+
+    def test_an_unchanged_listing_after_the_reached_position_is_behind(self, tmp_path: Path):
+        """Only the flags of the first listing changed, and the run stopped before the second.
+
+        The old entry of the second listing is current by its own hashes,
+        but the rows of the file are now the rows of the first listing.
+        """
+        from fw_context_mcp.indexer._manifest_updater import _update_manifest_after_index
+
+        listing = TestOneEntryForEachListing()
+        a_old = listing._unit(tmp_path, "misc/empty.c", "-DA")
+        b = listing._unit(tmp_path, "misc/empty.c", "-DB")
+        a_new = listing._unit(tmp_path, "misc/empty.c", "-DX")
+        manifest = listing._manifest(tmp_path, [a_old, b])
+
+        (tmp_path / "index").mkdir()
+        result = _update_manifest_after_index(
+            manifest=manifest, units=[a_new, b], project_root=tmp_path, db_dir=tmp_path / "index",
+            compile_commands=tmp_path / "compile_commands.json", updated_count=1,
+            tu_headers={"misc/empty.c": []}, config_hash="deadbeef",
+            reparsed_tus=_parsed(tmp_path, {"misc/empty.c"}),
+            transient_defines=DEFAULT_TRANSIENT_DEFINES, checkpoint_reached=1,
+        )
+
+        assert result is not None
+        first, second = result["entries"]
+        assert first["flags_hash"] == listing._flags(a_new) and "needs_reparse" not in first
+        assert second["flags_hash"] == listing._flags(b) and second["needs_reparse"] is True
+
+    def test_without_a_manifest_there_is_no_checkpoint(self, tmp_path: Path):
+        from fw_context_mcp.indexer._manifest_updater import _update_manifest_after_index
+
+        unit = TestOneEntryForEachListing()._unit(tmp_path, "src/main.c", "-DA")
+        (tmp_path / "index").mkdir()
+        result = _update_manifest_after_index(
+            manifest=None, units=[unit], project_root=tmp_path, db_dir=tmp_path / "index",
+            compile_commands=tmp_path / "compile_commands.json", updated_count=1,
+            tu_headers=None, config_hash="deadbeef", reparsed_tus={},
+            transient_defines=DEFAULT_TRANSIENT_DEFINES, checkpoint_reached=2,
+        )
+
+        assert result is None
+        assert list((tmp_path / "index").iterdir()) == []
+
+    def test_the_manifest_is_written_through_a_rename(self, tmp_path: Path, monkeypatch):
+        """A stop during the write must leave the old manifest, not a cut file."""
+        import fw_context_mcp.indexer.manifest as manifest_mod
+
+        manifest_mod.save({"_format": MANIFEST_FORMAT, "entries": []}, tmp_path, "cafe")
+        before = (tmp_path / "manifest.cafe.json").read_text(encoding="utf-8")
+
+        def stop(*args, **kwargs):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr("fw_context_mcp.utils.os.replace", stop)
+        with pytest.raises(KeyboardInterrupt):
+            manifest_mod.save({"_format": MANIFEST_FORMAT, "entries": [{"file": "a.c"}]}, tmp_path, "cafe")
+
+        assert (tmp_path / "manifest.cafe.json").read_text(encoding="utf-8") == before
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["manifest.cafe.json"]
+
+
 class TestOldEntriesTake:
     """The order of preference of ``_OldEntries.take``, one case for each rule."""
 
@@ -1871,3 +1990,28 @@ class TestFilesGeneratedColumn:
         )
         assert "project_patterns" in is_project_block
         assert "vendor_patterns" in is_project_block
+
+
+def test_an_incremental_update_keeps_the_extension_sets(tmp_path: Path):
+    """The update wrote the manifest without them, and load_tu_extensions gave None."""
+    import json
+
+    from fw_context_mcp.indexer._manifest_updater import _update_manifest_after_index
+    from fw_context_mcp.indexer.manifest import load_tu_extensions
+
+    listing = TestOneEntryForEachListing()
+    main = listing._unit(tmp_path, "src/main.c", "-DA")
+    cc = tmp_path / "compile_commands.json"
+    cc.write_text(json.dumps([
+        {"file": "src/main.c", "directory": str(tmp_path), "arguments": ["gcc", "-c", "src/main.c"]},
+        {"file": "src/start.S", "directory": str(tmp_path), "arguments": ["gcc", "-c", "src/start.S"]},
+    ]), encoding="utf-8")
+    (tmp_path / "index").mkdir()
+    _update_manifest_after_index(
+        manifest=listing._manifest(tmp_path, [main]), units=[main], project_root=tmp_path,
+        db_dir=tmp_path / "index", compile_commands=cc, updated_count=1,
+        tu_headers={"src/main.c": []}, config_hash="deadbeef",
+        reparsed_tus=_parsed(tmp_path, {"src/main.c"}), transient_defines=DEFAULT_TRANSIENT_DEFINES,
+    )
+
+    assert load_tu_extensions(tmp_path / "index", "deadbeef") == frozenset({".c", ".S"})

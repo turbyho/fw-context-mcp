@@ -31,6 +31,7 @@ from ..exit_codes import (  # noqa: F401 — re-exported
 )
 from ..mcp.shared.pid_file import PidFile
 from ..utils import TU_EXTENSIONS
+from . import _run_marker
 from ._embedding import (
     _build_embeddings,
     _chunk_body,
@@ -64,6 +65,7 @@ from .db import (
     upsert_project,
     write_lock,
 )
+from .ops import _normalize_file_path
 
 log = logging.getLogger(__name__)
 
@@ -132,6 +134,78 @@ class IndexTerminated(IndexStopped):
     label = "Terminated"
 
 
+# How often the run writes the manifest while it parses.  The manifest is
+# written at the end of the run, and a run that stopped before (a watchdog,
+# a manual operation, a crash) left the preliminary manifest of a new build,
+# whose entries have no hashes: the next run parsed every unit again, also
+# the units that the stopped run had stored.  A checkpoint costs one build of
+# the manifest from the units and one write; one each minute is small next to
+# a run that parses for minutes or hours, and a stop loses at most one minute.
+MANIFEST_CHECKPOINT_S: float = 60.0
+
+
+def _checkpoint_manifest(
+    *,
+    manifest: dict | None,
+    units: list,
+    project_root: Path,
+    db_dir: Path,
+    compile_commands: Path,
+    updated: int,
+    tu_headers: dict[str, list[dict]],
+    build_dir_patterns: list[str] | None,
+    vendor_patterns: list[str],
+    config_hash: str,
+    scope: list[str] | None,
+    reparsed_tus: dict[str, str],
+    transient_defines: Collection[str],
+    reached: int,
+    flags_hashes: list[str],
+) -> None:
+    """Write the manifest with the entries of the units that the run parsed so far.
+
+    The entries are the ones that the end of the run writes for those
+    units (the same updater, in checkpoint mode).  A unit that the run did
+    not parse keeps its old entry, thus the next run parses it as this run
+    would.  The rows of the parsed units are in the database: each unit is
+    one transaction, and the checkpoint runs after the commit.  The
+    post-processing is not done for them; the run marker
+    (:mod:`_run_marker`) tells the next run.
+
+    *reached* is the count of units that the loop reached: a later listing
+    of a file whose earlier listing was parsed keeps its old entry.
+
+    A write that fails is reported and the run goes on: the checkpoint only
+    saves work for a run that stops, and the next checkpoint writes again.
+    On Windows the rename fails while the MCP server reads the manifest.
+    """
+    from ._manifest_updater import _update_manifest_after_index
+
+    t0 = time.monotonic()
+    try:
+        _update_manifest_after_index(
+            manifest=manifest,
+            units=units,
+            project_root=project_root,
+            db_dir=db_dir,
+            compile_commands=compile_commands,
+            updated_count=updated,
+            tu_headers=tu_headers,
+            build_dir_patterns=build_dir_patterns,
+            vendor_patterns=vendor_patterns,
+            config_hash=config_hash,
+            scope=scope,
+            reparsed_tus=reparsed_tus,
+            transient_defines=transient_defines,
+            checkpoint_reached=reached,
+            flags_hashes=flags_hashes,
+        )
+    except OSError as exc:
+        log.warning("manifest checkpoint not written: %s", exc)
+        return
+    log.info("manifest checkpoint: %d file(s) parsed so far, %.1fs", len(reparsed_tus), time.monotonic() - t0)
+
+
 def raise_if_superseded(db_dir: Path) -> None:
     """Raise :class:`IndexSuperseded` when another process owns the index.
 
@@ -194,7 +268,6 @@ def _tus_to_requeue(
     stays empty and the mark reaches nothing.
     """
     from .manifest import tus_affected_by_headers
-    from .ops import _normalize_file_path
 
     flagged = {
         e["file"] for e in manifest.get("entries", []) if e.get("needs_reparse")
@@ -745,14 +818,31 @@ def run(
     # persist-stored skip set from a previous index run.
     skip_files: set[str] = set()
 
+    # An earlier run of this build that stored rows and stopped: its units
+    # read as unchanged now (the checkpoint below), and the post-processing
+    # must still run for them.  The units whose dispatch edges it lost are
+    # parsed again — see _run_marker.
+    pending_run = _run_marker.is_pending(db_path.parent, config_hash)
+    marker_units = set(_run_marker.units_to_parse(db_path.parent, config_hash))
+
     # Every unit is decided before the first parse: hashes only, no write.
     # A file whose listing changed is parsed in each of its listings, and
     # that needs the answer for all of them — see decide_units.
     decisions = decide_units(
-        units, project_root, existing_files, manifest_lookup, header_stale_tus,
+        units, project_root, existing_files, manifest_lookup,
+        header_stale_tus | marker_units,
         force=force, hash_cache=header_hash_cache, header_table=manifest_header_table,
         transient_defines=transient_defines,
     )
+    flags_hashes = [decision.hashes[1] for decision in decisions]
+
+    # This run writes the marker before its first row, and removes it after
+    # its own post-processing.  The units of an earlier marker stay in it
+    # until this run parses them.
+    marker_written = pending_run or any(not decision.unchanged for decision in decisions)
+    if marker_written:
+        _run_marker.mark_pending(db_path.parent, config_hash, marker_units)
+    last_checkpoint = time.monotonic()
 
     log.info("", extra={"phase": f"Parsing ({len(units)} TUs)"})
 
@@ -847,6 +937,12 @@ def run(
                 # Only a re-parsed TU may refresh its manifest entry — its
                 # symbols now match the headers it just read.
                 reparsed_tus[tu_key] = hashes[0]
+                # Its dispatch edges wait in a TEMP table for the post-
+                # processing, and a stop loses them: the marker names it.
+                unit_path = _normalize_file_path(str(unit.file.resolve()), project_root)
+                marker_units.discard(unit_path)
+                if index_refs and getattr(parsed_data, "pending_dispatches", None):
+                    marker_units.add(unit_path)
                 # An empty list too: a TU with no recorded header still gets
                 # its entry, with its source hash.  Without one, the entry of
                 # the preliminary manifest stayed, with an empty source hash,
@@ -866,6 +962,21 @@ def run(
             else:
                 skipped += 1
                 log.info("[%d/%d] %s: skipped", processed, len(units), fname)
+
+        if updated and time.monotonic() - last_checkpoint >= MANIFEST_CHECKPOINT_S:
+            # A manual operation that took the index wrote its own manifest;
+            # a checkpoint after it would overwrite that.  Give up first.
+            raise_if_superseded(db_path.parent)
+            _run_marker.mark_pending(db_path.parent, config_hash, marker_units)
+            _checkpoint_manifest(
+                manifest=manifest, units=units, project_root=project_root,
+                db_dir=db_path.parent, compile_commands=compile_commands, updated=updated,
+                tu_headers=tu_headers, build_dir_patterns=build_dir_patterns,
+                vendor_patterns=vendor_patterns, config_hash=config_hash, scope=scope,
+                reparsed_tus=reparsed_tus, transient_defines=transient_defines,
+                reached=processed, flags_hashes=flags_hashes,
+            )
+            last_checkpoint = time.monotonic()
 
 
     # ── Linker scripts, between the C units and the assembly ──
@@ -925,6 +1036,12 @@ def run(
     uncovered_paths = set(asm.paths) if asm is not None else set()
     if linker is not None:
         uncovered_paths |= linker.paths
+    # The manifest step writes the full manifest before the dispatch step
+    # resolves the edges, and the macros step between them runs for minutes:
+    # the marker names each unit whose edges wait, not only the ones of the
+    # last checkpoint.
+    if marker_written:
+        _run_marker.mark_pending(db_path.parent, config_hash, marker_units)
     _run_postprocess(
         asm_paths=uncovered_paths,
         conn=conn,
@@ -960,7 +1077,10 @@ def run(
         header_hash_cache=header_hash_cache,
         reparsed_tus=reparsed_tus,
         transient_defines=transient_defines,
+        pending_run=pending_run,
+        flags_hashes=flags_hashes,
     )
+    _run_marker.clear_pending(db_path.parent, config_hash)
 
     elapsed = time.monotonic() - t0
     log.info("", extra={"phase": f"Done — {total_syms} symbols, {total_refs} refs, {_fmt_dur(elapsed)}"})

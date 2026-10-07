@@ -16,6 +16,19 @@ Build or update the symbol index from `compile_commands.json`.
 > LLM analysis, overrides, and caches, without rebuilding, for example
 > after a schema change or a tool update.
 
+A file is changed when its content, the content of a header that it
+includes, or its compiler flags changed. fw-context compares hashes and no
+file time: `git checkout` and `touch` start no parse, and a copy that keeps
+an old time (`cp -p`) does. The `-D` macros of `[index] transient_defines`
+(a build time, a build counter) do not count, see
+[Configuration](configuration.md).
+
+A run that stops before its end (a watchdog, `Ctrl+C`, a manual
+`reindex_file`) keeps the files that it parsed: the run writes its manifest
+each minute. The next run parses the other files, and also the files whose
+call-graph dispatch edges (event-loop callbacks, thread starts) the stop
+lost. It expands the macros again, which the stopped run did not do.
+
 ```bash
 # Incremental (default) — reuse existing compile_commands.json, fast:
 fw-context index

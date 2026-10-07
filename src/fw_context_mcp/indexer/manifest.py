@@ -37,7 +37,7 @@ from fw_context_mcp.indexer.config_hash import (
     compute_flags_hash,
     drop_transient_defines,
 )
-from fw_context_mcp.utils import compute_source_hash
+from fw_context_mcp.utils import compute_source_hash, write_text_atomic
 
 log = logging.getLogger(__name__)
 
@@ -167,7 +167,8 @@ def derive_extension_sets(
     new-file scan would then stay blind to the files that need reporting.
 
     Reading the file again costs a plain json.load of a few hundred
-    kilobytes, once per index run.  It is not on the query path.
+    kilobytes, once per write of the manifest (the end of an index run and
+    each checkpoint).  It is not on the query path.
     """
     try:
         raw = json.loads(compile_commands_path.read_text(encoding="utf-8"))
@@ -380,8 +381,7 @@ def generate(
 
     manifest["config_hash"] = config_hash
     manifest_json = json.dumps(manifest, sort_keys=True, indent=2, ensure_ascii=False)
-    manifest_path = _manifest_path(db_dir, config_hash)
-    manifest_path.write_text(manifest_json, encoding="utf-8")
+    write_text_atomic(_manifest_path(db_dir, config_hash), manifest_json)
 
     elapsed = time.monotonic() - t0
     # Both numbers, because their ratio is the whole point of the /2 format:
@@ -694,7 +694,7 @@ def build_preliminary(
             )
             return config_hash
 
-    manifest_path.write_text(manifest_json, encoding="utf-8")
+    write_text_atomic(manifest_path, manifest_json)
     log.info("manifest.json (preliminary): %d TUs, config_hash=%s", len(entries), config_hash[:12])
     return config_hash
 
@@ -1389,5 +1389,5 @@ def save(manifest: dict, db_dir: Path, config_hash: str) -> str:
     prune_header_table(manifest)
     manifest["config_hash"] = config_hash
     manifest_json = json.dumps(manifest, sort_keys=True, indent=2, ensure_ascii=False)
-    _manifest_path(db_dir, config_hash).write_text(manifest_json, encoding="utf-8")
+    write_text_atomic(_manifest_path(db_dir, config_hash), manifest_json)
     return config_hash

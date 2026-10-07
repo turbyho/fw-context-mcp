@@ -932,6 +932,51 @@ def owner_is_dead(token: str) -> bool:
     return False
 
 
+
+# The owner token at the end of a temporary name: digits, "@", then the tag
+# (see _owner_tag).  No base name holds "@", thus the match is unambiguous.
+_TMP_OWNER = re.compile(r"\.(\d+@[A-Za-z0-9.-]+)\.tmp$")
+
+
+def write_text_atomic(path: Path, text: str) -> None:
+    """Write *text* to *path* through a file in the same directory and a rename.
+
+    A process that stops during a plain write leaves a cut file, and the
+    next reader gets no JSON at all.  The index run writes its manifest and
+    its run marker while it runs, and a run can stop at any moment.
+    ``os.replace`` is atomic on POSIX and on Windows when the two names are
+    in one directory, and it replaces an existing file on both.  On Windows
+    it fails while another process holds the target open (the MCP server
+    reading the manifest); the error goes to the caller.
+
+    The temporary name holds :func:`owner_token`, thus two writers never
+    share one, and :func:`remove_stale_tmp` removes the file of a writer
+    that a kill stopped between the write and the rename.
+    """
+    tmp = path.with_name(f".{path.name}.{owner_token()}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def remove_stale_tmp(directory: Path) -> int:
+    """Remove the temporary files of :func:`write_text_atomic` whose writer stopped.
+
+    Returns the count.  A manifest is tens of MB on a large project, thus a
+    file that a kill left behind is worth removing.  A file of a writer that
+    still runs, or of another host, stays: :func:`owner_is_dead` decides.
+    """
+    removed = 0
+    for tmp in directory.glob(".*.tmp"):
+        match = _TMP_OWNER.search(tmp.name)
+        if match is not None and owner_is_dead(match.group(1)):
+            tmp.unlink(missing_ok=True)
+            removed += 1
+    return removed
+
+
 _ON_WINDOWS = os.name == "nt"
 
 # Windows API values for the liveness probe, from the Win32 documentation.

@@ -730,6 +730,7 @@ def _step_update_manifest(conn: sqlite3.Connection, ctx: dict) -> None:
          scope=ctx.get("scope"),
          reparsed_tus=ctx.get("reparsed_tus"),
          transient_defines=ctx["transient_defines"],
+         flags_hashes=ctx.get("flags_hashes"),
      )
     # Keep whichever manifest is now authoritative so the coverage purge does
     # not have to re-read it.  A no-op run returns None and leaves the
@@ -996,8 +997,12 @@ def _needs_macros(ctx: dict) -> bool:
     again: measured on a Mbed project of 878 units, 104 s in each run that
     changed nothing.  A partial step over the re-parsed units would give
     another last unit, thus the step runs over all units or not at all.
+
+    ``pending_run`` says that an earlier run of the build stored rows and
+    stopped before this step: its units now read as unchanged (the manifest
+    checkpoint), and their values are not in the index (see ``_run_marker``).
     """
-    return bool(ctx.get("updated")) or bool(ctx.get("removed_files"))
+    return bool(ctx.get("updated")) or bool(ctx.get("removed_files")) or bool(ctx.get("pending_run"))
 
 
 def _step_expand_macros(conn: sqlite3.Connection, ctx: dict) -> None:
@@ -1793,6 +1798,8 @@ def _run_postprocess(
     header_hash_cache: dict[str, str] | None = None,
     reparsed_tus: Mapping[str, str] | None = None,
     transient_defines: Collection[str],
+    pending_run: bool = False,
+    flags_hashes: list[str] | None = None,
 ) -> None:
     """Run all post-processing phases via a data-driven pipeline.
 
@@ -1846,6 +1853,10 @@ def _run_postprocess(
         "header_hash_cache": header_hash_cache,
         # TUs re-parsed in this run — only they may refresh their manifest entry.
         "reparsed_tus": reparsed_tus,
+        # An earlier run of this build stopped after it stored rows.
+        "pending_run": pending_run,
+        # The flags hash of each unit, as the decision of the run computed it.
+        "flags_hashes": flags_hashes,
     }
 
     defer_skip: set[str] = set()

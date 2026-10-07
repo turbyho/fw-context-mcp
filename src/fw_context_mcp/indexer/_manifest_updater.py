@@ -22,7 +22,7 @@ that trigger unnecessary background reindexes.
 from __future__ import annotations
 
 import logging
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Mapping, Sequence
 from pathlib import Path
 
 from ..utils import compute_source_hash
@@ -241,6 +241,8 @@ def _update_manifest_after_index(
     scope: list[str] | None = None,
     reparsed_tus: Mapping[str, str] | None = None,
     transient_defines: Collection[str],
+    checkpoint_reached: int | None = None,
+    flags_hashes: Sequence[str] | None = None,
 ) -> dict | None:
     """Update ``manifest.json`` after an indexing run.
 
@@ -283,6 +285,21 @@ def _update_manifest_after_index(
 
     *transient_defines* is ``[index] transient_defines``: the flags hash of
     each new entry and the fallback config_hash use it, as the runner does.
+
+    *checkpoint_reached* makes this a write during the run
+    (``runner._checkpoint_manifest``), so that a run that stops keeps the
+    entries of the units that it parsed.  It is the count of units that the
+    loop of the run reached: a unit at or after that position gets no fresh
+    entry, also when another listing of its file was parsed (a fresh entry
+    would claim the flags of a listing whose rows are not in the index), and
+    keeps its old entry.  A unit without an old entry gets no entry: the end
+    of the run gives it one, and a new entry from the token stream costs a
+    parse of each such unit at each checkpoint.  Without a manifest there is
+    no checkpoint.
+
+    *flags_hashes* holds the flags hash of each unit, in order, as the
+    decision of the run computed it.  Without it each hash is computed
+    here, at 0.65 ms for a unit of 462 arguments (measured).
 
     Returns the updated manifest dict, or ``None`` when no update needed.
     """
@@ -361,11 +378,30 @@ def _update_manifest_after_index(
         }
     arg_sets: list[list[str]] = []
 
-    def _flags_hash(unit) -> str:
+    def _flags_hash(idx: int, unit) -> str:
         """Return the flags hash of *unit*, as each writer of an entry stores it."""
+        if flags_hashes is not None:
+            return flags_hashes[idx]
         if not unit.raw_entry:
             return ""
         return compute_flags_hash(unit.raw_entry, transient_defines=transient_defines)
+
+    def _behind_a_parsed_listing(idx: int, old_entry: dict) -> bool:
+        """Say if a checkpoint carries the entry of a listing whose file the run parsed.
+
+        The index holds ONE set of rows for a file: the rows of the listing
+        that the run parsed last.  A listing at or after *checkpoint_reached*
+        was not parsed yet, and another listing of its file was, thus the
+        rows are not the ones that its old entry describes, also when its
+        own flags and source did not change.  Marked, it is parsed again,
+        and the next run parses each listing of the file.
+        """
+        return (
+            checkpoint_reached is not None
+            and idx >= checkpoint_reached
+            and reparsed_tus is not None
+            and old_entry.get("file", "") in reparsed_tus
+        )
 
     def carry_over(old_entry: dict) -> dict:
         """Re-point a reused entry at THIS manifest's arg_sets table.
@@ -406,7 +442,13 @@ def _update_manifest_after_index(
 
             # Fresh hashes only from TUs that were really re-parsed —
             # see *reparsed_tus* in the docstring.
-            if tu_rel in tu_headers and (reparsed_tus is None or tu_rel in reparsed_tus):
+            reached = checkpoint_reached is None or idx < checkpoint_reached
+            if reached and tu_rel in tu_headers and (reparsed_tus is None or tu_rel in reparsed_tus):
+                # The fresh entry replaces the old entry of the same flags:
+                # take it, so that a later listing of the file does not get
+                # it (A, B parsed up to A gives A fresh and B old, not A, A).
+                if tu_rel in old_entries:
+                    old_entries.take(tu_rel, _flags_hash(idx, unit))
                 source_hash = (
                     reparsed_tus[tu_rel] if reparsed_tus is not None
                     else compute_source_hash(unit.file.resolve())
@@ -417,12 +459,14 @@ def _update_manifest_after_index(
                     "arg_set": _intern_arguments(unit.clang_args, arg_sets),
                     "source_hash": source_hash,
                     "headers": fold_headers(tu_headers[tu_rel], header_table),
-                    "flags_hash": _flags_hash(unit),
+                    "flags_hash": _flags_hash(idx, unit),
                 }
                 updated += 1
             elif tu_rel in old_entries:
-                carried.append((idx, old_entries.take(tu_rel, _flags_hash(unit))))
+                carried.append((idx, old_entries.take(tu_rel, _flags_hash(idx, unit))))
                 reused += 1
+            elif checkpoint_reached is not None:
+                continue
             else:
                 headers = _collect_headers_from_tokens(
                     unit, project_root, build_dir_patterns, header_table
@@ -434,7 +478,7 @@ def _update_manifest_after_index(
                     "arg_set": _intern_arguments(unit.clang_args, arg_sets),
                     "source_hash": source_hash,
                     "headers": headers,
-                    "flags_hash": _flags_hash(unit),
+                    "flags_hash": _flags_hash(idx, unit),
                 }
                 updated += 1
 
@@ -442,7 +486,9 @@ def _update_manifest_after_index(
         flagged = 0
         for idx, old_entry in carried:
             entry = carry_over(old_entry)
-            if _headers_moved_on(old_entry, old_header_table, header_table):
+            if _headers_moved_on(old_entry, old_header_table, header_table) or _behind_a_parsed_listing(
+                idx, old_entry,
+            ):
                 entry["needs_reparse"] = True
                 flagged += 1
             entry_slots[idx] = entry
@@ -453,6 +499,8 @@ def _update_manifest_after_index(
             updated, reused, flagged,
         )
     elif manifest is None:
+        if checkpoint_reached is not None:
+            return None
         # No manifest and no tu_headers — full rebuild via libclang (slow)
         log.info("Generating manifest.json from %d TUs...", len(units))
         gen_hash = generate_manifest(
@@ -477,7 +525,7 @@ def _update_manifest_after_index(
                 tu_rel = str(unit.file.resolve())
 
             if tu_rel in old_entries:
-                carried.append((idx, old_entries.take(tu_rel, _flags_hash(unit))))
+                carried.append((idx, old_entries.take(tu_rel, _flags_hash(idx, unit))))
                 reused += 1
             else:
                 headers = _collect_headers_from_tokens(
@@ -490,7 +538,7 @@ def _update_manifest_after_index(
                     "arg_set": _intern_arguments(unit.clang_args, arg_sets),
                     "source_hash": source_hash,
                     "headers": headers,
-                    "flags_hash": _flags_hash(unit),
+                    "flags_hash": _flags_hash(idx, unit),
                 }
                 updated += 1
 
@@ -536,6 +584,15 @@ def _update_manifest_after_index(
     # Preserve macros from old manifest
     if manifest and manifest.get("macros"):
         manifest_data["macros"] = manifest["macros"]
+    # The suffixes that this build touches, as generate() and
+    # build_preliminary() store them.  An update wrote the manifest without
+    # them, thus load_tu_extensions() gave None after every incremental run,
+    # and the readers fell back to the compiler rules.
+    from .manifest import derive_extension_sets
+
+    tu_exts, header_exts = derive_extension_sets(compile_commands, header_table)
+    manifest_data["tu_extensions"] = tu_exts
+    manifest_data["header_extensions"] = header_exts
     if not config_hash:
         from fw_context_mcp.config.settings import derive_project_id as _derive_id
 

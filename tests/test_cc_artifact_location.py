@@ -78,3 +78,22 @@ def test_the_cleanup_reads_the_directory_that_db_delete_reads(tmp_path: Path):
     # which is the database directory of the project.
     (tmp_path / f"compile_commands.{OLD}.json").write_text("{}", encoding="utf-8")
     assert _cleanup_orphaned_cc_artifacts(tmp_path / "index.db", "pid") == 1
+
+
+def test_the_run_marker_of_a_build_that_is_gone_is_removed(tmp_path: Path):
+    """The marker of a stopped run belongs to its build, and goes with it."""
+    from fw_context_mcp.indexer import _run_marker
+
+    conn = open_db(tmp_path / "index.db")
+    try:
+        with transaction(conn):
+            upsert_project(conn, "pid", "p", str(tmp_path))
+            upsert_build_config(conn, NEW, "pid", "b.json")
+    finally:
+        conn.close()
+    _run_marker.mark_pending(tmp_path, OLD)
+    _run_marker.mark_pending(tmp_path, NEW)
+
+    assert _cleanup_orphaned_cc_artifacts(tmp_path / "index.db", "pid") == 1
+    assert not _run_marker.is_pending(tmp_path, OLD)
+    assert _run_marker.is_pending(tmp_path, NEW)

@@ -23,7 +23,8 @@ import httpx
 
 from ..config.settings import DESCRIPTION_VERSION
 from ..llm.embedder_factory import get_embedder
-from ..utils import SAFE_EXCEPT, is_fatal
+from ..utils import SAFE_EXCEPT, is_fatal, remove_stale_tmp
+from . import _run_marker
 from .db import open_db
 from .db._embeddings import _vec_to_blob
 
@@ -176,7 +177,9 @@ def _cleanup_orphaned_cc_artifacts(db_path: Path, project_id: str) -> int:
     :func:`compute_config_hash` as debug artifacts and can become orphaned
     when ``fw-context index`` is interrupted before the end-of-run cleanup.
     ``linker_pass.<hash>.json`` files are the state of the linker script
-    pass (``_linker_pass.state_path``).  A build that ``fw-context db
+    pass (``_linker_pass.state_path``), and ``index_run.<hash>.pending`` the
+    marker of a run that stopped (``_run_marker``).  A temporary file
+    of a writer that stopped goes too (``utils.remove_stale_tmp``).  A build that ``fw-context db
     delete`` removes, and a database that ``reset_index`` deletes, leave
     theirs.  Call this at the START of a new index run so orphans from a
     previous crashed run are cleaned up immediately.
@@ -211,9 +214,12 @@ def _cleanup_orphaned_cc_artifacts(db_path: Path, project_id: str) -> int:
         if not f.is_file():
             continue
         name = f.name
-        if not name.endswith(".json"):
+        marker_hash = _run_marker.config_hash_of(name)
+        if marker_hash is not None:
+            hash_part = marker_hash
+        elif not name.endswith(".json"):
             continue
-        if name.startswith("compile_commands."):
+        elif name.startswith("compile_commands."):
             # Extract hash from filename: compile_commands.<64-char-hex>.json
             hash_part = name[len("compile_commands."): -len(".json")]
             if len(hash_part) != 64 or not all(c in "0123456789abcdef" for c in hash_part):
@@ -231,6 +237,7 @@ def _cleanup_orphaned_cc_artifacts(db_path: Path, project_id: str) -> int:
                 pass
 
     deleted += _remove_nested_cc_artifacts(cc_dir / project_id)
+    deleted += remove_stale_tmp(cc_dir)
 
     if deleted:
         log.info("Cleaned up %d orphaned per-build artifacts in %s", deleted, cc_dir)
