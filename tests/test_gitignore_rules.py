@@ -118,6 +118,214 @@ def test_a_dry_run_writes_nothing(tmp_path):
     assert gitignore.read_text(encoding="utf-8") == ".fw-context/\n"
 
 
+# ── One fw-context block ───────────────────────────────────────────────
+
+#: A .gitignore that an earlier fw-context wrote, with the block of another
+#: tool after it.  The blanket line hides config.toml.
+EARLIER = [
+    ".pio",
+    ".fw-context/",
+    "",
+    "# fw-context",
+    "compile_commands.json",
+    ".fw-context/local.toml",
+    "",
+    "# lean-ctx writes its rules into this file. It stays on disk, out of git.",
+    "LEAN-CTX.md",
+]
+
+
+def _block(lines: list[str]) -> list[str]:
+    """Return the lines of the first fw-context block, its header included."""
+    start = lines.index("# fw-context")
+    end = start + 1
+    while end < len(lines) and lines[end].strip() and not lines[end].startswith("#"):
+        end += 1
+    return lines[start:end]
+
+
+def test_new_entries_go_into_the_existing_block(tmp_path):
+    """init appended a second ``# fw-context`` block after the block of another tool."""
+    gitignore = tmp_path / ".gitignore"
+    gitignore.write_text("\n".join(EARLIER) + "\n", encoding="utf-8")
+    _ensure_gitignore(tmp_path, fix=True)
+    lines = gitignore.read_text(encoding="utf-8").splitlines()
+
+    assert lines.count("# fw-context") == 1
+    assert _block(lines) == [
+        "# fw-context", "compile_commands.json", ".fw-context/local.toml", EXCLUDE, NEGATION,
+    ]
+    # The new negation would go above LEAN-CTX.md, a pattern, at the end of
+    # the first block: the block moves to the end of the file instead.
+    lean = lines.index(EARLIER[-2])
+    assert lines[lean : lean + 2] == EARLIER[-2:], "the block of the other tool stays as it is"
+    assert lines[-1] == NEGATION
+
+
+def test_two_blocks_become_one(tmp_path):
+    """The file that the defect wrote: the next init joins the two blocks."""
+    gitignore = tmp_path / ".gitignore"
+    split = [line for line in EARLIER if line != ".fw-context/"] + ["", "# fw-context", EXCLUDE, NEGATION]
+    gitignore.write_text("\n".join(split) + "\n", encoding="utf-8")
+    _ensure_gitignore(tmp_path, fix=True)
+    lines = gitignore.read_text(encoding="utf-8").splitlines()
+
+    assert lines.count("# fw-context") == 1
+    assert _block(lines) == [
+        "# fw-context", "compile_commands.json", ".fw-context/local.toml", EXCLUDE, NEGATION,
+    ]
+    # The negation would move up past LEAN-CTX.md, a pattern: the join goes
+    # into the last block instead, and the first one moves down.
+    lean = lines.index(EARLIER[-2])
+    assert lines[lean + 1] == "LEAN-CTX.md"
+    assert lines[-1] == NEGATION
+    assert "" not in lines[lean + 2 : lines.index("# fw-context")][1:], "one blank line before the block"
+    assert lines[: lines.index(EARLIER[-2])].count("") == 1, "no blank line stays where the first block was"
+
+    before = gitignore.read_text(encoding="utf-8")
+    _ensure_gitignore(tmp_path, fix=True)
+    assert gitignore.read_text(encoding="utf-8") == before
+
+
+def test_a_file_without_a_block_gets_one_at_the_end(tmp_path):
+    gitignore = tmp_path / ".gitignore"
+    gitignore.write_text("*.pyc\n\n", encoding="utf-8")
+    _ensure_gitignore(tmp_path, fix=True)
+    assert gitignore.read_text(encoding="utf-8") == (
+        f"*.pyc\n\n# fw-context\ncompile_commands.json\n{EXCLUDE}\n{NEGATION}\n"
+    ), "one blank line before the block, not two"
+
+
+def _git_ignores(root, relative: str) -> bool:
+    result = subprocess.run(  # noqa: S603,S607
+        ["git", "check-ignore", "-q", relative], cwd=root, check=False
+    )
+    return result.returncode == 0
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
+def test_the_join_keeps_the_pair_in_order(tmp_path):
+    """The negation of a later block moved before an exclude outside the blocks.
+
+    Measured before the fix: git then ignored config.toml until a second run.
+    """
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)  # noqa: S603,S607
+    (tmp_path / ".fw-context").mkdir()
+    (tmp_path / ".fw-context" / "config.toml").write_text("", encoding="utf-8")
+    gitignore = tmp_path / ".gitignore"
+    gitignore.write_text(
+        "\n".join(["# fw-context", "compile_commands.json", "", "# tools", EXCLUDE, "# fw-context", NEGATION]) + "\n",
+        encoding="utf-8",
+    )
+    _ensure_gitignore(tmp_path, fix=True)
+    lines = gitignore.read_text(encoding="utf-8").splitlines()
+
+    assert not _git_ignores(tmp_path, ".fw-context/config.toml")
+    assert lines.count("# fw-context") == 1
+    assert lines.index(EXCLUDE) < lines.index(NEGATION)
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
+def test_a_join_that_changes_what_git_ignores_does_not_happen(tmp_path, capsys):
+    """A user negation between the blocks: a move across it changes the answer of git."""
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)  # noqa: S603,S607
+    (tmp_path / "tools").mkdir()
+    (tmp_path / "tools" / "compile_commands.json").write_text("", encoding="utf-8")
+    (tmp_path / "keep.o").write_text("", encoding="utf-8")
+    raw = [
+        "# fw-context", EXCLUDE, NEGATION, "", "!tools/compile_commands.json", "*.o",
+        "", "# fw-context", "compile_commands.json", "", "!keep.o",
+    ]
+    gitignore = tmp_path / ".gitignore"
+    gitignore.write_text("\n".join(raw) + "\n", encoding="utf-8")
+    before = {path: _git_ignores(tmp_path, path) for path in ("tools/compile_commands.json", "keep.o")}
+
+    _ensure_gitignore(tmp_path, fix=True)
+
+    assert {path: _git_ignores(tmp_path, path) for path in before} == before
+    assert "[warn]" in capsys.readouterr().out
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
+def test_a_new_entry_does_not_go_before_a_later_line_of_the_other_polarity(tmp_path):
+    """The pair went to the end of the block, before a later ``*.toml`` of another tool.
+
+    The earlier code wrote new entries at the end of the file, after it, and
+    git saw config.toml.  At the end of the block, git ignored it.
+    """
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)  # noqa: S603,S607
+    (tmp_path / ".fw-context").mkdir()
+    (tmp_path / ".fw-context" / "config.toml").write_text("", encoding="utf-8")
+    gitignore = tmp_path / ".gitignore"
+    gitignore.write_text(
+        "\n".join(["# fw-context", ".fw-context/", "compile_commands.json", "", "# other tool", "*.toml"]) + "\n",
+        encoding="utf-8",
+    )
+    _ensure_gitignore(tmp_path, fix=True)
+    lines = gitignore.read_text(encoding="utf-8").splitlines()
+
+    assert not _git_ignores(tmp_path, ".fw-context/config.toml")
+    assert lines.count("# fw-context") == 1
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
+def test_a_repeated_entry_keeps_its_last_place(tmp_path):
+    """The first copy of X, !X, X stayed, and git then stopped to ignore X."""
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)  # noqa: S603,S607
+    (tmp_path / "LEAN-CTX.md").write_text("", encoding="utf-8")
+    gitignore = tmp_path / ".gitignore"
+    gitignore.write_text(
+        "\n".join(["# fw-context", "# fw-context", "LEAN-CTX.md", "!LEAN-CTX.md", "LEAN-CTX.md", EXCLUDE, NEGATION])
+        + "\n",
+        encoding="utf-8",
+    )
+    assert _git_ignores(tmp_path, "LEAN-CTX.md")
+    _ensure_gitignore(tmp_path, fix=True)
+    assert _git_ignores(tmp_path, "LEAN-CTX.md")
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
+def test_lines_that_git_reads_as_different_stay_different(tmp_path):
+    """``keep.o`` and ``keep.o<TAB>`` are two patterns for git; strip() made them one."""
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)  # noqa: S603,S607
+    (tmp_path / "keep.o").write_text("", encoding="utf-8")
+    gitignore = tmp_path / ".gitignore"
+    gitignore.write_text(
+        "\n".join(["# fw-context", "keep.o", EXCLUDE, NEGATION, "", "# fw-context", "keep.o\t"]) + "\n",
+        encoding="utf-8",
+    )
+    assert _git_ignores(tmp_path, "keep.o")
+    _ensure_gitignore(tmp_path, fix=True)
+    assert _git_ignores(tmp_path, "keep.o")
+
+
+def test_a_line_is_split_only_at_a_newline(tmp_path):
+    """git splits a .gitignore at "\\n" only; a form feed is part of a pattern."""
+    gitignore = tmp_path / ".gitignore"
+    gitignore.write_bytes(b"pat\x0cx\n")
+    _ensure_gitignore(tmp_path, fix=True)
+    assert gitignore.read_bytes().startswith(b"pat\x0cx\n")
+
+
+def test_mixed_line_ends_stay_as_they_are(tmp_path):
+    gitignore = tmp_path / ".gitignore"
+    gitignore.write_bytes(b"a\nb\r\nc\n")
+    _ensure_gitignore(tmp_path, fix=True)
+    data = gitignore.read_bytes()
+    assert data.startswith(b"a\nb\r\nc\n")
+    assert b"\r" not in data[len(b"a\nb\r\nc\n"):], "the new lines take the line end of most lines"
+
+
+def test_a_crlf_file_stays_crlf(tmp_path):
+    """The earlier code appended to the file, thus the other lines kept their CRLF."""
+    gitignore = tmp_path / ".gitignore"
+    gitignore.write_bytes(b"*.pyc\r\n.fw-context/\r\n")
+    _ensure_gitignore(tmp_path, fix=True)
+    data = gitignore.read_bytes()
+    assert data.count(b"\r\n") == data.count(b"\n")
+    assert b"*.pyc\r\n" in data
+
+
 # ── What git actually does ─────────────────────────────────────────────
 
 

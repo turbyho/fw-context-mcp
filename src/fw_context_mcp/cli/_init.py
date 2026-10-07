@@ -998,12 +998,209 @@ def plan_gitignore(
     return kept, removed, append
 
 
+#: The comment line that starts the block of the entries that fw-context writes.
+FW_CONTEXT_BLOCK_HEADER = "# fw-context"
+
+
+def _git_key(line: str) -> str:
+    """Return *line* as git reads it: without its ``"\\r"`` and its trailing spaces.
+
+    Git keeps a leading space and a tab, thus ``" !x"`` is a pattern and
+    ``"x\\t"`` is not ``"x"``.  ``str.strip()`` removed both, and a join
+    then took two different lines for one and kept the wrong one.
+    """
+    return line.rstrip("\r").rstrip(" ")
+
+
+def _block_ranges(lines: list[str]) -> list[tuple[int, int]]:
+    """Return ``(start, end)`` of each fw-context block in *lines*.
+
+    A block is the header line and the lines that follow it up to the first
+    blank line or comment, as a person reads the groups of a ``.gitignore``.
+    *end* is the index after the last line of the block.
+    """
+    ranges: list[tuple[int, int]] = []
+    index = 0
+    while index < len(lines):
+        if _git_key(lines[index]) != FW_CONTEXT_BLOCK_HEADER:
+            index += 1
+            continue
+        end = index + 1
+        while end < len(lines) and _git_key(lines[end]) and not _git_key(lines[end]).startswith("#"):
+            end += 1
+        ranges.append((index, end))
+        index = end
+    return ranges
+
+
+def _polarity(line: str) -> str | None:
+    """Return ``"!"`` for a negation, ``"+"`` for a pattern, None for a blank line or a comment."""
+    text = _git_key(line)
+    if not text or text.startswith("#"):
+        return None
+    return "!" if text.startswith("!") else "+"
+
+
+def _move_conflicts(
+    kept: list[str], ranges: list[tuple[int, int]], append: list[str], target: int | None
+) -> list[str]:
+    """Return the lines that make a join into *target* change what git ignores.
+
+    *target* is the number of the block that takes the entries, or None for
+    a new block at the end of the file.
+
+    In a ``.gitignore`` the last line that matches a path decides, thus the
+    order matters only between a pattern and a negation.  A join moves the
+    lines of each other block to *target*: a line of a block before it moves
+    down, a line of a block after it moves up.  A new entry moves too: its
+    place was the end of the file, where the earlier code wrote it, and the
+    end of the block is above the lines that follow the block.  A move is
+    safe when no line that it passes has the other polarity.  The lines of
+    the blocks keep their order among themselves, thus only the lines
+    outside the blocks can conflict.
+    """
+    in_blocks = {index for start, end in ranges for index in range(start, end)}
+    target_start, target_end = ranges[target] if target is not None else (len(kept), len(kept))
+    conflicts: list[str] = []
+
+    def check(moved_lines: list[str], low: int, high: int) -> None:
+        moved = {_polarity(line) for line in moved_lines} - {None}
+        for index in range(low, high):
+            polarity = _polarity(kept[index])
+            if index in in_blocks or polarity is None or kept[index] in conflicts:
+                continue
+            if any(polarity != other for other in moved):
+                conflicts.append(kept[index])
+
+    for number, (start, end) in enumerate(ranges):
+        if number == target:
+            continue
+        if end <= target_start:
+            check(kept[start + 1 : end], end, target_start)
+        else:
+            check(kept[start + 1 : end], target_end, start)
+    check(append, target_end, len(kept))
+    return conflicts
+
+
+def _join_into(
+    kept: list[str], ranges: list[tuple[int, int]], target: int | None, append: list[str], eol: str
+) -> list[str]:
+    """Join every block into *target*, and add *append* at its end.
+
+    *target* is the number of a block, or None for a new block at the end
+    of the file, after one blank line.
+
+    The entries keep the order of the file, and a repeated entry stays
+    once: at its LAST place.  The last line that matches a path decides,
+    thus an earlier copy of a line never decides and can go.  To keep the
+    first copy instead moved the line up, and in ``X``, ``!X``, ``X`` git
+    then stopped to ignore ``X`` (measured with a property probe).
+
+    A block that goes takes one blank line beside it with it, thus no
+    double blank line stays where it was.
+    """
+    block_lines = [line for start, end in ranges for line in kept[start + 1 : end]]
+    last = {_git_key(line): index for index, line in enumerate(block_lines)}
+    entries = [line for index, line in enumerate(block_lines) if last[_git_key(line)] == index]
+    entries.extend(entry + eol for entry in append if entry not in last)
+
+    drop: set[int] = set()
+    for number, (start, end) in enumerate(ranges):
+        if number == target:
+            continue
+        drop.update(range(start, end))
+        # The blank line before the block, or after it when the block opens
+        # the file.  A blank line after a block in the middle of the file
+        # separates the lines around the block, and stays.
+        if start > 0 and not kept[start - 1].strip() and start - 1 not in drop:
+            drop.add(start - 1)
+        elif start == 0 and end < len(kept) and not kept[end].strip():
+            drop.add(end)
+
+    if target is None:
+        rest = [line for index, line in enumerate(kept) if index not in drop]
+        while rest and not rest[-1].strip():
+            rest.pop()
+        header = kept[ranges[0][0]] if ranges else FW_CONTEXT_BLOCK_HEADER + eol
+        return [*rest, *([eol] if rest else []), header, *entries]
+
+    target_start, target_end = ranges[target]
+    lines: list[str] = []
+    for index, line in enumerate(kept):
+        if index == target_start:
+            lines.append(line)
+            lines.extend(entries)
+        elif target_start < index < target_end or index in drop:
+            continue
+        else:
+            lines.append(line)
+    while lines and not lines[-1].strip() and kept and kept[-1].strip():
+        lines.pop()
+    return lines
+
+
+def assemble_gitignore(
+    kept: list[str], append: list[str], eol: str = ""
+) -> tuple[list[str], list[str]]:
+    """Return the lines of the ``.gitignore`` with one fw-context block, and the conflicts.
+
+    Pure, as ``plan_gitignore``.  *kept* and *append* are its answer.
+    *eol* is ``"\\r"`` when the new lines must end in CRLF: each line of
+    *kept* keeps its own ``"\\r"``.
+
+    ``init`` wrote each run of new entries as a new block at the end of the
+    file.  Another tool can append its own block between two runs (lean-ctx
+    does), thus a second ``# fw-context`` block came after it, and the
+    entries of fw-context were in two places.  Now:
+
+    * Without a block, the entries go into a new block at the end, after
+      one blank line.
+    * With blocks, every block and the new entries join into the first
+      block, or else the last block, or else a new block at the end of the
+      file: the first of the three that does not change what git ignores
+      (see ``_move_conflicts``).  Two moves did, and both are measured with
+      git: a negation of a later block that moved up past the exclude of
+      ``FW_CONTEXT_IGNORE_PAIR``, and the pair at the end of a block above a
+      ``*.toml`` of another tool.  Git ignored ``config.toml`` in the two.
+    * When no join is safe, the blocks stay apart, the new entries go into
+      a new block at the end, as the earlier code wrote them, and the second
+      value names the lines that stop the join.
+
+    A single block without new entries stays as it is.  No line outside a
+    block changes.
+    """
+    ranges = _block_ranges(kept)
+    if not append and len(ranges) <= 1:
+        return list(kept), []
+
+    candidates = [*dict.fromkeys((0, len(ranges) - 1)), None] if ranges else [None]
+    for target in candidates:
+        if not _move_conflicts(kept, ranges, append, target):
+            return _join_into(kept, ranges, target, append, eol), []
+
+    rest = list(kept)
+    if append:
+        while rest and not rest[-1].strip():
+            rest.pop()
+        rest = [*rest, *([eol] if rest else []), FW_CONTEXT_BLOCK_HEADER + eol, *(entry + eol for entry in append)]
+    return rest, _move_conflicts(kept, ranges, [], None)
+
+
 def _ensure_gitignore(project_root: Path, *, fix: bool = False, build_system: str | None = None) -> None:
     """Make git ignore the fw-context artifacts, but keep ``config.toml``.
 
-    ``plan_gitignore`` holds the rules and the reasons for them.  This
-    function reads the file, reports the plan, and — with *fix* — writes
-    it.  It is idempotent: more runs add no duplicates.
+    ``plan_gitignore`` holds the rules and the reasons for them, and
+    ``assemble_gitignore`` puts the entries into one block.  This function
+    reads the file, reports the plan, and — with *fix* — writes it.  It is
+    idempotent: more runs add no duplicates and no second block.
+
+    The file keeps its line ends.  The earlier code appended to the file,
+    and a rewrite must not change the other lines: each line keeps its own
+    ``"\\r"``, and a new line takes the line end of most lines.  The lines
+    are split at ``"\\n"`` only, as git splits them; ``str.splitlines()``
+    also splits at a form feed and at a lone ``"\\r"``, and a rewrite then
+    broke such a line in two.
 
     Args:
         project_root: Directory that holds the ``.gitignore``.
@@ -1012,12 +1209,29 @@ def _ensure_gitignore(project_root: Path, *, fix: bool = False, build_system: st
     """
     gitignore = project_root / ".gitignore"
     try:
-        raw = gitignore.read_text(encoding="utf-8").splitlines() if gitignore.exists() else []
+        # Bytes, not read_text(): read_text() turns "\r\n" into "\n", and
+        # the line end of the file is then lost.
+        text = gitignore.read_bytes().decode("utf-8") if gitignore.exists() else ""
     except (OSError, PermissionError):
         return
+    except UnicodeDecodeError:
+        # A rewrite would change bytes that this function cannot read.
+        print(f"  [warn] {gitignore}: not UTF-8, left as it is — add {', '.join(FW_CONTEXT_IGNORE_PAIR)} by hand")
+        return
+    raw = text.split("\n")
+    if raw[-1] == "":
+        raw.pop()
+    crlf = sum(1 for line in raw if line.endswith("\r"))
+    eol = "\r" if crlf > len(raw) - crlf else ""
 
     kept, removed, append = plan_gitignore(raw, build_system)
-    if not append and not removed:
+    lines, conflicts = assemble_gitignore(kept, append, eol)
+    if conflicts:
+        print(
+            f"  [warn] {gitignore}: the {FW_CONTEXT_BLOCK_HEADER!r} blocks stay apart — a join moves a line "
+            f"past {', '.join(line.strip() for line in conflicts)} and changes what git ignores"
+        )
+    if lines == raw:
         print(f"  [ok] {gitignore}")
         return
 
@@ -1027,31 +1241,13 @@ def _ensure_gitignore(project_root: Path, *, fix: bool = False, build_system: st
     if append:
         word = "missing entries:" if not fix else "added"
         print(f"  {mark} {gitignore}: {word} {', '.join(append)}")
+    if len(_block_ranges(kept)) > 1 and not conflicts:
+        word = "would join" if not fix else "joined"
+        print(f"  {mark} {gitignore}: {word} the {FW_CONTEXT_BLOCK_HEADER!r} blocks into one")
     if not fix:
         return
 
     try:
-        _write_gitignore(gitignore, kept if removed else None, append)
+        gitignore.write_text("\n".join(lines) + "\n" if lines else "", encoding="utf-8", newline="")
     except (OSError, PermissionError) as e:
         logging.getLogger(__name__).warning("Could not update %s: %s", gitignore, e)
-
-
-def _write_gitignore(gitignore: Path, kept: list[str] | None, append: list[str]) -> None:
-    """Write the planned ``.gitignore``.
-
-    Args:
-        gitignore: File to write.
-        kept: Lines to keep, when a line was removed and the file needs a
-            rewrite.  ``None`` leaves the current content in place.
-        append: Entries to write at the end, under one comment.
-    """
-    if kept is not None:
-        gitignore.write_text("\n".join(kept) + "\n" if kept else "", encoding="utf-8")
-    if not append:
-        return
-    with gitignore.open("a", encoding="utf-8") as f:
-        if gitignore.stat().st_size > 0:
-            f.write("\n")
-        f.write("# fw-context\n")
-        for entry in append:
-            f.write(f"{entry}\n")
