@@ -819,9 +819,9 @@ def get_active_build(
         # any command: the index is right and THIS PROCESS is the old reader,
         # thus the indexer writes the same new format again.  See the warning
         # that `row_format_newer` builds below.
-        stored_row_format = str(cfg.get("row_format") or "")
-        row_format_old = row_format_is_older(stored_row_format)
-        row_format_newer = row_format_is_newer(stored_row_format)
+        stored_format = stored_row_format(cfg)
+        row_format_old = row_format_is_older(stored_format)
+        row_format_newer = row_format_is_newer(stored_format)
 
         # A source file that the build system never saw has no translation
         # unit, thus a plain reindex cannot pick it up: it is absent from
@@ -983,8 +983,8 @@ def get_active_build(
             # by the gap — the faults of the generations are opposite, thus
             # one fixed sentence would be false for every gap but one.
             reindex_reasons.append(
-                f"row_format_mismatch: {stored_row_format or '(none)'} != "
-                f"{CURRENT_ROW_FORMAT} — {row_format_effect(stored_row_format)}. "
+                f"row_format_mismatch: {stored_format or '(none)'} != "
+                f"{CURRENT_ROW_FORMAT} — {row_format_effect(stored_format)}. "
                 f"Run `fw-context index`"
             )
         # A missing database of a build of fw-context is the missing build,
@@ -1172,8 +1172,8 @@ def get_active_build(
         if row_format_newer:
             client_restart_reason = (
                 f"This session reads row format {CURRENT_ROW_FORMAT} and the index holds "
-                f"{stored_row_format}. The index is the newer one and it is correct — do "
-                f"NOT reindex, because the indexer writes {stored_row_format} again and "
+                f"{stored_format}. The index is the newer one and it is correct — do "
+                f"NOT reindex, because the indexer writes {stored_format} again and "
                 f"this message comes back. This server process runs older code. Tell the "
                 f"operator to restart the LLM client (Claude Code, opencode, or the client "
                 f"in use). The MCP server is a child process of that client, thus nobody "
@@ -1181,7 +1181,7 @@ def get_active_build(
             )
             index_message = (
                 f"Restart the LLM client — this session reads row format "
-                f"{CURRENT_ROW_FORMAT} and the index holds {stored_row_format}. "
+                f"{CURRENT_ROW_FORMAT} and the index holds {stored_format}. "
                 f"Queries work meanwhile. {index_message}"
             )
 

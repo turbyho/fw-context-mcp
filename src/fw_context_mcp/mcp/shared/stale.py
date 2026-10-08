@@ -126,9 +126,10 @@ def check_structural_staleness(
     # of files.content and symbols.source became ifdef-filtered, and the
     # schema version above could not see it, thus an index went on answering
     # with dead code.  One column read, no recomputation.
-    # .get() and not [...]: a caller builds *cfg* with SELECT *, thus the
-    # key is there for any database that open_db() migrated.  An absent key
-    # reads as "no format", which asks for the reindex — the safe direction.
+    # stored_row_format and not cfg["row_format"]: a caller builds *cfg*
+    # with SELECT *, thus the key is there for any database that open_db()
+    # migrated.  An absent key reads as "no format", which asks for the
+    # reindex — the safe direction.
     #
     # Only an OLDER format belongs here, and the test is therefore an
     # ordinal one and not a plain inequality.  A NEWER format means that the
@@ -139,7 +140,7 @@ def check_structural_staleness(
     # index nothing was wrong with.  `get_active_build` reports that
     # direction as a warning instead, because the repair is a restart of the
     # LLM client and not a command against the index.
-    stored_format = str(cfg.get("row_format") or "")
+    stored_format = stored_row_format(cfg)
     if row_format_is_older(stored_format):
         reasons.append(
             f"row format {stored_format or '(none)'} != {CURRENT_ROW_FORMAT}"
