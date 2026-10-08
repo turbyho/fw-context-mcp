@@ -1,12 +1,17 @@
-"""``list_projects`` must read the row format, as ``get_active_build`` does.
+"""``list_projects`` must ask for a reindex where ``get_active_build`` does.
 
-``build_configs.row_format`` records which meaning the stored text carries.
-``get_active_build`` and the daemon ask for a reindex when that format is
-older than the format of this version.  ``list_projects`` read only the
-schema version and the mtime of compile_commands.json, thus it reported
-"ready" for the same index.  Measured on a real project after a bump to
-``fw-context-rows/5``: ``get_active_build`` gave ``reindex_needed`` and
-``list_projects`` gave ``ready``, from one server process.
+Two gaps made the two tools disagree over one index:
+
+- The row format.  ``build_configs.row_format`` records which meaning the
+  stored text carries.  ``get_active_build`` and the daemon ask for a
+  reindex when that format is older than the format of this version.
+  ``list_projects`` did not read it.  Measured on a real project after a
+  bump to ``fw-context-rows/5``: ``get_active_build`` gave
+  ``reindex_needed`` and ``list_projects`` gave ``ready``, from one server
+  process.
+- The other builds.  ``list_projects`` read only the newest build of a
+  project.  ``get_active_build`` reads each ``(variant, image)`` build,
+  because the builds of one project are not always indexed together.
 """
 
 from __future__ import annotations
@@ -129,16 +134,41 @@ def test_an_older_format_of_another_build_needs_a_reindex(tmp_path: Path) -> Non
     alone, thus a check of that row only reported "ready".
     """
     root, project_id = _project(tmp_path, row_format=CURRENT_ROW_FORMAT)
-    db_path = tmp_path / "index" / project_id / "index.db"
-    conn = open_db(db_path)
+    # Its own database, older than its index: the row format must be the
+    # ONLY stale thing about "boot", or the test passes without the check.
+    _add_old_boot_build(
+        root, project_id, tmp_path, _unchanged_database(root),
+        row_format="fw-context-rows/0",
+    )
+
+    entry = _entry(root, project_id)
+
+    assert entry["indexed_at"] != "2000-01-01 00:00:00", "the fixture must keep the current build newest"
+    assert entry["reindex_needed"] is True
+    assert entry["status"] == "reindex_needed"
+
+
+def _unchanged_database(root: Path) -> Path:
+    """Give a compile_commands.json of "boot" that is older than its index of 2000."""
+    cc_path = root / "boot.json"
+    cc_path.write_text("[]", encoding="utf-8")
+    old = time.time() - 365 * 24 * 3600 * 30
+    os.utime(cc_path, (old, old))
+    return cc_path
+
+
+def _add_old_boot_build(
+    root: Path, project_id: str, tmp_path: Path, cc_path: Path,
+    *, row_format: str = CURRENT_ROW_FORMAT,
+) -> None:
+    """Add a build of the image "boot", older than the newest build."""
+    conn = open_db(tmp_path / "index" / project_id / "index.db")
     try:
         with transaction(conn):
             upsert_build_config(
-                conn, f"hash-boot-{project_id}", project_id,
-                str(root / "compile_commands.json"), image="boot",
-                row_format="fw-context-rows/0",
+                conn, f"hash-boot-{project_id}", project_id, str(cc_path),
+                image="boot", row_format=row_format,
             )
-            # The current build is the newest one.
             conn.execute(
                 "UPDATE build_configs SET created_at='2000-01-01 00:00:00' "
                 "WHERE config_hash=?",
@@ -147,11 +177,43 @@ def test_an_older_format_of_another_build_needs_a_reindex(tmp_path: Path) -> Non
     finally:
         conn.close()
 
+
+def test_a_changed_database_of_another_build_needs_a_reindex(tmp_path: Path) -> None:
+    """The database of "boot" is newer than its index, and the newest build is current."""
+    root, project_id = _project(tmp_path, row_format=CURRENT_ROW_FORMAT)
+    boot_cc = root / "boot.json"
+    boot_cc.write_text("[]", encoding="utf-8")
+    _add_old_boot_build(root, project_id, tmp_path, boot_cc)
+
     entry = _entry(root, project_id)
 
     assert entry["indexed_at"] != "2000-01-01 00:00:00", "the fixture must keep the current build newest"
+    assert entry["reindex_needed"] is True, (
+        "get_active_build asks for a reindex of this build through "
+        "stale_builds, thus list_projects must not report the project as current"
+    )
+    assert entry["status"] == "reindex_needed"
+
+
+def test_a_missing_database_of_another_build_needs_a_reindex(tmp_path: Path) -> None:
+    root, project_id = _project(tmp_path, row_format=CURRENT_ROW_FORMAT)
+    _add_old_boot_build(root, project_id, tmp_path, root / "gone.json")
+
+    entry = _entry(root, project_id)
+
     assert entry["reindex_needed"] is True
     assert entry["status"] == "reindex_needed"
+
+
+def test_current_builds_are_ready(tmp_path: Path) -> None:
+    """The control: the same two builds, each current, ask for nothing."""
+    root, project_id = _project(tmp_path, row_format=CURRENT_ROW_FORMAT)
+    _add_old_boot_build(root, project_id, tmp_path, _unchanged_database(root))
+
+    entry = _entry(root, project_id)
+
+    assert entry["reindex_needed"] is False
+    assert entry["status"] == "ready"
 
 
 def test_a_project_without_a_build_is_not_stale_by_format(tmp_path: Path) -> None:

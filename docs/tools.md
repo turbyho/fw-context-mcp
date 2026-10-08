@@ -2631,10 +2631,13 @@ project.
 these is true:
 
 - The schema of the database is older than the schema of this version.
-- The `compile_commands.json` of the newest build changed after the index.
-- A build of the project holds rows of an older row format. The check reads
-  the newest build of each `(variant, image)`, because the builds of one
-  project are not always indexed together.
+- The `compile_commands.json` of a build changed after the index, or it is
+  missing.
+- A build of the project holds rows of an older row format.
+
+The two build checks read the newest build of each `(variant, image)`, as
+`get_active_build` does, because the builds of one project are not always
+indexed together.
 
 A newer row format does not set it. In that case, this process is the old
 reader, and `get_active_build` asks for a restart of the LLM client.

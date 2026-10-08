@@ -1362,10 +1362,10 @@ def _analysis_message(analysis: dict, analyze_vendor: bool) -> str:
 def _list_status(db_schema_ver: int, cc_stale: bool, row_format_old: bool) -> str:
     """Map schema version, compile-commands staleness and row format to a status label.
 
-    Returns ``"reindex_needed"`` when the DB schema is outdated, when
-    compile_commands.json has changed, or when a build holds text of an
-    older row format.  Returns ``"ready"`` otherwise.  Used by
-    ``list_projects`` to summarize each indexed project.
+    Returns ``"reindex_needed"`` when the DB schema is outdated, when the
+    compile_commands.json of a build changed or is missing, or when a build
+    holds text of an older row format.  Returns ``"ready"`` otherwise.  Used
+    by ``list_projects`` to summarize each indexed project.
 
     WHY the row format is here: the schema version hashes the column set
     alone, thus it does not move when the meaning of the text in a column
@@ -1406,9 +1406,10 @@ def list_projects(
         list of dicts, each with: project_id, name, root_path, build_system,
         symbol_count, file_count, indexed_at (str — UTC), description (str),
         first_indexed_at (str — UTC), schema_version, current_schema,
-        reindex_needed (bool — the schema is outdated,
-        compile_commands.json changed, or a build holds rows of an older
-        row format), status (str — "ready" or "reindex_needed"),
+        reindex_needed (bool — the schema is outdated, the
+        compile_commands.json of a build changed or is missing, or a build
+        holds rows of an older row format; each (variant, image) build
+        counts), status (str — "ready" or "reindex_needed"),
         db (path to SQLite database file),
         variant_count (int — number of build variants),
         image_count (int — number of images),
@@ -1454,34 +1455,32 @@ def list_projects(
                     for row in rows
                     if row["config_hash"]
                 }
-                # Each (variant, image) build, and not only the newest one:
-                # the builds of one project are not always indexed together,
-                # thus one build can hold text of an older format while the
-                # newest is current.  A project with no build has no entry,
-                # and an absent build is not an OLD format.
-                old_format = {
-                    row["project_id"]: any(
-                        row_format_is_older(stored_row_format(build))
-                        for build in latest_builds(conn, row["project_id"])
-                    )
-                    for row in rows
-                }
-                return rows, schema_ver, counts, coverage_map, old_format
+                # The newest build of each (variant, image), the builds that
+                # get_active_build and the daemon check.  The newest build of
+                # the project alone is not enough: the builds of one project
+                # are not always indexed together, thus another build can be
+                # stale while the newest is current.
+                builds = {row["project_id"]: latest_builds(conn, row["project_id"]) for row in rows}
+                return rows, schema_ver, counts, coverage_map, builds
 
-            rows, db_schema_ver, variant_counts, coverage_map, old_format = executor.execute_sync(
+            rows, db_schema_ver, variant_counts, coverage_map, builds = executor.execute_sync(
                 _query, ""
             )
             for r in rows:
-                # Staleness check: compare stored creation time with
-                # compile_commands.json mtime.  Does not require
-                # _wrap_tool — list_projects is informational only.
-                cc_stale = (
-                    _is_stale(
-                        {"created_at": r["created_at"]},
-                        r["compile_commands_path"],
-                    )[0]
-                    if r["compile_commands_path"]
-                    else False
+                project_builds = builds[r["project_id"]]
+                # A changed or missing compile_commands.json of a build: the
+                # check that get_active_build makes, by mtime against the
+                # time of the index.  Does not require _wrap_tool —
+                # list_projects is informational only.
+                cc_stale = any(
+                    _is_stale(build, build["compile_commands_path"])[0]
+                    for build in project_builds
+                    if build["compile_commands_path"]
+                )
+                # A project with no build has no row here, and an absent
+                # build is not an OLD format.
+                row_format_old = any(
+                    row_format_is_older(stored_row_format(build)) for build in project_builds
                 )
                 root = Path(r["root_path"]) if r["root_path"] else None
                 # Report the CONFIGURED build system first — projects without
@@ -1494,7 +1493,7 @@ def list_projects(
                 except Exception:
                     _bs = _detect_build_system(root) if root else "unknown"
                 cov = coverage_map.get(r["config_hash"]) if r["config_hash"] else None
-                status = _list_status(db_schema_ver, cc_stale, old_format[r["project_id"]])
+                status = _list_status(db_schema_ver, cc_stale, row_format_old)
                 results.append(
                     {
                         "project_id": r["project_id"],
