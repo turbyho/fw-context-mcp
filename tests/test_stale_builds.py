@@ -13,6 +13,7 @@ from pathlib import Path
 
 import fw_context_mcp  # noqa: F401  — must precede sqlite3
 from fw_context_mcp.indexer.db import (
+    CURRENT_ROW_FORMAT,
     open_db,
     transaction,
     upsert_build_config,
@@ -23,7 +24,12 @@ from fw_context_mcp.mcp.shared.stale import build_staleness, latest_builds, othe
 
 
 def _index(tmp_path: Path) -> tuple:
-    """An index of two builds of one variant: app (current) and boot (a source changed since)."""
+    """An index of two builds of one variant: app (current) and boot (a source changed since).
+
+    Each build carries ``CURRENT_ROW_FORMAT``, because each stands in for a
+    COMPLETED index run, and the postprocess of a real run writes that stamp.
+    Without it each build reports an old row format.
+    """
     root = tmp_path / "proj"
     root.mkdir()
     conn = open_db(tmp_path / "db" / "index.db")
@@ -34,7 +40,10 @@ def _index(tmp_path: Path) -> tuple:
             cc = root / f"{image}.json"
             cc.write_text("[]", encoding="utf-8")
             os.utime(cc, (old, old))
-            upsert_build_config(conn, f"h-{image}", "pid", str(cc), variant="v", image=image)
+            upsert_build_config(
+                conn, f"h-{image}", "pid", str(cc), variant="v", image=image,
+                row_format=CURRENT_ROW_FORMAT,
+            )
             source = root / f"{image}.c"
             source.write_text("int x;\n", encoding="utf-8")
             upsert_file(conn, f"h-{image}", f"{image}.c", "c", mtime=source.stat().st_mtime)
@@ -72,6 +81,58 @@ def test_a_missing_database_needs_a_reindex(tmp_path):
 
     assert needed is True
     assert reasons[0] == "compile_commands_missing"
+
+
+def _set_row_format(conn, config_hash: str, row_format: str) -> None:
+    with transaction(conn):
+        conn.execute(
+            "UPDATE build_configs SET row_format=? WHERE config_hash=?",
+            (row_format, config_hash),
+        )
+
+
+def test_an_older_row_format_needs_a_reindex(tmp_path):
+    """The builds of one project are not always indexed together.
+
+    One build can thus carry the text of an older version while the build
+    of a plain query is current.  The daemon checks the row format of each
+    build, and get_active_build read it only for its own build.
+    """
+    conn, root = _index(tmp_path)
+    _set_row_format(conn, "h-app", "fw-context-rows/0")
+    app = next(r for r in latest_builds(conn, "pid") if r["image"] == "app")
+
+    needed, reasons = build_staleness(conn, app, root, use_cache=False)
+
+    assert needed is True, "only an index run writes the rows again"
+    assert reasons == [f"row format fw-context-rows/0 != {CURRENT_ROW_FORMAT}"], (
+        "the short form of the daemon: get_active_build joins the reasons "
+        "with ', ', and the sentence of the effect ran into the next reason"
+    )
+
+
+def test_a_newer_row_format_is_no_reason(tmp_path):
+    """A newer format means that this process is the old reader.
+
+    A reindex writes the same newer format again, thus it cannot repair this.
+    """
+    conn, root = _index(tmp_path)
+    _set_row_format(conn, "h-app", "fw-context-rows/999")
+    app = next(r for r in latest_builds(conn, "pid") if r["image"] == "app")
+
+    assert build_staleness(conn, app, root, use_cache=False) == (False, [])
+
+
+def test_the_other_stale_builds_report_an_older_row_format(tmp_path):
+    conn, root = _index(tmp_path)
+    _set_row_format(conn, "h-boot", "fw-context-rows/0")
+
+    stale = other_stale_builds(conn, "pid", root, "h-app", use_cache=False)
+
+    assert len(stale) == 1
+    assert stale[0]["image"] == "boot"
+    assert stale[0]["reindex_needed"] is True
+    assert f"row format fw-context-rows/0 != {CURRENT_ROW_FORMAT}" in stale[0]["reasons"]
 
 
 def test_the_other_stale_builds_leave_out_the_active_one(tmp_path):

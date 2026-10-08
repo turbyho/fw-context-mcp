@@ -83,6 +83,8 @@ from ..shared.stale import (
     _check_header_staleness,
     _count_modified_files,
     find_unindexed_sources,
+    latest_builds,
+    stored_row_format,
 )
 
 log = logging.getLogger(__name__)
@@ -580,8 +582,9 @@ def get_active_build(
         stale_builds is not empty),
         stale_builds (list[dict] — the other (variant, image) builds of the
         project that are stale, each {variant, image, reindex_needed,
-        reasons}; a changed or missing database of a build needs a reindex,
-        modified files and headers make it stale),
+        reasons}; a changed or missing database of a build, or rows of an
+        older row format, need a reindex; modified files and headers make
+        it stale),
         _warning (str, optional — when manifest verification is not "full"),
         vec_available (bool), vec_error (str, optional),
         index_message (str — human-readable summary of index state),
@@ -894,8 +897,10 @@ def get_active_build(
         # Each query names one build, thus a build that a query does not
         # reach without a selector can be stale while this one is current:
         # a change in a file that only the bootloader compiles.  The same
-        # rules as above: a changed or missing database needs a reindex,
-        # modified files and headers make the build stale.
+        # rules as above: a changed or missing database, or rows of an older
+        # row format, need a reindex; modified files and headers make the
+        # build stale.  The builds of one project are not always indexed
+        # together, thus their row formats can differ.
         from ..shared.stale import build_label, other_stale_builds
 
         stale_builds = other_stale_builds(
@@ -1354,14 +1359,20 @@ def _analysis_message(analysis: dict, analyze_vendor: bool) -> str:
     )
 
 
-def _list_status(db_schema_ver: int, cc_stale: bool) -> str:
-    """Map schema version and compile-commands staleness to a status label.
+def _list_status(db_schema_ver: int, cc_stale: bool, row_format_old: bool) -> str:
+    """Map schema version, compile-commands staleness and row format to a status label.
 
-    Returns ``"reindex_needed"`` when either the DB schema is outdated
-    or compile_commands.json has changed.  Returns ``"ready"`` otherwise.
-    Used by ``list_projects`` to summarize each indexed project.
+    Returns ``"reindex_needed"`` when the DB schema is outdated, when
+    compile_commands.json has changed, or when a build holds text of an
+    older row format.  Returns ``"ready"`` otherwise.  Used by
+    ``list_projects`` to summarize each indexed project.
+
+    WHY the row format is here: the schema version hashes the column set
+    alone, thus it does not move when the meaning of the text in a column
+    changes.  Without this check ``list_projects`` reported "ready" over an
+    index for which ``get_active_build`` and the daemon ask for a reindex.
     """
-    needs = (db_schema_ver < CURRENT_SCHEMA_VERSION) or cc_stale
+    needs = (db_schema_ver < CURRENT_SCHEMA_VERSION) or cc_stale or row_format_old
     return "reindex_needed" if needs else "ready"
 
 
@@ -1395,7 +1406,9 @@ def list_projects(
         list of dicts, each with: project_id, name, root_path, build_system,
         symbol_count, file_count, indexed_at (str — UTC), description (str),
         first_indexed_at (str — UTC), schema_version, current_schema,
-        reindex_needed (bool), status (str — "ready" or "reindex_needed"),
+        reindex_needed (bool — the schema is outdated,
+        compile_commands.json changed, or a build holds rows of an older
+        row format), status (str — "ready" or "reindex_needed"),
         db (path to SQLite database file),
         variant_count (int — number of build variants),
         image_count (int — number of images),
@@ -1441,9 +1454,23 @@ def list_projects(
                     for row in rows
                     if row["config_hash"]
                 }
-                return rows, schema_ver, counts, coverage_map
+                # Each (variant, image) build, and not only the newest one:
+                # the builds of one project are not always indexed together,
+                # thus one build can hold text of an older format while the
+                # newest is current.  A project with no build has no entry,
+                # and an absent build is not an OLD format.
+                old_format = {
+                    row["project_id"]: any(
+                        row_format_is_older(stored_row_format(build))
+                        for build in latest_builds(conn, row["project_id"])
+                    )
+                    for row in rows
+                }
+                return rows, schema_ver, counts, coverage_map, old_format
 
-            rows, db_schema_ver, variant_counts, coverage_map = executor.execute_sync(_query, "")
+            rows, db_schema_ver, variant_counts, coverage_map, old_format = executor.execute_sync(
+                _query, ""
+            )
             for r in rows:
                 # Staleness check: compare stored creation time with
                 # compile_commands.json mtime.  Does not require
@@ -1467,6 +1494,7 @@ def list_projects(
                 except Exception:
                     _bs = _detect_build_system(root) if root else "unknown"
                 cov = coverage_map.get(r["config_hash"]) if r["config_hash"] else None
+                status = _list_status(db_schema_ver, cc_stale, old_format[r["project_id"]])
                 results.append(
                     {
                         "project_id": r["project_id"],
@@ -1480,8 +1508,8 @@ def list_projects(
                         "first_indexed_at": r["first_indexed_at"] if "first_indexed_at" in r.keys() else "",
                          "schema_version": db_schema_ver,
                          "current_schema": CURRENT_SCHEMA_VERSION,
-                         "reindex_needed": cc_stale or db_schema_ver < CURRENT_SCHEMA_VERSION,
-                         "status": _list_status(db_schema_ver, cc_stale),
+                         "reindex_needed": status == "reindex_needed",
+                         "status": status,
                          "db": str(db_path),
                          "variant_count": variant_counts.get(r["project_id"], (0, 0))[0],
                          "image_count": variant_counts.get(r["project_id"], (0, 0))[1],

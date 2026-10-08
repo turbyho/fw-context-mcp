@@ -906,6 +906,17 @@ def build_label(row) -> str:
     return "/".join(part for part in (row["variant"] or "", row["image"] or "") if part)
 
 
+def stored_row_format(row) -> str:
+    """Return the row format that a ``build_configs`` row records.
+
+    An absent column or an empty value gives ``""``.  ``row_format_is_older``
+    reads that as an old format, which asks for the reindex — the safe
+    direction: a reindex costs one run, and text of an unknown meaning costs
+    every answer that quotes it.
+    """
+    return str((row["row_format"] if "row_format" in row.keys() else "") or "")
+
+
 def build_staleness(
     conn, row, root: Path, *, use_cache: bool, hash_cache: dict[str, str] | None = None,
 ) -> tuple[bool, list[str]]:
@@ -916,6 +927,8 @@ def build_staleness(
 
     * the database of the build is missing or newer than the index — a
       reindex is necessary (``reindex_needed``);
+    * the rows of the build hold text of an OLDER row format — a reindex is
+      necessary (``reindex_needed``);
     * source files changed since the index — the build is stale, and the
       next query or background run reindexes it;
     * headers changed since the index, for the units that include them.
@@ -924,7 +937,21 @@ def build_staleness(
     holds several builds, and each query names one.  A change in a file that
     only another image compiles left that build stale while get_active_build
     reported a current index.
+
+    WHY the row format is checked for each build: the builds of one project
+    are not always indexed together, thus one build can hold the text of an
+    older version while the others are current.  A NEWER format is no reason
+    here, because a reindex writes that format again: this process is the
+    old reader (see ``row_format_is_newer``).
+
+    WHY the row-format reason is short, with no sentence about its effect:
+    a bump of the format makes every build of a project old at once, and
+    ``get_active_build`` joins the reasons of a build with ", ".  The
+    sentence holds commas and colons, thus it ran into the next reason, and
+    a project of 4 images got it 4 times.  ``get_active_build`` gives the
+    effect for its own build.  The daemon writes the same short form.
     """
+    from ...indexer.db import CURRENT_ROW_FORMAT, row_format_is_older
     from .context import _is_stale
 
     config_hash = row["config_hash"]
@@ -932,6 +959,10 @@ def build_staleness(
     database_stale, why = _is_stale(row, row["compile_commands_path"])
     if database_stale:
         reasons.append(why or "compile_commands_changed")
+    stored_format = stored_row_format(row)
+    row_format_old = row_format_is_older(stored_format)
+    if row_format_old:
+        reasons.append(f"row format {stored_format or '(none)'} != {CURRENT_ROW_FORMAT}")
     modified = _count_modified_files(conn, config_hash, root, use_cache=use_cache, hash_cache=hash_cache)
     if modified:
         reasons.append(f"{modified} modified file(s)")
@@ -941,7 +972,7 @@ def build_staleness(
         )
         if header_tus:
             reasons.append(f"{header_tus} source file(s) with stale header dependencies")
-    return database_stale, reasons
+    return database_stale or row_format_old, reasons
 
 
 def other_stale_builds(

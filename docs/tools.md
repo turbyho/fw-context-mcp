@@ -2401,8 +2401,10 @@ Read the reason text: it names the command.
 another build can be stale while the build of a query without `variant`
 and `image` is current: a change in a file that only the bootloader
 compiles. A changed or missing database of such a build sets
-`reindex_needed`. Modified files and changed headers make it stale, and
-set `stale`.
+`reindex_needed`. Rows of an older row format set it too, because the builds
+of one project are not always indexed together. The reason is then
+`row format <old> != <current>`. Modified files and changed headers make it
+stale, and set `stale`.
 
 One reason does not set `"reindex_needed"`: a new source file that is
 missing from compile_commands.json, when fw-context will build it by
@@ -2624,6 +2626,18 @@ format. `analysis` holds the `project` and `vendor` counts only, and is
 `null` when the project has no indexed build. For the `model`,
 `analyze_vendor`, and `complete` fields, call `get_active_build` for that
 project.
+
+`reindex_needed` is `true`, and `status` is `"reindex_needed"`, when one of
+these is true:
+
+- The schema of the database is older than the schema of this version.
+- The `compile_commands.json` of the newest build changed after the index.
+- A build of the project holds rows of an older row format. The check reads
+  the newest build of each `(variant, image)`, because the builds of one
+  project are not always indexed together.
+
+A newer row format does not set it. In that case, this process is the old
+reader, and `get_active_build` asks for a restart of the LLM client.
 
 When no project has an index, the result is one entry with an `info` key.
 When fw-context cannot read a database, the result holds one entry with `db`
