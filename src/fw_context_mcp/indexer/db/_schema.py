@@ -100,7 +100,15 @@ __all__ = [
 #      an ARM build saw `__GNUC__` 4, thus a header that requires GCC 6.3
 #      stopped with `#error`.  `macros.expanded_value` comes from the same
 #      flags, and it was empty for every ESP32 macro.
-CURRENT_ROW_FORMAT = "fw-context-rows/4"
+# /5 — `files.content` of each file that only assembly units read holds the
+#      directives, and no line of a skipped branch: it comes from the
+#      preprocessor record of libclang.  A file that a C unit also reads
+#      keeps the text of the C path.  Before it, the assembly pass wrote the
+#      `clang -E` view over the C text.  In one Zephyr image, 11 587 `#define` lines of
+#      the devicetree header were blank, thus `search_content` could not
+#      find a devicetree macro, and a header of the architecture read as
+#      blank lines.
+CURRENT_ROW_FORMAT = "fw-context-rows/5"
 
 # The config-hash format that was current when CURRENT_ROW_FORMAT last moved.
 #
@@ -115,7 +123,7 @@ CURRENT_ROW_FORMAT = "fw-context-rows/4"
 # the build, thus a plain `fw-context index` writes every file and every
 # body again.  The two must therefore move together, and
 # `test_row_format_invalidation.py` fails when only one of them does.
-ROW_FORMAT_PAIRED_WITH = "fw-context-cc/6"
+ROW_FORMAT_PAIRED_WITH = "fw-context-cc/7"
 
 
 def _row_format_number(value: str) -> int | None:
@@ -165,6 +173,10 @@ _ROW_FORMAT_FAULTS: tuple[tuple[int, str], ...] = (
         "headers from /usr/include and takes the #if branches of the host, "
         "an ARM index saw __GNUC__ 4, and the expanded value of a macro can "
         "be empty"),
+    (4, "the stored text of each file that an assembly unit reads has blank "
+        "directive lines, a short skipped block reads as live code, and a "
+        "header that C code also reads lost its C-only lines: search_content "
+        "and read_file can miss a #define or #include there"),
 )
 
 

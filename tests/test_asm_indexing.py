@@ -17,7 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from fw_context_mcp.indexer.asm import filtered_content, preprocess
+from fw_context_mcp.indexer.asm import filtered_content, preprocess, read_unit_texts
 
 pytestmark = pytest.mark.skipif(
     shutil.which("clang") is None, reason="the preprocessor is clang"
@@ -103,7 +103,8 @@ class TestPreprocess:
 
         src = preprocess(unit)
 
-        assert str((tmp_path / "table.inc").resolve()) in src.active
+        files = {m[0] for m in src.line_map if m is not None}
+        assert str((tmp_path / "table.inc").resolve()) in files
 
     def test_one_spelling_per_file(self, tmp_path: Path):
         """cpp echoes paths as the command line gave them.
@@ -116,8 +117,9 @@ class TestPreprocess:
 
         src = preprocess(unit)
 
-        assert len(src.active) == len({Path(p).resolve() for p in src.active})
-        assert all(Path(p).is_absolute() for p in src.active)
+        files = {m[0] for m in src.line_map if m is not None}
+        assert len(files) == len({Path(p).resolve() for p in files})
+        assert all(Path(p).is_absolute() for p in files)
 
     def test_a_unit_that_cannot_be_preprocessed_returns_none(self, tmp_path: Path):
         """Never guessed at: half a file read without its macros is worse."""
@@ -133,29 +135,23 @@ class TestPreprocess:
 
 
 class TestFilteredContent:
-    def test_line_numbers_are_preserved(self, tmp_path: Path):
+    def test_line_numbers_are_preserved(self):
         """Same convention as the C path: an inactive line becomes a newline."""
-        f = tmp_path / "t.S"
-        f.write_text("one\ntwo\nthree\n", encoding="utf-8")
-
-        content = filtered_content(str(f), {1, 3})
+        content = filtered_content(["one\n", "two\n", "three\n"], {1, 3})
 
         assert content.splitlines() == ["one", "", "three"]
 
-    def test_an_unreadable_file_gives_none(self, tmp_path: Path):
-        assert filtered_content(str(tmp_path / "absent.S"), {1}) is None
+    def test_a_unit_that_libclang_cannot_load_gives_none(self, tmp_path: Path):
+        """The file is read through the parse, thus no parse means no text."""
+        unit = SimpleNamespace(file=tmp_path / "absent.S", directory=tmp_path, clang_args=[])
 
-    def test_an_empty_file_gives_none(self, tmp_path: Path):
-        f = tmp_path / "empty.S"
-        f.write_text("", encoding="utf-8")
+        assert read_unit_texts(unit) is None
 
-        assert filtered_content(str(f), set()) is None
+    def test_an_empty_file_gives_none(self):
+        assert filtered_content([], set()) is None
 
-    def test_an_inactive_branch_is_blanked_not_dropped(self, tmp_path: Path):
-        f = tmp_path / "t.S"
-        f.write_text("active\ninactive\nactive2\n", encoding="utf-8")
-
-        content = filtered_content(str(f), {1, 3})
+    def test_an_inactive_branch_is_blanked_not_dropped(self):
+        content = filtered_content(["active\n", "inactive\n", "active2\n"], {1, 3})
 
         assert "inactive" not in content
         assert content.splitlines()[2] == "active2", "line 3 must stay line 3"

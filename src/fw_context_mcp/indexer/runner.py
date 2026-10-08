@@ -288,6 +288,47 @@ def _tus_to_requeue(
     )
 
 
+def _files_read_by_c_units(
+    units: list,
+    unit_headers: dict[str, set[str]],
+    manifest_lookup: dict[str, list[dict]] | None,
+    project_root: Path,
+) -> frozenset[Path]:
+    """Give the resolved path of each file that a C or C++ unit of the build reads.
+
+    The assembly pass writes no text for such a file: the C path owns it
+    (see ``asm.store_units``).  A unit whose headers this run collected
+    gives them in *unit_headers*, over all listings of its file — a parse,
+    or the content pass of an unchanged unit.  Another unit gives the
+    headers of its manifest entries: its rows and its text are the ones of
+    that earlier parse.
+
+    A header path is relative to *project_root* for a file of the project,
+    and absolute for a file outside it.  Both forms are resolved here.
+    """
+    def resolve(name: str) -> Path:
+        path = Path(name)
+        return (path if path.is_absolute() else project_root / path).resolve()
+
+    read: set[Path] = set()
+    for unit in units:
+        source = unit.file.resolve()
+        read.add(source)
+        try:
+            key = str(source.relative_to(project_root))
+        except ValueError:
+            key = str(source)
+        if key in unit_headers:
+            names = list(unit_headers[key])
+        else:
+            # The manifest keys an entry with the same relative-or-absolute
+            # form (``_manifest_updater``, ``"file": tu_rel``).
+            entries = (manifest_lookup or {}).get(key, [])
+            names = [name for entry in entries for name in entry.get("headers", [])]
+        read.update(resolve(name) for name in names)
+    return frozenset(read)
+
+
 def _store_linker_scripts(
     *,
     conn,
@@ -784,6 +825,10 @@ def run(
     # Collect headers during tokenization for incremental manifest update.
     # Maps file_path → list of {path, hash, generated} header dicts.
     tu_headers: dict[str, list[dict]] = {}
+    # The header paths that each C unit of this run read, over ALL listings
+    # of its file.  `tu_headers` keeps the list of the last listing only,
+    # and the assembly pass must know each header that a C unit reads.
+    c_unit_headers: dict[str, set[str]] = {}
     # TUs actually re-parsed in this run, with the source hash that the
     # decision read before the parse.  The manifest may only take fresh
     # header hashes from these — an entry refreshed for a TU that kept its
@@ -897,6 +942,8 @@ def run(
             content_filled += result["content_filled"]
             if result["headers"]:
                 tu_headers.update(result["headers"])
+                for key, headers in result["headers"].items():
+                    c_unit_headers.setdefault(key, set()).update(h["path"] for h in headers)
             log.info("[%d/%d] %s: %s", processed, len(units), fname, result["status"])
             continue
 
@@ -950,6 +997,7 @@ def run(
                 # project: 63 of 215 TUs.  None is a TU that failed to parse.
                 if tu_headers_list is not None:
                     tu_headers[tu_key] = tu_headers_list
+                    c_unit_headers.setdefault(tu_key, set()).update(h["path"] for h in tu_headers_list)
                 log.info(
                     "[%d/%d] %s: %d syms, %d refs, %.1fs",
                     processed,
@@ -1006,11 +1054,12 @@ def run(
     if asm_units:
         from .asm import store_units as _store_asm
 
+        c_read = _files_read_by_c_units(units, c_unit_headers, manifest_lookup, project_root)
         with write_lock(db_path.parent, timeout=120.0):
             with transaction(conn, checkpoint=False):
                 asm = _store_asm(
                     conn, config_hash, asm_units, project_root, build_dir_patterns,
-                    vendor_patterns, project_patterns_list,
+                    vendor_patterns, project_patterns_list, c_read=c_read,
                 )
         log.info(
             "assembly: %d unit(s) -> %d file(s), %d symbol(s), "

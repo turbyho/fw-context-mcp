@@ -25,16 +25,18 @@ often an included file rather than the unit itself, as in that case.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import sqlite3
 import subprocess
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from ._asm_macro import Report as MacroReport
 from ._asm_macro import expand_stream as expand_macros
+from ._parsed_text import decode_lines
 
 log = logging.getLogger(__name__)
 
@@ -66,15 +68,23 @@ class AsmSource:
             the source it came from, or None for a linemarker and for a
             line attributed to a synthetic file.  Indexed by output line,
             zero-based.
-        active: ``{resolved file path: set of source line numbers}`` — the
-            lines that survived the preprocessor.  A file appears here only
-            if it contributed at least one line, which is what makes an
-            ``#if`` branch that was not taken absent rather than blank.
+
+    The output does not decide the stored text of a file: it holds no line
+    for a directive, and blank lines for a short skipped block.  The text
+    comes from ``read_unit_texts``.
     """
 
     text: str
     line_map: list[tuple[str, int] | None]
-    active: dict[str, set[int]] = field(default_factory=dict)
+
+
+def _args_without_source(unit) -> list[str]:
+    """Give the flags of *unit* without its own source file.
+
+    Each reader names the file once on its own.  Named twice, clang reads
+    the unit twice (see ``preprocess``).
+    """
+    return [a for a in unit.clang_args if Path(a).name != unit.file.name]
 
 
 def preprocess(unit) -> AsmSource | None:
@@ -97,8 +107,7 @@ def preprocess(unit) -> AsmSource | None:
     # statements, and the second copy started at a position the first had
     # already used.  It also doubled the cost of the pass, which is 89-95%
     # preprocessor.
-    source_name = unit.file.name
-    args = [a for a in unit.clang_args if Path(a).name != source_name]
+    args = _args_without_source(unit)
     try:
         result = subprocess.run(
             # -C keeps comments.  Without it cpp strips them, and every
@@ -139,7 +148,6 @@ def _map_output(text: str, base: Path) -> AsmSource:
     file is the invariant every path-keyed lookup here relies on.
     """
     line_map: list[tuple[str, int] | None] = []
-    active: dict[str, set[int]] = {}
     cur_file: str | None = None
     cur_line = 0
 
@@ -164,45 +172,101 @@ def _map_output(text: str, base: Path) -> AsmSource:
             cur_line += 1
             continue
         line_map.append((cur_file, cur_line))
-        active.setdefault(cur_file, set()).add(cur_line)
         cur_line += 1
 
-    return AsmSource(text=text, line_map=line_map, active=active)
+    return AsmSource(text=text, line_map=line_map)
 
 
-def filtered_content(path: str, active_lines: set[int]) -> str | None:
-    """Return the text of *path* with every line the preprocessor dropped blanked.
+@dataclass
+class UnitText:
+    """The text of one file as the parse of an assembly unit read it.
+
+    Attributes:
+        data: The bytes that libclang read, thus the text and its hash
+            describe one version of the file.
+        active: The 1-based numbers of the lines that the preprocessor did
+            not skip.  A directive line and a comment line are in it.
+    """
+
+    data: bytes
+    active: set[int]
+
+
+def read_unit_texts(unit) -> dict[Path, UnitText] | None:
+    """Give the text and the live lines of each file that *unit* reads.
+
+    libclang loads an assembly unit as ``assembler-with-cpp`` and gives no
+    AST for it, but its preprocessor keeps the record of the branches it
+    skipped, as for a C unit.  That record decides the live lines, as on
+    the C path (``skipped_ranges.collect_skipped_lines``).
+
+    The output of ``clang -E`` cannot decide them.  The preprocessor emits
+    no line for a directive, and it emits blank lines for a short skipped
+    block.  Measured over 58 assembly units of 13 real builds, the ``-E``
+    view dropped about 1.19 million directive lines and showed 5289 lines
+    of skipped branches as live code.  The record of libclang agreed with
+    ``-E`` on each line that ``-E`` emitted as text, in the two directions.
+
+    The files are the main file and each include of the parse.  A header
+    that holds only directives (a generated devicetree header holds
+    thousands of ``#define`` lines) emits no text through ``-E``, but the
+    parse reads it all the same.
+
+    Returns None when libclang cannot load the unit.  A ``.s`` file with no
+    ``-x assembler-with-cpp`` is such a unit: the build does not
+    preprocess it, and ``clang -E`` gives no output for it either.
+    """
+    from clang import cindex as cx
+
+    from ._parsed_text import file_of_parse, parsed_bytes
+    from .skipped_ranges import collect_skipped_lines
+    from .symbols import _get_index
+
+    try:
+        tu = _get_index().parse(
+            str(unit.file),
+            args=_args_without_source(unit),
+            options=cx.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD,
+        )
+    except cx.TranslationUnitLoadError as exc:
+        log.debug("libclang load %s: %s", unit.file.name, exc)
+        return None
+
+    skipped = collect_skipped_lines(tu)
+    files = [(Path(unit.file).resolve(), file_of_parse(tu, str(unit.file)))]
+    files += [(Path(str(inc.include.name)).resolve(), inc.include) for inc in tu.get_includes()]
+    texts: dict[Path, UnitText] = {}
+    for resolved, handle in files:
+        if resolved in texts:
+            continue
+        data = parsed_bytes(tu, handle)
+        if data is None:
+            continue
+        count = len(decode_lines(data))
+        texts[resolved] = UnitText(data, set(range(1, count + 1)) - skipped.get(resolved, set()))
+    return texts
+
+
+def filtered_content(lines: list[str], active_lines: set[int]) -> str | None:
+    """Return *lines* joined, with each line that is not in *active_lines* blanked.
 
     The same convention the C path uses: line numbers stay put and an
     inactive line becomes a bare newline, so a caller can quote a line
-    number from the index and find it in the editor.  Here "inactive" means
-    the preprocessor did not emit it — an ``#if`` branch that was not taken.
+    number from the index and find it in the editor.  *lines* keep their
+    line ends, as ``decode_lines`` gives them.
 
-    Returns None when the file cannot be read, which the caller treats as
+    Returns None for a file with no line, which the caller treats as
     "no content" rather than as an empty file.
     """
-    try:
-        original = Path(path).read_text(encoding="utf-8", errors="replace").splitlines(
-            keepends=True
-        )
-    except OSError:
+    if not lines:
         return None
-    if not original:
-        return None
-
     # The range covers the whole file, for the reason the C path in
-    # `ops._build_filtered_file_content` gives: the preprocessor emits no
-    # line for a directive, thus a range that stopped at the last active
-    # line cut off the tail of every file that ends with `#endif`, and the
-    # stored length of the file with it.
-    #
-    # An empty *active_lines* gives a file of blank lines.  The caller
-    # cannot send one — a file enters ``AsmSource.active`` only when it
-    # gives at least one line — and blank lines are the correct answer for
-    # a file that the preprocessor dropped completely.
+    # `ops._build_filtered_file_content` gives: a range that stopped at the
+    # last active line cut off the tail of every file that ends with
+    # `#endif`, and the stored length of the file with it.
     return "".join(
-        original[i - 1] if i in active_lines else "\n"
-        for i in range(1, len(original) + 1)
+        lines[i - 1] if i in active_lines else "\n"
+        for i in range(1, len(lines) + 1)
     )
 
 
@@ -305,8 +369,13 @@ def _file_state(path: str) -> dict:
 def store_units(conn, config_hash: str, units: list, project_root: Path,
                 build_dir_patterns: list[str] | None = None,
                 vendor_patterns: list[str] | None = None,
-                project_patterns: list[str] | None = None) -> AsmResult:
+                project_patterns: list[str] | None = None,
+                *, c_read: Collection[Path] = frozenset()) -> AsmResult:
     """Index every assembly unit: text, symbols, and vector table edges.
+
+    *c_read* holds the resolved path of each file that a C or C++ unit of
+    the build reads.  This pass writes no text for such a file: the C path
+    owns it.
 
     Runs AFTER every C and C++ unit, and that ordering is load-bearing for
     the steps built on top of this one: pointing a vector slot at the
@@ -314,23 +383,25 @@ def store_units(conn, config_hash: str, units: list, project_root: Path,
     keeps, and that question has no answer until the rest of the index is
     in place.
 
-    libclang never saw these units — it cannot read assembly — so nothing
-    here comes from an AST.  The text is the preprocessed source, the
-    symbols are the directives it holds, and the vector edges are the slots
-    that name a symbol the rest of the index already knows.
+    libclang gives no AST for these units — it cannot read assembly.  The
+    symbols are the directives of the preprocessed source, and the vector
+    edges are the slots that name a symbol the rest of the index already
+    knows.  The stored text comes from the preprocessor record of libclang
+    (see ``read_unit_texts``).
     """
     from fw_context_mcp.indexer.db import upsert_file
     from fw_context_mcp.indexer.manifest import _is_generated_header
     from fw_context_mcp.indexer.ops import _normalize_file_path
-    from fw_context_mcp.utils import compute_source_hash
 
     result = AsmResult()
     cleared = False
     # The sources are kept so the vector pass can run over all of them
-    # after every symbol is stored, without preprocessing anything twice.
-    # Assembly units are few — one on the STM32 project, three on the Mbed project, seven per
-    # Zephyr image — and the preprocessor is 89-95% of the pass.
+    # after every symbol is stored, without running the preprocessor again.
+    # Assembly units are few — one on the STM32 project, three on the Mbed
+    # project, seven per Zephyr image.
     preprocessed: list[AsmSource] = []
+    # The live lines of each file that the units of this run read.
+    views: dict[Path, UnitText] = {}
     for unit in units:
         source = preprocess(unit)
         if source is None:
@@ -364,44 +435,79 @@ def store_units(conn, config_hash: str, units: list, project_root: Path,
         # The STM32 project and the Mbed project hid it — their table and handlers share one
         # file.
         preprocessed.append(source)
-        for path, active_lines in source.active.items():
-            content = filtered_content(path, active_lines)
-            if content is None:
-                continue
-            db_path = _normalize_file_path(path, project_root)
-            resolved = Path(path)
-            try:
-                mtime = resolved.stat().st_mtime
-            except OSError:
-                mtime = 0.0
-            upsert_file(
-                conn, config_hash, db_path,
-                "c",
-                generated=_is_generated_header(db_path, build_dir_patterns),
-                mtime=mtime,
-                source_hash=compute_source_hash(resolved),
+        texts = read_unit_texts(unit)
+        if texts is None:
+            # The symbols of the unit are stored, thus its files must stay
+            # covered: the coverage purge deletes each row that no unit
+            # covers.  Their rows keep the text that an earlier run stored.
+            log.warning("assembly unit %s: libclang cannot load it, thus no text of its files is stored",
+                        unit.file)
+            result.paths.update(
+                _normalize_file_path(name, project_root)
+                for name in {place[0] for place in source.line_map if place is not None}
             )
-            # is_project rides along with the content, and it must: the
-            # column defaults to 0, `upsert_file` cannot set it, and
-            # search_content(project_only=True) filters on it.  Without this
-            # a project that writes its own assembly could not find its own
-            # file.  MAX keeps the rule the C path uses — a file that any
-            # project symbol claimed is never downgraded to vendor.
-            conn.execute(
-                "UPDATE files SET content=?, is_project=MAX(is_project, ?) "
-                "WHERE config_hash=? AND path=?",
-                (
-                    content,
-                    _is_project_file(
-                        path, project_root, vendor_patterns or [],
-                        project_patterns or [],
-                    ),
-                    config_hash,
-                    db_path,
+            continue
+        for resolved, text in texts.items():
+            # Two units that read one file join their live lines.  The join
+            # lives in this run only: a view of an earlier run is never read
+            # back, thus a branch that the build stopped to take cannot stay
+            # live.  Another text (the file changed between two parses)
+            # replaces the view, because its line numbers belong to it.
+            earlier = views.get(resolved)
+            if earlier is not None and earlier.data == text.data:
+                earlier.active |= text.active
+            else:
+                views[resolved] = text
+
+    for resolved, text in views.items():
+        db_path = _normalize_file_path(str(resolved), project_root)
+        result.paths.add(db_path)
+        if resolved in c_read:
+            # A C or C++ unit of the build reads this file, thus the C path
+            # owns its text: most questions about a shared header are about
+            # the C code.  A branch that only assembly takes
+            # (`#ifdef _ASMLANGUAGE`) stays blank there.
+            #
+            # The rule must not look at the stored row.  A row does not say
+            # which pass wrote it: "write when the row is empty" let this
+            # pass fill a header that C keeps empty (C compiled no line of
+            # it), and the next run then took that text for the C text and
+            # kept a branch that the build stopped to take.
+            continue
+        content = filtered_content(decode_lines(text.data), text.active)
+        if content is None:
+            continue
+        try:
+            mtime = resolved.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        upsert_file(
+            conn, config_hash, db_path,
+            "c",
+            generated=_is_generated_header(db_path, build_dir_patterns),
+            mtime=mtime,
+            source_hash=hashlib.sha256(text.data).hexdigest(),
+        )
+        # is_project rides along with the content, and it must: the
+        # column defaults to 0, `upsert_file` cannot set it, and
+        # search_content(project_only=True) filters on it.  Without this
+        # a project that writes its own assembly could not find its own
+        # file.  MAX keeps the rule the C path uses — a file that any
+        # project symbol claimed is never downgraded to vendor.
+        conn.execute(
+            "UPDATE files SET content=?, is_project=MAX(is_project, ?) "
+            "WHERE config_hash=? AND path=?",
+            (
+                content,
+                _is_project_file(
+                    str(resolved), project_root, vendor_patterns or [],
+                    project_patterns or [],
                 ),
-            )
-            result.files += 1
-            result.paths.add(db_path)
+                config_hash,
+                db_path,
+            ),
+        )
+        result.files += 1
 
     # Second pass: every symbol of every unit is now in the index, so a
     # slot can reach a handler its own file does not define.

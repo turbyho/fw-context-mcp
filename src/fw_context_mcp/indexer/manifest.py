@@ -1075,6 +1075,11 @@ def compute_config_hash(
         # compiler is parsed with the system headers and the macros of its
         # own driver (``_driver_query``).  Before it, an ESP32 or AVR build
         # was parsed with the headers and the #if branches of the host.
+        # /7 marks a fifth change: ``files.content`` of each file that only
+        # assembly units read comes from the preprocessor record of libclang,
+        # and a file that a C unit also reads keeps the C text.  Before it, the
+        # assembly pass wrote the ``clang -E`` view over the C text: each
+        # directive was blank, and a short skipped block read as live.
         #
         # WHY the format version belongs in THIS hash: a new config_hash
         # leaves no row for the build, thus a plain `fw-context index` writes
@@ -1085,7 +1090,7 @@ def compute_config_hash(
         #
         # Every existing index therefore gets one final reindex, which is
         # intended.
-        "_format": "fw-context-cc/6",
+        "_format": "fw-context-cc/7",
         "project_root": str(project_root),
         # WHY only these two: config_hash answers "could the same source text
         # compile to something different now?"  Macros flip #ifdef, and the
