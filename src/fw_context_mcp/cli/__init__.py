@@ -255,12 +255,6 @@ def main() -> None:
         help="Do not index this image of the build (repeatable)",
     )
     p_index.add_argument(
-        "--no-index",
-        action="store_true",
-        dest="no_index",
-        help="With --build: build only, skip indexing",
-    )
-    p_index.add_argument(
         "--no-prune",
         action="store_true",
         dest="no_prune",

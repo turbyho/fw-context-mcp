@@ -69,7 +69,7 @@ def test_the_variants_are_indexed_from_their_own_database(
         variants=[BuildVariant(name="alpha", board="a"), BuildVariant(name="beta", board="b")],
     )
     cfg = SimpleNamespace(build=build)
-    args = SimpleNamespace(build=True, no_index=False)
+    args = SimpleNamespace(build=True)
     run_kwargs = {"vendor_paths": [], "project_paths": []}
 
     index_mod._run_multi(args, cfg, tmp_path, "pid", tmp_path / "index.db", "fake", run_kwargs)
@@ -128,7 +128,7 @@ def test_sysbuild_is_chosen_for_each_variant(monkeypatch, tmp_path: Path, board_
         ],
     )
     index_mod._run_multi(
-        SimpleNamespace(build=True, no_index=False), SimpleNamespace(build=build), tmp_path, "pid",
+        SimpleNamespace(build=True), SimpleNamespace(build=build), tmp_path, "pid",
         tmp_path / "index.db", "fake", {"vendor_paths": [], "project_paths": []},
     )
 
@@ -161,7 +161,7 @@ def _run_without_build(monkeypatch, tmp_path: Path, background: bool, may_build:
         variants=[BuildVariant(name="alpha", board="a"), BuildVariant(name="beta", board="b")],
     )
     index_mod._run_multi(
-        SimpleNamespace(build=False, no_index=False, background=background), SimpleNamespace(build=build),
+        SimpleNamespace(build=False, background=background), SimpleNamespace(build=build),
         tmp_path, "pid", tmp_path / "index.db", "fake", {"vendor_paths": [], "project_paths": []},
     )
     return seen
@@ -203,7 +203,7 @@ def test_a_variant_name_that_cannot_be_a_directory_stops_the_run_before_any_buil
         system="fake",
         variants=[BuildVariant(name="nrf/dev", board="a"), BuildVariant(name="beta", board="b")],
     )
-    args = SimpleNamespace(build=True, no_index=False)
+    args = SimpleNamespace(build=True)
     run_kwargs = {"vendor_paths": [], "project_paths": []}
 
     assert index_mod._run_multi(
@@ -224,7 +224,7 @@ def test_two_variant_names_of_one_directory_stop_the_run(
         system="fake",
         variants=[BuildVariant(name="Dev", board="a"), BuildVariant(name="dev", board="b")],
     )
-    args = SimpleNamespace(build=True, no_index=False)
+    args = SimpleNamespace(build=True)
 
     assert index_mod._run_multi(
         args, SimpleNamespace(build=build), tmp_path, "pid", tmp_path / "index.db", "fake",

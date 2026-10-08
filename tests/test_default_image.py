@@ -518,7 +518,7 @@ class TestRunMulti:
             lambda conn, pid, db_dir, variants, pairs: built.append(pairs) or [],
         )
         cfg = _cfg("esp-idf", variants=[BuildVariant(name="a"), BuildVariant(name="b")])
-        args = argparse.Namespace(build=False, background=False, no_index=False, image=None,
+        args = argparse.Namespace(build=False, background=False, image=None,
                                   exclude_image=[], variant=None, variants=None)
         db_path = tmp_path / "db" / "index.db"
         db_path.parent.mkdir()

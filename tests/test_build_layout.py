@@ -406,7 +406,7 @@ class TestIndexRemovesLegacyOutput:
         return flat
 
     def test_a_project_without_an_index_gets_no_index_file(self, tmp_path):
-        """A run with --no-index leaves a project without an index as it was: get_active_build says no_index."""
+        """The cleanup leaves a project without an index as it was: it makes no index.db, and get_active_build says no_index."""
         import os
 
         index_dir = Path(os.environ["FW_CONTEXT_INDEX_DIR"])

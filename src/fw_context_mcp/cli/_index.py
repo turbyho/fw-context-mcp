@@ -1211,10 +1211,6 @@ def _run_multi(
         return 1
     cc_list = _filter_images(cc_list, args)
 
-    if args.no_index:
-        print(f"Built {len(cc_list)} build(s) — skipping indexing (--no-index)")
-        return 0
-
     if not cc_list:
         print("error: no builds to index", file=sys.stderr)
         return 1
@@ -1968,11 +1964,6 @@ def _record_still_uncovered(project_root: Path, db_path: Path) -> None:
     from ..mcp.shared.stale import find_unindexed_sources
     from ..utils import compute_source_hash
 
-    # A run with --no-index builds and indexes nothing.  open_db would make
-    # an empty index.db for a project without an index, and
-    # get_active_build would then stop to report "no_index".
-    if not db_path.exists():
-        return
     try:
         conn = open_db(db_path)
         try:
