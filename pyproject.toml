@@ -1,6 +1,6 @@
 [project]
 name = "fw-context-mcp"
-version = "0.33.0"
+version = "0.34.0"
 description = "Build-aware code intelligence MCP server for embedded C/C++ firmware"
 requires-python = ">=3.11"
 # MIT for fw-context; Apache-2.0 WITH LLVM-exception for the clang compiler
