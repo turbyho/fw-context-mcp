@@ -705,6 +705,10 @@ $ fw-context version
 fw-context-mcp <version>
 ```
 
+When the MCP server found a newer release on PyPI, a second line names
+it. The command reads the stored answer of the MCP server and sends no
+request itself.
+
 ---
 
 ## MCP tools
@@ -2411,13 +2415,29 @@ missing from compile_commands.json, when fw-context will build it by
 itself. That reason is in `reindex_reasons` while `reindex_needed` is
 `false` and `status` is `"reindexing"`.
 
-**`client_restart_required`.** When the index holds a NEWER row format
-than this server process reads, the result holds
-`client_restart_required: true` and `client_restart_reason`, and
-`index_message` opens with it. `status` stays `"ready"`, and every query
+**`client_restart_required`.** This server process does not run the code
+that it must run. Two causes set the field:
+
+- The index holds a NEWER row format than this server process reads.
+- The operator installed a different fw-context after the LLM client
+  started this server process. This cause needs no index, thus it shows
+  also with `status` `"not_initialized"` and `"no_index"`.
+
+The result then holds `client_restart_required: true` and
+`client_restart_reason`, which names each cause that applies, and
+`index_message` opens with it. `status` does not change, and every query
 keeps working. Do NOT reindex: the indexer writes the same new format
 again. Tell the user to restart the LLM client (Claude Code, opencode, or
 the client in use). The MCP server is a child process of that client.
+
+**`update_notice`.** PyPI has a newer fw-context than the installed one.
+The field is not a status. Tell the user one time, and do not upgrade
+fw-context yourself: the user knows the tool that installed it. The
+server asks PyPI in a background thread at server start. After a request
+that succeeded, it asks again only after 24 hours. A request that failed
+writes nothing, thus the next server start tries again. The tool reads
+only the stored answer, thus it never waits for the network. An editable install gets no `update_notice`. To stop the
+check, see [`[updates]`](configuration.md#updates--release-check).
 
 `modified_files_count` counts the files whose content no longer matches
 the index. Both modes count it. `fast` controls only the header check:

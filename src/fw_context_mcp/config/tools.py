@@ -379,13 +379,18 @@ get_active_build() status:
     status "error". Use other tools.
 
 `client_restart_required: True` is not a status, and NO command repairs it.
-The index holds a newer row format than this session reads, thus the index
-is correct and this session is the old reader. Queries keep working. Do NOT
+This session does not run the code that it must: the index holds a newer row
+format than this session reads, or the operator installed a different
+fw-context after this session started. Queries keep working. Do NOT
 reindex — the indexer writes the same new format again and the field comes
 back. Tell the operator to restart the LLM client (Claude Code, opencode,
 or the client in use). The MCP server is a child process of that client,
 thus nobody can restart the server alone. `client_restart_reason` holds the
 wording.
+
+`update_notice` is not a status either. PyPI has a newer fw-context than
+the installed one. Tell the operator one time. Do NOT upgrade fw-context
+yourself: the operator knows the tool that installed it.
 
 ### Diff verification
 

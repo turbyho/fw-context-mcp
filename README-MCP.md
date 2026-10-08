@@ -166,6 +166,7 @@ Call `reset_index(confirm=true)` to delete the database. Then run `fw-context in
 
 - **CWD:** The server resolves the project root from `$PWD` when the request does not provide `project_root`. Launch the server from the firmware project root.
 - **The core tools need no network connection** (search, lookup, source, graph). `smart_search` and `explain_symbol` can optionally use a local Ollama server.
+- **The server asks PyPI for a newer release** in a background thread at server start. After a request that succeeded, it asks again only after 24 hours. A request that failed has no effect on the tools, and the next server start tries again. No tool waits for the request. `[updates] check = false` in the global config, or `FW_CONTEXT_NO_UPDATE_CHECK=1`, stops it. See [`[updates]`](docs/configuration.md#updates--release-check).
 - **The server keeps no state between calls.** For each call, a tool opens the database, runs the query, and closes the database.
 
 ## Debugging

@@ -868,12 +868,17 @@ mcp = FastMCP(
         '    It wins over "reindexing".  When bg_reindex_running=True, that run\n'
         "    already does the work: do not start a second one.\n"
         "  • client_restart_required=True — NOT a status, and NO command repairs\n"
-        "    it. The index holds a newer row format than this session reads, thus\n"
-        "    the index is correct and this session is the old reader. Queries keep\n"
+        "    it. This session does not run the code that it must: the index holds a\n"
+        "    newer row format than this session reads, or the operator installed\n"
+        "    a different fw-context after this session started. Queries keep\n"
         "    working. Do NOT reindex: the indexer writes the same new format again\n"
         "    and the field comes back. Tell the operator to restart the LLM client\n"
         "    (Claude Code, opencode, or the client in use). The MCP server is a\n"
         "    child process of that client, thus nobody can restart it alone.\n"
+        "    client_restart_reason holds the wording.\n"
+        "  • update_notice — NOT a status. PyPI has a newer fw-context than the\n"
+        "    installed one. Tell the operator one time. Do NOT upgrade it\n"
+        "    yourself: the operator knows the tool that installed it.\n"
         '  • status="not_initialized" — project not set up. ASK the operator:\n'
         '    "Initialize fw-context? Runs `fw-context init` — creates project ID,\n'
         "    config files (.fw-context/config.toml), and registers with AI tools.\"\n"
@@ -1290,6 +1295,10 @@ def main() -> None:
     4. Starts a ping thread that keeps the daemon alive, and that
        spawns the daemon again when a ping gets no answer.
 
+    Before step 1, it starts the background check for a newer release
+    (:mod:`fw_context_mcp.version_check`).  The check needs no project,
+    thus it starts before the first path that goes to ``mcp.run()``.
+
     **Why progressive startup?**  The server must NOT exit when the
     project is not initialized or has no index.  The whole point of
     ``get_active_build()`` returning ``not_initialized`` / ``no_index``
@@ -1298,6 +1307,19 @@ def main() -> None:
     the agent's context, breaking the guided setup flow.
     """
     log.info("fw-context MCP server starting")
+
+    # Phase 0: ask PyPI for a newer release in a daemon thread.  The thread
+    # writes a state file that get_active_build reads, thus no tool waits
+    # for the network.  load_update_settings reads one file of the global
+    # config, and not the full config: see its docstring.
+    try:
+        from ..config.settings import load_update_settings
+        from ..version_check import start_update_check
+        start_update_check(load_update_settings().check)
+    except RuntimeError:
+        # Thread.start() raises RuntimeError when the interpreter cannot
+        # start a thread.  The server must start without the check.
+        log.exception("Update check startup failed — get_active_build reports no newer release")
 
     # Phase 1: pre-populate the project-ready cache with a one-shot check.
     # _check_server_ready() raises RuntimeError when the project isn't

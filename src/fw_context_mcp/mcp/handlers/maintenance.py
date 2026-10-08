@@ -499,18 +499,34 @@ def get_active_build(
     in a warning.
 
     ``client_restart_required`` is the OPPOSITE case, and no command repairs
-    it.  The index carries a NEWER row format than this server process
-    reads, thus the index is the correct one and this process is the old
-    reader.  A reindex makes it worse than useless: the indexer writes the
-    same new format again, and the message comes back over an index that had
-    nothing wrong with it.  ``status`` therefore stays ``"ready"`` and
-    ``reindex_needed`` stays False — every query keeps working.
+    it.  This server process does not run the code that it must run.  Two
+    causes set it, and ``client_restart_reason`` names each one that
+    applies:
 
-    Do NOT run a reindex for this field.  Tell the operator to restart the
-    LLM client — Claude Code, opencode, or whichever one is in use.  The MCP
-    server is a child process of that client, thus nobody can restart the
-    server by itself.  ``client_restart_reason`` holds the wording, and
-    ``index_message`` opens with it.
+    * The index carries a NEWER row format than this process reads, thus
+      the index is the correct one and this process is the old reader.  A
+      reindex makes it worse than useless: the indexer writes the same new
+      format again, and the message comes back over an index that had
+      nothing wrong with it.
+    * The operator installed a different fw-context after the LLM client
+      started this process.  This cause does not need an index, thus it
+      shows also for ``not_initialized`` and ``no_index``.
+
+    ``status`` therefore stays as it is and ``reindex_needed`` stays False
+    — every query keeps working.  Do NOT run a reindex for this field.
+    Tell the operator to restart the LLM client — Claude Code, opencode, or
+    whichever one is in use.  The MCP server is a child process of that
+    client, thus nobody can restart the server by itself.
+    ``client_restart_reason`` holds the wording, and ``index_message``
+    opens with it.
+
+    ``update_notice`` is not a status either.  It shows when PyPI has a
+    newer fw-context than the installed one.  Tell the operator one time,
+    and do NOT upgrade fw-context yourself: the operator knows the tool
+    that installed it.  After a request that succeeded, the server asks
+    PyPI again only after 24 hours.  The request runs in a background
+    thread, and no tool waits for it.  ``[updates] check = false``
+    in the global config, or ``FW_CONTEXT_NO_UPDATE_CHECK=1``, stops it.
 
     ``indexed_at`` and ``first_indexed_at`` are UTC; file mtimes are local
     time.  Never compare the two directly — in UTC+2 a correctly indexed
@@ -603,7 +619,10 @@ def get_active_build(
         that the other fields describe, empty when no script names one),
         memory (list[dict] — the `MEMORY` regions of that build:
         {name, attributes, origin, length, origin_value, length_value,
-        file_path, line})}
+        file_path, line}),
+        client_restart_required (bool, optional — only when True),
+        client_restart_reason (str, optional — with the field above),
+        update_notice (str, optional — a newer release is on PyPI)}
 
         About ``memory``: ``origin`` and ``length`` hold the expression the
         script writes, thus they differ by platform — an mbed script writes
@@ -652,7 +671,49 @@ def get_active_build(
 
         For a project that is not initialized, the result holds only
         ``status``, ``project_root``, and ``index_message``.  When no index
-        exists, the result adds ``project_id``.
+        exists, the result adds ``project_id``.  The two version fields
+        (``client_restart_*`` for an upgrade, ``update_notice``) can come
+        with every result, these two included.
+    """
+    return _with_version_state(_active_build_state(project_root, fast))
+
+
+def _with_version_state(result: dict) -> dict:
+    """Add the version facts that do not depend on the index to *result*.
+
+    One wrapper around every return path of :func:`_active_build_state`,
+    because an upgrade of the package concerns the process and not the
+    project: the caller must read it also when the project has no index.
+    A restart reason of the index (a newer row format) and a restart reason
+    of the package can apply together, thus the second one joins the text
+    and does not replace it.
+    """
+    from ...config.settings import load_update_settings
+    from ...version_check import restart_reason, update_notice
+
+    reason = restart_reason()
+    if reason:
+        prior = result.get("client_restart_reason")
+        result["client_restart_required"] = True
+        result["client_restart_reason"] = f"{prior} {reason}" if prior else reason
+        # A row-format reason already put the same action at the front of
+        # index_message.  One action needs one sentence there.
+        if "index_message" in result and not prior:
+            result["index_message"] = (
+                "Restart the LLM client — this server runs a different fw-context than "
+                f"the installed one. Queries work meanwhile. {result['index_message']}"
+            )
+    notice = update_notice(load_update_settings().check)
+    if notice:
+        result["update_notice"] = notice
+    return result
+
+
+def _active_build_state(project_root: str | None, fast: bool) -> dict:
+    """Return the index state of :func:`get_active_build`.
+
+    The tool docstring describes the result.  This function holds the body,
+    thus :func:`_with_version_state` sees every return path at one place.
     """
     root = resolve_project_root(project_root)
     # Resolve project ID directly — bypass _db_path/derive_project_id so

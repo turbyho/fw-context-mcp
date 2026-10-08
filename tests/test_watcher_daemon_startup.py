@@ -167,14 +167,23 @@ class TestServerStartup:
 
     @staticmethod
     def _patch_main(monkeypatch, tmp_path: Path) -> dict:
-        """Replace everything ``main()`` touches, and record the two calls."""
+        """Replace everything ``main()`` touches, and record the three calls."""
         import fw_context_mcp.config as config_mod
+        import fw_context_mcp.config.settings as settings_mod
         import fw_context_mcp.deps as deps_mod
+        import fw_context_mcp.version_check as version_check_mod
         from fw_context_mcp.mcp import server as server_mod
 
         cfg = _FakeCfg(index=_FakeIndexCfg(db_dir=tmp_path / "index"))
-        calls: dict = {"ensure": [], "ping": []}
+        calls: dict = {"ensure": [], "ping": [], "update": []}
 
+        # A real update check would send a request to PyPI from the test.
+        # The settings are fixed, because the session home holds a copy of
+        # the global config of the operator.
+        monkeypatch.setattr(version_check_mod, "start_update_check", calls["update"].append)
+        monkeypatch.setattr(
+            settings_mod, "load_update_settings", lambda: settings_mod.UpdatesConfig(check=True)
+        )
         monkeypatch.setattr(server_mod, "_check_server_ready", lambda: tmp_path)
         monkeypatch.setattr(server_mod, "resolve_project_root", lambda arg: tmp_path)
         monkeypatch.setattr(deps_mod, "run_preflight", lambda: [])
@@ -217,6 +226,25 @@ class TestServerStartup:
 
         assert calls["ensure"] == [tmp_path]
         assert calls["ping"] == [tmp_path]
+
+    def test_the_update_check_starts_when_the_project_is_unknown(self, monkeypatch, tmp_path: Path):
+        """The check concerns the machine, thus it must not wait for a project.
+
+        The earliest exit of ``main()`` is a project root that does not
+        resolve.  The check must start also on that path.
+        """
+        from fw_context_mcp.mcp import server as server_mod
+
+        calls = self._patch_main(monkeypatch, tmp_path)
+
+        def _no_root(arg):
+            raise OSError("no project root")
+
+        monkeypatch.setattr(server_mod, "resolve_project_root", _no_root)
+        server_mod.main()
+
+        assert calls["update"] == [True]
+        assert calls["ping"] == []
 
 
 # ── Fix 3: `fw-context index` must start the daemon it can have missed ───────

@@ -21,7 +21,7 @@ fw-context merges three levels of TOML files, in this order. A later file overri
 
 `local.toml` holds settings that are specific to each developer. Examples are which Ollama model you have installed, where your index database is, and whether you want LLM analysis enabled. Keep `local.toml` out of git.
 
-The environment variable `FW_CONTEXT_HOME` moves the global `config.toml`, the local LLM cache `llm_cache.db`, and the global files that the cleanup removes (see [Obsolete keys and files](#obsolete-keys-and-files)). Without it, they are in `~/.fw-context`. It does not move the index, the project registry or the clang headers: these have their own variables (`FW_CONTEXT_INDEX_DIR`, `FW_CONTEXT_PROJECTS_DB`, `FW_CONTEXT_CLANG_RESOURCE_DIR`). The test suite of fw-context sets all four, thus a test cannot change the files of the operator.
+The environment variable `FW_CONTEXT_HOME` moves the global `config.toml`, the local LLM cache `llm_cache.db`, the state of the release check `update_check.json` (see [`[updates]`](#updates--release-check)), and the global files that the cleanup removes (see [Obsolete keys and files](#obsolete-keys-and-files)). Without it, they are in `~/.fw-context`. It does not move the index, the project registry or the clang headers: these have their own variables (`FW_CONTEXT_INDEX_DIR`, `FW_CONTEXT_PROJECTS_DB`, `FW_CONTEXT_CLANG_RESOURCE_DIR`). The test suite of fw-context sets all four, thus a test cannot change the files of the operator.
 
 Run `fw-context init` to create the project config files with commented-out default values. This command also adds the necessary entries to `.gitignore`. On first use, fw-context creates only the global `~/.fw-context/config.toml`. The MCP tools and `fw-context index` create no config file in a project that `init` did not set up, and read a missing project file as empty.
 
@@ -253,6 +253,23 @@ token = "<your-token>"
 ```
 
 For setup, deployment, and management instructions, see **[Cache Server →](cache-server.md)**.
+
+### `[updates]` — Release check
+
+At start, the MCP server asks PyPI for the newest release of `fw-context-mcp`. The request runs in a background thread, and no tool waits for it. After a request that succeeded, the server asks again only after 24 hours. The server stores the answer in `update_check.json` in the global directory (see `FW_CONTEXT_HOME` above). When the stored release is newer than the installed one, `get_active_build` gives an `update_notice`, and `fw-context version` prints a second line. A failed request writes nothing, and the next server start tries again. An editable install (`pip install -e`, `make install`) sends no request, because its package metadata does not follow the source tree.
+
+| Key | Default | Scope | Description |
+|-----|---------|-------|-------------|
+| `check` | `true` | global | When this key is `false`, the MCP server sends no request to PyPI, and `get_active_build` gives no `update_notice`. Set it to `false` on a machine without network access, or where a request to PyPI is not permitted. fw-context ignores this key in a project config, and logs a warning when a project config sets it. |
+
+The environment variable `FW_CONTEXT_NO_UPDATE_CHECK` also stops the check. Any value other than an empty string and `0` stops it. The test suite of fw-context sets it.
+
+```toml
+[updates]
+check = false
+```
+
+`get_active_build` also reports a different fw-context that the operator installed while the MCP server runs (an upgrade or a downgrade), independently of this key. The server then does not run the installed code, and `client_restart_required` tells the user to restart the LLM client. This check reads only the local package metadata.
 
 ## Obsolete keys and files
 

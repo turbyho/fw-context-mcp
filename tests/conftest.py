@@ -162,13 +162,21 @@ def _isolate_index_dir():
     is copied in, so that a test that asks Ollama uses the models of the
     operator, and a write goes to the copy.
 
+    A fifth is not a store: ``FW_CONTEXT_NO_UPDATE_CHECK`` stops the
+    request to PyPI (``version_check``).  An MCP server that a test starts
+    as a process must not send a request from the test machine.  The tests
+    of the check remove the variable with ``monkeypatch``.
+
     All variables are inherited by any subprocess a test spawns, thus a
     CLI invocation stays isolated too.  The temp dir is removed at session
     end.
     """
     import fw_context_mcp.config.settings as settings
 
-    names = ("FW_CONTEXT_INDEX_DIR", "FW_CONTEXT_PROJECTS_DB", "FW_CONTEXT_CLANG_RESOURCE_DIR", "FW_CONTEXT_HOME")
+    names = (
+        "FW_CONTEXT_INDEX_DIR", "FW_CONTEXT_PROJECTS_DB", "FW_CONTEXT_CLANG_RESOURCE_DIR", "FW_CONTEXT_HOME",
+        "FW_CONTEXT_NO_UPDATE_CHECK",
+    )
     prev = {name: os.environ.get(name) for name in names}
     prev_global = settings._GLOBAL_CONFIG_PATH
     with tempfile.TemporaryDirectory(prefix="fw-context-index-") as d:
@@ -180,6 +188,7 @@ def _isolate_index_dir():
         os.environ["FW_CONTEXT_PROJECTS_DB"] = str(Path(d) / "projects.db")
         os.environ["FW_CONTEXT_CLANG_RESOURCE_DIR"] = str(Path(d) / "clang-resource")
         os.environ["FW_CONTEXT_HOME"] = str(home)
+        os.environ["FW_CONTEXT_NO_UPDATE_CHECK"] = "1"
         # The module computed the path at import, before this fixture.
         settings._GLOBAL_CONFIG_PATH = home / "config.toml"
         try:

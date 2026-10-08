@@ -579,6 +579,27 @@ class CacheServerConfig:
 
 
 @dataclass
+class UpdatesConfig:
+    """The check for a newer fw-context release on PyPI.
+
+    fw-context reads it from the global config only, and ignores it in a
+    project config: the check is a fact about the machine, and the MCP
+    server reads it before it knows a project.  It is thus not a field of
+    :class:`Config`: :func:`load_update_settings` reads it.  See
+    :mod:`fw_context_mcp.version_check`.
+
+    Attributes:
+        check: When ``True`` (default), the MCP server asks PyPI at start
+            (after a request that succeeded, only after 24 hours), and
+            ``get_active_build`` reports a newer release.
+            Set it to ``False`` on a machine without network access, or
+            when no request to PyPI is permitted.
+    """
+
+    check: bool = True
+
+
+@dataclass
 class Config:
     """Top-level configuration container aggregating all sub-configs.
 
@@ -925,7 +946,14 @@ _LLM_FIELDS: list[tuple[str, str, str]] = [
     ("stream", "stream", "bool"),
 ]
 
-_KNOWN_SECTIONS: set[str] = {"project", "build", "index", "llm", "cache_server", "call_graph"}
+_UPDATES_FIELDS: list[tuple[str, str, str]] = [
+    ("check", "check", "bool"),
+]
+
+# "updates" is known although _from_dict does not read it: load() reads the
+# global file too, and must not report [updates] there as a typo.
+# load_update_settings() reads the section.
+_KNOWN_SECTIONS: set[str] = {"project", "build", "index", "llm", "cache_server", "call_graph", "updates"}
 
 # BuildConfig attribute name → merge semantics classification lives in
 # indexer/build.py; this module maps TOML keys → attribute names for the
@@ -1310,6 +1338,56 @@ def _read_toml_if_present(path: Path) -> dict:
     return tomllib.loads(text)
 
 
+def load_update_settings() -> UpdatesConfig:
+    """Read ``[updates]`` from the global config file, and nothing else.
+
+    WHY not :func:`load`: ``load`` resolves the embedding model (it runs
+    ``nvidia-smi`` and asks Ollama) and creates the global config file.
+    The MCP server reads this section before ``mcp.run()``, where a slow
+    start makes the client time out before it gets the tools, and
+    ``fw-context version`` must answer at once.  This function reads one
+    file and writes nothing.
+
+    A missing file, a file that does not parse, and a section that is not a
+    table give the defaults.  The log gets only a debug line: ``load``
+    reports the same file at each command, and ``get_active_build`` calls
+    this function at each call.
+    """
+    settings = UpdatesConfig()
+    path = _GLOBAL_CONFIG_PATH
+    try:
+        data = _read_toml_if_present(path)
+    except (OSError, ValueError):
+        log.debug("Cannot read %s — [updates] uses the defaults", path, exc_info=True)
+        return settings
+    if isinstance(data.get("updates"), dict):
+        _apply_section(data, "updates", _UPDATES_FIELDS, settings)
+    return settings
+
+
+#: The project files that got the warning about ``[updates]`` in this
+#: process.  ``load()`` runs many times in one MCP session.
+_project_updates_warned: set[Path] = set()
+
+
+def _warn_project_updates_once(layer: dict, path: Path) -> None:
+    """Warn one time for each *path* that a project file sets ``[updates]``.
+
+    WHY: fw-context reads ``[updates]`` from the global config only (see
+    :class:`UpdatesConfig`).  A team that writes ``check = false`` into the
+    committed config to stop requests to PyPI must learn that the key has
+    no effect there.
+    """
+    if "updates" not in layer or path in _project_updates_warned:
+        return
+    _project_updates_warned.add(path)
+    log.warning(
+        "%s: [updates] has no effect in a project config. Set it in the global config %s, "
+        "or set FW_CONTEXT_NO_UPDATE_CHECK=1.",
+        path, _GLOBAL_CONFIG_PATH,
+    )
+
+
 def _mtime_signature(paths: tuple[Path | None, ...]) -> tuple[float | None, ...]:
     """The mtime of each of *paths*, None for a path that is absent.
 
@@ -1388,6 +1466,7 @@ def load(project_root: Path | None = None) -> Config:
             proj_data = _read_toml_if_present(proj_path)
             _drop_malformed_sections(proj_data, proj_path)
             _drop_retired_keys(proj_data, proj_path)
+            _warn_project_updates_once(proj_data, proj_path)
             data = _deep_merge(data, proj_data)
             # A non-loopback ollama_url in the committed config.toml sends
             # source code to a host that the repository selects.
@@ -1403,6 +1482,7 @@ def load(project_root: Path | None = None) -> Config:
             local_data = _read_toml_if_present(local_path)
             _drop_malformed_sections(local_data, local_path)
             _drop_retired_keys(local_data, local_path)
+            _warn_project_updates_once(local_data, local_path)
             data = _deep_merge(data, local_data)
         except (OSError, ValueError):
             log.exception("Failed to parse %s — ignoring local config", local_path)

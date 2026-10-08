@@ -235,8 +235,19 @@ def cmd_analyze(args: argparse.Namespace) -> int:
 
 
 def cmd_version(args: argparse.Namespace) -> int:
-    """Print version and exit."""
+    """Print the version, and a newer release when the MCP server found one.
+
+    The command reads the state file of the update check and sends no
+    request: the MCP server asks PyPI in the background (see
+    ``version_check``), and a version command must give its answer at once
+    on a machine without network access too.
+    """
     from .. import __version__
+    from ..config.settings import load_update_settings
+    from ..version_check import newer_release
 
     print(f"fw-context-mcp {__version__}")
+    found = newer_release(load_update_settings().check)
+    if found is not None:
+        print(f"fw-context-mcp {found[0]} is available on PyPI. Upgrade it with the tool that installed it.")
     return 0
