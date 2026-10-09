@@ -48,13 +48,6 @@ htmlcov/
 tests/results/
 docs/examples/raw/
 
-# fw-context
-compile_commands.json
-mbed_config.h
-.fw-context/local.toml
-eim_config.toml
-test-firmware/
-
 # Backup and temporary files
 *.bak
 LEAN-CTX.md
@@ -84,5 +77,10 @@ plans/
 tests/test_feature_comparison.py
 
 # fw-context
+compile_commands.json
+mbed_config.h
+.fw-context/local.toml
+eim_config.toml
+test-firmware/
 **/.fw-context/*
 !**/.fw-context/config.toml
