@@ -66,7 +66,6 @@ from ...indexer.db import (
     count_refs,
     find_macro_refs,
     find_refs_with_candidates,
-    get_active_config,
     lookup_macro,
 )
 from ...indexer.db import (
@@ -295,9 +294,6 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
         # Runs under the executor lock on the single shared connection;
         # must not open its own connection.  Timeout is enforced by
         # _wrap_tool (300 s + interrupt), not here.
-        cfg_data = get_active_config(conn, db.project_id)
-        if not cfg_data:
-            return [{"error": "No build config indexed."}]
         # Every branch below names the relation and the tool that reads the
         # next page, thus both are resolved once here.
         label = "callers" if caller_mode else "references"

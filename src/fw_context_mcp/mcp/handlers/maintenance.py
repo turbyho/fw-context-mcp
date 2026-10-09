@@ -1546,8 +1546,14 @@ def reset_index(
 
     Returns:
         dict: {project_root, db, project_id, action: "dry_run"|"deleted",
-        message, symbol_count, indexed_at}.  ``symbol_count`` and
-        ``indexed_at`` are present only when a build config is readable.
+        message, build_count, symbol_count, indexed_at}.  ``build_count``
+        counts the completed builds of the project, as
+        ``get_project_status`` lists them.  ``symbol_count`` counts every
+        symbol row in the database, the rows that the reset deletes: also
+        the rows of a build that an index run writes now, and of an older
+        build of a pair that an interrupted run left behind.
+        ``indexed_at`` is the time of the newest build.  The three are
+        present only when a build config is readable.
 
         A ``warning`` key means that the database is corrupt — the
         integrity check failed, thus the counts can be incomplete.
@@ -1561,6 +1567,7 @@ def reset_index(
     project_id = derive_project_id(root)
     cfg_data = None
     sym_count = 0
+    build_count = 0
     corrupt = False
     conn = None
     try:
@@ -1572,12 +1579,14 @@ def reset_index(
         corrupt = True
     else:
         with conn:
+            # The newest build gives the time of the last run.  The counts
+            # are of the whole database, because the reset deletes all of
+            # it: the count of the newest build alone was the size of the
+            # one program that the last run did.
             cfg_data = get_active_config(conn, project_id)
             if cfg_data:
-                sym_count = conn.execute(
-                    "SELECT COUNT(*) FROM symbols WHERE config_hash=?",
-                    (cfg_data["config_hash"],),
-                ).fetchone()[0]
+                sym_count = conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
+                build_count = len(latest_builds(conn, project_id))
     finally:
         if conn is not None:
             try:
@@ -1590,6 +1599,7 @@ def reset_index(
         "project_id": project_id,
     }
     if cfg_data:
+        info["build_count"] = build_count
         info["symbol_count"] = sym_count
         info["indexed_at"] = cfg_data["created_at"]
     elif corrupt:

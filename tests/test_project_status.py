@@ -383,3 +383,43 @@ def test_a_build_that_a_reindex_removed_after_the_selection_is_an_error(tmp_path
     result = get_build_info(project_root=str(root))
 
     assert set(result) == {"error"} and "No build config indexed" in result["error"], result
+
+
+def test_reset_index_counts_the_whole_database(tmp_path):
+    """The reset deletes every build, thus the dry run counts every build.
+
+    It counted the symbols of the newest build alone: on a project of 7
+    builds, the size of the one program that the last index run did.
+    """
+    from fw_context_mcp.indexer.db import open_db, transaction, upsert_file
+    from fw_context_mcp.mcp.handlers.maintenance import reset_index
+
+    root = _project(tmp_path, TWO_IMAGES)
+    conn = open_db(tmp_path / "index" / PROJECT_ID / "index.db")
+    try:
+        with transaction(conn):
+            for config_hash, count in (("h-boot", 2), ("h-app", 3)):
+                file_id = upsert_file(conn, config_hash, "a.c", "c", mtime=0.0)
+                for n in range(count):
+                    conn.execute(
+                        "INSERT INTO symbols (config_hash, file_id, usr, name, qualified_name, kind, line, col,"
+                        " is_definition) VALUES (?, ?, ?, ?, ?, 'function', ?, 1, 1)",
+                        (config_hash, file_id, f"{config_hash}-{n}", f"f{n}", f"f{n}", n + 1),
+                    )
+    finally:
+        conn.close()
+
+    result = reset_index(project_root=str(root))
+
+    assert result["action"] == "dry_run"
+    assert (result["build_count"], result["symbol_count"]) == (2, 5), result
+
+
+def test_the_stale_recovery_needs_the_build_of_the_caller():
+    """Without a build it read the newest build of the project, not the build that the caller named."""
+    import inspect
+
+    from fw_context_mcp.mcp.shared.stale import _with_stale_recovery
+
+    parameter = inspect.signature(_with_stale_recovery).parameters["config_hash"]
+    assert parameter.default is inspect.Parameter.empty and parameter.kind is inspect.Parameter.KEYWORD_ONLY

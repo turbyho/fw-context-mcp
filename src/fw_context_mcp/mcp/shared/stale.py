@@ -30,8 +30,6 @@ import sqlite3
 import time
 from pathlib import Path
 
-from ...config import derive_project_id
-from ...indexer.db import get_active_config
 from ...indexer.manifest import _hash_with_cache, load_tu_extensions
 from ...utils import (
     MTIME_TOLERANCE_S,
@@ -40,7 +38,7 @@ from ...utils import (
     build_dir_patterns_with_fw_context,
     compute_source_hash,
 )
-from .context import _quick_open_readonly, get_executor
+from .context import get_executor
 from .paging import holds_past_end_info
 
 log = logging.getLogger(__name__)
@@ -924,8 +922,8 @@ def _with_stale_recovery(
     db_path: Path,
     query_fn,
     *,
+    config_hash: str,
     stale_msg: str = "",
-    config_hash: str | None = None,
 ) -> list[dict]:
     """Execute *query_fn(conn, config_hash)* on the executor with stale-recovery.
 
@@ -934,38 +932,20 @@ def _with_stale_recovery(
     stale) results are always returned — the background reindex handles
     the actual fix asynchronously.
 
-    The ENTIRE body (config read + ``query_fn`` + ``_stale_files``) runs
-    inside ``executor.execute_sync``: the connection is needed for the
-    whole search query, not just the staleness check.  A shorter variant
-    that closed or released the connection after the config read would
-    break every search tool — do NOT "optimise" this by splitting the
-    connection usage.
+    The ENTIRE body (``query_fn`` + ``_stale_files``) runs inside
+    ``executor.execute_sync``: the connection is needed for the whole
+    search query, not just the staleness check.  A shorter variant that
+    released the connection between the two would break every search
+    tool — do NOT "optimise" this by splitting the connection usage.
 
-    ``config_hash`` is read fresh per request via a short-lived
-    read-only connection (no write transaction), then passed per call
-    to the executor — a reindex with a changed build config can never
-    leave queries filtering by a stale hash.
+    *config_hash* is the build that the caller resolved from its selector
+    (``resolve_build``), fresh for each request: a reindex with a changed
+    build config can never leave queries filtering by a stale hash.  WHY it
+    is required: without it this function read the newest build of the
+    project, and on a project of several builds that is the build that the
+    last index run did, not the build that the caller named.
     """
     from ..background import _ensure_daemon_running  # lazy — avoids circular import
-
-    # ── Read config_hash via a separate short-lived read-only connection ──
-    # WHY: config_hash must be read BEFORE entering the executor lock.
-    # The executor's single shared connection is a scarce resource —
-    # using it for a 2-line config lookup would block all concurrent
-    # search queries.  _quick_open_readonly opens a separate WAL reader
-    # that coexists with the executor's connection.
-    # Fresh config_hash per request: a reindex with a changed build
-    # config can never leave queries filtering by a stale hash.
-    if config_hash is None:
-        conn = _quick_open_readonly(db_path)
-        try:
-            project_id = derive_project_id(root)
-            cfg = get_active_config(conn, project_id)
-            if not cfg:
-                return [{"error": "No build config indexed."}]
-            config_hash = cfg["config_hash"]
-        finally:
-            conn.close()
 
     executor = get_executor(db_path)
 
