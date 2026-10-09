@@ -32,6 +32,7 @@ import json
 import os
 import shutil
 from dataclasses import dataclass, field
+from itertools import pairwise
 from pathlib import Path
 
 from fw_context_mcp.utils import SAFE_EXCEPT, is_fatal
@@ -467,6 +468,147 @@ MARKER_START = "<!-- fw-context -->"
 MARKER_END = "<!-- /fw-context -->"
 
 
+@dataclass(frozen=True)
+class MarkerScan:
+    """The marked blocks of a text, and its marker lines that have no pair.
+
+    Each item is a character span ``(start, end)``; *end* includes the line
+    end of the last line.
+    """
+
+    blocks: tuple[tuple[int, int], ...]
+    orphans: tuple[tuple[int, int], ...]
+
+
+def _is_marker(line: str, tag: str) -> bool:
+    """Say whether *line* is the marker *tag*: the tag from the first column, and nothing else but trailing space.
+
+    WHY the first column: a file of the user can show the format of the
+    block in an indented example, and an indented line is that example.
+    """
+    return line.rstrip() == tag
+
+
+def scan_markers(text: str, start_tag: str = MARKER_START, end_tag: str = MARKER_END) -> MarkerScan:
+    """Find the marked blocks of *text*, and the marker lines without a pair.
+
+    A block runs from a start marker line to the next end marker line (see
+    :func:`_is_marker`).
+
+    WHY a marker counts only on a line of its own: a file of the user can
+    NAME the markers in its text, for example "fw-context writes the text
+    between `<!-- fw-context -->` and `<!-- /fw-context -->`".  A search for
+    the substring took that sentence for a block: the new block went into
+    the middle of the sentence, and the real block stayed with the old text.
+
+    A start marker that a second start marker follows before an end
+    marker, an end marker without a start marker, and a start marker
+    without an end are orphans: an edit by hand or a merge left them.  WHY
+    the later start wins: the span from the first start would take the
+    text of the user between the two starts for the block, and an update
+    would delete that text.
+    """
+    blocks: list[tuple[int, int]] = []
+    orphans: list[tuple[int, int]] = []
+    open_line: tuple[int, int] | None = None
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        span = (offset, offset + len(line))
+        offset += len(line)
+        if _is_marker(line, start_tag):
+            if open_line is not None:
+                orphans.append(open_line)
+            open_line = span
+        elif _is_marker(line, end_tag):
+            if open_line is None:
+                orphans.append(span)
+            else:
+                blocks.append((open_line[0], span[1]))
+                open_line = None
+    if open_line is not None:
+        orphans.append(open_line)
+    return MarkerScan(tuple(blocks), tuple(orphans))
+
+
+def marked_blocks(text: str, start_tag: str = MARKER_START, end_tag: str = MARKER_END) -> list[tuple[int, int]]:
+    """Return the character spans of the marked blocks of *text*, see :func:`scan_markers`."""
+    return list(scan_markers(text, start_tag, end_tag).blocks)
+
+
+@dataclass(frozen=True)
+class MarkerUpdate:
+    """The text after :func:`replace_marked_blocks`, and what the update did."""
+
+    text: str
+    # True when the first block got the new text.  False when the text held
+    # no block: the caller then decides where the new block goes.
+    replaced: bool
+    blocks_removed: int
+    orphans_removed: int
+
+
+def _join(parts: list[str], gap: str) -> str:
+    """Join *parts* with *gap* between each two parts that hold text.
+
+    One rule for the whole text, thus each update gives the same text for
+    the same blocks, and a second update changes nothing.
+    """
+    stripped = [part.strip("\n") for part in parts]
+    joined = gap.join(part for part in stripped if part.strip())
+    return joined + "\n" if joined else ""
+
+
+def replace_marked_blocks(
+    text: str, block: str, start_tag: str = MARKER_START, end_tag: str = MARKER_END, gap: str = "\n\n",
+) -> MarkerUpdate:
+    """Put *block* in place of the first marked block of *text*, and remove each other block and each orphan.
+
+    *block* is the whole block, with its markers.  *gap* is the space
+    between a block and the text around it.  Without a marked block in
+    *text*, only the orphans go and ``replaced`` is False (see
+    :func:`scan_markers`).
+
+    Two passes, and each has one rule.  The first removes the orphan lines,
+    and the text of the user around each one stays as it is.  The second
+    finds the blocks again: the first gets *block*, and each other block
+    goes, with *gap* between the parts that stay.
+
+    WHY the other blocks go: one file needs the instructions one time.  A
+    second block, from a merge of two branches or an edit by hand, kept its
+    old text, and an update of the first block alone left the reader with
+    two versions of the rules that contradict each other.
+
+    WHY an orphan goes: a marker without its pair is a rest of an edit, and
+    the next update would take it for a part of a block.
+
+    The text must have LF line ends: ``Path.read_text`` gives that for a
+    file with CRLF line ends, and the new text then has LF line ends.
+    """
+    orphans = scan_markers(text, start_tag, end_tag).orphans
+    for start, end in sorted(orphans, reverse=True):
+        text = text[:start] + text[end:]
+    blocks = scan_markers(text, start_tag, end_tag).blocks
+    if not blocks:
+        return MarkerUpdate(text, False, 0, len(orphans))
+    # One join of the parts of THIS text.  WHY not one edit for each block:
+    # an edit that strips the blank lines at the start of the file moves the
+    # text, and the next edit then cut the text of the user at the old offsets.
+    between = [text[end:next_start] for (_, end), (next_start, _) in pairwise(blocks)]
+    parts = [text[:blocks[0][0]], block, *between, text[blocks[-1][1]:]]
+    return MarkerUpdate(_join(parts, gap), True, len(blocks) - 1, len(orphans))
+
+
+def normalize_marked_block(text: str, block: str, start_tag: str = MARKER_START,
+                           end_tag: str = MARKER_END, gap: str = "\n\n") -> str:
+    """Return *text*, which holds *block* at its new place, in the form that an update gives.
+
+    A caller that inserts a new block (after the frontmatter of an agent,
+    at the end of a file) passes the result here, thus the first run and
+    each later run give the same text.
+    """
+    return replace_marked_blocks(text, block, start_tag, end_tag, gap).text
+
+
 # ── Instruction target ──────────────────────────────────────────────────────
 
 
@@ -806,8 +948,9 @@ def check_target(target: InstructionTarget, project_root: Path | None = None) ->
     except (UnicodeDecodeError, OSError):
         return collision
 
-    # Check for marked section
-    if MARKER_START in content and MARKER_END in content:
+    # Check for marked section: markers on lines of their own, see
+    # marked_blocks.
+    if marked_blocks(content):
         collision.has_marked_section = True
         return collision
 

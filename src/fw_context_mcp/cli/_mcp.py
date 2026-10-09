@@ -20,6 +20,10 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..config.tools import MarkerUpdate
 
 
 def _resolve_mcp_bin() -> str | None:
@@ -179,8 +183,15 @@ def _register_mcp_file(tool, mcp_bin: str, dry_run: bool = False) -> None:
     print(f"  [ok] {tool.name}: fw-context registered ({mcp_bin})")
 
 
-def _update_marked_section(path: Path, content: str, marker: str) -> None:
-    """Insert or replace a <!-- marker --> ... <!-- /marker --> block in a markdown file."""
+def _update_marked_section(path: Path, content: str, marker: str) -> MarkerUpdate:
+    """Insert or replace a <!-- marker --> ... <!-- /marker --> block in a markdown file.
+
+    Returns what the update removed: the first block gets *content*, and
+    each later block and each marker without a pair goes
+    (``config.tools.replace_marked_blocks``).
+    """
+    from ..config.tools import normalize_marked_block, replace_marked_blocks
+
     start_tag = f"<!-- {marker} -->"
     end_tag = f"<!-- /{marker} -->"
 
@@ -193,12 +204,14 @@ def _update_marked_section(path: Path, content: str, marker: str) -> None:
         backup = path.with_suffix(path.suffix + ".bak")
         backup.write_text(existing, encoding="utf-8")
 
-    if start_tag in existing and end_tag in existing:
+    update = replace_marked_blocks(existing, f"{start_tag}\n{content}\n{end_tag}\n", start_tag, end_tag)
+    if update.replaced:
         # Replace the existing marked block (keep markers for idempotency)
-        before = existing[: existing.index(start_tag)]
-        after = existing[existing.index(end_tag) + len(end_tag) :]
-        updated = before.rstrip("\n") + "\n\n" + start_tag + "\n" + content + "\n" + end_tag + "\n" + after.lstrip("\n")
+        updated = update.text
     else:
+        # No block: the markers without a pair are gone, and the block goes
+        # to the end.
+        existing = update.text
         # Remove any unmarked section with the same heading (idempotency for manual installs)
         heading_match = re.search(r"^## .+", content, re.MULTILINE)
         if heading_match:
@@ -217,6 +230,10 @@ def _update_marked_section(path: Path, content: str, marker: str) -> None:
                         skip_until_next_h2 = False
                         result_lines.append(line)
             existing = "\n".join(result_lines)
+        if not existing.strip():
+            # WHY: the white space of a last line such as " " stood before the
+            # start marker, and the marker then was no marker (``_is_marker``).
+            existing = ""
         updated = (
             existing.rstrip("\n")
             + ("\n\n" if existing.strip() else "")
@@ -228,27 +245,36 @@ def _update_marked_section(path: Path, content: str, marker: str) -> None:
             + "\n"
         )
 
+    if not update.replaced:
+        # A new block: the form that an update gives, thus a second run changes nothing.
+        updated = normalize_marked_block(
+            updated, f"{start_tag}\n{content}\n{end_tag}\n", start_tag, end_tag, gap="\n\n",
+        )
     path.write_text(updated, encoding="utf-8")
+    return update
 
 
-def _inject_agent_section(path: Path, content: str, marker: str) -> None:
+def _inject_agent_section(path: Path, content: str, marker: str) -> MarkerUpdate:
     """Insert or replace a ``<!-- marker --> ... <!-- /marker -->`` block in an agent markdown file.
 
     Unlike ``_update_marked_section``, when no existing marker is found this
     inserts the block right after the YAML frontmatter (``---`` delimiters)
     so the CRITICAL instructions are the first thing the agent sees.
     """
+    from ..config.tools import normalize_marked_block, replace_marked_blocks
+
     start_tag = f"<!-- {marker} -->"
     end_tag = f"<!-- /{marker} -->"
 
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
 
-    if start_tag in existing and end_tag in existing:
-        # Replace the existing marked block (keep markers for idempotency)
-        before = existing[: existing.index(start_tag)]
-        after = existing[existing.index(end_tag) + len(end_tag) :]
-        updated = before.rstrip("\n") + "\n\n" + start_tag + "\n" + content + "\n" + end_tag + "\n" + after.lstrip("\n")
+    update = replace_marked_blocks(existing, f"{start_tag}\n{content}\n{end_tag}\n", start_tag, end_tag)
+    if update.replaced:
+        # Replace the existing marked block (keep markers for idempotency).
+        # A marker counts only on a line of its own, and a second block goes.
+        updated = update.text
     else:
+        existing = update.text
         # Insert right after YAML frontmatter (after second "---").
         # Only count --- delimiters that appear in the document preamble —
         # once we pass the closing --- (or see non-YAML content before any
@@ -287,10 +313,16 @@ def _inject_agent_section(path: Path, content: str, marker: str) -> None:
             updated = start_tag + "\n" + content + "\n" + end_tag + "\n\n" + existing
 
     path.parent.mkdir(parents=True, exist_ok=True)
+    if not update.replaced:
+        # A new block: the form that an update gives, thus a second run changes nothing.
+        updated = normalize_marked_block(
+            updated, f"{start_tag}\n{content}\n{end_tag}\n", start_tag, end_tag, gap="\n\n",
+        )
     path.write_text(updated, encoding="utf-8")
+    return update
 
 
-def _inject_agent_toml_section(path: Path, content: str, marker: str) -> None:
+def _inject_agent_toml_section(path: Path, content: str, marker: str) -> MarkerUpdate:
     """Inject a ``# marker ... # /marker`` block into a Codex TOML agent file.
 
     Codex agent files use TOML format with an ``[instructions]`` key that
@@ -299,19 +331,23 @@ def _inject_agent_toml_section(path: Path, content: str, marker: str) -> None:
     When no ``[instructions]`` section exists, one is created at the end
     of the file.
     """
+    from ..config.tools import normalize_marked_block, replace_marked_blocks
+
     start_comment = f"# {marker}"
     end_comment = f"# /{marker}"
 
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
 
-    # If markers already exist, replace between them
-    if start_comment in existing and end_comment in existing:
-        before = existing[: existing.index(start_comment)]
-        after = existing[existing.index(end_comment) + len(end_comment) :]
-        updated = (
-            before.rstrip("\n") + "\n" + start_comment + "\n" + content + "\n" + end_comment + "\n" + after.lstrip("\n")
-        )
+    # If markers already exist, replace between them.  The rules of the
+    # Markdown block apply: a marker counts only on a line of its own, a
+    # second block goes, and so does a marker without a pair.
+    update = replace_marked_blocks(
+        existing, f"{start_comment}\n{content}\n{end_comment}\n", start_comment, end_comment, gap="\n",
+    )
+    if update.replaced:
+        updated = update.text
     else:
+        existing = update.text
         # Find [instructions] section and insert the block there
         instructions_match = re.search(r"^\[instructions\]\s*$", existing, re.MULTILINE)
         if instructions_match:
@@ -337,7 +373,13 @@ def _inject_agent_toml_section(path: Path, content: str, marker: str) -> None:
             )
 
     path.parent.mkdir(parents=True, exist_ok=True)
+    if not update.replaced:
+        # A new block: the form that an update gives, thus a second run changes nothing.
+        updated = normalize_marked_block(
+            updated, f"{start_comment}\n{content}\n{end_comment}\n", start_comment, end_comment, gap="\n",
+        )
     path.write_text(updated, encoding="utf-8")
+    return update
 
 
 def _convert_agent_md_to_toml(md_content: str) -> str:

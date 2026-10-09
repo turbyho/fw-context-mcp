@@ -207,6 +207,38 @@ def _build_agent_targets(
     return targets
 
 
+def _report_planned_cleanup(path: Path, *tags: str) -> None:
+    """In a dry run, say which blocks and marker lines an update of *path* would remove.
+
+    A file that cannot be read gets no count: the dry run shows what it
+    can, and the real run reports the error of that file.
+    """
+    from ..config.tools import scan_markers
+
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return
+    scan = scan_markers(text, *tags)
+    _report_marker_cleanup(path, max(len(scan.blocks) - 1, 0), len(scan.orphans), dry_run=True)
+
+
+def _report_marker_cleanup(path: Path, blocks: int, orphans: int, *, dry_run: bool = False) -> None:
+    """Say which older fw-context blocks and which markers without a pair an update removes.
+
+    WHY a line of its own: the update removes text from a file of the user,
+    and the user must see that it happened, also in a dry run.
+    """
+    parts = []
+    if blocks:
+        parts.append(f"{blocks} older fw-context section(s)")
+    if orphans:
+        parts.append(f"{orphans} fw-context marker line(s) without a pair")
+    if parts:
+        verb = "would remove" if dry_run else "removed"
+        print(f"  [{'dry-run' if dry_run else 'fix'}] {path}: {verb} {' and '.join(parts)}")
+
+
 def _inject_critical_block(
     agents_dir: Path,
     patterns: list[str],
@@ -235,14 +267,17 @@ def _inject_critical_block(
     for agent_path in existing_files:
         if dry_run:
             print(f"  [dry-run] {agent_path}: would UPDATE fw-context section")
+            tags = ("# fw-context", "# /fw-context") if agent_path.suffix == ".toml" else ()
+            _report_planned_cleanup(agent_path, *tags)
             installed = True
             continue
 
         if agent_path.suffix == ".toml":
-            _inject_agent_toml_section(agent_path, critical_block, "fw-context")
+            update = _inject_agent_toml_section(agent_path, critical_block, "fw-context")
         else:
-            _inject_agent_section(agent_path, critical_block, "fw-context")
+            update = _inject_agent_section(agent_path, critical_block, "fw-context")
         print(f"  [ok] {agent_path}: updated fw-context section")
+        _report_marker_cleanup(agent_path, update.blocks_removed, update.orphans_removed)
         installed = True
 
     return installed
@@ -525,15 +560,18 @@ def _inject_instructions(
                 print(f"  [dry-run] {resolved}: would UPDATE marked section")
             else:
                 print(f"  [dry-run] {resolved}: would CREATE ({target.method})")
+            if target.method == "marked_section":
+                _report_planned_cleanup(resolved)
             ok = True
             continue
 
         if target.method == "marked_section":
-            _update_marked_section(resolved, instructions, marker="fw-context")
+            update = _update_marked_section(resolved, instructions, marker="fw-context")
             if collision.has_marked_section:
                 print(f"  [ok] {resolved}: updated fw-context section")
             else:
                 print(f"  [ok] {resolved}: added fw-context section")
+            _report_marker_cleanup(resolved, update.blocks_removed, update.orphans_removed)
         elif target.method == "separate_file":
             resolved.parent.mkdir(parents=True, exist_ok=True)
             resolved.write_text(instructions, encoding="utf-8")
