@@ -855,7 +855,7 @@ def test_every_copy_of_the_instructions_teaches_the_selector():
 def test_every_copy_of_the_instructions_says_one_query_one_build():
     """A reader that misses this asks about a bootloader and an application.
 
-    Both selectors fail closed, thus a reader who does not know the rule
+    The server selects no build, thus a reader who does not know the rule
     meets an error and has to guess what to do.  The text must name the
     two axes, say that the answer covers one build, and give the way
     forward: ask twice.
@@ -898,7 +898,9 @@ def test_every_copy_of_the_instructions_states_the_corrected_tool_rules():
         "get_source and get_symbol_context set a stale_warning",
         "There is no status",
         'wins over "reindexing"',
-        "found in the index) and sets no [build] default_variant",
+        "fw-context selects none for you",
+        "If the task does not identify one build, ask the user",
+        "smart_search and semantic_search included",
         "when more is true",
         "search_content, find_dead_code",
         "Repeat the call with that project_id",

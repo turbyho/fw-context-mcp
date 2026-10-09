@@ -951,8 +951,9 @@ class TestESPIDFInitAndIndex:
     def test_the_bootloader_is_a_second_image(self, indexed):
         """idf.py builds the application and its bootloader, and each is an image of the build.
 
-        The application is indexed last, thus it is the newest build, and a
-        query without ``image`` gets it.
+        The application is indexed last, thus it is the newest build.  A
+        query names its image: without one, the query gets a refusal that
+        lists the two builds, and the server selects neither.
         """
         from fw_context_mcp.config import derive_project_id
         from fw_context_mcp.config import load as load_config
@@ -970,9 +971,11 @@ class TestESPIDFInitAndIndex:
             }
             app = next(r["config_hash"] for r in rows if r["image"] == "fwctx_test_esp_idf")
             assert _config_hash(conn, indexed) == app
-            chosen, err = resolve_build(conn, project_id, load_config(indexed), project_root=indexed)
-            assert err is None, err
-            assert chosen == app
+            cfg = load_config(indexed)
+            assert resolve_build(conn, project_id, cfg, "", "fwctx_test_esp_idf") == (app, None)
+            chosen, err = resolve_build(conn, project_id, cfg)
+            assert chosen is None, f"the server selected {chosen}"
+            assert err is not None and 'image="bootloader"' in err, err
         finally:
             conn.close()
 

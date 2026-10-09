@@ -1,9 +1,10 @@
-"""Tests for the default image: the program that a query without ``image`` gets.
+"""Tests for images: the programs of one build.
 
 An ESP-IDF build makes two programs, the application and its bootloader,
-and both are indexed as images of one build.  A query without ``image``
-gets ``[build] default_image``, else the image whose index read the database
-of the application, else an error that lists the images.
+and both are indexed as images of one build.  A query names one of them:
+the server selects no default image (``resolve_build``).  The application
+that the build system names is still what ``get_active_build`` and
+``fw-context index`` check (``active_build``).
 """
 
 import argparse
@@ -100,186 +101,83 @@ class TestEspIdfImages:
         assert set(output_compile_commands(ESPIDFBuildSystem(), tmp_path, BuildConfig())) == {APP, "bootloader"}
 
 
-class TestResolveWithoutVariants:
-    def test_the_build_system_names_the_application(self, temp_db, tmp_path):
-        """No config key is necessary: ESP-IDF says which database is the application."""
-        _two_images(temp_db, tmp_path)
+class TestResolveImages:
+    """A build that makes two programs is two builds, and a query names one of them.
 
-        config_hash, err = resolve_build(temp_db, "proj", _cfg("esp-idf"), project_root=tmp_path)
+    Until 2026-10 a query without ``image`` got ``[build] default_image``,
+    else the image that the build system names as its application.  The
+    caller then got the application while it asked about nothing, and the
+    answer did not say so.
+    """
 
-        assert err is None, err
-        assert config_hash == "h-app"
-
-    def test_no_build_output_is_necessary(self, temp_db, tmp_path):
-        """A clean build removes out/ for a while, and the index stays complete."""
-        _two_images(temp_db, tmp_path)
-        assert not BuildLayout(tmp_path).root.exists()
-
-        config_hash, err = resolve_build(temp_db, "proj", _cfg("esp-idf"), project_root=tmp_path)
-
-        assert err is None, err
-        assert config_hash == "h-app"
-
-    def test_the_config_comes_before_the_build_system(self, temp_db, tmp_path):
-        _two_images(temp_db, tmp_path)
-
-        config_hash, err = resolve_build(
-            temp_db, "proj", _cfg("esp-idf", default_image_name="bootloader"), project_root=tmp_path
-        )
-
-        assert err is None, err
-        assert config_hash == "h-boot"
-
-    def test_the_newest_build_does_not_decide(self, temp_db, tmp_path):
-        """The default is the application, and not the program that the index run did last."""
-        _two_images(temp_db, tmp_path, application_last=False)
-
-        config_hash, err = resolve_build(temp_db, "proj", _cfg("esp-idf"), project_root=tmp_path)
-
-        assert err is None, err
-        assert config_hash == "h-app"
-
-    def test_an_application_that_is_not_indexed_is_an_error(self, temp_db, tmp_path):
-        """The one image that is there is the bootloader, and the query is about the application."""
-        out_dir = BuildLayout(tmp_path).out_dir("")
-        _seed(temp_db, [("h-boot", "", "bootloader", out_dir / "bootloader" / "compile_commands.json")])
-
-        config_hash, err = resolve_build(temp_db, "proj", _cfg("esp-idf"), project_root=tmp_path)
-
-        assert config_hash is None
-        assert err is not None and "application" in err and "not indexed" in err, err
-        assert "bootloader" in err, err
-
-    def test_a_project_at_another_path_finds_its_application(self, temp_db, tmp_path):
-        """A moved project, a second clone and a git worktree share the index of the first path."""
-        _two_images(temp_db, tmp_path / "old", application_last=False)
-
-        config_hash, err = resolve_build(temp_db, "proj", _cfg("esp-idf"), project_root=tmp_path / "new")
-
-        assert err is None, err
-        assert config_hash == "h-app"
-
-    def test_the_build_from_before_images_is_the_application(self, temp_db, tmp_path):
-        """After an upgrade the index holds the old build without an image name and the new bootloader.
-
-        The old build is the application: a build of several programs then
-        indexed only the database that the build returned.  It answers
-        until the first run indexes the application as an image, and
-        that run removes it.
-        """
-        out_dir = BuildLayout(tmp_path).out_dir("")
-        _seed(temp_db, [
-            ("h-old", "", "", tmp_path / "build" / "compile_commands.json"),
-            ("h-boot", "", "bootloader", out_dir / "bootloader" / "compile_commands.json"),
-        ])
-
-        config_hash, err = resolve_build(temp_db, "proj", _cfg("esp-idf"), project_root=tmp_path)
-
-        assert err is None, err
-        assert config_hash == "h-old"
-
-    def test_one_image_answers_when_no_application_is_named(self, temp_db, tmp_path):
-        _seed(temp_db, [("h-only", "", "only", tmp_path / "cc.json")])
-
-        config_hash, err = resolve_build(temp_db, "proj", _cfg("cmake"), project_root=tmp_path)
-
-        assert err is None, err
-        assert config_hash == "h-only"
-
-    def test_without_a_default_the_query_must_name_the_image(self, temp_db, tmp_path):
-        """No project root and no config key: fail closed, and name the choices."""
+    def test_two_images_without_a_selector_are_refused(self, temp_db, tmp_path):
+        """The build system names the application, and the query still names no build."""
         _two_images(temp_db, tmp_path)
 
         config_hash, err = resolve_build(temp_db, "proj", _cfg("esp-idf"))
 
-        assert config_hash is None
-        assert err is not None and "image" in err
-        assert APP in err and "bootloader" in err, err
-        assert "default_image" in err, err
+        assert config_hash is None, f"the server selected {config_hash}"
+        assert err is not None and "names no build" in err, err
+        assert f'image="{APP}"' in err and 'image="bootloader"' in err, err
 
-    def test_a_named_image_answers(self, temp_db, tmp_path):
+    def test_default_image_selects_nothing(self, temp_db, tmp_path):
         _two_images(temp_db, tmp_path)
 
-        config_hash, err = resolve_build(temp_db, "proj", _cfg("esp-idf"), "", "bootloader", project_root=tmp_path)
+        config_hash, err = resolve_build(temp_db, "proj", _cfg("esp-idf", default_image_name="bootloader"))
 
-        assert err is None, err
-        assert config_hash == "h-boot"
+        assert config_hash is None, f"[build] default_image selected {config_hash}"
+        assert err is not None
 
-    def test_an_unknown_image_names_the_known_ones(self, temp_db, tmp_path):
+    @pytest.mark.parametrize(("image", "expected"), [(APP, "h-app"), ("bootloader", "h-boot")])
+    def test_a_named_image_answers(self, temp_db, tmp_path, image: str, expected: str):
         _two_images(temp_db, tmp_path)
 
-        config_hash, err = resolve_build(temp_db, "proj", _cfg("esp-idf"), "", "zzz", project_root=tmp_path)
+        assert resolve_build(temp_db, "proj", _cfg("esp-idf"), "", image) == (expected, None)
 
-        assert config_hash is None
-        assert err is not None and "Unknown image 'zzz'" in err
-        assert APP in err and "bootloader" in err, err
+    def test_the_only_indexed_image_answers_without_a_selector(self, temp_db, tmp_path):
+        """One build in the index is no choice, even when it is not the application."""
+        out_dir = BuildLayout(tmp_path).out_dir("")
+        _seed(temp_db, [("h-boot", "", "bootloader", out_dir / "bootloader" / "compile_commands.json")])
 
-    def test_a_variant_names_nothing_and_the_error_names_the_images(self, temp_db, tmp_path):
+        assert resolve_build(temp_db, "proj", _cfg("esp-idf")) == ("h-boot", None)
+
+    def test_an_unknown_image_lists_the_builds(self, temp_db, tmp_path):
         _two_images(temp_db, tmp_path)
 
-        config_hash, err = resolve_build(temp_db, "proj", _cfg("esp-idf"), "zzz", "", project_root=tmp_path)
+        config_hash, err = resolve_build(temp_db, "proj", _cfg("esp-idf"), "", "zzz")
 
         assert config_hash is None
-        assert err is not None and "declares no variants" in err, err
-        assert APP in err and "bootloader" in err, err
+        assert err is not None and 'image="zzz"' in err, err
+        assert f'image="{APP}"' in err and 'image="bootloader"' in err, err
 
+    def test_a_variant_in_a_project_without_variants_lists_the_builds(self, temp_db, tmp_path):
+        _two_images(temp_db, tmp_path)
 
-class TestResolveInAVariant:
-    def _seed(self, conn) -> None:
-        _seed(conn, [
+        config_hash, err = resolve_build(temp_db, "proj", _cfg("esp-idf"), "zzz", APP)
+
+        assert config_hash is None
+        assert err is not None and f'image="{APP}"' in err, err
+
+    def test_a_variant_with_images_needs_the_pair(self, temp_db):
+        _seed(temp_db, [
             ("h-a-app", "a", "app", Path("/tmp/a")),
             ("h-a-boot", "a", "mcuboot", Path("/tmp/b")),
             ("h-b-app", "b", "app", Path("/tmp/c")),
-            ("h-b-boot", "b", "mcuboot", Path("/tmp/d")),
         ])
-
-    def test_default_image_applies_to_the_default_variant(self, temp_db):
-        self._seed(temp_db)
         cfg = _cfg(variants=[BuildVariant(name="a"), BuildVariant(name="b")], default_variant="a",
                    default_image_name="app")
 
-        config_hash, err = resolve_build(temp_db, "proj", cfg)
-
-        assert err is None, err
-        assert config_hash == "h-a-app"
-
-    def test_default_image_applies_to_a_named_variant_that_holds_it(self, temp_db):
-        self._seed(temp_db)
-        cfg = _cfg(variants=[BuildVariant(name="a"), BuildVariant(name="b")], default_variant="a",
-                   default_image_name="app")
-
-        config_hash, err = resolve_build(temp_db, "proj", cfg, "b")
-
-        assert err is None, err
-        assert config_hash == "h-b-app"
-
-    def test_a_default_image_that_the_variant_does_not_hold_fails_closed(self, temp_db):
-        self._seed(temp_db)
-        cfg = _cfg(variants=[BuildVariant(name="a"), BuildVariant(name="b")], default_variant="a",
-                   default_image_name="stage0")
-
-        config_hash, err = resolve_build(temp_db, "proj", cfg)
-
-        assert config_hash is None
-        assert err is not None and "app" in err and "mcuboot" in err, err
-
-    def test_an_esp_idf_variant_gets_its_application(self, temp_db, tmp_path):
-        out_dir = BuildLayout(tmp_path).out_dir("esp32s3")
-        _seed(temp_db, [
-            ("h-app", "esp32s3", APP, out_dir / "compile_commands.json"),
-            ("h-boot", "esp32s3", "bootloader", out_dir / "bootloader" / "compile_commands.json"),
-        ])
-        cfg = _cfg("esp-idf", variants=[BuildVariant(name="esp32s3")], default_variant="esp32s3")
-
-        config_hash, err = resolve_build(temp_db, "proj", cfg, project_root=tmp_path)
-
-        assert err is None, err
-        assert config_hash == "h-app"
+        assert resolve_build(temp_db, "proj", cfg, "a", "mcuboot") == ("h-a-boot", None)
+        config_hash, err = resolve_build(temp_db, "proj", cfg, "a")
+        assert config_hash is None, f"the defaults completed the pair to {config_hash}"
+        assert err is not None and 'variant="a", image="mcuboot"' in err, err
 
 
 class TestActiveBuild:
-    def test_the_tools_without_a_selector_get_the_application(self, temp_db, tmp_path):
-        """smart_search and semantic_search answer for this build, and get_active_build reports it."""
+    """The build that ``get_active_build`` and ``fw-context index`` check: no query reads it."""
+
+    def test_the_check_gets_the_application(self, temp_db, tmp_path):
+        """A failed application leaves the bootloader as the newest build."""
         _two_images(temp_db, tmp_path, application_last=False)
 
         row, refusal = active_build(temp_db, "proj", _cfg("esp-idf"), tmp_path)
@@ -287,23 +185,73 @@ class TestActiveBuild:
         assert refusal is None
         assert row is not None and row["config_hash"] == "h-app"
 
-    def test_several_variants_without_a_default_give_the_newest_build(self, temp_db):
-        """The tools without a selector keep the newest build, as they always did."""
-        _seed(temp_db, [("h-a", "a", "", Path("/tmp/a")), ("h-b", "b", "", Path("/tmp/b"))])
+    def test_no_build_output_is_necessary(self, temp_db, tmp_path):
+        """A clean build removes out/ for a while, and the check still finds the application."""
+        _two_images(temp_db, tmp_path, application_last=False)
+        assert not BuildLayout(tmp_path).root.exists()
 
-        row, refusal = active_build(temp_db, "proj", _cfg(), None)
+        row, refusal = active_build(temp_db, "proj", _cfg("esp-idf"), tmp_path)
 
         assert refusal is None
-        assert row is not None and row["config_hash"] == "h-b"
+        assert row is not None and row["config_hash"] == "h-app"
 
-    def test_an_application_that_is_not_indexed_gives_no_build(self, temp_db, tmp_path):
-        """The first index run makes the bootloader in minutes and the application in hours.
+    def test_a_project_at_another_path_finds_its_application(self, temp_db, tmp_path):
+        """A moved project, a second clone and a git worktree share the index of the first path."""
+        _two_images(temp_db, tmp_path / "old", application_last=False)
 
-        The tools without a selector answered from the bootloader in that
-        time, while every other tool refused.
+        row, refusal = active_build(temp_db, "proj", _cfg("esp-idf"), tmp_path / "new")
+
+        assert refusal is None
+        assert row is not None and row["config_hash"] == "h-app"
+
+    def test_the_build_from_before_images_is_the_application(self, temp_db, tmp_path):
+        """After an upgrade the index holds the old build without an image name and the new bootloader.
+
+        The old build is the application: a build of several programs then
+        indexed only the database that the build returned.
         """
         out_dir = BuildLayout(tmp_path).out_dir("")
-        _seed(temp_db, [("h-boot", "", "bootloader", out_dir / "bootloader" / "compile_commands.json")])
+        _seed(temp_db, [
+            ("h-old", "", "", tmp_path / "build" / "compile_commands.json"),
+            ("h-boot", "", "bootloader", out_dir / "bootloader" / "compile_commands.json"),
+        ])
+
+        row, refusal = active_build(temp_db, "proj", _cfg("esp-idf"), tmp_path)
+
+        assert refusal is None
+        assert row is not None and row["config_hash"] == "h-old"
+
+    def test_default_image_has_no_effect(self, temp_db, tmp_path):
+        _two_images(temp_db, tmp_path)
+
+        row, _refusal = active_build(temp_db, "proj", _cfg("esp-idf", default_image_name="bootloader"), tmp_path)
+
+        assert row is not None and row["config_hash"] == "h-app", "[build] default_image selected the build"
+
+    def test_images_that_nothing_names_give_no_build(self, temp_db, tmp_path):
+        """A backend that names no application gives no rule to select one of the images."""
+        _seed(temp_db, [("h-one", "", "one", tmp_path / "1.json"), ("h-two", "", "two", tmp_path / "2.json")])
+
+        row, refusal = active_build(temp_db, "proj", _cfg("cmake"), tmp_path)
+
+        assert row is None
+        assert refusal is not None and "Nothing names one of them" in refusal, refusal
+
+    def test_several_variants_give_the_newest_build(self, temp_db):
+        _seed(temp_db, [("h-a", "a", "", Path("/tmp/a")), ("h-b", "b", "", Path("/tmp/b"))])
+
+        row, refusal = active_build(temp_db, "proj", _cfg(default_variant="a"), None)
+
+        assert refusal is None
+        assert row is not None and row["config_hash"] == "h-b", "default_variant has no effect"
+
+    def test_an_application_that_is_not_indexed_gives_no_build(self, temp_db, tmp_path):
+        """The first index run makes the bootloader in minutes and the application in hours."""
+        out_dir = BuildLayout(tmp_path).out_dir("")
+        _seed(temp_db, [
+            ("h-boot", "", "bootloader", out_dir / "bootloader" / "compile_commands.json"),
+            ("h-flasher", "", "flasher", out_dir / "flasher" / "compile_commands.json"),
+        ])
 
         row, refusal = active_build(temp_db, "proj", _cfg("esp-idf"), tmp_path)
 

@@ -401,8 +401,8 @@ class ZephyrBuildSystem:
 
         The default image of ``domains.yaml`` is the application.  None
         without the file: the build made one program, or it is not there.
-        While a pristine build has removed the file, a query must name the
-        image or use ``[build] default_image``.
+        No query reads it: a query names its image.  ``get_active_build``
+        and ``fw-context index`` check the build that it names.
         """
         try:
             domains = _read_domains(out_dir)

@@ -27,6 +27,7 @@ from fw_context_mcp.indexer.db import count_macros, lookup_macro
 from fw_context_mcp.mcp.handlers._search_fallbacks import _symbol_row_to_dict
 from fw_context_mcp.mcp.shared.context import _db_path
 from fw_context_mcp.mcp.shared.paging import clamp_offset, page_hint, page_notice, selector_args
+from fw_context_mcp.mcp.shared.variants import IMAGE_DESCRIPTION, VARIANT_DESCRIPTION
 from fw_context_mcp.utils import abs_path, macro_signature, resolve_project_root
 
 # ``class`` comes from the parent symbol, and it is empty for a free
@@ -102,14 +103,14 @@ def lookup_symbol(
     exact: Annotated[bool, Field(description="True = exact name match, False = prefix LIKE match (default).")] = False,
     limit: Annotated[int, Field(description="Maximum results returned (capped at 100, default 50).", ge=1)] = 50,
     offset: Annotated[int, Field(description="Skip this many results. Pages through a name that many classes share, such as 'read' or 'write'.", ge=0)] = 0,
-    variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
-    image: Annotated[str | None, Field(description="Image of the build (Zephyr sysbuild, ESP-IDF). Each image is a separate program. When omitted: [build] default_image, else the application that the build names (ESP-IDF, Zephyr sysbuild), else the only image, else an error that lists the images.")] = None,
+    variant: Annotated[str | None, Field(description=VARIANT_DESCRIPTION)] = None,
+    image: Annotated[str | None, Field(description=IMAGE_DESCRIPTION)] = None,
 ) -> list[dict]:
     """Look up a C/C++ symbol by name via libclang index — exact or prefix
     matching. Finds symbols text-based search can miss: build-conditional
     code, template instantiations, macro-expanded names. Macros are
     extracted via ``clang -dM -E`` during indexing so ``#ifdef``-conditional
-    macros resolve correctly for the active build config. Prefer this over
+    macros resolve correctly for the build of the query. Prefer this over
     search_code when you know the exact symbol name or a prefix
     (``uart_`` finds all UART symbols). Use search_code for
     keyword/concept search.
@@ -134,13 +135,14 @@ def lookup_symbol(
             notice names the offset to use.  The order is stable (a
             definition first, then the line, then the file and the USR),
             thus two pages never overlap and never skip a symbol.
-        variant: Build variant (multi-build project). Omit to use
-            default_variant. One query answers for ONE build.
-        image: Image of the build (Zephyr sysbuild, ESP-IDF). Each image
-            is a separate program. When omitted: [build] default_image,
-            else the application that the build names (ESP-IDF,
-            Zephyr sysbuild), else the only image, else an error that
-            lists the images.
+        variant: Variant of the build (a board, or a PlatformIO
+            environment). On a project of more than one build, give the
+            variant and the image of one build, as the refusal lists
+            them. fw-context does not select a build. One query answers
+            for ONE build.
+        image: Image of the build: a separate program, such as the
+            application or the bootloader. Give it when the build has an
+            image name.
 
     Returns:
         list[dict]: The page notice leads the answer — ``total``, ``offset``,

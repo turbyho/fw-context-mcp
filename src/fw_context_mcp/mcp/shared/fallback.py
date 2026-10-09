@@ -17,12 +17,10 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from ...config import derive_project_id
-from ...config import load as load_config
 from ...utils import abs_path
 from .context import _is_stale, _quick_open_readonly, get_executor
 from .paging import page_hint, page_notice, past_end_info
 from .stale import _stale_files
-from .variants import active_build
 
 
 def _fallback_to_search_code(
@@ -33,12 +31,18 @@ def _fallback_to_search_code(
     warning: str,
     offset: int = 0,
     hint_args: Mapping[str, object] | None = None,
+    *,
+    config_hash: str,
 ) -> list[dict]:
     """Fall back to lexical search when Ollama/embeddings are unavailable.
 
     Runs on the shared executor connection (same as regular tools) and
-    adds a stale warning when the index is out of date.  ``config_hash``
-    is read fresh per request via a short-lived read-only connection.
+    adds a stale warning when the index is out of date.
+
+    *config_hash* is the build that the caller resolved from its selector.
+    WHY the caller gives it: this function resolved a build of its own
+    until 2026-10, without the selector, and a fallback could answer for
+    another build than the main path.
 
     The answer is one page, at *offset*, with the page notice of
     semantic_search: the reader pages the tool it called, and the same
@@ -52,15 +56,12 @@ def _fallback_to_search_code(
         # of crashing (callers may pass a path whose index was deleted).
         return [{"error": f"Cannot open index database {db_path}: {e}. Run 'fw-context index' first."}]
     try:
-        project_id = derive_project_id(root)
-        # The build of semantic_search, which takes no selector: the build
-        # that its main path reads (see active_build), and not the newest.
-        cfg, refusal = active_build(conn, project_id, load_config(root), root)
-        if refusal:
-            return [{"error": refusal}]
-        if not cfg:
+        cfg = conn.execute(
+            "SELECT * FROM build_configs WHERE project_id = ? AND config_hash = ?",
+            (derive_project_id(root), config_hash),
+        ).fetchone()
+        if cfg is None:
             return [{"error": "No build config indexed."}]
-        config_hash = cfg["config_hash"]
         compile_commands_path = cfg["compile_commands_path"]
     finally:
         conn.close()

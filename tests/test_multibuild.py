@@ -263,225 +263,225 @@ class TestVariantDiscovery:
 
 
 class TestResolveBuild:
-    def _cfg(self, variants=None, default_variant=None):
+    """``resolve_build``: the caller names the build, and the server does not guess.
+
+    A project of several builds has no active build.  Until 2026-10 a query
+    without a selector got ``[build] default_variant``, ``[build]
+    default_image``, or the application that the build system names.  An
+    answer from a guessed build looks correct, thus the caller could not
+    see that it asked about another program.
+    """
+
+    def _cfg(self, variants=None, default_variant=None, default_image=None):
         from fw_context_mcp.config.settings import Config
 
         cfg = Config()
         cfg.build.variants = variants or []
         cfg.build.default_variant = default_variant
+        cfg.build.default_image = default_image
         return cfg
 
-    def _seed(self, conn):
+    @staticmethod
+    def _rows(conn, rows: list[tuple[str, str, str]]) -> None:
+        """Index ``(config_hash, variant, image)`` in this order: the last row is the newest."""
         from fw_context_mcp.indexer.db import transaction, upsert_build_config, upsert_project
 
         with transaction(conn):
             upsert_project(conn, "proj", "t", "/tmp/t")
-            upsert_build_config(conn, "h-a-app", "proj", "/tmp/a", variant="a", image="app")
-            upsert_build_config(conn, "h-a-stage", "proj", "/tmp/b", variant="a", image="stage0")
-            upsert_build_config(conn, "h-b-app", "proj", "/tmp/c", variant="b", image="app")
+            for config_hash, variant, image in rows:
+                upsert_build_config(conn, config_hash, "proj", f"/tmp/{config_hash}.json",
+                                    variant=variant, image=image)
 
-    def test_an_indexed_variant_makes_a_project_multi_build(self, temp_db):
-        """The INDEX is the fact; the config only declares an intention.
+    def _seed(self, conn):
+        self._rows(conn, [("h-a-app", "a", "app"), ("h-a-stage", "a", "stage0"), ("h-b-app", "b", "app")])
 
-        An index run with ``--variant`` writes the variant name into
-        build_configs.  A config that no longer declares that variant — it
-        was edited, or the index came from elsewhere — used to send the
-        query down the single-project path, where the NEWEST build wins in
-        silence.  Measured on a seeded index holding an application and a
-        bootloader, a query that named no build got the bootloader.
-        """
-        self._seed(temp_db)
-        config_hash, err = resolve_build(temp_db, "proj", self._cfg(), "", "")
+    # ── One build ──
 
-        assert config_hash is None, (
-            f"a query that named no build got {config_hash!r} of three builds"
-        )
-        assert err is not None and "variant" in err, f"got: {err}"
-        assert "a" in err and "b" in err, f"the error names no choice: {err}"
+    def test_a_single_build_needs_no_selector(self, temp_db):
+        self._rows(temp_db, [("h-single", "", "")])
 
-    def test_the_indexed_names_reach_the_error(self, temp_db):
-        """A config that declares nothing must still name the real choices."""
-        self._seed(temp_db)
-        _hash, err = resolve_build(temp_db, "proj", self._cfg(), "zzz", "")
-        assert err is not None and "Unknown variant" in err
-        assert "a" in err and "b" in err, f"got: {err}"
+        assert resolve_build(temp_db, "proj", self._cfg(), "", "") == ("h-single", None)
 
-    def test_an_indexed_variant_still_answers_when_named(self, temp_db):
-        """Fail-closed must not mean unreachable."""
-        self._seed(temp_db)
-        config_hash, err = resolve_build(temp_db, "proj", self._cfg(), "a", "stage0")
-        assert err is None, f"got: {err}"
-        assert config_hash == "h-a-stage"
+    def test_a_single_build_answers_its_own_pair(self, temp_db):
+        """A caller that copies the pair from the build list must not get a refusal."""
+        self._rows(temp_db, [("h-only", "a", "app")])
 
-    def test_single_project_needs_no_selector(self, temp_db):
-        from fw_context_mcp.indexer.db import transaction, upsert_build_config, upsert_project
-
-        with transaction(temp_db):
-            upsert_project(temp_db, "proj", "t", "/tmp/t")
-            upsert_build_config(temp_db, "h-single", "proj", "/tmp/cc.json")
-
-        config_hash, err = resolve_build(temp_db, "proj", self._cfg(), "", "")
-        assert err is None
-        assert config_hash == "h-single"
-
-    def _single(self, temp_db):
-        """A project with ONE build and no declared variant."""
-        from fw_context_mcp.indexer.db import (
-            transaction,
-            upsert_build_config,
-            upsert_project,
-        )
-
-        with transaction(temp_db):
-            upsert_project(temp_db, "proj", "t", "/tmp/t")
-            upsert_build_config(temp_db, "h-single", "proj", "/tmp/cc.json")
+        assert resolve_build(temp_db, "proj", self._cfg(), "a", "app") == ("h-only", None)
+        assert resolve_build(temp_db, "proj", self._cfg(), "", "") == ("h-only", None)
 
     @pytest.mark.parametrize(
         ("variant", "image"),
         [("zzz", ""), ("", "zzz"), ("zzz", "yyy"), ("*", "")],
         ids=["variant", "image", "both", "star"],
     )
-    def test_a_single_build_project_refuses_a_named_build(
-        self, temp_db, variant: str, image: str
-    ):
-        """Naming a build that cannot exist must fail, not answer.
+    def test_a_single_build_refuses_another_name(self, temp_db, variant: str, image: str):
+        """A named build that the project does not hold must fail, and not answer from the one it has.
 
-        This branch returned the active build without reading the two
-        arguments at all, thus every fail-closed check below it — the
-        refusal of ``variant="*"`` included — was out of reach for a
-        project that declares no variant.  Measured over 13 indexed
-        builds: the six single-build ones answered ``variant="zzz"`` with
-        rows while the seven Zephyr images refused it by name.
+        Measured over 13 indexed builds before this check: the six
+        single-build ones answered ``variant="zzz"`` with rows.
         """
-        self._single(temp_db)
+        self._rows(temp_db, [("h-single", "", "")])
 
         config_hash, err = resolve_build(temp_db, "proj", self._cfg(), variant, image)
 
         assert config_hash is None, "a named build must not answer from another"
-        assert err is not None
-        assert "ONE build" in err, err
-        if variant:
-            assert repr(variant) in err, err
-        if image:
-            assert repr(image) in err, err
+        assert err is not None and "holds one build" in err, err
+        for name in (variant, image):
+            if name:
+                assert f'"{name}"' in err, err
+        assert "no variant and no image" in err, f"the refusal does not name the build it has: {err}"
 
-    def test_multi_fail_closed_without_default(self, temp_db):
-        self._seed(temp_db)
-        cfg = self._cfg([BuildVariant(name="a"), BuildVariant(name="b")])
-        config_hash, err = resolve_build(temp_db, "proj", cfg, "", "")
-        assert err is not None and "default_variant" in err
+    def test_a_part_of_the_pair_of_a_single_build_is_refused(self, temp_db):
+        self._rows(temp_db, [("h-only", "a", "app")])
+
+        config_hash, err = resolve_build(temp_db, "proj", self._cfg(), "a", "")
+
         assert config_hash is None
+        assert err is not None and 'variant="a", image="app"' in err, err
 
-    def test_default_variant_still_needs_an_image(self, temp_db):
-        """A variant with several images has not said which program to read.
+    # ── Several builds ──
 
-        Variant 'a' holds 'app' and 'stage0', and those are separate
-        binaries.  Answering for both would blend a loader with the
-        application, thus the selection fails closed and names the choice.
-        """
+    def test_no_selector_on_several_builds_is_refused(self, temp_db):
+        """The refusal lists every build, with the arguments to repeat the call."""
         self._seed(temp_db)
-        cfg = self._cfg([BuildVariant(name="a"), BuildVariant(name="b")], default_variant="a")
-        config_hash, err = resolve_build(temp_db, "proj", cfg, "", "")
+
+        config_hash, err = resolve_build(temp_db, "proj", self._cfg(), "", "")
+
         assert config_hash is None
-        assert err is not None and "image" in err
-        assert "app" in err and "stage0" in err, f"the error names no choice: {err}"
+        assert err is not None and "names no build" in err, err
+        for pair in ('variant="a", image="app"', 'variant="a", image="stage0"', 'variant="b", image="app"'):
+            assert pair in err, f"the refusal hides {pair}: {err}"
+        assert "Repeat the call" in err, err
+        assert "ask the user" in err, err
 
-    def test_a_variant_with_one_image_needs_no_image(self, temp_db):
-        """With nothing to confuse, the query answers."""
+    def test_the_config_defaults_select_nothing(self, temp_db):
+        """``[build] default_variant`` and ``[build] default_image`` have no effect."""
         self._seed(temp_db)
-        cfg = self._cfg([BuildVariant(name="a"), BuildVariant(name="b")], default_variant="b")
+        cfg = self._cfg([BuildVariant(name="a"), BuildVariant(name="b")], default_variant="b", default_image="app")
+
         config_hash, err = resolve_build(temp_db, "proj", cfg, "", "")
-        assert err is None
-        assert config_hash == "h-b-app"
 
-    def test_variant_star_is_refused(self, temp_db):
-        """One query answers for ONE build — see shared/variants.py.
+        assert config_hash is None, f"a default selected {config_hash}"
+        assert err is not None and "names no build" in err, err
 
-        The star used to answer for every build at once.  A bootloader and
-        an application are separate programs, thus that answer served no
-        question, and two builds of one application repeated nearly every
-        row.
-        """
+    def test_a_variant_alone_does_not_complete_its_only_image(self, temp_db):
+        """``b`` holds one image today, and the next index run can add one."""
         self._seed(temp_db)
-        cfg = self._cfg([BuildVariant(name="a"), BuildVariant(name="b")])
-        config_hash, err = resolve_build(temp_db, "proj", cfg, "*", "")
+
+        config_hash, err = resolve_build(temp_db, "proj", self._cfg(), "b", "")
+
+        assert config_hash is None, f"a part of the pair selected {config_hash}"
+        assert err is not None and 'exactly the arguments variant="b"' in err, err
+        assert 'variant="b", image="app"' in err, err
+
+    def test_an_image_alone_does_not_complete_a_variant(self, temp_db):
+        self._seed(temp_db)
+
+        config_hash, err = resolve_build(temp_db, "proj", self._cfg(), "", "stage0")
+
+        assert config_hash is None, f"a part of the pair selected {config_hash}"
+        assert err is not None and 'variant="a", image="stage0"' in err, err
+
+    @pytest.mark.parametrize(("variant", "image"), [("zzz", ""), ("a", "zzz"), ("*", "")])
+    def test_an_unknown_name_is_refused_with_the_list(self, temp_db, variant: str, image: str):
+        self._seed(temp_db)
+
+        config_hash, err = resolve_build(temp_db, "proj", self._cfg(), variant, image)
+
         assert config_hash is None
-        assert err is not None and "ONE build" in err
-        assert "ask twice" in err, f"the error gives no way forward: {err}"
+        assert err is not None and "No build of this project" in err, err
+        assert 'variant="b", image="app"' in err, err
 
-    def test_unknown_variant_errors(self, temp_db):
+    def test_an_indexed_variant_that_the_config_does_not_declare_answers(self, temp_db):
+        """The index is the fact.  A config that declares only 'a' must not hide 'b'."""
         self._seed(temp_db)
-        cfg = self._cfg([BuildVariant(name="a")])
-        config_hash, err = resolve_build(temp_db, "proj", cfg, "zzz", "")
-        assert err is not None and "Unknown variant" in err
 
-    def test_a_declared_variant_does_not_hide_an_indexed_one(self, temp_db):
-        """The declared names and the indexed ones are UNITED.
+        config_hash, err = resolve_build(temp_db, "proj", self._cfg([BuildVariant(name="a")]), "b", "app")
 
-        ``declared or indexed`` read the index only when the config
-        declared nothing at all.  One declared variant therefore hid every
-        other variant the index holds: 'b' came back as unknown and its
-        build was out of reach, with no command to reach it — config.toml
-        would have to be edited to query a build that already exists.
-        """
-        self._seed(temp_db)
-        cfg = self._cfg([BuildVariant(name="a")])
+        assert (config_hash, err) == ("h-b-app", None)
 
-        config_hash, err = resolve_build(temp_db, "proj", cfg, "b", "")
-
-        assert err is None, f"an indexed variant was refused: {err}"
-        assert config_hash == "h-b-app"
-
-    def test_the_refusal_names_the_indexed_variant_too(self, temp_db):
-        self._seed(temp_db)
-        cfg = self._cfg([BuildVariant(name="a")])
-
-        _hash, err = resolve_build(temp_db, "proj", cfg, "", "")
-
-        assert err is not None, "three builds, and no selector: this must refuse"
-        # The whole list, and not the letter alone — "b" also sits inside
-        # the word "build", which every one of these messages carries.
-        assert "one of: a, b" in err, (
-            f"the refusal hides a build that exists: {err}"
-        )
-
-    def test_a_declared_variant_that_is_not_indexed_still_says_so(self, temp_db):
-        """The union must not turn 'declared but never built' into 'unknown'."""
+    def test_a_declared_variant_that_is_not_indexed_gives_the_command(self, temp_db):
         self._seed(temp_db)
         cfg = self._cfg([BuildVariant(name="a"), BuildVariant(name="ghost")])
 
         config_hash, err = resolve_build(temp_db, "proj", cfg, "ghost", "")
 
         assert config_hash is None
-        assert err is not None and "not indexed" in err, f"got: {err}"
+        assert err is not None and "not indexed" in err and "--variant ghost" in err, err
 
-    def test_unknown_image_names_the_known_ones(self, temp_db):
+    def test_every_build_answers_for_its_exact_pair(self, temp_db):
+        """One selection, one ``config_hash``, and no two selections share it."""
         self._seed(temp_db)
-        cfg = self._cfg([BuildVariant(name="a")])
-        config_hash, err = resolve_build(temp_db, "proj", cfg, "a", "zzz")
-        assert config_hash is None
-        assert err is not None and "Unknown image" in err
-        assert "app" in err and "stage0" in err, f"got: {err}"
-
-    def test_specific_image_narrows(self, temp_db):
-        self._seed(temp_db)
-        cfg = self._cfg([BuildVariant(name="a")])
-        config_hash, err = resolve_build(temp_db, "proj", cfg, "a", "stage0")
-        assert err is None and config_hash == "h-a-stage"
-
-    def test_every_selection_names_its_own_build(self, temp_db):
-        """The contract the rest of the code now rests on.
-
-        One selection, one ``config_hash``, and no two selections share it.
-        """
-        self._seed(temp_db)
-        cfg = self._cfg([BuildVariant(name="a"), BuildVariant(name="b")])
         seen: dict[str, tuple[str, str]] = {}
         for variant, image in (("a", "app"), ("a", "stage0"), ("b", "app")):
-            config_hash, err = resolve_build(temp_db, "proj", cfg, variant, image)
+            config_hash, err = resolve_build(temp_db, "proj", self._cfg(), variant, image)
             assert err is None, f"{variant}/{image}: {err}"
             assert config_hash is not None, f"{variant}/{image} named no build"
-            assert config_hash not in seen, (
-                f"{variant}/{image} and {seen.get(config_hash)} share one build"
-            )
+            assert config_hash not in seen, f"{variant}/{image} and {seen.get(config_hash)} share one build"
             seen[config_hash] = (variant, image)
+
+    def test_a_build_without_an_image_name_is_selected_without_image(self, temp_db):
+        self._rows(temp_db, [("h-a", "a", ""), ("h-b", "b", "")])
+
+        assert resolve_build(temp_db, "proj", self._cfg(), "a", "") == ("h-a", None)
+        _hash, err = resolve_build(temp_db, "proj", self._cfg(), "", "")
+        assert err is not None and 'variant="a"\n' in err, f"the list must give the variant alone: {err}"
+
+    def test_an_older_build_of_a_pair_is_not_one_more_build(self, temp_db):
+        """An interrupted run leaves an older build of a pair behind, and the newest one answers."""
+        self._rows(temp_db, [("h-old", "a", "app"), ("h-new", "a", "app")])
+
+        assert resolve_build(temp_db, "proj", self._cfg(), "", "") == ("h-new", None)
+
+    def test_a_build_that_is_still_indexing_is_not_a_build(self, temp_db):
+        self._seed(temp_db)
+        temp_db.execute("UPDATE build_configs SET manifest_verification = 'indexing' WHERE config_hash = 'h-b-app'")
+
+        _hash, err = resolve_build(temp_db, "proj", self._cfg(), "", "")
+
+        assert err is not None and 'variant="b"' not in err, err
+
+    def test_a_build_without_names_is_not_selected_among_others(self, temp_db):
+        """A call without a selector on several builds gets the list, never the unnamed build.
+
+        An index from before images holds a build without names next to the
+        images of a later run that failed for the application.  The call
+        selected that old build in silence, and the caller did not learn
+        that the bootloader is there too.
+        """
+        self._rows(temp_db, [("h-old", "", ""), ("h-boot", "", "bootloader")])
+
+        config_hash, err = resolve_build(temp_db, "proj", self._cfg(), "", "")
+
+        assert config_hash is None, f"the unnamed build answered: {config_hash}"
+        assert err is not None and 'image="bootloader"' in err, err
+        assert "No call can select it" in err and "fw-context index" in err, err
+
+    def test_no_build_is_no_refusal(self, temp_db):
+        """The caller decides between an empty answer and an error."""
+        assert resolve_build(temp_db, "proj", self._cfg(), "", "") == (None, None)
+
+    @pytest.mark.parametrize("state", ["empty", "indexing"])
+    def test_a_named_build_without_a_completed_build_is_refused(self, temp_db, state: str):
+        """During the first index run every row is still indexing.
+
+        ``(None, None)`` gives an empty list in the search tools, and an
+        empty list reads as "no such code".
+        """
+        if state == "indexing":
+            self._seed(temp_db)
+            temp_db.execute("UPDATE build_configs SET manifest_verification = 'indexing'")
+
+        config_hash, err = resolve_build(temp_db, "proj", self._cfg(), "a", "app")
+
+        assert config_hash is None
+        assert err is not None and "no completed build" in err and "fw-context index" in err, err
+
+    def test_the_refusal_names_the_status_tool(self, temp_db):
+        from fw_context_mcp.mcp.shared.variants import STATUS_TOOL
+
+        self._seed(temp_db)
+
+        _hash, err = resolve_build(temp_db, "proj", self._cfg(), "", "")
+
+        assert err is not None and f"{STATUS_TOOL}()" in err, err

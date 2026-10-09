@@ -45,6 +45,7 @@ from ..shared.stale import (
     collect_result_paths,
     diagnose_empty_result,
 )
+from ..shared.variants import IMAGE_DESCRIPTION, VARIANT_DESCRIPTION
 from ._base import BaseHandler
 
 log = logging.getLogger(__name__)
@@ -65,8 +66,8 @@ def find_variables(
         "(default 20, max 100).", ge=1)] = 20,
     offset: Annotated[int, Field(description="Skip this many variables. "
         "Reads the next page of a name that many variables share.", ge=0)] = 0,
-    variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
-    image: Annotated[str | None, Field(description="Image of the build (Zephyr sysbuild, ESP-IDF). Each image is a separate program. When omitted: [build] default_image, else the application that the build names (ESP-IDF, Zephyr sysbuild), else the only image, else an error that lists the images.")] = None,
+    variant: Annotated[str | None, Field(description=VARIANT_DESCRIPTION)] = None,
+    image: Annotated[str | None, Field(description=IMAGE_DESCRIPTION)] = None,
 ) -> list[dict]:
     """Find C/C++ variables by name or part of it and trace who reads or
     writes them through the call graph.  libclang-powered: splits
@@ -109,13 +110,14 @@ def find_variables(
         limit: Maximum results (default 20, max 100).
         offset: Skip this many variables.  Reads the next page; the page
             notice names the offset to use.
-        variant: Build variant (multi-build project). Omit to use
-            default_variant. One query answers for ONE build.
-        image: Image of the build (Zephyr sysbuild, ESP-IDF). Each image
-            is a separate program. When omitted: [build] default_image,
-            else the application that the build names (ESP-IDF,
-            Zephyr sysbuild), else the only image, else an error that
-            lists the images.
+        variant: Variant of the build (a board, or a PlatformIO
+            environment). On a project of more than one build, give the
+            variant and the image of one build, as the refusal lists
+            them. fw-context does not select a build. One query answers
+            for ONE build.
+        image: Image of the build: a separate program, such as the
+            application or the bootloader. Give it when the build has an
+            image name.
 
     Returns:
         list of dicts, each with: name (str), qualified_name (str),

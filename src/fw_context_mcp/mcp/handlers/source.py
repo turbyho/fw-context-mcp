@@ -80,6 +80,7 @@ from ...utils import escape_like as _escape_like
 from ..shared.context import _normalize_file_path_query
 from ..shared.paging import call_text, clamp_offset, page_hint, page_notice, past_end_info, selector_args
 from ..shared.stale import _file_differs
+from ..shared.variants import IMAGE_DESCRIPTION, VARIANT_DESCRIPTION
 from ._base import BaseHandler
 
 log = logging.getLogger(__name__)
@@ -705,8 +706,8 @@ async def explain_symbol(
     name: Annotated[str, Field(description="Symbol name to explain. E.g. 'uart_init', 'ModemMsg::send'.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     context_lines: Annotated[int, Field(description="Lines of source context around the symbol definition (1-200).", ge=0)] = 40,
-    variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
-    image: Annotated[str | None, Field(description="Image of the build (Zephyr sysbuild, ESP-IDF). Each image is a separate program. When omitted: [build] default_image, else the application that the build names (ESP-IDF, Zephyr sysbuild), else the only image, else an error that lists the images.")] = None,
+    variant: Annotated[str | None, Field(description=VARIANT_DESCRIPTION)] = None,
+    image: Annotated[str | None, Field(description=IMAGE_DESCRIPTION)] = None,
 ) -> dict:
     """Explain what a C/C++ symbol does in plain English — libclang-aware
     analysis. Uses pre-computed LLM analysis when available (instant),
@@ -727,13 +728,14 @@ async def explain_symbol(
         project_root: Project root directory. Auto-detected if omitted.
         context_lines: Lines of source context around the symbol definition
             (default 40, max 200). Only used when no pre-computed analysis exists.
-        variant: Build variant (multi-build project). Omit to use
-            default_variant. One query answers for ONE build.
-        image: Image of the build (Zephyr sysbuild, ESP-IDF). Each image
-            is a separate program. When omitted: [build] default_image,
-            else the application that the build names (ESP-IDF,
-            Zephyr sysbuild), else the only image, else an error that
-            lists the images.
+        variant: Variant of the build (a board, or a PlatformIO
+            environment). On a project of more than one build, give the
+            variant and the image of one build, as the refusal lists
+            them. fw-context does not select a build. One query answers
+            for ONE build.
+        image: Image of the build: a separate program, such as the
+            application or the bootloader. Give it when the build has an
+            image name.
 
     Returns:
         dict: {name, kind, file, line, signature, explanation, llm_analysis
@@ -927,8 +929,8 @@ async def explain_symbol(
 def get_source(
     name: Annotated[str, Field(description="Symbol name, or qualified name (Class::method) to select one symbol. Returns exact function body via libclang extent.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
-    image: Annotated[str | None, Field(description="Image of the build (Zephyr sysbuild, ESP-IDF). Each image is a separate program. When omitted: [build] default_image, else the application that the build names (ESP-IDF, Zephyr sysbuild), else the only image, else an error that lists the images.")] = None,
+    variant: Annotated[str | None, Field(description=VARIANT_DESCRIPTION)] = None,
+    image: Annotated[str | None, Field(description=IMAGE_DESCRIPTION)] = None,
 ) -> dict:
     """Read a C/C++ function/method/enum/macro body using libclang exact
     extents — no guessing line numbers. Uses AST-precise {start, end}
@@ -963,13 +965,14 @@ def get_source(
         name: Symbol name, or qualified name (``Class::method``) to select
             one symbol. Returns exact function body via libclang extent.
         project_root: Project root. Auto-detected if omitted.
-        variant: Build variant (multi-build project). Omit to use
-            default_variant. One query answers for ONE build.
-        image: Image of the build (Zephyr sysbuild, ESP-IDF). Each image
-            is a separate program. When omitted: [build] default_image,
-            else the application that the build names (ESP-IDF,
-            Zephyr sysbuild), else the only image, else an error that
-            lists the images.
+        variant: Variant of the build (a board, or a PlatformIO
+            environment). On a project of more than one build, give the
+            variant and the image of one build, as the refusal lists
+            them. fw-context does not select a build. One query answers
+            for ONE build.
+        image: Image of the build: a separate program, such as the
+            application or the bootloader. Give it when the build has an
+            image name.
 
     Returns:
         dict: {name, qualified_name, kind, file, line, signature,
@@ -1107,8 +1110,8 @@ def get_file_map(
     max_per_kind: Annotated[int, Field(description="Max items per symbol kind group (default 30, 0 = unlimited). With kind, the size of the page.", ge=0)] = 30,
     kind: Annotated[str | None, Field(description="One symbol kind, e.g. 'function' or 'enum_constant'. Gives one page of the items of that kind.")] = None,
     offset: Annotated[int, Field(description="With kind: skip this many items of that kind. Reads the next page.", ge=0)] = 0,
-    variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
-    image: Annotated[str | None, Field(description="Image of the build (Zephyr sysbuild, ESP-IDF). Each image is a separate program. When omitted: [build] default_image, else the application that the build names (ESP-IDF, Zephyr sysbuild), else the only image, else an error that lists the images.")] = None,
+    variant: Annotated[str | None, Field(description=VARIANT_DESCRIPTION)] = None,
+    image: Annotated[str | None, Field(description=IMAGE_DESCRIPTION)] = None,
 ) -> dict:
     """Fast structural map of all C/C++ symbols in a file grouped by kind —
     libclang-powered table of contents. Like a table of contents before
@@ -1150,13 +1153,14 @@ def get_file_map(
             instead of the map.
         offset: With ``kind``: skip this many items of that kind.  Reads
             the next page; ``page`` names the offset to use.
-        variant: Build variant (multi-build project). Omit to use
-            default_variant. One query answers for ONE build.
-        image: Image of the build (Zephyr sysbuild, ESP-IDF). Each image
-            is a separate program. When omitted: [build] default_image,
-            else the application that the build names (ESP-IDF,
-            Zephyr sysbuild), else the only image, else an error that
-            lists the images.
+        variant: Variant of the build (a board, or a PlatformIO
+            environment). On a project of more than one build, give the
+            variant and the image of one build, as the refusal lists
+            them. fw-context does not select a build. One query answers
+            for ONE build.
+        image: Image of the build: a separate program, such as the
+            application or the bootloader. Give it when the build has an
+            image name.
 
     Returns:
         dict: {file, total_symbols, symbols: {kind: {count, items[],
@@ -1597,8 +1601,8 @@ def _collect_override_info(
 def get_symbol_context(
     name: Annotated[str, Field(description="Symbol name. Returns body, signature, the direct callers and callees (each list with its total).", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
-    image: Annotated[str | None, Field(description="Image of the build (Zephyr sysbuild, ESP-IDF). Each image is a separate program. When omitted: [build] default_image, else the application that the build names (ESP-IDF, Zephyr sysbuild), else the only image, else an error that lists the images.")] = None,
+    variant: Annotated[str | None, Field(description=VARIANT_DESCRIPTION)] = None,
+    image: Annotated[str | None, Field(description=IMAGE_DESCRIPTION)] = None,
 ) -> dict:
     """Rich one-shot context for a C/C++ symbol: body, signature, the direct
     callers and callees. Answers "what does this do and how does it fit in
@@ -1628,13 +1632,14 @@ def get_symbol_context(
         name: Symbol name. Returns body, signature, the direct callers
             and callees (each list with its total).
         project_root: Project root. Auto-detected if omitted.
-        variant: Build variant (multi-build project). Omit to use
-            default_variant. One query answers for ONE build.
-        image: Image of the build (Zephyr sysbuild, ESP-IDF). Each image
-            is a separate program. When omitted: [build] default_image,
-            else the application that the build names (ESP-IDF,
-            Zephyr sysbuild), else the only image, else an error that
-            lists the images.
+        variant: Variant of the build (a board, or a PlatformIO
+            environment). On a project of more than one build, give the
+            variant and the image of one build, as the refusal lists
+            them. fw-context does not select a build. One query answers
+            for ONE build.
+        image: Image of the build: a separate program, such as the
+            application or the bootloader. Give it when the build has an
+            image name.
 
     Returns:
         dict with: name, qualified_name, kind, file, line, signature,
@@ -1870,8 +1875,8 @@ def read_file(
     line_numbers: Annotated[bool, Field(description="Prefix every line with its line number, like get_source. Default False (bare text).")] = False,
     start_line: Annotated[int, Field(description="First line to return, 1-based inclusive. 0 = from the start of the file.", ge=0)] = 0,
     end_line: Annotated[int, Field(description="Last line to return, 1-based inclusive. 0 = one page of at most 2000 lines.", ge=0)] = 0,
-    variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
-    image: Annotated[str | None, Field(description="Image of the build (Zephyr sysbuild, ESP-IDF). Each image is a separate program. When omitted: [build] default_image, else the application that the build names (ESP-IDF, Zephyr sysbuild), else the only image, else an error that lists the images.")] = None,
+    variant: Annotated[str | None, Field(description=VARIANT_DESCRIPTION)] = None,
+    image: Annotated[str | None, Field(description=IMAGE_DESCRIPTION)] = None,
 ) -> dict:
     """Read a C/C++ source file, one page at a time, with **ifdef-filtered** content —
     only code that actually compiles for the current build configuration.
@@ -1888,7 +1893,7 @@ def read_file(
     A blank line is an answer, and not a defect: it says that the line is
     in a branch the build does not take.  When EVERY line of the file is
     blank, the dict carries ``all_lines_inactive`` and a ``warning`` — such
-    a file holds code, and the active build compiles none of it.
+    a file holds code, and the build of the query compiles none of it.
 
     ``content`` is bare text by default and carries NO line-number prefix —
     unlike the ``source`` of ``get_source``, which numbers every line.
@@ -1935,13 +1940,14 @@ def read_file(
         start_line: First line to return, 1-based inclusive. 0 = file start.
         end_line: Last line to return, 1-based inclusive. 0 = one page of
             at most 2000 lines.
-        variant: Build variant (multi-build project). Omit to use
-            default_variant. One query answers for ONE build.
-        image: Image of the build (Zephyr sysbuild, ESP-IDF). Each image
-            is a separate program. When omitted: [build] default_image,
-            else the application that the build names (ESP-IDF,
-            Zephyr sysbuild), else the only image, else an error that
-            lists the images.
+        variant: Variant of the build (a board, or a PlatformIO
+            environment). On a project of more than one build, give the
+            variant and the image of one build, as the refusal lists
+            them. fw-context does not select a build. One query answers
+            for ONE build.
+        image: Image of the build: a separate program, such as the
+            application or the bootloader. Give it when the build has an
+            image name.
 
     Returns:
         dict: {file (str), language (str — ``"c"`` or ``"cpp"``),
@@ -1953,8 +1959,8 @@ def read_file(
         indexed content, or when no line of the file is active),
         all_lines_inactive (True, optional)}.
 
-        ``all_lines_inactive`` marks a file that the active build compiles
-        no line of: every line is inside an inactive ``#if`` branch, thus
+        ``all_lines_inactive`` marks a file of which the build of the query
+        compiles no line: every line is inside an inactive ``#if`` branch, thus
         ``content`` holds the correct number of lines and no text.  Without
         this field that answer reads as an empty file, and the two mean
         opposite things.
@@ -2035,11 +2041,11 @@ def read_file(
             # this branch as a normal answer — but content of the correct
             # length that holds no text reads exactly like an empty file.
             # The two mean opposite things: an empty file has no code, and
-            # this file has code that the active build does not compile.
+            # this file has code that the build of the query does not compile.
             result["all_lines_inactive"] = True
             result["warning"] = (
-                f"The active build compiles no line of {row['path']}. Every line "
-                f"is inside an inactive #if branch, thus the content below is "
+                f"The build of the query compiles no line of {row['path']}. "
+                f"Every line is inside an inactive #if branch, thus the content below is "
                 f"blank and the file is NOT empty on disk."
             )
         if _file_differs(result["file"], row["mtime"] or 0.0, row["source_hash"] or ""):

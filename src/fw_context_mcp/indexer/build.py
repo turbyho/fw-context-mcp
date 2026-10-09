@@ -111,8 +111,10 @@ class BuildConfig:
 
     # Multi-variant build configuration (opt-in).  When empty, every builder
     # produces a single compile_commands.json (variant='' image='' board='').
-    default_variant: str | None = None  # name of default variant (fail-closed queries)
-    default_image: str | None = None  # name of default image within default_variant
+    # No query reads the two names below since 2026-10: a query names its
+    # build (mcp/shared/variants.py).  Only get_active_build reports them.
+    default_variant: str | None = None
+    default_image: str | None = None
     variants: list[BuildVariant] = field(default_factory=list)
 
     # PlatformIO: the environment ([env:<name>] of platformio.ini) that this

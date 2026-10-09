@@ -421,10 +421,10 @@ def get_builds_for_scope(
     - ``variant=""`` → every build of the project, newest first.
 
     These are the semantics of THIS query and not of the MCP protocol, which
-    is narrower: ``resolve_build`` refuses ``variant="*"``, and for an
-    omitted image it chooses the default image or refuses, because one
-    query about code answers for one build.  It calls the wider forms here
-    to LIST what a project holds, and then names one build itself.
+    is narrower: ``resolve_build`` answers only for the exact pair of one
+    build, because one query about code answers for one build.  It reads
+    every build here to LIST what a project holds, and then matches the
+    pair of the caller.
 
     Completed builds only (``manifest_verification != 'indexing'``).
     """

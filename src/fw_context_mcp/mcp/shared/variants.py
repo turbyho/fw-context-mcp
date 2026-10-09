@@ -17,23 +17,35 @@ of different binaries, and where two builds ARE near-identical it duplicates
 almost every row: ``app`` and ``app_alt`` of that project share
 10585 of about 11000 names.
 
-Both selectors are therefore fail-closed:
+── The caller selects the build, and the server does not guess ──
 
-- single-project → one scope ``(variant='', image='')``, no error.
-- multi-build, variant omitted → error unless ``[build] default_variant``.
-- image omitted while the build holds several → the default image, else an
-  error that lists the images.  The default image is ``[build]
-  default_image`` when the build holds it, else the image that the build
-  system names as its application (ESP-IDF: the application, and not its
-  bootloader; Zephyr sysbuild: the default image of ``domains.yaml``), else
-  the only image.  A build without variants can hold several images too.
-- image omitted, and the build system names an application that the index
-  does not hold → error: the one image that is there is another program.
-- unknown variant or image → error listing the known names.
-- declared-but-unindexed variant → error pointing at ``fw-context index``.
+A project of several builds has no "active" build.  The agent knows the
+task, thus the agent selects the build, and when the task does not identify
+one, the agent asks the user.  The server keeps no selection between calls,
+and it fills in no part of one:
 
-A caller that wants to know whether a symbol lives in the bootloader as well
-asks twice, once per image.  Two plain answers beat one blended answer.
+- one build in the index → the query needs no selector.  A selector that
+  does not name that build is an error.
+- several builds → ``(variant, image)`` must be the pair of one build,
+  exactly.  A build without an image name is selected without ``image``.
+  A build without both names, from an older index run, is not selected.
+- no completed build → a call that names a build gets a refusal, and not
+  an empty answer.
+
+WHY no default, from the config or from the build system.  This module
+chose one until 2026-10: ``[build] default_variant``, ``[build]
+default_image``, the image that the build system names as its application,
+the only image of a variant.  Each one was a guess on behalf of the caller,
+and an answer from a guessed build looks correct.  A refusal costs one more
+call, and that call names the build that the caller means.
+
+WHY no completion of a part, such as ``variant="a"`` for the build
+``a/app`` when ``app`` is the only image of ``a``: the next index run can
+add an image, and the same call then means another thing or nothing.
+
+Each refusal lists the builds, with the arguments to repeat the call.  A
+caller that wants to know whether a symbol is in the bootloader as well
+asks twice, once per build.  Two plain answers beat one blended answer.
 """
 
 from __future__ import annotations
@@ -47,31 +59,84 @@ if TYPE_CHECKING:
 
     from ...config.settings import Config
 
+# The tool that gives the state of each build.  Every refusal names it,
+# thus one constant keeps the refusals and the tool name in step.
+STATUS_TOOL = "get_active_build"
 
-def _variant_names(conn: sqlite3.Connection, project_id: str, cfg: Config) -> list[str]:
-    """Return the variants of the project: the declared ones first, then the indexed ones.
+# The descriptions of the two selector parameters, one text for every tool.
+# WHY one constant: 28 tools take the selector, and 28 copies of a rule
+# change at different times.
+VARIANT_DESCRIPTION = (
+    "Variant of the build (a board, or a PlatformIO environment). On a project of more "
+    "than one build, give the variant and the image of one build, as the refusal lists "
+    "them. fw-context does not select a build for you. One query answers for ONE build."
+)
+IMAGE_DESCRIPTION = (
+    "Image of the build: a separate program, such as the application or the "
+    "bootloader. On a project of more than one build, give it when that build has "
+    "an image name, as the refusal lists it."
+)
 
-    WHY the index decides and not the config alone: the config DECLARES an
-    intention and ``build_configs`` records the FACT.  An index run with
-    ``--variant`` writes the name into that table, and a config that no
-    longer declares it — edited since, or an index made elsewhere — used to
-    send the query down the single-project path.  There the newest build
-    wins in silence, and the variant and image of the caller are not even
-    read: measured on a seeded index holding an application and a
-    bootloader, a query for the application got the bootloader.
 
-    The two are UNITED, and it is not one or the other.  ``declared or
-    indexed`` read the index only when the config declared NOTHING, thus one
-    declared variant hid every indexed one beside it: that name came back as
-    unknown and its build was out of reach, with no command to reach it.
-    The declared order leads, because it is the order the operator wrote
-    and the order the refusal of ``resolve_build`` reads out.
+def build_arguments(variant: str, image: str) -> str:
+    """Return the selector arguments of the build ``(variant, image)``, as a caller writes them.
+
+    A build without an image name gives only ``variant``, because the caller
+    selects it without ``image``.  A build without both names is the build
+    of a call without a selector, in a project of one build.
     """
-    from ...indexer.db import get_builds_for_scope
+    parts = [f'{key}="{value}"' for key, value in (("variant", variant), ("image", image)) if value]
+    return ", ".join(parts) if parts else "no variant and no image"
 
-    declared = [v.name for v in cfg.build.variants]
-    indexed = sorted({r["variant"] for r in get_builds_for_scope(conn, project_id) if r["variant"]})
-    return declared + [v for v in indexed if v not in declared]
+
+# The line of a build without a name in the list of a project of several
+# builds.  No call can name it, see :func:`resolve_build`.
+_UNNAMED_BUILD = (
+    "a build without a variant and an image name, from an older index run. "
+    "No call can select it. Run 'fw-context index' to replace it"
+)
+
+
+def _pair(row) -> tuple[str, str]:
+    return (row["variant"] or "", row["image"] or "")
+
+
+def _refusal(builds: list, asked: tuple[str, str]) -> str:
+    """Return the refusal of a selector that names no build of *builds*.
+
+    One shape for every refusal: what the call asked, and the arguments of
+    each build to repeat it with.  WHY the list is in the refusal and not
+    only in a status tool: the caller can repeat the call at once, without
+    one more call to find the names.
+    """
+    pairs = sorted(_pair(row) for row in builds)
+    status = f"To see the state of each build, call {STATUS_TOOL}()."
+    if len(pairs) == 1:
+        listing = f"  {build_arguments(*pairs[0])}"
+        return (
+            f"This project holds one build, and no build has the arguments "
+            f"{build_arguments(*asked)}. Remove the build arguments, or repeat the "
+            f"call with the arguments of that build:\n{listing}\n{status}"
+        )
+    listing = "\n".join(
+        f"  {build_arguments(*pair) if pair != ('', '') else _UNNAMED_BUILD}" for pair in pairs
+    )
+    if asked == ("", ""):
+        head = (
+            f"This project holds {len(pairs)} builds, and a query about code "
+            f"answers for one build. This call names no build."
+        )
+    else:
+        head = (
+            f"No build of this project has exactly the arguments "
+            f"{build_arguments(*asked)}. A query about code answers for one build."
+        )
+    return (
+        f"{head} Repeat the call with the arguments of one build:\n{listing}\n"
+        f"Select the build from the task. If the task does not identify one "
+        f"build, ask the user. Do not select a build from its position in this "
+        f"list. {status}"
+    )
 
 
 def resolve_build(
@@ -80,219 +145,111 @@ def resolve_build(
     cfg: Config,
     variant: str = "",
     image: str = "",
-    project_root: Path | None = None,
 ) -> tuple[str | None, str | None]:
     """Resolve ``(variant, image)`` → ``(config_hash, error)``.
-
-    *project_root* lets the build system name the default image (see
-    :func:`_default_build`).  Without it only ``[build] default_image``
-    names one.
 
     The answer is ONE build, thus the answer is one ``config_hash``.  Three
     outcomes, and the two fields tell them apart:
 
     * ``(hash, None)`` — this build answers the query.
-    * ``(None, error)`` — fail-closed refusal, in words for the caller to
-      pass on.  See the module docstring for the refusals.
-    * ``(None, None)`` — the project has no indexed build at all.  That is
-      not a refusal: the caller decides between an empty answer and an
-      error, and the two callers differ.
+    * ``(None, error)`` — a refusal, in words for the caller to pass on.
+      See the module docstring for the rule.
+    * ``(None, None)`` — the project has no completed build, and the call
+      names no build.  That is not a refusal: the caller decides between
+      an empty answer and an error, and the two callers differ.
 
-    This returned a list of scopes and a ``multi`` flag until the merging
-    of builds went away.  Neither survived the removal: the list could hold
-    one element, which invited a second pass and kept an unreachable merge
-    branch alive, and ``multi`` was read nowhere — ``list_variants`` and
-    ``get_active_build`` each compute that flag from the config themselves.
+    The builds are the newest completed build of each pair
+    (``latest_builds``).  An older build of a pair, which an interrupted
+    run left behind, is not one more build, and a build that is still
+    indexing answers no query.
+
+    *cfg* gives the declared variants.  A declared variant that the index
+    does not hold gets the command that indexes it, and not the list: the
+    caller named the right build, and the index does not hold it yet.
+
+    WHY a named build in an index without a completed build is a refusal,
+    and not ``(None, None)``: during the first index run every row is
+    still indexing, and the search tools give an empty list for
+    ``(None, None)``.  An empty list reads as "no such code".
+
+    WHY a call without a selector never selects a build without names in
+    a project of several builds: the caller named no build, thus the call
+    must get the list.  Such a build is a row of an older index run, from
+    before variants or images, and the next full run removes it
+    (``cleanup_retired_builds``).  Until then no call can select it, and
+    the list says so.
     """
-    from ...indexer.db import get_active_config, get_builds_for_scope
+    from .stale import latest_builds
 
-    build_cfg = cfg.build
-    names = _variant_names(conn, project_id, cfg)
+    builds = latest_builds(conn, project_id)
+    asked = (variant or "", image or "")
+    if len(builds) == 1 and asked == ("", ""):
+        return builds[0]["config_hash"], None
+    if asked != ("", ""):
+        for row in builds:
+            if _pair(row) == asked:
+                return row["config_hash"], None
 
-    if not names:
-        # WHY the arguments are read even here.  This branch used to
-        # return the active build without looking at `variant` or
-        # `image`, thus a project that declares no variant swallowed both
-        # silently — `variant="no_such_variant"` answered with rows, and
-        # so did `variant="*"`, which the refusal below calls out by
-        # name.  A caller that names a build is asking a question this
-        # project cannot answer, and an answer from the one build it has
-        # looks correct while the caller believes it asked about another.
-        rows = get_builds_for_scope(conn, project_id)
-        images = sorted({r["image"] for r in rows if r["image"]})
-        if variant and images:
-            return None, (
-                f"This project declares no variants, thus variant={variant!r} names "
-                f"nothing. Its build makes {len(images)} images: {', '.join(images)}. "
-                f"Drop `variant`, and name the program with `image`. "
-                f"Call get_active_build() for what is indexed."
-            )
-        if variant or (image and not images):
-            asked = f"variant={variant!r}" if variant else ""
-            if image:
-                asked = f"{asked} and image={image!r}" if asked else f"image={image!r}"
-            return None, (
-                f"This project has ONE build and declares no variants, thus "
-                f"{asked} names nothing. Drop the argument to ask about the "
-                f"build it has. Call get_active_build() for what is indexed."
-            )
-        if not images:
-            row = get_active_config(conn, project_id)
-            return (row["config_hash"] if row is not None else None), None
-        # One build without variants that makes several programs (ESP-IDF:
-        # the application and its bootloader).  The image is chosen as in a
-        # variant below.
-        return _choose_image(rows, images, "", image, cfg, project_root)
-
-    # ── Multi-build: fail-closed on variant ──
-    if not variant:
-        if build_cfg.default_variant:
-            variant = build_cfg.default_variant
-        else:
-            return None, (
-                f"Project has {len(names)} build variant(s). Specify ``variant`` "
-                f"(one of: {', '.join(names)}) or set [build] default_variant in "
-                f"config.toml. Call get_active_build() for the variants/images table."
-            )
-
-    if variant == "*":
+    indexed_variants = {row["variant"] or "" for row in builds}
+    declared = {v.name for v in cfg.build.variants}
+    if asked[0] in declared and asked[0] not in indexed_variants:
         return None, (
-            "A query about code answers for ONE build. A project can hold a "
-            "bootloader, a first-stage loader and the application, and they "
-            "are separate programs. Name one variant, and one image of it. "
-            "To learn whether a symbol is in two of them, ask twice. Call "
-            "get_active_build() for the variants/images table."
+            f"Variant '{asked[0]}' is declared in config but not indexed. "
+            f"Run 'fw-context index --build --variant {asked[0]}'."
         )
-
-    if variant not in set(names):
-        return None, f"Unknown variant '{variant}'. Available: {', '.join(sorted(names))}."
-
-    rows = get_builds_for_scope(conn, project_id, variant, image or "")
-    if not rows:
-        if image:
-            # A name of its own: ``names`` above holds the VARIANTS, and a
-            # second meaning for one name inside one function reads as the
-            # first one until a reader checks.
-            known = get_builds_for_scope(conn, project_id, variant)
-            known_images = sorted({r["image"] or "" for r in known if r["image"]})
-            if known_images:
-                return None, (
-                    f"Unknown image '{image}' of variant '{variant}'. "
-                    f"Available: {', '.join(known_images)}."
-                )
+    if not builds:
+        if asked == ("", ""):
+            return None, None
         return None, (
-            f"Variant '{variant}' is declared in config but not indexed. "
-            f"Run 'fw-context index --build --variant {variant}'."
+            f"The index of this project holds no completed build, thus no build has "
+            f"the arguments {build_arguments(*asked)}. When an index run is in "
+            f"progress, wait until it ends. Else run 'fw-context index'. Then repeat "
+            f"the call."
         )
-
-    # ── Fail-closed on image ──
-    # Several images of one variant are several PROGRAMS, thus a query that
-    # names none of them has not said what it asks about.  Answering for all
-    # of them would blend a bootloader with an application, and two builds of
-    # one application would duplicate nearly every row.
-    if image:
-        # One build answers.  The rows arrive newest first, thus an older
-        # build left behind by an interrupted index run cannot win.
-        return rows[0]["config_hash"], None
-    images = sorted({r["image"] or "" for r in rows if r["image"]})
-    return _choose_image(rows, images, variant, "", cfg, project_root)
-
-
-def _choose_image(
-    rows: list,
-    images: list[str],
-    variant: str,
-    image: str,
-    cfg: Config,
-    project_root: Path | None,
-) -> tuple[str | None, str | None]:
-    """Return the newest build of *image*, or of the default image when *image* is "".
-
-    *rows* are the builds of *variant* (or of the build without variants),
-    newest first, and *images* their image names.  A name that is not one of
-    *images* is an error that lists them.  WHY a default and not a refusal:
-    most questions are about the application, and a build that also makes a
-    bootloader made each of them name the image.  The default is a name,
-    thus a query without ``image`` still answers for ONE program, and
-    ``get_active_build`` reports it as ``active_image``.
-    """
-    owner = f"variant '{variant}'" if variant else "the build"
-    if image:
-        if image not in images:
-            return None, f"Unknown image '{image}' of {owner}. Available: {', '.join(images)}."
-        return next(r["config_hash"] for r in rows if r["image"] == image), None
-    if not images:
-        # The build makes one program, and its image has no name.
-        return rows[0]["config_hash"], None
-    default = _default_build(cfg, project_root, variant, rows)
-    if default.row is not None:
-        return default.row["config_hash"], None
-    if default.application_missing:
-        # The build system names its application, and the index holds only
-        # the other programs: the first index run is not complete, or a run
-        # that --image narrowed indexed only them.  The one image that is
-        # there is not the program that the query is about.
-        return None, (
-            f"The application of {owner} is not indexed. The index holds "
-            f"{', '.join(images)}. Name it with ``image`` to ask about it, or "
-            f"run 'fw-context index' to index the application."
-        )
-    if len(images) == 1:
-        return next(r["config_hash"] for r in rows if r["image"] == images[0]), None
-    holder = f"Variant '{variant}'" if variant else "The build"
-    return None, (
-        f"{holder} holds {len(images)} images, and each is a separate program: "
-        f"{', '.join(images)}. Specify ``image``, or set [build] default_image in "
-        f"config.toml. Call get_active_build() for the variants/images table."
-    )
+    return None, _refusal(builds, asked)
 
 
 @dataclass(frozen=True)
 class _DefaultBuild:
-    """The build of a query without ``image``, see :func:`_default_build`."""
+    """The build that :func:`active_build` reports, see :func:`_default_build`."""
 
     row: sqlite3.Row | dict | None
     application_missing: bool
 
 
 def default_image(cfg: Config, project_root: Path | None, variant: str, rows: list) -> str:
-    """Return the image that a query about *variant* without ``image`` gets, or "".
+    """Return the image of *variant* that the build system names as its application, or "".
 
     *rows* are the indexed builds of *variant*, newest first, with ``image``
-    and ``compile_commands_path``.  "" when nothing names a default among
-    them, or when the default is a build without an image name.  See
-    :func:`_default_build`.
+    and ``compile_commands_path``.  "" when nothing names an application
+    among them, or when the application is a build without an image name.
+    See :func:`_default_build`.  No query reads it: ``get_active_build``
+    reports it.
     """
     row = _default_build(cfg, project_root, variant, rows).row
     return (row["image"] or "") if row is not None else ""
 
 
 def _default_build(cfg: Config, project_root: Path | None, variant: str, rows: list) -> _DefaultBuild:
-    """Return the build of *variant* that a query without ``image`` gets.
+    """Return the build of *variant* that the build system names as its application.
 
     *rows* are the indexed builds of *variant*, newest first.
 
-    1. ``[build] default_image``, when *variant* holds that image: the
-       operator wrote it.
-    2. The build whose database is the database of the application, as the
+    1. The build whose database is the database of the application, as the
        build system names it (``builders.application_database``).  Only the
        part of the path in the output directory is compared: the index
        stores absolute paths, and a project that moved has another root.
-    3. A build without an image name, when the build system names an
+    2. A build without an image name, when the build system names an
        application.  The index holds such a build from before images: then
        a build of several programs indexed only the database that the build
        returned, and that was the database of the application.
-    4. Nothing, with ``application_missing`` when the build system names an
+    3. Nothing, with ``application_missing`` when the build system names an
        application that no build read.
 
     WHY the index and not the build output for ESP-IDF: the path is enough to
     tell the application from the bootloader, thus no file is read and a
-    query does not fail while a clean build has removed the output.
+    check does not fail while a clean build has removed the output.
     """
-    images = {r["image"] for r in rows if r["image"]}
-    configured = cfg.build.default_image
-    if configured and configured in images:
-        return _DefaultBuild(next(r for r in rows if r["image"] == configured), False)
     application = _application_in_out(cfg, project_root, variant)
     if application is None:
         return _DefaultBuild(None, False)
@@ -358,40 +315,45 @@ def active_build(
     project_id: str,
     cfg: Config,
     project_root: Path | None,
-) -> tuple[sqlite3.Row | None, str | None]:
-    """Return ``(build, refusal)`` for a query without ``variant`` and ``image``.
+) -> tuple[sqlite3.Row | dict | None, str | None]:
+    """Return ``(build, refusal)``: the build that ``get_active_build`` and ``fw-context index`` check.
 
-    ``get_active_build`` reports this build, and ``smart_search`` and
-    ``semantic_search``, which take no selector, answer for it.  It is the
-    build that :func:`resolve_build` chooses.  When that refuses because the
-    project has several variants and no ``default_variant``, the newest
-    build stands in, as these tools always did.  Any other refusal comes
-    back with no build: the application is not indexed, or the build holds
-    several images and nothing names a default.
+    No query reads it: a query names its build (:func:`resolve_build`).
+    These two report the health of an index, and they check one build:
 
-    WHY not the newest build: a build that makes several programs indexes
-    them one after the other, and the newest one is the program that the
-    run did last.  During the first index run, which builds the bootloader
-    in minutes and the application in hours, that is the bootloader, and
-    the tools without a selector answered from it while the others refused.
+    * one build → that build;
+    * builds of several variants → the newest build;
+    * images of a build without variants → the application that the build
+      system names (``_default_build``), else a refusal.
+
+    WHY the application and not the newest build for images: a build that
+    makes several programs indexes them one after the other, and the newest
+    one is the program that the run did last.  After a failed application,
+    that is the bootloader, and its database does not tell whether the
+    application has new sources.
     """
     from ...indexer.db import get_active_config
+    from .stale import latest_builds
 
     newest = get_active_config(conn, project_id)
     if newest is None:
         return None, None
-    chosen, refusal = resolve_build(conn, project_id, cfg, project_root=project_root)
-    if chosen is None:
-        if _variant_names(conn, project_id, cfg) and not cfg.build.default_variant:
-            return newest, None
-        return (None, refusal) if refusal else (newest, None)
-    if chosen == newest["config_hash"]:
+    builds = latest_builds(conn, project_id)
+    if len(builds) <= 1 or cfg.build.variants or any(row["variant"] for row in builds):
         return newest, None
-    row = conn.execute(
-        "SELECT * FROM build_configs WHERE project_id = ? AND config_hash = ?",
-        (project_id, chosen),
-    ).fetchone()
-    return (row, None) if row is not None else (newest, None)
+    default = _default_build(cfg, project_root, "", builds)
+    if default.row is not None:
+        return default.row, None
+    images = sorted(row["image"] or "" for row in builds)
+    if default.application_missing:
+        return None, (
+            f"The application of the build is not indexed. The index holds "
+            f"{', '.join(images)}. Run 'fw-context index' to index the application."
+        )
+    return None, (
+        f"The build holds {len(images)} images, and each is a separate program: "
+        f"{', '.join(images)}. Nothing names one of them as the application."
+    )
 
 
 def run_scoped_query(
@@ -417,7 +379,7 @@ def run_scoped_query(
     cfg = load_config(root)
     conn = _quick_open_readonly(db_path)
     try:
-        config_hash, err = resolve_build(conn, project_id, cfg, variant or "", image or "", project_root=root)
+        config_hash, err = resolve_build(conn, project_id, cfg, variant or "", image or "")
     finally:
         conn.close()
     if err:

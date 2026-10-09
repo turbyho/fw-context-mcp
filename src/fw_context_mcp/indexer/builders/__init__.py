@@ -95,14 +95,14 @@ def output_compile_commands(builder: BuildSystem | None, out_dir: Path, cfg) -> 
 def application_database(builder: BuildSystem | None, out_dir: Path) -> Path | None:
     """Return the database of the application of a build in *out_dir*, or None.
 
-    A query without ``image`` gets the image whose index read this database,
-    when ``[build] default_image`` names none of the images (see
-    ``mcp.shared.variants.resolve_build``).  ``application_database`` is an
+    ``get_active_build`` and ``fw-context index`` check the build whose
+    index read this database (``mcp.shared.variants.active_build``).  No
+    query reads it: a query names its image.  ``application_database`` is an
     OPTIONAL method of a backend whose build makes the application and other
     programs of lower rank: ESP-IDF makes the application and its
     bootloader, and a Zephyr sysbuild names its default image in
-    ``domains.yaml``.  None when the backend does not name one, and then a
-    query must name the image.  The database need not exist: ESP-IDF answers
+    ``domains.yaml``.  None when the backend does not name one.  The
+    database need not exist: ESP-IDF answers
     with a path alone, thus the answer holds while a clean build has removed
     *out_dir*.
     """

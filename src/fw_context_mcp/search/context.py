@@ -123,8 +123,14 @@ class PipelineContext:
         query: str,
         project_root: str | None = None,
         limit: int = 20,
+        variant: str | None = None,
+        image: str | None = None,
     ) -> PipelineContext:
-        """Factory: resolve project root, load config, read config_hash, get executor.
+        """Factory: resolve project root, load config, resolve the build, get executor.
+
+        *variant* and *image* select the build, as in every query tool
+        (``resolve_build``).  A refusal raises ``ValueError`` with its text,
+        which lists the builds to repeat the call with.
 
         Why a factory method?
             Creating a PipelineContext requires multiple steps (resolve root,
@@ -138,7 +144,7 @@ class PipelineContext:
         ``ensure_schema`` write transaction for a two-field read.  All
         phase queries go through the shared ``executor``.
         """
-        from fw_context_mcp.mcp.shared.variants import active_build
+        from fw_context_mcp.mcp.shared.variants import resolve_build
 
         root = resolve_project_root(project_root)
         cfg = load_config(project_root=root)
@@ -150,14 +156,16 @@ class PipelineContext:
 
         conn = _quick_open_readonly(db_path)
         try:
-            # The build that get_active_build reports, because a search tool
-            # without `variant` and `image` answers for that build.
-            build_cfg, refusal = active_build(conn, project_id, cfg, root)
+            # The build that the caller names.  These tools took no selector
+            # until 2026-10.  On a project of several variants they answered
+            # for the newest build, thus for the build that the last index
+            # run did, and for the images of one build for the application.
+            # Both were choices that the caller did not make.
+            config_hash, refusal = resolve_build(conn, project_id, cfg, variant or "", image or "")
             if refusal:
                 raise ValueError(refusal)
-            if not build_cfg:
+            if config_hash is None:
                 raise ValueError(f"No build config indexed for {root}.")
-            config_hash = build_cfg["config_hash"]
         finally:
             conn.close()
 

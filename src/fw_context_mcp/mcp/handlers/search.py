@@ -53,6 +53,7 @@ from ..shared.context import _db_path, _is_stale, _quick_open_readonly
 from ..shared.fallback import _fallback_to_search_code
 from ..shared.paging import clamp_offset, page_hint, page_notice, past_end_info, selector_args
 from ..shared.stale import _with_stale_recovery
+from ..shared.variants import IMAGE_DESCRIPTION, VARIANT_DESCRIPTION
 from ._lookup import lookup_symbol
 from ._search_fallbacks import (
     _SEARCH_CODE_FALLBACKS,
@@ -95,7 +96,7 @@ def _resolve_build_for_search(
     cfg = load_config(root)
     conn = _quick_open_readonly(db_path)
     try:
-        return resolve_build(conn, project_id, cfg, variant or "", image or "", project_root=root)
+        return resolve_build(conn, project_id, cfg, variant or "", image or "")
     finally:
         conn.close()
 
@@ -226,8 +227,8 @@ def search_code(
      limit: Annotated[int, Field(description="Maximum results of one page (default 20, max 100).", ge=1)] = 20,
      offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a topic that many symbols carry.", ge=0)] = 0,
      project_only: Annotated[bool, Field(description="Exclude vendor SDK code. When True, only application code. Default False.")] = False,
-     variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
-     image: Annotated[str | None, Field(description="Image of the build (Zephyr sysbuild, ESP-IDF). Each image is a separate program. When omitted: [build] default_image, else the application that the build names (ESP-IDF, Zephyr sysbuild), else the only image, else an error that lists the images.")] = None,
+     variant: Annotated[str | None, Field(description=VARIANT_DESCRIPTION)] = None,
+     image: Annotated[str | None, Field(description=IMAGE_DESCRIPTION)] = None,
  ) -> list[dict]:
     """Find C/C++ symbols by name — searches function/class/enum NAMES.
 
@@ -315,13 +316,14 @@ def search_code(
             never changes the step under the reader.
         project_only: When True, exclude vendor SDK directories and return only
             application code. Default False.
-        variant: Build variant (multi-build project). Omit to use
-            default_variant. One query answers for ONE build.
-        image: Image of the build (Zephyr sysbuild, ESP-IDF). Each image
-            is a separate program. When omitted: [build] default_image,
-            else the application that the build names (ESP-IDF,
-            Zephyr sysbuild), else the only image, else an error that
-            lists the images.
+        variant: Variant of the build (a board, or a PlatformIO
+            environment). On a project of more than one build, give the
+            variant and the image of one build, as the refusal lists
+            them. fw-context does not select a build. One query answers
+            for ONE build.
+        image: Image of the build: a separate program, such as the
+            application or the bootloader. Give it when the build has an
+            image name.
 
     Returns:
         list of dicts.  The page notice leads the answer — ``total``,
@@ -445,6 +447,8 @@ async def smart_search(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum results on one page (default 20). Held between 1 and 100.", ge=1)] = 20,
     offset: Annotated[int, Field(description="Skip this many results of the previous search of this query. 0 (the default) is a new search.", ge=0)] = 0,
+    variant: Annotated[str | None, Field(description=VARIANT_DESCRIPTION)] = None,
+    image: Annotated[str | None, Field(description=IMAGE_DESCRIPTION)] = None,
 ) -> list[dict]:
     """Natural-language search: an LLM generates FTS5 keywords, then searches
     the libclang index. Finds concepts by meaning rather than exact text
@@ -456,11 +460,6 @@ async def smart_search(
     ``SMART_SEARCH`` pipeline (translate → rough_search → llm_query →
     fts5_search → refine → embedding → adaptive_fusion → deduplicate →
     expand_context → format).
-
-    **This tool names no build.**  It takes neither ``variant`` nor
-    ``image``, and it answers for the build that ``get_active_build``
-    reports as the active one.  On a project that holds several builds,
-    use ``search_code`` or ``search_bodies`` to ask about one named build.
 
     Multi-phase approach:
     1) Translate non-English queries
@@ -492,6 +491,14 @@ async def smart_search(
             last search was of another query (or another project, or a
             build that a reindex changed), the tool searches again first.
             An index run that keeps the build keeps the stored answer.
+        variant: Variant of the build (a board, or a PlatformIO
+            environment). On a project of more than one build, give the
+            variant and the image of one build, as the refusal lists
+            them. fw-context does not select a build. One query answers
+            for ONE build.
+        image: Image of the build: a separate program, such as the
+            application or the bootloader. Give it when the build has an
+            image name.
 
     Returns:
         list of dicts with metadata entries (_generated_queries, _rough_queries,
@@ -525,7 +532,9 @@ async def smart_search(
     skip = clamp_offset(offset)
     try:
         # The pipeline gives the whole answer that the pages are cut from.
-        ctx = PipelineContext.create(query=query, project_root=project_root, limit=_SMART_ANSWER_SIZE)
+        ctx = PipelineContext.create(
+            query=query, project_root=project_root, limit=_SMART_ANSWER_SIZE, variant=variant, image=image,
+        )
     except ValueError as e:
         return [{"error": str(e)}]
 
@@ -552,7 +561,9 @@ async def smart_search(
     if total:
         results.append(page_notice(
             total, skip, len(page),
-            hint=page_hint("smart_search", query, **selector_args(project_root), next_offset=skip + len(page)),
+            hint=page_hint(
+                "smart_search", query, **selector_args(project_root, variant, image), next_offset=skip + len(page),
+            ),
         ))
     results += page
     # Append staleness warning unless the LLM setup itself failed — in that
@@ -668,6 +679,8 @@ async def semantic_search(
     threshold: Annotated[float, Field(description="Minimum cosine similarity (0.0-1.0). Default 0.60. Use 0.55 for exploratory, 0.50 for broad search.", ge=0.0, le=1.0)] = _SEMANTIC_DEFAULT_THRESHOLD,
     limit: Annotated[int, Field(description="Maximum results on one page (default 20). Held between 1 and 100.", ge=1)] = 20,
     offset: Annotated[int, Field(description="Skip this many results. Reads the next page of the symbols above the threshold.", ge=0)] = 0,
+    variant: Annotated[str | None, Field(description=VARIANT_DESCRIPTION)] = None,
+    image: Annotated[str | None, Field(description=IMAGE_DESCRIPTION)] = None,
 ) -> list[dict]:
     """Semantic search using pre-computed libclang symbol embeddings. Finds
     symbols by meaning, not by text — matches concepts even when query
@@ -707,11 +720,6 @@ async def semantic_search(
     the query locally and needs no Ollama.  Without one of them, the tool
     falls back to a lexical search with a warning.
 
-    **This tool names no build.**  It takes neither ``variant`` nor
-    ``image``, and it answers for the build that ``get_active_build``
-    reports as the active one.  On a project that holds several builds,
-    use ``search_code`` or ``search_bodies`` to ask about one named build.
-
     Read-only. No side effects.
 
     Args:
@@ -724,6 +732,14 @@ async def semantic_search(
         limit: Maximum number of results on one page (default 20, max 100).
         offset: Skip this many results.  Reads the next page; the page
             notice names the offset to use.
+        variant: Variant of the build (a board, or a PlatformIO
+            environment). On a project of more than one build, give the
+            variant and the image of one build, as the refusal lists
+            them. fw-context does not select a build. One query answers
+            for ONE build.
+        image: Image of the build: a separate program, such as the
+            application or the bootloader. Give it when the build has an
+            image name.
 
     Returns:
         The page notice ``{total, offset, shown, more, hint}`` comes before
@@ -787,7 +803,20 @@ async def semantic_search(
         # The hint of each page repeats a threshold that is not the default,
         # and the project: the next call must ask for the same set.
         args: dict[str, object] = {} if threshold == _SEMANTIC_DEFAULT_THRESHOLD else {"threshold": threshold}
-        args.update(selector_args(project_root))
+        args.update(selector_args(project_root, variant, image))
+
+        # The build first, before the LLM checks: every path below answers
+        # for this build, the lexical fallbacks too, and a call that names
+        # no build gets the refusal whether the LLM runs or not.
+        from fw_context_mcp.search.context import PipelineContext
+
+        try:
+            ctx = PipelineContext.create(
+                query=query, project_root=str(root), limit=limit, variant=variant, image=image,
+            )
+        except ValueError as e:
+            return [{"error": str(e)}]
+        config_hash = ctx.config_hash
 
         # Verify LLM setup — embedding generation runs against the configured
         # Ollama instance or cloud API. Without an active LLM, embedding-based
@@ -796,7 +825,7 @@ async def semantic_search(
         cfg = load_config(project_root=root)
         if not cfg.llm.enabled:
             return _fallback_to_search_code(
-                root, db_path, query, limit, offset=skip, hint_args=args,
+                root, db_path, query, limit, offset=skip, hint_args=args, config_hash=config_hash,
                 warning="LLM is disabled in config. "
                         "Enable it with `[llm] enabled = true` to use semantic search.",
             )
@@ -813,22 +842,13 @@ async def semantic_search(
 
         if not setup.get("ollama_running"):
             return _fallback_to_search_code(
-                root, db_path, query, limit, offset=skip, hint_args=args,
+                root, db_path, query, limit, offset=skip, hint_args=args, config_hash=config_hash,
                 warning="LLM is not running. Start it to use semantic search.",
             )
 
         # Delegate to the semantic search pipeline (EmbeddingPhase + FormatPhase).
         # The pipeline handles embedding generation, KNN search, and source-aware
         # boosting internally.
-        from fw_context_mcp.search.context import PipelineContext
-
-        try:
-            ctx = PipelineContext.create(
-                query=query, project_root=str(root), limit=limit
-            )
-        except ValueError as e:
-            return [{"error": str(e)}]
-
         from fw_context_mcp.search.pipeline import PipelineRunner, _build_semantic_search
 
         # Build the semantic pipeline: one KNN query for every symbol above
@@ -850,7 +870,7 @@ async def semantic_search(
             else:
                 warning_msg = str(ctx.ollama_warning)
             return _fallback_to_search_code(
-                root, db_path, query, limit, offset=skip, hint_args=args,
+                root, db_path, query, limit, offset=skip, hint_args=args, config_hash=config_hash,
                 warning=warning_msg,
             )
 
@@ -869,7 +889,8 @@ async def semantic_search(
                     "Try lowering the threshold or rephrasing the query."
                 )
             return _fallback_to_search_code(
-                root, db_path, query, limit, offset=skip, hint_args=args, warning=no_match_reason,
+                root, db_path, query, limit, offset=skip, hint_args=args, config_hash=config_hash,
+                warning=no_match_reason,
             )
 
         # `_method` tells a result of this path from a result of the
@@ -1105,8 +1126,8 @@ def search_bodies(
     limit: Annotated[int, Field(description="Maximum results of one page (default 20, max 100).", ge=1)] = 20,
     offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a pattern with many hits.", ge=0)] = 0,
     project_only: Annotated[bool, Field(description="Exclude vendor SDK code. When True, only application code. Default False.")] = False,
-    variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
-    image: Annotated[str | None, Field(description="Image of the build (Zephyr sysbuild, ESP-IDF). Each image is a separate program. When omitted: [build] default_image, else the application that the build names (ESP-IDF, Zephyr sysbuild), else the only image, else an error that lists the images.")] = None,
+    variant: Annotated[str | None, Field(description=VARIANT_DESCRIPTION)] = None,
+    image: Annotated[str | None, Field(description=IMAGE_DESCRIPTION)] = None,
 ) -> list[dict]:
     """Find patterns in the TEXT OF A DEFINITION — the code inside its extent.
 
@@ -1207,13 +1228,14 @@ def search_bodies(
             with many hits; the page notice names the offset to use.
         project_only: When True, exclude vendor SDK directories and return only
             application code. Default False.
-        variant: Build variant (multi-build project). Omit to use
-            default_variant. One query answers for ONE build.
-        image: Image of the build (Zephyr sysbuild, ESP-IDF). Each image
-            is a separate program. When omitted: [build] default_image,
-            else the application that the build names (ESP-IDF,
-            Zephyr sysbuild), else the only image, else an error that
-            lists the images.
+        variant: Variant of the build (a board, or a PlatformIO
+            environment). On a project of more than one build, give the
+            variant and the image of one build, as the refusal lists
+            them. fw-context does not select a build. One query answers
+            for ONE build.
+        image: Image of the build: a separate program, such as the
+            application or the bootloader. Give it when the build has an
+            image name.
 
     Returns:
         list of dicts.  The page notice leads the answer — ``total``,
@@ -1442,8 +1464,8 @@ def search_content(
     limit: Annotated[int, Field(description="Maximum results of one page (default 20, max 100).", ge=1)] = 20,
     offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a topic that many files touch.", ge=0)] = 0,
     project_only: Annotated[bool, Field(description="Exclude vendor SDK code. When True, only application code. Default False.")] = False,
-    variant: Annotated[str | None, Field(description="Build variant (multi-build project). Omit to use default_variant. One query answers for ONE build.")] = None,
-    image: Annotated[str | None, Field(description="Image of the build (Zephyr sysbuild, ESP-IDF). Each image is a separate program. When omitted: [build] default_image, else the application that the build names (ESP-IDF, Zephyr sysbuild), else the only image, else an error that lists the images.")] = None,
+    variant: Annotated[str | None, Field(description=VARIANT_DESCRIPTION)] = None,
+    image: Annotated[str | None, Field(description=IMAGE_DESCRIPTION)] = None,
 ) -> list[dict]:
     """Find patterns in FULL file content — the whole file, not only the
     text that belongs to a definition.
@@ -1497,13 +1519,14 @@ def search_content(
         offset: Skip this many results. Reads the next page of a topic
             that many files touch; the page notice names the offset to use.
         project_only: When True, filter to project code only (files with is_project = 1).
-        variant: Build variant (multi-build project). Omit to use
-            default_variant. One query answers for ONE build.
-        image: Image of the build (Zephyr sysbuild, ESP-IDF). Each image
-            is a separate program. When omitted: [build] default_image,
-            else the application that the build names (ESP-IDF,
-            Zephyr sysbuild), else the only image, else an error that
-            lists the images.
+        variant: Variant of the build (a board, or a PlatformIO
+            environment). On a project of more than one build, give the
+            variant and the image of one build, as the refusal lists
+            them. fw-context does not select a build. One query answers
+            for ONE build.
+        image: Image of the build: a separate program, such as the
+            application or the bootloader. Give it when the build has an
+            image name.
 
     Returns:
         list of dicts.  The page notice leads the answer — ``total``,

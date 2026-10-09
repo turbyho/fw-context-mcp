@@ -65,8 +65,8 @@ for C/C++ code, stop and use the fw-context equivalent instead.
 
 ### Every answer is ifdef-filtered
 
-fw-context gives the code that COMPILES for the active build. A line of an
-inactive `#if` branch is blank in the `content` of `read_file`, in the text
+fw-context gives the code that COMPILES for the build of the query. A line
+of an inactive `#if` branch is blank in the `content` of `read_file`, in the text
 that `search_content` and `search_bodies` search, and in the body that
 `get_source` and `get_symbol_context` give. Line numbers never move.
 
@@ -87,7 +87,7 @@ limits:
   an answer, not a failure — the code does not compile.
 - A file can come back with every line blank. `read_file` marks it with
   `all_lines_inactive` and a `warning`. Such a file holds code, and the
-  active build compiles none of it — it is NOT an empty file.
+  build of the query compiles none of it — it is NOT an empty file.
 
 Never conclude that code is live because you saw it in a file. Cite
 fw-context, and check `source_origin` when the answer carries one.
@@ -140,32 +140,26 @@ One project can hold several builds on two axes: `variant` is the board,
 an ESP-IDF project has its application and `bootloader` — a bootloader is
 NOT the application.
 
-**One query answers for ONE build.** Both selectors fail closed: when the
-project holds variants (declared in the config or found in the index) and
-sets no `[build] default_variant`, or the build holds more than one image
-and no default image applies (`[build] default_image`, or the application
-that the build names: ESP-IDF, Zephyr sysbuild), a query that names none
-gets an error that lists the choices. That is on purpose — an answer blending a bootloader with an application serves
-no question, and two builds of one application would repeat nearly every
-row.
+**One query answers for ONE build, and you select it.** A project of
+several builds has no active build, and fw-context selects none for you:
+no default from the config, no application from the build system, no
+completion of a part of a pair. On a project of more than one build, give
+the `variant` and the `image` of one build, exactly. A query that names no
+build, or a part of one, gets an error that lists each build with the
+arguments to repeat the call. An answer that blends a bootloader with an
+application serves no question, and two builds of one application repeat
+nearly every row.
 
-Two tools tell you what there is to choose from:
-
-- `get_active_build` — `multi`, `variants`, `images`, `variant_images`
-  (which images each variant holds) and `active_variant`. Call it first.
-- `list_variants` — one row per indexed build, with its own `config_hash`,
-  `board`, `symbol_count`, `entry_point` and memory map. Use it when you
-  must tell two builds apart by what they hold.
-
-Both read the INDEX and not only the config, thus a build indexed with
-`--variant` is listed even when config.toml no longer declares it.
-
-- Pass `variant` and `image` to every call that TAKES them. Every tool
-  that answers about code takes them, with two exceptions: `smart_search`
-  and `semantic_search` take neither, and they answer for the active
-  build. An argument a tool does not declare is an error that names it.
+- Select the build from the task. If the task does not identify one
+  build, ask the user. Do not select a build from its position in a list.
+- `list_variants` gives one row per indexed build, with its own
+  `config_hash`, `board`, `symbol_count`, `entry_point` and memory map.
+  It reads the INDEX and not only the config, thus a build indexed with
+  `--variant` is listed even when config.toml no longer declares it.
+- Pass `variant` and `image` to every tool that answers about code,
+  `smart_search` and `semantic_search` included.
 - To learn whether a symbol is in the bootloader TOO, ask twice — once per
-  image. Two plain answers beat one blended answer.
+  build. Two plain answers beat one blended answer.
 
 ### Reading past the first page
 
@@ -427,7 +421,7 @@ AGENT_CRITICAL_BLOCK = """\
 
 ALL C/C++ source code access MUST go through fw-context MCP tools.
 Raw source files contain unprocessed #ifdef noise; fw-context shows only
-what actually compiles for the active build configuration.
+what actually compiles for the build of the query.
 
 PROHIBITED for .c/.cpp/.h/.hpp/.s/.inc files:
 - Read, cat — raw preprocessor noise, not compiled code
@@ -457,7 +451,7 @@ above are MANDATORY for you — no exceptions, no excuses:
 - NEVER read C/C++ source files (.c, .cpp, .h, .hpp, .s, .inc) with
   Read, cat, grep, or any non-fw-context tool.
 - Raw source files contain unprocessed #ifdef noise — only fw-context shows
-  what actually compiles for the active build configuration.
+  what actually compiles for the build of the query.
 - If fw-context MCP tools are available, they are the ONLY allowed way to
   access C/C++ source code. No fallback to raw file reads.
 - If you don't have fw-context tools available, state that limitation and

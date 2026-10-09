@@ -923,8 +923,8 @@ def build_staleness(
 ) -> tuple[bool, list[str]]:
     """Return ``(reindex_needed, reasons)`` of one build of the index.
 
-    The same checks as ``get_active_build`` makes for the build of a query
-    without ``variant`` and ``image``:
+    The same checks as ``get_active_build`` makes for the build that it
+    reports:
 
     * the database of the build is missing or newer than the index — a
       reindex is necessary (``reindex_needed``);
