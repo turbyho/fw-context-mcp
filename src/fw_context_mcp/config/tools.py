@@ -838,7 +838,8 @@ TOOLS: dict[str, AiTool] = {
         agent_dirs_global=["~/.codex/agents"],
         agent_dirs_project=["{project}/.codex/agents"],
         agent_file_patterns=["*.toml"],
-        agent_strip_name=True,
+        # Codex requires `name` in an agent file.
+        agent_strip_name=False,
         skill_dirs_global=["~/.codex/skills"],
         skill_dirs_project=["{project}/.codex/skills"],
         targets=[

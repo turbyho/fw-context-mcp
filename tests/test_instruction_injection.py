@@ -277,23 +277,6 @@ def test_a_lone_start_goes_and_the_block_is_added_once(tmp_path):
     assert path.read_text(encoding="utf-8") == after_first, "a second run changed the file"
 
 
-
-def test_a_toml_agent_gets_the_same_rules(tmp_path):
-    from fw_context_mcp.cli._mcp import _inject_agent_toml_section
-
-    path = tmp_path / "agent.toml"
-    path.write_text(_file("[instructions]", "Text names # fw-context in a line.", "# fw-context", "old one",
-                          "# /fw-context", "keep", "# fw-context", "old two", "# /fw-context", ""),
-                    encoding="utf-8")
-
-    update = _inject_agent_toml_section(path, "NEW", "fw-context")
-
-    text = path.read_text(encoding="utf-8")
-    assert update.replaced and update.blocks_removed == 1
-    assert "Text names # fw-context in a line." in text and "keep" in text
-    assert "old one" not in text and "old two" not in text and text.count("NEW") == 1
-
-
 def test_init_names_what_it_removed(capsys, tmp_path):
     from fw_context_mcp.cli._init import _report_marker_cleanup
 
@@ -364,21 +347,6 @@ def test_an_agent_file_is_stable_after_the_first_insert(tmp_path, body):
     assert first.startswith("---\nname: a\n---\n\n" + MARKER_START) and "Body" in first
 
 
-def test_a_toml_agent_is_stable_after_the_first_insert(tmp_path):
-    from fw_context_mcp.cli._mcp import _inject_agent_toml_section
-
-    path = tmp_path / "agent.toml"
-    path.write_text(_file("# name: a", "", "[instructions]", "Text.", "", "[other]", "k = 1", ""),
-                    encoding="utf-8")
-
-    _inject_agent_toml_section(path, "NEW", "fw-context")
-    first = path.read_text(encoding="utf-8")
-    _inject_agent_toml_section(path, "NEW", "fw-context")
-
-    assert path.read_text(encoding="utf-8") == first
-    assert first.index("Text.") < first.index("NEW") < first.index("[other]")
-
-
 def test_a_dry_run_on_a_file_it_cannot_read_gives_no_count(tmp_path, capsys):
     """A file that is not UTF-8 made the dry run stop with a traceback."""
     from fw_context_mcp.cli._init import _report_planned_cleanup
@@ -445,20 +413,6 @@ def test_an_agent_file_with_a_leading_blank_line_keeps_its_text(tmp_path):
     assert text.count(MARKER_START + "\n") == 1 and text.startswith(MARKER_START)
 
 
-def test_a_toml_agent_with_a_leading_blank_line_keeps_its_keys(tmp_path):
-    from fw_context_mcp.cli._mcp import _inject_agent_toml_section
-
-    start, end = "# fw-context", "# /fw-context"
-    path = tmp_path / "agent.toml"
-    path.write_text(_file("", start, "a", end, "key = 1", start, "b", end, ""), encoding="utf-8")
-
-    _inject_agent_toml_section(path, "NEW", "fw-context")
-
-    text = path.read_text(encoding="utf-8")
-    assert "\nkey = 1\n" in text, text
-    assert text.count(start + "\n") == 1 and "#\n" not in text
-
-
 @pytest.mark.parametrize("content", [" ", "\t\n", "\n \n"])
 def test_a_file_of_white_space_only_gets_a_whole_block(tmp_path, content):
     """The white space of the last line stood before the start marker.
@@ -478,3 +432,196 @@ def test_a_file_of_white_space_only_gets_a_whole_block(tmp_path, content):
 
     assert first.startswith(MARKER_START + "\n") and len(marked_blocks(first)) == 1, repr(first)
     assert path.read_text(encoding="utf-8") == first
+
+
+# ── Codex agent files ──────────────────────────────────────────────────
+#
+# Codex requires three strings in an agent file: name, description and
+# developer_instructions (Codex docs, page "Subagents").  fw-context wrote a
+# table [instructions] with raw Markdown in it, which is no valid TOML.
+
+CODEX_HEAD = 'name = "a"\ndescription = "d"\nmodel = "m"\n'
+CODEX_TAIL = '\n[mcp_servers.x]\ncommand = "y"\n'
+CODEX_BLOCK = _file(MARKER_START, "NEW", MARKER_END)
+
+
+def _codex(instructions: str) -> str:
+    return CODEX_HEAD + instructions + CODEX_TAIL
+
+
+def _parsed(path):
+    import tomllib
+
+    return tomllib.loads(path.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("instructions", [
+    "developer_instructions = \'\'\'\nUser text.\n\'\'\'\n",
+    'developer_instructions = """\nUser text.\n"""\n',
+    "developer_instructions = \'\'\'User text.\n\'\'\'\n",
+    "  developer_instructions   =   \'\'\'\nUser text.\n\'\'\'\n",
+], ids=["literal", "basic", "text on the opening line", "indented"])
+def test_a_codex_agent_gets_the_block_at_the_start_of_its_instructions(tmp_path, instructions):
+    from fw_context_mcp.cli._mcp import _inject_agent_toml_section
+
+    path = tmp_path / "agent.toml"
+    path.write_text(_codex(instructions), encoding="utf-8")
+    before = _parsed(path)
+
+    update = _inject_agent_toml_section(path, "NEW", "fw-context")
+    first = path.read_text(encoding="utf-8")
+    _inject_agent_toml_section(path, "NEW", "fw-context")
+
+    after = _parsed(path)
+    assert not update.replaced
+    assert after["developer_instructions"] == CODEX_BLOCK + "\nUser text.\n"
+    assert {k: v for k, v in after.items() if k != "developer_instructions"} == {
+        k: v for k, v in before.items() if k != "developer_instructions"}
+    assert path.read_text(encoding="utf-8") == first, "the second run changed the file"
+
+
+def test_a_codex_agent_gets_the_rules_of_a_markdown_block(tmp_path):
+    """A sentence that names a marker stays, the first block gets the text, and the second block goes."""
+    from fw_context_mcp.cli._mcp import _inject_agent_toml_section
+
+    path = tmp_path / "agent.toml"
+    path.write_text(_codex("developer_instructions = \'\'\'\n" + SENTENCE + _file(
+        MARKER_START, "old one", MARKER_END, "keep", MARKER_START, "old two", MARKER_END, "") + "\'\'\'\n"),
+        encoding="utf-8")
+
+    update = _inject_agent_toml_section(path, "NEW", "fw-context")
+
+    instructions = _parsed(path)["developer_instructions"]
+    assert update.replaced and update.blocks_removed == 1
+    assert SENTENCE in instructions and "keep" in instructions
+    assert "old one" not in instructions and "old two" not in instructions and instructions.count("NEW") == 1
+
+
+def test_the_block_of_the_old_format_goes(tmp_path):
+    """The old injection put a table [instructions] with raw Markdown under the instructions of the user."""
+    from fw_context_mcp.cli._mcp import _inject_agent_toml_section
+
+    path = tmp_path / "agent.toml"
+    path.write_text(_codex("developer_instructions = \'\'\'\nUser text.\n\'\'\'\n") + _file(
+        "", "[instructions]", "# fw-context", "## CRITICAL — old", "- raw Markdown", "# /fw-context", ""),
+        encoding="utf-8")
+
+    update = _inject_agent_toml_section(path, "NEW", "fw-context")
+
+    text = path.read_text(encoding="utf-8")
+    assert update.blocks_removed == 1
+    assert "[instructions]" not in text and "# fw-context" not in text
+    assert _parsed(path)["developer_instructions"] == CODEX_BLOCK + "\nUser text.\n"
+
+
+@pytest.mark.parametrize("content", [
+    "name = \"a\"\n[instructions]\n## raw Markdown\n",
+    'name = "a"\ndescription = "d"\n',
+    'name = "a"\ndescription = "d"\ndeveloper_instructions = "one line"\n',
+    ' [instructions]\n# fw-context\nold\n# /fw-context\n',
+], ids=["no valid TOML", "no instructions", "instructions on one line", "indented old table"])
+def test_a_file_that_init_cannot_change_safely_stays_as_it_is(tmp_path, content):
+    """The old code found no table at an indented header, and added a second table [instructions]."""
+    from fw_context_mcp.cli._mcp import AgentFileSkipped, _inject_agent_toml_section
+
+    path = tmp_path / "agent.toml"
+    path.write_text(content, encoding="utf-8")
+
+    with pytest.raises(AgentFileSkipped):
+        _inject_agent_toml_section(path, "NEW", "fw-context")
+
+    assert path.read_text(encoding="utf-8") == content
+
+
+def test_init_warns_about_a_codex_agent_that_it_skips(tmp_path, capsys):
+    from fw_context_mcp.cli._init import _inject_critical_block
+
+    path = tmp_path / "agent.toml"
+    path.write_text('name = "a"\n', encoding="utf-8")
+
+    _inject_critical_block(tmp_path, ["*.toml"], critical_block="NEW")
+
+    assert "[warn]" in capsys.readouterr().out and path.read_text(encoding="utf-8") == 'name = "a"\n'
+
+
+def test_each_agent_template_converts_to_a_codex_agent():
+    import tomllib
+    from pathlib import Path
+
+    import fw_context_mcp
+    from fw_context_mcp.cli._mcp import _convert_agent_md_to_toml
+
+    templates = sorted((Path(fw_context_mcp.__file__).parent / "data" / "agents").glob("*.md"))
+    assert templates
+    for template in templates:
+        data = tomllib.loads(_convert_agent_md_to_toml(template.read_text(encoding="utf-8")))
+        assert data["name"] == template.stem
+        assert data["description"] and MARKER_START in data["developer_instructions"]
+
+
+def test_a_description_with_quotes_and_control_characters_stays_valid_toml():
+    import tomllib
+
+    from fw_context_mcp.cli._mcp import _convert_agent_md_to_toml
+
+    description = 'Says "hi" \\ and \x7f'
+    text = _convert_agent_md_to_toml(_file("---", "name: a", "description: " + description, "---", "Body", ""))
+
+    assert tomllib.loads(text)["description"] == description
+
+
+def test_init_writes_a_codex_agent_of_the_old_format_again(tmp_path, capsys):
+    from pathlib import Path
+
+    import fw_context_mcp
+    from fw_context_mcp.cli._init import _install_toml_template
+
+    template = Path(fw_context_mcp.__file__).parent / "data" / "agents" / "code-explorer.md"
+    target = tmp_path / "code-explorer.toml"
+    old = _file("# description: x", "", "[instructions]", "# fw-context", "## raw", "# /fw-context", "")
+    target.write_text(old, encoding="utf-8")
+
+    assert _install_toml_template(target, template, dry_run=False)
+
+    assert _parsed(target)["name"] == "code-explorer"
+    assert (tmp_path / "code-explorer.toml.bak").read_text(encoding="utf-8") == old
+    assert "[fix]" in capsys.readouterr().out
+    assert not _install_toml_template(target, template, dry_run=False), "a Codex agent of the user must stay"
+
+
+def test_a_line_fw_context_in_a_valid_codex_agent_stays(tmp_path):
+    """The removal of the old format ran on each file, and took a heading and a comment of the user."""
+    from fw_context_mcp.cli._mcp import _inject_agent_toml_section
+
+    path = tmp_path / "agent.toml"
+    path.write_text(CODEX_HEAD + _file(
+        "developer_instructions = '''", "# fw-context", "Keep 1.", "# /fw-context", "Keep 2.", "'''",
+        "# fw-context", "[mcp_servers.fw-context]", 'command = "y"', ""), encoding="utf-8")
+
+    update = _inject_agent_toml_section(path, "NEW", "fw-context")
+
+    text = path.read_text(encoding="utf-8")
+    assert (update.blocks_removed, update.orphans_removed) == (0, 0)
+    assert _parsed(path)["developer_instructions"] == CODEX_BLOCK + _file(
+        "", "# fw-context", "Keep 1.", "# /fw-context", "Keep 2.", "")
+    assert "# fw-context\n[mcp_servers.fw-context]" in text
+
+
+def test_a_codex_agent_that_init_cannot_read_stays_as_it_is(tmp_path, capsys):
+    from fw_context_mcp.cli._init import _install_toml_template
+    from fw_context_mcp.cli._mcp import AgentFileSkipped, _inject_agent_toml_section
+
+    content = b'name = "caf\xe9"\n'
+    agent = tmp_path / "agent.toml"
+    agent.write_bytes(content)
+    named = tmp_path / "code-explorer.toml"
+    named.write_bytes(content)
+    template = tmp_path / "code-explorer.md"
+    template.write_text(_file("---", "name: code-explorer", "description: d", "---", "Body", ""), encoding="utf-8")
+
+    with pytest.raises(AgentFileSkipped):
+        _inject_agent_toml_section(agent, "NEW", "fw-context")
+    assert not _install_toml_template(named, template, dry_run=False)
+
+    assert agent.read_bytes() == content and named.read_bytes() == content
+    assert "[warn]" in capsys.readouterr().out

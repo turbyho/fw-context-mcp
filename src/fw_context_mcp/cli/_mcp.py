@@ -19,6 +19,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -322,93 +323,195 @@ def _inject_agent_section(path: Path, content: str, marker: str) -> MarkerUpdate
     return update
 
 
-def _inject_agent_toml_section(path: Path, content: str, marker: str) -> MarkerUpdate:
-    """Inject a ``# marker ... # /marker`` block into a Codex TOML agent file.
+class AgentFileSkipped(Exception):
+    """``init`` cannot put the block into an agent file, and leaves the file as it is.
 
-    Codex agent files use TOML format with an ``[instructions]`` key that
-    holds freeform text.  The fw-context block is inserted into the
-    ``[instructions]`` section using ``# fw-context`` comment markers.
-    When no ``[instructions]`` section exists, one is created at the end
-    of the file.
+    The message says why.  WHY an exception and not a quiet return: a file
+    that does not get the block keeps the old rules, and the operator must
+    see that.
     """
-    from ..config.tools import normalize_marked_block, replace_marked_blocks
 
-    start_comment = f"# {marker}"
-    end_comment = f"# /{marker}"
 
-    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+# The keys that Codex requires in a custom agent file (Codex docs, page
+# "Subagents": each file must define name, description and
+# developer_instructions, all three strings).
+_CODEX_REQUIRED_KEYS = ("name", "description", "developer_instructions")
+_CODEX_INSTRUCTIONS_KEY = "developer_instructions"
 
-    # If markers already exist, replace between them.  The rules of the
-    # Markdown block apply: a marker counts only on a line of its own, a
-    # second block goes, and so does a marker without a pair.
-    update = replace_marked_blocks(
-        existing, f"{start_comment}\n{content}\n{end_comment}\n", start_comment, end_comment, gap="\n",
-    )
+# The opening line of the instructions as a multi-line string.  TOML trims
+# a line end directly after the opening delimiter.
+_CODEX_INSTRUCTIONS_OPENING = re.compile(
+    r"^[ \t]*developer_instructions[ \t]*=[ \t]*('''|\"\"\")[ \t]*(\n)?", re.MULTILINE,
+)
+
+# The markers of the format that fw-context wrote before: a table
+# ``[instructions]`` with the block as raw Markdown between these comment
+# lines.  That file is no valid TOML, and Codex cannot read it.
+_OLD_TOML_START = "# fw-context"
+_OLD_TOML_END = "# /fw-context"
+_OLD_TOML_TABLE = re.compile(r"^[ \t]*\[[ \t]*instructions[ \t]*\][ \t]*(#.*)?\n?", re.MULTILINE)
+
+
+def _remove_old_toml_block(text: str) -> tuple[str, int, int]:
+    """Remove the block of the format that fw-context wrote before.
+
+    Returns the text, the count of blocks and the count of marker lines
+    without a pair that went.  The table ``[instructions]`` goes too when
+    it is empty after that: fw-context made it for the block, and Codex
+    does not use it.  A table that still holds a key stays.
+    """
+    from ..config.tools import replace_marked_blocks
+
+    old = replace_marked_blocks(text, "", _OLD_TOML_START, _OLD_TOML_END, gap="\n")
+    text = old.text
+    blocks = old.blocks_removed + (1 if old.replaced else 0)
+    if blocks or old.orphans_removed:
+        try:
+            empty_table = tomllib.loads(text).get("instructions") == {}
+        except tomllib.TOMLDecodeError:
+            empty_table = False
+        if empty_table:
+            text = _OLD_TOML_TABLE.sub("", text, count=1)
+    return text, blocks, old.orphans_removed
+
+
+def _toml_basic_string(text: str) -> str:
+    """Return *text* as a TOML basic string, with the escapes that TOML 1.0 requires.
+
+    WHY not ``json.dumps``: JSON does not escape DEL (U+007F), and TOML
+    does not permit it in a basic string.
+    """
+    escaped = []
+    for char in text:
+        if char in ('"', "\\"):
+            escaped.append("\\" + char)
+        elif char < " " or char == "\x7f":
+            escaped.append(f"\\u{ord(char):04x}")
+        else:
+            escaped.append(char)
+    return '"' + "".join(escaped) + '"'
+
+
+def _codex_agent_problem(text: str) -> str | None:
+    """Return why *text* is no Codex agent file, or None when it is one."""
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        return f"the file is not valid TOML ({exc})"
+    missing = [key for key in _CODEX_REQUIRED_KEYS if not isinstance(data.get(key), str)]
+    if missing:
+        return "the file has no string " + ", ".join(f"`{key}`" for key in missing)
+    return None
+
+
+def _inject_agent_toml_section(path: Path, content: str, marker: str) -> MarkerUpdate:
+    """Put the ``<!-- marker --> ... <!-- /marker -->`` block into the instructions of a Codex agent file.
+
+    A Codex agent file is TOML, and its ``developer_instructions`` string
+    is the Markdown prompt of the agent.  The block goes into that string,
+    with the Markdown markers, thus the rules of a Markdown agent file
+    apply to it: a marker counts only on a line of its own, a second block
+    goes, and so does a marker without a pair.  A new block goes to the
+    start of the instructions.
+
+    A block of the format that fw-context wrote before (comment markers
+    under a table ``[instructions]``) goes first, because it made the file
+    invalid TOML.
+
+    The new text must be valid TOML, every key but the instructions must
+    keep its value, and the instructions must keep each word of the user.
+    WHY a check of the result: the edit is on the text of the file, and
+    the text of a TOML file can hold the same line in a different string.
+    When the check fails, or the file is no Codex agent file, the file
+    stays as it is and :class:`AgentFileSkipped` says why.
+    """
+    from ..config.tools import MarkerUpdate, normalize_marked_block, replace_marked_blocks
+
+    start_tag = f"<!-- {marker} -->"
+    end_tag = f"<!-- /{marker} -->"
+    block = f"{start_tag}\n{content}\n{end_tag}\n"
+
+    try:
+        original = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise AgentFileSkipped(f"cannot read the file ({exc})") from exc
+    # WHY only a file that is not valid TOML: the old format never was
+    # valid TOML.  In a valid file a line `# fw-context` is text of the
+    # user, for example a heading in the instructions.
+    try:
+        tomllib.loads(original)
+    except tomllib.TOMLDecodeError:
+        text, old_blocks, old_orphans = _remove_old_toml_block(original)
+    else:
+        text, old_blocks, old_orphans = original, 0, 0
+    problem = _codex_agent_problem(text)
+    if problem:
+        raise AgentFileSkipped(problem)
+    before = tomllib.loads(text)
+
+    update = replace_marked_blocks(text, block, start_tag, end_tag, gap="\n")
     if update.replaced:
         updated = update.text
     else:
-        existing = update.text
-        # Find [instructions] section and insert the block there
-        instructions_match = re.search(r"^\[instructions\]\s*$", existing, re.MULTILINE)
-        if instructions_match:
-            # Find end of instructions section (next TOML section or EOF)
-            section_end = len(existing)
-            next_section = re.search(r"^\[", existing[instructions_match.end() :], re.MULTILINE)
-            if next_section:
-                section_end = instructions_match.end() + next_section.start()
-            before = existing[:section_end]
-            after = existing[section_end:]
-            updated = before.rstrip("\n") + "\n" + start_comment + "\n" + content + "\n" + end_comment + "\n" + after
-        else:
-            # No [instructions] section — create one at end of file
-            updated = (
-                existing.rstrip("\n")
-                + "\n\n[instructions]\n"
-                + start_comment
-                + "\n"
-                + content
-                + "\n"
-                + end_comment
-                + "\n"
-            )
+        text = update.text
+        opening = _CODEX_INSTRUCTIONS_OPENING.search(text)
+        if opening is None:
+            raise AgentFileSkipped("`developer_instructions` is not a multi-line string on a line of its own")
+        # Without a line end after the delimiter, one goes in first: TOML
+        # trims it, thus the block starts the string.
+        head = text[:opening.end()] + ("" if opening.group(2) else "\n")
+        updated = normalize_marked_block(head + block + text[opening.end():], block, start_tag, end_tag, gap="\n")
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if not update.replaced:
-        # A new block: the form that an update gives, thus a second run changes nothing.
-        updated = normalize_marked_block(
-            updated, f"{start_comment}\n{content}\n{end_comment}\n", start_comment, end_comment, gap="\n",
-        )
+    problem = _codex_agent_problem(updated)
+    if problem:
+        raise AgentFileSkipped(f"the update would break the file: {problem}")
+    after = tomllib.loads(updated)
+    instructions = after[_CODEX_INSTRUCTIONS_KEY]
+    kept = replace_marked_blocks(instructions, "", start_tag, end_tag).text
+    user = replace_marked_blocks(before[_CODEX_INSTRUCTIONS_KEY], "", start_tag, end_tag).text
+    others_kept = {k: v for k, v in after.items() if k != _CODEX_INSTRUCTIONS_KEY} == {
+        k: v for k, v in before.items() if k != _CODEX_INSTRUCTIONS_KEY
+    }
+    if block.strip("\n") not in instructions or kept.split() != user.split() or not others_kept:
+        raise AgentFileSkipped("the update would change text of the user, or the block is not in the instructions")
+
     path.write_text(updated, encoding="utf-8")
-    return update
+    return MarkerUpdate(
+        updated, update.replaced, update.blocks_removed + old_blocks, update.orphans_removed + old_orphans,
+    )
 
 
 def _convert_agent_md_to_toml(md_content: str) -> str:
-    """Convert agent ``.md`` template to Codex ``.toml`` format.
+    """Convert an agent ``.md`` template to a Codex agent file.
 
-    YAML frontmatter → TOML comments, ``<!-- fw-context -->`` markers
-    → ``# fw-context``, body wrapped in ``[instructions]`` section.
+    The ``name`` and the ``description`` of the frontmatter become the two
+    TOML strings of these names, and the Markdown body becomes
+    ``developer_instructions``: the three keys that Codex requires.  The
+    body goes into a multi-line literal string, thus a backslash in it
+    stays a backslash.  The markers stay the Markdown markers.
+
+    Raises ValueError for a template without a name or a description, or
+    with a body that holds ``'''``: no literal string can hold it.
     """
     parts = md_content.split("---", 2)
-    if len(parts) >= 3:
-        frontmatter_text = parts[1]
-        body = parts[2]
-    else:
-        frontmatter_text = ""
-        body = md_content
-
-    lines: list[str] = []
+    frontmatter_text, body = (parts[1], parts[2]) if len(parts) >= 3 else ("", md_content)
+    fields: dict[str, str] = {}
     for line in frontmatter_text.strip().splitlines():
-        m = re.match(r"^(name|description):\s*(.*)", line)
-        if m:
-            key = m.group(1)
-            value = m.group(2).strip()
-            lines.append(f"# {key}: {value}")
-    if lines:
-        lines.append("")
-
-    lines.append("[instructions]")
-    # Convert HTML comment markers to TOML hash-comment markers
-    body = body.replace("<!-- fw-context -->", "# fw-context")
-    body = body.replace("<!-- /fw-context -->", "# /fw-context")
-    lines.append(body.strip())
-    return "\n".join(lines) + "\n"
+        match = re.match(r"^(name|description):\s*(.*)", line)
+        if match:
+            fields[match.group(1)] = match.group(2).strip()
+    missing = [key for key in ("name", "description") if not fields.get(key)]
+    if missing:
+        raise ValueError(f"the agent template has no {' and no '.join(missing)}")
+    body = body.strip("\n")
+    if "'''" in body:
+        raise ValueError("the agent template holds ''', which no TOML literal string can hold")
+    text = (
+        f"name = {_toml_basic_string(fields['name'])}\n"
+        f"description = {_toml_basic_string(fields['description'])}\n"
+        f"{_CODEX_INSTRUCTIONS_KEY} = '''\n{body}\n'''\n"
+    )
+    problem = _codex_agent_problem(text)
+    if problem:
+        raise ValueError(f"the converted agent is no Codex agent file: {problem}")
+    return text

@@ -254,10 +254,11 @@ def _inject_critical_block(
 
     WHY: Existing agent files already contain user content.  We must
     inject the fw-context critical block without overwriting the rest
-    of the file.  This requires format-aware injection: TOML uses
-    section headers, markdown uses HTML-style markers.
+    of the file.  This requires format-aware injection: in a Codex TOML
+    file the block goes into the ``developer_instructions`` string, and a
+    file that ``init`` cannot change safely gets a ``[warn]`` line.
     """
-    from ._mcp import _inject_agent_section, _inject_agent_toml_section
+    from ._mcp import AgentFileSkipped, _inject_agent_section, _inject_agent_toml_section
 
     installed = False
     existing_files: list[Path] = []
@@ -267,13 +268,16 @@ def _inject_critical_block(
     for agent_path in existing_files:
         if dry_run:
             print(f"  [dry-run] {agent_path}: would UPDATE fw-context section")
-            tags = ("# fw-context", "# /fw-context") if agent_path.suffix == ".toml" else ()
-            _report_planned_cleanup(agent_path, *tags)
+            _report_planned_cleanup(agent_path)
             installed = True
             continue
 
         if agent_path.suffix == ".toml":
-            update = _inject_agent_toml_section(agent_path, critical_block, "fw-context")
+            try:
+                update = _inject_agent_toml_section(agent_path, critical_block, "fw-context")
+            except AgentFileSkipped as exc:
+                print(f"  [warn] {agent_path}: not changed, {exc}")
+                continue
         else:
             update = _inject_agent_section(agent_path, critical_block, "fw-context")
         print(f"  [ok] {agent_path}: updated fw-context section")
@@ -281,6 +285,44 @@ def _inject_critical_block(
         installed = True
 
     return installed
+
+
+def _install_toml_template(target_path: Path, template_path: Path, *, dry_run: bool) -> bool:
+    """Write the Codex agent file *target_path* from the Markdown template *template_path*.
+
+    Returns ``True`` if the file was written (or would be in dry-run).
+
+    A file that is there and is a Codex agent belongs to the user: only the
+    block in it changes, in :func:`_inject_critical_block`.  A file that is
+    there and is no Codex agent is one that fw-context wrote before, in a
+    format that Codex cannot read, and it gets the template.  The old file
+    goes to a ``.bak`` file next to it.
+    """
+    from ._mcp import _codex_agent_problem, _convert_agent_md_to_toml
+
+    try:
+        existing = target_path.read_text(encoding="utf-8") if target_path.exists() else None
+    except (OSError, UnicodeDecodeError) as exc:
+        # The file belongs to someone: without its text, no backup is possible.
+        print(f"  [warn] {target_path}: not changed, cannot read the file ({exc})")
+        return False
+    problem = _codex_agent_problem(existing) if existing is not None else None
+    if existing is not None and problem is None:
+        return False
+    template_text = _convert_agent_md_to_toml(template_path.read_text(encoding="utf-8"))
+    if dry_run:
+        action = "CREATE" if existing is None else f"WRITE AGAIN ({problem})"
+        print(f"  [dry-run] {target_path}: would {action} (TOML)")
+        return True
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    if existing is not None:
+        backup = target_path.with_suffix(target_path.suffix + ".bak")
+        backup.write_text(existing, encoding="utf-8")
+        print(f"  [fix] {target_path}: written again, {problem} (backup in {backup.name})")
+    else:
+        print(f"  [ok] {target_path}: created (TOML)")
+    target_path.write_text(template_text, encoding="utf-8")
+    return True
 
 
 def _install_template_agents(
@@ -306,8 +348,6 @@ def _install_template_agents(
     This avoids maintaining duplicate templates that would inevitably
     drift out of sync.
     """
-    from ._mcp import _convert_agent_md_to_toml
-
     if not templates:
         return False
     if not agents_dir.exists() and scope != "all":
@@ -321,20 +361,9 @@ def _install_template_agents(
             # Convert .md → .toml when target uses TOML patterns (Codex)
             has_toml = any(".toml" in p for p in patterns)
             if has_toml:
-                target_name = template_path.stem + ".toml"
-                target_path = agents_dir / target_name
-                template_text = _convert_agent_md_to_toml(template_path.read_text(encoding="utf-8"))
-                if strip_name:
-                    template_text = re.sub(r"^# name:.*\n", "", template_text, flags=re.MULTILINE)
-                if dry_run:
-                    if not target_path.exists():
-                        print(f"  [dry-run] {target_path}: would CREATE (TOML)")
-                        installed = True
-                    continue
-                agents_dir.mkdir(parents=True, exist_ok=True)
-                target_path.write_text(template_text, encoding="utf-8")
-                print(f"  [ok] {target_path}: created (TOML)")
-                installed = True
+                if _install_toml_template(agents_dir / (template_path.stem + ".toml"), template_path,
+                                          dry_run=dry_run):
+                    installed = True
             # Rename .md → .mdc when target uses Cursor patterns (same content)
             elif any(".mdc" in p for p in patterns):
                 target_name = template_path.stem + ".mdc"
@@ -400,13 +429,16 @@ def _install_agents(dry_run: bool = False, project_root: Path | None = None, sco
 
     installed = False
     for agents_dir, _tool_id, patterns, strip_name in targets:
-        if _inject_critical_block(
-            agents_dir, patterns, dry_run=dry_run, critical_block=AGENT_CRITICAL_BLOCK
-        ):
-            installed = True
+        # The templates first: the block of a new template file is the one
+        # of the template, and the injection then gives it the current
+        # block in the same run.
         if _install_template_agents(
             agents_dir, templates, patterns,
             strip_name=strip_name, dry_run=dry_run, scope=scope,
+        ):
+            installed = True
+        if _inject_critical_block(
+            agents_dir, patterns, dry_run=dry_run, critical_block=AGENT_CRITICAL_BLOCK
         ):
             installed = True
 
