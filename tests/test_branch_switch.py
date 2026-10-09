@@ -319,13 +319,13 @@ def _switch_to(repo: Path, branch: str) -> None:
 
 
 class TestTheToolAsksForABuild:
-    """`get_active_build` is the mandatory first call, so the reason has to
+    """`get_project_status` is the mandatory first call, so the reason has to
     reach it — twice in this series a wiring mistake survived unit tests."""
 
     def _state(self, root: Path) -> dict:
-        from fw_context_mcp.mcp.handlers.maintenance import get_active_build
+        from fw_context_mcp.mcp.handlers.maintenance import get_project_status
 
-        return get_active_build(project_root=str(root))
+        return get_project_status(project_root=str(root))
 
     def test_the_recorded_branch_is_the_one_the_content_came_from(
         self, indexed_repo

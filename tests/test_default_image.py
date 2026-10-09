@@ -3,8 +3,8 @@
 An ESP-IDF build makes two programs, the application and its bootloader,
 and both are indexed as images of one build.  A query names one of them:
 the server selects no default image (``resolve_build``).  The application
-that the build system names is still what ``get_active_build`` and
-``fw-context index`` check (``active_build``).
+that the build system names is still what the checks of
+``fw-context index`` read (``active_build``).
 """
 
 import argparse
@@ -18,7 +18,7 @@ from fw_context_mcp.indexer.build import BuildConfig, BuildVariant
 from fw_context_mcp.indexer.build_layout import BuildLayout
 from fw_context_mcp.indexer.builders import application_database, output_compile_commands
 from fw_context_mcp.indexer.builders.esp_idf import ESPIDFBuildSystem
-from fw_context_mcp.mcp.shared.variants import active_build, default_image, resolve_build
+from fw_context_mcp.mcp.shared.variants import active_build, resolve_build
 
 APP = "fwctx_app"
 
@@ -174,7 +174,7 @@ class TestResolveImages:
 
 
 class TestActiveBuild:
-    """The build that ``get_active_build`` and ``fw-context index`` check: no query reads it."""
+    """The build that the checks of ``fw-context index`` read: no query reads it."""
 
     def test_the_check_gets_the_application(self, temp_db, tmp_path):
         """A failed application leaves the bootloader as the newest build."""
@@ -257,12 +257,6 @@ class TestActiveBuild:
 
         assert row is None
         assert refusal is not None and "not indexed" in refusal
-
-    def test_default_image_for_discovery(self, temp_db, tmp_path):
-        _two_images(temp_db, tmp_path)
-        rows = temp_db.execute("SELECT * FROM build_configs").fetchall()
-
-        assert default_image(_cfg("esp-idf"), tmp_path, "", rows) == APP
 
 
 class TestSingleBuildImages:
@@ -418,27 +412,6 @@ class TestRunSingle:
         assert "one program" in capsys.readouterr().err
 
 
-class TestDiscovery:
-    def test_active_image_of_a_build_without_variants(self, tmp_path):
-        """get_active_build reports the image that a query without ``image`` gets."""
-        from fw_context_mcp.mcp.handlers.maintenance import _build_variant_discovery
-
-        out_dir = BuildLayout(tmp_path).out_dir("")
-        builds = [
-            {"variant": "", "image": "bootloader", "board": "", "config_hash": "h-boot",
-             "compile_commands_path": str(out_dir / "bootloader" / "compile_commands.json")},
-            {"variant": "", "image": APP, "board": "", "config_hash": "h-app",
-             "compile_commands_path": str(out_dir / "compile_commands.json")},
-        ]
-
-        discovery = _build_variant_discovery(_cfg("esp-idf"), builds, tmp_path)
-
-        assert discovery["multi"] is False
-        assert {img["name"] for img in discovery["images"]} == {APP, "bootloader"}
-        assert discovery["active_image"] == APP
-
-
-
 class TestRunMulti:
     def test_a_variant_with_a_failed_image_keeps_its_builds(self, tmp_path, monkeypatch):
         """Its build without an image name, from before the images, can be its only complete application."""
@@ -487,7 +460,7 @@ class TestRunMulti:
 
 
 class TestCheckedBuild:
-    def test_the_cli_checks_the_build_that_get_active_build_reports(self, temp_db, tmp_path, monkeypatch):
+    def test_the_cli_checks_the_application(self, temp_db, tmp_path, monkeypatch):
         """The newest build is the bootloader, and the checks must read the application."""
         import fw_context_mcp.cli._index as index_mod
         import fw_context_mcp.config as config_mod
@@ -500,20 +473,3 @@ class TestCheckedBuild:
         assert row is not None and row["config_hash"] == "h-app"
 
 
-class TestDiscoveryCompletedOnly:
-    def test_a_build_that_is_still_indexing_is_not_the_active_image(self, tmp_path):
-        from fw_context_mcp.mcp.handlers.maintenance import _build_variant_discovery
-
-        out_dir = BuildLayout(tmp_path).out_dir("")
-        builds = [
-            {"variant": "", "image": APP, "board": "", "config_hash": "h-app",
-             "manifest_verification": "indexing",
-             "compile_commands_path": str(out_dir / "compile_commands.json")},
-            {"variant": "", "image": "bootloader", "board": "", "config_hash": "h-boot",
-             "manifest_verification": "full",
-             "compile_commands_path": str(out_dir / "bootloader" / "compile_commands.json")},
-        ]
-
-        discovery = _build_variant_discovery(_cfg("esp-idf"), builds, tmp_path)
-
-        assert discovery["active_image"] is None

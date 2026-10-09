@@ -10,7 +10,7 @@ WHY there are two staleness helpers (``_stale_files`` vs ``_count_modified_files
 - ``_stale_files`` operates on a small set of result files — it checks "are THESE
   specific files stale?"  Used after every search/lookup to warn the assistant.
 - ``_count_modified_files`` scans ALL files in the database — it answers "how many
-  files are stale overall?"  Used by ``get_active_build`` for the dashboard count
+  files are stale overall?"  Used by ``get_project_status`` for the dashboard count
   and by the daemon's startup check.
 
 WHY the project-wide count can be cached: it hashes every indexed file (0.02 to
@@ -18,7 +18,7 @@ WHY the project-wide count can be cached: it hashes every indexed file (0.02 to
 check takes the ``_modified_cache`` with a 30-second TTL.  The ``MAX(mtime)``
 verification before serving cached values catches external modifications by the
 daemon's background reindex (which is a separate OS process and cannot call
-``_invalidate_modified_cache``).  get_active_build does not take the cache: an
+``_invalidate_modified_cache``).  get_project_status does not take the cache: an
 edit on disk leaves it valid.
 """
 
@@ -137,7 +137,7 @@ def check_structural_staleness(
     # writes the same new format again and the reason comes back.  This
     # function feeds the daemon (`daemon.py:_staleness_check`), which acts on
     # what it returns, and a plain `!=` put that daemon into a loop over an
-    # index nothing was wrong with.  `get_active_build` reports that
+    # index nothing was wrong with.  `get_project_status` reports that
     # direction as a warning instead, because the repair is a restart of the
     # LLM client and not a command against the index.
     stored_format = stored_row_format(cfg)
@@ -325,8 +325,9 @@ def _count_modified_files(
     same answers.
 
     *hash_cache* is shared with the header check and the other builds of
-    the project (see :func:`build_staleness`): measured on a project of 7
-    builds, 5821 rows were 1483 files, and each build hashed them again.
+    the project (``_build_health`` in ``mcp/handlers/maintenance.py``):
+    measured on a project of 7 builds, 5821 rows were 1483 files, and each
+    build hashed them again.
 
     Deduplicates by resolved absolute path, keeping the row with a hash,
     then the one with the newest stored mtime.  This prevents false positives from duplicate ``files`` rows
@@ -674,7 +675,7 @@ def find_unindexed_sources(
         # A build already ran for this file and the build system still
         # did not take it.  Reporting it again only tells the caller to
         # run a command that changes nothing, and it would hold
-        # get_active_build on "reindex_needed" for ever.  The hash is
+        # get_project_status on "reindex_needed" for ever.  The hash is
         # what expires the record: an edit means the user may have just
         # added the file to the build, thus it earns one more report.
         recorded = excluded.get(key)
@@ -825,7 +826,7 @@ def _check_header_staleness(
 
     Performance is bounded by *max_files* (default 200).  When
     *use_cache* is True (default), results are cached for 30 seconds.
-    Callers that need fresh results (e.g. ``get_active_build``) should
+    Callers that need fresh results (e.g. ``get_project_status``) should
     pass ``use_cache=False``.
     """
     if use_cache:
@@ -916,95 +917,6 @@ def stored_row_format(row) -> str:
     every answer that quotes it.
     """
     return str((row["row_format"] if "row_format" in row.keys() else "") or "")
-
-
-def build_staleness(
-    conn, row, root: Path, *, use_cache: bool, hash_cache: dict[str, str] | None = None,
-) -> tuple[bool, list[str]]:
-    """Return ``(reindex_needed, reasons)`` of one build of the index.
-
-    The same checks as ``get_active_build`` makes for the build that it
-    reports:
-
-    * the database of the build is missing or newer than the index — a
-      reindex is necessary (``reindex_needed``);
-    * the rows of the build hold text of an OLDER row format — a reindex is
-      necessary (``reindex_needed``);
-    * source files changed since the index — the build is stale, and the
-      next query or background run reindexes it;
-    * headers changed since the index, for the units that include them.
-
-    WHY each build and not only that one: a project with variants or images
-    holds several builds, and each query names one.  A change in a file that
-    only another image compiles left that build stale while get_active_build
-    reported a current index.
-
-    WHY the row format is checked for each build: the builds of one project
-    are not always indexed together, thus one build can hold the text of an
-    older version while the others are current.  A NEWER format is no reason
-    here, because a reindex writes that format again: this process is the
-    old reader (see ``row_format_is_newer``).
-
-    WHY the row-format reason is short, with no sentence about its effect:
-    a bump of the format makes every build of a project old at once, and
-    ``get_active_build`` joins the reasons of a build with ", ".  The
-    sentence holds commas and colons, thus it ran into the next reason, and
-    a project of 4 images got it 4 times.  ``get_active_build`` gives the
-    effect for its own build.  The daemon writes the same short form.
-    """
-    from ...indexer.db import CURRENT_ROW_FORMAT, row_format_is_older
-    from .context import _is_stale
-
-    config_hash = row["config_hash"]
-    reasons: list[str] = []
-    database_stale, why = _is_stale(row, row["compile_commands_path"])
-    if database_stale:
-        reasons.append(why or "compile_commands_changed")
-    stored_format = stored_row_format(row)
-    row_format_old = row_format_is_older(stored_format)
-    if row_format_old:
-        reasons.append(f"row format {stored_format or '(none)'} != {CURRENT_ROW_FORMAT}")
-    modified = _count_modified_files(conn, config_hash, root, use_cache=use_cache, hash_cache=hash_cache)
-    if modified:
-        reasons.append(f"{modified} modified file(s)")
-    if row["manifest_verification"] == "full":
-        header_tus, _ = _check_header_staleness(
-            conn, config_hash, root, use_cache=use_cache, hash_cache=hash_cache,
-        )
-        if header_tus:
-            reasons.append(f"{header_tus} source file(s) with stale header dependencies")
-    return database_stale or row_format_old, reasons
-
-
-def other_stale_builds(
-    conn, project_id: str, root: Path, active_hash: str, *, use_cache: bool,
-    hash_cache: dict[str, str] | None = None,
-) -> list[dict]:
-    """Return the stale builds of the project other than *active_hash*, see :func:`build_staleness`.
-
-    Each item: ``{"variant", "image", "reindex_needed", "reasons"}``.  A
-    build without a reason is not in the list.
-
-    One hash cache for all builds: measured on a project of 7 builds, the
-    header check took 3.6 s with one cache for each build, because each
-    image hashed the same headers of the SDK again.  *hash_cache* lets the
-    caller share the cache of its own build too.
-    """
-    stale: list[dict] = []
-    if hash_cache is None:
-        hash_cache = {}
-    for row in latest_builds(conn, project_id):
-        if row["config_hash"] == active_hash:
-            continue
-        needed, reasons = build_staleness(conn, row, root, use_cache=use_cache, hash_cache=hash_cache)
-        if reasons:
-            stale.append({
-                "variant": row["variant"] or "",
-                "image": row["image"] or "",
-                "reindex_needed": needed,
-                "reasons": reasons,
-            })
-    return stale
 
 
 def _with_stale_recovery(

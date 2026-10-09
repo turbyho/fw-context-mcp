@@ -94,8 +94,8 @@ def test_the_suite_covers_every_tool():
     # These take no argument that this file can be wrong about.
     assert uncovered <= {
         "check_dependencies", "check_ollama", "configure_llm",
-        "get_active_build", "get_environment_status", "get_project_info",
-        "list_projects", "list_variants", "reset_index",
+        "get_build_info", "get_project_info", "get_project_status",
+        "list_projects", "reset_index",
     }, f"a tool grew an unchecked argument: {sorted(uncovered)}"
     # Measured when this file was written: 37 numeric parameters and 21
     # required strings over 39 tools.  The floor guards against a change

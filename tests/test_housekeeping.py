@@ -622,7 +622,7 @@ class TestDatabasesInUse:
         assert databases_in_use(root) is None
 
     def test_the_index_is_read_without_a_migration(self, tmp_path: Path, home, monkeypatch) -> None:
-        """doctor, `cleanup --dry-run` and get_environment_status read it: open_db would migrate it."""
+        """doctor, `cleanup --dry-run` and check_dependencies read it: open_db would migrate it."""
         from fw_context_mcp.indexer import db as db_module
         from fw_context_mcp.indexer.db import _connection
 

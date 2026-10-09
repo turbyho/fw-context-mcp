@@ -5,7 +5,7 @@ ALREADY initialized project: it adds/removes/lists build variants without
 re-running agent/deps/LLM provisioning.
 
 ``list`` reads ``[[build.variants]]`` from ``config.toml`` (what the config
-declares) — NOT ``list_variants`` (MCP), which reads ``build_configs`` (what
+declares) — NOT ``get_project_status`` (MCP), which lists ``build_configs`` (what
 is actually indexed).  After a change the new variants are unindexed until
 ``fw-context index --build`` runs.
 """

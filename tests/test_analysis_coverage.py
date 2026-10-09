@@ -239,7 +239,7 @@ class TestIndexMessage:
         )
 
     def test_message_starts_with_the_separator(self):
-        """get_active_build appends this part to an existing message."""
+        """get_project_status appends this part to an existing message."""
         for analyze_vendor in (False, True):
             message = _analysis_message(
                 self._analysis(1, 1, 2, 1, 1, 2), analyze_vendor

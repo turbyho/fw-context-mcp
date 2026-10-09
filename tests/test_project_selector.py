@@ -866,7 +866,7 @@ def test_every_copy_of_the_instructions_says_one_query_one_build():
         assert "one build" in text.lower(), label
         assert "image" in text, label
         assert "variant" in text, label
-        assert "get_active_build" in text, label
+        assert "get_project_status" in text, label
         assert "twice" in text, f"{label}: no way given to compare two builds"
 
 

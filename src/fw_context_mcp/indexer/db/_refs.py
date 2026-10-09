@@ -283,7 +283,7 @@ def count_indirect_call_sites(conn: sqlite3.Connection, config_hash: str) -> int
     """Return total indirect call site count for a build config.
 
     Returns 0 when the Phase 2 analysis has not been indexed.  Used by
-    ``get_active_build()`` to report index coverage.
+    ``find_indirect_call_sites`` for the total of its page notice.
     """
     return conn.execute(
         "SELECT COUNT(*) FROM indirect_call_sites WHERE config_hash=?",
@@ -909,7 +909,7 @@ def count_refs(conn: sqlite3.Connection, config_hash: str) -> int:
     """Return total reference count for a build config.
 
     Returns 0 when refs have not been indexed.  Used by
-    ``get_active_build()`` to display index statistics and by the
+    ``get_build_info()`` to display index statistics and by the
     indexer to decide whether reference-based tools (find_callers,
     find_hotspots) are available.
     """

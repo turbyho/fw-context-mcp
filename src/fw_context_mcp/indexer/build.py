@@ -112,7 +112,7 @@ class BuildConfig:
     # Multi-variant build configuration (opt-in).  When empty, every builder
     # produces a single compile_commands.json (variant='' image='' board='').
     # No query reads the two names below since 2026-10: a query names its
-    # build (mcp/shared/variants.py).  Only get_active_build reports them.
+    # build (mcp/shared/variants.py), and no tool reports them.
     default_variant: str | None = None
     default_image: str | None = None
     variants: list[BuildVariant] = field(default_factory=list)
@@ -704,7 +704,7 @@ def checked_compile_commands(project_root: Path, cfg, indexed: Path | None) -> P
     None for a project with ``[[build.variants]]``: each variant has a file
     of its own, and this check does not cover them.
 
-    The CLI and ``get_active_build`` both ask here, thus the two cannot
+    The CLI and ``get_project_status`` both ask here, thus the two cannot
     disagree about which build is missing.
     """
     if cfg.build.variants:
@@ -781,7 +781,7 @@ def user_database(project_root: Path, cfg) -> Path | None:
     database there is, thus it is no database "of the user" here, and the
     checks of its build stay.
 
-    The CLI and ``get_active_build`` both ask here, thus the two cannot
+    The CLI and ``get_project_status`` both ask here, thus the two cannot
     disagree about what fw-context builds.
     """
     root = project_root.resolve()

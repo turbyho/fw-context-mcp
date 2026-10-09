@@ -15,7 +15,7 @@ Two markers live next to the index database:
 
 * ``build_problem.json`` — why the last index run stopped without an index:
   the build is not there, or the run failed.  Each query tool answer of
-  the project carries this text as a warning, and ``get_active_build``
+  the project carries this text as a warning, and ``get_project_status``
   names it as a reason.  A file and not a check per query: the check reads
   compile_commands.json, and the index run already did it.  The next run
   that ends well with the build there removes the file.

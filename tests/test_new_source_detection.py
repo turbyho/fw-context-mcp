@@ -237,7 +237,7 @@ class TestExcludedSources:
     """A file a build ran for and still did not cover is reported once.
 
     Without this, editing a .c that the build system deliberately leaves out
-    holds get_active_build on "reindex_needed" for ever: the only thing that
+    holds get_project_status on "reindex_needed" for ever: the only thing that
     clears the report is a build that makes compile_commands.json newer than
     the file, and no build will ever take that file.
     """
@@ -595,7 +595,7 @@ class TestEveryUncoveredFileIsRecorded:
         assert len(load_excluded(db_path.parent)) == 25
 
     def test_nothing_is_reported_once_the_whole_set_is_recorded(self, tmp_path: Path):
-        """The end the suppression exists for: a quiet get_active_build."""
+        """The end the suppression exists for: a quiet get_project_status."""
         from fw_context_mcp.indexer.autobuild import record_excluded
         from fw_context_mcp.indexer.db import open_db
         from fw_context_mcp.mcp.shared.stale import find_unindexed_sources

@@ -714,7 +714,7 @@ def run(
 
     # Resolve analyze_vendor: CLI flag takes precedence, config falls back.
     # Only meaningful when analyze_symbols is True — otherwise analysis doesn't
-    # run and the flag is irrelevant (storing True would mislead get_active_build).
+    # run and the flag is irrelevant (storing True would mislead get_project_status).
     if analyze_symbols:
         _analyze_vendor = analyze_vendor or (llm_config is not None and llm_config.analyze_vendor)
     else:

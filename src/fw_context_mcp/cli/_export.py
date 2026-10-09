@@ -218,7 +218,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         _build_overrides(conn, config_hash, db_path.parent)
         conn.commit()
 
-        # Update stored analyze_vendor so get_active_build reports
+        # Update stored analyze_vendor so get_project_status reports
         # consistent state.  Only manifest_verification and description
         # are preserved from the existing row (not overwritten).
         upsert_build_config(

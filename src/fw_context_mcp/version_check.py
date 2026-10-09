@@ -1,6 +1,6 @@
 """Tell the caller about a newer release and about a server that does not run the installed code.
 
-Two facts about the version of fw-context reach ``get_active_build``:
+Two facts about the version of fw-context reach ``get_project_status``:
 
 - **The server does not run the installed code.**  ``__version__`` is read
   once, when the process imports the package.  When the operator installs
@@ -18,7 +18,7 @@ Two facts about the version of fw-context reach ``get_active_build``:
   nothing, thus a machine without network access tries again at each
   server start.  The request runs in the background and costs no session
   time.
-  ``get_active_build`` reads only the state file, never the network: a
+  ``get_project_status`` reads only the state file, never the network: a
   query must not wait for PyPI, and a machine without network access must
   get the same answers as a machine with it.
 
@@ -138,7 +138,7 @@ def is_editable_install() -> bool | None:
     ``None`` means that the file is there and is not JSON, thus the install
     type is not known.  The callers then skip the check, because a guess
     can report a release that the source tree already holds.  The answer
-    of ``get_active_build`` must not fail for this file, thus the function
+    of ``get_project_status`` must not fail for this file, thus the function
     does not raise.
     """
     try:
@@ -150,7 +150,7 @@ def is_editable_install() -> bool | None:
     try:
         data = json.loads(text)
     except ValueError:
-        # get_active_build calls this function at each call, and one
+        # get_project_status calls this function at each call, and one
         # warning for each process is sufficient.
         if DISTRIBUTION not in _direct_url_warned:
             _direct_url_warned.add(DISTRIBUTION)
@@ -190,7 +190,7 @@ def read_state() -> UpdateState | None:
 
     ``None`` means that no request succeeded yet.  A file that fw-context
     cannot parse gives ``None`` too: the next request writes it again, and
-    a damaged state file must not stop the answer of ``get_active_build``.
+    a damaged state file must not stop the answer of ``get_project_status``.
     """
     try:
         data = json.loads(state_path().read_text(encoding="utf-8"))

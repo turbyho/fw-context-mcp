@@ -490,7 +490,7 @@ def check_obsolete_files(project_root: str | Path | None = None) -> DepCheckResu
     """List what an older fw-context wrote and no version uses, see ``housekeeping``.
 
     The check removes nothing: ``doctor`` and the MCP tool
-    ``get_environment_status`` only read.  ``doctor --fix`` removes the list.
+    ``check_dependencies`` only read.  ``doctor --fix`` removes the list.
     Not critical: such a file or key takes space and gives a warning, and
     no answer changes.
     """

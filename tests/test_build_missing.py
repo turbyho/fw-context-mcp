@@ -140,7 +140,7 @@ def _project(root: Path, index_dir: Path, cc: Path, system: str = "cmake") -> Pa
 
 @pytest.mark.usefixtures("global_config")
 class TestTheCheckedFile:
-    """The CLI and get_active_build ask one function, thus they cannot disagree."""
+    """The CLI and get_project_status ask one function, thus they cannot disagree."""
 
     @staticmethod
     def _cfg(root: Path, build_table: str = 'system = "cmake"'):
@@ -568,53 +568,53 @@ class TestTheMcpAnswers:
         answer = asyncio.run(_wrap_tool(handler)(project_root=str(root)))
         assert answer[0] == {"warning": "The last index run failed (exit code 1)."}
 
-    def test_get_active_build_finds_a_build_that_went_away(self, tmp_path: Path) -> None:
+    def test_get_project_status_finds_a_build_that_went_away(self, tmp_path: Path) -> None:
         """No run has seen it yet, thus there is no marker; the tool checks itself."""
         import shutil
 
-        from fw_context_mcp.mcp.handlers.maintenance import get_active_build
+        from fw_context_mcp.mcp.handlers.maintenance import get_project_status
 
         root, _ = self._indexed(tmp_path)
         shutil.rmtree(_out(root))
 
-        result = get_active_build(project_root=str(root))
+        result = get_project_status(project_root=str(root))
         assert result["status"] == "reindex_needed"
         assert result["index_message"].startswith(f"compile_commands.json {_default_cc(root)} does not exist")
         assert "fw-context index --build" in result["index_message"]
         assert "compile_commands_missing" not in result["reindex_reasons"], "one reason names it once"
 
-    def test_get_active_build_finds_a_missing_build_directory(self, tmp_path: Path) -> None:
-        from fw_context_mcp.mcp.handlers.maintenance import get_active_build
+    def test_get_project_status_finds_a_missing_build_directory(self, tmp_path: Path) -> None:
+        from fw_context_mcp.mcp.handlers.maintenance import get_project_status
 
         root = tmp_path / "proj"
         root.mkdir()
         _project(root, tmp_path / "index", _half_gone(root))
 
-        result = get_active_build(project_root=str(root))
+        result = get_project_status(project_root=str(root))
         assert result["status"] == "reindex_needed"
         assert result["index_message"].startswith(f"the build directory {_out(root) / 'app'}")
 
     def test_a_reason_of_a_build_that_is_back_goes_away(self, tmp_path: Path) -> None:
         """The user built outside of fw-context: the old text must not stay in each answer."""
         from fw_context_mcp.indexer.autobuild import read_problem, record_problem
-        from fw_context_mcp.mcp.handlers.maintenance import get_active_build
+        from fw_context_mcp.mcp.handlers.maintenance import get_project_status
 
         root, db_path = self._indexed(tmp_path)
         record_problem(db_path.parent, "the build directory /x does not exist.", build_missing=True)
 
-        result = get_active_build(project_root=str(root))
+        result = get_project_status(project_root=str(root))
         assert not any("does not exist" in r for r in result["reindex_reasons"])
         assert read_problem(db_path.parent) is None
 
     def test_a_failed_run_stays_while_the_build_is_there(self, tmp_path: Path) -> None:
         """Only a run that ends well removes the text of a failed run."""
         from fw_context_mcp.indexer.autobuild import read_problem, record_problem
-        from fw_context_mcp.mcp.handlers.maintenance import get_active_build
+        from fw_context_mcp.mcp.handlers.maintenance import get_project_status
 
         root, db_path = self._indexed(tmp_path)
         record_problem(db_path.parent, "The last index run failed (exit code 1).")
 
-        result = get_active_build(project_root=str(root))
+        result = get_project_status(project_root=str(root))
         assert result["status"] == "reindex_needed"
         assert "The last index run failed (exit code 1)." in result["reindex_reasons"]
         assert read_problem(db_path.parent) is not None
@@ -624,13 +624,13 @@ class TestTheMcpAnswers:
         import shutil
 
         from fw_context_mcp.indexer.autobuild import record_problem
-        from fw_context_mcp.mcp.handlers.maintenance import get_active_build
+        from fw_context_mcp.mcp.handlers.maintenance import get_project_status
 
         root, db_path = self._indexed(tmp_path)
         shutil.rmtree(_out(root))
         record_problem(db_path.parent, "refused: the build is gone.", build_missing=True)
 
-        result = get_active_build(project_root=str(root))
+        result = get_project_status(project_root=str(root))
         assert [r for r in result["reindex_reasons"] if "build" in r] == ["refused: the build is gone."]
 
     def test_an_index_of_an_explicit_file_gets_no_check(self, tmp_path: Path) -> None:
@@ -639,21 +639,21 @@ class TestTheMcpAnswers:
         The build of the default file is gone too: only the comparison with
         the file of the index keeps the check away.
         """
-        from fw_context_mcp.mcp.handlers.maintenance import get_active_build
+        from fw_context_mcp.mcp.handlers.maintenance import get_project_status
 
         root = tmp_path / "proj"
         root.mkdir()
         explicit = _write_cc(tmp_path / "ci" / "compile_commands.json", tmp_path / "ci-machine" / "build")
         _project(root, tmp_path / "index", explicit)
 
-        result = get_active_build(project_root=str(root))
+        result = get_project_status(project_root=str(root))
         assert not any("the build directory" in r for r in result["reindex_reasons"])
         assert not any("does not exist" in r for r in result["reindex_reasons"])
 
     def test_a_marker_stays_when_the_tool_cannot_check(self, tmp_path: Path) -> None:
         """No check is no evidence that the build is back."""
         from fw_context_mcp.indexer.autobuild import read_problem, record_problem
-        from fw_context_mcp.mcp.handlers.maintenance import get_active_build
+        from fw_context_mcp.mcp.handlers.maintenance import get_project_status
 
         root = tmp_path / "proj"
         root.mkdir()
@@ -661,7 +661,7 @@ class TestTheMcpAnswers:
         db_path = _project(root, tmp_path / "index", explicit)
         record_problem(db_path.parent, "refused: the build is gone.", build_missing=True)
 
-        result = get_active_build(project_root=str(root))
+        result = get_project_status(project_root=str(root))
         assert "refused: the build is gone." in result["reindex_reasons"]
         assert read_problem(db_path.parent) is not None
 
@@ -728,13 +728,13 @@ class TestTheDatabaseOfTheUser:
 
         assert checked_compile_commands(root, cfg, (root / "ci" / "cc.json").resolve()) is None
 
-    def test_get_active_build_reports_no_missing_build(self, tmp_path: Path) -> None:
+    def test_get_project_status_reports_no_missing_build(self, tmp_path: Path) -> None:
         """The directory of a CI database is on the CI machine; that is no missing build."""
-        from fw_context_mcp.mcp.handlers.maintenance import get_active_build
+        from fw_context_mcp.mcp.handlers.maintenance import get_project_status
 
         root, _ = self._project_with_user_database(tmp_path)
 
-        result = get_active_build(project_root=str(root))
+        result = get_project_status(project_root=str(root))
         assert not any("build directory" in r or "--build" in r for r in result.get("reindex_reasons", []))
 
     def test_new_sources_get_the_advice_of_a_database_of_the_user(self, tmp_path: Path) -> None:

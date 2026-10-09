@@ -11,37 +11,37 @@ from unittest import mock
 import pytest
 
 # ═══════════════════════════════════════════════════════════════════════════
-# B3 — get_active_build "stale" key
+# B3 — get_project_status "stale" key
 # ═══════════════════════════════════════════════════════════════════════════
 
 
 class TestGetActiveBuildStaleKey:
-    """Verify get_active_build returns the 'stale' key and its semantics."""
+    """Verify get_project_status returns the 'stale' key and its semantics."""
 
     def test_docstring_mentions_stale(self):
-        """get_active_build docstring must document the 'stale' key."""
-        from fw_context_mcp.mcp.handlers.maintenance import get_active_build
+        """get_project_status docstring must document the 'stale' key."""
+        from fw_context_mcp.mcp.handlers.maintenance import get_project_status
 
-        doc = get_active_build.__doc__ or ""
+        doc = get_project_status.__doc__ or ""
         assert "stale" in doc, (
-            "get_active_build docstring must mention the 'stale' return key"
+            "get_project_status docstring must mention the 'stale' return key"
         )
 
     def test_docstring_mentions_stale_semantics(self):
-        """get_active_build docstring explains stale means needs_reindex or header_affected_tus > 0."""
-        from fw_context_mcp.mcp.handlers.maintenance import get_active_build
+        """get_project_status docstring explains stale means needs_reindex or header_affected_tus > 0."""
+        from fw_context_mcp.mcp.handlers.maintenance import get_project_status
 
-        doc = get_active_build.__doc__ or ""
+        doc = get_project_status.__doc__ or ""
         assert "stale" in doc
         assert "reindex_needed" in doc
         assert "header_affected_tus" in doc
 
     def test_stale_is_boolean_field(self):
-        """The 'stale' field documented in get_active_build must be a boolean concept."""
-        from fw_context_mcp.mcp.handlers.maintenance import get_active_build
+        """The 'stale' field documented in get_project_status must be a boolean concept."""
+        from fw_context_mcp.mcp.handlers.maintenance import get_project_status
 
         # Verify the function's return type documentation includes stale
-        doc = get_active_build.__doc__ or ""
+        doc = get_project_status.__doc__ or ""
         # stale is documented in the Returns section
         assert "stale" in doc
 
@@ -49,7 +49,7 @@ class TestGetActiveBuildStaleKey:
         """Verify the tool-coverage suite asserts 'stale' key presence (α4.py).
 
         This test is a self-check: the standalone coverage script already
-        validates that get_active_build returns the stale key when run
+        validates that get_project_status returns the stale key when run
         against a real indexed project.  We verify the check exists.
         """
         # The test_tool_coverage.py script has:

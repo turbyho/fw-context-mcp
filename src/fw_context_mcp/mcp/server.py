@@ -1,6 +1,6 @@
 """fw-context MCP server — build-aware code intelligence for embedded C/C++ projects.
 
-Serves 39 MCP tools and 4 MCP resources via FastMCP (stdio transport).
+Serves 38 MCP tools and 4 MCP resources via FastMCP (stdio transport).
 The two counts are pinned by a test — a docstring that drifts describes
 a server that no longer exists.
 
@@ -62,10 +62,10 @@ client-side connection timeouts.
 
 **Variables:** ``find_variables``.
 
-**Maintenance tools:** ``get_active_build``, ``get_environment_status``,
+**Maintenance tools:** ``get_project_status``, ``get_build_info``,
 ``check_dependencies``, ``list_projects``, ``get_project_info``,
 ``check_ollama``, ``configure_llm``, ``reindex_file``,
-``reindex_file_impl``, ``reset_index``, ``list_variants``.
+``reindex_file_impl``, ``reset_index``.
 
 **MCP Resources:** ``fw-context://stats``, ``fw-context://projects``,
 ``fw-context://symbols/{name}``, ``fw-context://skills/fw-review``.
@@ -747,7 +747,7 @@ mcp = FastMCP(
         "1. Call list_projects. It gives the name, the project_id, and the\n"
         "   root_path of each indexed project.\n"
         '2. Give project="<name>" (or project_root="<root_path>") to EVERY\n'
-        "   call that follows, get_active_build included.\n"
+        "   call that follows, get_project_status included.\n"
         "A name that several projects share gives an error that lists each one\n"
         "with its project_id. Repeat the call with that project_id.\n"
         "Do not invent other parameter names. An unknown argument causes an\n"
@@ -769,10 +769,11 @@ mcp = FastMCP(
         "• Select the build from the task.  If the task does not identify one\n"
         "  build, ask the user.  Do not select a build from its position in a\n"
         "  list.\n"
-        "• Call list_variants for one row per indexed build, with its own\n"
-        "  config_hash, board, counts and memory map.  It reads the INDEX and\n"
-        "  not only the config, thus a build indexed with --variant is listed\n"
-        "  even when config.toml no longer declares it.\n"
+        "• get_project_status lists every build in `builds`, with its state\n"
+        "  and counts.  get_build_info(variant, image) gives the config_hash,\n"
+        "  board, memory map and defines of one build.  Both read the INDEX\n"
+        "  and not only the config, thus a build indexed with --variant is\n"
+        "  listed even when config.toml no longer declares it.\n"
         "• Pass `variant` and `image` to every tool that answers about code,\n"
         "  smart_search and semantic_search included.\n"
         "• To learn whether a symbol is in the bootloader TOO, ask twice, once\n"
@@ -829,11 +830,11 @@ mcp = FastMCP(
         "• `query` — the search terms.  (search_code, search_bodies,\n"
         "  search_content, smart_search, semantic_search)\n"
         "No tool takes a filler argument.  Send no argument you did not read in\n"
-        "the schema — `get_active_build` accepts only `project`, `project_root`\n"
+        "the schema — `get_project_status` accepts only `project`, `project_root`\n"
         "and `fast`.\n"
         "When a call fails on an argument, DROP the bad argument and REPEAT the\n"
         "call.  Do not continue without the answer, and above all do not skip\n"
-        "`get_active_build`: it says whether the index can be trusted at all.\n\n"
+        "`get_project_status`: it says whether the index can be trusted at all.\n\n"
         "ANTI-PATTERNS — do NOT:\n"
         "• Use external search tools for C/C++ symbols → use lookup_symbol or search_code\n"
         "• Use external search tools for code patterns → use search_bodies (function\n"
@@ -854,12 +855,12 @@ mcp = FastMCP(
         "  search_code is for concept/keyword DISCOVERY only.\n"
         "• Use generic review agents/skills for C/C++ code → use\n"
         "  fw-review skill (see REVIEW SKILL section below).\n\n"
-        "AGENT LOOP: Check(get_active_build) → Find(search_code/lookup_symbol)\n"
+        "AGENT LOOP: Check(get_project_status) → Find(search_code/lookup_symbol)\n"
         "→ Read(get_symbol_context) ← preferred (body+callers+callees in one call).\n"
         "  Fallback: get_source (body only). For whole-file reads: read_file.\n"
         "→ Trace(find_references/find_callers) — skip if context already from get_symbol_context.\n"
         "→ For body patterns use search_bodies.\n"
-        "→ DECISION after get_active_build():\n"
+        "→ DECISION after get_project_status():\n"
         '  • status="ready" or "reindexing" — fw-context is fully operational.\n'
         "    bg_reindex_running does NOT mean the index is unavailable. Continue.\n"
         '  • status="reindex_needed" — queries still work, but schedule fw-context index.\n'
@@ -881,7 +882,7 @@ mcp = FastMCP(
         '    "Initialize fw-context? Runs `fw-context init` — creates project ID,\n'
         "    config files (.fw-context/config.toml), and registers with AI tools.\"\n"
         "    Do NOT run without operator confirmation. On approval → run\n"
-        "    `fw-context init` via bash, then call get_active_build() again\n"
+        "    `fw-context init` via bash, then call get_project_status() again\n"
         "    (returns no_index). init and index are SEPARATE steps — after init,\n"
         "    ask AGAIN before indexing (see no_index below).\n"
         '  • status="no_index" — project initialized but no symbol index. ASK the\n'
@@ -890,7 +891,7 @@ mcp = FastMCP(
         "    and uses gigabytes of disk.\" Do NOT run without operator confirmation.\n"
         "    On approval → run `fw-context index --build` via bash (or\n"
         "    `fw-context index <compile_commands.json>` if one exists), then call\n"
-        '    get_active_build() again to confirm status="ready".\n'
+        '    get_project_status() again to confirm status="ready".\n'
         "    NOTE: init and index are NEVER combined — each requires its own\n"
         "    operator confirmation before execution.\n"
         "  • NO status, only `error` — DB corruption or access error. There is\n"
@@ -942,10 +943,10 @@ mcp = FastMCP(
         "Inheritance: get_inheritance_chain, get_class_members,\n"
         "get_template_instances, get_method_overrides.\n"
         "Source: get_source, get_symbol_context, get_file_map, explain_symbol, read_file.\n"
-         "Maintenance: get_active_build, get_environment_status,\n"
+         "Maintenance: get_project_status, get_build_info,\n"
          "check_dependencies, list_projects, get_project_info,\n"
          "check_ollama, configure_llm, reindex_file, reindex_file_impl,\n"
-         "reset_index, list_variants.\n\n"
+         "reset_index.\n\n"
          "MULTIPROJECT / MULTIDEVICE — a project of more than one build:\n"
          "  • The project indexes N variants × M images (boards/cores).\n"
          "  • ONE QUERY ANSWERS FOR ONE BUILD.  Every tool that answers about\n"
@@ -957,7 +958,8 @@ mcp = FastMCP(
          "  • variant=\"*\" is REFUSED.  To learn whether a symbol is in two\n"
          "    builds, ask twice, once per build.  No answer merges builds, and\n"
          "    no row carries a variant/image label.\n"
-         "  • list_variants() shows the authoritative per-build config_hash + counts.\n"
+         "  • get_project_status() lists the builds; get_build_info(variant, image)\n"
+         "    gives the config_hash and the memory map of one build.\n"
          "  • \"ukaž stage0 na nRF52840\" → variant=\"nrf52840\", image=\"stage0\".\n"
          "  • A project without variants can still hold several images\n"
          "    (ESP-IDF: the application and `bootloader`): give image=<name>.\n\n"
@@ -982,11 +984,11 @@ mcp = FastMCP(
         "commit, verify this change.\n"
         "If the project has a LOCAL fw-review skill, that overrides\n"
         "the global default — the user has intentionally customized it.\n\n"
-        "Start every session with get_active_build(), and repeat it when the\n"
+        "Start every session with get_project_status(), and repeat it when the\n"
         "first attempt fails on an argument.  An answer built on an index of\n"
         "unknown health is worth nothing.\n"
         "For non-C/C++ files, general-purpose tools are preferred.\n\n"
-        "LLM SETUP — after get_active_build returns status='ready', call\n"
+        "LLM SETUP — after get_project_status returns status='ready', call\n"
         "check_ollama to verify the LLM backend:\n"
         "  • status='ok' — LLM ready. Continue.\n"
         "  • status='not_configured' — Ollama not running, no chat API. ASK:\n"
@@ -1087,7 +1089,7 @@ mcp = FastMCP(
 # (config reads, file stats, SQLite pragma checks) and complete in <1 s.
 # Wrapping them would add asyncio overhead for no benefit, and the lock
 # would serialize fast queries behind slow ones (e.g., a 30 s search_bodies
-# query blocking a 10 ms get_active_build check).
+# query blocking a 10 ms get_project_status check).
 #
 # All search, call graph, symbol source, inheritance, and variable tools
 # ARE wrapped — they may run for seconds to minutes (BFS traversal,
@@ -1106,11 +1108,10 @@ _forbid_unknown_tool_arguments()
 mcp.tool()(_with_project_selector(maintenance.check_dependencies))
 mcp.tool()(_with_project_selector(maintenance.check_ollama))
 mcp.tool()(_with_project_selector(maintenance.configure_llm))
-mcp.tool()(_with_project_selector(maintenance.get_active_build))
-mcp.tool()(_with_project_selector(maintenance.get_environment_status))
+mcp.tool()(_with_project_selector(maintenance.get_build_info))
 mcp.tool()(_with_project_selector(maintenance.get_project_info))
+mcp.tool()(_with_project_selector(maintenance.get_project_status))
 mcp.tool()(_with_project_selector(maintenance.list_projects))
-mcp.tool()(_with_project_selector(maintenance.list_variants))
 mcp.tool()(_with_project_selector(maintenance.reindex_file))
 mcp.tool()(_with_project_selector(maintenance.reindex_file_impl))
 mcp.tool()(_with_project_selector(maintenance.reset_index))
@@ -1176,9 +1177,14 @@ def resource_stats() -> str:
             lines.append(f"- **{p.get('db', '?')}**: ERROR — {p['error']}")
             continue
         stale = "⚠ reindex_needed" if p.get("reindex_needed") else "✓ ready"
+        # A project of several builds has no counts (see list_projects): a
+        # sum counts shared code once for each build.
+        size = (
+            f"{p['symbol_count']} symbols, {p['file_count']} files"
+            if p["symbol_count"] is not None else f"{p['build_count']} builds"
+        )
         lines.append(
-            f"- **{p['name']}** ({p['project_id']}) — "
-            f"{p['symbol_count']} symbols, {p['file_count']} files, "
+            f"- **{p['name']}** ({p['project_id']}) — {size}, "
             f"indexed {p['indexed_at']}, {stale}"
         )
     return "\n".join(lines)
@@ -1274,11 +1280,11 @@ def main() -> None:
        - If project root cannot be resolved: sets a sentinel so all tools
          return a clear error (fatal — server cannot operate).
        - If project is not initialized (``fw-context init`` not run): server
-         starts normally — ``get_active_build()`` returns ``not_initialized``
+         starts normally — ``get_project_status()`` returns ``not_initialized``
          so the agent can ask the operator and run init via bash.  Other
          tools raise ``ProjectNotInitializedError`` (fail-fast).
        - If project is initialized but no index exists: server starts
-         normally — ``get_active_build()`` returns ``no_index`` so the
+         normally — ``get_project_status()`` returns ``no_index`` so the
          agent can ask the operator and run index via bash.  The ping
          thread starts, thus the watcher daemon starts as soon as the
          operator creates the index.
@@ -1294,7 +1300,7 @@ def main() -> None:
 
     **Why progressive startup?**  The server must NOT exit when the
     project is not initialized or has no index.  The whole point of
-    ``get_active_build()`` returning ``not_initialized`` / ``no_index``
+    ``get_project_status()`` returning ``not_initialized`` / ``no_index``
     is so the agent can ask the operator and run the corresponding
     command via bash.  An early exit would make the tools disappear from
     the agent's context, breaking the guided setup flow.
@@ -1302,7 +1308,7 @@ def main() -> None:
     log.info("fw-context MCP server starting")
 
     # Phase 0: ask PyPI for a newer release in a daemon thread.  The thread
-    # writes a state file that get_active_build reads, thus no tool waits
+    # writes a state file that get_project_status reads, thus no tool waits
     # for the network.  load_update_settings reads one file of the global
     # config, and not the full config: see its docstring.
     try:
@@ -1312,7 +1318,7 @@ def main() -> None:
     except RuntimeError:
         # Thread.start() raises RuntimeError when the interpreter cannot
         # start a thread.  The server must start without the check.
-        log.exception("Update check startup failed — get_active_build reports no newer release")
+        log.exception("Update check startup failed — get_project_status reports no newer release")
 
     # Phase 1: pre-populate the project-ready cache with a one-shot check.
     # _check_server_ready() raises RuntimeError when the project isn't
@@ -1337,7 +1343,7 @@ def main() -> None:
 
     # Phase 3: if the project IS ready, pre-mark integrity check and ensure
     # daemon.  If not ready, skip to mcp.run() — tools will report status
-    # via get_active_build().
+    # via get_project_status().
     try:
         root = resolve_project_root(None)
     except OSError:
@@ -1351,18 +1357,18 @@ def main() -> None:
         from ..config.settings import ProjectNotInitializedError
         project_id = derive_project_id(root)
     except ProjectNotInitializedError:
-        log.info("Project not initialized at %s — get_active_build() will report not_initialized", root)
+        log.info("Project not initialized at %s — get_project_status() will report not_initialized", root)
         mcp.run()
         return
 
     # Check 2: does the index database exist?
     # If not, we DON'T set the sentinel — the server starts normally so
-    # that get_active_build() can return status="no_index", allowing the
+    # that get_project_status() can return status="no_index", allowing the
     # agent to ask the operator and run `fw-context index` via bash.
     cfg = load_config(project_root=root)
     db_path = cfg.index.db_dir / project_id / "index.db"
     if not db_path.exists():
-        log.info("No index found at %s — get_active_build() will report no_index", db_path)
+        log.info("No index found at %s — get_project_status() will report no_index", db_path)
         # The ping thread starts even when no index exists.  The thread
         # calls _ensure_daemon_running every PING_INTERVAL seconds, thus
         # the watcher starts when the operator runs `fw-context index`.

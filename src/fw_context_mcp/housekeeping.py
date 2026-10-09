@@ -430,7 +430,7 @@ def databases_in_use(project_root: Path) -> list[Path] | None:
 
     The index opens read-only, not through ``open_db``: that runs the
     schema migrations, and ``doctor``, ``cleanup --dry-run`` and the MCP
-    tool ``get_environment_status`` call this function and must change
+    tool ``check_dependencies`` call this function and must change
     nothing.  An index of an older schema that the query cannot read gives
     None, thus its old copies stay until an index run migrates it.
     """

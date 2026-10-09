@@ -248,7 +248,7 @@ class TestCountModifiedByHash:
     def test_the_two_helpers_agree_on_a_backdated_file(self, tmp_path: Path):
         """The invariant, not the implementation.
 
-        get_active_build reads _count_modified_files and the search tools
+        get_project_status reads _count_modified_files and the search tools
         read _stale_files.  A file the one reports and the other does not
         gives the caller two readings and no way to choose — which is the
         contradiction 242472e set out to remove.
@@ -274,7 +274,7 @@ class TestCountModifiedByHash:
         )
 
     def test_one_cache_hashes_each_file_once(self, tmp_path: Path, monkeypatch):
-        """The builds of a project share their files; get_active_build counts each build."""
+        """The builds of a project share their files; get_project_status counts each build."""
         import fw_context_mcp.indexer.manifest as manifest_mod
         from fw_context_mcp.mcp.shared.stale import _count_modified_files
 

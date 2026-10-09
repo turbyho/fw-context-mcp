@@ -472,11 +472,11 @@ class TestFallbackToSearchCode:
         # Must return a dict (error) or list (results), not crash
         assert isinstance(result, (list, dict))
 
-    def test_get_active_build_docstring_covers_staleness(self):
-        """get_active_build docstring explains reindex_needed and status."""
-        from fw_context_mcp.mcp.handlers.maintenance import get_active_build
+    def test_get_project_status_docstring_covers_staleness(self):
+        """get_project_status docstring explains reindex_needed and status."""
+        from fw_context_mcp.mcp.handlers.maintenance import get_project_status
 
-        doc = get_active_build.__doc__ or ""
+        doc = get_project_status.__doc__ or ""
         assert "schema_version" in doc, "docstring must mention schema_version"
         assert "current_schema" in doc, "docstring must mention current_schema"
         assert "reindex" in doc.lower(), (
@@ -484,10 +484,10 @@ class TestFallbackToSearchCode:
         )
         assert "status" in doc, "docstring must mention status field"
 
-    def test_get_active_build_docstring_reindex_field(self):
-        """get_active_build docstring mentions reindex_needed field."""
-        from fw_context_mcp.mcp.handlers.maintenance import get_active_build
+    def test_get_project_status_docstring_reindex_field(self):
+        """get_project_status docstring mentions reindex_needed field."""
+        from fw_context_mcp.mcp.handlers.maintenance import get_project_status
 
-        doc = get_active_build.__doc__ or ""
+        doc = get_project_status.__doc__ or ""
         assert "reindex_needed" in doc, "docstring must mention reindex_needed field"
         assert "modified_files_count" in doc, "docstring must mention modified_files_count"

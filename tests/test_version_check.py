@@ -1,4 +1,4 @@
-"""Tests for the version facts that ``get_active_build`` reports.
+"""Tests for the version facts that ``get_project_status`` reports.
 
 Two facts, two sources:
 
@@ -22,7 +22,7 @@ import httpx
 import pytest
 
 import fw_context_mcp.version_check as vc
-from fw_context_mcp.mcp.handlers.maintenance import _with_version_state, get_active_build
+from fw_context_mcp.mcp.handlers.maintenance import _with_version_state, get_project_status
 
 _NOW = datetime(2026, 10, 8, 12, 0, tzinfo=UTC)
 
@@ -157,7 +157,7 @@ class TestEditableInstall:
         assert vc.is_editable_install() is False
 
     def test_a_file_that_is_not_json_gives_unknown(self, monkeypatch, caplog):
-        """One warning for each process: get_active_build calls the function at each call."""
+        """One warning for each process: get_project_status calls the function at each call."""
         import logging
 
         monkeypatch.setattr(vc.importlib.metadata, "distribution", lambda name: _FakeDistribution("{not json"))
@@ -429,7 +429,7 @@ class TestCmdVersion:
         assert len(capsys.readouterr().out.splitlines()) == 1
 
 
-# ── get_active_build ─────────────────────────────────────────────────────────
+# ── get_project_status ─────────────────────────────────────────────────────────
 
 
 def _uninitialized_project(tmp_path: Path) -> Path:
@@ -443,7 +443,7 @@ class TestGetActiveBuild:
     def test_an_upgrade_asks_for_a_restart_without_an_index(self, tmp_path, home, installed):
         """The fact concerns the process, thus it must not wait for an index."""
         installed("99.0.0")
-        result = get_active_build(project_root=str(_uninitialized_project(tmp_path)))
+        result = get_project_status(project_root=str(_uninitialized_project(tmp_path)))
 
         assert result["status"] == "not_initialized"
         assert result["client_restart_required"] is True
@@ -456,7 +456,7 @@ class TestGetActiveBuild:
 
         installed(__version__)
         _write_state(home, __version__)
-        result = get_active_build(project_root=str(_uninitialized_project(tmp_path)))
+        result = get_project_status(project_root=str(_uninitialized_project(tmp_path)))
 
         assert "client_restart_required" not in result
         assert "update_notice" not in result
@@ -466,7 +466,7 @@ class TestGetActiveBuild:
 
         installed(__version__)
         _write_state(home, "99.0.0")
-        result = get_active_build(project_root=str(_uninitialized_project(tmp_path)))
+        result = get_project_status(project_root=str(_uninitialized_project(tmp_path)))
 
         assert "99.0.0" in result["update_notice"]
         assert result["status"] == "not_initialized"
@@ -477,7 +477,7 @@ class TestGetActiveBuild:
 
         installed(__version__)
         _write_state(home, "99.0.0")
-        result = get_active_build(project_root=str(_uninitialized_project(tmp_path)))
+        result = get_project_status(project_root=str(_uninitialized_project(tmp_path)))
 
         assert "update_notice" not in result
 

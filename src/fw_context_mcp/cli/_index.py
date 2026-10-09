@@ -64,11 +64,11 @@ log = logging.getLogger(__name__)
 def _checked_build(conn, project_root: Path, cfg):
     """Return the build that the checks of an index run read, or None without one.
 
-    The build of a query without ``variant`` and ``image``, as
-    ``get_active_build`` reports it (``active_build``), thus the CLI and the
-    MCP server check one build.  The newest build only when no build
-    answers such a query: the newest one is the program that the last run
-    did last, a bootloader after a failed application.
+    One build (``active_build``): the application of a build of several
+    images, else the newest build.  The newest build only when no build
+    system names the application: the newest one is the program that the
+    last run did last, a bootloader after a failed application.  The MCP
+    server checks every build (``get_project_status``).
     """
     from ..config import derive_project_id
     from ..indexer.db import get_active_config
@@ -250,7 +250,7 @@ def _plan_auto_build(
         # The build is gone as a whole: no file list and no compiler answer
         # can come from it, thus it outranks the two other reasons.  The
         # file is the one that this run reads and that the index came from,
-        # as `get_active_build` checks it (`build.checked_compile_commands`).
+        # as `get_project_status` checks it (`build.checked_compile_commands`).
         checked = (
             checked_compile_commands(project_root, cfg, Path(active["compile_commands_path"]))
             if background else None
@@ -1947,7 +1947,7 @@ def _record_still_uncovered(project_root: Path, db_path: Path) -> None:
     a file waiting for a build — the build system does not want it: a test
     outside the build, an old experiment, a variant that is not compiled.
     Reporting it again would tell the caller to run `fw-context index
-    --build`, which changes nothing, and would hold get_active_build on
+    --build`, which changes nothing, and would hold get_project_status on
     "reindex_needed" for as long as the file stays edited.
 
     Recomputing the scan here is simpler than remembering the list from

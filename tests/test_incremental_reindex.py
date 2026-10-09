@@ -3444,7 +3444,7 @@ class TestTheDecisionIsByHash:
 
         The manifest and the files row then held the hash of the text saved
         after the parse, beside the symbols of the text before it.  The next
-        run found every unit current, and ``get_active_build`` found no
+        run found every unit current, and ``get_project_status`` found no
         change.
         """
         from fw_context_mcp.mcp.shared.stale import _count_modified_files

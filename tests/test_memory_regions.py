@@ -19,7 +19,6 @@ from pathlib import Path
 from fw_context_mcp.indexer.db import (
     get_entry_point,
     get_memory_regions,
-    get_memory_regions_by_config,
     open_db,
     replace_memory_regions,
     set_entry_point,
@@ -204,27 +203,6 @@ class TestOneBuildOnly:
         finally:
             conn.close()
         assert [r["name"] for r in flpr] == ["RAM"]
-
-    def test_the_batch_query_groups_by_config(self, tmp_path):
-        conn = _db(tmp_path, "a", "b", "c")
-        try:
-            with transaction(conn):
-                replace_memory_regions(conn, "a", [FLASH, RAM])
-            with transaction(conn):
-                replace_memory_regions(conn, "b", [FLASH])
-            grouped = get_memory_regions_by_config(conn, ["a", "b", "c"])
-        finally:
-            conn.close()
-        assert len(grouped["a"]) == 2
-        assert len(grouped["b"]) == 1
-        assert "c" not in grouped
-
-    def test_the_batch_query_with_no_config(self, tmp_path):
-        conn = _db(tmp_path)
-        try:
-            assert get_memory_regions_by_config(conn, []) == {}
-        finally:
-            conn.close()
 
 
 class TestEntryPoint:

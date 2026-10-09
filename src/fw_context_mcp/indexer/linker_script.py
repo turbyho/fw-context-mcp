@@ -959,7 +959,7 @@ def store_scripts(
     map and the entry point that an earlier run wrote for *config_hash*.
     The hash depends on the compile flags only, thus a change of the link,
     or a run that could not read it, keeps the hash.  Without this removal
-    `get_active_build` gives the old map as the map of the current build.
+    `get_build_info` gives the old map as the map of the current build.
 
     Call this AFTER the C and C++ units and BEFORE the assembly pass:
 

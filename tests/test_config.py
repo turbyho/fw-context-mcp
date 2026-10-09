@@ -473,13 +473,13 @@ class TestLoadCreatesNoProjectFile:
         local.unlink()
         assert load(project).llm.num_ctx != 1234
 
-    def test_get_active_build_creates_nothing_before_init(self, tmp_path):
-        from fw_context_mcp.mcp.handlers.maintenance import get_active_build
+    def test_get_project_status_creates_nothing_before_init(self, tmp_path):
+        from fw_context_mcp.mcp.handlers.maintenance import get_project_status
 
         project = tmp_path / "proj"
         project.mkdir()
 
-        result = get_active_build(project_root=str(project))
+        result = get_project_status(project_root=str(project))
 
         assert result["status"] == "not_initialized"
         assert not (project / ".fw-context").exists()

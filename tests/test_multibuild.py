@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from fw_context_mcp.indexer.build import BuildImage, BuildVariant
+from fw_context_mcp.indexer.build import BuildVariant
 from fw_context_mcp.indexer.builders.zephyr import ZephyrBuildSystem
 from fw_context_mcp.mcp.shared.variants import resolve_build
 
@@ -136,130 +136,6 @@ class TestRetiredBuilds:
         cleanup_retired_builds(temp_db, "proj-001", tmp_path, {"a"}, {("a", "")})
 
         assert not artifact.exists()
-
-
-class TestVariantDiscovery:
-    def _make_cfg(self):
-        from fw_context_mcp.config.settings import Config
-
-        cfg = Config()
-        cfg.build.board = "default_board"
-        cfg.build.variants = [
-            BuildVariant(
-                name="nrf52840",
-                description="nRF52840 DK",
-                board="nrf52840dk/nrf52840",
-                images=[
-                    BuildImage(name="app", dir="proj/app", type="project"),
-                    BuildImage(name="mcuboot", dir="${NCS}/bootloader/mcuboot", type="sdk"),
-                ],
-            ),
-            BuildVariant(
-                name="nrf54lm20a",
-                board="nrf54lm20dk/nrf54lm20a/cpuapp",
-                images=[
-                    BuildImage(name="app", dir="proj/app", type="project"),
-                    BuildImage(name="app_flpr", dir="proj/app_flpr", type="project", board="nrf54lm20dk/nrf54lm20a/cpuflpr"),
-                ],
-            ),
-        ]
-        cfg.build.default_variant = "nrf52840"
-        return cfg
-
-    def test_discovery_from_config(self):
-        from fw_context_mcp.mcp.handlers.maintenance import _build_variant_discovery
-
-        cfg = self._make_cfg()
-        discovery = _build_variant_discovery(cfg, [], Path("/tmp"))
-        assert discovery["multi"] is True
-        assert [v["name"] for v in discovery["variants"]] == ["nrf52840", "nrf54lm20a"]
-        assert discovery["variants"][0]["board"] == "nrf52840dk/nrf52840"
-        assert {i["name"] for i in discovery["images"]} == {"app", "mcuboot", "app_flpr"}
-        # per-image board override (FLPR) surfaces on the image entry
-        flpr = next(i for i in discovery["images"] if i["name"] == "app_flpr")
-        assert flpr["board"] == "nrf54lm20dk/nrf54lm20a/cpuflpr"
-        assert discovery["variant_images"]["nrf52840"] == ["app", "mcuboot"]
-        assert discovery["active_variant"] == "nrf52840"
-
-    def test_an_indexed_variant_is_discovered_without_config(self):
-        """get_active_build and list_variants must agree on ``multi``.
-
-        The index is the fact.  A config that declares no variant over an
-        index that holds two builds of one board reported ``multi: false``
-        and an empty ``variants`` list, while ``variant_images`` of the
-        SAME payload named the builds — a payload that contradicted itself,
-        and a tool that contradicted ``list_variants``.
-        """
-        from fw_context_mcp.mcp.handlers.maintenance import _build_variant_discovery
-
-        cfg = self._make_cfg()
-        cfg.build.variants = []          # the config declares nothing
-        cfg.build.default_variant = None
-        builds = [
-            {"variant": "nrf52840", "image": "app", "board": "b1", "config_hash": "h1"},
-            {"variant": "nrf52840", "image": "mcuboot", "board": "b1", "config_hash": "h2"},
-        ]
-
-        discovery = _build_variant_discovery(cfg, builds, Path("/tmp"))
-
-        assert discovery["multi"] is True, "an indexed variant makes it multi-build"
-        assert [v["name"] for v in discovery["variants"]] == ["nrf52840"], (
-            f"a caller told to choose a variant got no list: {discovery['variants']}"
-        )
-        assert discovery["variants"][0]["board"] == "b1"
-        assert discovery["variant_images"]["nrf52840"] == ["app", "mcuboot"]
-
-    def test_a_declared_variant_does_not_hide_an_indexed_one(self):
-        """This table is where the refusal of ``resolve_build`` sends a reader.
-
-        ``resolve_build`` unites the declared names with the indexed ones,
-        thus its refusal reads "one of: a, b. Call get_active_build() for
-        the variants/images table".  Listing the declared names alone left
-        that table showing 'a' only, and a reader who followed the advice
-        could not find 'b'.
-        """
-        from fw_context_mcp.mcp.handlers.maintenance import _build_variant_discovery
-
-        cfg = self._make_cfg()
-        cfg.build.variants = [BuildVariant(name="a", board="board-a")]
-        cfg.build.default_variant = None
-        builds = [
-            {"variant": "a", "image": "app", "board": "board-a", "config_hash": "h1"},
-            {"variant": "b", "image": "app", "board": "board-b", "config_hash": "h2"},
-        ]
-
-        discovery = _build_variant_discovery(cfg, builds, Path("/tmp"))
-
-        assert [v["name"] for v in discovery["variants"]] == ["a", "b"], (
-            f"the table hides a build that exists: {discovery['variants']}"
-        )
-        assert discovery["variants"][1]["board"] == "board-b"
-
-    def test_a_single_project_stays_single(self):
-        """No variant anywhere means no choice to make."""
-        from fw_context_mcp.mcp.handlers.maintenance import _build_variant_discovery
-
-        cfg = self._make_cfg()
-        cfg.build.variants = []
-        builds = [{"variant": "", "image": "", "board": "b", "config_hash": "h"}]
-
-        discovery = _build_variant_discovery(cfg, builds, Path("/tmp"))
-
-        assert discovery["multi"] is False
-        assert discovery["variants"] == []
-
-    def test_discovery_auto_detect_from_builds(self):
-        from fw_context_mcp.mcp.handlers.maintenance import _build_variant_discovery
-
-        cfg = self._make_cfg()
-        cfg.build.variants = [BuildVariant(name="nrf52840", board="x")]  # no images
-        builds = [
-            {"variant": "nrf52840", "image": "app", "board": "x", "config_hash": "h1"},
-            {"variant": "nrf52840", "image": "stage0", "board": "x", "config_hash": "h2"},
-        ]
-        discovery = _build_variant_discovery(cfg, builds, Path("/tmp"))
-        assert [i["name"] for i in discovery["images"]] == ["app", "stage0"]
-        assert discovery["variant_images"]["nrf52840"] == ["app", "stage0"]
 
 
 class TestResolveBuild:

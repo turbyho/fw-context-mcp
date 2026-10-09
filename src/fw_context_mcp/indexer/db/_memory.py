@@ -23,9 +23,7 @@ import sqlite3
 
 __all__ = [
     "get_entry_point",
-    "get_entry_points_by_config",
     "get_memory_regions",
-    "get_memory_regions_by_config",
     "replace_memory_regions",
     "set_entry_point",
 ]
@@ -128,50 +126,6 @@ def get_memory_regions(
     ]
 
 
-def get_memory_regions_by_config(
-    conn: sqlite3.Connection, config_hashes: list[str]
-) -> dict[str, list[dict]]:
-    """Return the regions of every config in *config_hashes*.
-
-    One query rather than one per config.  `list_variants` reports every
-    build of a project, and the Zephyr project has nine — a query each would
-    make the tool nine times as slow for no gain.
-
-    A config with no regions is absent from the result, so the caller uses
-    ``result.get(hash, [])``.
-    """
-    if not config_hashes:
-        return {}
-    grouped: dict[str, list[dict]] = {}
-    for start in range(0, len(config_hashes), 500):
-        chunk = config_hashes[start:start + 500]
-        marks = ",".join("?" * len(chunk))
-        try:
-            rows = conn.execute(
-                f"SELECT config_hash, name, attributes, origin, length, "  # noqa: S608
-                f"origin_value, length_value, file_path, line "
-                f"FROM memory_regions WHERE config_hash IN ({marks}) "
-                f"ORDER BY config_hash, line, name",
-                chunk,
-            ).fetchall()
-        except sqlite3.OperationalError:
-            # No table: an index from before this feature.  See
-            # `get_memory_regions`.
-            return {}
-        for row in rows:
-            grouped.setdefault(row["config_hash"], []).append({
-                "name": row["name"],
-                "attributes": row["attributes"],
-                "origin": row["origin"],
-                "length": row["length"],
-                "origin_value": row["origin_value"],
-                "length_value": row["length_value"],
-                "file_path": row["file_path"],
-                "line": row["line"],
-            })
-    return grouped
-
-
 def set_entry_point(
     conn: sqlite3.Connection, config_hash: str, entry_point: str
 ) -> None:
@@ -201,34 +155,3 @@ def get_entry_point(conn: sqlite3.Connection, config_hash: str) -> str:
     except sqlite3.OperationalError:
         return ""
     return str(row["entry_point"]) if row is not None else ""
-
-
-def get_entry_points_by_config(
-    conn: sqlite3.Connection, config_hashes: list[str]
-) -> dict[str, str]:
-    """Return the entry point of every config in *config_hashes*.
-
-    One query rather than one per config, for the same reason as
-    `get_memory_regions_by_config`.  A config with no entry point is absent
-    from the result, thus the caller uses ``result.get(hash, "")``.
-
-    A missing column answers with nothing — see `get_entry_point`.
-    """
-    if not config_hashes:
-        return {}
-    found: dict[str, str] = {}
-    for start in range(0, len(config_hashes), 500):
-        chunk = config_hashes[start:start + 500]
-        marks = ",".join("?" * len(chunk))
-        try:
-            rows = conn.execute(
-                f"SELECT config_hash, entry_point FROM build_configs "  # noqa: S608
-                f"WHERE config_hash IN ({marks})",
-                chunk,
-            ).fetchall()
-        except sqlite3.OperationalError:
-            return {}
-        for row in rows:
-            if row["entry_point"]:
-                found[row["config_hash"]] = str(row["entry_point"])
-    return found

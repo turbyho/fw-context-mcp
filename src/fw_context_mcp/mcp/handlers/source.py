@@ -624,7 +624,7 @@ def _read_verified_body(
         # accessor an empty body (1102 of them in one index).  From
         # `fw-context-rows/3` on, such a definition carries its text and
         # takes the branch above.  An index older than that still reaches
-        # this line, and `get_active_build` asks it for a reindex.
+        # this line, and `get_project_status` asks it for a reindex.
         return _read_symbol_body(file_path, line_no, end_line=end_line), "disk", None
 
     if _body_matches_symbol(file_path, row):

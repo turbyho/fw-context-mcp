@@ -103,7 +103,7 @@ def _symbol_row_to_dict(r: sqlite3.Row, root: Path, **extra) -> dict[str, Any]:
     #
     # The name of the wrapper says where the text came from.  The name of
     # the model is not repeated here: there is one model for each index,
-    # and `get_active_build().analysis.model` already gives it.
+    # and `get_build_info().analysis.model` already gives it.
     analysis = {f: row[f] for f in ("summary", "inputs", "outputs") if row.get(f)}
     if analysis:
         d["llm_analysis"] = analysis

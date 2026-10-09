@@ -648,9 +648,9 @@ def command_line_defines(cc_path: Path) -> tuple[dict[str, str], int]:
 
     WHY this reads the JSON itself instead of calling `parse`: `parse`
     normalizes every flag for libclang, which costs 6966 ms on the Mbed project
-    against 19 ms here — measured.  `get_active_build` is the mandatory
-    first call, so seven seconds of flag normalization to read 27 defines
-    would be paid by every session.
+    against 19 ms here — measured.  `get_build_info` gives the defines,
+    and seven seconds of flag normalization to read 27 defines
+    would be paid at each call.
 
     WHY not the `macros` table: that holds every macro the preprocessor
     saw — 27800 distinct names on the STM32 project, 23507 on the Mbed project.  Three orders
@@ -662,7 +662,7 @@ def command_line_defines(cc_path: Path) -> tuple[dict[str, str], int]:
 
     No log line on that path, and this module keeps no logger on purpose.
     An unreadable compile_commands.json is not a detail a caller could
-    miss: the whole index is built from it, and `get_active_build` reports
+    miss: the whole index is built from it, and `get_project_status` reports
     that state on its own.
     """
     try:

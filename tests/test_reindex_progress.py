@@ -5,7 +5,7 @@
 that process, so west, cmake, ninja, and the shell that started them all
 write to the same file.
 
-Observed defect: ``get_active_build`` reported ``"reindex_progress":
+Observed defect: ``get_project_status`` reported ``"reindex_progress":
 "lean-ctx:"`` and ``fw-context watch status`` printed ``Last index:
 lean-ctx:``.  Both read ``lines[-1]``, and the last line came from a shell
 wrapper, not from the index run.
@@ -141,7 +141,7 @@ def test_tail_cut_inside_a_utf8_character(tmp_path: Path) -> None:
     The previous reader opened the file as text and seeked to
     ``size - 4096``.  An offset inside a UTF-8 sequence makes the read
     raise UnicodeDecodeError, which the reader did not catch — it left
-    ``get_active_build``.  Ordinary progress lines carry "→" and "—", so
+    ``get_project_status``.  Ordinary progress lines carry "→" and "—", so
     the boundary is reachable.
     """
     pad = "—"  # em dash, 3 bytes in UTF-8

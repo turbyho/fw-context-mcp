@@ -591,7 +591,7 @@ class UpdatesConfig:
     Attributes:
         check: When ``True`` (default), the MCP server asks PyPI at start
             (after a request that succeeded, only after 24 hours), and
-            ``get_active_build`` reports a newer release.
+            ``get_project_status`` reports a newer release.
             Set it to ``False`` on a machine without network access, or
             when no request to PyPI is permitted.
     """
@@ -1350,7 +1350,7 @@ def load_update_settings() -> UpdatesConfig:
 
     A missing file, a file that does not parse, and a section that is not a
     table give the defaults.  The log gets only a debug line: ``load``
-    reports the same file at each command, and ``get_active_build`` calls
+    reports the same file at each command, and ``get_project_status`` calls
     this function at each call.
     """
     settings = UpdatesConfig()

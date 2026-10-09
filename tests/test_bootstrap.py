@@ -1,6 +1,6 @@
 """Tests for the three-state bootstrap flow: not_initialized → no_index → ready.
 
-get_active_build() is the diagnostic tool that guides the agent through
+get_project_status() is the diagnostic tool that guides the agent through
 project setup.  It must gracefully report the project state without
 raising, while other tools fail-fast with ProjectNotInitializedError.
 """
@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from fw_context_mcp.config.settings import generate_project_id
-from fw_context_mcp.mcp.handlers.maintenance import get_active_build
+from fw_context_mcp.mcp.handlers.maintenance import get_build_info, get_project_status
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -89,11 +89,11 @@ def _reset_sentinel():
 
 
 class TestNotInitialized:
-    """get_active_build returns not_initialized when project ID is missing."""
+    """get_project_status returns not_initialized when project ID is missing."""
 
     def test_returns_not_initialized_status(self, tmp_path: Path):
         root = _make_project_root(tmp_path, project_id=None)
-        result = get_active_build(project_root=str(root))
+        result = get_project_status(project_root=str(root))
 
         assert result["status"] == "not_initialized"
         assert result["project_root"] == str(root)
@@ -101,16 +101,16 @@ class TestNotInitialized:
         assert "fw-context init" in result["index_message"]
 
     def test_does_not_raise(self, tmp_path: Path):
-        """get_active_build must not raise even when project is uninitialized."""
+        """get_project_status must not raise even when project is uninitialized."""
         root = _make_project_root(tmp_path, project_id=None)
         # This should not raise ProjectNotInitializedError
-        result = get_active_build(project_root=str(root))
+        result = get_project_status(project_root=str(root))
         assert result["status"] == "not_initialized"
 
     def test_no_project_id_in_result(self, tmp_path: Path):
         """not_initialized result should not contain a project_id."""
         root = _make_project_root(tmp_path, project_id=None)
-        result = get_active_build(project_root=str(root))
+        result = get_project_status(project_root=str(root))
         assert "project_id" not in result
 
 
@@ -118,12 +118,12 @@ class TestNotInitialized:
 
 
 class TestNoIndex:
-    """get_active_build returns no_index when project is initialized but no DB."""
+    """get_project_status returns no_index when project is initialized but no DB."""
 
     def test_returns_no_index_status(self, tmp_path: Path):
         pid = generate_project_id()
         root = _make_project_root(tmp_path, project_id=pid)
-        result = get_active_build(project_root=str(root))
+        result = get_project_status(project_root=str(root))
 
         assert result["status"] == "no_index"
         assert result["project_root"] == str(root)
@@ -135,7 +135,7 @@ class TestNoIndex:
         """After init but before index, the DB file should not exist."""
         pid = generate_project_id()
         root = _make_project_root(tmp_path, project_id=pid)
-        result = get_active_build(project_root=str(root))
+        result = get_project_status(project_root=str(root))
         assert result["status"] == "no_index"
 
 
@@ -143,7 +143,7 @@ class TestNoIndex:
 
 
 class TestReady:
-    """get_active_build returns ready when a valid index DB exists."""
+    """get_project_status returns ready when a valid index DB exists."""
 
     def test_returns_ready_status(self, tmp_path: Path):
         pid = generate_project_id()
@@ -152,7 +152,7 @@ class TestReady:
         db_path = cfg.index.db_dir / pid / "index.db"
         _create_index_db(db_path, pid, root)
 
-        result = get_active_build(project_root=str(root))
+        result = get_project_status(project_root=str(root))
 
         assert result["status"] == "ready"
         assert result["project_id"] == pid
@@ -166,7 +166,7 @@ class TestReady:
         db_path = cfg.index.db_dir / pid / "index.db"
         _create_index_db(db_path, pid, root)
 
-        result = get_active_build(project_root=str(root))
+        result = get_build_info(project_root=str(root))
         assert result["config_hash"] == "hash-test"
 
 
@@ -176,7 +176,7 @@ class TestAnIndexNewerThanThisProcess:
     A session that started before a row-format bump keeps reading the old
     format.  Its index is the correct one, thus a reindex writes the same new
     format again and the complaint never clears.  Measured on a real project:
-    ``get_active_build`` reported ``reindex_needed`` straight after a
+    ``get_project_status`` reported ``reindex_needed`` straight after a
     finished reindex, and after every reindex that followed.
 
     The repair is to restart the LLM client, because the MCP server is a
@@ -206,7 +206,7 @@ class TestAnIndexNewerThanThisProcess:
 
     def test_the_status_stays_ready(self, tmp_path: Path):
         root = self._project_with_a_newer_format(tmp_path)
-        result = get_active_build(project_root=str(root))
+        result = get_project_status(project_root=str(root))
 
         assert result["status"] == "ready", (
             "the index is the correct one, thus every query keeps working"
@@ -218,7 +218,7 @@ class TestAnIndexNewerThanThisProcess:
 
     def test_it_asks_for_a_client_restart(self, tmp_path: Path):
         root = self._project_with_a_newer_format(tmp_path)
-        result = get_active_build(project_root=str(root))
+        result = get_project_status(project_root=str(root))
 
         assert result["client_restart_required"] is True
         reason = result["client_restart_reason"]
@@ -239,7 +239,7 @@ class TestAnIndexNewerThanThisProcess:
         cfg = _load_cfg(root)
         _create_index_db(cfg.index.db_dir / pid / "index.db", pid, root)
 
-        result = get_active_build(project_root=str(root))
+        result = get_project_status(project_root=str(root))
         assert "client_restart_required" not in result
         assert "client_restart_reason" not in result
 
@@ -285,7 +285,7 @@ class TestARunningIndexChangesTheAdvice:
         root = self._project_needing_a_reindex(tmp_path)
         monkeypatch.setattr(maintenance, "_is_bg_reindex_running", lambda _root: True)
 
-        result = get_active_build(project_root=str(root))
+        result = get_project_status(project_root=str(root))
 
         assert result["bg_reindex_running"] is True
         assert result["status"] == "reindex_needed", (
@@ -308,7 +308,7 @@ class TestARunningIndexChangesTheAdvice:
         root = self._project_needing_a_reindex(tmp_path)
         monkeypatch.setattr(maintenance, "_is_bg_reindex_running", lambda _root: False)
 
-        result = get_active_build(project_root=str(root))
+        result = get_project_status(project_root=str(root))
 
         assert result["status"] == "reindex_needed"
         assert not result["index_message"].startswith("An index run is in progress")
@@ -326,7 +326,7 @@ class TestARunningIndexChangesTheAdvice:
         _create_index_db(cfg.index.db_dir / pid / "index.db", pid, root)
         monkeypatch.setattr(maintenance, "_is_bg_reindex_running", lambda _root: True)
 
-        result = get_active_build(project_root=str(root))
+        result = get_project_status(project_root=str(root))
 
         assert result["status"] == "reindexing"
         assert not result["index_message"].startswith("An index run is in progress")
@@ -342,7 +342,7 @@ def _load_cfg(root: Path):
 
 
 class TestOtherToolsFailFast:
-    """Operational tools (not get_active_build) must raise PIE when uninitialized."""
+    """Operational tools (not get_project_status) must raise PIE when uninitialized."""
 
     def test_reset_index_raises_pie(self, tmp_path: Path):
         from fw_context_mcp.config.settings import ProjectNotInitializedError
@@ -367,16 +367,16 @@ class TestOtherToolsFailFast:
 
 
 class TestSentinelBypass:
-    """get_active_build must work even when a sentinel is set (fatal error case)."""
+    """get_project_status must work even when a sentinel is set (fatal error case)."""
 
     def test_works_with_sentinel_set(self, tmp_path: Path):
-        """Even if _server_init_error is set, get_active_build should not be blocked."""
+        """Even if _server_init_error is set, get_project_status should not be blocked."""
         from fw_context_mcp.mcp.shared import context as ctx
 
         ctx._server_init_error = "Some fatal error from main()"
         root = _make_project_root(tmp_path, project_id=None)
-        result = get_active_build(project_root=str(root))
-        # get_active_build bypasses _check_server_ready, so it still works
+        result = get_project_status(project_root=str(root))
+        # get_project_status bypasses _check_server_ready, so it still works
         assert result["status"] == "not_initialized"
 
     def test_other_tools_blocked_by_sentinel(self, tmp_path: Path):
@@ -435,7 +435,7 @@ class TestModifiedCountInFastMode:
     def test_unchanged_file_is_not_counted(self, tmp_path: Path):
         root, _ = self._project_with_one_indexed_file(tmp_path)
 
-        result = get_active_build(project_root=str(root))
+        result = get_project_status(project_root=str(root))
 
         assert result["status"] == "ready"
         assert result["modified_files_count"] == 0
@@ -460,7 +460,7 @@ class TestModifiedCountInFastMode:
             maintenance, "_autobuild_state", lambda *a, **k: AutobuildState.WILL_BUILD
         )
 
-        result = get_active_build(project_root=str(root))
+        result = get_project_status(project_root=str(root))
 
         assert result["status"] == "reindexing"
         assert "src/added.c" in result["index_message"]
@@ -480,7 +480,7 @@ class TestModifiedCountInFastMode:
             maintenance, "_autobuild_state", lambda *a, **k: AutobuildState.UNSUPPORTED
         )
 
-        result = get_active_build(project_root=str(root))
+        result = get_project_status(project_root=str(root))
 
         assert result["status"] == "reindex_needed"
         assert "fw-context index --build" in result["index_message"]
@@ -504,7 +504,7 @@ class TestModifiedCountInFastMode:
         db_dir = _load_cfg(root).index.db_dir / _load_cfg(root).project.id
         record_problem(db_dir, "The last index run failed (exit code 1).")
 
-        result = get_active_build(project_root=str(root))
+        result = get_project_status(project_root=str(root))
 
         assert result["status"] == "reindex_needed"
         assert result["index_message"].startswith("The last index run failed (exit code 1).")
@@ -520,8 +520,8 @@ class TestModifiedCountInFastMode:
         stamp = os.path.getmtime(source) + 200
         os.utime(source, (stamp, stamp))
 
-        fast = get_active_build(project_root=str(root))
-        slow = get_active_build(project_root=str(root), fast=False)
+        fast = get_project_status(project_root=str(root))
+        slow = get_project_status(project_root=str(root), fast=False)
 
         assert fast["modified_files_count"] == 1
         assert slow["modified_files_count"] == 1

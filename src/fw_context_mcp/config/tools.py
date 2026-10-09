@@ -58,7 +58,7 @@ file-reading tool:
 | Read a file, or a range of it | `read_file` | `"main.cpp"`, `start_line=60` |
 | File structure overview | `get_file_map` | `"main.cpp"` |
 | Interrupt handler of each vector | `get_vector_table` | — ISRs have no caller |
-| Check index health | `get_active_build` | — always call first |
+| Check index health | `get_project_status` | — always call first |
 
 SELF-CORRECT: the moment you reach for any tool that is NOT fw-context
 for C/C++ code, stop and use the fw-context equivalent instead.
@@ -125,7 +125,7 @@ operator asked about.
 1. Call `list_projects`. It gives the `name`, the `project_id`, and the
    `root_path` of each indexed project.
 2. Give `project="<name>"` (or `project_root="<root_path>"`) to EVERY
-   call that follows, `get_active_build` included.
+   call that follows, `get_project_status` included.
 
 A name that several projects share gives an error that lists each one
 with its `project_id`. Repeat the call with that `project_id`.
@@ -152,9 +152,10 @@ nearly every row.
 
 - Select the build from the task. If the task does not identify one
   build, ask the user. Do not select a build from its position in a list.
-- `list_variants` gives one row per indexed build, with its own
-  `config_hash`, `board`, `symbol_count`, `entry_point` and memory map.
-  It reads the INDEX and not only the config, thus a build indexed with
+- `get_project_status` lists every build in `builds`, with its state and
+  counts. `get_build_info(variant, image)` gives the `config_hash`,
+  `board`, `entry_point`, memory map and defines of one build. Both read
+  the INDEX and not only the config, thus a build indexed with
   `--variant` is listed even when config.toml no longer declares it.
 - Pass `variant` and `image` to every tool that answers about code,
   `smart_search` and `semantic_search` included.
@@ -222,10 +223,10 @@ cover almost every tool:
 - `file_path` — the file (`read_file`, `get_file_map`).
 - `query` — the search terms (every search tool).
 
-No tool takes a filler argument. `get_active_build` accepts only
+No tool takes a filler argument. `get_project_status` accepts only
 `project`, `project_root` and `fast`. When a call fails on an argument,
 drop that argument and REPEAT the call — never continue without the
-answer, and never skip `get_active_build`.
+answer, and never skip `get_project_status`.
 
 ### search_bodies reaches more than functions
 
@@ -357,12 +358,12 @@ a `warning` row that names them, and each result carries
   parameter pages through a name that many classes share.
 
 ### Agent loop
-Check(`get_active_build`) → Find(`search_code`/`lookup_symbol`)
+Check(`get_project_status`) → Find(`search_code`/`lookup_symbol`)
 → Read(`get_symbol_context`) ← preferred. Fallback: `get_source` (body only).
 → Trace(`find_references`/`find_callers`) — skip if context from get_symbol_context.
 → For pattern-in-body searches use `search_bodies`.
 
-get_active_build() status:
+get_project_status() status:
   • "ready" / "reindexing" — fully operational. Continue.
   • "reindex_needed" — queries work, schedule `fw-context index`. It wins
     over "reindexing". When `bg_reindex_running` is true, that run already
@@ -408,8 +409,8 @@ find_dead_code, find_wrapper_callers, trace_data_flow,
 find_indirect_call_sites, find_indirect_targets.
 Inheritance: get_inheritance_chain, get_class_members,
 get_template_instances, get_method_overrides.
-Maintenance: get_active_build, reindex_file, reset_index,
-check_ollama, list_projects, get_project_info.
+Maintenance: get_project_status, get_build_info, reindex_file, reset_index,
+check_ollama, check_dependencies, list_projects, get_project_info.
 
 Individual tool descriptions are in the MCP tool listings —
 discover them at runtime.
@@ -812,7 +813,7 @@ def check_target(target: InstructionTarget, project_root: Path | None = None) ->
 
     # Check for unmarked fw-context content (keyword density)
     fw_keywords = ["fw-context", "lookup_symbol", "search_code", "smart_search",
-                   "explain_symbol", "get_active_build"]
+                   "explain_symbol", "get_active_build", "get_project_status"]
     keyword_count = sum(1 for kw in fw_keywords if kw in content)
     if keyword_count >= 3:
         collision.has_unmarked_content = True

@@ -24,9 +24,7 @@ from pathlib import Path
 
 from fw_context_mcp.indexer.db import (
     get_entry_point,
-    get_entry_points_by_config,
     get_memory_regions,
-    get_memory_regions_by_config,
     open_db,
     transaction,
 )
@@ -146,7 +144,7 @@ class TestTheReadPathToleratesAnOlderIndex:
 
     Measured: the ESP32 project holds user_version 155546819 and no `entry_point`
     column, and naming that column in a shared SELECT made
-    `get_active_build` raise `no such column: b.entry_point`.
+    `get_project_status` raise `no such column: b.entry_point`.
 
     "Not recorded" is the honest answer there, and it is already the answer
     for a build system that records no linker script.
@@ -202,24 +200,10 @@ class TestTheReadPathToleratesAnOlderIndex:
         finally:
             conn.close()
 
-    def test_the_regions_of_several_configs(self, tmp_path):
-        conn = self._old_index(tmp_path)
-        try:
-            assert get_memory_regions_by_config(conn, ["ch", "other"]) == {}
-        finally:
-            conn.close()
-
     def test_the_entry_point_of_one_config(self, tmp_path):
         conn = self._old_index(tmp_path)
         try:
             assert get_entry_point(conn, "ch") == ""
-        finally:
-            conn.close()
-
-    def test_the_entry_points_of_several_configs(self, tmp_path):
-        conn = self._old_index(tmp_path)
-        try:
-            assert get_entry_points_by_config(conn, ["ch", "other"]) == {}
         finally:
             conn.close()
 

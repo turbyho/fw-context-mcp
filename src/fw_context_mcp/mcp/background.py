@@ -16,7 +16,7 @@ Key design decisions:
   picks up the lock as soon as the spawner releases.  No race window.
 
 - **Staleness check is split into two tiers**: ``_fast_staleness_check``
-  (called via ``get_active_build``) does only structural checks — schema
+  (called via ``get_project_status``) does only structural checks — schema
   version, compile_commands.json mtime, missing refs.  The daemon's
   ``_staleness_check`` adds file-level mtime comparison because the daemon
   needs to detect files that changed BEFORE it started (watchfiles only
@@ -97,7 +97,7 @@ def _is_bg_reindex_running(root: Path) -> bool:
     Note: ``watcher.lock`` is NOT checked here — the persistent daemon
     holds it for its entire lifetime, even when idle (just watching for
     file changes).  Checking it was a false positive that made every
-    ``get_active_build`` call report "reindexing" when the daemon was
+    ``get_project_status`` call report "reindexing" when the daemon was
     merely running.
     """
     db_path = _db_path(root)
@@ -157,7 +157,7 @@ def read_reindex_progress(db_dir: Path) -> str | None:
     file, and a build runs inside that process, so the file also holds the
     output of west, cmake, ninja, and the shell that started them.  The
     last line is often one of theirs: a run in the Zephyr project ended on a
-    bare ``lean-ctx:``, and both readers of this log — ``get_active_build``
+    bare ``lean-ctx:``, and both readers of this log — ``get_project_status``
     and ``fw-context watch status`` — reported that text as the progress.
 
     The error text of fw-context is not safe to take either.  When a build
@@ -325,7 +325,7 @@ def _fast_staleness_check(root: Path) -> tuple[bool, list[str]]:
     compile_commands.json modification) and pending LLM analysis.
 
     The analysis check calls ``count_pending_analysis``, which shares its
-    query with the ``analysis`` coverage report of ``get_active_build``.
+    query with the ``analysis`` coverage report of ``get_project_status``.
     Thus the two can never disagree about what still needs analysis.
     """
     from ..config import derive_project_id
@@ -366,7 +366,7 @@ def _fast_staleness_check(root: Path) -> tuple[bool, list[str]]:
         # --analyze-vendor run stored True but config is False.
         #
         # count_pending_analysis shares its query with the coverage report
-        # in get_active_build, thus "N unanalyzed symbols" here and
+        # in get_project_status, thus "N unanalyzed symbols" here and
         # analysis.complete there can never disagree.  Both use
         # ANALYZABLE_KINDS, and both count a skip:* sentinel as done.
         proj_cfg = load_config(root)

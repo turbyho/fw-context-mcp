@@ -92,7 +92,7 @@ def run_full_check(
     when a prerequisite failed.  Loads config once for Ollama/model checks.
 
     When *subset* is given, only checks whose ``name`` is in *subset* run
-    (in ``CHECK_ORDER`` order).  Used by ``get_environment_status`` for the
+    (in ``CHECK_ORDER`` order).  Used by ``check_dependencies`` for the
     ``not_initialized`` path — pip-only checks that do not depend on a
     project config.  Default ``None`` runs the full audit (unchanged for
     ``doctor``).

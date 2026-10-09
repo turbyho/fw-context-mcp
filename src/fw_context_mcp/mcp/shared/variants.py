@@ -61,7 +61,7 @@ if TYPE_CHECKING:
 
 # The tool that gives the state of each build.  Every refusal names it,
 # thus one constant keeps the refusals and the tool name in step.
-STATUS_TOOL = "get_active_build"
+STATUS_TOOL = "get_project_status"
 
 # The descriptions of the two selector parameters, one text for every tool.
 # WHY one constant: 28 tools take the selector, and 28 copies of a rule
@@ -217,19 +217,6 @@ class _DefaultBuild:
     application_missing: bool
 
 
-def default_image(cfg: Config, project_root: Path | None, variant: str, rows: list) -> str:
-    """Return the image of *variant* that the build system names as its application, or "".
-
-    *rows* are the indexed builds of *variant*, newest first, with ``image``
-    and ``compile_commands_path``.  "" when nothing names an application
-    among them, or when the application is a build without an image name.
-    See :func:`_default_build`.  No query reads it: ``get_active_build``
-    reports it.
-    """
-    row = _default_build(cfg, project_root, variant, rows).row
-    return (row["image"] or "") if row is not None else ""
-
-
 def _default_build(cfg: Config, project_root: Path | None, variant: str, rows: list) -> _DefaultBuild:
     """Return the build of *variant* that the build system names as its application.
 
@@ -316,10 +303,10 @@ def active_build(
     cfg: Config,
     project_root: Path | None,
 ) -> tuple[sqlite3.Row | dict | None, str | None]:
-    """Return ``(build, refusal)``: the build that ``get_active_build`` and ``fw-context index`` check.
+    """Return ``(build, refusal)``: the build that the checks of ``fw-context index`` read.
 
     No query reads it: a query names its build (:func:`resolve_build`).
-    These two report the health of an index, and they check one build:
+    The index run checks one build:
 
     * one build → that build;
     * builds of several variants → the newest build;

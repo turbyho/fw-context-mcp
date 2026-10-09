@@ -1,6 +1,6 @@
 """Ollama setup diagnostics.
 
-Called by the ``get_active_build`` → ``check_ollama`` tool path and
+Called by the ``get_project_status`` → ``check_ollama`` tool path and
 as a standalone entry point (``fw-context diag llm``).  Returns a
 structured status report for both chat and embedding models.
 

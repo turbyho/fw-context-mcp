@@ -1896,7 +1896,7 @@ class TestTheFlagReachesTheReport:
     def test_an_entry_past_the_window_is_not_seen(self, tmp_path: Path):
         """A recorded limit, not a defect to fix here.
 
-        max_files exists for the latency of get_active_build.  On the Mbed project (876
+        max_files exists for the latency of get_project_status.  On the Mbed project (876
         TUs) a flagged entry past index 200 is invisible to this report,
         while the index run itself still queues it.
         """

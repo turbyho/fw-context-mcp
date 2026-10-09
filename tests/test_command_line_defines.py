@@ -164,8 +164,8 @@ class TestTheCostIsWhyItIsNotStored:
 
     `compile_commands.parse` normalizes every flag for libclang and costs
     6966 ms on the Mbed project against 19 ms for the direct read — measured.
-    `get_active_build` is the mandatory first call, thus the difference is
-    paid by every session.
+    `get_build_info` gives the defines, thus the difference is paid at each
+    call of it.
     """
 
     def test_it_does_not_call_the_normalizing_parser(self, tmp_path, monkeypatch):

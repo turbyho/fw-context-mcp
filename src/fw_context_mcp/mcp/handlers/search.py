@@ -334,7 +334,7 @@ def search_code(
         constants include ``enum_value`` with the integer value. May also
         include ``template_usr``, ``parent_usr``, and ``llm_analysis``
         (``{summary, inputs, outputs}`` — written by a model, not by the
-        code.  ``get_active_build().analysis.model`` names it). Fallback
+        code.  ``get_build_info().analysis.model`` names it). Fallback
         results include ``_fallback`` with the method name.  A macro
         result also holds ``_macro_value`` and ``_macro_expanded_value``
         when they are not empty.

@@ -1,16 +1,16 @@
-"""``list_projects`` must ask for a reindex where ``get_active_build`` does.
+"""``list_projects`` must ask for a reindex where ``get_project_status`` does.
 
 Two gaps made the two tools disagree over one index:
 
 - The row format.  ``build_configs.row_format`` records which meaning the
-  stored text carries.  ``get_active_build`` and the daemon ask for a
+  stored text carries.  ``get_project_status`` and the daemon ask for a
   reindex when that format is older than the format of this version.
   ``list_projects`` did not read it.  Measured on a real project after a
-  bump to ``fw-context-rows/5``: ``get_active_build`` gave
+  bump to ``fw-context-rows/5``: ``get_project_status`` gave
   ``reindex_needed`` and ``list_projects`` gave ``ready``, from one server
   process.
 - The other builds.  ``list_projects`` read only the newest build of a
-  project.  ``get_active_build`` reads each ``(variant, image)`` build,
+  project.  ``get_project_status`` reads each ``(variant, image)`` build,
   because the builds of one project are not always indexed together.
 """
 
@@ -86,7 +86,7 @@ def test_an_older_row_format_needs_a_reindex(tmp_path: Path) -> None:
     entry = _entry(root, project_id)
 
     assert entry["reindex_needed"] is True, (
-        "get_active_build asks for a reindex over this index, thus "
+        "get_project_status asks for a reindex over this index, thus "
         "list_projects must not report it as current"
     )
     assert entry["status"] == "reindex_needed"
@@ -114,7 +114,7 @@ def test_the_current_row_format_is_ready(tmp_path: Path) -> None:
 def test_a_newer_row_format_is_ready(tmp_path: Path) -> None:
     """A reindex cannot repair a newer format: this process is the old reader.
 
-    ``get_active_build`` asks for a restart of the LLM client there, and not
+    ``get_project_status`` asks for a restart of the LLM client there, and not
     for a reindex.  A ``reindex_needed`` here would advise the one command
     that writes the same newer format again.
     """
@@ -189,8 +189,8 @@ def test_a_changed_database_of_another_build_needs_a_reindex(tmp_path: Path) -> 
 
     assert entry["indexed_at"] != "2000-01-01 00:00:00", "the fixture must keep the current build newest"
     assert entry["reindex_needed"] is True, (
-        "get_active_build asks for a reindex of this build through "
-        "stale_builds, thus list_projects must not report the project as current"
+        "get_project_status asks for a reindex of this build in its "
+        "builds list, thus list_projects must not report the project as current"
     )
     assert entry["status"] == "reindex_needed"
 

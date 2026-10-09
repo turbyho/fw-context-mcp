@@ -43,7 +43,8 @@ from fw_context_mcp.mcp.handlers.inheritance import (  # noqa: E402
 )
 from fw_context_mcp.mcp.handlers.maintenance import (  # noqa: E402
     check_ollama,
-    get_active_build,
+    get_build_info,
+    get_project_status,
     list_projects,
     reindex_file,
     reset_index,
@@ -426,19 +427,26 @@ def run_tests_for_project(proj: dict, results: CheckResults) -> None:
     # ═══ 1. METADATA ═══════════════════════════════════════════════════════════
     results.section("1. Metadata")
 
-    # get_active_build
-    build = _call(results, "get_active_build", get_active_build, project_root=root)
+    # get_project_status
+    build = _call(results, "get_project_status", get_project_status, project_root=root)
     if build:
-        results.check("get_active_build → has config_hash", "config_hash" in build)
-        results.check("get_active_build → has project_id", "project_id" in build)
-        results.check("get_active_build → has build_system", "build_system" in build)
-        results.check("get_active_build → symbol_count > 0", build.get("symbol_count", 0) > 0)
-        results.check("get_active_build → has schema_version", "schema_version" in build)
-        results.check("get_active_build → has stale flag", "stale" in build)
-    bad_build = _call(results, "get_active_build nonexistent", get_active_build,
+        results.check("get_project_status → has builds", bool(build.get("builds")))
+        results.check("get_project_status → has project_id", "project_id" in build)
+        results.check("get_project_status → has build_system", "build_system" in build)
+        results.check("get_project_status → symbol_count > 0",
+                      all(b.get("symbol_count", 0) > 0 for b in build.get("builds", [])))
+        results.check("get_project_status → has schema_version", "schema_version" in build)
+        results.check("get_project_status → has stale flag", "stale" in build)
+        first = (build.get("builds") or [{}])[0]
+        info = _call(results, "get_build_info", get_build_info, project_root=root,
+                     variant=first.get("variant") or None, image=first.get("image") or None)
+        if info:
+            results.check("get_build_info → has config_hash", "config_hash" in info)
+            results.check("get_build_info → has memory", "memory" in info)
+    bad_build = _call(results, "get_project_status nonexistent", get_project_status,
                       project_root="/tmp/__nonexistent_fw_context_test__")
     if bad_build is not None:
-        results.check("get_active_build nonexistent root → error",
+        results.check("get_project_status nonexistent root → error",
                       "error" in bad_build or "config_hash" not in bad_build)
 
     # list_projects

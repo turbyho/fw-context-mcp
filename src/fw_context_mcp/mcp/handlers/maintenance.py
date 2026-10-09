@@ -8,8 +8,8 @@ they inspect index metadata, configure runtime behavior, and
 manage the index lifecycle.
 
 Public MCP handlers in this module:
-    get_active_build         — mandatory first-call index health report
-    get_environment_status   — aggregate deps/build/index/llm in one call
+    get_project_status       — mandatory first call: index health and the builds
+    get_build_info           — the detail of one build (memory map, defines)
     check_ollama             — LLM backend availability and model status
     check_dependencies       — read-only dependency audit (structured results)
     configure_llm            — write per-developer LLM settings to local.toml
@@ -29,6 +29,7 @@ import logging
 import sqlite3
 import time
 from collections.abc import Collection
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated
 
@@ -52,13 +53,10 @@ from ...indexer.db import (
     compute_analysis_coverage,
     count_refs,
     get_active_config,
-    get_all_builds_for_project,
     get_all_projects,
     get_db_schema_version,
     get_entry_point,
-    get_entry_points_by_config,
     get_memory_regions,
-    get_memory_regions_by_config,
     make_analysis_summary,
     open_db,
     row_format_effect,
@@ -66,7 +64,7 @@ from ...indexer.db import (
     row_format_is_older,
     transaction,
 )
-from ...indexer.git_context import branch_moved_since
+from ...indexer.git_context import branch_of_description
 from ...llm.ollama import check_setup
 from ...utils import HEADER_EXTENSIONS, resolve_project_root
 from ..background import _is_bg_reindex_running, read_reindex_progress
@@ -82,10 +80,12 @@ from ..shared.context import (
 from ..shared.stale import (
     _check_header_staleness,
     _count_modified_files,
+    build_label,
     find_unindexed_sources,
     latest_builds,
     stored_row_format,
 )
+from ..shared.variants import IMAGE_DESCRIPTION, VARIANT_DESCRIPTION
 
 log = logging.getLogger(__name__)
 
@@ -155,28 +155,6 @@ def _build_missing_advice(reason: str, root: Path, proj_cfg) -> str:
     )
 
 
-def _expand_dir_placeholder(dir_str: str, root: Path) -> str:
-    """Expand the ``${NCS}`` placeholder in an image source dir (best-effort).
-
-    ``dir`` for an SDK image may point outside project_root (``${NCS}/…``) —
-    a machine-specific path that must not be committed literally.  The
-    placeholder is expanded to the NCS root detected from standard signals;
-    on failure the raw string is returned (the LLM still sees the placeholder).
-    """
-    if "${NCS}" not in dir_str:
-        return dir_str
-    try:
-        from ...indexer.builders.zephyr import ZephyrBuildSystem
-
-        ncs = ZephyrBuildSystem._detect_ncs(root)
-        if ncs is not None:
-            _, version, ncs_root = ncs
-            return dir_str.replace("${NCS}", f"{ncs_root}/{version}")
-    except Exception:  # nosec B110 — best-effort display expansion
-        pass
-    return dir_str
-
-
 def _background_build_allowed(root: Path, proj_cfg: Config) -> bool:
     """Say whether fw-context may run a build of this project on its own.
 
@@ -205,221 +183,721 @@ def _background_build_allowed(root: Path, proj_cfg: Config) -> bool:
         return False
 
 
-def _build_variant_discovery(cfg: Config, builds: list, root: Path) -> dict:
-    """Build discovery data (variants/images/variant_images) for the LLM.
+def _with_version_state(result: dict) -> dict:
+    """Add the version facts that do not depend on the index to *result*.
 
-    WHY discovery: the LLM must know what the project contains (parts = images)
-    and for which MCU variants indexes exist — without guessing names.  Source
-    of truth is config ``[[build.variants]]`` first; when config ``images`` is
-    empty (auto-detect), the actually-indexed ``build_configs`` rows fill in.
+    One wrapper around every return path of :func:`_project_state`,
+    because an upgrade of the package concerns the process and not the
+    project: the caller must read it also when the project has no index.
+    A restart reason of the index (a newer row format) and a restart reason
+    of the package can apply together, thus the second one joins the text
+    and does not replace it.
     """
-    build_cfg = cfg.build
-    variants_cfg = build_cfg.variants
+    from ...config.settings import load_update_settings
+    from ...version_check import restart_reason, update_notice
 
-    # The INDEX is the fact, the config only declares an intention.  These
-    # two used to disagree: a project indexed with ``--variant`` whose
-    # config declares no variant reported ``multi: false`` and an empty
-    # ``variants`` list, while ``variant_images`` below was filled from the
-    # same builds and ``list_variants`` reported ``multi: true``.  The LLM
-    # then read one payload that contradicted itself and another tool.
-    indexed_variants: list[str] = []
-    for b in builds:
-        name = b["variant"] or ""
-        if name and name not in indexed_variants:
-            indexed_variants.append(name)
-    multi = bool(variants_cfg) or bool(indexed_variants)
-
-    # The declared variants and the indexed ones are UNITED, exactly as
-    # ``resolve_build`` unites them.  Listing the declared ones ALONE was
-    # the same ``declared or indexed`` fault one module over, and this is
-    # the table that the refusal of ``resolve_build`` sends the reader to:
-    # with 'a' declared and 'b' indexed, that refusal reads "one of: a, b.
-    # Call get_active_build() for the variants/images table" and the table
-    # showed only 'a'.  A reader who followed the advice could not find 'b'.
-    boards = {b["variant"] or "": (b["board"] or "") for b in builds}
-    declared_names = {v.name for v in variants_cfg}
-    variants = [
-        {
-            "name": v.name,
-            "description": v.description,
-            "board": v.board or boards.get(v.name) or build_cfg.board or "",
-        }
-        for v in variants_cfg
-    ]
-    # Named by the builds themselves, so that a caller told to choose a
-    # variant has every real choice to choose from.
-    variants += [
-        {
-            "name": name,
-            "description": "",
-            "board": boards.get(name) or build_cfg.board or "",
-        }
-        for name in indexed_variants
-        if name not in declared_names
-    ]
-
-    images: list[dict] = []
-    variant_images: dict[str, list[str]] = {}
-    if any(v.images for v in variants_cfg):
-        seen: set[str] = set()
-        for v in variants_cfg:
-            variant_images[v.name] = [img.name for img in v.images]
-            for img in v.images:
-                if img.name in seen:
-                    continue
-                seen.add(img.name)
-                entry = {
-                    "name": img.name,
-                    "description": img.description,
-                    "dir": _expand_dir_placeholder(img.dir, root) if img.dir else "",
-                    "type": img.type,
-                }
-                if img.board:
-                    entry["board"] = img.board
-                images.append(entry)
-    else:
-        # Auto-detect from build_configs (no explicit images in config).
-        seen_images: set[str] = set()
-        for b in builds:
-            variant_name = b["variant"] or ""
-            image_name = b["image"] or ""
-            if variant_name and image_name:
-                variant_images.setdefault(variant_name, [])
-                if image_name not in variant_images[variant_name]:
-                    variant_images[variant_name].append(image_name)
-            if image_name and image_name not in seen_images:
-                seen_images.add(image_name)
-                images.append({"name": image_name, "description": "", "dir": "", "type": "project"})
-
-    # The image of a query that names none, as resolve_build chooses it: the
-    # build system can name it when the config does not.  For a project with
-    # variants, the image of the default variant.  Completed builds only, as
-    # resolve_build reads them: a build that is still indexing answers no
-    # query.
-    from ..shared.variants import default_image
-
-    active_variant = (build_cfg.default_variant or "") if multi else ""
-    completed = [
-        b for b in builds
-        if (b["variant"] or "") == active_variant and b.get("manifest_verification") != "indexing"
-    ]
-    active_image = default_image(cfg, root, active_variant, completed) or None
-
-    return {
-        "multi": multi,
-        "variants": variants,
-        "images": images,
-        "variant_images": variant_images,
-        "active_variant": build_cfg.default_variant,
-        "active_image": active_image,
-    }
+    reason = restart_reason()
+    if reason:
+        prior = result.get("client_restart_reason")
+        result["client_restart_required"] = True
+        result["client_restart_reason"] = f"{prior} {reason}" if prior else reason
+        # A row-format reason already put the same action at the front of
+        # index_message.  One action needs one sentence there.
+        if "index_message" in result and not prior:
+            result["index_message"] = (
+                "Restart the LLM client — this server runs a different fw-context than "
+                f"the installed one. Queries work meanwhile. {result['index_message']}"
+            )
+    notice = update_notice(load_update_settings().check)
+    if notice:
+        result["update_notice"] = notice
+    return result
 
 
-def list_variants(
-    project_root: Annotated[
-        str | None, Field(description="Project root directory. Auto-detected from CWD if omitted.")
-    ] = None,
-) -> dict:
-    """List every indexed build with its (variant, image, board) identity.
+@dataclass(frozen=True)
+class _IndexTarget:
+    """The index of one project, as the two status tools find it."""
 
-    Read-only diagnostic — shows what is actually indexed, not what the config
-    declares.  Each row is one ``(variant, image)`` build with its own
-    ``config_hash`` and symbol count.  For single-project indexes this returns
-    one row with ``variant``/``image`` empty, and one row for each image when
-    the build makes several programs (ESP-IDF: the application and
-    ``bootloader``).
+    root: Path
+    cfg: Config
+    project_id: str
+    db_path: Path
+    # A run of the daemon or of the operator, see `_is_bg_reindex_running`.
+    # Read once for each call: a run is a fact of the project, and not of a
+    # build.
+    bg_running: bool
 
-    This and ``get_active_build`` are the two tools that say what a query can
-    choose from.  Both read the index, thus a build written by
-    ``fw-context index --build --variant X`` is listed even when config.toml
-    no longer declares X — and ``resolve_build`` fails closed on that same
-    fact, so the two never disagree about whether a choice must be made.
 
-    Use ``get_active_build`` for the mandatory first-call health check and the
-    human-readable ``variants``/``images`` discovery; use this tool to see the
-    per-build ``config_hash`` and symbol counts (authoritative per-build state).
+def _index_target(project_root: str | None) -> _IndexTarget | dict:
+    """Find the index of the project, or give the answer for a project without one.
 
-    Args:
-        project_root: Project root directory. Auto-detected from CWD if
-            omitted.
-
-    Returns:
-        dict: {builds (list[dict]), multi (bool — True when the config
-        declares variants or a build has a non-empty variant name)}.
-
-        Each build dict holds: variant (str — empty for a single-project
-        index), image (str — empty for a build of one program), board (str),
-        config_hash (str), symbol_count (int), file_count (int),
-        manifest_verification (str — "full" or "none"),
-        entry_point (str — the `ENTRY()` of the linker script of this build,
-        empty when no script names one),
-        memory (list[dict] — the `MEMORY` regions of this build:
-        {name, attributes, origin, length, origin_value, length_value,
-        file_path, line}).  `origin` and `length` are the expression the
-        script writes; `origin_value` and `length_value` are numbers, and
-        they are None for an expression that names a symbol such as
-        `ORIGIN(RAM) + LENGTH(RAM)`.  A name that the link command defines
-        with `--defsym` counts as a number: `LENGTH = LD_MAX_DATA_SIZE`
-        gets `length_value` 98304 on the STM32 Arduino core.  Empty for a
-        build whose system records no linker script — see the note below.
-
-        THIS is where a per-build memory map lives, not in the `images`
-        list of ``get_active_build``: that list holds one entry per image
-        NAME, and one name can belong to two variants with different
-        addresses.
-
-        When the project is not initialized, or has no index, the result is
-        {builds: [], multi: False, error (str)}.
+    WHY the project ID comes from the config here and not from
+    ``derive_project_id``: that call raises for a project that is not
+    initialized, and these two tools report that state instead.  The other
+    tools fail fast in that case, and these diagnostic tools explain it.
     """
     root = resolve_project_root(project_root)
-    cfg = load_config(root)
-    project_id = cfg.project.id
-    if not project_id:
-        return {"builds": [], "multi": False, "error": f"Project at {root} is not initialized."}
-    db_path = cfg.index.db_dir / project_id / "index.db"
+    fw_cfg = load_config(root)
+    if not fw_cfg.project.id:
+        return {
+            "status": "not_initialized",
+            "project_root": str(root),
+            "index_message": (
+                f"Project at {root} is not initialized. "
+                "Run `fw-context init` via bash to create a project ID and config, "
+                "then call get_project_status() again."
+            ),
+        }
+    db_path = fw_cfg.index.db_dir / fw_cfg.project.id / "index.db"
     if not db_path.exists():
-        return {"builds": [], "multi": False, "error": f"No index found for {root}."}
+        return {
+            "status": "no_index",
+            "project_root": str(root),
+            "project_id": fw_cfg.project.id,
+            "index_message": (
+                f"No symbol index found for {root}. "
+                "Run `fw-context index <path/to/compile_commands.json>` via bash "
+                "to build the index, then call get_project_status() again."
+            ),
+        }
+    # Read BEFORE the database: while a run is in progress the cache of
+    # modified files can hold the counts from before it started.
+    return _IndexTarget(root, fw_cfg, derive_project_id(root), db_path, _is_bg_reindex_running(root))
 
-    conn = _quick_open_readonly(db_path)
+
+@dataclass(frozen=True)
+class _ProjectFacts:
+    """The facts of the project that the health of each build reads, computed one time for a call."""
+
+    # Source files that no build covers, and what happens to them.
+    new_sources: list[str]
+    auto_state: AutobuildState
+    # The text of the marker of the last index run that stopped without an
+    # index, after the check below; "" without one.
+    build_problem: str
+    # True when that marker says that the build is missing: a missing
+    # database of a build is then the same fact, and the marker names it
+    # with the command of the run.
+    marker_build_missing: bool
+    # The branch that the tree is on, "" for a detached HEAD or no git.
+    live_branch: str
+
+
+def _project_facts(conn, target: _IndexTarget) -> _ProjectFacts:
+    """Return the facts of the project, from the build that ``fw-context index`` checks.
+
+    WHY one time and against that build, and not in the health of each
+    build:
+
+    * The marker of a failed run is one file for the project, and the index
+      run writes it for the build that it checks (``active_build``: the
+      application of a build of several images).  A check of another build
+      found that build present and removed the marker while the
+      application was still missing, and every query answer then lost its
+      ``build_warning``.
+    * ``find_unindexed_sources`` reads the TU extensions and the build
+      directories of the build that it starts from.  From the bootloader, a
+      new ``.cpp`` of the application was no candidate.
+    * The branch is one ``git`` call, and it is the same for each build.
+    """
+    from ...indexer.git_context import current_branch
+    from ..shared.variants import active_build
+
+    checked, _refusal = active_build(conn, target.project_id, target.cfg, target.root)
+    if checked is None:
+        # No build system names the application of several images: the
+        # newest build, as the index run reads it (`cli._index._checked_build`).
+        checked = get_active_config(conn, target.project_id)
+    if checked is None:
+        # Both callers read a completed build first, thus only a reindex
+        # that removed it in between gets here.  No build, no facts.
+        return _ProjectFacts([], AutobuildState.WILL_BUILD, "", False, "")
+    db_dir = target.db_path.parent
+    cc_path = Path(checked["compile_commands_path"])
+    problem = read_build_problem(db_dir)
+    if problem is not None and problem.build_missing:
+        checked_cc = checked_compile_commands(target.root, target.cfg, cc_path)
+        if checked_cc is not None and not build_missing_reason(checked_cc):
+            # The check ran and found the build (built outside of
+            # fw-context): the text is out of date for every answer, not
+            # only here.  Without a check the marker stays.
+            clear_build_problem(db_dir)
+            problem = None
+    new_sources = find_unindexed_sources(conn, checked["config_hash"], target.root, cc_path)
+    return _ProjectFacts(
+        new_sources=new_sources,
+        auto_state=_autobuild_state(target.root, target.cfg, new_sources),
+        build_problem=problem.text if problem is not None else "",
+        marker_build_missing=problem is not None and problem.build_missing,
+        live_branch=current_branch(target.root),
+    )
+
+
+def _analysis_of(conn, config_hash: str) -> tuple[dict, bool]:
+    """Return the LLM-analysis coverage of a build, and the stored ``analyze_vendor``.
+
+    Split by project vs vendor, so the LLM can tell intentionally skipped
+    vendor symbols apart from project symbols that still need analysis.
+    """
+    coverage = compute_analysis_coverage(conn, config_hash)
+    # Exclude the skip:* sentinels (skip:toolarge, skip:unparseable) —
+    # they are not model names and must never surface as analysis.model.
+    analysis_model_row = conn.execute(
+        """SELECT a.model FROM llm_analysis a
+           JOIN symbols s ON s.id = a.symbol_id
+           WHERE s.config_hash = ?
+             AND a.model NOT LIKE 'skip:%' LIMIT 1""",
+        (config_hash,),
+    ).fetchone()
+    model = analysis_model_row["model"] if analysis_model_row else None
+    # The stored analyze_vendor: what was actually indexed.  False for a
+    # database from before the column.
     try:
-        builds = get_all_builds_for_project(conn, project_id)
-        # The memory map is per build, thus it belongs on these rows and not
-        # in the `images` list of get_active_build: that list holds one entry
-        # per image NAME, and two variants of the Zephyr project both carry an
-        # image called `app` with different flash addresses.
-        hashes = [b["config_hash"] for b in builds]
-        regions_by_config = get_memory_regions_by_config(conn, hashes)
-        # Read separately and not as a column of the query above: this
-        # connection comes from `_quick_open_readonly`, which skips the
-        # schema block by design, so an index written before this feature
-        # holds no such column.  Naming it in a shared SELECT made
-        # get_active_build raise on the ESP32 project.
-        entry_by_config = get_entry_points_by_config(conn, hashes)
-    finally:
-        conn.close()
+        stored_analyze_vendor = bool(
+            conn.execute(
+                "SELECT analyze_vendor FROM build_configs WHERE config_hash = ?",
+                (config_hash,),
+            ).fetchone()["analyze_vendor"]
+        )
+    except sqlite3.OperationalError:
+        stored_analyze_vendor = False
+    return make_analysis_summary(coverage, stored_analyze_vendor, model), stored_analyze_vendor
 
-    result_builds: list[dict] = []
-    for b in builds:
-        result_builds.append(
-            {
-                "variant": b["variant"] or "",
-                "image": b["image"] or "",
-                "board": b["board"] or "",
-                "config_hash": b["config_hash"],
-                "symbol_count": b["symbol_count"],
-                "file_count": b["file_count"],
-                "manifest_verification": b["manifest_verification"],
-                "entry_point": entry_by_config.get(b["config_hash"], ""),
-                "memory": regions_by_config.get(b["config_hash"], []),
-            }
+
+def _build_health(
+    conn,
+    target: _IndexTarget,
+    cfg,
+    *,
+    fast: bool,
+    hash_cache: dict[str, str],
+    facts: _ProjectFacts,
+    detail: bool = True,
+) -> dict:
+    """Return the health of the build *cfg* (a ``build_configs`` row).
+
+    Runs under the executor lock on the single shared connection, and must
+    not open its own connection.
+
+    *detail* False leaves out what only a report of this one build gives:
+    ``reference_count`` and ``analysis`` (None), and the analysis part of
+    ``index_message``.  WHY: the list of the builds of a project shows
+    neither, and each costs queries over every symbol of the build.
+
+    The result holds the fields of the build that the two status tools
+    report, and two internal ones: ``_restart_reason`` (the index holds a
+    NEWER row format than this process reads) and ``_restart_format``.
+    ``index_message`` comes without the two leading notes that concern the
+    project, a run in progress and a restart of the client:
+    :func:`_with_project_notes` adds them one time.
+
+    *hash_cache* is one cache of file hashes for the whole call: the count,
+    the header check and the other builds read the same files of the SDK.
+    Measured on a project of 7 builds, the header check took 3.6 s with one
+    cache for each build.
+    """
+    root = target.root
+    proj_cfg = target.cfg
+    bg_running = target.bg_running
+    config_hash = cfg["config_hash"]
+    sym_count = conn.execute("SELECT COUNT(*) FROM symbols WHERE config_hash=?", (config_hash,)).fetchone()[0]
+    file_count = conn.execute("SELECT COUNT(*) FROM files WHERE config_hash=?", (config_hash,)).fetchone()[0]
+    ref_count = count_refs(conn, config_hash) if detail else None
+    manifest_verification = cfg["manifest_verification"] or "none"
+    # The scan runs in fast mode too.  Without it the status tool answered
+    # "ready" while search_code on the same index warned about the same
+    # file, and the caller had no way to tell which reading held.  It costs
+    # about 41 ms on a project of 1900 files, against the 749 ms that the
+    # header check below already spends.
+    #
+    # use_cache=False on purpose: the cache validates itself against
+    # MAX(mtime) of the files table, which only a reindex moves, thus a
+    # cached answer would miss the edit that just happened.
+    modified_count = _count_modified_files(conn, config_hash, root, use_cache=False, hash_cache=hash_cache)
+    # The header check is NOT cheap: it hashes every header of every
+    # translation unit, which is 22,693 files and 749 ms on the Mbed
+    # project.  `fast` only gives it a cache, and does not skip it.
+    if manifest_verification == "full":
+        header_affected_tus, _ = _check_header_staleness(
+            conn, config_hash, root, use_cache=fast, hash_cache=hash_cache,
+        )
+    else:
+        header_affected_tus = 0
+    db_schema_ver = get_db_schema_version(conn)
+
+    analysis, stored_analyze_vendor = _analysis_of(conn, config_hash) if detail else (None, False)
+
+    cc_changed, stale_reason = _is_stale(cfg, cfg["compile_commands_path"])
+    schema_old = db_schema_ver < CURRENT_SCHEMA_VERSION
+    # Does the stored text still mean what this version reads it to mean?
+    # The schema version above cannot answer that: it hashes the column
+    # SET, thus it moves only when a column appears or goes, while the
+    # content of a column can change under an unchanged name.  See
+    # CURRENT_ROW_FORMAT.
+    # The test is ordinal, and not a plain inequality, because the two
+    # directions need opposite answers.  An OLDER format asks for a
+    # reindex, and the run repairs it.  A NEWER one cannot be repaired by
+    # any command: the index is right and THIS PROCESS is the old reader,
+    # thus the indexer writes the same new format again.
+    stored_format = stored_row_format(cfg)
+    row_format_old = row_format_is_older(stored_format)
+    row_format_newer = row_format_is_newer(stored_format)
+
+    # ── The build: what the last run found, and what is there now ──
+    # The marker is the text of the last index run that stopped without
+    # an index (``autobuild.record_problem``); each query tool answer
+    # carries it.  `_project_facts` reads it one time for the project.
+    # The check of the build runs here too, because the status tool is
+    # the first call of a session: a build that went away after the last
+    # run has no marker yet.
+    #
+    # The check reads the file that an index run checks
+    # (``checked_compile_commands``), and only when the index came from
+    # it: an index of an explicit file, or of build variants, gets no
+    # check, as `fw-context index` does none, and its advice `--build`
+    # would replace the explicit file.  A build of fw-context keeps its
+    # database in its output directory, thus a missing database is a
+    # missing build, and it gets the advice of one.
+    checked_cc = checked_compile_commands(root, proj_cfg, Path(cfg["compile_commands_path"]))
+    build_missing = build_missing_reason(checked_cc) if checked_cc is not None else ""
+    if facts.marker_build_missing:
+        # The marker says the same, with the command of the run.
+        build_missing = ""
+    build_problem = facts.build_problem
+    new_sources, auto_state = facts.new_sources, facts.auto_state
+
+    # A source file that the build system never saw has no translation
+    # unit, thus a plain reindex cannot pick it up.  It forces a reindex
+    # only when fw-context will not build it on its own.  When it will,
+    # the state is "reindexing" below: work is under way, and telling the
+    # caller to run a command would only duplicate it.
+    blocked_sources = bool(new_sources) and auto_state is not AutobuildState.WILL_BUILD
+
+    # ── The tree moved to another branch since this index ──
+    # The only condition that a plain reindex cannot fix.
+    # compile_commands.json is a build artifact of the branch it was
+    # generated on: it carries that branch's file list AND its compiler
+    # flags.  Measured on the Mbed project, a switch from 4.15.3 to 4.15.1
+    # left two generated zcbor sources listed in that file and absent
+    # from the tree, and a reindex reads the same file again.
+    # The same rule as ``branch_moved_since``, with the branch of the tree
+    # read one time for the project.
+    indexed_branch = branch_of_description(cfg["description"] if "description" in cfg.keys() else "")
+    live_branch = facts.live_branch
+    branch_moved = bool(indexed_branch and live_branch and live_branch != indexed_branch)
+    # Modified source files are handled per query and do NOT force a
+    # reindex.
+    needs_reindex = bool(
+        cc_changed or schema_old or row_format_old or blocked_sources or branch_moved
+        or build_problem or build_missing
+    )
+    # Asked once, because the call reaches the build backend and is not
+    # free.  Only the branch reason below reads it.
+    bg_build_allowed = branch_moved and _background_build_allowed(root, proj_cfg)
+
+    reindex_reasons: list[str] = []
+    if build_problem:
+        reindex_reasons.append(build_problem)
+    if build_missing:
+        reindex_reasons.append(_build_missing_advice(build_missing, root, proj_cfg))
+    if branch_moved:
+        # Always names `--build`, never a plain reindex: that would reuse
+        # compile_commands.json, which belongs to the branch the index
+        # was built on, with its file list and its compiler flags.
+        #
+        # The daemon runs it on its own where the backend allows a
+        # background build, so the advice says both — a checkout on a
+        # project nobody is watching gets no burst, and then the manual
+        # command is the only thing that fixes it.  A run already under way
+        # changes the advice: the command named here is the command that
+        # runs, thus naming it asks for the same work a second time.
+        #
+        # WHY the wording stays careful: `bg_running` says that AN INDEX
+        # RUN exists, and nothing more.  The run belongs to the daemon or
+        # to the operator, and its arguments are not readable from here.
+        # Only `--build` regenerates compile_commands.json, thus a plain
+        # run leaves this reason standing.
+        #
+        # A database of the user gets no build of fw-context, thus
+        # `--build` is no repair there: the user makes the file again.
+        if user_database(root, proj_cfg) is not None:
+            branch_advice = (
+                "; the index reads the database that [index] compile_commands names — "
+                "make it again on this branch, then run `fw-context index`"
+            )
+        elif bg_running:
+            branch_advice = (
+                "; an index run is in progress — wait for it rather than "
+                "start a second one, and run `fw-context index --build` "
+                "afterwards only if this reason stays (a run without "
+                "--build cannot clear it)"
+            )
+        elif bg_build_allowed:
+            branch_advice = (
+                "; a background reindex regenerates it with --build when "
+                "the watcher sees a change, or run "
+                "`fw-context index --build` now"
+            )
+        else:
+            branch_advice = ", run `fw-context index --build`"
+        reindex_reasons.append(
+            f"branch changed: indexed on {indexed_branch!r}, "
+            f"now on {live_branch!r} — compile_commands.json belongs to "
+            f"the old branch" + branch_advice
+        )
+    if schema_old:
+        reindex_reasons.append(f"schema_mismatch: {db_schema_ver} < {CURRENT_SCHEMA_VERSION}")
+    if row_format_old:
+        # Names the effect, not only the value: the caller has to know
+        # what the answers it gets now are worth.  `row_format_effect`
+        # picks the wording by the gap — the faults of the generations are
+        # opposite, thus one fixed sentence would be false for every gap
+        # but one.
+        reindex_reasons.append(
+            f"row_format_mismatch: {stored_format or '(none)'} != "
+            f"{CURRENT_ROW_FORMAT} — {row_format_effect(stored_format)}. "
+            f"Run `fw-context index`"
+        )
+    # A missing database of a build of fw-context is the missing build,
+    # and the build reason above (or the marker of the run that found it)
+    # already names it with its command.
+    database_gone = checked_cc is not None and not checked_cc.exists()
+    if cc_changed and not database_gone:
+        reindex_reasons.append(stale_reason or "compile_commands_changed")
+    if new_sources:
+        listed = ", ".join(new_sources[:3])
+        more = f" and {len(new_sources) - 3} more" if len(new_sources) > 3 else ""
+        # "No command is needed" is false while the last run failed: the
+        # build that adds them is the one that must be repaired first.
+        advice = (
+            "repair the build first, see the first reason"
+            if build_problem or build_missing else _AUTOBUILD_ADVICE[auto_state]
+        )
+        reindex_reasons.append(
+            f"{len(new_sources)} source file(s) not in compile_commands.json "
+            f"({listed}{more}) — {advice}"
         )
 
-    multi = bool(cfg.build.variants) or any(r["variant"] for r in result_builds)
-    return {"builds": result_builds, "multi": multi}
+    # One status that drives the decision of the caller.
+    # Priority: reindex_needed > reindexing > ready.
+    #
+    # A file that fw-context will build on its own counts as "reindexing":
+    # the work is under way or about to be, and every query keeps working
+    # meanwhile.  "reindex_needed" would ask the caller for a command that
+    # only duplicates it.
+    if needs_reindex:
+        status = "reindex_needed"
+    elif bg_running or (new_sources and auto_state is AutobuildState.WILL_BUILD):
+        status = "reindexing"
+    else:
+        status = "ready"
+
+    if status == "ready" and modified_count:
+        # The index is structurally sound, thus the status stays "ready"
+        # and every query keeps working.  But files on disk have moved past
+        # it, and the per-query warnings will say so — this message must
+        # not contradict them by claiming full freshness.
+        index_message = (
+            f"Index is usable ({sym_count} symbols), but {modified_count} file(s) "
+            f"changed since the last index run. Results about those files can be "
+            f"out of date — run `fw-context index`."
+        )
+    elif status == "ready":
+        index_message = f"Index is fully up to date ({sym_count} symbols)"
+    elif status == "reindexing":
+        if new_sources and auto_state is AutobuildState.WILL_BUILD:
+            index_message = (
+                f"{len(new_sources)} source file(s) are not in compile_commands.json "
+                f"(first: {new_sources[0]}). fw-context builds them on its own — "
+                f"no command is needed. Queries work on existing data meanwhile."
+            )
+        elif modified_count:
+            index_message = (
+                f"Index is usable — {modified_count} file(s) being reindexed "
+                f"in background. All queries return accurate results."
+            )
+        else:
+            index_message = (
+                "Index is usable — background reindex in progress. All queries return accurate results."
+            )
+    elif build_problem or build_missing:
+        # First among the reasons: without the build each unit gets no
+        # answer of its compiler, and no other repair helps before it.
+        index_message = (
+            (build_problem or _build_missing_advice(build_missing, root, proj_cfg))
+            + " Queries still work on the data of the last finished index run."
+        )
+    elif new_sources:
+        # Checked before the other reindex reasons: `--build` is the only
+        # command that repairs this one, and a message that says plain
+        # `index` would send the caller in a circle.  Reaching here means
+        # fw-context will NOT build them itself — _AUTOBUILD_ADVICE says
+        # which of the two reasons applies.
+        index_message = (
+            f"{len(new_sources)} source file(s) are not in compile_commands.json "
+            f"(first: {new_sources[0]}). A plain reindex cannot see them — "
+            f"{_AUTOBUILD_ADVICE[auto_state]}. Queries still work on existing data."
+        )
+    elif schema_old and cc_changed:
+        index_message = (
+            f"Schema version mismatch ({db_schema_ver} < {CURRENT_SCHEMA_VERSION}) "
+            f"and compile_commands.json changed. Run fw-context index. "
+            f"Queries still work on existing data."
+        )
+    elif schema_old:
+        index_message = (
+            f"Schema version mismatch ({db_schema_ver} < {CURRENT_SCHEMA_VERSION}). "
+            f"Run fw-context index. Queries still work on existing data."
+        )
+    else:
+        index_message = "Compile commands changed — run fw-context index. Queries still work on existing data."
+
+    # When manifest verification is not full, warn the LLM.
+    warning = None
+    if manifest_verification != "full":
+        if bg_running:
+            warning = (
+                "Index was built without full header dependency "
+                "tracking (manifest verification: "
+                f"{manifest_verification}). A reindex is currently "
+                "running — the index will be updated once it "
+                "completes. You may continue analysis, but note "
+                "that header changes since the last completed "
+                "index may not be reflected."
+            )
+            index_message += (
+                f" — manifest verification: {manifest_verification} (reindex in progress — wait for completion)"
+            )
+        else:
+            warning = (
+                "⚠️ INDEX DEGRADED — STOP ALL C/C++ ANALYSIS "
+                "IMMEDIATELY.\n\n"
+                "manifest.json is NOT available "
+                "for this index (manifest verification: "
+                f"{manifest_verification}). The index may contain "
+                "STALE data — header changes cannot be detected "
+                "without manifest.json. Continuing analysis with a "
+                "stale index WILL produce incorrect results.\n\n"
+                "REQUIRED: Tell the user to run 'fw-context index' "
+                "to rebuild with full dependency tracking. Do NOT "
+                "continue any C/C++ analysis until the user "
+                "confirms the index has been rebuilt."
+            )
+            index_message += (
+                f" — manifest verification: {manifest_verification} (run 'fw-context index' for full tracking)"
+            )
+
+    if header_affected_tus:
+        # A TU that failed to parse keeps its needs_reparse mark, so it
+        # counts here run after run.  Without the second half of this
+        # sentence the user is told to run 'fw-context index', and the
+        # index does not clear it.
+        index_message += (
+            f" | {header_affected_tus} source file(s) have stale header dependencies "
+            "— header changes since last index, or a TU that failed to "
+            "parse (see the index log)"
+        )
+
+    # LLM-analysis coverage, split by project/vendor, so the LLM reads
+    # unanalyzed vendor symbols as expected (analyze_vendor=false), not as
+    # a defect.
+    if analysis is not None:
+        index_message += _analysis_message(analysis, stored_analyze_vendor)
+
+    # ── This process is older than the index it reads ──
+    # No command repairs this, thus it is a warning and not a reindex
+    # reason.
+    restart_reason = ""
+    if row_format_newer:
+        restart_reason = (
+            f"This session reads row format {CURRENT_ROW_FORMAT} and the index holds "
+            f"{stored_format}. The index is the newer one and it is correct — do "
+            f"NOT reindex, because the indexer writes {stored_format} again and "
+            f"this message comes back. This server process runs older code. Tell the "
+            f"operator to restart the LLM client (Claude Code, opencode, or the client "
+            f"in use). The MCP server is a child process of that client, thus nobody "
+            f"can restart the server alone."
+        )
+
+    health: dict = {
+        "indexed_at": cfg["created_at"],
+        "symbol_count": sym_count,
+        "file_count": file_count,
+        "reference_count": ref_count,
+        "modified_files_count": modified_count,
+        "header_affected_tus": header_affected_tus,
+        "analysis": analysis,
+        "manifest_verification": manifest_verification,
+        "description": cfg["description"] if "description" in cfg.keys() else "",
+        "first_indexed_at": cfg["first_indexed_at"] if "first_indexed_at" in cfg.keys() else "",
+        "status": status,
+        "reindex_needed": needs_reindex,
+        "reindex_reasons": reindex_reasons,
+        "stale": needs_reindex or header_affected_tus > 0,
+        "index_message": index_message,
+        "_restart_reason": restart_reason,
+        "_restart_format": stored_format,
+    }
+    if warning is not None:
+        health["_warning"] = warning
+    return health
 
 
-# ── moved from server.py ──
-def get_active_build(
+def _with_project_notes(result: dict, target: _IndexTarget, restart_reason: str, restart_format: str) -> dict:
+    """Put the two notes of the project in front of ``index_message``, and add the project fields.
+
+    The front of ``index_message`` is what a caller acts on, thus a note
+    that changes the action goes there, one time for the call.
+
+    * A run in progress, while a reason asks for a command.  Every message
+      names a command, and a caller that follows it asks the operator for
+      work that is being done.  ``status`` stays "reindex_needed" on
+      purpose: the answers of THIS moment come from the rows of the last
+      finished run, and "reindexing" carries "continue" in the tool
+      instructions.  The wording promises nothing about the outcome: the
+      run belongs to the daemon or to the operator, and its arguments
+      cannot be read from here.
+    * This process is older than the index it reads (a NEWER row format).
+      No command repairs that, and a "fully up to date" message alone would
+      hide the one action that helps.
+    """
+    if result["reindex_needed"] and target.bg_running:
+        result["index_message"] = (
+            "An index run is in progress — wait for it rather than start "
+            "a second one, and ask the operator for no command yet. It "
+            "can clear the reasons below, but a reason that needs "
+            "`--build` clears only if the run uses it. Answers meanwhile "
+            "come from the last finished run. " + result["index_message"]
+        )
+    if restart_reason:
+        result["index_message"] = (
+            f"Restart the LLM client — this session reads row format "
+            f"{CURRENT_ROW_FORMAT} and the index holds {restart_format}. "
+            f"Queries work meanwhile. {result['index_message']}"
+        )
+        # No leading underscore: this is an answer to act on, and not a
+        # note about where an answer came from.
+        result["client_restart_required"] = True
+        result["client_restart_reason"] = restart_reason
+    result["bg_reindex_running"] = target.bg_running
+    if target.bg_running:
+        result["reindex_progress"] = read_reindex_progress(target.db_path.parent)
+    # sqlite-vec is an optional C extension for vector embeddings.  Report
+    # its availability so semantic_search can degrade gracefully.
+    from ...deps import _vec_available
+
+    vec_ok, vec_err = _vec_available()
+    result["vec_available"] = vec_ok
+    if vec_err is not None:
+        result["vec_error"] = vec_err
+    return result
+
+
+def _public(health: dict) -> dict:
+    """Return the fields of *health* that a tool gives, without the internal ones."""
+    return {key: value for key, value in health.items() if not key.startswith("_restart")}
+
+
+# The fields of one build in the `builds` list of get_project_status.
+_BUILD_ROW_FIELDS = (
+    "symbol_count", "file_count", "indexed_at", "status", "reindex_needed", "stale",
+    "modified_files_count", "header_affected_tus",
+)
+
+
+def _build_row(build, health: dict) -> dict:
+    """Return the entry of one build in the ``builds`` list of :func:`get_project_status`."""
+    row = {
+        "variant": build["variant"] or "",
+        "image": build["image"] or "",
+        "board": build["board"] or "",
+        **{key: health[key] for key in _BUILD_ROW_FIELDS},
+        "reasons": health["reindex_reasons"],
+    }
+    if health.get("_warning"):
+        row["manifest_verification"] = health["manifest_verification"]
+    return row
+
+
+def _build_state_words(health: dict) -> str:
+    """Return the state of one build in a few words, for the message of a project of several builds."""
+    if health["status"] != "ready":
+        return health["status"]
+    parts = []
+    if health.get("_warning"):
+        # A build without full header tracking is not up to date: the
+        # warning of the project says so, and the message must agree.
+        parts.append(f"manifest verification {health['manifest_verification']}")
+    if health["modified_files_count"]:
+        parts.append(f"{health['modified_files_count']} modified file(s)")
+    if health["header_affected_tus"]:
+        parts.append(f"{health['header_affected_tus']} file(s) with stale headers")
+    return ", ".join(parts)
+
+
+def _project_health(builds: list, healths: list[dict]) -> dict:
+    """Join the health of several builds into the health of the project.
+
+    No sums: a file that two images compile is in the index of each, thus
+    a sum counts shared code once for each build.  The counts are in the
+    ``builds`` list.
+
+    A reason that every build gives is a reason of the project, such as an
+    old schema or a failed build, and it comes one time and without a
+    label.  Any other reason gets the label of its build.
+    """
+    labels = [build_label(build) or "(no name)" for build in builds]
+    common = set.intersection(*(set(health["reindex_reasons"]) for health in healths))
+    reasons = [reason for reason in healths[0]["reindex_reasons"] if reason in common]
+    for label, health in zip(labels, healths, strict=True):
+        reasons += [f"build {label}: {reason}" for reason in health["reindex_reasons"] if reason not in common]
+    if any(health["status"] == "reindex_needed" for health in healths):
+        status = "reindex_needed"
+    elif any(health["status"] == "reindexing" for health in healths):
+        status = "reindexing"
+    else:
+        status = "ready"
+    behind = [(label, words) for label, health in zip(labels, healths, strict=True)
+              if (words := _build_state_words(health))]
+    listing = "; ".join(f"{label}: {words}" for label, words in behind)
+    if not behind:
+        message = f"Index is fully up to date ({len(builds)} builds)."
+    elif not reasons and status == "reindexing":
+        # The words of one build in the same state: no reason to read, and
+        # nothing for the caller to do but to wait for the run.
+        message = (
+            f"Index is usable — background reindex in progress ({listing}). "
+            f"All queries return accurate results."
+        )
+    elif not reasons:
+        # `_warning` only when a build has one: a pointer to an absent field
+        # sends the caller to look for nothing.
+        read = "builds and _warning" if any(health.get("_warning") for health in healths) else "builds"
+        message = (
+            f"{len(behind)} of {len(builds)} builds are not up to date — {listing}. "
+            f"Queries work, and their answers can be out of date — run `fw-context index`. "
+            f"Read {read} for each build."
+        )
+    else:
+        message = (
+            f"{len(behind)} of {len(builds)} builds are not up to date — {listing}. "
+            f"Read reindex_reasons for the action, and builds for each build."
+        )
+    result = {
+        "status": status,
+        "reindex_needed": status == "reindex_needed",
+        "reindex_reasons": reasons,
+        "stale": any(health["stale"] for health in healths),
+        "index_message": message,
+    }
+    degraded = [label for label, health in zip(labels, healths, strict=True) if health.get("_warning")]
+    if degraded:
+        first = next(health["_warning"] for health in healths if health.get("_warning"))
+        result["_warning"] = f"Builds without full header tracking: {', '.join(degraded)}. {first}"
+    return result
+
+
+def get_project_status(
     project_root: Annotated[
         str | None, Field(description="Project root directory. Auto-detected from CWD if omitted.")
     ] = None,
@@ -429,13 +907,22 @@ def get_active_build(
         "False to recompute the header hashes, which is far slower.")
     ] = True,
 ) -> dict:
-    """MANDATORY FIRST CALL for C/C++ projects. Return metadata about the
-    most recently indexed build configuration — check index health before
-    using any other fw-context tools.
+    """MANDATORY FIRST CALL for C/C++ projects. Return the health of the
+    index of the project, and the list of its builds — check it before you
+    use any other fw-context tool, and call it again while you wait for a
+    reindex.
 
     Read-only, and it spawns no subprocess — the startup daemon thread and
     the file watcher own the background reindex.  It creates no
-    ``.fw-context`` file in a project that is not initialized.
+    ``.fw-context`` file in a project that is not initialized.  It takes no
+    ``variant`` and no ``image``: it reports every build.  For the detail
+    of one build (its ``config_hash``, memory map, defines), call
+    ``get_build_info``.
+
+    ``builds`` lists every build of the index.  A project of more than one
+    build has no active build: every query tool must get the ``variant``
+    and the ``image`` of one build.  Select the build from the task, and
+    ask the user when the task does not identify one.
 
     Act on ``status``:
 
@@ -462,11 +949,14 @@ def get_active_build(
     * ``"no_index"`` — initialized, never indexed. Run ``fw-context index``.
     * ``"not_initialized"`` — run ``fw-context init``.
 
+    A project of several builds gets the worst status of its builds.  A
+    reason that every build gives comes one time, and any other reason
+    names its build: ``build <variant>/<image>: <reason>``.
+
     A failure sets NO ``status``.  DB corruption, no access to the index,
     or an index with no build config gives a dict that holds ``error``
-    alone.  Read that key first:
-    a reader that waits for ``status == "error"`` waits for a value this
-    tool does not produce.
+    alone.  Read that key first: a reader that waits for
+    ``status == "error"`` waits for a value this tool does not produce.
 
     Five conditions set ``reindex_needed``: an outdated schema, an outdated
     ROW FORMAT, a changed compile_commands.json, a branch change since the
@@ -474,9 +964,8 @@ def get_active_build(
     compile_commands.json when fw-context will not build it on its own.
     The last two need a build, because only the build system writes that
     file — a plain reindex has no translation unit for a new file and skips
-    it without a word.
-    Modified source files are something else: they are handled per-query,
-    and never set it.
+    it without a word.  Modified source files are something else: they are
+    handled per query, and never set it.
 
     ``row_format_mismatch`` means that the same columns hold text with an
     older meaning.  Take it seriously: an index written before
@@ -559,115 +1048,53 @@ def get_active_build(
             False recomputes the header hashes and costs several times more.
 
     Returns:
-        dict: {config_hash, project_id, project_root, build_system,
-        compile_commands, indexed_at (str — "YYYY-MM-DD HH:MM:SS" in UTC,
-        the completion time of the last full index), symbol_count, file_count,
-        reference_count, modified_files_count (int — files whose content no
-        longer matches the index; counted in both modes),
-        header_affected_tus (int — number of source files with stale
-        header dependencies; a file that compile_commands.json lists more
-        than once counts once), manifest_verification (str —
-        "full" when manifest.json exists, "none" otherwise),
-        analysis (dict — LLM-analysis coverage split by project/vendor:
-        {model, analyze_vendor, project: {analyzed, skipped, total},
-        vendor: {analyzed, skipped, total}, complete}),
-        description (str), first_indexed_at (str — UTC, same format as
-        indexed_at),
+        dict: {project_id, project_root, build_system, schema_version (int
+        — DB schema version), current_schema (int — code expects),
         vendor_paths (list[str] — config index.vendor_paths),
         project_paths (list[str] — config index.project_paths),
-        effective_vendor_patterns (list[str] — the SQL LIKE patterns that
-        this build really used to mark vendor code, for example
-        ``["mbed-os/%"]``; empty when the manifest cannot be read.  The two
-        lists above hold what the config asks for, this one what the index
-        did),
-        bg_reindex_running (bool),
-        reindex_progress (str or None — last log line when reindex is running),
-        schema_version (int — DB schema version),
-        current_schema (int — code expects), status (str — "ready"|"reindexing"|
-        "reindex_needed"|"no_index"|"not_initialized"; a failure sets no
-        status and gives ``error`` alone), reindex_needed (bool —
-        structural mismatch requiring a full reindex),
-        reindex_reasons (list[str] — why reindex is needed, empty when False,
-        except that a new source file that fw-context builds on its own is
-        listed while ``reindex_needed`` is False.  One of them asks for `fw-context index --build` rather than a plain
-        reindex: when the tree is on a different branch than the index,
-        compile_commands.json belongs to the OLD branch and carries its file
-        list and its compiler flags, so only a build regenerates it.  Read
-        the reason text — it names the command it needs),
-        stale (bool — True when reindex_needed, header_affected_tus > 0, or
-        stale_builds is not empty),
-        stale_builds (list[dict] — the other (variant, image) builds of the
-        project that are stale, each {variant, image, reindex_needed,
-        reasons}; a changed or missing database of a build, or rows of an
-        older row format, need a reindex; modified files and headers make
-        it stale),
-        _warning (str, optional — when manifest verification is not "full"),
-        vec_available (bool), vec_error (str, optional),
+        status (str — "ready"|"reindexing"|"reindex_needed"|"no_index"|
+        "not_initialized"; a failure sets no status and gives ``error``
+        alone), reindex_needed (bool), reindex_reasons (list[str] — why a
+        reindex is needed, empty when False, except that a new source file
+        that fw-context builds on its own is listed while
+        ``reindex_needed`` is False.  One of them asks for
+        `fw-context index --build` rather than a plain reindex: when the
+        tree is on a different branch than the index, compile_commands.json
+        belongs to the OLD branch and carries its file list and its
+        compiler flags, so only a build regenerates it.  Read the reason
+        text — it names the command it needs), stale (bool — True when a
+        build needs a reindex or has stale header dependencies),
         index_message (str — human-readable summary of index state),
-        multi (bool — True for a multi-variant project),
-        variants (list[dict] — {name, description, board}),
-        images (list[dict] — {name, description, dir, type}),
-        variant_images (dict — variant name to its image names),
-        active_variant (str or None — [build] default_variant),
-        active_image (str or None — the image that a query without
-        `image` gets: [build] default_image, or the application that the
-        build system names),
-        default_build_error (str — only when no build answers a query
-        without `image`, for example while the application is not
-        indexed; the other fields then describe the newest build),
-        entry_point (str — the `ENTRY()` of the linker script of the build
-        that the other fields describe, empty when no script names one),
-        memory (list[dict] — the `MEMORY` regions of that build:
-        {name, attributes, origin, length, origin_value, length_value,
-        file_path, line}),
+        builds (list[dict] — every build: {variant, image, board,
+        symbol_count, file_count, indexed_at, status, reindex_needed,
+        stale, modified_files_count, header_affected_tus, reasons}, and
+        ``manifest_verification`` on a build without full header
+        tracking), declared_not_indexed (list[dict], optional — each
+        variant that the config declares and the index does not hold:
+        {variant, command}; no query reaches it until the command ran),
+        bg_reindex_running (bool), reindex_progress (str or
+        None — last log line when reindex is running), _warning (str,
+        optional — when the manifest verification of a build is not
+        "full"), vec_available (bool), vec_error (str, optional),
         client_restart_required (bool, optional — only when True),
         client_restart_reason (str, optional — with the field above),
         update_notice (str, optional — a newer release is on PyPI)}
 
-        About ``memory``: ``origin`` and ``length`` hold the expression the
-        script writes, thus they differ by platform — an mbed script writes
-        `0xefe00` and a Zephyr script writes `((673792) - 0xe6)`.
-        ``origin_value`` and ``length_value`` hold the number, and both are
-        None for an expression that names a symbol, such as
-        `ORIGIN(RAM) + LENGTH(RAM)`.  A name that the link command defines
-        with ``--defsym`` counts as a number: the STM32 Arduino core writes
-        `LENGTH = LD_MAX_DATA_SIZE` and gets ``length_value`` 98304.  The
-        end of a region is ``origin_value + length_value``.
-
-        ``memory`` and ``entry_point`` describe ONE build.  For a
-        multi-variant project they follow ``config_hash``, which is the
-        build named by ``[build] default_variant``, and both are empty when
-        the config names no default (``config_hash`` and
-        ``compile_commands`` are then empty too).  For such a project
-        ``symbol_count``, ``file_count``, and ``reference_count`` are sums
-        over all builds.
-        Use ``list_variants`` for the map of every build.
-
-        ``memory`` is empty for a build system that records no linker
-        script, such as Keil or IAR.  A PlatformIO project records its link
-        only in ``fw-context index --build``: SCons writes no file with the
-        link command, thus the build asks ``pio run -t envdump``.  An empty
-        list for PlatformIO means that no build recorded the link yet, and
-        ``fw-context index --build`` is the step.  An empty list means "not
-        recorded", never "no memory".
-
-        ``defines`` (dict — the `-D` flags of that build) and
-        ``defines_varying`` (int).  ``defines`` holds only the names that
-        EVERY translation unit of the build carries with the same value, so
-        the tool never shows the defines of one file as the defines of the
-        build.  ``defines_varying`` counts the names left out, thus a name
-        absent from ``defines`` is either not defined at all or not defined
-        everywhere — measured on the Mbed project: 27 names in all 881 units, 59
-        in only some, where the three assembly files get a shorter set.
-
-        This is the configuration the BUILD states, not every macro the
-        preprocessor saw.  The second is three orders of magnitude larger —
-        27800 distinct names on the STM32 project — and almost all of it comes from the
-        headers and the compiler.  A Zephyr build keeps its real
-        configuration in ``autoconf.h`` (740 `CONFIG_*` names) and passes
-        few `-D` flags, so ``defines`` says little there and a great deal on
-        an mbed build, where it holds `APPLICATION_ADDR`,
-        `APPLICATION_SIZE`, and `CMSIS_VECTAB_VIRTUAL`.
+        A project of ONE build also gets the fields of that build at the
+        top level: indexed_at (str — "YYYY-MM-DD HH:MM:SS" in UTC, the
+        completion time of the last full index), first_indexed_at,
+        symbol_count, file_count, reference_count, modified_files_count
+        (int — files whose content no longer matches the index; counted in
+        both modes), header_affected_tus (int — number of source files with
+        stale header dependencies; a file that compile_commands.json lists
+        more than once counts once), manifest_verification (str — "full"
+        when manifest.json exists, "none" otherwise), analysis (dict — LLM
+        analysis coverage split by project/vendor: {model, analyze_vendor,
+        project: {analyzed, skipped, total}, vendor: {analyzed, skipped,
+        total}, complete}), description (str).  A project of several
+        builds gets no sums: the counts of each build are in ``builds``,
+        and ``reference_count``, ``analysis``, ``description`` and
+        ``first_indexed_at`` of a build are in ``get_build_info``.
 
         For a project that is not initialized, the result holds only
         ``status``, ``project_root``, and ``index_message``.  When no index
@@ -675,708 +1102,223 @@ def get_active_build(
         (``client_restart_*`` for an upgrade, ``update_notice``) can come
         with every result, these two included.
     """
-    return _with_version_state(_active_build_state(project_root, fast))
+    return _with_version_state(_project_state(project_root, fast))
 
 
-def _with_version_state(result: dict) -> dict:
-    """Add the version facts that do not depend on the index to *result*.
+def _project_state(project_root: str | None, fast: bool) -> dict:
+    """Return the state of :func:`get_project_status`, before the version fields."""
+    target = _index_target(project_root)
+    if isinstance(target, dict):
+        return target
 
-    One wrapper around every return path of :func:`_active_build_state`,
-    because an upgrade of the package concerns the process and not the
-    project: the caller must read it also when the project has no index.
-    A restart reason of the index (a newer row format) and a restart reason
-    of the package can apply together, thus the second one joins the text
-    and does not replace it.
+    def _query(conn, _config_hash):
+        builds = sorted(latest_builds(conn, target.project_id), key=build_label)
+        if not builds:
+            return {"error": f"No build config indexed for project at {target.root}."}
+        hash_cache: dict[str, str] = {}
+        facts = _project_facts(conn, target)
+        # One build gives its whole health at the top level, as get_build_info
+        # does.  The list of several builds shows no analysis and no count of
+        # references, thus it does not pay for them.
+        detail = len(builds) == 1
+        healths = [
+            _build_health(conn, target, build, fast=fast, hash_cache=hash_cache, facts=facts, detail=detail)
+            for build in builds
+        ]
+        result = _public(healths[0]) if len(builds) == 1 else _project_health(builds, healths)
+        result["builds"] = [_build_row(build, health) for build, health in zip(builds, healths, strict=True)]
+        # A variant that the config declares and the index does not hold: no
+        # query reaches it, and nothing else says that it exists.
+        indexed = {build["variant"] or "" for build in builds}
+        missing = [v.name for v in target.cfg.build.variants if v.name not in indexed]
+        if missing:
+            result["declared_not_indexed"] = [
+                {"variant": name, "command": f"fw-context index --build --variant {name}"} for name in missing
+            ]
+        restart = next((health for health in healths if health["_restart_reason"]), None)
+        return result, restart, get_db_schema_version(conn)
+
+    answer = get_executor(target.db_path).execute_sync(_query, "")
+    if isinstance(answer, dict):
+        return answer
+    result, restart, schema_version = answer
+    result.update({
+        "project_id": target.project_id,
+        "project_root": str(target.root),
+        "build_system": target.cfg.build.system or _detect_build_system(target.root),
+        "schema_version": schema_version,
+        "current_schema": CURRENT_SCHEMA_VERSION,
+        "vendor_paths": target.cfg.index.vendor_paths,
+        "project_paths": target.cfg.index.project_paths,
+    })
+    return _with_project_notes(
+        result, target,
+        restart["_restart_reason"] if restart else "",
+        restart["_restart_format"] if restart else "",
+    )
+
+
+def get_build_info(
+    project_root: Annotated[
+        str | None, Field(description="Project root directory. Auto-detected from CWD if omitted.")
+    ] = None,
+    variant: Annotated[str | None, Field(description=VARIANT_DESCRIPTION)] = None,
+    image: Annotated[str | None, Field(description=IMAGE_DESCRIPTION)] = None,
+    fast: Annotated[
+        bool, Field(description="When True (default), reuse the cached manifest "
+        "hashes for the header check. Pass False to recompute them, which is far slower.")
+    ] = True,
+) -> dict:
+    """Return the detail of ONE build: its identity, its health, its memory
+    map and its defines.
+
+    Read-only, and it spawns no subprocess.  On a project of more than one
+    build, give the ``variant`` and the ``image`` of one build, as
+    ``get_project_status`` lists them in ``builds``.  Without them the
+    answer is an error that lists the builds.  A project of one build
+    needs no selector.
+
+    The health fields (``status``, ``reindex_needed``, ``reindex_reasons``,
+    ``index_message``, ``modified_files_count`` and the others) have the
+    meaning that ``get_project_status`` gives them, for this build only.
+    The version fields (``update_notice``, a restart after an upgrade) are
+    in ``get_project_status``.
+
+    About ``memory``: ``origin`` and ``length`` hold the expression the
+    script writes, thus they differ by platform — an mbed script writes
+    `0xefe00` and a Zephyr script writes `((673792) - 0xe6)`.
+    ``origin_value`` and ``length_value`` hold the number, and both are
+    None for an expression that names a symbol, such as
+    `ORIGIN(RAM) + LENGTH(RAM)`.  A name that the link command defines
+    with ``--defsym`` counts as a number: the STM32 Arduino core writes
+    `LENGTH = LD_MAX_DATA_SIZE` and gets ``length_value`` 98304.  The end
+    of a region is ``origin_value + length_value``.
+
+    ``memory`` is empty for a build system that records no linker script,
+    such as Keil or IAR.  A PlatformIO project records its link only in
+    ``fw-context index --build``: SCons writes no file with the link
+    command, thus the build asks ``pio run -t envdump``.  An empty list for
+    PlatformIO means that no build recorded the link yet, and
+    ``fw-context index --build`` is the step.  An empty list means "not
+    recorded", never "no memory".
+
+    ``defines`` holds only the names that EVERY translation unit of the
+    build carries with the same value, so the tool never shows the defines
+    of one file as the defines of the build.  ``defines_varying`` counts
+    the names left out, thus a name absent from ``defines`` is either not
+    defined at all or not defined everywhere.  Measured on the Mbed
+    project, 27 names are in all 881 units and 59 in only some, where the
+    three assembly files get a shorter set.
+
+    This is the configuration the BUILD states, not every macro the
+    preprocessor saw.  The second is three orders of magnitude larger —
+    27800 distinct names on the STM32 project — and almost all of it comes
+    from the headers and the compiler.  A Zephyr build keeps its real
+    configuration in ``autoconf.h`` (740 `CONFIG_*` names) and passes few
+    `-D` flags, so ``defines`` says little there and a great deal on an
+    mbed build, where it holds `APPLICATION_ADDR`, `APPLICATION_SIZE`, and
+    `CMSIS_VECTAB_VIRTUAL`.
+
+    Args:
+        project_root: Project root directory. Auto-detected from CWD if
+            omitted.
+        variant: Variant of the build (a board, or a PlatformIO
+            environment). On a project of more than one build, give the
+            variant and the image of one build, as the refusal lists
+            them. fw-context does not select a build. One query answers
+            for ONE build.
+        image: Image of the build: a separate program, such as the
+            application or the bootloader. Give it when the build has an
+            image name.
+        fast: When True (default), the header check reuses the cached
+            manifest hashes.  False recomputes them.
+
+    Returns:
+        dict: {variant, image, board, config_hash, project_id, project_root,
+        build_system, compile_commands, indexed_at (str — UTC),
+        first_indexed_at, symbol_count, file_count, reference_count,
+        modified_files_count, header_affected_tus, manifest_verification,
+        analysis, description, vendor_paths, project_paths,
+        effective_vendor_patterns (list[str] — the SQL LIKE patterns that
+        this build really used to mark vendor code, for example
+        ``["mbed-os/%"]``; empty when the manifest cannot be read.  The two
+        lists above hold what the config asks for, this one what the index
+        did), status, reindex_needed, reindex_reasons, stale,
+        index_message, entry_point (str — the `ENTRY()` of the linker
+        script of the build, empty when no script names one), memory
+        (list[dict] — the `MEMORY` regions of the build: {name, attributes,
+        origin, length, origin_value, length_value, file_path, line}),
+        defines (dict — the `-D` flags of the build), defines_varying
+        (int), bg_reindex_running (bool), reindex_progress (str or None),
+        vec_available (bool), vec_error (str, optional), _warning (str,
+        optional), client_restart_required (bool, optional),
+        client_restart_reason (str, optional)}
+
+        A refusal of the selector, or an index with no build config, gives
+        a dict that holds ``error`` alone.  A project that is not
+        initialized or has no index gets the answer of
+        ``get_project_status``.
     """
-    from ...config.settings import load_update_settings
-    from ...version_check import restart_reason, update_notice
+    target = _index_target(project_root)
+    if isinstance(target, dict):
+        return target
+    from ..shared.variants import resolve_build
 
-    reason = restart_reason()
-    if reason:
-        prior = result.get("client_restart_reason")
-        result["client_restart_required"] = True
-        result["client_restart_reason"] = f"{prior} {reason}" if prior else reason
-        # A row-format reason already put the same action at the front of
-        # index_message.  One action needs one sentence there.
-        if "index_message" in result and not prior:
-            result["index_message"] = (
-                "Restart the LLM client — this server runs a different fw-context than "
-                f"the installed one. Queries work meanwhile. {result['index_message']}"
-            )
-    notice = update_notice(load_update_settings().check)
-    if notice:
-        result["update_notice"] = notice
-    return result
-
-
-def _active_build_state(project_root: str | None, fast: bool) -> dict:
-    """Return the index state of :func:`get_active_build`.
-
-    The tool docstring describes the result.  This function holds the body,
-    thus :func:`_with_version_state` sees every return path at one place.
-    """
-    root = resolve_project_root(project_root)
-    # Resolve project ID directly — bypass _db_path/derive_project_id so
-    # get_active_build can report not_initialized/no_index gracefully
-    # instead of raising.  Other tools still use derive_project_id
-    # (via _resolve_context) and raise ProjectNotInitializedError when
-    # the project is not initialized — fail-fast for operational tools,
-    # graceful degradation for this diagnostic tool.
-    fw_cfg = load_config(root)
-    project_id = fw_cfg.project.id
-    if not project_id:
-        # The project directory exists but was never initialized.
-        # Return a human-readable status so the LLM can guide the user.
-        return {
-            "status": "not_initialized",
-            "project_root": str(root),
-            "index_message": (
-                f"Project at {root} is not initialized. "
-                "Run `fw-context init` via bash to create a project ID and config, "
-                "then call get_active_build() again."
-            ),
-        }
-    db_path = fw_cfg.index.db_dir / project_id / "index.db"
-    if not db_path.exists():
-        # Project is initialized but no index was ever built.
-        # The LLM uses this to prompt the user for indexing.
-        return {
-            "status": "no_index",
-            "project_root": str(root),
-            "project_id": project_id,
-            "index_message": (
-                f"No symbol index found for {root}. "
-                "Run `fw-context index <path/to/compile_commands.json>` via bash "
-                "to build the index, then call get_active_build() again."
-            ),
-        }
-
-    # Check bg reindex status BEFORE querying the DB — when a bg reindex
-    # is running, the _modified_cache may contain stale counts from before
-    # the reindex started.  Skipping the cache ensures accurate counts.
-    bg_running = _is_bg_reindex_running(root)
-
-    # Open a short-lived read-only connection to fetch the active config
-    # hash.  We close it immediately — the actual heavy queries run
-    # through the executor on its own connection.
-    conn = _quick_open_readonly(db_path)
+    conn = _quick_open_readonly(target.db_path)
     try:
-        project_id = derive_project_id(root)
-        # The build of a query without `variant` and `image`, and not the
-        # newest build: see active_build.
-        from ..shared.variants import active_build
-
-        cfg, default_refusal = active_build(conn, project_id, fw_cfg, root)
-        if cfg is None and default_refusal:
-            # No build answers a query without `image` (the application is
-            # not indexed yet).  This tool still reports the health of the
-            # index, from the newest build, and says why in
-            # `default_build_error`.
-            cfg = get_active_config(conn, project_id)
-        if not cfg:
-            return {"error": f"No build config indexed for project at {root}."}
-        config_hash = cfg["config_hash"]
+        config_hash, refusal = resolve_build(conn, target.project_id, target.cfg, variant or "", image or "")
     finally:
         conn.close()
-
-    # The executor serializes all DB access through a single shared
-    # connection.  This prevents SQLITE_BUSY errors when the MCP server
-    # handles concurrent requests and a background reindex is running.
-    executor = get_executor(db_path)
+    if refusal:
+        return {"error": refusal}
+    if config_hash is None:
+        return {"error": f"No build config indexed for project at {target.root}."}
 
     def _query(conn, config_hash):
-        # Runs under the executor lock on the single shared connection;
-        # must not open its own connection.  Timeout is enforced by
-        # _wrap_tool (300 s + interrupt), not here.
-        sym_count = conn.execute("SELECT COUNT(*) FROM symbols WHERE config_hash=?", (config_hash,)).fetchone()[0]
-        file_count = conn.execute("SELECT COUNT(*) FROM files WHERE config_hash=?", (config_hash,)).fetchone()[0]
-        ref_count = count_refs(conn, config_hash)
-        manifest_verification = cfg.get("manifest_verification", "none")
-        # One cache of file hashes for this call: the count, the header check
-        # and the other builds read the same files of the SDK.
-        hash_cache: dict[str, str] = {}
-        if fast:
-            # The scan runs in fast mode too.  Without it this tool answered
-            # "ready" while search_code on the same index warned about the
-            # same file, and the caller had no way to tell which reading
-            # held.  It costs about 41 ms on a project of 1900 files,
-            # against the 749 ms that the header check below already spends.
-            #
-            # use_cache=False on purpose: the cache validates itself against
-            # MAX(mtime) of the files table, which only a reindex moves, thus
-            # a cached answer would miss the edit that just happened.
-            modified_count = _count_modified_files(
-                conn, config_hash, root, use_cache=False, hash_cache=hash_cache,
-            )
-            # NOTE: the header check is NOT cheap — it hashes every header of
-            # every translation unit, which is 22,693 files and 749 ms on
-            # The Mbed project.  `fast` only gives it a cache; it does not skip it.
-            if manifest_verification == "full":
-                header_affected_tus, _ = _check_header_staleness(
-                    conn, config_hash, root, use_cache=True, hash_cache=hash_cache,
-                )
-            else:
-                header_affected_tus = 0
-        else:
-            # Full scan — hashes every indexed file on disk.
-            modified_count = _count_modified_files(
-                conn, config_hash, root, use_cache=False, hash_cache=hash_cache,
-            )
-            # Check header dependencies separately (different metric: TUs, not files)
-            if manifest_verification == "full":
-                header_affected_tus, _ = _check_header_staleness(
-                    conn,
-                    config_hash,
-                    root,
-                    use_cache=False,
-                    hash_cache=hash_cache,
-                )
-            else:
-                header_affected_tus = 0
-        db_schema_ver = get_db_schema_version(conn)
-
-        # LLM analysis coverage — split by project vs vendor so the LLM can
-        # tell intentionally-skipped vendor symbols apart from project
-        # symbols that genuinely still need analysis.
-        coverage = compute_analysis_coverage(conn, config_hash)
-        # Exclude the skip:* sentinels (skip:toolarge, skip:unparseable) —
-        # they are not model names and must never surface as analysis.model.
-        analysis_model_row = conn.execute(
-            """SELECT a.model FROM llm_analysis a
-               JOIN symbols s ON s.id = a.symbol_id
-               WHERE s.config_hash = ?
-                 AND a.model NOT LIKE 'skip:%' LIMIT 1""",
-            (config_hash,),
+        cfg = conn.execute(
+            "SELECT * FROM build_configs WHERE project_id = ? AND config_hash = ?",
+            (target.project_id, config_hash),
         ).fetchone()
-        model = analysis_model_row["model"] if analysis_model_row else None
-
-        # Read stored analyze_vendor — what was actually indexed.
-        # Fall back to False for DBs that predate the column.
-        try:
-            stored_analyze_vendor = bool(
-                conn.execute(
-                    "SELECT analyze_vendor FROM build_configs WHERE config_hash = ?",
-                    (config_hash,),
-                ).fetchone()["analyze_vendor"]
-            )
-        except sqlite3.OperationalError:
-            stored_analyze_vendor = False
-
-        # Load project config for vendor_paths/project_paths in the response.
-        proj_cfg = load_config(project_root=root)
-
-        analysis = make_analysis_summary(coverage, stored_analyze_vendor, model)
-
-        cc_changed, stale_reason = _is_stale(cfg, cfg["compile_commands_path"])
-        schema_old = db_schema_ver < CURRENT_SCHEMA_VERSION
-        # Does the stored text still mean what this version reads it to mean?
-        # The schema version above cannot answer that: it hashes the column
-        # SET, thus it moves only when a column appears or goes, while the
-        # content of a column can change under an unchanged name.  See
-        # CURRENT_ROW_FORMAT.
-        # The test is ordinal, and not a plain inequality, because the two
-        # directions need opposite answers.  An OLDER format asks for a
-        # reindex, and the run repairs it.  A NEWER one cannot be repaired by
-        # any command: the index is right and THIS PROCESS is the old reader,
-        # thus the indexer writes the same new format again.  See the warning
-        # that `row_format_newer` builds below.
-        stored_format = stored_row_format(cfg)
-        row_format_old = row_format_is_older(stored_format)
-        row_format_newer = row_format_is_newer(stored_format)
-
-        # A source file that the build system never saw has no translation
-        # unit, thus a plain reindex cannot pick it up: it is absent from
-        # compile_commands.json, and only a build puts it there.  Without
-        # this check the tool reported "ready" over a file it knew nothing
-        # about, and it kept reporting it after a reindex.
-        new_sources = find_unindexed_sources(
-            conn, config_hash, root, Path(cfg["compile_commands_path"])
-        )
-        # What will happen to those files decides both the status and the
-        # wording.  fw-context builds them on its own where the backend can
-        # isolate its output, and then the caller has nothing to do; where it
-        # cannot, the caller must act.
-        auto_state = _autobuild_state(root, proj_cfg, new_sources)
-
-        # ── The build: what the last run found, and what is there now ──
-        # The marker is the text of the last index run that stopped without
-        # an index (``autobuild.record_problem``); each query tool answer
-        # carries it.  The check of the build runs here too, because this
-        # tool is the first call of a session: a build that went away after
-        # the last run has no marker yet.
-        #
-        # The check reads the file that an index run checks
-        # (``checked_compile_commands``), and only when the index came from
-        # it: an index of an explicit file, or of build variants, gets no
-        # check, as `fw-context index` does none, and its advice `--build`
-        # would replace the explicit file.  A build of fw-context keeps its
-        # database in its output directory, thus a missing database is a
-        # missing build, and it gets the advice of one.
-        checked_cc = checked_compile_commands(
-            root, proj_cfg, Path(cfg["compile_commands_path"])
-        )
-        build_checked = checked_cc is not None
-        build_missing = build_missing_reason(checked_cc) if checked_cc is not None else ""
-        problem = read_build_problem(db_path.parent)
-        if problem is not None and problem.build_missing:
-            if build_missing:
-                # The marker says the same, with the command of the run.
-                build_missing = ""
-            elif build_checked:
-                # The check ran and found the build (built outside of
-                # fw-context): the text is out of date for every answer,
-                # not only here.  Without a check the marker stays.
-                clear_build_problem(db_path.parent)
-                problem = None
-        build_problem = problem.text if problem is not None else ""
-
-        # Four conditions force a reindex:
-        #   1. Schema version in DB is older than current code expects.
-        #   2. compile_commands.json was modified since indexing
-        #      (detected via mtime comparison in _is_stale).
-        #   3. A source file is missing from compile_commands.json AND
-        #      fw-context will not build it on its own.  When it will, the
-        #      state is "reindexing" below — work is under way, and telling
-        #      the caller to run a command would only duplicate it.
-        #   4. The build is not there, or the last index run failed.
-        # Modified source files are handled per-query via auto-reindex
-        # and do NOT cause reindex_needed=True.
-        blocked_sources = bool(new_sources) and auto_state is not AutobuildState.WILL_BUILD
-
-        # ── The tree moved to another branch since this index ──
-        # A fourth condition, and the only one a plain reindex cannot fix.
-        # compile_commands.json is a build artifact of the branch it was
-        # generated on: it carries that branch's file list AND its compiler
-        # flags.  Measured on the Mbed project, a switch from 4.15.3 to 4.15.1
-        # left two generated zcbor sources listed in that file and absent
-        # from the tree, and a reindex reads the same file again.
-        indexed_branch, live_branch = branch_moved_since(
-            cfg["description"] if "description" in cfg.keys() else "", root
-        )
-        branch_moved = bool(indexed_branch)
-        # ── The other builds of the project ──
-        # Each query names one build, thus a build that a query does not
-        # reach without a selector can be stale while this one is current:
-        # a change in a file that only the bootloader compiles.  The same
-        # rules as above: a changed or missing database, or rows of an older
-        # row format, need a reindex; modified files and headers make the
-        # build stale.  The builds of one project are not always indexed
-        # together, thus their row formats can differ.
-        from ..shared.stale import build_label, other_stale_builds
-
-        stale_builds = other_stale_builds(
-            conn, project_id, root, config_hash, use_cache=fast, hash_cache=hash_cache,
-        )
-        needs_reindex = bool(
-            cc_changed or schema_old or row_format_old or blocked_sources or branch_moved
-            or build_problem or build_missing
-            or any(build["reindex_needed"] for build in stale_builds)
-        )
-
-        # Asked once, because the call reaches the build backend and is not
-        # free.  Only the branch reason below reads it.
-        bg_build_allowed = branch_moved and _background_build_allowed(root, proj_cfg)
-
-        # Build reindex_reasons — only when reindex is actually needed
-        reindex_reasons: list[str] = []
-        if build_problem:
-            reindex_reasons.append(build_problem)
-        if build_missing:
-            reindex_reasons.append(_build_missing_advice(build_missing, root, proj_cfg))
-        if branch_moved:
-            # Always names `--build`, never a plain reindex: that would reuse
-            # compile_commands.json, which belongs to the branch the index
-            # was built on, with its file list and its compiler flags.
-            #
-            # The daemon runs it on its own where the backend allows a
-            # background build, so the advice says both — a checkout on a
-            # project nobody is watching gets no burst, and then the manual
-            # command is the only thing that fixes it.  Measured: without the
-            # second half this reason read as a command while the
-            # new-source reason beside it read "no command is needed", and
-            # the two contradicted each other on one checkout of the Mbed project.
-            # A run already under way changes the advice: the command named
-            # here is the command that runs, thus naming it asks for the same
-            # work a second time.
-            #
-            # WHY the wording stays careful: `bg_running` says that AN INDEX
-            # RUN exists, and nothing more.  The run belongs to the daemon or
-            # to the operator — `reindex.pid` carries both (see
-            # `background._is_bg_reindex_running`) — and its arguments are
-            # not readable from here.  Only `--build` regenerates
-            # compile_commands.json, thus a plain run leaves this reason
-            # standing, and a promise that the run clears it would be a
-            # guess.
-            #
-            # A database of the user gets no build of fw-context, thus
-            # `--build` is no repair there: the user makes the file again.
-            if user_database(root, proj_cfg) is not None:
-                branch_advice = (
-                    "; the index reads the database that [index] compile_commands names — "
-                    "make it again on this branch, then run `fw-context index`"
-                )
-            elif bg_running:
-                branch_advice = (
-                    "; an index run is in progress — wait for it rather than "
-                    "start a second one, and run `fw-context index --build` "
-                    "afterwards only if this reason stays (a run without "
-                    "--build cannot clear it)"
-                )
-            elif bg_build_allowed:
-                branch_advice = (
-                    "; a background reindex regenerates it with --build when "
-                    "the watcher sees a change, or run "
-                    "`fw-context index --build` now"
-                )
-            else:
-                branch_advice = ", run `fw-context index --build`"
-            reindex_reasons.append(
-                f"branch changed: indexed on {indexed_branch!r}, "
-                f"now on {live_branch!r} — compile_commands.json belongs to "
-                f"the old branch" + branch_advice
-            )
-        if schema_old:
-            reindex_reasons.append(f"schema_mismatch: {db_schema_ver} < {CURRENT_SCHEMA_VERSION}")
-        if row_format_old:
-            # Names the effect, not only the value: the caller has to know
-            # what the answers it gets now are worth, which is not obvious
-            # from a version string.  `row_format_effect` picks the wording
-            # by the gap — the faults of the generations are opposite, thus
-            # one fixed sentence would be false for every gap but one.
-            reindex_reasons.append(
-                f"row_format_mismatch: {stored_format or '(none)'} != "
-                f"{CURRENT_ROW_FORMAT} — {row_format_effect(stored_format)}. "
-                f"Run `fw-context index`"
-            )
-        # A missing database of a build of fw-context is the missing build,
-        # and the build reason above (or the marker of the run that found
-        # it) already names it with its command.
-        database_gone = checked_cc is not None and not checked_cc.exists()
-        if cc_changed and not database_gone:
-            reindex_reasons.append(stale_reason or "compile_commands_changed")
-        for build in stale_builds:
-            if build["reindex_needed"]:
-                reindex_reasons.append(
-                    f"build {build_label(build)}: {', '.join(build['reasons'])} — "
-                    f"run `fw-context index`"
-                )
-        if new_sources:
-            listed = ", ".join(new_sources[:3])
-            more = f" and {len(new_sources) - 3} more" if len(new_sources) > 3 else ""
-            # "No command is needed" is false while the last run failed: the
-            # build that adds them is the one that must be repaired first.
-            advice = (
-                "repair the build first, see the first reason"
-                if build_problem or build_missing else _AUTOBUILD_ADVICE[auto_state]
-            )
-            reindex_reasons.append(
-                f"{len(new_sources)} source file(s) not in compile_commands.json "
-                f"({listed}{more}) — {advice}"
-            )
-
-        # Determine status — single value that drives LLM decision-making.
-        # Priority: reindex_needed > reindexing > ready.
-        #
-        # A file that fw-context will build on its own counts as
-        # "reindexing": the work is under way or about to be, and every query
-        # keeps working meanwhile.  "reindex_needed" would ask the caller for
-        # a command that only duplicates it.
-        if needs_reindex:
-            status = "reindex_needed"
-        elif bg_running or (new_sources and auto_state is AutobuildState.WILL_BUILD):
-            status = "reindexing"
-        else:
-            status = "ready"
-
-        # Build human-readable index message
-        if status == "ready" and modified_count:
-            # The index is structurally sound, thus the status stays "ready"
-            # and every query keeps working.  But files on disk have moved
-            # past it, and the per-query warnings will say so — this message
-            # must not contradict them by claiming full freshness.
-            index_message = (
-                f"Index is usable ({sym_count} symbols), but {modified_count} file(s) "
-                f"changed since the last index run. Results about those files can be "
-                f"out of date — run `fw-context index`."
-            )
-        elif status == "ready":
-            index_message = f"Index is fully up to date ({sym_count} symbols)"
-        elif status == "reindexing":
-            if new_sources and auto_state is AutobuildState.WILL_BUILD:
-                index_message = (
-                    f"{len(new_sources)} source file(s) are not in compile_commands.json "
-                    f"(first: {new_sources[0]}). fw-context builds them on its own — "
-                    f"no command is needed. Queries work on existing data meanwhile."
-                )
-            elif modified_count:
-                index_message = (
-                    f"Index is usable — {modified_count} file(s) being reindexed "
-                    f"in background. All queries return accurate results."
-                )
-            else:
-                index_message = (
-                    "Index is usable — background reindex in progress. All queries return accurate results."
-                )
-        elif build_problem or build_missing:
-            # First among the reasons: without the build each unit gets no
-            # answer of its compiler, and no other repair helps before it.
-            index_message = (
-                (build_problem or _build_missing_advice(build_missing, root, proj_cfg))
-                + " Queries still work on the data of the last finished index run."
-            )
-        elif new_sources:
-            # Checked before the other reindex reasons: `--build` is the only
-            # command that repairs this one, and a message that says plain
-            # `index` would send the caller in a circle.  Reaching here means
-            # fw-context will NOT build them itself — _AUTOBUILD_ADVICE says
-            # which of the two reasons applies.
-            index_message = (
-                f"{len(new_sources)} source file(s) are not in compile_commands.json "
-                f"(first: {new_sources[0]}). A plain reindex cannot see them — "
-                f"{_AUTOBUILD_ADVICE[auto_state]}. Queries still work on existing data."
-            )
-        elif schema_old and cc_changed:
-            index_message = (
-                f"Schema version mismatch ({db_schema_ver} < {CURRENT_SCHEMA_VERSION}) "
-                f"and compile_commands.json changed. Run fw-context index. "
-                f"Queries still work on existing data."
-            )
-        elif schema_old:
-            index_message = (
-                f"Schema version mismatch ({db_schema_ver} < {CURRENT_SCHEMA_VERSION}). "
-                f"Run fw-context index. Queries still work on existing data."
-            )
-        else:
-            index_message = "Compile commands changed — run fw-context index. Queries still work on existing data."
-
-        # ── A reason and a running index at the same time ──
-        # Every message above names a command.  When a run is already under
-        # way that reads as a contradiction, and a caller that follows it
-        # asks the operator for work that is being done.  Say so in front,
-        # because the front of this string is what a caller acts on.
-        #
-        # `status` stays "reindex_needed" on purpose.  The answers of THIS
-        # moment still come from the rows of the last finished run, thus a
-        # caller must not read them as final — and "reindexing" carries
-        # "fully operational, continue" in the tool instructions.
-        #
-        # The wording promises nothing about the outcome: `bg_running` says
-        # only that an index run exists.  It belongs to the daemon or to the
-        # operator, and its arguments cannot be read from here, thus a reason
-        # that needs `--build` may well survive it.
-        if needs_reindex and bg_running:
-            index_message = (
-                "An index run is in progress — wait for it rather than start "
-                "a second one, and ask the operator for no command yet. It "
-                "can clear the reasons below, but a reason that needs "
-                "`--build` clears only if the run uses it. Answers meanwhile "
-                "come from the last finished run. " + index_message
-            )
-
-        # When manifest verification is not full, warn the LLM.
-        _warning = None
-        if manifest_verification != "full":
-            if bg_running:
-                _warning = (
-                    "Index was built without full header dependency "
-                    "tracking (manifest verification: "
-                    f"{manifest_verification}). A reindex is currently "
-                    "running — the index will be updated once it "
-                    "completes. You may continue analysis, but note "
-                    "that header changes since the last completed "
-                    "index may not be reflected."
-                )
-                index_message += (
-                    f" — manifest verification: {manifest_verification} (reindex in progress — wait for completion)"
-                )
-            else:
-                _warning = (
-                    "⚠️ INDEX DEGRADED — STOP ALL C/C++ ANALYSIS "
-                    "IMMEDIATELY.\n\n"
-                    "manifest.json is NOT available "
-                    "for this index (manifest verification: "
-                    f"{manifest_verification}). The index may contain "
-                    "STALE data — header changes cannot be detected "
-                    "without manifest.json. Continuing analysis with a "
-                    "stale index WILL produce incorrect results.\n\n"
-                    "REQUIRED: Tell the user to run 'fw-context index' "
-                    "to rebuild with full dependency tracking. Do NOT "
-                    "continue any C/C++ analysis until the user "
-                    "confirms the index has been rebuilt."
-                )
-                index_message += (
-                    f" — manifest verification: {manifest_verification} (run 'fw-context index' for full tracking)"
-                )
-
-        if header_affected_tus:
-            # A TU that failed to parse keeps its needs_reparse mark, so it
-            # counts here run after run.  Without the second half of this
-            # sentence the user is told to run 'fw-context index', and the
-            # index does not clear it.
-            index_message += (
-                f" | {header_affected_tus} source file(s) have stale header dependencies "
-                "— header changes since last index, or a TU that failed to "
-                "parse (see the index log)"
-            )
-
-        # Append LLM-analysis coverage, split by project/vendor, so the LLM
-        # reads unanalyzed vendor symbols as expected (analyze_vendor=false),
-        # not as a defect.
-        index_message += _analysis_message(analysis, stored_analyze_vendor)
-
-        # ── This process is older than the index it reads ──
-        # No command repairs this, thus it is a warning and not a reindex
-        # reason.  It goes in front of `index_message` because that string is
-        # what a caller reads first, and a "fully up to date" message alone
-        # would hide the one action that helps.
-        client_restart_reason = ""
-        if row_format_newer:
-            client_restart_reason = (
-                f"This session reads row format {CURRENT_ROW_FORMAT} and the index holds "
-                f"{stored_format}. The index is the newer one and it is correct — do "
-                f"NOT reindex, because the indexer writes {stored_format} again and "
-                f"this message comes back. This server process runs older code. Tell the "
-                f"operator to restart the LLM client (Claude Code, opencode, or the client "
-                f"in use). The MCP server is a child process of that client, thus nobody "
-                f"can restart the server alone."
-            )
-            index_message = (
-                f"Restart the LLM client — this session reads row format "
-                f"{CURRENT_ROW_FORMAT} and the index holds {stored_format}. "
-                f"Queries work meanwhile. {index_message}"
-            )
-
-        result: dict = {
+        if cfg is None:
+            # A reindex removed the build between the two reads.
+            return {"error": f"No build config indexed for project at {target.root}."}
+        health = _build_health(conn, target, cfg, fast=fast, hash_cache={}, facts=_project_facts(conn, target))
+        compile_commands = cfg["compile_commands_path"]
+        # The `-D` flags of this build, read from ITS compile_commands.json.
+        # Computed here and not stored: the read costs 19 ms on the Mbed
+        # project with 881 units, measured, so a column would buy nothing
+        # and a stale one would mislead.
+        defines, varying = command_line_defines(Path(compile_commands) if compile_commands else Path())
+        result = {
+            "variant": cfg["variant"] or "",
+            "image": cfg["image"] or "",
+            "board": cfg["board"] or "",
             "config_hash": config_hash,
-            "project_id": project_id,
-            "project_root": str(root),
-            "build_system": proj_cfg.build.system or _detect_build_system(root),
-            "compile_commands": cfg["compile_commands_path"],
-            "indexed_at": cfg["created_at"],
-            "symbol_count": sym_count,
-            "file_count": file_count,
-            "reference_count": ref_count,
-            "modified_files_count": modified_count,
-            "header_affected_tus": header_affected_tus,
-            "schema_version": db_schema_ver,
-            "current_schema": CURRENT_SCHEMA_VERSION,
-            "analysis": analysis,
-            "manifest_verification": manifest_verification,
-            "description": cfg["description"] if "description" in cfg.keys() else "",
-            "first_indexed_at": cfg["first_indexed_at"] if "first_indexed_at" in cfg.keys() else "",
-            "vendor_paths": proj_cfg.index.vendor_paths,
-            "project_paths": proj_cfg.index.project_paths,
-            # What the INDEX RUN applied, which is not always what the config
-            # says today: the builder derives part of it, a variant adds to
-            # it, and the config can have changed since.  Three layers with no
-            # way to read the result are worse than two.
+            "project_id": target.project_id,
+            "project_root": str(target.root),
+            "build_system": target.cfg.build.system or _detect_build_system(target.root),
+            "compile_commands": compile_commands,
+            **_public(health),
+            "vendor_paths": target.cfg.index.vendor_paths,
+            "project_paths": target.cfg.index.project_paths,
+            # What the INDEX RUN applied, which is not always what the
+            # config says today: the builder derives part of it, a variant
+            # adds to it, and the config can have changed since.
             "effective_vendor_patterns": _effective_vendor_patterns(
-                db_path.parent, config_hash, root
+                target.db_path.parent, config_hash, target.root
             ),
-            "status": status,
-            "reindex_needed": needs_reindex,
-            "reindex_reasons": reindex_reasons,
-            "stale": needs_reindex or header_affected_tus > 0 or bool(stale_builds),
-            # No leading underscore: the builds a caller must not read as
-            # current.  Empty when every other build of the project is.
-            "stale_builds": stale_builds,
-            "index_message": index_message,
+            "entry_point": get_entry_point(conn, config_hash),
+            "memory": get_memory_regions(conn, config_hash),
+            "defines": defines,
+            "defines_varying": varying,
         }
-        if default_refusal:
-            # No leading underscore: the caller must name `image` until the
-            # application is indexed.
-            result["default_build_error"] = default_refusal
-        if client_restart_reason:
-            # No leading underscore: this is an answer to act on, and not a
-            # note about where an answer came from.
-            result["client_restart_required"] = True
-            result["client_restart_reason"] = client_restart_reason
-        if _warning is not None:
-            result["_warning"] = _warning
+        return result, health["_restart_reason"], health["_restart_format"]
 
-        # ── Multi-variant discovery (§5.6.A) ──
-        # Tell the LLM what the project contains (parts = images) and for which
-        # variants indexes exist — before it guesses names.  Sources: config
-        # [[build.variants]] first, build_configs fallback.
-        builds = get_all_builds_for_project(conn, project_id)
-        discovery = _build_variant_discovery(proj_cfg, builds, root)
-        result["multi"] = discovery["multi"]
-        result["variants"] = discovery["variants"]
-        result["images"] = discovery["images"]
-        result["variant_images"] = discovery["variant_images"]
-        result["active_variant"] = discovery["active_variant"]
-        result["active_image"] = discovery["active_image"]
-
-        if discovery["multi"]:
-            # Aggregate health fields across builds (shared common/ code is
-            # counted N times — sums are "total symbol records", not unique).
-            result["symbol_count"] = sum(b["symbol_count"] for b in builds)
-            result["file_count"] = sum(b["file_count"] for b in builds)
-            result["reference_count"] = sum(b["reference_count"] for b in builds)
-            # config_hash/compile_commands reflect the default build only: the
-            # build of a query without `variant` and `image` (active_build).
-            # Empty without [build] default_variant (the LLM must pick a
-            # variant), and when no build of the default variant answers.
-            default_build = cfg if discovery["active_variant"] and not default_refusal else None
-            result["config_hash"] = default_build["config_hash"] if default_build else ""
-            result["compile_commands"] = (
-                default_build["compile_commands_path"] if default_build else ""
-            )
-
-        # ── The memory map of the build these fields describe ──
-        # AFTER the multi-variant block, because that block replaces
-        # `config_hash` with the default build.  Read before it, a
-        # multi-variant project would report the map of one build under the
-        # identity of another — measured on the Zephyr project, where `app`
-        # starts at flash 372736 and `mcuboot` at 110592.
-        #
-        # One build only.  `list_variants` reports every build's map, and
-        # this tool has no variant parameter to ask for another.
-        active_hash = result["config_hash"]
-        if active_hash:
-            result["entry_point"] = get_entry_point(conn, active_hash)
-            result["memory"] = get_memory_regions(conn, active_hash)
-            # The `-D` flags of the build that `config_hash` names, read
-            # from ITS compile_commands.json rather than from the project's.
-            # Computed here and not stored: the read costs 19 ms on
-            # The Mbed project with 881 units, measured, so a column would buy
-            # nothing and a stale one would mislead.
-            defines, varying = command_line_defines(
-                Path(result["compile_commands"])
-                if result["compile_commands"] else Path()
-            )
-            result["defines"] = defines
-            result["defines_varying"] = varying
-        else:
-            # A multi-variant project with no [build] default_variant: the
-            # LLM has to pick a variant first, thus there is no one map to
-            # report.  Empty rather than a guess at which build is meant.
-            result["entry_point"] = ""
-            result["memory"] = []
-            result["defines"] = {}
-            result["defines_varying"] = 0
-
-        return result
-
-    result = executor.execute_sync(_query, config_hash)
-    if "error" in result:
-        return result
-    # Background reindex is managed by the startup daemon thread and the
-    # file watcher — get_active_build() is a read-only tool and should
-    # not spawn subprocesses.
-    result["bg_reindex_running"] = bg_running
-    if bg_running:
-        result["reindex_progress"] = read_reindex_progress(db_path.parent)
-
-    # sqlite-vec is an optional C extension for vector embeddings.
-    # Report its availability so semantic_search can degrade gracefully.
-    from ...deps import _vec_available
-    vec_ok, vec_err = _vec_available()
-    result["vec_available"] = vec_ok
-    if vec_err is not None:
-        result["vec_error"] = vec_err
-
-    return result
+    answer = get_executor(target.db_path).execute_sync(_query, config_hash)
+    if isinstance(answer, dict):
+        return answer
+    result, restart_reason, restart_format = answer
+    return _with_project_notes(result, target, restart_reason, restart_format)
 
 
 # ── moved from server.py ──
@@ -1431,7 +1373,7 @@ def _list_status(db_schema_ver: int, cc_stale: bool, row_format_old: bool) -> st
     WHY the row format is here: the schema version hashes the column set
     alone, thus it does not move when the meaning of the text in a column
     changes.  Without this check ``list_projects`` reported "ready" over an
-    index for which ``get_active_build`` and the daemon ask for a reindex.
+    index for which ``get_project_status`` and the daemon ask for a reindex.
     """
     needs = (db_schema_ver < CURRENT_SCHEMA_VERSION) or cc_stale or row_format_old
     return "reindex_needed" if needs else "ready"
@@ -1449,15 +1391,22 @@ def list_projects(
 ) -> list[dict]:
     """List all indexed firmware projects with their statistics.
 
-    Read-only. No side effects. Use at session start to discover available
-    projects; use ``get_active_build`` for details on the currently active project.
+    Read-only. No side effects. Use it to find another project; call
+    ``get_project_status`` for the builds and the health of one project.
 
     ``indexed_at`` and ``first_indexed_at`` are UTC, in ``"YYYY-MM-DD
-    HH:MM:SS"`` format — the same format that ``get_active_build`` returns.
+    HH:MM:SS"`` format — the same format that ``get_project_status`` returns.
+    ``indexed_at`` is the time of the newest build.
+
+    A project of several builds gets no counts here (``symbol_count``,
+    ``file_count``, ``description`` and ``analysis`` are None): a file that
+    two images compile is in the index of each, thus a sum counts shared
+    code once for each build.  ``get_project_status`` gives the counts of
+    each build.
 
     ``analysis`` holds the ``project`` and ``vendor`` counts only.  For the
     ``model``, ``analyze_vendor``, and ``complete`` fields, call
-    ``get_active_build`` for that project.
+    ``get_build_info`` for that build.
 
     Args:
         project_root: Project root whose config names the index
@@ -1472,8 +1421,7 @@ def list_projects(
         holds rows of an older row format; each (variant, image) build
         counts), status (str — "ready" or "reindex_needed"),
         db (path to SQLite database file),
-        variant_count (int — number of build variants),
-        image_count (int — number of images),
+        build_count (int — number of builds, each a (variant, image) pair),
         analysis (dict — LLM-analysis coverage
         {project: {analyzed, skipped, total},
         vendor: {analyzed, skipped, total}}, or None when no build is
@@ -1503,34 +1451,24 @@ def list_projects(
                 # connection; must not open its own connection.
                 rows = get_all_projects(conn)
                 schema_ver = get_db_schema_version(conn)
-                counts = {}
-                for row in conn.execute(
-                    "SELECT project_id, "
-                    "COUNT(DISTINCT CASE WHEN variant != '' THEN variant END) AS vc, "
-                    "COUNT(DISTINCT CASE WHEN image != '' THEN image END) AS ic "
-                    "FROM build_configs GROUP BY project_id"
-                ).fetchall():
-                    counts[row["project_id"]] = (row["vc"] or 0, row["ic"] or 0)
                 coverage_map = {
                     row["config_hash"]: compute_analysis_coverage(conn, row["config_hash"])
                     for row in rows
                     if row["config_hash"]
                 }
                 # The newest build of each (variant, image), the builds that
-                # get_active_build and the daemon check.  The newest build of
-                # the project alone is not enough: the builds of one project
-                # are not always indexed together, thus another build can be
-                # stale while the newest is current.
+                # get_project_status and the daemon check.  The newest build
+                # of the project alone is not enough: the builds of one
+                # project are not always indexed together, thus another build
+                # can be stale while the newest is current.
                 builds = {row["project_id"]: latest_builds(conn, row["project_id"]) for row in rows}
-                return rows, schema_ver, counts, coverage_map, builds
+                return rows, schema_ver, coverage_map, builds
 
-            rows, db_schema_ver, variant_counts, coverage_map, builds = executor.execute_sync(
-                _query, ""
-            )
+            rows, db_schema_ver, coverage_map, builds = executor.execute_sync(_query, "")
             for r in rows:
                 project_builds = builds[r["project_id"]]
                 # A changed or missing compile_commands.json of a build: the
-                # check that get_active_build makes, by mtime against the
+                # check that get_project_status makes, by mtime against the
                 # time of the index.  Does not require _wrap_tool —
                 # list_projects is informational only.
                 cc_stale = any(
@@ -1553,30 +1491,32 @@ def list_projects(
                     _bs = (_pc.build.system if _pc else None) or (_detect_build_system(root) if root else "unknown")
                 except Exception:
                     _bs = _detect_build_system(root) if root else "unknown"
-                cov = coverage_map.get(r["config_hash"]) if r["config_hash"] else None
                 status = _list_status(db_schema_ver, cc_stale, row_format_old)
+                # The counts of the newest build describe the project only
+                # when it is the one build.  See the docstring.
+                single = len(project_builds) <= 1
+                cov = coverage_map.get(r["config_hash"]) if single and r["config_hash"] else None
                 results.append(
                     {
                         "project_id": r["project_id"],
                         "name": r["name"],
                         "root_path": r["root_path"],
                         "build_system": _bs,
-                        "symbol_count": r["symbol_count"],
-                        "file_count": r["file_count"],
+                        "symbol_count": r["symbol_count"] if single else None,
+                        "file_count": r["file_count"] if single else None,
                         "indexed_at": r["created_at"],
-                        "description": r["description"] if "description" in r.keys() else "",
+                        "description": (r["description"] if "description" in r.keys() else "") if single else None,
                         "first_indexed_at": r["first_indexed_at"] if "first_indexed_at" in r.keys() else "",
-                         "schema_version": db_schema_ver,
-                         "current_schema": CURRENT_SCHEMA_VERSION,
-                         "reindex_needed": status == "reindex_needed",
-                         "status": status,
-                         "db": str(db_path),
-                         "variant_count": variant_counts.get(r["project_id"], (0, 0))[0],
-                         "image_count": variant_counts.get(r["project_id"], (0, 0))[1],
-                         "analysis": (
-                             {"project": cov["project"], "vendor": cov["vendor"]}
-                             if cov else None
-                         ),
+                        "schema_version": db_schema_ver,
+                        "current_schema": CURRENT_SCHEMA_VERSION,
+                        "reindex_needed": status == "reindex_needed",
+                        "status": status,
+                        "db": str(db_path),
+                        "build_count": len(project_builds),
+                        "analysis": (
+                            {"project": cov["project"], "vendor": cov["vendor"]}
+                            if cov else None
+                        ),
                     }
                 )
         except (sqlite3.Error, OSError) as e:
@@ -1935,7 +1875,7 @@ def _update_manifest_after_reindex(
 
     The manifest tracks each TU's source hash and its set of included
     headers.  After re-parsing a file, the manifest entry must be
-    refreshed so header-staleness detection (used by ``get_active_build``)
+    refreshed so header-staleness detection (used by ``get_project_status``)
     reflects the file's current dependencies.
 
     compile_commands.json can list one file more than once, each time with
@@ -2769,7 +2709,7 @@ def check_ollama(
 
 
 def _dep_to_schema(r) -> dict:
-    """Map one ``DepCheckResult`` to the ``{name, status, message, action}`` schema.
+    """Map one ``DepCheckResult`` to the ``{name, status, critical, message, action}`` schema.
 
     The optional ``action`` carries a human-readable ``message`` (what is
     wrong or what to do) and an exact shell ``command`` (``fix_cmd``).
@@ -2779,7 +2719,7 @@ def _dep_to_schema(r) -> dict:
     ``status="skipped"`` passes through unchanged — it signals a missing
     prerequisite, not a failure.
     """
-    d: dict = {"name": r.name, "status": r.status, "message": r.message}
+    d: dict = {"name": r.name, "status": r.status, "critical": r.critical, "message": r.message}
     if r.fix_cmd or r.instructions:
         human = r.instructions or r.message
         if r.fix_cmd and human.strip() == r.fix_cmd.strip():
@@ -2788,150 +2728,10 @@ def _dep_to_schema(r) -> dict:
     return d
 
 
-def _llm_to_schema(result: dict) -> dict:
-    """Map ``check_ollama()`` output to the documented ``llm`` sub-schema.
-
-    ``check_ollama`` returns ``ollama_enabled``/``configured_model``/
-    ``configured_embed_model``/``embedding_installed`` — not the ``llm``
-    sub-schema.  This adapter maps those keys.  The disabled path returns
-    only a subset of keys, so every read uses ``.get(key, default)``.
-    """
-    llm: dict = {
-        "enabled": bool(result.get("ollama_enabled")),
-        "ollama_running": bool(result.get("ollama_running")),
-        "chat_model": result.get("configured_model"),
-        "embed_model": result.get("configured_embed_model"),
-    }
-    status = result.get("status")
-    action: dict | None = None
-    if status == "model_missing":
-        model = (
-            result.get("configured_embed_model")
-            if not result.get("embedding_installed")
-            else result.get("configured_model")
-        )
-        action = {"message": result.get("message", ""), "command": f"ollama pull {model}" if model else None}
-    elif status in ("not_configured", "disabled"):
-        action = {"message": result.get("message", ""), "command": "fw-context init"}
-    elif status in ("embedding_unavailable", "error"):
-        action = {"message": result.get("message", "")}
-    if action is not None:
-        llm["action"] = action
-    return llm
-
-
-def _cc_entry_count(cc: Path) -> int | None:
-    """Count entries in a compile_commands.json (None on parse error).
-
-    ``None`` signals "count unknown" to the LLM — a corrupt file must not
-    crash this read-only status tool.  ``0`` is reserved for an
-    empty-but-valid compile DB, so a parse failure is kept distinct.
-    """
-    import json
-
-    try:
-        return len(json.loads(cc.read_text(encoding="utf-8")))
-    except (json.JSONDecodeError, OSError):
-        return None
-
-
-def get_environment_status(
-    project_root: Annotated[
-        str | None,
-        Field(description="Project root. Auto-detected if omitted. Pass explicitly when the project is not the server cwd."),
-    ] = None,
-) -> dict:
-    """Return the complete project environment status in one call.
-
-    Read-only. No side effects: it creates no ``.fw-context`` file in a
-    project that is not initialized.  Aggregates five domains into a single
-    call so the LLM can see everything at session start without extra
-    round-trips:
-
-    - ``deps`` — dependency audit (``run_full_check``), each entry with an
-      optional ``action`` (``message`` + shell ``command``).  ``status="skipped"``
-      means a prerequisite is missing (e.g. ``libclang-so`` skipped because
-      ``libclang-python`` is absent) — not a failure.
-    - ``build_system`` — detected build system, ``None`` when unknown.
-    - ``compile_db`` — whether compile_commands.json exists and its entry count.
-      Reported as ``{"exists": false, ...}`` before init (no config to resolve
-      the path from).
-    - ``index`` — the FULL ``get_active_build()`` result, unchanged (its action
-      lives in ``index_message``).
-    - ``llm`` — LLM backend status with an optional ``action``.
-
-    When the project is not initialized (``index.status == "not_initialized"``),
-    only the config-independent dependency subset runs (checks that do not need
-    a project config) — Ollama/model/db/build checks are skipped.
-
-    Args:
-        project_root: Project root directory. Auto-detected from CWD if omitted.
-
-    Returns:
-        dict: {init_status (str — "initialized" or "not_initialized"),
-        deps (list[dict] — name, status, message, and an optional action),
-        build_system (str or None),
-        compile_db (dict — {exists (bool), path (str or None),
-        entry_count (int or None — None before init, and when fw-context
-        cannot read the file)}),
-        index (dict — the full ``get_active_build`` result),
-        llm (dict — {enabled, ollama_running, chat_model, embed_model}, plus
-        an optional ``action`` ({message, command}; command is absent for
-        "embedding_unavailable" and "error"))}.
-    """
-    from ...deps import run_full_check
-
-    root = resolve_project_root(project_root)
-
-    index = get_active_build(project_root=str(root))
-    init_status = "initialized" if index.get("status") != "not_initialized" else "not_initialized"
-
-    if index.get("status") == "not_initialized":
-        # libclang-so is project-config-independent (only needs libclang-python),
-        # so it belongs in the pre-init subset — the "missing libclang .so →
-        # apt install libclang-18-dev" signal must work before the first init.
-        pip_subset = {"pysqlite3", "sqlite-vec", "libclang-python", "libclang-so", "watchfiles", "tomli-w"}
-        dep_results = run_full_check(project_root=str(root), subset=pip_subset)
-        # No [index] compile_commands path exists pre-init: nothing to
-        # resolve, thus no compile database to report.
-        compile_db: dict = {"exists": False, "path": None, "entry_count": None}
-    else:
-        dep_results = run_full_check(project_root=str(root))
-        cfg = load_config(root)
-        from ...indexer.build import default_compile_commands
-
-        cc = default_compile_commands(root, cfg)
-        compile_db = {"exists": cc.exists(), "path": str(cc) if cc.exists() else None, "entry_count": None}
-        if cc.exists():
-            compile_db["entry_count"] = _cc_entry_count(cc)
-    deps = [_dep_to_schema(r) for r in dep_results]
-
-    build_system_raw = index.get("build_system") or _detect_build_system(root)
-    build_system = None if build_system_raw == "unknown" else build_system_raw
-
-    if index.get("status") == "not_initialized":
-        # No project config exists yet — probe the LLM backend from the
-        # defaults.  Resolve the embed model first so the report mirrors the
-        # initialized path (concrete embed_model, no pull).
-        from ...config.settings import LLMConfig
-        from ...llm.auto_model import resolve_embed_model
-
-        default_cfg = LLMConfig()
-        resolve_embed_model(default_cfg, skip_pull=True)
-        llm_result = check_setup(default_cfg)
-        llm_result["ollama_enabled"] = True
-        llm = _llm_to_schema(llm_result)
-    else:
-        llm = _llm_to_schema(check_ollama(project_root=str(root)))
-
-    return {
-        "init_status": init_status,
-        "deps": deps,
-        "build_system": build_system,
-        "compile_db": compile_db,
-        "index": index,
-        "llm": llm,
-    }
+# The checks that need no project config: they run also before `fw-context
+# init`.  libclang-so needs only libclang-python, thus the signal "missing
+# libclang .so → apt install libclang-18-dev" works before the first init.
+_PRE_INIT_CHECKS = frozenset({"pysqlite3", "sqlite-vec", "libclang-python", "libclang-so", "watchfiles", "tomli-w"})
 
 
 def check_dependencies(
@@ -2940,24 +2740,37 @@ def check_dependencies(
         Field(description="Project root. Auto-detected if omitted. Pass explicitly when the project is not the server cwd."),
     ] = None,
 ) -> list[dict]:
-    """Run the full dependency audit. Read-only. Returns structured results.
+    """Run the dependency audit of the installation. Read-only, and it creates no file.
 
-    Returns the raw per-check dicts (``name``, ``status``, ``message``,
-    ``fix_cmd``, ``instructions``, ``critical``) — NOT the formatted
-    ``doctor`` table.  Read ``status``/``fix_cmd``/``instructions`` per
-    issue; ``status="skipped"`` means a prerequisite is missing.
+    Call it when get_project_status or another tool reports a problem of
+    the installation, or before the first ``fw-context init``.  It is not a
+    call for each session: it runs every check of the installation.
+
+    Each entry gives what to do in ``action``: a ``message`` for a human,
+    and the shell ``command`` that repairs it.  ``status="skipped"`` means a
+    prerequisite is missing (e.g. ``libclang-so`` skipped because
+    ``libclang-python`` is absent) — not a failure.
+
+    In a project that is not initialized, only the checks that need no
+    project config run: the Python packages and libclang.  The Ollama,
+    model, database and build checks need the config.
 
     Args:
         project_root: Project root directory. Auto-detected from CWD if omitted.
 
     Returns:
-        list[dict]: one dict per check, ``DepCheckResult`` fields via ``asdict``.
+        list[dict]: one dict per check, each with ``name``, ``status``,
+        ``critical`` (bool), ``message``, and an optional ``action``
+        ({message, command}).
     """
-    from dataclasses import asdict
-
     from ...deps import run_full_check
 
-    return [asdict(r) for r in run_full_check(project_root=project_root)]
+    root = resolve_project_root(project_root)
+    if load_config(root).project.id:
+        results = run_full_check(project_root=str(root))
+    else:
+        results = run_full_check(project_root=str(root), subset=set(_PRE_INIT_CHECKS))
+    return [_dep_to_schema(r) for r in results]
 
 
 def get_project_info(
@@ -2991,7 +2804,7 @@ def get_project_info(
         # run to answer a question about a project that is already indexed.
         return {
             "error": "project_id is necessary. Call list_projects for the id of every "
-            "indexed project, or get_active_build for the id of this one."
+            "indexed project, or get_project_status for the id of this one."
         }
     result = get_project_by_id(project_id)
     if result is None:
