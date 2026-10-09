@@ -109,9 +109,9 @@ When a run stops without an index (the build is not there, or the run
 failed), fw-context writes the reason to `build_problem.json` next to the
 index. Each answer of a query tool of the project carries it: a list gets
 a leading `warning` row, a dict gets `build_warning`. The maintenance tools
-do not carry it. `get_active_build` gives it as a reason, with the status
+do not carry it. `get_project_status` gives it as a reason, with the status
 `reindex_needed`. The next run that ends well with the build there removes
-the file. `get_active_build` removes a reason that said the build is not
+the file. `get_project_status` removes a reason that said the build is not
 there when it finds the build again. A failed automatic build is not
 paused: the next background run builds again.
 
@@ -411,8 +411,8 @@ fw-context init-variants remove <name>
 
 `list` shows what the config declares. It does not show what fw-context
 has indexed. After you add or remove a variant, run `fw-context index
---build` to index the new set. The MCP `list_variants` tool shows what is
-actually indexed.
+--build` to index the new set. The `builds` list of the MCP tool
+`get_project_status` shows what fw-context has indexed.
 
 ### `fw-context export`
 
@@ -727,7 +727,7 @@ project. To ask about a project that is not the project of the current
 directory, give the `project` parameter — the `name` or the `project_id`
 that `list_projects` shows. It is an alternative to `project_root`, which
 takes the root path. Give one of the two, not both. The `project`
-parameter must go on each call, `get_active_build` included, because
+parameter must go on each call, `get_project_status` included, because
 fw-context keeps no session state.
 
 ```
@@ -743,29 +743,57 @@ A project name that matches more than one project in the registry causes
 an error. The error lists each candidate with its `project_id` and root
 path. Repeat the call with the `project_id`.
 
-**Multi-variant projects.** One query answers for one build. Every tool
-that answers about code accepts `variant` and `image` parameters, except
-`smart_search` and `semantic_search`. These two take neither, and answer
-for the active build. Both selectors fail closed:
+**A project of several builds.** One query answers for one build. A
+build is one `(variant, image)` pair: `variant` is the board (or the
+PlatformIO environment), and `image` is the program, for example the
+application or the bootloader. Every tool that answers about code accepts
+the `variant` and `image` parameters, `smart_search` and `semantic_search`
+included. The caller selects the build, and fw-context selects none:
 
-- When the project has variants, name a `variant`. When you omit it,
-  fw-context uses `[build] default_variant`, or returns an error that lists
-  the valid names.
-- When the build holds more than one image, name an `image`. Each image
-  is a separate program, for example a bootloader and the application. When
-  you omit it, fw-context uses `[build] default_image` if the build holds
-  that image. Else the build gives the application that its build system
-  names (ESP-IDF, Zephyr sysbuild). Else a build with one image gives that
-  image. Else the query returns an error that lists the images.
+- A project of one build needs no selector. A selector that does not
+  name that build causes an error.
+- On a project of more than one build, give the arguments of one build
+  exactly as the error lists them: `variant`, `image`, or the two.
+  fw-context uses no default and does not complete a part of a pair. It
+  does not select the application that the build system names, and it
+  does not select the only image of a variant.
+- To select a build without an image name, give only `variant`.
+- To select a build without a variant name, give only `image`. A project
+  without `[[build.variants]]` has such builds, for example an ESP-IDF
+  project or a Zephyr sysbuild.
 - `variant="*"` is refused. To learn whether a symbol is in two builds, ask
   once for each build.
-- A project with one build and no variants refuses `variant`. It refuses
-  `image` too, unless the build makes more than one program (ESP-IDF, a
-  Zephyr sysbuild).
 
-The valid variants are the declared variants (`[[build.variants]]`) and
-the variants in the index. Call `get_active_build` or `list_variants` to
-see the variants and images that fw-context has indexed.
+A call that names no build, or a part of one, gets an `error`. The error
+lists each build as the arguments to repeat the call with:
+
+```
+This project holds 3 builds, and a query about code answers for one build. This call names no build. Repeat the call with the arguments of one build:
+  variant="nrf52840-dev", image="app"
+  variant="nrf52840-dev", image="mcuboot"
+  variant="nrf54l15-dev", image="app"
+Select the build from the task. If the task does not identify one build, ask the user. Do not select a build from its position in this list. To see the state of each build, call get_project_status().
+```
+
+The tool gives this text in the `error` field of its answer.
+
+The agent selects the build from the task. When the task does not
+identify one build, the agent asks the user. Two more cases give an error
+with a command:
+
+- A variant that `[[build.variants]]` declares and the index does not
+  hold. The error names `fw-context index --build --variant <name>`.
+- A call that names a build while the index holds no completed build,
+  for example during the first index run. An empty answer then reads as
+  "no such code", thus the tool refuses the call.
+
+A build without a variant name and without an image name can come from
+an older index run. On a project of several builds, no call can select
+it, and the list in the error says so. The next `fw-context index` over
+all builds (without `--variant` and without `--image`) removes it.
+
+Call `get_project_status` to see the builds that fw-context has indexed.
+Call `get_build_info` for the detail of one build.
 
 **Paging.** Each tool that can give a long list gives it in pages, and
 says how much there is. The answer has one of these forms:
@@ -864,7 +892,7 @@ reason: a flat key would sit beside `signature` and `docstring`, which
 come from the source, with nothing to separate a description from a
 guess. Use `llm_analysis` to find a symbol. Quote `signature`,
 `docstring`, or the `source` of `get_source`.
-`get_active_build().analysis.model` names the model — one for each index.
+`get_build_info().analysis.model` names the model — one for each build.
 
 **Local variables are out:** FTS5 indexes the qualified name, thus a local
 variable matches through the name of its parent. A query for `sensor`
@@ -1134,6 +1162,10 @@ Multi-phase pipeline: translate → rough search → LLM query generation
 When no symbol matches, the result holds the metadata entries and a dict
 with `info`. One dict with `error` means that the query failed.
 
+The search answers for one build. On a project of several builds, give
+the arguments of one build (`variant`, `image`, or the two), as for each
+query tool (see [A project of several builds](#mcp-tools)).
+
 **Pages.** `limit` is the size of one page, from 1 to 100. The search
 ranks up to 100 symbols, and `total` counts them. An LLM writes the
 queries of this tool, thus two runs of one question can find different
@@ -1239,6 +1271,11 @@ one page at `offset`, with the page notice of `semantic_search`. A
 leading dict holds a `warning` with the reason, the page notice follows,
 and each symbol holds `_method: "search_code_fallback"`. When the lexical
 search also finds nothing, the result is one `warning`.
+
+The search answers for one build. On a project of several builds, give
+the arguments of one build (`variant`, `image`, or the two), as for each
+query tool (see [A project of several builds](#mcp-tools)). The
+embedding search and the lexical fallback answer for the same build.
 
 #### `find_variables`
 
@@ -1636,7 +1673,7 @@ blank line is an inactive line, or a line that is blank on disk.
 
 When every line of the file is inactive, the result holds
 `all_lines_inactive: true` and a `warning`. Such a file holds code, and
-the active build compiles none of it. It is NOT an empty file.
+the build of the query compiles none of it. It is NOT an empty file.
 
 When the file changed after the last index run, the result holds
 `stale: true` and a `stale_warning`: the content comes from the index, not
@@ -2278,88 +2315,66 @@ empty lists.
 
 ### Index maintenance
 
-#### `get_environment_status`
+#### `get_project_status`
 
-Return the complete project environment status in one call. This tool
-aggregates the dependency audit, the detected build system, the
-compilation database, the index state, and the LLM backend.
-
-```
-Input:  {"project_root?": "/path/to/project"}
-Output: {"init_status": "initialized",
-         "deps": [{"name": "libclang-so", "status": "missing",
-                    "action": {"message": "libclang shared library not found.",
-                               "command": "apt install libclang-18-dev"}}],
-         "build_system": "zephyr",
-         "compile_db": {"exists": true, "path": "/path/build/compile_commands.json",
-                        "entry_count": 312},
-         "index": {"status": "reindex_needed", "index_message": "…", …},
-         "llm": {"enabled": true, "ollama_running": true,
-                 "chat_model": "qwen2.5-coder:14b", "embed_model": "qwen3-embedding:8b"}}
-```
-
-Each problem field (`deps[*]`, `compile_db`, `llm`) may carry an `action`
-with a human-readable `message` and an exact shell `command`. Pass both to
-the user without interpretation. The `index` field is the full
-`get_active_build()` result, unchanged; its `index_message` carries the
-action.
-
-This tool is read-only, and it creates no `.fw-context` file in a project
-that is not initialized. Use it at session start, to see everything that
-needs fixing before answering the user. Pass `project_root` explicitly
-when the project is not the server's working directory.
-
-#### `check_dependencies`
-
-Run the full dependency audit. Read-only. Returns structured results, one
-entry per check.
+Check the health of the index of the project, and list its builds. Call
+it first in each session, and call it again while you wait for a reindex.
 
 ```
-Input:  {"project_root?": "/path/to/project"}
-Output: [{"name": "libclang-so", "status": "missing",
-          "message": "…", "fix_cmd": "apt install libclang-18-dev",
-          "instructions": "…", "critical": true}, …]
+Input:  {"project_root?": "/path/to/project", "fast?": true}
+Output: {"project_id": "c3d4…", "project_root": "/path/to/project",
+         "build_system": "zephyr", "schema_version": 84935291, "current_schema": 84935291,
+         "vendor_paths": [], "project_paths": [],
+         "status": "ready", "reindex_needed": false, "reindex_reasons": [], "stale": false,
+         "index_message": "Index is fully up to date (2 builds).",
+         "builds": [
+           {"variant": "nrf52840-dev", "image": "app", "board": "nrf52840dk/nrf52840",
+            "symbol_count": 12430, "file_count": 1502, "indexed_at": "2026-06-05 09:35:18",
+            "status": "ready", "reindex_needed": false, "stale": false,
+            "modified_files_count": 0, "header_affected_tus": 0, "reasons": []},
+           {"variant": "nrf52840-dev", "image": "mcuboot", "board": "nrf52840dk/nrf52840",
+            "symbol_count": 3120, "file_count": 480, "indexed_at": "2026-06-05 09:31:02",
+            "status": "ready", "reindex_needed": false, "stale": false,
+            "modified_files_count": 0, "header_affected_tus": 0, "reasons": []}],
+         "bg_reindex_running": false, "vec_available": true}
 ```
 
-Read `status`, `fix_cmd`, and `instructions` per issue. A `status` of
-`"skipped"` means a prerequisite check is missing. This tool is the MCP
-wrapper for `fw-context doctor` without `--fix`; it repairs nothing. For a
-single-call overview of the whole environment, use
-`get_environment_status`.
-
-#### `get_active_build`
-
-Check index health — call at session start.
-
-```
-Input:  {"project_root?": "/path/to/project"}
-Output: {"config_hash": "a1b2…", "project_id": "c3d4…", "project_root": "/path/to/project",
-         "build_system": "zephyr", "compile_commands": "/path/build/compile_commands.json",
-         "indexed_at": "2026-06-05 09:35:18", "symbol_count": 12430, "file_count": 1502,
-         "reference_count": 8900, "modified_files_count": 3,
-         "header_affected_tus": 0, "manifest_verification": "full",
-         "schema_version": 84935291, "current_schema": 84935291,
-         "analysis": {"model": "qwen2.5-coder:14b", "analyze_vendor": false,
-                      "project": {"analyzed": 8450, "skipped": 6, "total": 8570},
-                      "vendor": {"analyzed": 0, "skipped": 0, "total": 42330},
-                      "complete": false},
-         "vendor_paths": [], "project_paths": [], "effective_vendor_patterns": ["zephyr/%", …],
-         "bg_reindex_running": false,
-         "status": "ready", "reindex_needed": false, "reindex_reasons": [],
-         "index_message": "Index is fully up to date (12430 symbols) | LLM analysis: project 8450/8570 (vendor skipped — analyze_vendor=false)",
-         "entry_point": "__start",
-         "memory": [{"name": "FLASH", "attributes": "rx", "origin": "0x0", "length": "0x100000",
-                     "origin_value": 0, "length_value": 1048576,
-                     "file_path": "build/zephyr/linker.cmd", "line": 12}, …],
-         "defines": {"__ZEPHYR__": "1", …}, "defines_varying": 4}
-```
-
-**Read-only.** It creates no `.fw-context` file in a project that is not
-initialized. This tool does not spawn background tasks. The server startup thread and the file watcher manage the
+**Read-only, with one exception.** The last index run can leave a marker
+that says that the build is not there. When the tool finds that build
+there again, for example after a build in the IDE, it removes the marker.
+The tool makes no other change. The tool takes no `variant` and no
+`image`, because it reports every build. It creates no `.fw-context` file
+in a project that is not initialized. This tool does not spawn background
+tasks. The server startup thread and the file watcher manage the
 background reindex. `bg_reindex_running` reports whether an index run is
 active. Only while a run is active, `reindex_progress` holds the newest
-progress or error line that fw-context wrote for that run. Output of the
-build tools in the same log is skipped.
+progress or error line that fw-context wrote for that run. fw-context
+skips the output of the build tools in the same log.
+
+**`builds`** lists every build of the index, one entry for each
+`(variant, image)` pair: `{variant, image, board, symbol_count,
+file_count, indexed_at, status, reindex_needed, stale,
+modified_files_count, header_affected_tus, reasons}`. A build without
+full header tracking also holds `manifest_verification`. The list shows
+what fw-context has indexed, not what the config declares. On a project
+of more than one build, fw-context selects no build: each query tool must
+get the arguments of one build, as the error lists them (`variant`,
+`image`, or the two). Select the build from the task, and ask the user
+when the task does not identify one.
+
+**`declared_not_indexed`** is present when `[[build.variants]]` declares
+a variant that the index does not hold. Each entry is `{variant,
+command}`, and `command` is `fw-context index --build --variant <name>`.
+No query reaches such a variant until you run the command.
+
+**One build or several builds.** A project of one build also gets the
+fields of that build at the top level: `indexed_at`, `first_indexed_at`,
+`symbol_count`, `file_count`, `reference_count`, `modified_files_count`,
+`header_affected_tus`, `manifest_verification`, `analysis`, and
+`description`. A project of several builds gets no sums, because a file
+that two images compile is in the index of each. The counts of each build
+are in `builds`. `reference_count`, `analysis`, `description`, and
+`first_indexed_at` of one build are in `get_build_info`.
 
 **`status` field (use for decision-making):**
 
@@ -2370,6 +2385,9 @@ build tools in the same log is skipped.
 | ``"reindex_needed"`` | A structural cause — see `reindex_reasons` below | Queries still work, but read `reindex_reasons` for the command |
 | ``"no_index"`` | Initialized, but `index.db` does not exist | Run ``fw-context index`` |
 | ``"not_initialized"`` | ``fw-context init`` was not run | Run ``fw-context init`` |
+
+A project of several builds gets the worst status of its builds:
+`"reindex_needed"`, then `"reindexing"`, then `"ready"`.
 
 A failure sets no `status`. On DB corruption, an access error, or a
 database that holds no build config, the result is a dict that holds only
@@ -2382,6 +2400,12 @@ instead of naming a command.
 
 **`reindex_reasons`** names each cause of `"reindex_needed"`:
 
+- The last index run failed. The reason is the text that this run wrote,
+  and it names the command that repairs the cause.
+- The build is not there, for example after you removed the build
+  output. The reason names the command: `fw-context index --build`, or,
+  when fw-context cannot run the build of the project, a build outside of
+  fw-context and then `fw-context index`.
 - Schema mismatch (`schema_mismatch: <old> < <new>`).
 - Older row format (`row_format_mismatch: <old> != <new> — <effect>`).
   The stored text has an older meaning. For example, an index written
@@ -2391,24 +2415,30 @@ instead of naming a command.
 - A source file on disk is missing from compile_commands.json, and
   fw-context will not build it by itself. The reason says why.
 - The tree is on another git branch than the index.
-- Another build of the project (`build <variant>/<image>: …`) has a changed
-  or missing database.
 
 A missing source file and a branch change need `fw-context index --build`,
-because only a build regenerates compile_commands.json. The others need
-`fw-context index`.
-Read the reason text: it names the command.
+because only a build regenerates compile_commands.json. An exception is
+a database that `[index] compile_commands` names: fw-context does not
+build it, thus the reason tells you to make that file again and then run
+`fw-context index`. A schema mismatch, an older row format, and a changed
+compile_commands.json need `fw-context index`. Read the reason text: it
+names the command.
 
-**`stale_builds`** lists the other builds of the project — each
-`(variant, image)` — that are stale, as
-`{variant, image, reindex_needed, reasons}`. A query names one build, thus
-another build can be stale while the build of a query without `variant`
-and `image` is current: a change in a file that only the bootloader
-compiles. A changed or missing database of such a build sets
-`reindex_needed`. Rows of an older row format set it too, because the builds
-of one project are not always indexed together. The reason is then
-`row format <old> != <current>`. Modified files and changed headers make it
-stale, and set `stale`.
+On a project of several builds, a reason that every build gives comes one
+time, without a label, for example an old schema or a failed build. Each
+other reason starts with the label of its build:
+
+- `build <variant>/<image>: <reason>` for a build with the two names.
+- `build <image>: <reason>` for a build without a variant name.
+- `build <variant>: <reason>` for a build without an image name.
+- `build (no name): <reason>` for a build without the two names.
+
+The `reasons` of each entry in `builds` hold the reasons of that build.
+fw-context reads the marker of the last index run and finds the new
+source files one time for the project. For the two, it uses the build
+that `fw-context index` checks. fw-context reads the git branch of the
+tree one time, and compares it with the indexed branch of each build.
+The indexed branch comes from the description of that build.
 
 One reason does not set `"reindex_needed"`: a new source file that is
 missing from compile_commands.json, when fw-context will build it by
@@ -2448,38 +2478,20 @@ dependencies. A file that `compile_commands.json` lists more than once
 counts once. This count is non-zero when headers changed since the
 last index with `manifest_verification: "full"`.
 
-`effective_vendor_patterns` holds the SQL LIKE patterns that this build
-really used to mark vendor code. `vendor_paths` and `project_paths` hold
-what the config asks for. The list is empty when the manifest cannot be
-read.
-
-**Build facts.** `entry_point` is the `ENTRY()` of the linker script of
-the build that `config_hash` names. `memory` lists the `MEMORY` regions of
-that script: `{name, attributes, origin, length, origin_value,
-length_value, file_path, line}`. `origin` and `length` are the expression
-that the script writes. `origin_value` and `length_value` are numbers, or
-`null` for an expression that names a symbol. An empty value means "not
-recorded", never "no memory". A build system such as Keil or IAR records
-no linker script. A PlatformIO project records its link only in
-`fw-context index --build`, thus an empty value there means that no build
-recorded the link yet.
-`defines` holds the `-D` flags that every translation unit of the build
-carries with one value. `defines_varying` counts the names that are left
-out because they are not on every unit or have different values. In a
-multi-variant project with no `[build] default_variant`, the four fields
-are empty. Use `list_variants` for the map of every build.
-
 `manifest_verification` is `"full"` when `manifest.json` is available. In
 that case, fw-context tracks header staleness with SHA-256 hashes that
 fw-context collects during indexing. `manifest_verification` is `"none"`
 when no manifest exists. In that case, fw-context cannot detect header
-changes. Run `fw-context index --build` to regenerate the index with full
-dependency tracking.
+changes, and the result holds a `_warning`. The `_warning` tells you to
+run `fw-context index`, which writes the index again with full dependency
+tracking.
 
 `analysis` splits LLM-analysis coverage by project vs vendor symbols so
 the reader can tell intentionally-skipped vendor symbols apart from
 project symbols that still need analysis:
 
+- `model` — the model of the analysis, or `null`. The field names one
+  model, also when the index run used more than one.
 - `project.analyzed` / `project.total` — project definition symbols.
 - `vendor.analyzed` / `vendor.total` — vendor/SDK definition symbols.
 - `project.skipped` / `vendor.skipped` — symbols that the pipeline tried
@@ -2502,56 +2514,116 @@ format. File modification times are local time. Do not compare the two
 directly. In UTC+2, a file that fw-context indexed correctly looks 2 hours
 newer than `indexed_at`. To find modified files, use `modified_files_count`.
 
-**Multi-variant output.** The result holds these fields:
+For a project that is not initialized, the result holds only `status`,
+`project_root`, and `index_message`. When no index exists, the result
+also holds `project_id`. The two version fields (`client_restart_*` for an
+upgrade, and `update_notice`) can come with each result.
 
-- `multi` — `true` for a multi-variant project: the config declares
-  variants, or the index holds a build with a variant name
-- `variants` — a list of `{name, description, board}`: the declared
-  variants, plus the indexed variants that the config does not declare
-- `images` — a list of `{name, description, dir, type, board?}`
-- `variant_images` — a map of variant name to its image names. It is empty
-  for a project without variants. The images of its build are in `images`
-- `active_variant` — the `[build] default_variant` value
-- `active_image` — the image that a query without `image` gets, in the
-  default variant: the `[build] default_image` value when the build holds
-  it, or the application that the build names. `config_hash` and the other
-  fields describe the build of a query without `variant` and `image`, and
-  `smart_search` and `semantic_search` answer for that build. A project
-  with several variants and no `default_variant` has no such build: then
-  the two tools answer for the newest build
-- `default_build_error` — only when no build answers a query without
-  `image`, for example while the bootloader is indexed and the application
-  is not. The other fields then describe the newest build. Name `image`
-  until the application is indexed
+#### `get_build_info`
 
-#### `list_variants`
+Give the detail of one build: its identity, its health, its memory map,
+and its defines.
 
-List every indexed build, with its `(variant, image, board)` identity.
-This tool shows what fw-context actually indexed, not what the config
-declares. Each `builds` entry is one `(variant, image)` build, with its
-own `config_hash` and symbol count.
+```
+Input:  {"project_root?": "/path/to/project", "variant?": "nrf52840-dev", "image?": "app", "fast?": true}
+Output: {"variant": "nrf52840-dev", "image": "app", "board": "nrf52840dk/nrf52840",
+         "config_hash": "a1b2…", "project_id": "c3d4…", "project_root": "/path/to/project",
+         "build_system": "zephyr", "compile_commands": "/path/.fw-context/build/nrf52840-dev/out/app/compile_commands.json",
+         "indexed_at": "2026-06-05 09:35:18", "first_indexed_at": "2026-06-01 11:02:44",
+         "symbol_count": 12430, "file_count": 1502,
+         "reference_count": 8900, "modified_files_count": 3,
+         "header_affected_tus": 0, "manifest_verification": "full",
+         "analysis": {"model": "qwen2.5-coder:14b", "analyze_vendor": false,
+                      "project": {"analyzed": 8450, "skipped": 6, "total": 8570},
+                      "vendor": {"analyzed": 0, "skipped": 0, "total": 42330},
+                      "complete": false},
+         "description": "branch: main",
+         "vendor_paths": [], "project_paths": [], "effective_vendor_patterns": ["zephyr/%", …],
+         "status": "ready", "reindex_needed": false, "reindex_reasons": [], "stale": false,
+         "index_message": "Index is fully up to date (12430 symbols) | LLM analysis: project 8450/8570 (vendor skipped — analyze_vendor=false)",
+         "entry_point": "__start",
+         "memory": [{"name": "FLASH", "attributes": "rx", "origin": "0x0", "length": "0x100000",
+                     "origin_value": 0, "length_value": 1048576,
+                     "file_path": "build/zephyr/linker.cmd", "line": 12}, …],
+         "defines": {"__ZEPHYR__": "1", …}, "defines_varying": 4,
+         "bg_reindex_running": false, "vec_available": true}
+```
+
+**Read-only, with the same exception as `get_project_status`.** When the
+tool finds a build there again after the last index run said that it is
+not there, it removes that marker. The tool takes the selector of the query
+tools. On a project of more than one build, give the arguments of one
+build, as the error lists them: `variant`, `image`, or the two.
+`get_project_status` lists the names of each build in `builds`. Without
+them, the result is an `error` that lists the builds (see
+[A project of several builds](#mcp-tools)). A project of one build needs
+no selector.
+
+The health fields (`status`, `reindex_needed`, `reindex_reasons`,
+`index_message`, `modified_files_count`, and the others) have the meaning
+that [`get_project_status`](#get_project_status) gives them, for this
+build only. The version fields (`update_notice`, and a restart after an
+upgrade) are in `get_project_status`. A refusal of the selector, or an
+index with no build config, gives a dict that holds only `error`. A
+project that is not initialized, or that has no index, gets the answer
+of `get_project_status` without the version fields: only `status`,
+`project_root`, `index_message`, and, when no index exists,
+`project_id`.
+
+`config_hash` identifies the build in the index. `compile_commands` is
+the `compile_commands.json` that the index run read for this build.
+
+`effective_vendor_patterns` holds the SQL LIKE patterns that this build
+really used to mark vendor code. `vendor_paths` and `project_paths` hold
+what the config asks for. The list is empty when the manifest cannot be
+read.
+
+**Build facts.** `entry_point` is the `ENTRY()` of the linker script of
+the build. `memory` lists the `MEMORY` regions of that script:
+`{name, attributes, origin, length, origin_value, length_value,
+file_path, line}`. `origin` and `length` are the expression that the
+script writes. `origin_value` and `length_value` are numbers, or `null`
+for an expression that names a symbol. A name that the link command
+defines with `--defsym` counts as a number. The end of a region is
+`origin_value + length_value`. An empty value means "not recorded", never
+"no memory". A build system such as Keil or IAR records no linker script.
+A PlatformIO project records its link only in `fw-context index --build`,
+thus an empty value there means that no build recorded the link yet.
+`defines` holds the `-D` flags that every translation unit of the build
+carries with one value. `defines_varying` counts the names that are left
+out because they are not on every unit or have different values. Thus a
+name that is not in `defines` is not defined, or is not defined in every
+unit. To get the memory map of each build, call `get_build_info` one time
+for each build.
+
+#### `check_dependencies`
+
+Run the dependency audit of the installation. Read-only, and it creates
+no file. Returns one entry for each check.
 
 ```
 Input:  {"project_root?": "/path/to/project"}
-Output: {"multi": true, "builds": [
-           {"variant": "nrf52840-dev", "image": "app", "board": "nrf52840dk/nrf52840",
-            "config_hash": "a1b2…", "symbol_count": 12430, "file_count": 1502,
-            "manifest_verification": "full"},
-           {"variant": "nrf52840-dev", "image": "mcuboot", "board": "nrf52840dk/nrf52840",
-            "config_hash": "c3d4…", "symbol_count": 3120, "file_count": 480,
-            "manifest_verification": "full"}]}
+Output: [{"name": "libclang-so", "status": "missing", "critical": true,
+          "message": "…",
+          "action": {"message": "libclang shared library not found.",
+                     "command": "apt install libclang-18-dev"}}, …]
 ```
 
-For a single-project index, this tool returns one `builds` entry, with an
-empty `variant` and an empty `image`. Use `get_active_build` for the
-human-readable variant and image discovery.
+Call it when `get_project_status` or another tool reports a problem of
+the installation, or before the first `fw-context init`. It is not a call
+for each session, because it runs every check of the installation.
 
-This tool is read-only, with one exception: the config load creates
-default `.fw-context/config.toml` and `local.toml` when they are missing.
+Each entry holds `name`, `status`, `critical`, and `message`. An entry
+that has a repair also holds `action`: a `message` for a human, and the
+shell `command` that repairs it. Give both to the user without
+interpretation. A `status` of `"skipped"` means that a prerequisite is
+missing. For example, the audit skips `libclang-so` when
+`libclang-python` is absent. A skipped check is not a failure.
 
-Each `builds` entry also holds `entry_point` and `memory`, in the same
-shape as in `get_active_build`. This is the memory map of every build;
-`get_active_build` gives it for one build only.
+In a project that is not initialized, only the checks that need no
+project config run: the Python packages and libclang. The Ollama, model,
+database, and build checks need the config. This tool is the MCP wrapper
+for `fw-context doctor` without `--fix`, and it repairs nothing.
 
 #### `reindex_file`
 
@@ -2615,9 +2687,20 @@ one including translation unit, with the same `warning` as in
 Delete the index. Always run a dry run first, then pass `confirm: true`.
 
 ```
-Input:  {"project_root?": "/path/to/project", "confirm": false}     → {"action": "dry_run", "symbol_count": 8586, …}
+Input:  {"project_root?": "/path/to/project", "confirm": false}     → {"action": "dry_run", "build_count": 2, "symbol_count": 8586, …}
 Input:  {"project_root?": "/path/to/project", "confirm": true}      → {"action": "deleted", "message": "…"}
 ```
+
+The dry run gives the counts of the whole database, because the reset
+deletes all of it. `build_count` counts the completed builds of the
+project, as `get_project_status` lists them. `symbol_count` counts every
+symbol row in the database: also the rows of a build that an index run
+writes now, and the rows of an older build that an interrupted run left.
+`indexed_at` is the time of the newest build. The three fields are
+present only when fw-context can read a build config. A `warning` key
+means that the database is corrupt: the integrity check failed, thus
+fw-context counts nothing and the three fields are absent. The reset can
+delete a corrupt database.
 
 The delete removes the database with its `-wal`, `-shm`, and `-journal`
 files. It also removes the automatic-build markers `build_problem.json` and
@@ -2636,16 +2719,26 @@ Output: [{"project_id": "a1b2…", "name": "my-zephyr-app", "root_path": "/path"
           "first_indexed_at": "2026-06-01 11:02:44",
           "schema_version": 84935291, "current_schema": 84935291,
           "reindex_needed": false, "status": "ready", "db": "…",
-          "variant_count": 2, "image_count": 5,
+          "build_count": 1,
           "analysis": {"project": {"analyzed": 8450, "skipped": 6, "total": 8570},
                        "vendor": {"analyzed": 0, "skipped": 0, "total": 42330}}}, …]
 ```
 
+Use this tool to find another project. Call `get_project_status` for the
+builds and the health of one project.
+
 `indexed_at` and `first_indexed_at` are UTC, in `"YYYY-MM-DD HH:MM:SS"`
-format. `analysis` holds the `project` and `vendor` counts only, and is
-`null` when the project has no indexed build. For the `model`,
-`analyze_vendor`, and `complete` fields, call `get_active_build` for that
-project.
+format. `indexed_at` is the time of the newest build. `build_count` counts
+the builds of the project, one for each `(variant, image)` pair.
+
+A project of several builds gets no counts here: `symbol_count`,
+`file_count`, `description`, and `analysis` are `null`. A file that two
+images compile is in the index of each, thus a sum counts shared code one
+time for each build. `get_project_status` gives the counts of each build.
+
+`analysis` holds the `project` and `vendor` counts only, and is `null`
+when the project has no indexed build. For the `model`, `analyze_vendor`,
+and `complete` fields, call `get_build_info` for that build.
 
 `reindex_needed` is `true`, and `status` is `"reindex_needed"`, when one of
 these is true:
@@ -2656,11 +2749,11 @@ these is true:
 - A build of the project holds rows of an older row format.
 
 The two build checks read the newest build of each `(variant, image)`, as
-`get_active_build` does, because the builds of one project are not always
-indexed together.
+`get_project_status` does, because the builds of one project are not
+always indexed together.
 
 A newer row format does not set it. In that case, this process is the old
-reader, and `get_active_build` asks for a restart of the LLM client.
+reader, and `get_project_status` asks for a restart of the LLM client.
 
 When no project has an index, the result is one entry with an `info` key.
 When fw-context cannot read a database, the result holds one entry with `db`
@@ -2974,7 +3067,7 @@ For manual recovery, use `reindex_file` or `fw-context index`.
 
 6. Write build metadata:
    compile_commands.json hash, file mtimes, symbol/file/ref/macro counts
-   Stamp the row format at the end of the run (get_active_build compares it)
+   Stamp the row format at the end of the run (get_project_status compares it)
 ```
 
 ### Vector search

@@ -61,14 +61,10 @@ as a **variant**, with an array-of-tables entry. Each `(variant, image)`
 pair becomes one indexed build, with its own `config_hash`. This feature
 works for every build system, not only Zephyr.
 
-Shared `[build]` keys for multi-variant projects. `default_image` also
-applies to a project without variants whose build makes several images
-(ESP-IDF):
+Shared `[build]` keys for multi-variant projects:
 
 | Key | Default | Scope | Description |
 |-----|---------|-------|-------------|
-| `default_variant` | *(none)* | project | The variant that a query uses when it omits `variant`. Without this key, a query without `variant` fails closed. |
-| `default_image` | *(none)* | project | The image that a query gets when it does not name `image` and the build holds more than one image. The key applies to each variant that holds an image of this name. Without the key, the query gets the application that the build system names: an ESP-IDF build names its application, and a Zephyr sysbuild names its default image in `domains.yaml`. A build with one image gives that image. In all other cases, the query must name `image`. `get_active_build` reports the result as `active_image`. |
 | `sysbuild` | `false` | project | Use `west build --sysbuild` (Zephyr). |
 | `source_dir` | *(none)* | project | The sysbuild input application directory (Zephyr). |
 | `environment` | *(none)* | project | The `[env:<name>]` of `platformio.ini` that the build builds (PlatformIO). A variant can override it; its default is the variant name. In a project without `[[build.variants]]`, each of two or more environments becomes a variant, see [Build Configuration](build.md#platformio). |
@@ -91,13 +87,22 @@ scalar value (such as `board`) replaces the shared value. A list value
 (such as `defines`) replaces the shared list. A dict value (such as
 `env`) merges into the shared dict.
 
+On a project of more than one build, each query tool needs the arguments
+of one build: `variant`, `image`, or the two, as the error lists them. A
+build without an image name needs only `variant`, and a build without a
+variant name needs only `image`. See
+[A project of several builds](tools.md#mcp-tools). The keys
+`[build] default_variant` and `[build] default_image` are retired, and
+they have no effect. The config loader ignores them and logs a warning
+that they have no effect. It does not change your config file, thus you
+can remove the keys yourself.
+
 ```toml
 [build]
 system = "bare"
 compiler = "arm-none-eabi-gcc"
 source_dirs = ["src", "lib"]
 include_dirs = ["include"]
-default_variant = "board-a"
 
 [[build.variants]]
 name = "board-a"
@@ -256,11 +261,11 @@ For setup, deployment, and management instructions, see **[Cache Server →](cac
 
 ### `[updates]` — Release check
 
-At start, the MCP server asks PyPI for the newest release of `fw-context-mcp`. The request runs in a background thread, and no tool waits for it. After a request that succeeded, the server asks again only after 24 hours. The server stores the answer in `update_check.json` in the global directory (see `FW_CONTEXT_HOME` above). When the stored release is newer than the installed one, `get_active_build` gives an `update_notice`, and `fw-context version` prints a second line. A failed request writes nothing, and the next server start tries again. An editable install (`pip install -e`, `make install`) sends no request, because its package metadata does not follow the source tree.
+At start, the MCP server asks PyPI for the newest release of `fw-context-mcp`. The request runs in a background thread, and no tool waits for it. After a request that succeeded, the server asks again only after 24 hours. The server stores the answer in `update_check.json` in the global directory (see `FW_CONTEXT_HOME` above). When the stored release is newer than the installed one, `get_project_status` gives an `update_notice`, and `fw-context version` prints a second line. A failed request writes nothing, and the next server start tries again. An editable install (`pip install -e`, `make install`) sends no request, because its package metadata does not follow the source tree.
 
 | Key | Default | Scope | Description |
 |-----|---------|-------|-------------|
-| `check` | `true` | global | When this key is `false`, the MCP server sends no request to PyPI, and `get_active_build` gives no `update_notice`. Set it to `false` on a machine without network access, or where a request to PyPI is not permitted. fw-context ignores this key in a project config, and logs a warning when a project config sets it. |
+| `check` | `true` | global | When this key is `false`, the MCP server sends no request to PyPI, and `get_project_status` gives no `update_notice`. Set it to `false` on a machine without network access, or where a request to PyPI is not permitted. fw-context ignores this key in a project config, and logs a warning when a project config sets it. |
 
 The environment variable `FW_CONTEXT_NO_UPDATE_CHECK` also stops the check. Any value other than an empty string and `0` stops it. The test suite of fw-context sets it.
 
@@ -269,7 +274,7 @@ The environment variable `FW_CONTEXT_NO_UPDATE_CHECK` also stops the check. Any 
 check = false
 ```
 
-`get_active_build` also reports a different fw-context that the operator installed while the MCP server runs (an upgrade or a downgrade), independently of this key. The server then does not run the installed code, and `client_restart_required` tells the user to restart the LLM client. This check reads only the local package metadata.
+`get_project_status` also reports a different fw-context that the operator installed while the MCP server runs (an upgrade or a downgrade), independently of this key. The server then does not run the installed code, and `client_restart_required` tells the user to restart the LLM client. This check reads only the local package metadata.
 
 ## Obsolete keys and files
 

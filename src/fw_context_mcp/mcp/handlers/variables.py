@@ -112,9 +112,9 @@ def find_variables(
             notice names the offset to use.
         variant: Variant of the build (a board, or a PlatformIO
             environment). On a project of more than one build, give the
-            variant and the image of one build, as the refusal lists
-            them. fw-context does not select a build. One query answers
-            for ONE build.
+            arguments of one build as the refusal lists them: the
+            variant, the image, or the two. fw-context does not select a
+            build. One query answers for ONE build.
         image: Image of the build: a separate program, such as the
             application or the bootloader. Give it when the build has an
             image name.

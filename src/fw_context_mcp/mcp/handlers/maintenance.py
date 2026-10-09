@@ -912,16 +912,20 @@ def get_project_status(
     use any other fw-context tool, and call it again while you wait for a
     reindex.
 
-    Read-only, and it spawns no subprocess — the startup daemon thread and
-    the file watcher own the background reindex.  It creates no
+    Read-only with one exception, and it spawns no subprocess — the
+    startup daemon thread and the file watcher own the background reindex.
+    The exception: the last index run can leave a marker that says that
+    the build is not there, and when the tool finds that build again, it
+    removes the marker.  It creates no
     ``.fw-context`` file in a project that is not initialized.  It takes no
     ``variant`` and no ``image``: it reports every build.  For the detail
     of one build (its ``config_hash``, memory map, defines), call
     ``get_build_info``.
 
     ``builds`` lists every build of the index.  A project of more than one
-    build has no active build: every query tool must get the ``variant``
-    and the ``image`` of one build.  Select the build from the task, and
+    build has no active build: every query tool must get the parts of one
+    entry that are not empty, its ``variant``, its ``image``, or the two.
+    Select the build from the task, and
     ask the user when the task does not identify one.
 
     Act on ``status``:
@@ -1172,10 +1176,13 @@ def get_build_info(
     """Return the detail of ONE build: its identity, its health, its memory
     map and its defines.
 
-    Read-only, and it spawns no subprocess.  On a project of more than one
-    build, give the ``variant`` and the ``image`` of one build, as
-    ``get_project_status`` lists them in ``builds``.  Without them the
-    answer is an error that lists the builds.  A project of one build
+    Read-only with the one exception that ``get_project_status`` also has:
+    it removes the marker of a missing build when it finds that build
+    again.  It spawns no subprocess.  On a project of more than one
+    build, give the arguments of one build as the refusal lists them: the
+    ``variant``, the ``image``, or the two.  ``get_project_status`` lists
+    the builds in ``builds``.  Without the arguments the answer is an
+    error that lists the builds.  A project of one build
     needs no selector.
 
     The health fields (``status``, ``reindex_needed``, ``reindex_reasons``,
@@ -1224,9 +1231,9 @@ def get_build_info(
             omitted.
         variant: Variant of the build (a board, or a PlatformIO
             environment). On a project of more than one build, give the
-            variant and the image of one build, as the refusal lists
-            them. fw-context does not select a build. One query answers
-            for ONE build.
+            arguments of one build as the refusal lists them: the
+            variant, the image, or the two. fw-context does not select a
+            build. One query answers for ONE build.
         image: Image of the build: a separate program, such as the
             application or the bootloader. Give it when the build has an
             image name.
@@ -1556,7 +1563,8 @@ def reset_index(
         present only when a build config is readable.
 
         A ``warning`` key means that the database is corrupt — the
-        integrity check failed, thus the counts can be incomplete.
+        integrity check failed, thus the tool counts nothing and the
+        three count fields are absent.
 
         On failure the dict holds only ``error`` with the reason.
     """

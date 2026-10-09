@@ -11,7 +11,7 @@
 
 | Category | Calls | Tools |
 |-----------|-------------|----------|
-| `get_active_build` | 1 | Index health check |
+| `get_active_build` (now `get_project_status`) | 1 | Index health check |
 | `find_hotspots` | 1 | Pre-review prioritization |
 | `lookup_symbol` | ~30 | Symbol, class, method lookup |
 | `get_source` / `get_symbol_context` | ~60 | Function body reading |

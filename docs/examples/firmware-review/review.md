@@ -5,12 +5,13 @@
 **Method:** Deep recursive — fw-context call graph, find_references, search_bodies, search_content
 
 > **💡 fw-context insight — review scoping:**
-> The review started with `get_active_build()`, to verify that the index was
-> healthy (52 646 symbols, 1 335 934 references, status "ready"). Then the
-> review used `find_hotspots`, to identify the most-called functions. This
-> step showed that `zdebug` (2 086 callers) and `get_ctime` (2 038 callers)
-> were unchanged. So the review could safely focus on the 115 actually
-> modified files, rather than on auditing the entire codebase.
+> The review started with `get_active_build()` (now `get_project_status()`),
+> to verify that the index was healthy (52 646 symbols, 1 335 934
+> references, status "ready"). Then the review used `find_hotspots`,
+> to identify the most-called functions. This step showed that `zdebug`
+> (2 086 callers) and `get_ctime` (2 038 callers) were unchanged. So
+> the review could safely focus on the 115 actually modified files, rather
+> than on auditing the entire codebase.
 
 ---
 

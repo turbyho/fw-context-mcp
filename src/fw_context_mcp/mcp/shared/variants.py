@@ -68,8 +68,9 @@ STATUS_TOOL = "get_project_status"
 # change at different times.
 VARIANT_DESCRIPTION = (
     "Variant of the build (a board, or a PlatformIO environment). On a project of more "
-    "than one build, give the variant and the image of one build, as the refusal lists "
-    "them. fw-context does not select a build for you. One query answers for ONE build."
+    "than one build, give the arguments of one build as the refusal lists them: the "
+    "variant, the image, or the two. fw-context does not select a build for you. One "
+    "query answers for ONE build."
 )
 IMAGE_DESCRIPTION = (
     "Image of the build: a separate program, such as the application or the "

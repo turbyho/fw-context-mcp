@@ -98,8 +98,10 @@ effective savings**.
 
 ## Learning Takeaways
 
-1. **Always start with `get_active_build()`** — verify index health before
-   any analysis. A stale index produces wrong results.
+1. **Always start with `get_project_status()`** — verify index health before
+   any analysis. A stale index produces wrong results. On a project of more
+   than one build, give the arguments of one build to each query tool:
+   `variant`, `image`, or the two, as the error lists them.
 
 2. **Use `find_hotspots` to prioritize** — focus review effort on the most
    heavily-called functions first.

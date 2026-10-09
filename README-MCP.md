@@ -4,17 +4,19 @@ fw-context-mcp is an MCP (Model Context Protocol) server. fw-context-mcp exposes
 
 ## What it is
 
-Your AI assistant (for example, Claude Code or OpenCode) starts fw-context-mcp as a persistent subprocess. fw-context-mcp provides **37 tools** to navigate embedded firmware codebases:
+Your AI assistant (for example, Claude Code or OpenCode) starts fw-context-mcp as a persistent subprocess. fw-context-mcp provides **38 tools** to navigate embedded firmware codebases:
 
 | Category | Tools |
 |----------|-------|
 | **Search & lookup** | `search_code`, `lookup_symbol`, `smart_search`, `semantic_search`, `search_bodies`, `search_content`, `find_variables` |
 | **Understanding** | `get_file_map`, `get_source`, `explain_symbol`, `get_symbol_context`, `read_file` |
-| **Call graph** | `find_callers`, `find_references`, `find_call_path`, `find_all_callers_recursive`, `find_callees_recursive`, `find_dead_code`, `find_hotspots`, `find_wrapper_callers`, `find_indirect_call_sites`, `find_indirect_targets`, `trace_data_flow` |
+| **Call graph** | `find_callers`, `find_references`, `find_call_path`, `find_all_callers_recursive`, `find_callees_recursive`, `find_dead_code`, `find_hotspots`, `find_wrapper_callers`, `find_indirect_call_sites`, `find_indirect_targets`, `trace_data_flow`, `get_vector_table` |
 | **Class analysis** | `get_inheritance_chain`, `get_class_members`, `get_template_instances`, `get_method_overrides` |
-| **Index maintenance** | `get_active_build`, `get_environment_status`, `check_dependencies`, `configure_llm`, `reindex_file`, `reindex_file_impl`, `reset_index`, `list_projects`, `get_project_info`, `check_ollama` |
+| **Index maintenance** | `get_project_status`, `get_build_info`, `check_dependencies`, `configure_llm`, `reindex_file`, `reindex_file_impl`, `reset_index`, `list_projects`, `get_project_info`, `check_ollama` |
 
 For the full tool reference, with schemas and examples, see **[Tools Reference](docs/tools.md)**.
+
+Call `get_project_status` first in each session. It gives the health of the index and the list of the builds of the project. A project can hold more than one build: a board is a `variant`, and a program (for example the application or the bootloader) is an `image`. On a project of more than one build, each query tool needs the arguments of one build, as the error lists them: `variant`, `image`, or the two. A build without an image name needs only `variant`, and a build without a variant name needs only `image`. fw-context selects no build. A query without them gets an error that lists each build, and the agent repeats the call with the arguments of one build. See [A project of several builds](docs/tools.md#mcp-tools).
 
 ## Protocol
 

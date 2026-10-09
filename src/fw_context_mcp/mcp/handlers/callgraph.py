@@ -575,9 +575,9 @@ def find_callers(
             with many call sites; the page notice names the offset to use.
         variant: Variant of the build (a board, or a PlatformIO
             environment). On a project of more than one build, give the
-            variant and the image of one build, as the refusal lists
-            them. fw-context does not select a build. One query answers
-            for ONE build.
+            arguments of one build as the refusal lists them: the
+            variant, the image, or the two. fw-context does not select a
+            build. One query answers for ONE build.
         image: Image of the build: a separate program, such as the
             application or the bootloader. Give it when the build has an
             image name.
@@ -650,9 +650,9 @@ def find_references(
             with many references; the page notice names the offset to use.
         variant: Variant of the build (a board, or a PlatformIO
             environment). On a project of more than one build, give the
-            variant and the image of one build, as the refusal lists
-            them. fw-context does not select a build. One query answers
-            for ONE build.
+            arguments of one build as the refusal lists them: the
+            variant, the image, or the two. fw-context does not select a
+            build. One query answers for ONE build.
         image: Image of the build: a separate program, such as the
             application or the bootloader. Give it when the build has an
             image name.
@@ -738,9 +738,9 @@ def find_indirect_call_sites(
             notice names the offset to use.
         variant: Variant of the build (a board, or a PlatformIO
             environment). On a project of more than one build, give the
-            variant and the image of one build, as the refusal lists
-            them. fw-context does not select a build. One query answers
-            for ONE build.
+            arguments of one build as the refusal lists them: the
+            variant, the image, or the two. fw-context does not select a
+            build. One query answers for ONE build.
         image: Image of the build: a separate program, such as the
             application or the bootloader. Give it when the build has an
             image name.
@@ -854,9 +854,9 @@ def find_indirect_targets(
             notice names the offset to use.
         variant: Variant of the build (a board, or a PlatformIO
             environment). On a project of more than one build, give the
-            variant and the image of one build, as the refusal lists
-            them. fw-context does not select a build. One query answers
-            for ONE build.
+            arguments of one build as the refusal lists them: the
+            variant, the image, or the two. fw-context does not select a
+            build. One query answers for ONE build.
         image: Image of the build: a separate program, such as the
             application or the bootloader. Give it when the build has an
             image name.
@@ -1104,9 +1104,9 @@ def find_call_path(
             depth gives up on that budget and not on the depth.
         variant: Variant of the build (a board, or a PlatformIO
             environment). On a project of more than one build, give the
-            variant and the image of one build, as the refusal lists
-            them. fw-context does not select a build. One query answers
-            for ONE build.
+            arguments of one build as the refusal lists them: the
+            variant, the image, or the two. fw-context does not select a
+            build. One query answers for ONE build.
         image: Image of the build: a separate program, such as the
             application or the bootloader. Give it when the build has an
             image name.
@@ -1228,9 +1228,9 @@ def find_all_callers_recursive(
             call tree; the page notice names the offset to use.
         variant: Variant of the build (a board, or a PlatformIO
             environment). On a project of more than one build, give the
-            variant and the image of one build, as the refusal lists
-            them. fw-context does not select a build. One query answers
-            for ONE build.
+            arguments of one build as the refusal lists them: the
+            variant, the image, or the two. fw-context does not select a
+            build. One query answers for ONE build.
         image: Image of the build: a separate program, such as the
             application or the bootloader. Give it when the build has an
             image name.
@@ -1380,9 +1380,9 @@ def find_callees_recursive(
             call tree; the page notice names the offset to use.
         variant: Variant of the build (a board, or a PlatformIO
             environment). On a project of more than one build, give the
-            variant and the image of one build, as the refusal lists
-            them. fw-context does not select a build. One query answers
-            for ONE build.
+            arguments of one build as the refusal lists them: the
+            variant, the image, or the two. fw-context does not select a
+            build. One query answers for ONE build.
         image: Image of the build: a separate program, such as the
             application or the bootloader. Give it when the build has an
             image name.
@@ -1498,9 +1498,9 @@ def find_dead_code(
             symbols. Set False to see all results.
         variant: Variant of the build (a board, or a PlatformIO
             environment). On a project of more than one build, give the
-            variant and the image of one build, as the refusal lists
-            them. fw-context does not select a build. One query answers
-            for ONE build.
+            arguments of one build as the refusal lists them: the
+            variant, the image, or the two. fw-context does not select a
+            build. One query answers for ONE build.
         image: Image of the build: a separate program, such as the
             application or the bootloader. Give it when the build has an
             image name.
@@ -1606,9 +1606,9 @@ def find_wrapper_callers(
             page notice names the offset to use.
         variant: Variant of the build (a board, or a PlatformIO
             environment). On a project of more than one build, give the
-            variant and the image of one build, as the refusal lists
-            them. fw-context does not select a build. One query answers
-            for ONE build.
+            arguments of one build as the refusal lists them: the
+            variant, the image, or the two. fw-context does not select a
+            build. One query answers for ONE build.
         image: Image of the build: a separate program, such as the
             application or the bootloader. Give it when the build has an
             image name.
@@ -1823,9 +1823,9 @@ def trace_data_flow(
             one page.
         variant: Variant of the build (a board, or a PlatformIO
             environment). On a project of more than one build, give the
-            variant and the image of one build, as the refusal lists
-            them. fw-context does not select a build. One query answers
-            for ONE build.
+            arguments of one build as the refusal lists them: the
+            variant, the image, or the two. fw-context does not select a
+            build. One query answers for ONE build.
         image: Image of the build: a separate program, such as the
             application or the bootloader. Give it when the build has an
             image name.
@@ -2034,9 +2034,9 @@ def find_hotspots(
             tool parameter). E.g. ``['lib/%']``.
         variant: Variant of the build (a board, or a PlatformIO
             environment). On a project of more than one build, give the
-            variant and the image of one build, as the refusal lists
-            them. fw-context does not select a build. One query answers
-            for ONE build.
+            arguments of one build as the refusal lists them: the
+            variant, the image, or the two. fw-context does not select a
+            build. One query answers for ONE build.
         image: Image of the build: a separate program, such as the
             application or the bootloader. Give it when the build has an
             image name.
@@ -2567,9 +2567,9 @@ def get_vector_table(
             notice names the offset to use.
         variant: Variant of the build (a board, or a PlatformIO
             environment). On a project of more than one build, give the
-            variant and the image of one build, as the refusal lists
-            them. fw-context does not select a build. One query answers
-            for ONE build.
+            arguments of one build as the refusal lists them: the
+            variant, the image, or the two. fw-context does not select a
+            build. One query answers for ONE build.
         image: Image of the build: a separate program, such as the
             application or the bootloader. Give it when the build has an
             image name.

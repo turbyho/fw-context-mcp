@@ -4,7 +4,7 @@
 
 **Build-aware code intelligence for AI coding agents working on embedded C and C++ firmware.**
 
-fw-context builds a persistent semantic index from `compile_commands.json` and the libclang AST, then exposes it to coding agents through MCP. Instead of reconstructing your firmware through repeated file reads and text searches, the agent can query the program structure produced by the active build configuration.
+fw-context builds a persistent semantic index from `compile_commands.json` and the libclang AST, then exposes it to coding agents through MCP. Instead of reconstructing your firmware through repeated file reads and text searches, the agent can query the program structure that one build produces.
 
 It helps agents answer questions such as:
 
@@ -79,7 +79,7 @@ Without a semantic project index, an AI coding agent usually starts by opening f
 
 That approach can fail in predictable ways:
 
-- reviewing source files that are not part of the active build
+- reviewing source files that are not part of the build that you query
 - following the wrong preprocessor branch
 - missing callback registrations and indirect calls
 - selecting an inactive driver or platform implementation
@@ -113,7 +113,7 @@ fw-context indexes the project through the same compilation database used by bui
 flowchart LR
     CCJ[compile_commands.json] & SRC[(source files)] --> LIBCLANG[libclang<br/>AST parser]
     LIBCLANG --> SYMBOLS[symbols<br/>name, kind, USR<br/>signature, ifdef-filtered source body<br/>docstring, tokens] & FILES[files<br/>path, language<br/>ifdef-filtered content<br/>project/SDK sources] & REFS[refs &amp; call graph<br/>fp_assignments<br/>indirect_call_sites] & INHERIT[inheritance<br/>&amp; overrides<br/>virtual dispatch] & MACROS[macros<br/>params, value<br/>&amp; expanded value<br/>FTS5 searchable] & ENRICH[optional enrichment<br/>embeddings &amp; summaries<br/>hotspot cache]
-    SYMBOLS & FILES & REFS & INHERIT & MACROS & ENRICH --> MCP[MCP server<br/>39 tools]
+    SYMBOLS & FILES & REFS & INHERIT & MACROS & ENRICH --> MCP[MCP server<br/>38 tools]
     MCP --> LLM[AI coding agent]
 ```
 

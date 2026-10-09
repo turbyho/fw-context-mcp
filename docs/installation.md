@@ -323,8 +323,14 @@ cd ~/.fw-context/src && make update
 `make install`.
 
 An update can change the format of the rows in the index. Then
-`get_active_build` reports `row_format_mismatch`. Run `fw-context index`
+`get_project_status` reports `row_format_mismatch`. Run `fw-context index`
 once in each project to write the rows again.
+
+An update can also rename or remove an MCP tool. The instruction block
+that an older `fw-context init` wrote into `CLAUDE.md` or `AGENTS.md`
+keeps the old tool names. Run `fw-context init` again in each project to
+write the new block. For a global install, run
+`fw-context init --scope global` again.
 
 ## Verify
 

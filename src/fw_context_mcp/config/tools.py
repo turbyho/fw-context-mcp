@@ -145,8 +145,9 @@ NOT the application.
 several builds has no active build, and fw-context selects none for you:
 no default from the config, no application from the build system, no
 completion of a part of a pair. On a project of more than one build, give
-the `variant` and the `image` of one build, exactly. A query that names no
-build, or a part of one, gets an error that lists each build with the
+the arguments of one build exactly as the error lists them: the `variant`,
+the `image`, or the two. A query that names no build, or a part of one,
+gets an error that lists each build with the
 arguments to repeat the call. An answer that blends a bootloader with an
 application serves no question, and two builds of one application repeat
 nearly every row.

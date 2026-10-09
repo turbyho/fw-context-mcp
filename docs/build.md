@@ -148,8 +148,8 @@ unit would get wrong system headers and macros.
   or with `fw-context index --build`), then run `fw-context index`.
 
 A run with an explicit `compile_commands.json`, or a project with
-`[[build.variants]]`, does not do this check. `get_active_build` does not
-do it for such an index either.
+`[[build.variants]]`, does not do this check. `get_project_status` does
+not do it for such an index either.
 
 A run builds when an index exists and a build can repair something that a
 reindex cannot:
@@ -160,9 +160,9 @@ reindex cannot:
 
 When a run stops without an index (the build is not there, or the run
 failed), fw-context keeps the reason next to the index. Each answer of a
-query tool of the project then carries it, and `get_active_build` gives it
-as a reason. The next run that ends well with the build there removes it.
-When you build outside of fw-context, `get_active_build` finds the build
+query tool of the project then carries it, and `get_project_status` gives
+it as a reason. The next run that ends well with the build there removes it.
+When you build outside of fw-context, `get_project_status` finds the build
 and removes a reason that said it is not there. A failed automatic build
 is not paused: the next background run builds again. The daemon starts
 that run when a C/C++ file changes; a change of a build file only (for
@@ -244,17 +244,18 @@ the build runs: the builder commands, the `pre_build` hook, and the
 
 NCS builds with sysbuild also without `--sysbuild`, and `sysbuild = true`
 adds the flag for upstream Zephyr. A sysbuild writes `out/domains.yaml`,
-which names each image and the default image. fw-context indexes each image
-in that file. Each image has its database in `out/<image>/`. The application
-image has the name of the application directory, not the name in
-`project()`, and it is the default image: a query without `image` gets it.
-For example, `hello_world` with `SB_CONFIG_BOOTLOADER_MCUBOOT=y` gives the
+which names each image. fw-context indexes each image in that file. Each
+image has its database in `out/<image>/`. The application image has the
+name of the application directory, not the name in `project()`. For
+example, `hello_world` with `SB_CONFIG_BOOTLOADER_MCUBOOT=y` gives the
 images `hello_world` and `mcuboot`. Without `domains.yaml`, the build made
 one program, and its database is `out/compile_commands.json`.
 
-While a pristine build has removed `domains.yaml`, a query without `image`
-on a build of several images gets an error. Set `[build] default_image` to
-remove this gap.
+Each image is a build of its own. A query on a build of several images
+must name the `image`, also for the application. It names the `variant`
+too when `[[build.variants]]` declares one. A sysbuild without variants
+makes builds without a variant name, thus a query gives only `image`.
+See [A project of several builds](tools.md#mcp-tools).
 
 ### PlatformIO
 
@@ -270,7 +271,7 @@ board and flags. Thus each environment is a variant:
   `variant`.
 - A project with more than one environment and no `[[build.variants]]`
   gets one variant for each environment, with the name of the environment.
-  A query without `variant` then needs `[build] default_variant`.
+  Each query then must name the `variant`.
 - A `[[build.variants]]` entry builds the environment that `environment`
   names (in the entry, or in `[build]`), or else the environment with the
   name of the variant.
@@ -299,8 +300,8 @@ PlatformIO decides the set (`pio project config`), thus `extends`,
 bootloader. fw-context indexes each one as an image of the build. The name
 of an image is the `project_name` in the `project_description.json` of its
 build directory: the project name for the application, and `bootloader`
-for the bootloader. A query without `image` gets the application, unless
-`[build] default_image` names the other image. Use `--image` or
+for the bootloader. A query must name the `image`, also for the
+application, because fw-context selects no image. Use `--image` or
 `--exclude-image` to index one of the two.
 
 ### Arduino
@@ -369,6 +370,14 @@ indexed build, with its own `config_hash`.
 variant, and one image of it. To compare two builds, ask once for each
 build. You do not need one checkout per board.
 
+On a project of more than one build, each query tool needs the arguments
+of one build: `variant`, `image`, or the two, as the error lists them. A
+build without an image name needs only `variant`. A build without a
+variant name needs only `image`. fw-context uses no default. A query
+without them gets an error that lists each build, and the agent repeats
+the call with the arguments of one build. See
+[A project of several builds](tools.md#mcp-tools).
+
 ### Concepts
 
 - **Variant** — one build configuration, for one board, target, or environment.
@@ -398,16 +407,18 @@ The `images` sub-table:
 | `type` | `str` | `"project"` | `"project"` or `"sdk"`. |
 | `board` | `str` | — | A per-image board override. |
 
-Shared `[build]` keys for multi-variant projects. `default_image` also
-applies to a project without variants whose build makes several images
-(ESP-IDF):
+Shared `[build]` keys for multi-variant projects:
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `default_variant` | — | The variant that a query uses when it omits `variant`. |
-| `default_image` | — | The image that a query gets when it does not name `image` and the build holds more than one image. The key applies to each variant that holds an image of this name. Without the key, the query gets the application that the build system names: an ESP-IDF build names its application, and a Zephyr sysbuild names its default image in `domains.yaml`. A build with one image gives that image. In all other cases, the query must name `image`. `get_active_build` reports the result as `active_image`. |
 | `sysbuild` | `false` | Use `west build --sysbuild` (Zephyr). |
 | `source_dir` | — | The application directory that `west build` builds (Zephyr), relative to the project root. Without it, west builds the project root. |
+
+The keys `[build] default_variant` and `[build] default_image` are
+retired. They have no effect: a query names its build, and fw-context
+selects none. The config loader ignores the two keys and logs a warning
+that they have no effect. It does not change your config file, thus you
+can remove the keys yourself.
 
 Variant overrides merge with the shared `[build]` section by type. A
 scalar value (such as `board`) replaces the shared value. A list value
@@ -722,7 +733,6 @@ system = "bare"
 compiler = "arm-none-eabi-gcc"
 source_dirs = ["src", "lib"]
 include_dirs = ["include"]
-default_variant = "board-a"
 
 [[build.variants]]
 name = "board-a"
@@ -767,7 +777,6 @@ indexed build:
 system = "zephyr"
 sysbuild = true
 source_dir = "proj/app"
-default_variant = "nrf52840-dev"
 
 [[build.variants]]
 name = "nrf52840-dev"

@@ -730,9 +730,9 @@ async def explain_symbol(
             (default 40, max 200). Only used when no pre-computed analysis exists.
         variant: Variant of the build (a board, or a PlatformIO
             environment). On a project of more than one build, give the
-            variant and the image of one build, as the refusal lists
-            them. fw-context does not select a build. One query answers
-            for ONE build.
+            arguments of one build as the refusal lists them: the
+            variant, the image, or the two. fw-context does not select a
+            build. One query answers for ONE build.
         image: Image of the build: a separate program, such as the
             application or the bootloader. Give it when the build has an
             image name.
@@ -967,9 +967,9 @@ def get_source(
         project_root: Project root. Auto-detected if omitted.
         variant: Variant of the build (a board, or a PlatformIO
             environment). On a project of more than one build, give the
-            variant and the image of one build, as the refusal lists
-            them. fw-context does not select a build. One query answers
-            for ONE build.
+            arguments of one build as the refusal lists them: the
+            variant, the image, or the two. fw-context does not select a
+            build. One query answers for ONE build.
         image: Image of the build: a separate program, such as the
             application or the bootloader. Give it when the build has an
             image name.
@@ -1155,9 +1155,9 @@ def get_file_map(
             the next page; ``page`` names the offset to use.
         variant: Variant of the build (a board, or a PlatformIO
             environment). On a project of more than one build, give the
-            variant and the image of one build, as the refusal lists
-            them. fw-context does not select a build. One query answers
-            for ONE build.
+            arguments of one build as the refusal lists them: the
+            variant, the image, or the two. fw-context does not select a
+            build. One query answers for ONE build.
         image: Image of the build: a separate program, such as the
             application or the bootloader. Give it when the build has an
             image name.
@@ -1634,9 +1634,9 @@ def get_symbol_context(
         project_root: Project root. Auto-detected if omitted.
         variant: Variant of the build (a board, or a PlatformIO
             environment). On a project of more than one build, give the
-            variant and the image of one build, as the refusal lists
-            them. fw-context does not select a build. One query answers
-            for ONE build.
+            arguments of one build as the refusal lists them: the
+            variant, the image, or the two. fw-context does not select a
+            build. One query answers for ONE build.
         image: Image of the build: a separate program, such as the
             application or the bootloader. Give it when the build has an
             image name.
@@ -1942,9 +1942,9 @@ def read_file(
             at most 2000 lines.
         variant: Variant of the build (a board, or a PlatformIO
             environment). On a project of more than one build, give the
-            variant and the image of one build, as the refusal lists
-            them. fw-context does not select a build. One query answers
-            for ONE build.
+            arguments of one build as the refusal lists them: the
+            variant, the image, or the two. fw-context does not select a
+            build. One query answers for ONE build.
         image: Image of the build: a separate program, such as the
             application or the bootloader. Give it when the build has an
             image name.
