@@ -148,13 +148,11 @@ class TestResolveBuild:
     see that it asked about another program.
     """
 
-    def _cfg(self, variants=None, default_variant=None, default_image=None):
+    def _cfg(self, variants=None):
         from fw_context_mcp.config.settings import Config
 
         cfg = Config()
         cfg.build.variants = variants or []
-        cfg.build.default_variant = default_variant
-        cfg.build.default_image = default_image
         return cfg
 
     @staticmethod
@@ -229,16 +227,6 @@ class TestResolveBuild:
             assert pair in err, f"the refusal hides {pair}: {err}"
         assert "Repeat the call" in err, err
         assert "ask the user" in err, err
-
-    def test_the_config_defaults_select_nothing(self, temp_db):
-        """``[build] default_variant`` and ``[build] default_image`` have no effect."""
-        self._seed(temp_db)
-        cfg = self._cfg([BuildVariant(name="a"), BuildVariant(name="b")], default_variant="b", default_image="app")
-
-        config_hash, err = resolve_build(temp_db, "proj", cfg, "", "")
-
-        assert config_hash is None, f"a default selected {config_hash}"
-        assert err is not None and "names no build" in err, err
 
     def test_a_variant_alone_does_not_complete_its_only_image(self, temp_db):
         """``b`` holds one image today, and the next index run can add one."""

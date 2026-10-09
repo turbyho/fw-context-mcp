@@ -1605,12 +1605,6 @@ def _cmd_index(args: argparse.Namespace, outside: _SigtermOutsideTheLock) -> int
         if found:
             cfg.build.variants = found
             print(f"The project builds {len(found)} variants: {', '.join(v.name for v in found)}")
-            if not cfg.build.default_variant:
-                print(
-                    "  A query without `variant` needs [build] default_variant in "
-                    ".fw-context/config.toml, for example: default_variant = "
-                    f'"{found[0].name}"'
-                )
 
     # A compile_commands.json that the user names is the input of this run.
     # No automatic build may replace it: `--build` comes before the explicit

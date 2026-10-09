@@ -483,3 +483,26 @@ class TestLoadCreatesNoProjectFile:
 
         assert result["status"] == "not_initialized"
         assert not (project / ".fw-context").exists()
+
+
+class TestRetiredSelectionKeys:
+    """``[build] default_variant`` and ``default_image`` load without an effect, and with a warning.
+
+    A query names its build since 2026-10.  The test reuses the isolated
+    project of the class above, and not its tests.
+    """
+
+    _project = TestRetiredQueryDriverKeys._project
+
+    @pytest.mark.parametrize("layer", ["committed", "local", "global_text"])
+    def test_each_layer_drops_the_keys(self, tmpdir, monkeypatch, caplog, layer):
+        import fw_context_mcp.config.settings as settings
+
+        monkeypatch.setattr(settings, "_selection_keys_warned", set())
+        files = {layer: '[build]\ndefault_variant = "a"\nsystem = "zephyr"\n'}
+
+        cfg = load(self._project(tmpdir, monkeypatch, **files))
+
+        assert cfg.build.system == "zephyr", "the other [build] keys of the file stay"
+        assert not hasattr(cfg.build, "default_variant")
+        assert "default_variant has no effect" in caplog.text, caplog.text

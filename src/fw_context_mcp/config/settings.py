@@ -211,8 +211,6 @@ _PROJECT_DEFAULTS_TEMPLATE = """\
 # Optional shared defaults:
 # source_dir = "proj/app"        # sysbuild input app (Zephyr)
 # sysbuild   = true              # use `west build --sysbuild`
-# default_variant = "nrf52840-dev"  # default when a query omits variant
-# default_image   = "app"           # image of a query that names no image
 
 # ── PlatformIO ───────────────────────────────────────────────────────────
 # Usually needs no extra config.  Each [env:<name>] of platformio.ini is a
@@ -763,7 +761,6 @@ def _from_dict(data: dict) -> Config:
     # [[build.variants]] is an array-of-tables, not a scalar — parsed
     # separately from the flat _BUILD_FIELDS mapping.
     cfg.build.variants = _build_variants(data)
-    _validate_variant_names(cfg.build)
 
     # Normalize sentinel values: -1 means "not set" for embed_dim.
     # The TOML file cannot express None, so we use -1 as a sentinel that
@@ -903,8 +900,6 @@ _BUILD_FIELDS: list[tuple[str, str, str]] = [
     ("sysbuild", "sysbuild", "bool"),
     ("environment", "environment", "str"),
     ("build_dir", "build_dir", "str"),
-    ("default_variant", "default_variant", "str"),
-    ("default_image", "default_image", "str"),
     ("env", "env", "dict"),
 ]
 
@@ -1040,32 +1035,6 @@ def _build_variants(data: dict) -> list[BuildVariant]:
         )
 
     return variants
-
-
-def _validate_variant_names(build: BuildConfig) -> None:
-    """Warn when default_variant/default_image reference unknown names.
-
-    WHY a warning, not an error: the config may declare a default_variant that
-    has not been indexed yet — the choice is owned by the project author, so a
-    typo must be surfaced but must not block startup.
-    """
-    if not build.variants:
-        return
-    names = {v.name for v in build.variants}
-    if build.default_variant and build.default_variant not in names:
-        log.warning(
-            "[build] default_variant '%s' not found in [[build.variants]] "
-            "(valid: %s)",
-            build.default_variant, ", ".join(sorted(names)),
-        )
-    if build.default_image and build.default_variant in names:
-        dv = next(v for v in build.variants if v.name == build.default_variant)
-        img_names = {i.name for i in dv.images}
-        if build.default_image not in img_names:
-            log.warning(
-                "[build] default_image '%s' not found in images of variant '%s'",
-                build.default_image, build.default_variant,
-            )
 
 
 # The name of a C macro.  A -D name of another form cannot occur in a
@@ -1288,6 +1257,46 @@ def _drop_retired_keys(layer: dict, path: Path) -> None:
         )
 
 
+#: The keys of ``[build]`` that selected the build of a query.  No code reads
+#: them since 2026-10: a query names its build, and fw-context selects none.
+_RETIRED_SELECTION_KEYS = ("default_variant", "default_image")
+
+#: The files that got the warning about a selection key in this process.
+#: ``load()`` runs many times in one MCP session.
+_selection_keys_warned: set[Path] = set()
+
+
+def _drop_selection_keys(layer: dict, path: Path) -> None:
+    """Remove ``[build] default_variant`` and ``default_image`` from one config layer, and warn one time.
+
+    WHY a warning and not an error: an older ``config.toml`` keeps working.
+    WHY not silence: the operator who wrote the key expects that it selects
+    a build, and a query without a selector now gets a refusal that lists
+    the builds.  The file of the user is not changed.
+
+    WHY a ``[[build.variants]]`` table too: such a table copies each key
+    that is not an ``[index]`` field into its ``[build]`` overrides, and
+    ``build_variant_config`` then reports the key as unknown.  That message
+    is wrong, as for ``_drop_retired_keys``.
+    """
+    build = layer.get("build")
+    if not isinstance(build, dict):
+        return
+    variants = build.get("variants")
+    tables = [build, *(v for v in variants if isinstance(v, dict))] if isinstance(variants, list) else [build]
+    found = sorted({key for table in tables for key in _RETIRED_SELECTION_KEYS if key in table})
+    for table in tables:
+        for key in _RETIRED_SELECTION_KEYS:
+            table.pop(key, None)
+    if found and path not in _selection_keys_warned:
+        _selection_keys_warned.add(path)
+        log.warning(
+            "%s: [build] %s %s no effect. A query names its build with variant and image, "
+            "and fw-context selects none. You can remove %s.",
+            path, ", ".join(found), "has" if len(found) == 1 else "have", "it" if len(found) == 1 else "them",
+        )
+
+
 def _warn_retired_toolchains_file(project_root: Path) -> None:
     """Warn when the project still has the retired ``toolchains.toml``.
 
@@ -1453,6 +1462,7 @@ def load(project_root: Path | None = None) -> Config:
         data = tomllib.loads(global_path.read_text(encoding="utf-8"))
         _drop_malformed_sections(data, global_path)
         _drop_retired_keys(data, global_path)
+        _drop_selection_keys(data, global_path)
     except (OSError, ValueError):
         log.exception("Failed to parse %s — using defaults", global_path)
 
@@ -1466,6 +1476,7 @@ def load(project_root: Path | None = None) -> Config:
             proj_data = _read_toml_if_present(proj_path)
             _drop_malformed_sections(proj_data, proj_path)
             _drop_retired_keys(proj_data, proj_path)
+            _drop_selection_keys(proj_data, proj_path)
             _warn_project_updates_once(proj_data, proj_path)
             data = _deep_merge(data, proj_data)
             # A non-loopback ollama_url in the committed config.toml sends
@@ -1482,6 +1493,7 @@ def load(project_root: Path | None = None) -> Config:
             local_data = _read_toml_if_present(local_path)
             _drop_malformed_sections(local_data, local_path)
             _drop_retired_keys(local_data, local_path)
+            _drop_selection_keys(local_data, local_path)
             _warn_project_updates_once(local_data, local_path)
             data = _deep_merge(data, local_data)
         except (OSError, ValueError):

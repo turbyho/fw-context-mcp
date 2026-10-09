@@ -111,10 +111,8 @@ class BuildConfig:
 
     # Multi-variant build configuration (opt-in).  When empty, every builder
     # produces a single compile_commands.json (variant='' image='' board='').
-    # No query reads the two names below since 2026-10: a query names its
-    # build (mcp/shared/variants.py), and no tool reports them.
-    default_variant: str | None = None
-    default_image: str | None = None
+    # A query names one of the builds (mcp/shared/variants.py): no field
+    # selects a default one.
     variants: list[BuildVariant] = field(default_factory=list)
 
     # PlatformIO: the environment ([env:<name>] of platformio.ini) that this
@@ -323,8 +321,8 @@ def build_variant_config(base: BuildConfig, variant: BuildVariant) -> BuildConfi
         setattr(cfg, f.name, val)
 
     # The explicit variant field board is a scalar override; env is a dict
-    # merge.  images/default_* are not part of the effective build, and
-    # neither is the retired build_dir (see retired_build_dir_keys).
+    # merge.  images are not part of the effective build, and neither is the
+    # retired build_dir (see retired_build_dir_keys).
     cfg.variant_name = variant.name
     if variant.board is not None:
         cfg.board = variant.board

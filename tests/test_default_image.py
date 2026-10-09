@@ -36,12 +36,10 @@ def _esp_idf_build(out_dir: Path, *, with_bootloader: bool = True) -> None:
         )
 
 
-def _cfg(system: str | None = None, default_image_name: str | None = None, variants=None, default_variant=None):
+def _cfg(system: str | None = None, variants=None):
     cfg = Config()
     cfg.build.system = system
-    cfg.build.default_image = default_image_name
     cfg.build.variants = variants or []
-    cfg.build.default_variant = default_variant
     return cfg
 
 
@@ -120,14 +118,6 @@ class TestResolveImages:
         assert err is not None and "names no build" in err, err
         assert f'image="{APP}"' in err and 'image="bootloader"' in err, err
 
-    def test_default_image_selects_nothing(self, temp_db, tmp_path):
-        _two_images(temp_db, tmp_path)
-
-        config_hash, err = resolve_build(temp_db, "proj", _cfg("esp-idf", default_image_name="bootloader"))
-
-        assert config_hash is None, f"[build] default_image selected {config_hash}"
-        assert err is not None
-
     @pytest.mark.parametrize(("image", "expected"), [(APP, "h-app"), ("bootloader", "h-boot")])
     def test_a_named_image_answers(self, temp_db, tmp_path, image: str, expected: str):
         _two_images(temp_db, tmp_path)
@@ -164,12 +154,11 @@ class TestResolveImages:
             ("h-a-boot", "a", "mcuboot", Path("/tmp/b")),
             ("h-b-app", "b", "app", Path("/tmp/c")),
         ])
-        cfg = _cfg(variants=[BuildVariant(name="a"), BuildVariant(name="b")], default_variant="a",
-                   default_image_name="app")
+        cfg = _cfg(variants=[BuildVariant(name="a"), BuildVariant(name="b")])
 
         assert resolve_build(temp_db, "proj", cfg, "a", "mcuboot") == ("h-a-boot", None)
         config_hash, err = resolve_build(temp_db, "proj", cfg, "a")
-        assert config_hash is None, f"the defaults completed the pair to {config_hash}"
+        assert config_hash is None, f"a part of the pair selected {config_hash}"
         assert err is not None and 'variant="a", image="mcuboot"' in err, err
 
 
@@ -221,13 +210,6 @@ class TestActiveBuild:
         assert refusal is None
         assert row is not None and row["config_hash"] == "h-old"
 
-    def test_default_image_has_no_effect(self, temp_db, tmp_path):
-        _two_images(temp_db, tmp_path)
-
-        row, _refusal = active_build(temp_db, "proj", _cfg("esp-idf", default_image_name="bootloader"), tmp_path)
-
-        assert row is not None and row["config_hash"] == "h-app", "[build] default_image selected the build"
-
     def test_images_that_nothing_names_give_no_build(self, temp_db, tmp_path):
         """A backend that names no application gives no rule to select one of the images."""
         _seed(temp_db, [("h-one", "", "one", tmp_path / "1.json"), ("h-two", "", "two", tmp_path / "2.json")])
@@ -240,10 +222,10 @@ class TestActiveBuild:
     def test_several_variants_give_the_newest_build(self, temp_db):
         _seed(temp_db, [("h-a", "a", "", Path("/tmp/a")), ("h-b", "b", "", Path("/tmp/b"))])
 
-        row, refusal = active_build(temp_db, "proj", _cfg(default_variant="a"), None)
+        row, refusal = active_build(temp_db, "proj", _cfg(), None)
 
         assert refusal is None
-        assert row is not None and row["config_hash"] == "h-b", "default_variant has no effect"
+        assert row is not None and row["config_hash"] == "h-b"
 
     def test_an_application_that_is_not_indexed_gives_no_build(self, temp_db, tmp_path):
         """The first index run makes the bootloader in minutes and the application in hours."""

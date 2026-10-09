@@ -77,7 +77,7 @@ class TestTheEnvironmentsOfTheProject:
 
         assert code == 0
         assert seen == {"variants": ["nucleo", "native"]}
-        assert "default_variant" in capsys.readouterr().out, "the run says how a query needs no variant"
+        assert "default_variant" not in capsys.readouterr().out, "no key selects the build of a query"
 
     def test_one_environment_is_no_variant(self, tmp_path: Path, monkeypatch) -> None:
         code, seen = _run(tmp_path, monkeypatch, ["esp32dev"])

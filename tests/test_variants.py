@@ -62,7 +62,6 @@ class TestVariantConfigParsing:
                 "system": "zephyr",
                 "sysbuild": True,
                 "source_dir": "proj/app",
-                "default_variant": "nrf52840-dev",
                 "variants": [
                     {
                         "name": "nrf52840-dev",
@@ -82,7 +81,6 @@ class TestVariantConfigParsing:
         b = cfg.build
         assert b.sysbuild is True
         assert b.source_dir == "proj/app"
-        assert b.default_variant == "nrf52840-dev"
         assert len(b.variants) == 1
         v = b.variants[0]
         assert v.name == "nrf52840-dev"
@@ -91,3 +89,56 @@ class TestVariantConfigParsing:
         assert v.overrides == {"defines": ["HW_REV=2"]}
         assert [i.name for i in v.images] == ["app", "mcuboot"]
         assert v.images[1].type == "sdk"
+
+
+class TestRetiredSelectionKeys:
+    """``[build] default_variant`` and ``default_image`` selected the build of a query until 2026-10.
+
+    A query names its build now, thus the keys have no effect.  An older
+    config.toml must keep working, and its author must learn that the key
+    does nothing.
+    """
+
+    def test_the_keys_go_and_the_warning_names_them(self, tmp_path, caplog):
+        import logging
+
+        from fw_context_mcp.config.settings import _drop_selection_keys
+
+        layer = {"build": {"system": "zephyr", "default_variant": "a", "default_image": "app"}}
+        path = tmp_path / "config.toml"
+
+        with caplog.at_level(logging.WARNING, logger="fw_context_mcp.config.settings"):
+            _drop_selection_keys(layer, path)
+
+        assert layer == {"build": {"system": "zephyr"}}
+        assert "default_image, default_variant have no effect" in caplog.text, caplog.text
+
+    def test_a_variant_table_loses_the_keys_too(self, tmp_path):
+        """A key in a variant table went to its overrides, and the warning called it unknown."""
+        from fw_context_mcp.config.settings import _drop_selection_keys
+
+        layer = {"build": {"variants": [{"name": "a", "default_image": "app"}]}}
+        _drop_selection_keys(layer, tmp_path / "config.toml")
+
+        assert layer == {"build": {"variants": [{"name": "a"}]}}
+
+    def test_one_warning_for_each_file(self, tmp_path, caplog):
+        import logging
+
+        from fw_context_mcp.config.settings import _drop_selection_keys
+
+        path = tmp_path / "config.toml"
+        with caplog.at_level(logging.WARNING, logger="fw_context_mcp.config.settings"):
+            for _ in range(3):
+                _drop_selection_keys({"build": {"default_variant": "a"}}, path)
+
+        assert caplog.text.count("has no effect") == 1, "load() runs many times in one MCP session"
+
+    def test_a_layer_without_the_keys_is_unchanged(self, tmp_path, caplog):
+        from fw_context_mcp.config.settings import _drop_selection_keys
+
+        layer = {"build": {"system": "zephyr"}, "index": {"db_dir": "x"}}
+        _drop_selection_keys(layer, tmp_path / "config.toml")
+
+        assert layer == {"build": {"system": "zephyr"}, "index": {"db_dir": "x"}}
+        assert caplog.text == ""
