@@ -218,9 +218,10 @@ def row_format_is_newer(stored: str) -> bool:
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, type_def: str) -> None:
     """Add a column to a table if it does not exist (idempotent).
 
-    Used as a guard in functions that write to migrated columns.  The
-    ALTER TABLE DDL auto-commits when ``isolation_level=''`` (the default)
-    so no explicit COMMIT is needed.
+    Used as a guard in functions that write to migrated columns.  SQLite
+    runs ALTER TABLE in the transaction that is open, thus the column
+    becomes durable with the COMMIT of the caller, and a ROLLBACK removes
+    it again.  Without an open transaction the statement commits at once.
 
     Why this exists: a migration may have run for project A's database
     but not project B's.  Rather than track per-project migration state,

@@ -1453,7 +1453,10 @@ def _step_finalize_manifest(conn: sqlite3.Connection, ctx: dict) -> None:
         upsert_build_config(
             conn, ctx["config_hash"], ctx["project_id"],
             str(ctx["compile_commands"]),
+            # None for both after a checkout that the run did not build:
+            # the recorded tree stays (`runner.run`, `record_git`).
             description=ctx["git_description"],
+            git_head=ctx["git_head"],
             manifest_verification=manifest_verification,
             analyze_vendor=int(ctx["analyze_vendor"]),
             variant=ctx.get("variant", ""),
@@ -1784,8 +1787,9 @@ def _run_postprocess(
     vendor_patterns: list[str],
     project_patterns_list: list[str],
     project_id: str,
-    git_description: str,
+    git_description: str | None,
     *,
+    git_head: str | None = None,
     asm_paths: set[str] | None = None,
     index_refs: bool,
     index_embeddings: bool,
@@ -1840,6 +1844,7 @@ def _run_postprocess(
         "project_patterns_list": project_patterns_list,
         "project_id": project_id,
         "git_description": git_description,
+        "git_head": git_head,
         "index_refs": index_refs,
         "index_embeddings": index_embeddings,
         "index_macros_expanded": index_macros_expanded,

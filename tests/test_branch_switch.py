@@ -30,10 +30,12 @@ from fw_context_mcp.indexer.db import (
     upsert_project,
 )
 from fw_context_mcp.indexer.git_context import (
-    branch_moved_since,
     branch_of_description,
-    current_branch,
     get_git_description,
+    head_label,
+    head_moved,
+    head_path,
+    read_head,
 )
 
 
@@ -89,73 +91,86 @@ def repo(tmp_path: Path) -> Path:
     return tmp_path
 
 
-class TestTheCurrentBranch:
-    def test_a_repository_on_a_branch(self, repo):
-        assert current_branch(repo) == "main"
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+class TestTheHeadOfTheTree:
+    """`read_head` gives the text of the file HEAD, for each shape of a checkout."""
+
+    def test_a_branch(self, repo):
+        assert read_head(repo) == "ref: refs/heads/main"
 
     def test_a_detached_head(self, repo):
-        # `git rev-parse --abbrev-ref HEAD` answers "HEAD" here, which is a
-        # position and not a branch name.
-        head = subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=repo, check=True,
-            capture_output=True, text=True,
-        ).stdout.strip()
-        subprocess.run(
-            ["git", "checkout", "-q", head], cwd=repo, check=True,
-            capture_output=True, text=True,
-        )
-        assert current_branch(repo) == ""
+        sha = _git(repo, "rev-parse", "HEAD")
+        _git(repo, "checkout", "-q", sha)
+        assert read_head(repo) == sha
+
+    def test_a_subdirectory_of_the_repository(self, repo):
+        # A project root below the top of the repository reads the same HEAD.
+        sub = repo / "fw"
+        sub.mkdir()
+        assert read_head(sub) == "ref: refs/heads/main"
+
+    def test_a_worktree_reads_its_own_head(self, repo, tmp_path_factory):
+        # In a worktree `.git` is a file, and HEAD lives in the main repository.
+        other = tmp_path_factory.mktemp("wt") / "tree"
+        _git(repo, "worktree", "add", "-q", "-b", "feature", str(other))
+        assert (other / ".git").is_file()
+        assert read_head(other) == "ref: refs/heads/feature"
+        assert read_head(repo) == "ref: refs/heads/main"
 
     def test_a_directory_that_is_not_a_repository(self, tmp_path):
-        assert current_branch(tmp_path / "nowhere") == ""
+        nowhere = tmp_path / "nowhere"
+        nowhere.mkdir()
+        assert head_path(nowhere) is None
+        assert read_head(nowhere) == ""
+
+    def test_the_labels(self):
+        assert head_label("ref: refs/heads/release/4.15.1") == "release/4.15.1"
+        assert head_label("0123456789abcdef0123") == "commit 0123456789ab"
+        assert head_label("") == ""
 
 
 class TestTheDetection:
-    def test_the_same_branch(self, repo):
-        assert branch_moved_since("branch: main", repo) == ("", "")
+    """`head_moved`: the recorded HEAD first, the branch of an older index second."""
 
-    def test_another_branch(self, repo):
-        subprocess.run(
-            ["git", "checkout", "-q", "-b", "release/4.15.1"], cwd=repo,
-            check=True, capture_output=True, text=True,
-        )
-        assert branch_moved_since("branch: main", repo) == ("main", "release/4.15.1")
+    def test_the_same_head(self):
+        assert head_moved("ref: refs/heads/main", "", "ref: refs/heads/main") == ("", "")
+
+    def test_another_branch(self):
+        assert head_moved("ref: refs/heads/main", "", "ref: refs/heads/release/4.15.1") == (
+            "main", "release/4.15.1")
+
+    def test_a_checkout_of_a_tag_is_a_move(self):
+        # The blind spot of the branch name: a tag or a commit detaches HEAD.
+        assert head_moved("ref: refs/heads/main", "branch: main", "a" * 40) == (
+            "main", "commit aaaaaaaaaaaa")
+
+    def test_from_one_commit_to_another(self):
+        assert head_moved("a" * 40, "", "b" * 40) == ("commit aaaaaaaaaaaa", "commit bbbbbbbbbbbb")
+
+    def test_a_tree_without_git_reports_nothing(self):
+        assert head_moved("ref: refs/heads/main", "branch: main", "") == ("", "")
+
+    def test_an_older_index_compares_the_branch(self):
+        # No recorded HEAD: the branch of the description, as before.
+        assert head_moved("", "branch: main, tag: v1", "ref: refs/heads/main") == ("", "")
+        assert head_moved("", "branch: main", "ref: refs/heads/dev") == ("main", "dev")
+
+    def test_an_older_index_does_not_see_a_detached_head(self):
+        assert head_moved("", "branch: main", "a" * 40) == ("", "")
+        assert head_moved("", "tag: v1", "ref: refs/heads/main") == ("", "")
 
     def test_a_new_tag_on_the_same_branch_is_not_a_move(self, repo):
         # The description also carries the last tag, and a release tag moves
-        # no file.  Comparing whole descriptions would ask for a build after
-        # every tag.
-        subprocess.run(
-            ["git", "tag", "v1.0.0"], cwd=repo, check=True,
-            capture_output=True, text=True,
-        )
-        before = "branch: main"
-        after = get_git_description(repo)
-        assert "tag: v1.0.0" in after, "the fixture did not tag"
-        assert before != after
-        assert branch_moved_since(before, repo) == ("", "")
-
-    def test_an_index_with_no_recorded_branch(self, repo):
-        # Nothing to compare against, thus nothing is reported.
-        assert branch_moved_since("", repo) == ("", "")
-        assert branch_moved_since("tag: v1.0.0", repo) == ("", "")
-
-    def test_a_detached_head_reports_nothing(self, repo):
-        head = subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=repo, check=True,
-            capture_output=True, text=True,
-        ).stdout.strip()
-        subprocess.run(
-            ["git", "checkout", "-q", head], cwd=repo, check=True,
-            capture_output=True, text=True,
-        )
-        # A documented blind spot: checking out a tag or a commit leaves no
-        # branch name on either side.  Reporting a move would be a guess,
-        # and the ordinary staleness checks still see the changed files.
-        assert branch_moved_since("branch: main", repo) == ("", "")
-
-    def test_a_project_that_is_not_a_repository(self, tmp_path):
-        assert branch_moved_since("branch: main", tmp_path) == ("", "")
+        # no file, and no HEAD.
+        before = read_head(repo)
+        _git(repo, "tag", "v1.0.0")
+        assert "tag: v1.0.0" in get_git_description(repo), "the fixture did not tag"
+        assert head_moved(before, "branch: main", read_head(repo)) == ("", "")
 
 
 class TestTheDescriptionDescribesTheContent:
@@ -339,7 +354,7 @@ class TestTheToolAsksForABuild:
         state = self._state(indexed_repo)
         assert not [
             reason for reason in state.get("reindex_reasons", [])
-            if "branch changed" in reason
+            if "checkout changed" in reason
         ], state.get("reindex_reasons")
 
     def test_a_switch_asks_for_index_build(self, indexed_repo):
@@ -348,8 +363,8 @@ class TestTheToolAsksForABuild:
 
         assert state["reindex_needed"] is True
         reasons = state["reindex_reasons"]
-        moved = [r for r in reasons if "branch changed" in r]
-        assert moved, f"no reason names the branch change: {reasons}"
+        moved = [r for r in reasons if "checkout changed" in r]
+        assert moved, f"no reason names the checkout: {reasons}"
         reason = moved[0]
         # The command matters: a plain reindex reuses compile_commands.json,
         # which belongs to the branch the index was built on.
@@ -385,7 +400,7 @@ class TestTheToolAsksForABuild:
         _switch_to(indexed_repo, "release/4.15.1")
         state = self._state(indexed_repo)
         reason = next(
-            r for r in state["reindex_reasons"] if "branch changed" in r
+            r for r in state["reindex_reasons"] if "checkout changed" in r
         )
         assert "background reindex" in reason, reason
         assert "--build" in reason, reason
@@ -403,7 +418,7 @@ class TestTheToolAsksForABuild:
         _switch_to(indexed_repo, "release/4.15.1")
         state = self._state(indexed_repo)
         reason = next(
-            r for r in state["reindex_reasons"] if "branch changed" in r
+            r for r in state["reindex_reasons"] if "checkout changed" in r
         )
         assert "background reindex" not in reason, reason
         assert "run `fw-context index --build`" in reason, reason
@@ -487,10 +502,10 @@ class TestThePlanTakesTheBranch:
         db_path = self._project(repo, tmp_path, "branch: main")
         _switch_to(repo, "release/4.15.1")
         keys, config, reason = self._plan(repo, db_path)
-        assert keys == ["branch:release/4.15.1"]
+        assert keys == ["checkout:release/4.15.1"]
         assert config is not None
-        assert "branch changed from main to release/4.15.1" in reason
-        assert "compile_commands.json belongs to the old branch" in reason
+        assert "checkout changed from main to release/4.15.1" in reason
+        assert "compile_commands.json belongs to the old checkout" in reason
 
     def test_no_index_plans_nothing(self, repo, tmp_path):
         # The project and its config exist; the database does not.  Without
@@ -518,7 +533,7 @@ class TestThePlanTakesTheBranch:
         _switch_to(repo, "release/4.15.1")
         record_problem(db_path.parent, "The last index run failed (exit code 1).")
         keys, _config, _reason = self._plan(repo, db_path)
-        assert keys == ["branch:release/4.15.1"]
+        assert keys == ["checkout:release/4.15.1"]
 
 
 class TestTheDaemonPassesNoBuildFlag:
@@ -571,3 +586,404 @@ class TestTheDaemonPassesNoBuildFlag:
         from fw_context_mcp.mcp import daemon
 
         assert not hasattr(daemon, "_branch_needs_build")
+
+
+# ── The recorded checkout, and the builds that the checks reach ───────────
+
+
+class TestTheRecordedHead:
+    def _db(self, tmp_path: Path):
+        conn = open_db(tmp_path / "index.db")
+        with transaction(conn):
+            upsert_project(conn, "pid", "p", str(tmp_path))
+        return conn
+
+    def test_the_column_is_outside_the_fingerprint_of_the_schema(self, tmp_path):
+        """An index of an older version must not read as an older schema."""
+        from fw_context_mcp.indexer.db._schema import CURRENT_SCHEMA_VERSION
+
+        conn = self._db(tmp_path)
+        try:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(build_configs)")}
+            assert "git_head" not in columns
+            with transaction(conn):
+                upsert_build_config(conn, "ch", "pid", "cc.json", git_head="ref: refs/heads/main")
+            assert conn.execute("PRAGMA user_version").fetchone()[0] == CURRENT_SCHEMA_VERSION
+        finally:
+            conn.close()
+        conn = open_db(tmp_path / "index.db")
+        try:
+            row = conn.execute("SELECT git_head FROM build_configs WHERE config_hash='ch'").fetchone()
+            assert row["git_head"] == "ref: refs/heads/main"
+        finally:
+            conn.close()
+
+    def test_none_keeps_the_stored_value(self, tmp_path):
+        conn = self._db(tmp_path)
+        try:
+            with transaction(conn):
+                upsert_build_config(conn, "ch", "pid", "cc.json", git_head="ref: refs/heads/main")
+            with transaction(conn):
+                upsert_build_config(conn, "ch", "pid", "cc.json")
+            row = conn.execute("SELECT git_head FROM build_configs WHERE config_hash='ch'").fetchone()
+            assert row["git_head"] == "ref: refs/heads/main"
+        finally:
+            conn.close()
+
+    def test_an_index_run_records_the_head(self, indexed_repo):
+        from fw_context_mcp.mcp.handlers.maintenance import get_project_status
+
+        state = get_project_status(project_root=str(indexed_repo))
+        assert "branch: main" in state["description"]
+        assert not [r for r in state.get("reindex_reasons", []) if "checkout changed" in r]
+
+    def test_a_checkout_of_a_tag_asks_for_a_build(self, indexed_repo):
+        from fw_context_mcp.mcp.handlers.maintenance import get_project_status
+
+        _git(indexed_repo, "tag", "v1.0.0")
+        _git(indexed_repo, "checkout", "-q", "v1.0.0")
+        state = get_project_status(project_root=str(indexed_repo))
+        moved = [r for r in state["reindex_reasons"] if "checkout changed" in r]
+        assert moved and "commit " in moved[0] and "--build" in moved[0], state["reindex_reasons"]
+        assert state["status"] == "reindex_needed"
+
+    def test_a_run_that_does_not_build_keeps_the_old_checkout(self, indexed_repo):
+        """`record_git=False`: the reason stays until a build.
+
+        Before, a plain run recorded the new branch, and the reason went away
+        while the index still read the database of the old branch.
+        """
+        from fw_context_mcp.indexer.runner import run
+        from fw_context_mcp.mcp.handlers.maintenance import get_project_status
+
+        _switch_to(indexed_repo, "release/4.15.1")
+        index_dir = Path(
+            (indexed_repo / ".fw-context" / "local.toml").read_text(encoding="utf-8").split('"')[1]
+        )
+        run(
+            compile_commands=indexed_repo / "compile_commands.json",
+            db_path=index_dir / "0123456789abcdef0123456789abcdef" / "index.db",
+            project_root=indexed_repo,
+            project_id="0123456789abcdef0123456789abcdef",
+            index_refs=False, index_embeddings=False, analyze_symbols=False,
+            analyze_overrides=False, record_git=False,
+        )
+        state = get_project_status(project_root=str(indexed_repo))
+        assert "branch: main" in state["description"]
+        assert [r for r in state["reindex_reasons"] if "checkout changed" in r]
+
+
+class TestTheRunDecidesWhatItRecords:
+    """`cli._index._records_checkout`."""
+
+    def _decide(self, repo: Path, db_path: Path, *, build: bool = False, explicit: bool = False,
+                system: str = "cmake", **narrow) -> bool:
+        import argparse
+
+        from fw_context_mcp.cli._index import _records_checkout
+        from fw_context_mcp.config.settings import Config
+
+        cfg = Config()
+        cfg.build.system = system
+        args = argparse.Namespace(build=build, **narrow)
+        return _records_checkout(args, cfg, None, repo, "0123456789abcdef0123456789abcdef", db_path, explicit)
+
+    def _db(self, repo: Path, tmp_path: Path, head: str) -> Path:
+        db_path = tmp_path / "index" / "index.db"
+        db_path.parent.mkdir(parents=True)
+        conn = open_db(db_path)
+        try:
+            with transaction(conn):
+                upsert_project(conn, "0123456789abcdef0123456789abcdef", "p", str(repo))
+                upsert_build_config(conn, "ch", "0123456789abcdef0123456789abcdef", "cc.json",
+                                    manifest_verification="full", git_head=head)
+        finally:
+            conn.close()
+        return db_path
+
+    def test_the_same_checkout_records(self, repo, tmp_path):
+        assert self._decide(repo, self._db(repo, tmp_path, read_head(repo)))
+
+    def test_another_checkout_without_a_build_keeps_the_old_one(self, repo, tmp_path):
+        db_path = self._db(repo, tmp_path, read_head(repo))
+        _switch_to(repo, "release/4.15.1")
+        assert not self._decide(repo, db_path)
+
+    def test_a_build_records(self, repo, tmp_path):
+        db_path = self._db(repo, tmp_path, read_head(repo))
+        _switch_to(repo, "release/4.15.1")
+        assert self._decide(repo, db_path, build=True)
+
+    def test_a_database_of_the_user_records(self, repo, tmp_path):
+        # fw-context builds nothing then: the user made the database for this tree.
+        db_path = self._db(repo, tmp_path, read_head(repo))
+        _switch_to(repo, "release/4.15.1")
+        assert self._decide(repo, db_path, explicit=True)
+
+    def test_no_index_records(self, repo, tmp_path):
+        assert self._decide(repo, tmp_path / "absent" / "index.db")
+
+
+class TestEachBuildIsChecked:
+    """A project of several builds: the build that moved can be any one."""
+
+    def test_the_plan_sees_a_build_that_is_not_the_newest(self, repo, tmp_path):
+        import json
+
+        from fw_context_mcp.cli._index import _plan_auto_build
+        from fw_context_mcp.config import load as load_config
+
+        pid = "0123456789abcdef0123456789abcdef"
+        cc = repo / ".fw-context" / "build" / "default" / "out" / "compile_commands.json"
+        cc.parent.mkdir(parents=True, exist_ok=True)
+        cc.write_text(json.dumps([{"directory": str(repo), "file": "main.c",
+                                   "arguments": ["cc", "-c", "main.c"]}]), encoding="utf-8")
+        db_dir = tmp_path / "index" / pid
+        db_dir.mkdir(parents=True)
+        conn = open_db(db_dir / "index.db")
+        try:
+            with transaction(conn):
+                upsert_project(conn, pid, "p", str(repo))
+                # The bootloader recorded another commit; the application, the
+                # newest build, is on the tree of now.
+                upsert_build_config(conn, "boot", pid, str(cc), manifest_verification="full",
+                                    image="bootloader", git_head="a" * 40)
+                upsert_build_config(conn, "app", pid, str(cc), manifest_verification="full",
+                                    git_head=read_head(repo))
+        finally:
+            conn.close()
+        config_dir = repo / ".fw-context"
+        (config_dir / "config.toml").write_text(
+            f'[project]\nid = "{pid}"\n[build]\nsystem = "cmake"\n', encoding="utf-8")
+        (config_dir / "local.toml").write_text(
+            f'[index]\ndb_dir = "{tmp_path / "index"}"\n', encoding="utf-8")
+
+        keys, config, reason = _plan_auto_build(
+            repo, db_dir / "index.db", load_config(project_root=repo), None, background=True)
+
+        assert keys == ["checkout:main"], (keys, reason)
+        assert config is not None and "commit aaaaaaaaaaaa" in reason
+
+    def test_the_daemon_start_sees_a_checkout(self, indexed_repo):
+        from fw_context_mcp.mcp.daemon import _staleness_check
+
+        _switch_to(indexed_repo, "release/4.15.1")
+        needs, reasons = _staleness_check(indexed_repo)
+        assert needs and any("checkout changed from main to release/4.15.1" in r for r in reasons), reasons
+
+
+# ── The fixes of the review: stubs, narrowed runs, rebases, detached commits ──
+
+
+class TestABuildOutsideOfFwContext:
+    """A stub such as STM32CubeIDE: the user builds in the IDE, and `--build` fails."""
+
+    def _db(self, repo: Path, tmp_path: Path) -> Path:
+        return TestTheRunDecidesWhatItRecords()._db(repo, tmp_path, read_head(repo))
+
+    def test_a_plain_run_records_the_checkout(self, repo, tmp_path):
+        db_path = self._db(repo, tmp_path)
+        _switch_to(repo, "release/4.15.1")
+        decide = TestTheRunDecidesWhatItRecords()._decide
+        assert decide(repo, db_path, system="stm32cubeide")
+        assert not decide(repo, db_path, system="cmake")
+
+    def test_an_unknown_system_is_not_a_stub(self, repo, tmp_path):
+        # No builder knows the name, thus nothing says that the build runs in an IDE.
+        db_path = self._db(repo, tmp_path)
+        _switch_to(repo, "release/4.15.1")
+        assert not TestTheRunDecidesWhatItRecords()._decide(repo, db_path, system="no-such-system")
+
+    def test_the_advice_names_the_ide_and_not_build(self, indexed_repo):
+        from fw_context_mcp.mcp.handlers.maintenance import get_project_status
+
+        (indexed_repo / ".fw-context" / "config.toml").write_text(
+            '[project]\nid = "0123456789abcdef0123456789abcdef"\n[build]\nsystem = "stm32cubeide"\n',
+            encoding="utf-8",
+        )
+        _switch_to(indexed_repo, "release/4.15.1")
+        reason = next(r for r in get_project_status(project_root=str(indexed_repo))["reindex_reasons"]
+                      if "checkout changed" in r)
+        assert "outside of fw-context" in reason and "--build" not in reason, reason
+
+
+class TestANarrowedRun:
+    """`--image app` builds and records the application alone."""
+
+    def _two_images(self, repo: Path, tmp_path: Path) -> Path:
+        db_path = tmp_path / "index" / "index.db"
+        db_path.parent.mkdir(parents=True)
+        pid = "0123456789abcdef0123456789abcdef"
+        conn = open_db(db_path)
+        try:
+            with transaction(conn):
+                upsert_project(conn, pid, "p", str(repo))
+                upsert_build_config(conn, "boot", pid, "b.json", manifest_verification="full",
+                                    image="mcuboot", git_head="a" * 40)
+                upsert_build_config(conn, "app", pid, "a.json", manifest_verification="full",
+                                    image="app", git_head=read_head(repo))
+        finally:
+            conn.close()
+        return db_path
+
+    def test_a_build_that_the_run_leaves_out_does_not_count(self, repo, tmp_path):
+        import argparse
+
+        from fw_context_mcp.cli._index import _checkout_moves
+
+        db_path = self._two_images(repo, tmp_path)
+        conn = open_db(db_path)
+        try:
+            pid = "0123456789abcdef0123456789abcdef"
+            narrowed = argparse.Namespace(variant=None, variants=None, image="app", exclude_image=[])
+            excluded = argparse.Namespace(variant=None, variants=None, image=None, exclude_image=["mcuboot"])
+            assert _checkout_moves(conn, pid, repo, narrowed) == []
+            assert _checkout_moves(conn, pid, repo, excluded) == []
+            assert [m[0] for m in _checkout_moves(conn, pid, repo)] == ["mcuboot"]
+        finally:
+            conn.close()
+
+    def test_the_variant_filters_follow_the_run(self, repo, tmp_path):
+        """`--variant` wins over `--variants`, and a project without variants ignores both."""
+        import argparse
+
+        from fw_context_mcp.cli._index import _checkout_moves
+
+        db_path = self._two_images(repo, tmp_path)
+        conn = open_db(db_path)
+        pid = "0123456789abcdef0123456789abcdef"
+        try:
+            # No build has a variant name: `--variant foo` indexes the build of "".
+            ignored = argparse.Namespace(variant="foo", variants=None, image=None, exclude_image=[])
+            assert [m[0] for m in _checkout_moves(conn, pid, repo, ignored)] == ["mcuboot"]
+            with transaction(conn):
+                conn.execute("UPDATE build_configs SET variant = 'A'")
+            both = argparse.Namespace(variant="A", variants="B", image=None, exclude_image=[])
+            assert [m[0] for m in _checkout_moves(conn, pid, repo, both)] == ["A/mcuboot"]
+        finally:
+            conn.close()
+
+    def test_the_narrowed_run_records(self, repo, tmp_path):
+        db_path = self._two_images(repo, tmp_path)
+        decide = TestTheRunDecidesWhatItRecords()._decide
+        assert decide(repo, db_path, variant=None, variants=None, image="app", exclude_image=[])
+        assert not decide(repo, db_path, variant=None, variants=None, image=None, exclude_image=[])
+
+
+class TestHeadMovesWithoutACheckout:
+    def test_a_rebase_reads_as_the_branch_that_it_updates(self, repo):
+        # While a rebase runs, HEAD is detached and moves with each commit.
+        before = read_head(repo)
+        _git(repo, "checkout", "-q", "--detach")
+        state = repo / ".git" / "rebase-merge"
+        state.mkdir()
+        (state / "head-name").write_text("refs/heads/main\n", encoding="utf-8")
+        assert read_head(repo) == before
+        assert head_moved(before, "", read_head(repo), repo) == ("", "")
+
+    def test_a_rebase_of_a_detached_head_names_no_branch(self, repo):
+        _git(repo, "checkout", "-q", "--detach")
+        sha = _git(repo, "rev-parse", "HEAD")
+        state = repo / ".git" / "rebase-apply"
+        state.mkdir()
+        (state / "head-name").write_text("detached HEAD\n", encoding="utf-8")
+        assert read_head(repo) == sha
+
+    def test_a_commit_on_a_detached_head_is_no_checkout(self, repo):
+        _git(repo, "checkout", "-q", "--detach")
+        indexed = read_head(repo)
+        _git(repo, "commit", "-q", "--allow-empty", "-m", "second")
+        _git(repo, "commit", "-q", "--allow-empty", "-m", "third")
+        live = read_head(repo)
+        assert live != indexed
+        assert head_moved(indexed, "", live, repo) == ("", "")
+        # Without the tree the reflog cannot be read, thus it is a move.
+        assert head_moved(indexed, "", live) != ("", "")
+
+    def test_a_checkout_of_another_commit_is_a_checkout(self, repo):
+        first = _git(repo, "rev-parse", "HEAD")
+        _git(repo, "commit", "-q", "--allow-empty", "-m", "second")
+        _git(repo, "checkout", "-q", "--detach")
+        indexed = read_head(repo)
+        _git(repo, "checkout", "-q", first)
+        assert head_moved(indexed, "", read_head(repo), repo) == (
+            f"commit {indexed[:12]}", f"commit {first[:12]}")
+
+
+class TestTheCacheOfTheHeadPath:
+    def test_a_later_git_init_is_seen(self, tmp_path, monkeypatch):
+        from fw_context_mcp.indexer import git_context
+
+        tree = tmp_path / "tree"
+        tree.mkdir()
+        assert head_path(tree) is None
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=tree, check=True, capture_output=True)
+        assert head_path(tree) is None, "inside the recheck time the answer is the cached one"
+        monkeypatch.setattr(git_context, "_NO_GIT_RECHECK_S", 0.0)
+        assert read_head(tree) == "ref: refs/heads/main"
+
+    def test_a_relative_root_gives_an_absolute_path(self, repo, monkeypatch):
+        monkeypatch.chdir(repo.parent)
+        found = head_path(Path(repo.name))
+        assert found is not None and found.is_absolute()
+        monkeypatch.chdir("/")
+        assert read_head(Path(repo)) == "ref: refs/heads/main"
+
+
+class TestARunThatBuiltOnAnotherPath:
+    """A database that the run built belongs to the tree of now, also without `--build`."""
+
+    def test_the_single_build(self, tmp_path, monkeypatch):
+        import argparse
+
+        from fw_context_mcp.cli import _index
+        from fw_context_mcp.config.settings import Config
+        from fw_context_mcp.indexer import runner
+
+        cc = tmp_path / "compile_commands.json"
+        cc.write_text("[]", encoding="utf-8")
+        seen: list[bool] = []
+        monkeypatch.setattr(_index, "_resolve_compile_commands", lambda *a, **k: (cc, False))
+        monkeypatch.setattr(_index, "_validate_and_fix_artifacts", lambda *a, **k: (cc, [], True))
+        monkeypatch.setattr(_index, "_post_index_optimize", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "run", lambda **k: seen.append(k["record_git"]) or "h" * 16)
+        cfg = Config()
+        cfg.build.system = "cmake"
+        db_path = tmp_path / "db" / "index.db"
+        db_path.parent.mkdir()
+
+        for built in (False, True):
+            args = argparse.Namespace(image=None, exclude_image=[], variant=None, variants=None)
+            if built:
+                _index._note_build(args)
+            _index._run_single(args, cfg, tmp_path, "proj", db_path, "cmake", False, {"record_git": False})
+
+        assert seen == [False, True]
+
+    def test_a_variant_that_the_run_built(self, tmp_path, monkeypatch):
+        import argparse
+
+        from fw_context_mcp.cli import _index
+        from fw_context_mcp.config.settings import Config
+        from fw_context_mcp.indexer import runner
+        from fw_context_mcp.indexer.build import BuildVariant
+
+        found = [("a", "", tmp_path / "a.json", "")]
+        built = [("b", "", tmp_path / "b.json", "")]
+        monkeypatch.setattr(_index, "_discover_existing_cc", lambda *a, **k: list(found))
+        monkeypatch.setattr(_index, "_build_variants", lambda *a, **k: list(built))
+        monkeypatch.setattr(_index, "_post_index_optimize", lambda *a, **k: None)
+        seen: dict[str, bool] = {}
+        monkeypatch.setattr(runner, "run", lambda *, variant="", **k: seen.__setitem__(variant, k["record_git"]) or "h" * 16)
+        cfg = Config()
+        cfg.build.system = "cmake"
+        cfg.build.variants = [BuildVariant(name="a"), BuildVariant(name="b")]
+        args = argparse.Namespace(build=False, background=False, image=None, exclude_image=[],
+                                  variant=None, variants=None)
+        db_path = tmp_path / "db" / "index.db"
+        db_path.parent.mkdir()
+
+        _index._run_multi(args, cfg, tmp_path, "proj", db_path, "cmake",
+                          {"vendor_paths": [], "project_paths": [], "record_git": False})
+
+        assert seen == {"a": False, "b": True}

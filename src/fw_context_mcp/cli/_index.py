@@ -46,6 +46,8 @@ from ..utils import (
 from . import VerboseFormatter
 
 if TYPE_CHECKING:
+    import sqlite3
+
     from ..indexer.build import BuildConfig
 
 log = logging.getLogger(__name__)
@@ -185,6 +187,7 @@ def _plan_auto_build(
     detected_system: str | None,
     *,
     background: bool,
+    args: argparse.Namespace | None = None,
 ) -> tuple[list[str], BuildConfig | None, str]:
     """Return ``(the keys of this build, its config, a line to log)``.
 
@@ -202,19 +205,20 @@ def _plan_auto_build(
          ``_resolve_compile_commands``).
        * Source files sit on disk that compile_commands.json does not cover.
          Such a file has no translation unit, so a reindex skips it.
-       * The tree is on a different branch than the index.
-         compile_commands.json is a build artifact of the branch it was
-         generated on and carries that branch's file list AND its compiler
-         flags.  Measured on the Mbed project, a switch from 4.15.3 to 4.15.1
-         left two generated zcbor sources listed in it and absent from the
-         tree; a reindex reads the same file again.
+       * The tree has a different checkout than a build of the index (a
+         branch, a tag or a commit, ``_checkout_moves``).
+         compile_commands.json is a build artifact of the checkout it was
+         generated on and carries its file list AND its compiler flags.
+         Measured on the Mbed project, a switch from 4.15.3 to 4.15.1 left
+         two generated zcbor sources listed in it and absent from the tree;
+         a reindex reads the same file again.
 
     3. The backend may build in the background — it writes its output into
        the build tree of fw-context, or it compiles nothing.  See
        ``builders.background_build_safe``.
 
     The KEYS name the trigger: ``"build-missing"``, the source paths, or
-    ``"branch:<name>"``.  An earlier failure does not block the build: the
+    ``"checkout:<label>"``.  An earlier failure does not block the build: the
     run that fails again writes the error for the MCP answers
     (``autobuild.record_problem``), and that is what makes the user repair
     it.
@@ -224,13 +228,14 @@ def _plan_auto_build(
     lock the build of the IDE.
 
     The config that comes back is ``cfg.build``, the config the build uses.
+    *args* limits the checkout check to the builds that the run indexes
+    (``_checkout_moves``).
     """
     if not db_path.exists():
         return [], None, ""
 
     from ..indexer.build import checked_compile_commands
     from ..indexer.build_layout import BuildLayout
-    from ..indexer.git_context import branch_moved_since
     from ..mcp.shared.stale import find_unindexed_sources
 
     if not _may_build_in_background(cfg, detected_system):
@@ -266,20 +271,20 @@ def _plan_auto_build(
             project_root,
             Path(active["compile_commands_path"]),
         )
-        recorded = ""
-        if "description" in active.keys():
-            recorded = str(active["description"] or "")
+        moves = _checkout_moves(conn, str(active["project_id"]), project_root, args)
     finally:
         conn.close()
 
-    # The branch first: it makes compile_commands.json wrong as a whole,
+    # The checkout first: it makes compile_commands.json wrong as a whole,
     # while an uncovered source makes it incomplete.  A build repairs both,
-    # so the more complete reason is the one worth logging.
-    indexed_branch, live_branch = branch_moved_since(recorded, project_root)
-    if indexed_branch:
-        return [f"branch:{live_branch}"], candidate, (
-            f"branch changed from {indexed_branch} to {live_branch} — "
-            f"compile_commands.json belongs to the old branch, "
+    # so the more complete reason is the one worth logging.  Each build is
+    # checked: one run builds every build, and a build that the run did not
+    # check kept the old checkout.
+    if moves:
+        _label, indexed, live = moves[0]
+        return [f"checkout:{live}"], candidate, (
+            f"checkout changed from {indexed} to {live} — "
+            f"compile_commands.json belongs to the old checkout, "
             f"running a build into {target}"
         )
 
@@ -292,6 +297,110 @@ def _plan_auto_build(
         f"compile_commands.json ({listed}{more}) — running a build into "
         f"{target}"
     )
+
+
+def _run_selects(row, args: argparse.Namespace | None, has_variants: bool) -> bool:
+    """Say whether a run with *args* indexes the build of *row* (``--variant``, ``--variants``, ``--image``, ``--exclude-image``).
+
+    The same filters as ``_select_variants`` and ``_filter_images``:
+    ``--variant`` wins over ``--variants``, and a project without variants
+    (*has_variants* False) ignores both, as its run does.
+    """
+    if args is None:
+        return True
+    variant = str(row["variant"] or "")
+    image = str(row["image"] or "")
+    requested: set[str] | None = None
+    if has_variants and getattr(args, "variant", None):
+        requested = {args.variant}
+    elif has_variants and getattr(args, "variants", None):
+        requested = {v.strip() for v in args.variants.split(",") if v.strip()}
+    if requested is not None and variant not in requested:
+        return False
+    if getattr(args, "image", None) and image != args.image:
+        return False
+    return not (image and image in set(getattr(args, "exclude_image", None) or []))
+
+
+def _checkout_moves(
+    conn: sqlite3.Connection, project_id: str, project_root: Path, args: argparse.Namespace | None = None,
+) -> list[tuple[str, str, str]]:
+    """Return ``(build label, indexed checkout, live checkout)`` for each build of another checkout.
+
+    Each completed build that a run with *args* indexes (all of them
+    without *args*), compared with the HEAD of the tree
+    (``git_context.head_moved``).  WHY only those: a run of one image
+    builds and records that image, and a build that the run leaves out
+    kept the old checkout.  It started the build of the next run of that
+    image again, and again, without end.
+    """
+    from ..indexer.git_context import head_moved, read_head, stored_head
+    from ..mcp.shared.stale import build_label, latest_builds
+
+    live = read_head(project_root)
+    rows = latest_builds(conn, project_id)
+    # A build with a variant name means a project with variants.
+    has_variants = any(row["variant"] for row in rows)
+    moves = []
+    for row in rows:
+        if not _run_selects(row, args, has_variants):
+            continue
+        description = str(row["description"] or "") if "description" in row.keys() else ""
+        indexed, now = head_moved(stored_head(row), description, live, project_root)
+        if indexed:
+            moves.append((build_label(row), indexed, now))
+    return moves
+
+
+def _records_checkout(
+    args: argparse.Namespace, cfg, detected_system: str | None, project_root: Path, project_id: str,
+    db_path: Path, explicit_cc: bool,
+) -> bool:
+    """Say whether this run records the checkout of the tree on its builds (``runner.run``).
+
+    True when:
+
+    * the run builds (``--build``, or the plan turned it on);
+    * the user gives the database, or the build of the project runs
+      outside of fw-context (a stub such as STM32CubeIDE,
+      ``build.build_runs_outside``).
+      The build of the user runs outside of fw-context, and no run of
+      fw-context can ever build it.  A recorded old checkout gave an
+      advice to run ``--build``, which fails there, and the reason never
+      went away;
+    * no build of the run has another checkout.
+
+    False after a checkout that this run does not build:
+    compile_commands.json still belongs to the old checkout, and the
+    recorded checkout keeps the reason in each answer until a build.
+    Before this rule a plain run recorded the new branch and the reason
+    went away, while the index still read the old database.  A run that
+    builds on another path (a missing or stale database) records the build
+    that it made (``args.build_ran``, see ``_run_single`` and
+    ``_run_multi``).
+    """
+    from ..indexer.build import build_runs_outside
+
+    if getattr(args, "build", False) or explicit_cc or not db_path.exists():
+        return True
+    if build_runs_outside(cfg.build, cfg.build.system or detected_system):
+        return True
+    from ..indexer.db import open_db
+
+    conn = open_db(db_path)
+    try:
+        return not _checkout_moves(conn, project_id, project_root, args)
+    finally:
+        conn.close()
+
+
+def _note_build(args: argparse.Namespace) -> None:
+    """Remember that this run built the database that it indexes, on a path other than ``--build``.
+
+    The run then records the checkout of the tree (``_records_checkout``):
+    the database belongs to it.
+    """
+    args.build_ran = True
 
 
 def _may_build_in_background(cfg, detected_system: str | None) -> bool:
@@ -405,7 +514,9 @@ def _resolve_compile_commands(
             return None, False
         print("compile_commands.json not found, running build...", file=sys.stderr)
         try:
-            return generate_compile_commands(project_root, cfg.build), False
+            built = generate_compile_commands(project_root, cfg.build)
+            _note_build(args)
+            return built, False
         except RuntimeError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return None, False
@@ -467,6 +578,7 @@ def _validate_and_fix_artifacts(
                 print(f"compile_commands.json is stale ({'; '.join(stale_reasons)}), rebuilding...")
                 try:
                     compile_commands_new = generate_compile_commands(project_root, cfg.build)
+                    _note_build(args)
                     print(f"Generated: {compile_commands_new}")
                     compile_commands = compile_commands_new
                 except RuntimeError as exc:
@@ -486,6 +598,7 @@ def _validate_and_fix_artifacts(
             print("Rebuilding to fix issues...")
             try:
                 compile_commands_new = generate_compile_commands(project_root, cfg.build)
+                _note_build(args)
                 print(f"Generated: {compile_commands_new}")
                 issues = validate_and_fix(compile_commands_new, project_root, builder_instance, cfg.build, fix=True)
                 errors = [i for i in issues if i.severity == "error"]
@@ -1173,6 +1286,9 @@ def _run_multi(
     builder = builder_cls() if builder_cls else None
 
     cc_list: list[tuple[str, str, Path, str]] = []
+    # The (variant, image) pairs that this run built: their databases belong
+    # to the tree of now (`_records_checkout`).
+    built_pairs: set[tuple[str, str]] = set()
 
     # Each variant names one directory, .fw-context/build/<variant> (see
     # build_layout), thus a name that cannot be a directory stops the run
@@ -1203,7 +1319,9 @@ def _run_multi(
                 )
         elif missing:
             print(f"No build for variant(s) {', '.join(v.name for v in missing)} — running the build")
-            cc_list += _build_variants(project_root, build_cfg, builder, missing)
+            built = _build_variants(project_root, build_cfg, builder, missing)
+            built_pairs.update((name, image) for name, image, _, _ in built)
+            cc_list += built
 
     unknown = _unknown_images(cc_list, args)
     if unknown:
@@ -1229,6 +1347,8 @@ def _run_multi(
         # two variants may vendor different in-tree trees.  run_kwargs holds
         # the [index] layer (or the CLI flag, which replaces it).
         per_build = dict(run_kwargs)
+        if (variant_name, image) in built_pairs:
+            per_build["record_git"] = True
         idx = v.index_overrides if v is not None else {}
         for key in ("vendor_paths", "project_paths"):
             extra = list(idx.get(key) or [])
@@ -1632,7 +1752,7 @@ def _cmd_index(args: argparse.Namespace, outside: _SigtermOutsideTheLock) -> int
     auto_build_sources: list[str] = []
     if not getattr(args, "build", False) and not explicit_cc:
         auto_build_sources, auto_build_cfg, auto_build_reason = _plan_auto_build(
-            project_root, db_path, cfg, detected_system, background=bg
+            project_root, db_path, cfg, detected_system, background=bg, args=args
         )
         # The two always arrive together; the second test is what lets the
         # type checker see that, and it costs nothing.
@@ -1665,6 +1785,9 @@ def _cmd_index(args: argparse.Namespace, outside: _SigtermOutsideTheLock) -> int
 
     run_kwargs = _build_run_kwargs(
         args, cfg, project_root, project_id, vendor_paths, project_paths, cs_config,
+    )
+    run_kwargs["record_git"] = _records_checkout(
+        args, cfg, detected_system, project_root, project_id, db_path, explicit_cc,
     )
     multi = bool(cfg.build.variants)
 
@@ -1823,6 +1946,9 @@ def _run_single(
         )
         return 1
 
+    # A database that this run built belongs to the tree of now.
+    if getattr(args, "build_ran", False):
+        run_kwargs = {**run_kwargs, "record_git": True}
     failed: list[str] = []
     for image, cc in selected:
         try:

@@ -491,6 +491,7 @@ def run(
     defer_fts: bool = False,
     defer_cleanup: bool = False,
     transient_defines: Collection[str] = DEFAULT_TRANSIENT_DEFINES,
+    record_git: bool = True,
 ) -> str:
     """Index a project: parse translation units, extract symbols, and store to SQLite.
 
@@ -541,6 +542,12 @@ def run(
             that the config_hash and the flags hash of each unit ignore.  The
             CLI passes the value of the config.  The default is the default
             of the config, for a caller without a config.
+        record_git: Whether this run records the git context of the tree
+            (``description`` and HEAD) on its builds.  False keeps the
+            recorded values.  The CLI passes False after a checkout that the
+            run did not build: compile_commands.json then still belongs to
+            the old checkout, and the recorded HEAD is what tells each
+            answer that the index is of the old tree.
 
     Returns:
         The ``config_hash`` string — a content-addressable fingerprint of the
@@ -562,10 +569,12 @@ def run(
     if project_id is None:
         project_id = derive_project_id(project_root)
     name = project_name or project_root.name
-    # Collect git context for build description (branch + last tag).
-    from .git_context import get_git_description
+    # Collect git context for build description (branch + last tag) and
+    # HEAD, at the start: the content comes from the tree of this moment.
+    from .git_context import get_git_description, read_head
 
-    git_description = get_git_description(project_root)
+    git_description: str | None = get_git_description(project_root) if record_git else None
+    git_head: str | None = read_head(project_root) if record_git else None
     # Clean up compile_commands.<hash>.json artifacts left by a previous
     # interrupted run before computing a new config_hash.
     _cleanup_orphaned_cc_artifacts(db_path, project_id)
@@ -1107,6 +1116,7 @@ def run(
         project_patterns_list=project_patterns_list,
         project_id=project_id,
         git_description=git_description,
+        git_head=git_head,
         index_refs=index_refs,
         index_embeddings=index_embeddings,
         index_macros_expanded=index_macros_expanded,

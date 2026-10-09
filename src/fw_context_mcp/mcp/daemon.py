@@ -572,7 +572,12 @@ def _staleness_check(project_root: Path) -> tuple[bool, list[str]]:
     not only the newest one: an edit to a file that only another image
     compiles made that build stale, and the check of the newest build did
     not see it.  A reason of a build carries its ``variant/image``.
+
+    A checkout that happened while no daemon ran is a reason too: the
+    watcher sees a change of HEAD only while it runs
+    (``git_context.head_moved``).
     """
+    from ..indexer.git_context import head_moved, read_head, stored_head
     from .shared.context import _db_path, _quick_open_readonly
     from .shared.stale import _count_modified_files, check_structural_staleness
 
@@ -594,6 +599,7 @@ def _staleness_check(project_root: Path) -> tuple[bool, list[str]]:
         from .shared.stale import build_label, latest_builds
 
         project_id = derive_project_id(project_root)
+        live_head = read_head(project_root)
         for cfg in latest_builds(conn, project_id):
             config_hash = cfg["config_hash"]
             label = build_label(cfg)
@@ -609,6 +615,13 @@ def _staleness_check(project_root: Path) -> tuple[bool, list[str]]:
             modified = _count_modified_files(conn, config_hash, project_root, use_cache=True)
             if modified > 0:
                 found.append(f"{modified} modified files")
+
+            # 6. Another checkout than the build: the run then builds
+            #    (`cli._index._plan_auto_build`).
+            description = str(cfg["description"] or "") if "description" in cfg.keys() else ""
+            indexed, live = head_moved(stored_head(cfg), description, live_head, project_root)
+            if indexed:
+                found.append(f"checkout changed from {indexed} to {live}")
             reasons.extend(prefix + reason for reason in found)
     finally:
         conn.close()

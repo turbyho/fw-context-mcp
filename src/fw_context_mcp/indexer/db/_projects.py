@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import sqlite3
 
+from ._schema import _ensure_column
+
 __all__ = [
     "ANALYZABLE_KINDS",
     "compute_analysis_coverage",
@@ -241,6 +243,7 @@ def upsert_build_config(
     image: str | None = None,
     board: str | None = None,
     row_format: str | None = None,
+    git_head: str | None = None,
 ) -> None:
     """Insert or update a build configuration record.
 
@@ -302,6 +305,17 @@ def upsert_build_config(
         board: Concrete board string per-(variant, image) — captures per-image
             board overrides.  ``None`` keeps the stored value, as with
             ``variant``.
+        git_head: The text of the file HEAD of the tree that the content
+            came from (``git_context.read_head``).  ``None`` keeps the
+            stored value, for the reason that ``description`` gives.
+
+            WHY the column is outside the fingerprint of the schema
+            (``_ensure_column``, not ``_MIGRATION_ADD_COLUMNS``): a new
+            column in the fingerprint reports each existing index as an
+            index of an older schema, and asks for a full reindex of each
+            project.  An index without the value compares the branch of
+            ``description``, as before, until its next run
+            (``git_context.head_moved``).
 
     Returns:
         None.
@@ -363,6 +377,12 @@ def upsert_build_config(
                row_format = excluded.row_format""",
         (config_hash, project_id, compile_commands_path, embedding_dim, manifest_verification, description, analyze_vendor, variant, image, board, row_format),
     )
+    if git_head is not None:
+        _ensure_column(conn, "build_configs", "git_head", "TEXT")
+        conn.execute(
+            "UPDATE build_configs SET git_head = ? WHERE config_hash = ?",
+            (git_head, config_hash),
+        )
 
 
 def get_active_config(

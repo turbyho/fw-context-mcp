@@ -64,7 +64,7 @@ from ...indexer.db import (
     row_format_is_older,
     transaction,
 )
-from ...indexer.git_context import branch_of_description
+from ...indexer.git_context import head_moved, stored_head
 from ...llm.ollama import check_setup
 from ...utils import HEADER_EXTENSIONS, resolve_project_root
 from ..background import _is_bg_reindex_running, read_reindex_progress
@@ -183,6 +183,21 @@ def _background_build_allowed(root: Path, proj_cfg: Config) -> bool:
         return False
 
 
+def _build_runs_outside(root: Path, proj_cfg: Config) -> bool:
+    """Say whether the build of this project runs outside of fw-context by design (``build.build_runs_outside``).
+
+    Asked only to word the advice.  Any failure to decide answers no,
+    which keeps ``--build`` in the advice, as before.
+    """
+    from ...indexer.build import build_runs_outside, detect_build_system
+    from ...utils import SAFE_EXCEPT
+
+    try:
+        return build_runs_outside(proj_cfg.build, proj_cfg.build.system or detect_build_system(root))
+    except SAFE_EXCEPT:
+        return False
+
+
 def _with_version_state(result: dict) -> dict:
     """Add the version facts that do not depend on the index to *result*.
 
@@ -279,8 +294,9 @@ class _ProjectFacts:
     # database of a build is then the same fact, and the marker names it
     # with the command of the run.
     marker_build_missing: bool
-    # The branch that the tree is on, "" for a detached HEAD or no git.
-    live_branch: str
+    # The text of the file HEAD of the tree (`git_context.read_head`): a
+    # branch, or the commit of a detached HEAD; "" without git.
+    live_head: str
 
 
 def _project_facts(conn, target: _IndexTarget) -> _ProjectFacts:
@@ -298,9 +314,9 @@ def _project_facts(conn, target: _IndexTarget) -> _ProjectFacts:
     * ``find_unindexed_sources`` reads the TU extensions and the build
       directories of the build that it starts from.  From the bootloader, a
       new ``.cpp`` of the application was no candidate.
-    * The branch is one ``git`` call, and it is the same for each build.
+    * HEAD is the same for each build.
     """
-    from ...indexer.git_context import current_branch
+    from ...indexer.git_context import read_head
     from ..shared.variants import active_build
 
     checked, _refusal = active_build(conn, target.project_id, target.cfg, target.root)
@@ -329,7 +345,7 @@ def _project_facts(conn, target: _IndexTarget) -> _ProjectFacts:
         auto_state=_autobuild_state(target.root, target.cfg, new_sources),
         build_problem=problem.text if problem is not None else "",
         marker_build_missing=problem is not None and problem.build_missing,
-        live_branch=current_branch(target.root),
+        live_head=read_head(target.root),
     )
 
 
@@ -473,34 +489,38 @@ def _build_health(
     # caller to run a command would only duplicate it.
     blocked_sources = bool(new_sources) and auto_state is not AutobuildState.WILL_BUILD
 
-    # ── The tree moved to another branch since this index ──
+    # ── The tree has another checkout than this index ──
     # The only condition that a plain reindex cannot fix.
-    # compile_commands.json is a build artifact of the branch it was
-    # generated on: it carries that branch's file list AND its compiler
-    # flags.  Measured on the Mbed project, a switch from 4.15.3 to 4.15.1
-    # left two generated zcbor sources listed in that file and absent
-    # from the tree, and a reindex reads the same file again.
-    # The same rule as ``branch_moved_since``, with the branch of the tree
-    # read one time for the project.
-    indexed_branch = branch_of_description(cfg["description"] if "description" in cfg.keys() else "")
-    live_branch = facts.live_branch
-    branch_moved = bool(indexed_branch and live_branch and live_branch != indexed_branch)
+    # compile_commands.json is a build artifact of the checkout it was
+    # generated on: it carries its file list AND its compiler flags.
+    # Measured on the Mbed project, a switch from 4.15.3 to 4.15.1 left two
+    # generated zcbor sources listed in that file and absent from the
+    # tree, and a reindex reads the same file again.  A branch, a tag and a
+    # commit all count (`git_context.head_moved`), with HEAD read one time
+    # for the project.
+    indexed_checkout, live_checkout = head_moved(
+        stored_head(cfg),
+        str(cfg["description"] or "") if "description" in cfg.keys() else "",
+        facts.live_head,
+        root,
+    )
+    checkout_moved = bool(indexed_checkout)
     # Modified source files are handled per query and do NOT force a
     # reindex.
     needs_reindex = bool(
-        cc_changed or schema_old or row_format_old or blocked_sources or branch_moved
+        cc_changed or schema_old or row_format_old or blocked_sources or checkout_moved
         or build_problem or build_missing
     )
     # Asked once, because the call reaches the build backend and is not
     # free.  Only the branch reason below reads it.
-    bg_build_allowed = branch_moved and _background_build_allowed(root, proj_cfg)
+    bg_build_allowed = checkout_moved and _background_build_allowed(root, proj_cfg)
 
     reindex_reasons: list[str] = []
     if build_problem:
         reindex_reasons.append(build_problem)
     if build_missing:
         reindex_reasons.append(_build_missing_advice(build_missing, root, proj_cfg))
-    if branch_moved:
+    if checkout_moved:
         # Always names `--build`, never a plain reindex: that would reuse
         # compile_commands.json, which belongs to the branch the index
         # was built on, with its file list and its compiler flags.
@@ -538,12 +558,20 @@ def _build_health(
                 "the watcher sees a change, or run "
                 "`fw-context index --build` now"
             )
+        elif _build_runs_outside(root, proj_cfg):
+            # A stub such as STM32CubeIDE: `--build` fails there, and the
+            # run after the build of the user records the checkout
+            # (`cli._index._records_checkout`).
+            branch_advice = (
+                "; fw-context cannot run this build — build the project again "
+                "outside of fw-context (for example in the IDE), then run `fw-context index`"
+            )
         else:
             branch_advice = ", run `fw-context index --build`"
         reindex_reasons.append(
-            f"branch changed: indexed on {indexed_branch!r}, "
-            f"now on {live_branch!r} — compile_commands.json belongs to "
-            f"the old branch" + branch_advice
+            f"checkout changed: indexed at {indexed_checkout!r}, "
+            f"now at {live_checkout!r} — compile_commands.json belongs to "
+            f"the old checkout" + branch_advice
         )
     if schema_old:
         reindex_reasons.append(f"schema_mismatch: {db_schema_ver} < {CURRENT_SCHEMA_VERSION}")

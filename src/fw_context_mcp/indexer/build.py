@@ -686,6 +686,20 @@ def can_run_build(cfg: BuildConfig, system: str | None) -> bool:
     return bool(getattr(builder_cls, "can_build", True))
 
 
+def build_runs_outside(cfg: BuildConfig, system: str | None) -> bool:
+    """Say if the build of *system* runs outside of fw-context by design (a stub such as STM32CubeIDE).
+
+    True only when the builder of *system* says so (``can_build = False``)
+    and no ``[build] command`` replaces it.  WHY not ``not can_run_build``:
+    that is also True for a system that no builder knows, and such a
+    project is not known to build in an IDE.
+    """
+    if cfg.command:
+        return False
+    builder_cls = _builder_registry.get(system) if system else None
+    return builder_cls is not None and not getattr(builder_cls, "can_build", True)
+
+
 def checked_compile_commands(project_root: Path, cfg, indexed: Path | None) -> Path | None:
     """Give the compile_commands.json whose build an index run checks, or None.
 
