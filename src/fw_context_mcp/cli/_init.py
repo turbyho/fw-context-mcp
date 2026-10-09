@@ -368,13 +368,17 @@ def _install_template_agents(
             elif any(".mdc" in p for p in patterns):
                 target_name = template_path.stem + ".mdc"
                 target_path = agents_dir / target_name
+                # A file that is there belongs to the user: only the block
+                # in it changes, in _inject_critical_block.  The old code
+                # wrote the template over it on each run.
+                if target_path.exists():
+                    continue
                 template_text = template_path.read_text(encoding="utf-8")
                 if strip_name:
                     template_text = re.sub(r"^name:.*\n", "", template_text, flags=re.MULTILINE)
                 if dry_run:
-                    if not target_path.exists():
-                        print(f"  [dry-run] {target_path}: would CREATE")
-                        installed = True
+                    print(f"  [dry-run] {target_path}: would CREATE")
+                    installed = True
                     continue
                 agents_dir.mkdir(parents=True, exist_ok=True)
                 target_path.write_text(template_text, encoding="utf-8")

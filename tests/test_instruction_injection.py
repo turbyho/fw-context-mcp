@@ -625,3 +625,23 @@ def test_a_codex_agent_that_init_cannot_read_stays_as_it_is(tmp_path, capsys):
 
     assert agent.read_bytes() == content and named.read_bytes() == content
     assert "[warn]" in capsys.readouterr().out
+
+
+def test_a_cursor_agent_of_the_user_keeps_its_text(tmp_path):
+    """The template went over an .mdc file that was there, on each run."""
+    from fw_context_mcp.cli._init import _install_template_agents
+
+    template = tmp_path / "src" / "code-explorer.md"
+    template.parent.mkdir()
+    template.write_text(_file("---", "name: code-explorer", "description: d", "---", "Body", ""), encoding="utf-8")
+    agents = tmp_path / "agents"
+    agents.mkdir()
+    mine = agents / "code-explorer.mdc"
+    mine.write_text("My own rules.\n", encoding="utf-8")
+
+    _install_template_agents(agents, [template], ["*.mdc"])
+    assert mine.read_text(encoding="utf-8") == "My own rules.\n"
+
+    mine.unlink()
+    assert _install_template_agents(agents, [template], ["*.mdc"])
+    assert "Body" in mine.read_text(encoding="utf-8")
