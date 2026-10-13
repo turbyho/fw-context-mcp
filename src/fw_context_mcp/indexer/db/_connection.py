@@ -17,8 +17,9 @@ Every connection goes through ``open_db`` → ``_configure_connection`` →
   3. **ensure_schema** — idempotent schema migration and self-healing.
      The version-gate skips the expensive migration block when the
      on-disk schema is current.
-  4. **Integrity check** — ``PRAGMA integrity_check``, skipped on
-     auxiliary connections or when pre-marked as already verified.
+  4. **Integrity check** — ``PRAGMA quick_check``, one time for each
+     database file in each process (two times for a new file, see
+     ``open_db``).  Auxiliary connections skip it.
 
 WAL mode
 ────────
@@ -71,6 +72,7 @@ the database should match the current code's expectations.
 
 import logging
 import sqlite3
+import threading
 import time as _time
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -274,6 +276,60 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         rebuild_fts(conn)
 
 
+# ── Integrity check: one time in each process ───────────────────────────
+#
+# WHY one time: one `fw-context index` run opened the database six times,
+# and the daemon opened it again after the run.  Each open did a full
+# `PRAGMA integrity_check`, and on a database of 6.5 GB one check took
+# 19 s.  Thus a run that indexed one changed file spent 2 min on checks.
+#
+# WHY `quick_check`: the SQLite documentation says that it does the
+# checks of `integrity_check`, with two exceptions.  It does not compare
+# each index with its table, and it does not examine the UNIQUE
+# constraints.  Thus it finds a damaged page or B-tree, and a probe showed
+# the same report from the two checks.  It took 1.5 s on the same
+# database, and those two parts took the other 17.5 s.
+#
+# The key holds the device and the inode of the file.  A file that a
+# rename puts at the path has a new inode, thus it gets a new check.  A
+# copy over the file keeps the inode, and a deleted file can give its
+# inode to a new file.  Then the check does not occur again.  fw-context
+# deletes its database only in `reset_index` and in `db delete --all`,
+# and an index run then makes the new file.  A long process such as the
+# MCP server can thus skip the check of a new file.  A read of a damaged
+# page then raises an error, and `reset_index` treats that error as
+# damage.
+_FileKey = tuple[str, int, int]
+_checked_files: set[_FileKey] = set()
+_checked_files_lock = threading.Lock()
+
+
+def _file_key(path: Path) -> _FileKey | None:
+    """Return the key of the database file, or ``None`` when the stat fails."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (str(path.resolve()), stat.st_dev, stat.st_ino)
+
+
+def _was_checked(key: _FileKey | None) -> bool:
+    """Tell if this process did a check of this database file that found no damage."""
+    with _checked_files_lock:
+        return key is not None and key in _checked_files
+
+
+def _mark_checked(key: _FileKey | None) -> None:
+    """Record that this process did a check of this database file that found no damage.
+
+    When the file had no key (a new database, or a stat that failed), the
+    function records nothing.  Thus the next open does the check again.
+    """
+    if key is not None:
+        with _checked_files_lock:
+            _checked_files.add(key)
+
+
 def open_db(path: Path, *, skip_integrity_check: bool = False, check_same_thread: bool = True, _retries: int = 0) -> sqlite3.Connection:
     """Open SQLite database at *path*, enabling WAL mode and loading extensions.
 
@@ -298,9 +354,13 @@ def open_db(path: Path, *, skip_integrity_check: bool = False, check_same_thread
     8. Unconditionally ensures ``files_fts`` FTS5 table exists (self-healing
        when a migration was interrupted — see ``_CRITICAL_TABLES`` for the
        same pattern applied to regular tables).
-    9. Runs ``PRAGMA integrity_check`` (unless *skip_integrity_check*
-       is ``True``) — raises ``DatabaseCorruptionError`` on failure
-       (detected before any tool reads the data).
+    9. Runs ``PRAGMA quick_check`` (unless *skip_integrity_check* is
+       ``True``) — raises ``DatabaseCorruptionError`` on failure (detected
+       before any tool reads the data).  After one check that found no
+       damage, the other opens of this file in this process skip it.  A
+       failed check and an open with *skip_integrity_check* record nothing.
+       An open of a file that did not exist before it records nothing too,
+       thus the next open does the check again.
 
     On ``OperationalError('locked')`` the connection is retried once after a
     short sleep.  Other ``OperationalError`` and ``DatabaseError`` are
@@ -308,11 +368,11 @@ def open_db(path: Path, *, skip_integrity_check: bool = False, check_same_thread
 
     Args:
         path: Filesystem path to the SQLite database file.
-        skip_integrity_check: When ``True``, skip the ``PRAGMA integrity_check``
+        skip_integrity_check: When ``True``, skip the ``PRAGMA quick_check``
             scan.  Use for auxiliary connections (worker threads, pooled
             connections) where the check was already performed on the primary
-            connection.  On large databases (5+ GB) the scan takes 15–30 s
-            and saturates disk I/O.
+            connection.  The scan reads the full file: 1.5 s on a database
+            of 6.5 GB.
         check_same_thread: Passed through to ``sqlite3.connect``.  Set to
             ``False`` when the connection will be shared across threads
             (e.g. in a thread-safe connection cache).  Default ``True``.
@@ -321,10 +381,13 @@ def open_db(path: Path, *, skip_integrity_check: bool = False, check_same_thread
         Open ``sqlite3.Connection`` with ``row_factory = sqlite3.Row``.
 
     Raises:
-        DatabaseCorruptionError: When ``PRAGMA integrity_check`` fails or the
+        DatabaseCorruptionError: When ``PRAGMA quick_check`` fails or the
             database is otherwise unreadable.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
+    # The key of the integrity check comes from the file before the
+    # connection opens it, see the check below.
+    key = None if skip_integrity_check else _file_key(path)
     conn = sqlite3.connect(str(path), check_same_thread=check_same_thread)
     # Ensure DB file is only readable by the owner (defense in depth).
     try:
@@ -401,25 +464,35 @@ def open_db(path: Path, *, skip_integrity_check: bool = False, check_same_thread
         conn.close()
         raise DatabaseCorruptionError(str(path), str(e)) from e
 
-    # Integrity check — detect corruption early, before any tool uses the DB.
-    # Skip for auxiliary connections (worker threads, pooled connections)
-    # where the check already ran on the primary connection.
+    # Integrity check — find a damaged database before a tool uses it.
+    # Auxiliary connections (worker threads) skip it: the check already ran
+    # on the primary connection.  After a check that found no damage, the
+    # other opens of the file in this process skip it, see `_checked_files`.
     #
-    # GOTCHA — on 5+ GB databases a full scan takes 15–30 s and saturates
-    # disk I/O.  Never call this during MCP server startup (even in a
-    # background thread — the I/O contention delays first queries).
-    # server.py pre-marks _integrity_checked to skip it; the DB was already
-    # verified during ``fw-context index``.  See server.py:324-328.
-    if not skip_integrity_check:
+    # The record uses the key from before the connection opened the file.
+    # A different process can put a new file at the path after the stat.
+    # The new file has a different key, thus it gets its own check.  A new
+    # database has no key, thus its next open does the check again.  That
+    # check is short, because a new database is small.
+    #
+    # GOTCHA — the scan reads the full file.  Never call this during MCP
+    # server startup (even in a background thread — the I/O contention
+    # delays first queries).  The query connections of the MCP server do
+    # not use open_db, see `SyncQueryExecutor._open_connection`.
+    if not skip_integrity_check and not _was_checked(key):
+        # The report of the check is outside the try.  Inside the try, the
+        # except below would catch the error of the report and wrap it a
+        # second time.  A report of damage has no cause, and an error of
+        # SQLite during the check is its cause, see `reset_index`.
         try:
-            result = conn.execute("PRAGMA integrity_check").fetchone()
-            if result and result[0] != "ok":
-                details = result[0]
-                conn.close()
-                raise DatabaseCorruptionError(str(path), details)
+            result = conn.execute("PRAGMA quick_check").fetchone()
         except sqlite3.DatabaseError as e:
             conn.close()
             raise DatabaseCorruptionError(str(path), str(e)) from e
+        if result and result[0] != "ok":
+            conn.close()
+            raise DatabaseCorruptionError(str(path), result[0])
+        _mark_checked(key)
 
     # No per-query progress-handler timeout is installed here — see the
     # "Removed: progress-handler query timeout" note at the top of this

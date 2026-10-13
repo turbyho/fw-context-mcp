@@ -23,7 +23,7 @@ Do NOT reintroduce a connection pool here.
 What remains in this module:
 
 - ``_integrity_checked`` — set of db_keys pre-marked at server startup
-  (``server.main``); the integrity scan (15-30 s on multi-GB databases)
+  (``server.main``); the integrity scan reads the full database file and
   must never run during request handling.
 - ``_quick_open_readonly`` — short-lived read-only connections for
   per-request config reads.

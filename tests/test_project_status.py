@@ -418,6 +418,139 @@ def test_reset_index_counts_the_whole_database(tmp_path):
     assert (result["build_count"], result["symbol_count"]) == (2, 5), result
 
 
+@pytest.mark.parametrize("confirm", [False, True])
+def test_reset_index_deletes_a_database_that_was_damaged_after_the_check(tmp_path, monkeypatch, confirm):
+    """The check of a process runs one time, thus a later damage reaches the counts.
+
+    The MCP server runs for a long time.  Its first reset_index call checked
+    the database, and a later damage at the same inode got no check.  The
+    count then raised a `sqlite3.DatabaseError`, and the reset could not
+    delete the database that it must delete.
+    """
+    from fw_context_mcp.indexer.db import _connection, open_db, transaction, upsert_file
+    from fw_context_mcp.mcp.handlers.maintenance import reset_index
+
+    monkeypatch.setattr(_connection, "_checked_files", set())
+    root = _project(tmp_path, [("h-only", "", "")])
+    db_path = tmp_path / "index" / PROJECT_ID / "index.db"
+    conn = open_db(db_path)
+    try:
+        with transaction(conn):
+            file_id = upsert_file(conn, "h-only", "a.c", "c", mtime=0.0)
+            conn.executemany(
+                "INSERT INTO symbols (config_hash, file_id, usr, name, qualified_name, kind, line, col,"
+                " is_definition) VALUES ('h-only', ?, ?, ?, ?, 'function', ?, 1, 1)",
+                [(file_id, f"usr-{n}", f"function_{n:06d}", f"function_{n:06d}", n + 1) for n in range(3000)],
+            )
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+        roots = [row[0] for row in conn.execute("SELECT rootpage FROM sqlite_master WHERE tbl_name = 'symbols'"
+                                                " AND rootpage > 0")]
+    finally:
+        conn.close()
+    assert _connection._was_checked(_connection._file_key(db_path)), "the check must run before the damage"
+    with open(db_path, "r+b") as db_file:  # in place: the inode stays
+        for root_page in roots:
+            db_file.seek((root_page - 1) * page_size)
+            db_file.write(b"\xff" * page_size)
+
+    result = reset_index(project_root=str(root), confirm=confirm)
+
+    assert "warning" in result and "symbol_count" not in result, result
+    if confirm:
+        assert result["action"] == "deleted", result
+        assert not db_path.exists()
+    else:
+        assert result["action"] == "dry_run" and "is corrupt" in result["message"], result
+
+
+_SQLITE_ERRORS = {  # kind: (message, result code)
+    "lock": ("database is locked", 5),
+    "full disk": ("database or disk is full", 13),
+    "disk": ("disk I/O error", 10),
+    "read-only": ("attempt to write a readonly database", 8),
+    "schema": ("no such table: build_configs", 1),
+    "schema change": ("database schema has changed", 17),
+    "not a database": ("file is not a database", 26),
+    "no code": ("Cannot operate on a closed database.", None),
+}
+
+
+def _sqlite_error(kind: str):
+    """Make the error of *kind* as SQLite gives it, with its result code."""
+    import sqlite3  # after fw_context_mcp: the import redirects it to pysqlite3
+
+    message, code = _SQLITE_ERRORS[kind]
+    if code is None:
+        return sqlite3.ProgrammingError(message)
+    error = sqlite3.OperationalError(message) if code != 26 else sqlite3.DatabaseError(message)
+    error.sqlite_errorcode = code
+    return error
+
+
+def _error_of_open_db(kind: str):
+    """Make the error that open_db raises for *kind*: the error of SQLite is the cause."""
+    from fw_context_mcp.indexer.db import DatabaseCorruptionError
+
+    if kind == "lock":
+        return DatabaseCorruptionError("index.db", "Database locked after 4 attempts", locked=True)
+    if kind == "report of the check":
+        return DatabaseCorruptionError("index.db", "*** in database main ***")
+    try:
+        raise DatabaseCorruptionError("index.db", _SQLITE_ERRORS[kind][0]) from _sqlite_error(kind)
+    except DatabaseCorruptionError as error:
+        return error
+
+
+def _reset_with_error(tmp_path, monkeypatch, error, of_open_db: bool):
+    """Run reset_index with confirm=True, when the open or the read raises *error*."""
+    from fw_context_mcp.mcp.handlers import maintenance
+
+    root = _project(tmp_path, [("h-only", "", "")])
+
+    def _fails(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(maintenance, "open_db" if of_open_db else "get_active_config", _fails)
+    return root, lambda: maintenance.reset_index(project_root=str(root), confirm=True)
+
+
+@pytest.mark.parametrize("of_open_db", [False, True], ids=["read", "open_db"])
+@pytest.mark.parametrize("kind", ["lock", "full disk", "disk", "read-only", "schema change", "no code"])
+def test_reset_index_does_not_call_a_good_database_corrupt(tmp_path, monkeypatch, kind, of_open_db):
+    """A lock, a fault of the disk or a fault of the code is not damage: the caller gets the error.
+
+    The tool called each error of the open damage, and `confirm=True`
+    then deleted a good index.
+    """
+    import sqlite3  # after fw_context_mcp: the import redirects it to pysqlite3
+
+    error = _error_of_open_db(kind) if of_open_db else _sqlite_error(kind)
+    _, reset = _reset_with_error(tmp_path, monkeypatch, error, of_open_db)
+
+    with pytest.raises(sqlite3.DatabaseError) as raised:
+        reset()
+    assert raised.value is error
+    assert (tmp_path / "index" / PROJECT_ID / "index.db").exists()
+
+
+@pytest.mark.parametrize(("kind", "of_open_db"), [
+    ("report of the check", True),
+    ("schema", True),
+    ("not a database", True),
+    ("schema", False),
+])
+def test_reset_index_deletes_a_database_that_open_db_cannot_use(tmp_path, monkeypatch, kind, of_open_db):
+    """Damage, and a schema that open_db cannot repair, are the work of the reset."""
+    error = _error_of_open_db(kind) if of_open_db else _sqlite_error(kind)
+    _, reset = _reset_with_error(tmp_path, monkeypatch, error, of_open_db)
+
+    result = reset()
+
+    assert result["action"] == "deleted" and "warning" in result, result
+    assert not (tmp_path / "index" / PROJECT_ID / "index.db").exists()
+
+
 def test_the_stale_recovery_needs_the_build_of_the_caller():
     """Without a build it read the newest build of the project, not the build that the caller named."""
     import inspect

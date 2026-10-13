@@ -23,7 +23,7 @@ Design rationale (self-contained — no external documents needed):
   ``interrupt_all()`` calling ``sqlite3_interrupt()``.
 
 - The connection is WARM for the process lifetime — the expensive parts
-  of ``open_db`` (ensure_schema write transaction, integrity_check scan,
+  of ``open_db`` (ensure_schema write transaction, integrity scan,
   extension loading) are paid once at executor creation, not per request.
   Per-request cost is: one lock acquire, one ``st_mtime`` stat (reindex
   detection) and at most one ``SELECT 1`` health check per 60 s.
@@ -94,9 +94,9 @@ class SyncQueryExecutor:
         - NO ``ensure_schema``: its unconditional ``executescript`` is a
           write transaction — paying it per open caused lock contention
           on what should be read-only request handling.
-        - NO ``integrity_check``: done once at server startup
+        - NO integrity check: done once at server startup
           (``server.main`` pre-marks ``_integrity_checked``); the scan
-          takes 15-30 s on multi-GB databases.
+          reads the full database file.
         - NO progress-handler query timeout: timeout enforcement is
           ``_wrap_tool`` 300 s + ``interrupt()``.  The old 10 s progress
           handler killed legitimate BFS queries that need 15-25 s on

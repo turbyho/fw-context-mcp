@@ -1405,8 +1405,8 @@ def main() -> None:
         return
 
     # Project is ready — pre-mark integrity check and start normally.
-    # GOTCHA — integrity_check on large DBs is I/O-bound (10-30 s for
-    # 3+ GB).  If it runs here via _open_db_safe during MCP server startup,
+    # GOTCHA — the integrity check reads the full database file, thus it
+    # is I/O-bound on a large DB.  If it runs here via _open_db_safe during MCP server startup,
     # the MCP client times out during tool discovery and fw-context tools
     # never appear.  The check already ran during ``fw-context index``, so
     # we skip it by pre-marking the DB — a corrupt DB will be caught by

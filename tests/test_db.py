@@ -983,6 +983,127 @@ class TestIntegrityCheck:
         assert exc_info.value.details  # non-empty
 
 
+class TestIntegrityCheckOneTimeInEachProcess:
+    """One index run opened the database six times, and each open did a full check.
+
+    On a database of 6.5 GB one full check took 19 s.  Now the first open of a
+    file in a process does a `quick_check`, and the other opens do no check.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_file_checked(self, monkeypatch):
+        from fw_context_mcp.indexer.db import _connection
+
+        monkeypatch.setattr(_connection, "_checked_files", set())
+
+    @staticmethod
+    def _count_checks(monkeypatch) -> dict[str, int]:
+        """Count each integrity PRAGMA on each connection that open_db makes."""
+        from fw_context_mcp.indexer.db import _connection
+
+        counts = {"quick_check": 0, "integrity_check": 0}
+        real_connect = _connection.sqlite3.connect
+
+        def _connect(*args, **kwargs):
+            conn = real_connect(*args, **kwargs)
+
+            def _trace(statement: str) -> None:
+                for pragma in counts:
+                    if statement.strip().lower() == f"pragma {pragma}":
+                        counts[pragma] += 1
+
+            conn.set_trace_callback(_trace)
+            return conn
+
+        monkeypatch.setattr(_connection.sqlite3, "connect", _connect)
+        return counts
+
+    @staticmethod
+    def _make_damaged_database(db_path: Path) -> None:
+        """Make a database with a damaged page of a table.
+
+        The damage is in the cells of the root page of the table.  A probe
+        showed that `quick_check` and `integrity_check` both report this
+        damage, and that `ensure_schema` does not read the table.  Thus
+        only the check in open_db can find the damage.
+        """
+        conn = open_db(db_path, skip_integrity_check=True)
+        conn.execute("CREATE TABLE probe(id INTEGER PRIMARY KEY, text TEXT)")
+        conn.executemany("INSERT INTO probe(text) VALUES (?)", [(f"row {i:06d} " * 8,) for i in range(5000)])
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+        root = conn.execute("SELECT rootpage FROM sqlite_master WHERE name = 'probe'").fetchone()[0]
+        conn.close()
+        with open(db_path, "r+b") as db_file:
+            db_file.seek((root - 1) * page_size + 100)
+            db_file.write(b"\xff" * 200)
+
+    def test_only_the_first_open_does_the_check(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "index.db"
+        open_db(db_path, skip_integrity_check=True).close()
+        counts = self._count_checks(monkeypatch)
+
+        for _ in range(3):
+            open_db(db_path).close()
+
+        assert counts == {"quick_check": 1, "integrity_check": 0}
+
+    def test_a_new_database_gets_the_check_at_its_next_open(self, tmp_path, monkeypatch):
+        """The key comes from the file before the connection opens it, and a new file has none.
+
+        A different process can put a new file at the path after the stat.  A
+        key from after the open recorded that file, and its check never ran.
+        """
+        counts = self._count_checks(monkeypatch)
+        db_path = tmp_path / "index.db"
+
+        for _ in range(3):
+            open_db(db_path).close()
+
+        assert counts == {"quick_check": 2, "integrity_check": 0}
+
+    def test_the_check_finds_a_damaged_page(self, tmp_path):
+        db_path = tmp_path / "index.db"
+        self._make_damaged_database(db_path)
+
+        with pytest.raises(DatabaseCorruptionError) as raised:
+            open_db(db_path)
+        # The report of the check has no cause: `reset_index` reads a
+        # cause as an error of SQLite, and the report as damage.  The
+        # except of the check caught the report and wrapped it again.
+        assert raised.value.__cause__ is None
+        assert raised.value.details.startswith("*** in database main ***"), raised.value.details
+
+    def test_a_file_that_replaces_the_database_gets_a_new_check(self, tmp_path):
+        import os
+
+        from fw_context_mcp.indexer.db import _connection
+
+        db_path = tmp_path / "index.db"
+        open_db(db_path, skip_integrity_check=True).close()
+        open_db(db_path).close()
+        assert _connection._was_checked(_connection._file_key(db_path)), "the old file must have its record"
+        damaged = tmp_path / "damaged.db"
+        self._make_damaged_database(damaged)
+
+        os.replace(damaged, db_path)
+        for suffix in ("-wal", "-shm"):
+            Path(f"{db_path}{suffix}").unlink(missing_ok=True)
+
+        with pytest.raises(DatabaseCorruptionError):
+            open_db(db_path)
+
+    def test_a_failed_check_is_done_again(self, tmp_path):
+        """A failed check records nothing: the next open finds the damage again."""
+        db_path = tmp_path / "index.db"
+        self._make_damaged_database(db_path)
+
+        for _ in range(2):
+            with pytest.raises(DatabaseCorruptionError):
+                open_db(db_path)
+
+
 class TestInheritance:
     """C++ inheritance chain: insert, query bases/derived, delete by file."""
 

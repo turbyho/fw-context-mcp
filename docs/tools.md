@@ -2780,9 +2780,9 @@ symbol row in the database: also the rows of a build that an index run
 writes now, and the rows of an older build that an interrupted run left.
 `indexed_at` is the time of the newest build. The three fields are
 present only when fw-context can read a build config. A `warning` key
-means that the database is corrupt: the integrity check failed, thus
-fw-context counts nothing and the three fields are absent. The reset can
-delete a corrupt database.
+means that the database is corrupt: the integrity check or a read of the
+database failed, thus fw-context counts nothing and the three fields are
+absent. The reset can delete a corrupt database.
 
 The delete removes the database with its `-wal`, `-shm`, and `-journal`
 files. It also removes the automatic-build markers `build_problem.json` and

@@ -1682,6 +1682,44 @@ def list_projects(
     return results
 
 
+# SQLite result codes (the low byte of an extended code) that do not show
+# damage of the database file:
+#   - a fault of the host: SQLITE_PERM, SQLITE_NOMEM, SQLITE_READONLY,
+#     SQLITE_IOERR, SQLITE_FULL, SQLITE_CANTOPEN, SQLITE_NOLFS
+#   - a different connection or a stop: SQLITE_ABORT, SQLITE_BUSY,
+#     SQLITE_LOCKED, SQLITE_INTERRUPT, SQLITE_PROTOCOL, SQLITE_SCHEMA
+#     (a run changed the schema), SQLITE_AUTH
+#   - a fault of the code: SQLITE_MISUSE, SQLITE_RANGE
+_FAULT_CODES = frozenset({3, 4, 5, 6, 7, 8, 9, 10, 13, 14, 15, 17, 21, 22, 23, 25})
+
+
+def _shows_damage(exc: sqlite3.DatabaseError) -> bool:
+    """Tell if *exc* shows a damaged database, and not a lock or a fault of the disk.
+
+    WHY: a lock, a full disk, an I/O error or a missing permission does
+    not damage the database.  If the tool calls such a database damaged,
+    the user can delete a good index.  Each other error of SQLite shows a
+    database that the tool must let the user delete: damaged pages, and
+    also a schema that open_db cannot repair.
+
+    open_db wraps most errors of SQLite in `DatabaseCorruptionError`, and
+    keeps the error of SQLite as the cause.  The other errors of open_db
+    and of the reads come without a wrap.  A report of the integrity check
+    has no cause: that is damage.  ``locked=True`` tells that open_db could
+    not get the lock.  An error without a result code, for example a
+    `sqlite3.ProgrammingError`, is a fault of the code, not damage.
+    """
+    error: sqlite3.Error = exc
+    if isinstance(exc, DatabaseCorruptionError):
+        if exc.locked:
+            return False
+        if not isinstance(exc.__cause__, sqlite3.Error):
+            return True
+        error = exc.__cause__
+    code = getattr(error, "sqlite_errorcode", None)
+    return code is not None and (code & 0xFF) not in _FAULT_CODES
+
+
 # ── moved from server.py ──
 def reset_index(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
@@ -1714,8 +1752,8 @@ def reset_index(
         present only when a build config is readable.
 
         A ``warning`` key means that the database is corrupt — the
-        integrity check failed, thus the tool counts nothing and the
-        three count fields are absent.
+        integrity check or a read of the database failed, thus the tool
+        counts nothing and the three count fields are absent.
 
         On failure the dict holds only ``error`` with the reason.
     """
@@ -1731,12 +1769,6 @@ def reset_index(
     conn = None
     try:
         conn = open_db(db_path)
-        # DatabaseCorruptionError is raised during open when the integrity
-        # check (PRAGMA integrity_check) fails.  A corrupt DB can still
-        # be deleted — we track the flag and skip symbol counting.
-    except DatabaseCorruptionError:
-        corrupt = True
-    else:
         with conn:
             # The newest build gives the time of the last run.  The counts
             # are of the whole database, because the reset deletes all of
@@ -1746,6 +1778,13 @@ def reset_index(
             if cfg_data:
                 sym_count = conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
                 build_count = len(latest_builds(conn, project_id))
+    except sqlite3.DatabaseError as exc:
+        if not _shows_damage(exc):
+            raise
+        # The reset can still delete a damaged database, thus the tool
+        # records the flag and gives no counts.
+        corrupt = True
+        cfg_data = None
     finally:
         if conn is not None:
             try:
@@ -1762,7 +1801,7 @@ def reset_index(
         info["symbol_count"] = sym_count
         info["indexed_at"] = cfg_data["created_at"]
     elif corrupt:
-        info["warning"] = "Database is corrupt — integrity check failed."
+        info["warning"] = "Database is corrupt — integrity check or read failed."
     if not confirm:
         info["action"] = "dry_run"
         if corrupt:
