@@ -593,7 +593,21 @@ async def _reindex_loop(
             return
         # Synchronous, thus in an executor: the socket server answers the
         # pings in this time.
-        needs, reasons = await loop.run_in_executor(None, startup_check, project_root)
+        #
+        # WHY the errors stop here: the check finds only the work of the
+        # time when no daemon watched.  Some errors made the exception leave
+        # the loop: a locked or damaged database, a file that cannot be
+        # read, or a config that lost its project ID after the start
+        # (`ProjectNotInitializedError`).  The daemon then stopped, and a
+        # new daemon stopped on the same error.  Without the check the
+        # watcher continues.  The status tools do their own check: they
+        # show the error, or that no run updates the index
+        # ("not_scheduled"), and they name the command.
+        try:
+            needs, reasons = await loop.run_in_executor(None, startup_check, project_root)
+        except (sqlite3.Error, OSError, ValueError, RuntimeError):
+            dlog.warning("The check at the start failed; the watcher continues without it", exc_info=True)
+            needs, reasons = False, []
         if needs:
             dlog.info("Initial index needed (%s)", ", ".join(reasons))
             # A reason of a build carries its variant/image in front.

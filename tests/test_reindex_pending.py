@@ -384,6 +384,65 @@ class TestTheCheckAtTheStart:
         assert not pending.is_set()
         assert not (tmp_path / PENDING_MARKER).exists()
 
+    @pytest.mark.parametrize("kind", ["database", "file", "config"])
+    def test_an_error_of_the_check_does_not_stop_the_daemon(
+        self, monkeypatch, tmp_path, fast_loop, kind, caplog,
+    ):
+        """The check is a help for the time when no daemon watched: the watcher must continue."""
+        import sqlite3  # after fw_context_mcp: the import redirects it to pysqlite3
+
+        from fw_context_mcp.config.settings import ProjectNotInitializedError
+
+        daemon_mod = fast_loop
+        runs: list[bool] = []
+        # A config that lost its project ID after the start reads as the
+        # defaults, and `_db_path` raises this.
+        errors = {
+            "database": sqlite3.OperationalError("database is locked"),
+            "file": PermissionError("config.toml"),
+            "config": ProjectNotInitializedError(tmp_path),
+        }
+
+        def _broken(root: Path) -> tuple[bool, list[str]]:
+            raise errors[kind]
+
+        async def _fake_run(project_root, db_dir, *, force_refs=False):
+            runs.append(force_refs)
+            return SimpleNamespace(pid=4321, returncode=0)
+
+        async def _done(proc, shutdown, *, db_dir):
+            return 0
+
+        monkeypatch.setattr(daemon_mod, "_run_index_async", _fake_run)
+        monkeypatch.setattr(daemon_mod, "_wait_index", _done)
+        pending = daemon_mod._PendingWork(tmp_path)
+        pending.set()  # a change that the watcher saw
+
+        with caplog.at_level(logging.WARNING, logger="test.daemon"):
+            _run_loop(daemon_mod, tmp_path, pending, lambda: bool(runs), startup_check=_broken)
+
+        assert runs == [False], "the change after the error got no run"
+        warnings = [r for r in caplog.records if "The check at the start failed" in r.getMessage()]
+        assert warnings and warnings[0].exc_info is not None, "the error must reach the log of the daemon"
+
+    @pytest.mark.parametrize("project_id", [None, ""])
+    def test_a_config_without_an_id_gives_the_error_of_the_project(self, monkeypatch, tmp_path, project_id):
+        """An assert gave an AssertionError, and the daemon did not handle it.
+
+        An empty ID passed the assert, and the database was then in the
+        directory of all indexes, not of this project.
+        """
+        from fw_context_mcp.config.settings import Config, ProjectNotInitializedError
+        from fw_context_mcp.mcp.shared import readiness
+
+        cfg = Config()
+        cfg.project.id = project_id
+        monkeypatch.setattr(readiness, "_check_server_ready", lambda root: tmp_path)
+        monkeypatch.setattr(readiness.config, "load", lambda root: cfg)
+
+        with pytest.raises(ProjectNotInitializedError):
+            readiness._db_path(tmp_path)
+
 
 class TestTheStartOfTheDaemon:
     @staticmethod

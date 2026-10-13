@@ -103,7 +103,13 @@ def _db_path(project_root: Path | None) -> Path:
     """Resolve the database path for a project root."""
     root = _check_server_ready(project_root)
     cfg = config.load(root)
-    assert cfg.project.id is not None
+    # An error and not an assert: the config can lose its ID after the
+    # check above (a damaged config.toml reads as the defaults), and a
+    # caller such as the daemon handles this error and continues.  An
+    # empty ID is not an ID, as in `_check_server_ready`: it puts the
+    # database in the directory of all indexes, not of this project.
+    if not cfg.project.id:
+        raise ProjectNotInitializedError(root)
     return _index_db_path(cfg)
 
 
