@@ -659,8 +659,15 @@ fw-context watch restart --project /path  # specific project
 #### `fw-context watch status`
 
 Show the watcher daemon status for the current project: whether the daemon
-is running, its PID and uptime, the modified file count, and whether a
-background reindex is in progress.
+is running, its PID and uptime, the modified file count, and the state of
+the index:
+
+- `Index:      running`: an index run holds the index, or a `reindex_file`
+  or a `reset_index` writes to it.
+- `Index:      scheduled`: the daemon has work that it did not complete.
+  The work waits for the debounce, for a manual operation, or for the
+  start of the run.
+- `Index:      idle`: no run is active, and the daemon has no work.
 
 ```bash
 $ fw-context watch status
@@ -2339,15 +2346,21 @@ Output: {"project_id": "c3d4…", "project_root": "/path/to/project",
          "bg_reindex_running": false, "vec_available": true}
 ```
 
-**Read-only, with one exception.** The last index run can leave a marker
-that says that the build is not there. When the tool finds that build
-there again, for example after a build in the IDE, it removes the marker.
+**Read-only, with two exceptions.** The tool removes only marker files:
+
+- The last index run can leave a marker that says that the build is not
+  there. When the tool finds that build there again, for example after a
+  build in the IDE, it removes the marker.
+- A `reindex.pid` or a `reindex.pending` that holds the PID of a process
+  that no longer runs is not current. The tool removes it.
+
 The tool makes no other change. The tool takes no `variant` and no
 `image`, because it reports every build. It creates no `.fw-context` file
 in a project that is not initialized. This tool does not spawn background
 tasks. The server startup thread and the file watcher manage the
 background reindex. `bg_reindex_running` reports whether an index run is
-active. Only while a run is active, `reindex_progress` holds the newest
+active, or the watcher has work that it did not complete. Only while a
+run is active, `reindex_progress` holds the newest
 progress or error line that fw-context wrote for that run. fw-context
 skips the output of the build tools in the same log.
 
@@ -2381,7 +2394,7 @@ are in `builds`. `reference_count`, `analysis`, `description`, and
 | Status | Meaning | What to do |
 |--------|---------|------------|
 | ``"ready"`` | Fully up to date, no issues | Continue normally |
-| ``"reindexing"`` | Background reindex in progress, or fw-context is about to build a new source file by itself | Index is still usable — continue normally |
+| ``"reindexing"`` | Background reindex in progress or scheduled, or fw-context is about to build a new source file by itself | Index is still usable — continue normally |
 | ``"reindex_needed"`` | A structural cause — see `reindex_reasons` below | Queries still work, but read `reindex_reasons` for the command |
 | ``"no_index"`` | Initialized, but `index.db` does not exist | Run ``fw-context index`` |
 | ``"not_initialized"`` | ``fw-context init`` was not run | Run ``fw-context init`` |
@@ -2395,8 +2408,8 @@ database that holds no build config, the result is a dict that holds only
 
 `"reindex_needed"` outranks `"reindexing"`: the answers of this moment
 come from the last finished run. When `bg_reindex_running` is `true` at
-the same time, `index_message` says to wait for the running index run
-instead of naming a command.
+the same time, `index_message` says to wait for the index run that is
+running or scheduled, instead of naming a command.
 
 **`reindex_reasons`** names each cause of `"reindex_needed"`:
 
@@ -2549,9 +2562,10 @@ Output: {"variant": "nrf52840-dev", "image": "app", "board": "nrf52840dk/nrf5284
          "bg_reindex_running": false, "vec_available": true}
 ```
 
-**Read-only, with the same exception as `get_project_status`.** When the
-tool finds a build there again after the last index run said that it is
-not there, it removes that marker. The tool takes the selector of the query
+**Read-only, with the same two exceptions as `get_project_status`.** When
+the tool finds a build there again after the last index run said that it
+is not there, it removes that marker. It also removes a `reindex.pid` or a
+`reindex.pending` of a process that no longer runs. The tool takes the selector of the query
 tools. On a project of more than one build, give the arguments of one
 build, as the error lists them: `variant`, `image`, or the two.
 `get_project_status` lists the names of each build in `builds`. Without

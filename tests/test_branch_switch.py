@@ -929,6 +929,13 @@ class TestTheCacheOfTheHeadPath:
         monkeypatch.chdir("/")
         assert read_head(Path(repo)) == "ref: refs/heads/main"
 
+    def test_a_git_directory_that_went_away_is_asked_again(self, repo):
+        import shutil
+
+        assert head_path(repo) is not None
+        shutil.rmtree(repo / ".git")
+        assert head_path(repo) is None, "the cache kept the path of a removed git directory"
+
 
 class TestARunThatBuiltOnAnotherPath:
     """A database that the run built belongs to the tree of now, also without `--build`."""

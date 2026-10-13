@@ -329,7 +329,7 @@ class TestProjectMessage:
         from fw_context_mcp.mcp.handlers import maintenance
 
         root = _project(tmp_path, TWO_IMAGES)
-        monkeypatch.setattr(maintenance, "_is_bg_reindex_running", lambda root: True)
+        monkeypatch.setattr(maintenance, "read_reindex_state", lambda root: "reindexing")
         monkeypatch.setattr(maintenance, "read_reindex_progress", lambda db_dir: "→ 10/20")
 
         result = get_project_status(project_root=str(root))

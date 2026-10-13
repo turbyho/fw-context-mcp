@@ -62,7 +62,7 @@ def _health(conn, root: Path, tmp_path: Path, image: str) -> dict:
     from fw_context_mcp.config.settings import Config
     from fw_context_mcp.mcp.handlers.maintenance import AutobuildState, _build_health, _IndexTarget, _ProjectFacts
 
-    target = _IndexTarget(root, Config(), "pid", tmp_path / "db" / "index.db", False)
+    target = _IndexTarget(root, Config(), "pid", tmp_path / "db" / "index.db", None)
     build = next(r for r in latest_builds(conn, "pid") if r["image"] == image)
     facts = _ProjectFacts([], AutobuildState.WILL_BUILD, "", False, "")
     return _build_health(conn, target, build, fast=False, hash_cache={}, facts=facts)

@@ -7,6 +7,7 @@ raising, while other tools fail-fast with ProjectNotInitializedError.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -252,9 +253,10 @@ class TestARunningIndexChangesTheAdvice:
     follows it asks the operator for work that is being done.
 
     ``bg_reindex_running`` covers a run of the daemon AND a run the operator
-    started — ``reindex.pid`` carries both.  The arguments of neither can be
-    read, thus the wording must promise nothing about the outcome: only
-    ``--build`` regenerates compile_commands.json.
+    started — ``reindex.pid`` carries both — and work that the daemon
+    scheduled, which ``reindex.pending`` carries.  The arguments of no run
+    can be read, thus the wording must promise nothing about the outcome:
+    only ``--build`` regenerates compile_commands.json.
     """
 
     @staticmethod
@@ -283,7 +285,7 @@ class TestARunningIndexChangesTheAdvice:
         from fw_context_mcp.mcp.handlers import maintenance
 
         root = self._project_needing_a_reindex(tmp_path)
-        monkeypatch.setattr(maintenance, "_is_bg_reindex_running", lambda _root: True)
+        monkeypatch.setattr(maintenance, "read_reindex_state", lambda _root: "reindexing")
 
         result = get_project_status(project_root=str(root))
 
@@ -306,7 +308,7 @@ class TestARunningIndexChangesTheAdvice:
         from fw_context_mcp.mcp.handlers import maintenance
 
         root = self._project_needing_a_reindex(tmp_path)
-        monkeypatch.setattr(maintenance, "_is_bg_reindex_running", lambda _root: False)
+        monkeypatch.setattr(maintenance, "read_reindex_state", lambda _root: None)
 
         result = get_project_status(project_root=str(root))
 
@@ -324,12 +326,38 @@ class TestARunningIndexChangesTheAdvice:
         root = _make_project_root(tmp_path, project_id=pid)
         cfg = _load_cfg(root)
         _create_index_db(cfg.index.db_dir / pid / "index.db", pid, root)
-        monkeypatch.setattr(maintenance, "_is_bg_reindex_running", lambda _root: True)
+        monkeypatch.setattr(maintenance, "read_reindex_state", lambda _root: "reindexing")
 
         result = get_project_status(project_root=str(root))
 
         assert result["status"] == "reindexing"
         assert not result["index_message"].startswith("An index run is in progress")
+
+    def test_work_that_the_daemon_scheduled_counts_as_a_run(self, tmp_path: Path):
+        """Between the spawn and the index lock, only the pending marker shows the work.
+
+        The run writes ``reindex.pid`` when it holds the index lock.  Before
+        that, the interpreter starts, the config loads, and for a PlatformIO
+        project the build system lists the variants.  That can take some
+        seconds.  A status that read only ``reindex.pid`` said "no run" in
+        that time, and the caller started a second index run of the same
+        work.
+        """
+        from fw_context_mcp.mcp.background import PENDING_MARKER
+        from fw_context_mcp.mcp.shared.pid_file import PidFile
+
+        root = self._project_needing_a_reindex(tmp_path)
+        cfg = _load_cfg(root)
+        # A live process that is not this one: the parent of the test.
+        PidFile(cfg.index.db_dir / cfg.project.id / PENDING_MARKER, pid=os.getppid()).write()
+
+        result = get_project_status(project_root=str(root))
+
+        assert result["bg_reindex_running"] is True
+        assert result["index_message"].startswith("An index run is in progress or scheduled"), (
+            result["index_message"][:80]
+        )
+        assert "reindex_progress" not in result, "before the run starts, the log holds the run before it"
 
 
 def _load_cfg(root: Path):

@@ -33,7 +33,7 @@ def cmd_watch_status(args: argparse.Namespace) -> int:
 
     from ..config import derive_project_id
     from ..config import load as load_config
-    from ..mcp.background import _is_bg_reindex_running, read_reindex_progress
+    from ..mcp.background import read_reindex_progress, read_reindex_state
     from ..mcp.daemon import DAEMON_SOCK_NAME, ping_daemon
     from ..utils import resolve_project_root
 
@@ -92,9 +92,13 @@ def cmd_watch_status(args: argparse.Namespace) -> int:
         except (sqlite3.Error, OSError):
             pass
 
-    # Index subprocess
-    if _is_bg_reindex_running(root):
+    # Index subprocess.  "scheduled" is work of the daemon that waits for
+    # the debounce, for a manual operation, or for the start of its run.
+    state = read_reindex_state(root)
+    if state == "reindexing":
         print("Index:      running")
+    elif state == "pending":
+        print("Index:      scheduled")
     else:
         print("Index:      idle")
 

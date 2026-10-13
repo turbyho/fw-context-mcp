@@ -22,7 +22,10 @@ the background reindex.  PID-based ownership prevents this.
 from __future__ import annotations
 
 import os
+import tempfile
 from pathlib import Path
+
+from ...utils import owner_token
 
 
 class PidFile:
@@ -72,8 +75,32 @@ class PidFile:
     # ── Instance methods ────────────────────────────────────────────
 
     def write(self) -> None:
-        """Write our PID to the file, overwriting any existing content."""
-        self._path.write_text(str(self._pid), encoding="utf-8")
+        """Write our PID to the file, overwriting any existing content.
+
+        WHY a temporary file and a rename: a plain write truncates the file
+        first.  A reader in that moment reads an empty file, and
+        :meth:`is_active` deletes a file that holds no PID.  The marker of
+        a live process was then gone.  ``os.replace`` changes the file in
+        one step, thus a reader sees the old PID or the new PID.
+
+        WHY ``mkstemp`` and not ``utils.write_text_atomic``: that function
+        gives each process one temporary name.  Two threads of one MCP
+        server that write ``reindex.pause`` at the same time then share it,
+        and the second rename fails.  The suffix holds
+        ``utils.owner_token``, thus ``utils.remove_stale_tmp`` removes the
+        file of a writer that a kill stopped before the rename.
+        """
+        fd, tmp = tempfile.mkstemp(
+            dir=self._path.parent, prefix=f".{self._path.name}.", suffix=f".{owner_token()}.tmp",
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(str(self._pid))
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, self._path)
+        except OSError:
+            Path(tmp).unlink(missing_ok=True)
+            raise
 
     def unlink_if_ours(self) -> None:
         """Remove the PID file, but **only** if it contains our PID.
@@ -136,10 +163,12 @@ class PidFile:
         Cleans up stale files (PID not alive or corrupt content)
         automatically — the caller never sees a stale PID file as active.
         """
-        if not path.exists():
-            return False
         try:
             pid = int(path.read_text(encoding="utf-8").strip())
+        except FileNotFoundError:
+            # Nothing to clean.  An unlink here deleted the file that a
+            # writer made after this read, thus a live marker.
+            return False
         except (OSError, ValueError):
             path.unlink(missing_ok=True)
             return False
@@ -174,10 +203,11 @@ class PidFile:
         Returns ``None`` when the file does not exist or contains
         garbage.  Corrupt files are cleaned up automatically.
         """
-        if not path.exists():
-            return None
         try:
             return int(path.read_text(encoding="utf-8").strip())
+        except FileNotFoundError:
+            # See is_active: no unlink of a file that a writer made since.
+            return None
         except (OSError, ValueError):
             path.unlink(missing_ok=True)
             return None

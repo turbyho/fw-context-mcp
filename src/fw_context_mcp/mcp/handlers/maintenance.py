@@ -67,7 +67,7 @@ from ...indexer.db import (
 from ...indexer.git_context import head_moved, stored_head
 from ...llm.ollama import check_setup
 from ...utils import HEADER_EXTENSIONS, resolve_project_root
-from ..background import _is_bg_reindex_running, read_reindex_progress
+from ..background import read_reindex_progress, read_reindex_state
 from ..shared.context import (
     _db_path,
     _detect_build_system,
@@ -237,10 +237,26 @@ class _IndexTarget:
     cfg: Config
     project_id: str
     db_path: Path
-    # A run of the daemon or of the operator, see `_is_bg_reindex_running`.
+    # "reindexing" for an index run of the daemon or of the operator, and
+    # for a `reindex_file` or a `reset_index` that holds `write.lock`.
+    # "pending" for work of the daemon that is not complete.  See
+    # `read_reindex_state`.
     # Read once for each call: a run is a fact of the project, and not of a
     # build.
-    bg_running: bool
+    reindex_state: str | None
+
+    @property
+    def bg_running(self) -> bool:
+        """Return True when an index run is active or the daemon has work that comes.
+
+        WHY "pending" counts: the daemon starts its run, and the run holds
+        the index only after the interpreter started and the config loaded.
+        For a PlatformIO project, the build system also lists the variants
+        before the run holds the index.  That can take some seconds.  A
+        status that said "no run" in that time sent the caller to start a
+        second index run of the same work.
+        """
+        return self.reindex_state is not None
 
 
 def _index_target(project_root: str | None) -> _IndexTarget | dict:
@@ -277,7 +293,7 @@ def _index_target(project_root: str | None) -> _IndexTarget | dict:
         }
     # Read BEFORE the database: while a run is in progress the cache of
     # modified files can hold the counts from before it started.
-    return _IndexTarget(root, fw_cfg, derive_project_id(root), db_path, _is_bg_reindex_running(root))
+    return _IndexTarget(root, fw_cfg, derive_project_id(root), db_path, read_reindex_state(root))
 
 
 @dataclass(frozen=True)
@@ -547,7 +563,7 @@ def _build_health(
             )
         elif bg_running:
             branch_advice = (
-                "; an index run is in progress — wait for it rather than "
+                "; an index run is in progress or scheduled — wait for it rather than "
                 "start a second one, and run `fw-context index --build` "
                 "afterwards only if this reason stays (a run without "
                 "--build cannot clear it)"
@@ -646,7 +662,7 @@ def _build_health(
             )
         else:
             index_message = (
-                "Index is usable — background reindex in progress. All queries return accurate results."
+                "Index is usable — background reindex in progress or scheduled. All queries return accurate results."
             )
     elif build_problem or build_missing:
         # First among the reasons: without the build each unit gets no
@@ -687,14 +703,14 @@ def _build_health(
             warning = (
                 "Index was built without full header dependency "
                 "tracking (manifest verification: "
-                f"{manifest_verification}). A reindex is currently "
-                "running — the index will be updated once it "
-                "completes. You may continue analysis, but note "
-                "that header changes since the last completed "
-                "index may not be reflected."
+                f"{manifest_verification}). A reindex is running or "
+                "scheduled, and it updates the index when it "
+                "completes. You can continue the analysis, but the "
+                "index can miss header changes since the last "
+                "completed index run."
             )
             index_message += (
-                f" — manifest verification: {manifest_verification} (reindex in progress — wait for completion)"
+                f" — manifest verification: {manifest_verification} (reindex in progress or scheduled — wait for completion)"
             )
         else:
             warning = (
@@ -777,9 +793,9 @@ def _with_project_notes(result: dict, target: _IndexTarget, restart_reason: str,
     The front of ``index_message`` is what a caller acts on, thus a note
     that changes the action goes there, one time for the call.
 
-    * A run in progress, while a reason asks for a command.  Every message
-      names a command, and a caller that follows it asks the operator for
-      work that is being done.  ``status`` stays "reindex_needed" on
+    * A run in progress or scheduled, while a reason asks for a command.
+      Every message names a command, and a caller that follows it asks the
+      operator for work that is being done.  ``status`` stays "reindex_needed" on
       purpose: the answers of THIS moment come from the rows of the last
       finished run, and "reindexing" carries "continue" in the tool
       instructions.  The wording promises nothing about the outcome: the
@@ -791,7 +807,7 @@ def _with_project_notes(result: dict, target: _IndexTarget, restart_reason: str,
     """
     if result["reindex_needed"] and target.bg_running:
         result["index_message"] = (
-            "An index run is in progress — wait for it rather than start "
+            "An index run is in progress or scheduled — wait for it rather than start "
             "a second one, and ask the operator for no command yet. It "
             "can clear the reasons below, but a reason that needs "
             "`--build` clears only if the run uses it. Answers meanwhile "
@@ -808,7 +824,11 @@ def _with_project_notes(result: dict, target: _IndexTarget, restart_reason: str,
         result["client_restart_required"] = True
         result["client_restart_reason"] = restart_reason
     result["bg_reindex_running"] = target.bg_running
-    if target.bg_running:
+    # Only for "reindexing".  For "pending", the log holds the lines of the
+    # run before until the daemon starts the next run, and the start
+    # empties the log.  Thus a line in that time can come from the old run
+    # or from the next run.
+    if target.reindex_state == "reindexing":
         result["reindex_progress"] = read_reindex_progress(target.db_path.parent)
     # sqlite-vec is an optional C extension for vector embeddings.  Report
     # its availability so semantic_search can degrade gracefully.
@@ -894,7 +914,7 @@ def _project_health(builds: list, healths: list[dict]) -> dict:
         # The words of one build in the same state: no reason to read, and
         # nothing for the caller to do but to wait for the run.
         message = (
-            f"Index is usable — background reindex in progress ({listing}). "
+            f"Index is usable — background reindex in progress or scheduled ({listing}). "
             f"All queries return accurate results."
         )
     elif not reasons:
@@ -959,7 +979,7 @@ def get_project_status(
     Act on ``status``:
 
     * ``"ready"`` — up to date. Continue.
-    * ``"reindexing"`` — background reindex running, or fw-context builds
+    * ``"reindexing"`` — background reindex running or scheduled, or fw-context builds
       new source files on its own; queries stay accurate. Continue.
       ``reindex_progress`` holds the last log line of a running reindex.
     * ``"reindex_needed"`` — schema mismatch, an old row format, changed
@@ -973,8 +993,9 @@ def get_project_status(
       Read ``bg_reindex_running`` before you name any command here.  A run
       already under way does the work, thus a second one only waits on the
       same lock, and ``index_message`` and the branch reason both say so.
-      That field covers a run of the daemon AND a run the operator started
-      — the arguments of neither are readable, thus a reason that needs
+      That field covers a run of the daemon AND a run the operator started,
+      and also work that the daemon has scheduled and not yet started
+      — the arguments of no run are readable, thus a reason that needs
       ``--build`` can outlive a run without it.  This status wins over
       ``"reindexing"`` deliberately: the answers of this moment come from
       the rows of the last FINISHED run.

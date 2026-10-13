@@ -149,9 +149,10 @@ class SyncQueryExecutor:
 
         # Record file identity on EVERY open, including the first.
         # Without the first-open record, _check_reindex would skip identity
-        # detection while _db_identity is None, and a manual
-        # 'fw-context index' run (which leaves no reindex.pid file) would
-        # go undetected until some unrelated reconnect happened.
+        # detection while _db_identity is None.  An index run that started
+        # and ended between two checks (no check saw its reindex.pid) then
+        # stayed unknown to the executor until a reconnect for a different
+        # cause.
         try:
             st = self._db_path.stat()
             self._db_identity = (st.st_ino, st.st_mtime)
@@ -202,19 +203,19 @@ class SyncQueryExecutor:
            single query, because the file never exists in normal
            operation.  The correct test is the existed→vanished edge.
         2. IDENTITY CHANGE: ``(st_ino, st_mtime)`` of the DB file differs
-           from the values recorded at open.  Covers DB replacement by a
-           manual ``fw-context index`` run, which writes no pid file.
+           from the values recorded at open.  Covers DB replacement by an
+           index run that started and ended between two checks.
 
         Why two triggers and not a single mechanism:
 
-        - The pid-file transition catches background reindexes triggered
-          by the daemon (file watcher → reindex).  The daemon writes
-          ``reindex.pid`` before starting and removes it on completion.
-        - The identity change catches manual ``fw-context index`` runs.
-          These produce a new DB file (different inode) or overwrite
-          the existing one (same inode, different mtime).  The manual
-          reindex path does not write a pid file.
-        - Relying only on the pid file would miss manual reindexes.
+        - The pid-file transition catches each index run that a check
+          saw, of the daemon and of the operator.  Each ``fw-context
+          index`` run writes ``reindex.pid`` when it holds the index lock
+          (``cli._index._claim_index``) and removes it when it ends.
+        - The identity change catches a run that no check saw.  Such a
+          run produces a new DB file (different inode) or overwrites the
+          existing one (same inode, different mtime).
+        - Relying only on the pid file would miss a run that no check saw.
           Relying only on identity would miss the case where the
           reindex replaces the DB atomically (rename) but the executor
           was already connected to the old file — the inode changes

@@ -881,8 +881,9 @@ def _owner_tag() -> str:
     share a project on a network file system.  Where ``/proc`` is not
     available (macOS), the tag is the host name.
 
-    Only ``[A-Za-z0-9.-]`` stays in the tag, because the tag goes into a
-    file name.
+    The tag goes into a file name, thus each character of the host name
+    other than ``[A-Za-z0-9.-]`` becomes ``_``, and an empty host name is
+    ``_``.  :data:`_TMP_OWNER` accepts these characters.
     """
     host = re.sub(r"[^A-Za-z0-9.-]", "_", socket.gethostname()) or "_"
     try:
@@ -956,7 +957,7 @@ def owner_is_dead(token: str) -> bool:
 
 # The owner token at the end of a temporary name: digits, "@", then the tag
 # (see _owner_tag).  No base name holds "@", thus the match is unambiguous.
-_TMP_OWNER = re.compile(r"\.(\d+@[A-Za-z0-9.-]+)\.tmp$")
+_TMP_OWNER = re.compile(r"\.(\d+@[A-Za-z0-9._-]+)\.tmp$")
 
 
 def write_text_atomic(path: Path, text: str, *, mode: int | None = None) -> None:
@@ -1005,11 +1006,13 @@ def write_text_atomic(path: Path, text: str, *, mode: int | None = None) -> None
 
 
 def remove_stale_tmp(directory: Path) -> int:
-    """Remove the temporary files of :func:`write_text_atomic` whose writer stopped.
+    """Remove the temporary files whose writer stopped.
 
-    Returns the count.  A manifest is tens of MB on a large project, thus a
-    file that a kill left behind is worth removing.  A file of a writer that
-    still runs, or of another host, stays: :func:`owner_is_dead` decides.
+    Two writers name their temporary files with :func:`owner_token`:
+    :func:`write_text_atomic` and ``PidFile.write``.  Returns the count.  A
+    manifest is tens of MB on a large project, thus a file that a kill left
+    behind is worth removing.  A file of a writer that still runs, or of
+    another host, stays: :func:`owner_is_dead` decides.
     """
     removed = 0
     for tmp in directory.glob(".*.tmp"):

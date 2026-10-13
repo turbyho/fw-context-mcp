@@ -100,7 +100,7 @@ def branch_of_description(description: str) -> str:
 # then one read of a small file for each query.  A root without git is asked
 # again after _NO_GIT_RECHECK_S: a `git init` while a server runs is then
 # seen, and a tree without git costs one `git` call a minute, not one for
-# each query.
+# each query.  A path whose directory is gone is asked again at once.
 _HEAD_PATHS: dict[str, tuple[Path | None, float]] = {}
 _NO_GIT_RECHECK_S = 60.0
 
@@ -125,8 +125,14 @@ def head_path(project_root: Path) -> Path | None:
     key = str(root)
     now = time.monotonic()
     cached = _HEAD_PATHS.get(key)
-    if cached is not None and (cached[0] is not None or now - cached[1] < _NO_GIT_RECHECK_S):
-        return cached[0]
+    if cached is not None:
+        path, when = cached
+        # A git directory that went away (a removed worktree, `rm -rf .git`)
+        # makes the cached path wrong: the tree is then asked again.
+        if path is not None and path.parent.is_dir():
+            return path
+        if path is None and now - when < _NO_GIT_RECHECK_S:
+            return None
     try:
         out = subprocess.check_output(
             ["git", "rev-parse", "--git-path", "HEAD"],
@@ -139,9 +145,9 @@ def head_path(project_root: Path) -> Path | None:
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired, UnicodeDecodeError):
         out = ""
     # The path is relative to the directory of the call, or absolute.
-    path = (root / out) if out else None
-    _HEAD_PATHS[key] = (path, now)
-    return path
+    found = (root / out) if out else None
+    _HEAD_PATHS[key] = (found, now)
+    return found
 
 
 def read_head(project_root: Path) -> str:

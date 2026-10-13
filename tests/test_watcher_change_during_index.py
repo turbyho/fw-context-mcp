@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -33,11 +34,12 @@ DLOG = logging.LoggerAdapter(logging.getLogger("test.daemon"), {})
 
 @pytest.fixture
 def fast_loop(monkeypatch):
-    """Remove the two waits that would make each test take seconds."""
+    """Remove the waits that would make each test take seconds."""
     from fw_context_mcp.mcp import daemon as daemon_mod
 
     monkeypatch.setattr(daemon_mod, "_DEBOUNCE_S", 0.0)
     monkeypatch.setattr(daemon_mod, "_WATCH_TIMEOUT", 0.01)
+    monkeypatch.setattr(daemon_mod, "_HELD_POLL_S", 0.01)
     return daemon_mod
 
 
@@ -54,13 +56,6 @@ def _stop_after(predicate, *, max_polls: int = 200):
         return bool(predicate()) or state["n"] > max_polls
 
     return _expired
-
-
-def _no_pause(monkeypatch) -> None:
-    """Report that no manual operation holds the index."""
-    from fw_context_mcp.mcp import background as background_mod
-
-    monkeypatch.setattr(background_mod, "_check_bg_pause", lambda root: False)
 
 
 # ── The reindex loop must pick a change up after the run it raced ────────────
@@ -88,19 +83,18 @@ class TestChangeDuringIndex:
     ):
         """This is the defect.  One edit at 16:09:21, one more index run."""
         daemon_mod = fast_loop
-        _no_pause(monkeypatch)
-        pending = asyncio.Event()
+        pending = daemon_mod._PendingWork(tmp_path)
         pending.set()
         flag_at_spawn: list[bool] = []
 
-        async def _fake_run(project_root, db_dir, *, force_refs=False, with_build=False):
+        async def _fake_run(project_root, db_dir, *, force_refs=False):
             flag_at_spawn.append(pending.is_set())
             return SimpleNamespace(pid=4321, returncode=0)
 
         async def _fake_wait(proc, shutdown, *, db_dir):
             if len(flag_at_spawn) == 1:
                 pending.set()  # the user writes the file mid-run
-            return False
+            return 0
 
         monkeypatch.setattr(daemon_mod, "_run_index_async", _fake_run)
         monkeypatch.setattr(daemon_mod, "_wait_index", _fake_wait)
@@ -119,17 +113,16 @@ class TestChangeDuringIndex:
     def test_a_quiet_run_is_not_repeated(self, monkeypatch, tmp_path: Path, fast_loop):
         """No change during the run, thus one run only."""
         daemon_mod = fast_loop
-        _no_pause(monkeypatch)
-        pending = asyncio.Event()
+        pending = daemon_mod._PendingWork(tmp_path)
         pending.set()
         spawns: list[int] = []
 
-        async def _fake_run(project_root, db_dir, *, force_refs=False, with_build=False):
+        async def _fake_run(project_root, db_dir, *, force_refs=False):
             spawns.append(1)
             return SimpleNamespace(pid=1, returncode=0)
 
         async def _fake_wait(proc, shutdown, *, db_dir):
-            return False
+            return 0
 
         monkeypatch.setattr(daemon_mod, "_run_index_async", _fake_run)
         monkeypatch.setattr(daemon_mod, "_wait_index", _fake_wait)
@@ -146,31 +139,28 @@ class TestChangeDuringIndex:
     def test_a_held_pause_keeps_the_change(self, monkeypatch, tmp_path: Path, fast_loop):
         """A manual single-file reindex covers one file, not the other changes."""
         daemon_mod = fast_loop
-        from fw_context_mcp.mcp import background as background_mod
+        from fw_context_mcp.mcp.background import PENDING_MARKER
+        from fw_context_mcp.mcp.shared.pid_file import PidFile
 
-        monkeypatch.setattr(background_mod, "_check_bg_pause", lambda root: True)
-        waits: list[int] = []
+        # A live process that is not this one holds the pause.
+        PidFile(tmp_path / "reindex.pause", pid=os.getppid()).write()
 
-        async def _never_clears(root, shutdown):
-            waits.append(1)
-            return False
-
-        async def _must_not_run(project_root, db_dir, *, force_refs=False, with_build=False):
+        async def _must_not_run(project_root, db_dir, *, force_refs=False):
             raise AssertionError("the loop started an index under a held pause")
 
-        monkeypatch.setattr(daemon_mod, "_wait_for_pause_to_clear", _never_clears)
         monkeypatch.setattr(daemon_mod, "_run_index_async", _must_not_run)
 
-        pending = asyncio.Event()
+        pending = daemon_mod._PendingWork(tmp_path)
         pending.set()
         self._run_loop(
             daemon_mod,
             pending=pending,
-            ping_expired=_stop_after(lambda: len(waits) >= 1),
+            ping_expired=_stop_after(lambda: False, max_polls=20),
             tmp_path=tmp_path,
         )
 
         assert pending.is_set(), "the loop dropped a change that nobody indexed"
+        assert PidFile.is_active(tmp_path / PENDING_MARKER), "the other processes do not see the work"
 
 
 # ── The watcher task must set the flag, and filter on the file type ──────────

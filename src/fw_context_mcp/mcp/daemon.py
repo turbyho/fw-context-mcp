@@ -73,11 +73,13 @@ import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import TextIO
 
 from ..config import derive_project_id
 from ..config import load as load_config
 from ..exit_codes import EXIT_ALREADY_RUNNING, EXIT_SUPERSEDED
-from ..utils import HEADER_EXTENSIONS, TU_EXTENSIONS
+from ..utils import HEADER_EXTENSIONS, TU_EXTENSIONS, remove_stale_tmp
+from .background import PENDING_MARKER
 from .shared.pid_file import PidFile
 
 log = logging.getLogger(__name__)
@@ -88,12 +90,15 @@ PING_INTERVAL = 15   # How often each MCP server pings (seconds)
 PING_TIMEOUT = 60    # Exit after this long without any ping (seconds)
 _DEBOUNCE_S = 2.0    # Collect changes before spawning index
 _WATCH_TIMEOUT = 5   # watchfiles yield_on_timeout interval (seconds)
-# A reindex abandoned because a manual operation took the index over is
-# retried, not dropped — its changes are still unindexed.  Bounded because a
-# manual operation that keeps re-taking the index would otherwise spin here;
-# after this the next file change picks the work up.
-_SUPERSEDED_RETRIES = 3
-_PAUSE_WAIT_S = 120.0  # How long to wait for a manual operation to release
+# A run that a manual operation stopped (EXIT_SUPERSEDED) is work that is
+# still to do, thus the loop runs it again when the operation releases the
+# index.  The limit is for an operation that stops each new run, for example
+# an LLM that calls reindex_file after each edit: each retry starts an index
+# subprocess.  The limit counts the stopped runs in a row, the first run
+# included, thus 3 runs give 2 retries.  After the limit the next change
+# brings the work back.
+_SUPERSEDED_RUNS_MAX = 3
+_HELD_POLL_S = 2.0  # How often the loop looks if the other process released the index
 
 # ── Watched file extensions ──────────────────────────────────────────────────
 # What the watcher reacts to: a translation unit or a header, by the
@@ -150,6 +155,58 @@ def ping_daemon(project_root: Path) -> bool:
         sock.close()
 
 
+# ── Pending work ─────────────────────────────────────────────────────────────
+
+
+class _PendingWork(asyncio.Event):
+    """The flag of the work that the daemon has, and the marker that shows it to the other processes.
+
+    The marker ``reindex.pending`` holds the PID of the daemon
+    (``background.read_reindex_state`` reads it).  It means "the daemon has
+    work that is not done".  :meth:`set` writes it.  Three places remove
+    it:
+
+    - The reindex loop, at the end of a turn that leaves no work
+      (:meth:`hide_if_done`), also a turn that gives the work up.
+    - ``_cleanup_daemon``, when the daemon stops.
+    - ``daemon_main``, when the daemon starts: a daemon that a SIGKILL
+      stopped leaves its marker, and its PID can come back.
+
+    WHY the marker stays while a run works: the run owns ``reindex.pid``
+    only from the moment that it holds the index lock until it releases
+    it.  The start of the subprocess comes before, and the outcome of the
+    run, which can be "do it again", comes after.  A marker that went away
+    at the start of the run left these times without a state, and the
+    answers of that time said "run fw-context index" for work that came.
+    While the run owns ``reindex.pid``, the reader gives "reindexing"
+    first.
+
+    WHY :meth:`set` writes the marker, and not the loop: the loop takes the
+    flag only on its next turn.  A change during a run was invisible until
+    that turn, measured at 1.4 s.
+    """
+
+    def __init__(self, db_dir: Path) -> None:
+        super().__init__()
+        self.marker = PidFile(db_dir / PENDING_MARKER)
+
+    def set(self) -> None:
+        super().set()
+        self.show()
+
+    def show(self) -> None:
+        """Write the marker.  A failed write costs the state only, thus the work still runs."""
+        try:
+            self.marker.write()
+        except OSError as exc:
+            log.warning("Cannot write %s: %s", self.marker.path, exc)
+
+    def hide_if_done(self) -> None:
+        """Remove the marker when no change came after the last clear of the flag."""
+        if not self.is_set():
+            self.marker.unlink_if_ours()
+
+
 # ── Daemon main (asyncio) ────────────────────────────────────────────────────
 
 
@@ -172,6 +229,15 @@ async def daemon_main(project_root: Path) -> None:
     except (OSError, BlockingIOError):
         log.error("Daemon already running for %s", project_root)
         sys.exit(1)
+
+    # Only the daemon that holds the lock writes the marker of pending work.
+    # A marker that is there now is from a daemon that a SIGKILL stopped,
+    # and a new process with its old PID makes it read as work that comes.
+    # The startup check of the reindex loop finds that work again.
+    (db_dir / PENDING_MARKER).unlink(missing_ok=True)
+    # A kill between the write and the rename of a marker leaves its
+    # temporary file (`PidFile.write`).  Only the file of a dead writer goes.
+    remove_stale_tmp(db_dir)
 
     pid_file = db_dir / "watcher.pid"
     # O_EXCL | O_CREAT does not follow symlinks — defense against symlink attack
@@ -217,6 +283,7 @@ async def daemon_main(project_root: Path) -> None:
     dlog.info("Daemon started  socket=%s", sock_path)
 
     watch_task: asyncio.Task | None = None
+    head_task: asyncio.Task | None = None
     try:
         # Load the build-dir exclusion patterns from the manifest (derived
         # from SDK detection and the ``[index] exclude_paths`` config).  They
@@ -230,26 +297,13 @@ async def daemon_main(project_root: Path) -> None:
         # Start the watcher BEFORE the initial index.  The initial index runs
         # as long as any other index run, thus a watcher that starts after it
         # loses each edit that a user makes while it runs.
-        pending: asyncio.Event = asyncio.Event()
+        pending = _PendingWork(db_dir)
         watch_task = asyncio.create_task(
             _watch_changes(project_root, build_patterns, pending, shutdown, dlog)
         )
-
-        # ── Initial staleness check ──────────────────────────────────────
-        # watchfiles reports new events only.  Files that changed before the
-        # daemon started are found here, and become the first pending change.
-        # The check is synchronous, thus it runs in an executor and does not
-        # block the socket server.
-        from .background import _check_bg_pause as _bg_paused
-        needs, reasons = await asyncio.get_running_loop().run_in_executor(
-            None, _staleness_check, project_root
-        )
-        force_refs = False
-        if needs and not _bg_paused(project_root):
-            dlog.info("Initial index needed (%s)", ", ".join(reasons))
-            # A reason of a build carries its variant/image in front.
-            force_refs = any(reason.endswith("refs missing") for reason in reasons)
-            pending.set()
+        # A checkout changes HEAD, and HEAD is outside of the files that the
+        # watcher above reacts to (and outside of the tree for a worktree).
+        head_task = asyncio.create_task(_watch_head(project_root, pending, shutdown, dlog))
 
         def _set_index_proc(proc: asyncio.subprocess.Process | None) -> None:
             """Publish the running subprocess, thus the cleanup can stop it."""
@@ -275,13 +329,15 @@ async def daemon_main(project_root: Path) -> None:
             ping_expired=_ping_expired,
             on_index_proc=_set_index_proc,
             build_patterns=build_patterns,
-            force_refs=force_refs,
+            startup_check=_staleness_check,
         )
 
     finally:
         shutdown.set()
         if watch_task is not None:
             await _stop_watcher(watch_task)
+        if head_task is not None:
+            await _stop_watcher(head_task)
         await _cleanup_daemon(index_proc, server, sock_path, pid_file, lock_fd, shutdown)
 
 
@@ -289,6 +345,32 @@ async def daemon_main(project_root: Path) -> None:
 
 
 # ── Change watcher ───────────────────────────────────────────────────────────
+
+
+class _WatchErrors:
+    """Log the first failure of a watch as a warning, and the same failure again at debug level.
+
+    WHY: a watch that cannot start fails again on each retry, every 5 s.
+    The limit of inotify instances of the user (128 on many systems) is
+    such a cause, and the daemon has two watches.  A warning for each
+    retry wrote 720 lines an hour, and the first line says all of it.
+    A watch that works again (:meth:`clear`) makes the next failure a
+    warning again.
+    """
+
+    def __init__(self, dlog: logging.LoggerAdapter, where: str) -> None:
+        self._dlog = dlog
+        self._where = where
+        self._last: str | None = None
+
+    def report(self, exc: BaseException) -> None:
+        text = f"{type(exc).__name__}: {exc}"
+        level = logging.DEBUG if text == self._last else logging.WARNING
+        self._dlog.log(level, "watchfiles error on %s: %s", self._where, text)
+        self._last = text
+
+    def clear(self) -> None:
+        self._last = None
 
 
 async def _watch_changes(
@@ -317,6 +399,7 @@ async def _watch_changes(
     """
     from watchfiles import awatch
 
+    errors = _WatchErrors(dlog, str(project_root))
     while not shutdown.is_set():
         try:
             async for changes in awatch(
@@ -329,13 +412,130 @@ async def _watch_changes(
             ):
                 if shutdown.is_set():
                     return
+                errors.clear()
                 for _, changed_path_str in changes:
                     if _is_source_file(changed_path_str, build_patterns):
                         pending.set()
                         break
         except (OSError, RuntimeError) as exc:
-            dlog.warning("watchfiles error: %s", exc)
+            errors.report(exc)
             await asyncio.sleep(5)
+
+
+async def _watch_head(
+    project_root: Path,
+    pending: asyncio.Event,
+    shutdown: asyncio.Event,
+    dlog: logging.LoggerAdapter,
+) -> None:
+    """Set *pending* for each change of the file HEAD of *project_root*, until shutdown.
+
+    A checkout changes HEAD, and the run that follows builds when the
+    checkout of a build differs (``cli._index._plan_auto_build``).  Without
+    this task only the source files that a checkout rewrites started a
+    run, and a checkout that changed only a configuration file started
+    nothing.
+
+    WHY the directory of HEAD and not the file: git writes ``HEAD.lock``
+    and renames it to ``HEAD``, thus a watch of the inode of the old file
+    sees nothing after the first checkout.  The watch is not recursive: the
+    directory of HEAD is the git directory, with all of its objects.
+
+    WHY ``watch_filter=None``: the default filter of watchfiles ignores each
+    path in a ``.git`` directory, and HEAD is always in one.  With that
+    filter this task saw no checkout.
+
+    WHY the text of HEAD decides, and not the event: git also rewrites
+    HEAD with the same text, for a checkout of the branch that is out
+    already.  Such an event started a run for nothing.  The text is what
+    the index compares too (``git_context.read_head``), thus a run comes
+    exactly when the checkout of the index can differ.
+
+    WHY the task reads the text at each output of the watch, also at the
+    empty output after each timeout, and not only for an event of HEAD:
+    the watch starts in a thread, and a checkout before the watch exists
+    has no event.  A read at each output finds it within one timeout.  The
+    read is of one small file.  For the same reason no event is compared
+    with the path of HEAD: ``.git/logs/HEAD`` has the same name, and
+    macOS gives ``/private/var`` for ``/var``.
+
+    A tree without git gets a watch when ``git init`` comes later:
+    ``head_path`` looks for the git directory again after its recheck time.
+    A git directory that goes away, or that ``rm -rf .git && git init``
+    replaces, stops the watch: inotify watches the old directory, which
+    gets no more events.  The task then finds HEAD again.
+
+    On a file system that gives a directory another inode at each stat
+    (some FUSE file systems), the watch starts again at each output.  The
+    checkout still reaches the daemon.
+    """
+    from watchfiles import Change, awatch
+
+    from ..indexer.git_context import _NO_GIT_RECHECK_S, head_label, head_path, read_head
+
+    loop = asyncio.get_running_loop()
+    errors = _WatchErrors(dlog, f"the git directory of {project_root}")
+    # The checkout that this task saw last.  The startup check compares the
+    # index with the checkout of the start, thus the task starts from it.
+    seen = await loop.run_in_executor(None, read_head, project_root)
+
+    async def _follow() -> None:
+        nonlocal seen
+        now = await loop.run_in_executor(None, read_head, project_root)
+        if now != seen:
+            dlog.info(
+                "Checkout changed from %s to %s — the index follows it",
+                head_label(seen) or "no git", head_label(now) or "no git",
+            )
+            seen = now
+            pending.set()
+
+    while not shutdown.is_set():
+        head = await loop.run_in_executor(None, head_path, project_root)
+        git_dir = head.parent.resolve() if head is not None else None
+        identity = _dir_identity(git_dir) if git_dir is not None else None
+        if head is None or git_dir is None or identity is None:
+            try:
+                await asyncio.wait_for(shutdown.wait(), timeout=_NO_GIT_RECHECK_S)
+            except TimeoutError:
+                pass
+            continue
+        try:
+            async for changes in awatch(
+                git_dir,
+                watch_filter=None,
+                debounce=int(_DEBOUNCE_S * 1000),
+                recursive=False,
+                rust_timeout=_WATCH_TIMEOUT * 1000,
+                yield_on_timeout=True,
+                stop_event=shutdown,
+            ):
+                if shutdown.is_set():
+                    return
+                errors.clear()
+                await _follow()
+                # The deletion of the directory itself is necessary too: a
+                # new directory can get the inode of the old one.
+                if any(
+                    change == Change.deleted and Path(changed) == git_dir for change, changed in changes
+                ) or _dir_identity(git_dir) != identity:
+                    dlog.info("The git directory %s went away — looking for HEAD again", git_dir)
+                    break
+        except (OSError, RuntimeError) as exc:
+            errors.report(exc)
+            await asyncio.sleep(5)
+
+
+def _dir_identity(path: Path) -> tuple[int, int] | None:
+    """Return the device and the inode of the directory *path*, or None when it is not there.
+
+    A directory of the same name that replaces it has another inode.
+    """
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    return (info.st_dev, info.st_ino)
 
 
 async def _stop_watcher(task: asyncio.Task) -> None:
@@ -361,13 +561,13 @@ async def _reindex_loop(
     project_root: Path,
     db_dir: Path,
     *,
-    pending: asyncio.Event,
+    pending: _PendingWork,
     shutdown: asyncio.Event,
     dlog: logging.LoggerAdapter,
     ping_expired: Callable[[], bool],
     on_index_proc: Callable[[asyncio.subprocess.Process | None], None],
     build_patterns: list[str] | None = None,
-    force_refs: bool = False,
+    startup_check: Callable[[Path], tuple[bool, list[str]]] | None = None,
 ) -> None:
     """Run one index for each pending change, until shutdown or a ping timeout.
 
@@ -378,10 +578,30 @@ async def _reindex_loop(
     edit starts the next run.  The cost of this order is one more run when
     the subprocess already saw the change.  A run that is not necessary is
     cheaper than an index that is not correct.
-    """
-    from .background import _check_bg_pause as _bg_paused
 
+    *startup_check* finds the work of the time when no daemon watched:
+    watchfiles reports new events only.  It runs here, and not before the
+    loop, because it reads the index: a manual run that holds the index
+    writes it, and a check of a half-written index finds work that the
+    manual run does.  ``refs missing`` from such a check started a full
+    parse of the project after the manual run.
+    """
     loop = asyncio.get_running_loop()
+    force_refs = False
+    if startup_check is not None:
+        if not await _index_is_free(db_dir, shutdown, ping_expired, dlog):
+            return
+        # Synchronous, thus in an executor: the socket server answers the
+        # pings in this time.
+        needs, reasons = await loop.run_in_executor(None, startup_check, project_root)
+        if needs:
+            dlog.info("Initial index needed (%s)", ", ".join(reasons))
+            # A reason of a build carries its variant/image in front.
+            force_refs = any(reason.endswith("refs missing") for reason in reasons)
+            pending.set()
+
+    # Runs in a row that a manual operation stopped.
+    superseded_runs = 0
 
     while not shutdown.is_set():
         if not pending.is_set():
@@ -398,47 +618,108 @@ async def _reindex_loop(
         # touch many files, and one index run covers all of them.
         await asyncio.sleep(_DEBOUNCE_S)
 
-        # A manual operation can hold the index.  Keep the pending flag while
-        # it does — a single-file reindex does not cover the other changes.
-        if _bg_paused(project_root):
-            dlog.info("Manual index in progress — the background reindex waits")
-            if not await _wait_for_pause_to_clear(project_root, shutdown):
-                continue
+        # The flag stays while another process holds the index: a
+        # single-file reindex does not cover the other changes.
+        if not await _index_is_free(db_dir, shutdown, ping_expired, dlog):
+            return
 
         pending.clear()
-
-        # A manual operation can also take the index over mid-run, and the run
-        # then abandons itself rather than finishing from a snapshot that
-        # operation invalidated.  Its work is still outstanding, thus retry
-        # after the marker clears.  After the last attempt the loop gives the
-        # work up, because a manual operation that takes the index over again
-        # and again would otherwise spawn one index subprocess after another.
-        for _attempt in range(_SUPERSEDED_RETRIES):
+        try:
             proc = await _run_index_async(project_root, db_dir, force_refs=force_refs)
-            on_index_proc(proc)
-            superseded = await _wait_index(proc, shutdown, db_dir=db_dir)
-            on_index_proc(None)
-            if not superseded or shutdown.is_set():
-                break
-            if not await _wait_for_pause_to_clear(project_root, shutdown):
-                dlog.info(
-                    "Pause marker still held — leaving the reindex to the next change"
-                )
-                break
-        else:
-            dlog.warning(
-                "Background reindex superseded %d times — giving up until the "
-                "next change",
-                _SUPERSEDED_RETRIES,
-            )
-        force_refs = False
+        except OSError as exc:
+            # The daemon stays: it watches on, and the next change tries
+            # again.  Without a marker the answers tell the LLM to run
+            # `fw-context index`, and that run shows the cause.
+            dlog.error("Cannot start the background reindex: %s — the work waits for the next change", exc)
+            superseded_runs = 0
+            pending.hide_if_done()
+            continue
+        on_index_proc(proc)
+        returncode = await _wait_index(proc, shutdown, db_dir=db_dir)
+        on_index_proc(None)
+        if returncode is None:
+            return  # shutdown
 
+        if returncode == EXIT_ALREADY_RUNNING:
+            # Another run took the index lock after the check above.  Not a
+            # retry that counts: the next turn waits for that run.
+            dlog.info("Background index skipped — another index run holds the index; it runs after that run")
+            pending.set()
+            continue
+        if returncode == EXIT_SUPERSEDED:
+            # A manual operation took the index over.  The changes of this
+            # run are still not in the index, and the next turn waits for
+            # the operation.
+            superseded_runs += 1
+            if superseded_runs < _SUPERSEDED_RUNS_MAX:
+                dlog.info("Background index superseded by a manual operation — it runs again after it")
+                pending.set()
+                continue
+            dlog.warning(
+                "Background index superseded %d times in a row — giving up until the next change",
+                _SUPERSEDED_RUNS_MAX,
+            )
+        elif returncode == 0:
+            dlog.info("Background index completed")
+        else:
+            dlog.warning("Background index exited with %d", returncode)
+        superseded_runs = 0
+        force_refs = False
+        # The work of this turn is done or given up.  A change that came
+        # during the run keeps the marker that its set() wrote.
+        pending.hide_if_done()
+
+        if returncode == 0:
+            # After the marker: the run is done, and this is maintenance.
+            await loop.run_in_executor(None, _optimize_db, db_dir)
         # A completed run can write a new manifest.  Refresh the exclusions in
         # place, because the watcher task holds the same list object.
         if build_patterns is not None and not shutdown.is_set():
             build_patterns[:] = await loop.run_in_executor(
                 None, _load_build_patterns, db_dir
             )
+
+
+def _index_held(db_dir: Path) -> bool:
+    """Return True while another process holds the index.
+
+    ``reindex.pause``: ``reindex_file`` and ``reset_index`` of an MCP
+    server write it, and each ``fw-context index`` run.  ``reindex.pid``:
+    each ``fw-context index`` run writes it when it holds the index lock
+    (``cli._index._claim_index``), also a run that holds no pause marker
+    any more because a ``reindex_file`` replaced it and then removed it.
+    Between two turns no run of this daemon owns either file: the run
+    removes them when it ends, and ``_wait_index`` removes the files of a
+    run that a kill stopped.
+    """
+    return PidFile.is_active(db_dir / "reindex.pause") or PidFile.is_active(db_dir / "reindex.pid")
+
+
+async def _index_is_free(
+    db_dir: Path,
+    shutdown: asyncio.Event,
+    ping_expired: Callable[[], bool],
+    dlog: logging.LoggerAdapter,
+) -> bool:
+    """Wait while another process holds the index.
+
+    Returns True when the index is free, and False on shutdown or a ping
+    timeout.  WHY no time limit: a manual index of a large project runs
+    for hours, and work that the loop gives up after a limit was not done
+    by anybody.  The loop must still stop with the daemon, thus this
+    function looks at the shutdown and the pings.
+    """
+    if not _index_held(db_dir):
+        return True
+    dlog.info("Another process holds the index — the background reindex waits")
+    while _index_held(db_dir):
+        if shutdown.is_set() or ping_expired():
+            return False
+        try:
+            await asyncio.wait_for(shutdown.wait(), timeout=_HELD_POLL_S)
+        except TimeoutError:
+            pass
+    return not shutdown.is_set()
 
 
 async def _setup_unix_socket(db_dir: Path, on_ping) -> tuple[asyncio.Server, Path]:
@@ -510,6 +791,9 @@ async def _cleanup_daemon(
     shutdown.set()
     server.close()
     await server.wait_closed()
+    # Work that this daemon did not start goes with it.  The startup check
+    # of the next daemon finds it again.
+    PidFile(sock_path.parent / PENDING_MARKER).unlink_if_ours()
     _cleanup_files(sock_path, pid_file)
     fcntl.flock(lock_fd, fcntl.LOCK_UN)
     os.close(lock_fd)
@@ -644,18 +928,25 @@ async def _run_index_async(
     ``--build`` from here failed with "--build and --background are mutually
     exclusive" in under a second.
 
-    Writes the subprocess PID to ``reindex.pid`` so ``_is_bg_reindex_running``
-    can reliably detect an active index run (without false positives from
-    the daemon's ``watcher.lock``).
+    WHY the daemon writes no ``reindex.pid``: the run writes it when it
+    holds the index lock (``cli._index._claim_index``), and removes it when
+    it releases the lock.  A file that the daemon wrote before the spawn
+    named a run that could lose the lock to a manual run, and the daemon
+    then overwrote the file of that manual run.  Until the run holds the
+    lock, the marker of the pending work shows it.
 
     Returns the asyncio Process handle — caller must wait or terminate.
+    Raises :class:`OSError` when the subprocess cannot start.
     """
     log_file = db_dir / "reindex.log"
+    log_target: int | TextIO
     try:
         fd = os.open(log_file, os.O_NOFOLLOW | os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
-        log_fh = os.fdopen(fd, "w", closefd=True)
-    except OSError:
-        log_fh = _DEVNULL  # type: ignore[assignment]
+        log_target = os.fdopen(fd, "w", closefd=True)
+    except OSError as exc:
+        # The run does its work also without a log.
+        log.warning("Cannot open %s: %s — the background index runs without a log", log_file, exc)
+        log_target = asyncio.subprocess.DEVNULL
 
     env: dict[str, str] = {
         **os.environ,
@@ -665,66 +956,18 @@ async def _run_index_async(
         env["FW_CONTEXT_FORCE_REFINDEX"] = "1"
 
     log.info("Starting background index for %s (force_refs=%s)", project_root, force_refs)
-
-    # Write reindex.pid BEFORE spawning so a concurrent daemon
-    # restart sees the marker and doesn't spawn a duplicate.
-    rp = db_dir / "reindex.pid"
-    old_pid = PidFile.read_pid(rp)
-    if old_pid is not None and PidFile._pid_exists(old_pid):
-        raise RuntimeError(
-            f"Another index process (pid {old_pid}) is already running for {project_root}"
-        )
-    # Clean up any stale file before writing ours.
-    rp.unlink(missing_ok=True)
-    pf = open(rp, "w", encoding="utf-8")
-    pf.write(str(os.getpid()))
-    pf.flush()
-
     try:
-        proc = await asyncio.create_subprocess_exec(
+        return await asyncio.create_subprocess_exec(
             sys.executable, "-u", "-m", "fw_context_mcp.cli", "index", "--background",
             cwd=str(project_root),
-            stdout=log_fh,
+            stdout=log_target,
             stderr=asyncio.subprocess.STDOUT,
             env=env,
         )
-        # Update PID file with the real subprocess PID.
-        pf.seek(0)
-        pf.truncate()
-        pf.write(str(proc.pid))
-        pf.close()
-        if log_fh is not _DEVNULL:
-            log_fh.close()
-    except (ValueError, TypeError, RuntimeError, AttributeError, FileExistsError, OSError):
-        log.exception("Failed to spawn index subprocess")
-        pf.close()
-        rp.unlink(missing_ok=True)
-        if log_fh is not _DEVNULL:
-            log_fh.close()
-        raise
-    return proc
-
-
-async def _wait_for_pause_to_clear(
-    project_root: Path, shutdown: asyncio.Event
-) -> bool:
-    """Wait for the manual operation to release the index.
-
-    Returns True when the marker cleared and a retry makes sense, False on
-    shutdown or when the operation outlasts the wait — a manual reindex of a
-    large project can run for an hour, and holding the daemon in a poll loop
-    that whole time buys nothing over letting the next file change trigger it.
-    """
-    from .background import _check_bg_pause as _bg_paused
-
-    deadline = time.monotonic() + _PAUSE_WAIT_S
-    while time.monotonic() < deadline:
-        if shutdown.is_set():
-            return False
-        if not _bg_paused(project_root):
-            return True
-        await asyncio.sleep(2.0)
-    return False
+    finally:
+        # The subprocess has its own copy of the file descriptor.
+        if not isinstance(log_target, int):
+            log_target.close()
 
 
 async def _wait_index(
@@ -732,15 +975,17 @@ async def _wait_index(
     shutdown: asyncio.Event,
     *,
     db_dir: Path,
-) -> bool:
+) -> int | None:
     """Wait for *proc* to finish, polling *shutdown* every 500 ms.
 
-    When *shutdown* is set, terminates the subprocess gracefully
-    (SIGTERM → 10 s → SIGKILL).  Removes ``reindex.pid`` on exit
-    so ``_is_bg_reindex_running`` doesn't report a stale PID.
+    Returns the exit code of the run, or None when *shutdown* stopped it.
+    On shutdown the run gets SIGTERM, and SIGKILL after 10 s.
 
-    Returns True when the run was superseded by a manual operation and its
-    work still has to be done.
+    Removes ``reindex.pid`` and ``reindex.pause`` when they still name
+    *proc*: a run that a SIGKILL stopped cannot remove them, and the PID
+    can come back as another process.  A ``reindex.pause`` of that PID
+    then makes ``_index_is_free`` wait, with no time limit, for a process
+    that has no relation to the index.  The files of another run stay.
     """
     try:
         while proc.returncode is None:
@@ -752,34 +997,12 @@ async def _wait_index(
                     log.warning("Index subprocess did not exit after SIGTERM, killing")
                     proc.kill()
                     await proc.wait()
-                return False
+                return None
             await asyncio.sleep(0.5)
     finally:
         PidFile(db_dir / "reindex.pid", pid=proc.pid).unlink_if_ours()
-
-    if proc.returncode == EXIT_SUPERSEDED:
-        # The run stopped because a manual operation took the index over.
-        # The changes that triggered it are still unindexed, so this must not
-        # be treated as done — going back to waiting for the NEXT change
-        # would leave them out until something else happens to be edited.
-        log.info("Background index superseded by a manual operation — will retry")
-        return True
-    if proc.returncode == EXIT_ALREADY_RUNNING:
-        # Another indexing run owns the index.  Nothing to retry — that run
-        # covers this project, and racing it is what the lock prevents.
-        log.info("Background index skipped — another index run holds the index")
-        return False
-    if proc.returncode == 0:
-        log.info("Background index completed")
-        # WAL files grow unboundedly during long reindex runs because
-        # the index subprocess writes continuously without checkpointing.
-        # PRAGMA optimize triggers a checkpoint + ANALYZE to shrink the
-        # WAL and refresh query-planner statistics.  This runs AFTER the
-        # index completes — no lock contention with the subprocess.
-        _optimize_db(db_dir)
-    else:
-        log.warning("Background index exited with %d", proc.returncode)
-    return False
+        PidFile(db_dir / "reindex.pause", pid=proc.pid).unlink_if_ours()
+    return proc.returncode
 
 
 # ── DB helper ────────────────────────────────────────────────────────────────
@@ -817,11 +1040,6 @@ def _optimize_db(db_dir: Path) -> None:
         log.debug("PRAGMA optimize failed", exc_info=True)
     finally:
         conn.close()
-
-
-# ── Sentinel for log_fh default ──────────────────────────────────────────────
-# ``object()`` suffices — all call sites use ``is`` comparison.
-_DEVNULL = object()
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

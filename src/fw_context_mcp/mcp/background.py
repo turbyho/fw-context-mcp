@@ -85,9 +85,11 @@ def _is_bg_reindex_running(root: Path) -> bool:
 
     Checks two signals:
 
-    1. ``<db_dir>/<project_id>/reindex.pid`` — written by the daemon's
-       index subprocess or a standalone ``fw-context index`` at startup,
-       removed on exit.  A stale file (PID not alive) is cleaned up.
+    1. ``<db_dir>/<project_id>/reindex.pid`` — each ``fw-context index``
+       run writes it when it holds the index lock
+       (``cli._index._claim_index``), the run that the daemon started
+       included, and removes it when it releases the lock.  A stale file
+       (PID not alive) is cleaned up.
     2. ``<db_dir>/write.lock`` — held during write operations
        (``reindex_file``, ``reset_index``, index write phases).
 
@@ -128,6 +130,31 @@ def _is_bg_reindex_running(root: Path) -> bool:
         return True
 
     return False
+
+
+# The marker of the work that the daemon has and did not complete: a change
+# that waits for the debounce, for a manual operation that holds the index,
+# or for the run that the daemon started.  It holds the PID of the daemon,
+# thus a daemon that died leaves a marker that nobody reads as work.
+PENDING_MARKER = "reindex.pending"
+
+
+def read_reindex_state(root: Path) -> str | None:
+    """Return ``"reindexing"`` while an index run is active, ``"pending"`` while the daemon has work that is not complete, else None.
+
+    WHY the two: an LLM that waits for a reindex must know that one comes.
+    The daemon keeps its work as a flag in its memory, thus before this
+    marker no other process saw a change that waited for the debounce or
+    for a manual operation, and the answers said "run fw-context index"
+    while the daemon was about to run it.  A run that holds the index
+    makes "reindexing", also when the marker is there.
+    """
+    if _is_bg_reindex_running(root):
+        return "reindexing"
+    db_path = _db_path(root)
+    if PidFile.is_active(db_path.parent / PENDING_MARKER):
+        return "pending"
+    return None
 
 
 # ── read_reindex_progress ────────────────────────────────────────────────────
