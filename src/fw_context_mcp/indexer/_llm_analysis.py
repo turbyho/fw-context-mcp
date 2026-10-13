@@ -414,10 +414,11 @@ def _build_llm_analysis(
             # unparseable-response path below keeps its sentinel out of
             # those caches for the same reason.
             #
-            # The sentinel goes into the per-build table only.  It keeps
-            # the symbol out of ``count_pending_analysis``, thus a file
-            # that a build step removed cannot hold the index in
-            # ``reindex_needed`` for good.  The next run still repairs the
+            # The sentinel goes into the per-build table only.
+            # ``compute_analysis_coverage`` counts it as skipped, and
+            # ``make_analysis_summary`` counts a skipped symbol as done.
+            # Thus a file that a build step removed cannot keep the
+            # analysis incomplete permanently.  The next run still repairs the
             # symbol: ``h`` came from an empty body, thus it cannot match
             # the hash of a body that reads correctly, and the code above
             # falls through to a real analysis.

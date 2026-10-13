@@ -1,8 +1,8 @@
-"""Coverage and staleness must agree — regression tests for ANALYZABLE_KINDS.
+"""The pipeline and the coverage report must agree — regression tests for ANALYZABLE_KINDS.
 
-The analysis pipeline, the coverage report, and the staleness check all
-import ``ANALYZABLE_KINDS``.  Before that, each had its own kind list, and
-the staleness check missed the analysis work for 4 of the 10 kinds.
+The analysis pipeline and the coverage report import ``ANALYZABLE_KINDS``.
+Before that, each had its own kind list, and a check of the pending work
+missed the analysis work for 4 of the 10 kinds.
 """
 
 from __future__ import annotations
@@ -10,7 +10,6 @@ from __future__ import annotations
 from fw_context_mcp.indexer._llm_analysis import _select_unanalyzed_symbols
 from fw_context_mcp.indexer.db import (
     compute_analysis_coverage,
-    count_pending_analysis,
     make_analysis_summary,
     transaction,
     upsert_file,
@@ -73,9 +72,8 @@ class TestKindCoverage:
             _add_kinds(populated_db)
 
         selected = _select_unanalyzed_symbols(populated_db, CONFIG_HASH, True)
-        pending = count_pending_analysis(
-            populated_db, CONFIG_HASH, analyze_vendor=False
-        )
+        project = compute_analysis_coverage(populated_db, CONFIG_HASH)["project"]
+        pending = project["total"] - project["analyzed"] - project["skipped"]
         assert pending == len(selected) == len(ANALYZABLE_KINDS)
 
 
@@ -96,8 +94,8 @@ class TestSkipSentinel:
         coverage = compute_analysis_coverage(populated_db, CONFIG_HASH)
         assert coverage["project"] == {"analyzed": 1, "skipped": 1, "total": 2}
 
-    def test_skip_row_does_not_keep_the_reindex_pending(self, populated_db):
-        """A skipped symbol must not restart the background reindex forever."""
+    def test_skip_row_does_not_keep_the_analysis_incomplete(self, populated_db):
+        """The pipeline cannot analyze a skipped symbol, thus it counts as done."""
         with transaction(populated_db):
             file_id = upsert_file(populated_db, CONFIG_HASH, "/tmp/test.cpp", "cpp")
             big = _add_symbol(populated_db, file_id, "big", "function")
@@ -105,27 +103,18 @@ class TestSkipSentinel:
                 populated_db, [(big, "", "", "", "skip:unparseable:m", "h1")]
             )
 
-        pending = count_pending_analysis(
-            populated_db, CONFIG_HASH, analyze_vendor=False
-        )
-        assert pending == 0
-
         coverage = compute_analysis_coverage(populated_db, CONFIG_HASH)
         summary = make_analysis_summary(coverage, False, "m")
         assert summary["complete"] is True
 
 
-class TestCompleteAgreesWithPending:
+class TestComplete:
     def test_complete_is_false_while_work_remains(self, populated_db):
         with transaction(populated_db):
             _add_kinds(populated_db)
 
         coverage = compute_analysis_coverage(populated_db, CONFIG_HASH)
         summary = make_analysis_summary(coverage, False, None)
-        pending = count_pending_analysis(
-            populated_db, CONFIG_HASH, analyze_vendor=False
-        )
-        assert summary["complete"] is (pending == 0)
         assert summary["complete"] is False
 
     def test_vendor_symbols_do_not_block_completeness(self, populated_db):
@@ -135,13 +124,6 @@ class TestCompleteAgreesWithPending:
         coverage = compute_analysis_coverage(populated_db, CONFIG_HASH)
         assert coverage["vendor"]["total"] == len(ANALYZABLE_KINDS)
         assert coverage["project"]["total"] == 0
-
-        assert count_pending_analysis(
-            populated_db, CONFIG_HASH, analyze_vendor=False
-        ) == 0
-        assert count_pending_analysis(
-            populated_db, CONFIG_HASH, analyze_vendor=True
-        ) == len(ANALYZABLE_KINDS)
 
         assert make_analysis_summary(coverage, False, None)["complete"] is True
         assert make_analysis_summary(coverage, True, None)["complete"] is False

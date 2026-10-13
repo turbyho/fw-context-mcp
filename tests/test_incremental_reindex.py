@@ -3006,8 +3006,8 @@ int sensor_read(void) {
             cc_json.write_text(json.dumps(cc_original, indent=2), encoding="utf-8")
 
 
-class TestFastStalenessCheck:
-    """Verify ``_fast_staleness_check`` and related fixes for the bg reindex timeout loop.
+class TestStartupStalenessCheck:
+    """Verify the check at the start of the daemon and the fixes for the bg reindex timeout loop.
 
     The ``indexed_project`` fixture uses ``--no-refs --no-analyze``, so a fresh
     index has empty ``refs``, ``indirect_call_sites``, and ``llm_analysis`` tables.
@@ -3015,30 +3015,21 @@ class TestFastStalenessCheck:
     that after filling the data, no false positives remain.
     """
 
-    def test_detects_missing_refs_and_unanalyzed(self, indexed_project: Path):
-        """Index built with --no-refs --no-analyze: fast check reports missing refs.
+    def test_detects_missing_refs(self, indexed_project: Path):
+        """Index built with --no-refs --no-analyze: the check reports missing refs."""
+        from fw_context_mcp.mcp.daemon import _staleness_check
 
-        "unanalyzed" may not appear if Phase 3 restored analysis from the
-        cross-project cache (~/.fw-context/llm_cache.db) — that is correct
-        behaviour (the cache serves its purpose).
-        """
-        from fw_context_mcp.mcp.background import _fast_staleness_check
-
-        needs, reasons = _fast_staleness_check(indexed_project)
+        needs, reasons = _staleness_check(indexed_project)
         assert needs, "Should detect work needed (missing refs)"
         assert "refs missing" in reasons, f"Expected 'refs missing', got: {reasons}"
         assert "indirect call sites missing" in reasons, f"Expected 'indirect call sites missing', got: {reasons}"
-        # Unanalyzed is optional — Phase 3 may restore cached analysis from ~/.fw-context/llm_cache.db
-        has_unanalyzed = any("unanalyzed" in r for r in reasons)
-        if not has_unanalyzed:
-            print("  (unanalyzed not reported — analysis restored from cross-project cache)")
 
     def test_no_false_positive_after_full_reindex(self, indexed_project: Path):
         """After filling refs, indirect sites, and analysis: check is clean."""
         import os as _os
 
         from fw_context_mcp.indexer.runner import run
-        from fw_context_mcp.mcp.background import _fast_staleness_check
+        from fw_context_mcp.mcp.daemon import _staleness_check
         from fw_context_mcp.mcp.shared.stale import _count_modified_files
 
         db_path = _db_path_for_project(indexed_project)
@@ -3063,7 +3054,7 @@ class TestFastStalenessCheck:
             _os.environ.pop("FW_CONTEXT_FORCE_REFINDEX", None)
 
         # Now check — refs should be present
-        needs, reasons = _fast_staleness_check(indexed_project)
+        needs, reasons = _staleness_check(indexed_project)
         assert "refs missing" not in reasons, f"Refs should be populated after reindex with --refs, got: {reasons}"
         # Note: "indirect call sites missing" may be legitimate — the test
         # project has no function pointer calls, so the table is empty.
@@ -3077,11 +3068,11 @@ class TestFastStalenessCheck:
             conn.close()
 
     def test_detects_missing_refs_after_delete(self, indexed_project: Path):
-        """After filling refs then deleting them, fast check reports 'refs missing'."""
+        """After filling refs then deleting them, the check reports 'refs missing'."""
         import os as _os
 
         from fw_context_mcp.indexer.runner import run
-        from fw_context_mcp.mcp.background import _fast_staleness_check
+        from fw_context_mcp.mcp.daemon import _staleness_check
 
         db_path = _db_path_for_project(indexed_project)
         cc_json = indexed_project / "compile_commands.json"
@@ -3112,35 +3103,35 @@ class TestFastStalenessCheck:
         finally:
             conn.close()
 
-        needs, reasons = _fast_staleness_check(indexed_project)
+        needs, reasons = _staleness_check(indexed_project)
         assert needs, "Should detect refs missing after DELETE"
         assert "refs missing" in reasons, f"Expected 'refs missing', got: {reasons}"
 
     def test_detects_schema_mismatch(self, indexed_project: Path, monkeypatch):
-        """When schema version is behind, _fast_staleness_check reports it.
+        """When schema version is behind, the check reports it.
 
         ``open_db()`` auto-migrates, so we monkeypatch ``get_db_schema_version``
         to return a version lower than ``CURRENT_SCHEMA_VERSION``.
         """
         import fw_context_mcp.indexer.db as db_mod
-        from fw_context_mcp.mcp.background import _fast_staleness_check
+        from fw_context_mcp.mcp.daemon import _staleness_check
 
         monkeypatch.setattr(db_mod, "get_db_schema_version", lambda conn: 0)
 
-        needs, reasons = _fast_staleness_check(indexed_project)
+        needs, reasons = _staleness_check(indexed_project)
         assert needs, "Should detect schema mismatch"
         assert any("schema" in r for r in reasons), f"Expected schema-related reason, got: {reasons}"
 
     def test_compile_commands_changed_detection(self, indexed_project: Path):
         """When compile_commands.json mtime is newer than index, it's detected."""
 
-        from fw_context_mcp.mcp.background import _fast_staleness_check
+        from fw_context_mcp.mcp.daemon import _staleness_check
 
         cc_json = indexed_project / "compile_commands.json"
         cc_json.touch()
         _advance_mtime(cc_json)
 
-        needs, reasons = _fast_staleness_check(indexed_project)
+        needs, reasons = _staleness_check(indexed_project)
         assert needs, "Should detect compile_commands.json changed"
         assert "compile_commands.json changed" in reasons, (
             f"Expected 'compile_commands.json changed' in reasons, got: {reasons}"
@@ -3790,15 +3781,15 @@ class TestBgReindexEndToEnd:
         """The full cycle: missing refs → reindex via runner.run() → no false positive.
 
         1. Fill refs via run() API, then delete them to simulate the problem
-        2. _fast_staleness_check detects "refs missing"
+        2. The check at the start of the daemon detects "refs missing"
         3. runner.run() with FW_CONTEXT_FORCE_REFINDEX=1 refills refs
-        4. After completion, _fast_staleness_check returns clean for refs
+        4. After completion, the check returns clean for refs
         5. _count_modified_files returns 0 (no false positive mtime detection)
         """
         import os as _os
 
         from fw_context_mcp.indexer.runner import run
-        from fw_context_mcp.mcp.background import _fast_staleness_check
+        from fw_context_mcp.mcp.daemon import _staleness_check
         from fw_context_mcp.mcp.shared.stale import (
             _count_modified_files,
             _invalidate_modified_cache,
@@ -3833,8 +3824,8 @@ class TestBgReindexEndToEnd:
             conn.close()
             _invalidate_modified_cache(ch)
 
-        # ── Step 2: Verify fast check detects the problem ──
-        needs_before, reasons = _fast_staleness_check(indexed_project)
+        # ── Step 2: Verify the check detects the problem ──
+        needs_before, reasons = _staleness_check(indexed_project)
         assert needs_before, f"Should detect work needed, got reasons: {reasons}"
         assert "refs missing" in reasons, f"Should detect refs missing, got: {reasons}"
         print(f"  Detected before reindex: {reasons}")
@@ -3857,7 +3848,7 @@ class TestBgReindexEndToEnd:
             del _os.environ["FW_CONTEXT_FORCE_REFINDEX"]
 
         # ── Step 4: Verify refs were refilled ──
-        needs_after, reasons_after = _fast_staleness_check(indexed_project)
+        needs_after, reasons_after = _staleness_check(indexed_project)
         assert "refs missing" not in reasons_after, f"Refs should be populated after bg reindex, got: {reasons_after}"
         assert "indirect call sites missing" not in reasons_after, (
             f"Indirect call sites should be populated, got: {reasons_after}"

@@ -80,8 +80,9 @@ def _path_matches_patterns(path: str, patterns: list[str]) -> bool:
 
 
 # ── Structural staleness ──────────────────────────────────────────────────
-# Shared by background._fast_staleness_check, daemon._staleness_check and
-# the state of the index in each query answer (`index_state`).
+# daemon._staleness_check uses `check_structural_staleness`.  The state of
+# the index in each query answer (`index_state`) uses `quick_structural_reasons`,
+# the part without the count of refs.
 
 
 def check_structural_staleness(
@@ -93,9 +94,9 @@ def check_structural_staleness(
     """Check structural staleness — compile_commands.json, schema, row format, refs.
 
     Returns a list of human-readable reasons the index needs a reindex.
-    These are the checks that both the background reindex trigger and the
-    daemon startup perform — file-level mtime checks are added separately
-    by callers that need them.
+    The check at the start of the daemon (`daemon._staleness_check`) uses
+    these reasons.  It adds the check of each file (the stored hash against
+    the file on disk) and the other reasons itself.
 
     All imports are lazy to avoid circular dependencies at module level.
     """

@@ -851,7 +851,7 @@ def _cleanup_files(sock_path: Path, pid_file: Path) -> None:
     pid_file.unlink(missing_ok=True)
 
 
-# ── Staleness check (minimal — same spirit as _fast_staleness_check) ─────────
+# ── Staleness check at the start of the daemon ───────────────────────────────
 
 
 def _staleness_check(project_root: Path) -> tuple[bool, list[str]]:
@@ -908,8 +908,8 @@ def _staleness_check(project_root: Path) -> tuple[bool, list[str]]:
             label = build_label(cfg)
             prefix = f"{label}: " if label else ""
 
-            # 1-4. Structural checks (shared with background._fast_staleness_check):
-            #      compile_commands.json, schema version, row format, refs.
+            # 1-4. Structural checks: compile_commands.json, schema version,
+            #      row format, refs.  `index_state` does checks 1-3 and not the refs.
             found = check_structural_staleness(conn, config_hash, dict(cfg), project_root)
 
             # 5. Modified source files — files changed before daemon started.

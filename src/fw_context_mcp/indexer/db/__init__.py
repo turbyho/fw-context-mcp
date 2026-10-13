@@ -48,7 +48,6 @@ __all__ = [
     "count_indirect_target_matches",
     "count_llm_analysis",
     "count_macros",
-    "count_pending_analysis",
     "count_refs",
     "count_template_instances",
     "delete_build_data",
@@ -225,7 +224,6 @@ from ._memory import (
 )
 from ._projects import (
     compute_analysis_coverage,
-    count_pending_analysis,
     delete_build_data,
     get_active_config,
     get_all_builds_for_project,

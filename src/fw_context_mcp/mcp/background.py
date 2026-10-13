@@ -15,12 +15,10 @@ Key design decisions:
   then releases — the daemon blocks on its own ``flock`` acquisition and
   picks up the lock as soon as the spawner releases.  No race window.
 
-- **Staleness check is split into two tiers**: ``_fast_staleness_check``
-  (called via ``get_project_status``) does only structural checks — schema
-  version, compile_commands.json mtime, missing refs.  The daemon's
-  ``_staleness_check`` adds file-level mtime comparison because the daemon
-  needs to detect files that changed BEFORE it started (watchfiles only
-  detects NEW changes).
+- **The check of the work that waits is in the daemon**: the daemon's
+  ``_staleness_check`` runs one time at its start.  It finds the work of the
+  time when no daemon watched: the structural reasons, files that changed,
+  a checkout and new source files.  watchfiles finds only NEW changes.
 
 - **Pause/resume protocol**: before an MCP tool writes to the index
   (reindex_file_impl), it calls ``_request_bg_reindex_pause`` to prevent
@@ -37,7 +35,6 @@ import fcntl
 import logging
 import os
 import re
-import sqlite3
 import subprocess
 import sys
 from contextlib import contextmanager
@@ -338,74 +335,3 @@ def _check_bg_pause(root: Path) -> bool:
     """
     db_path = _db_path(root)
     return PidFile.is_active(db_path.parent / "reindex.pause")
-
-# ── _fast_staleness_check ────────────────────────────────────────────────────
-def _fast_staleness_check(root: Path) -> tuple[bool, list[str]]:
-    """Lightweight staleness check — COUNT queries and at most one ``stat()``.
-
-    Returns ``(needs_reindex, reasons)`` where *reasons* is a list of
-    human-readable strings explaining why a reindex is needed.
-
-    Does **not** call ``_count_modified_files`` — the background subprocess
-    does its own per-file mtime comparison during ``run()``.  This function
-    only detects structural issues (missing data, schema changes,
-    compile_commands.json modification) and pending LLM analysis.
-
-    The analysis check calls ``count_pending_analysis``, which shares its
-    query with the ``analysis`` coverage report of ``get_project_status``.
-    Thus the two can never disagree about what still needs analysis.
-    """
-    from ..config import derive_project_id
-    from ..config import load as load_config
-    from ..indexer.db import count_pending_analysis, get_active_config
-    from .shared.context import _db_path, _quick_open_readonly
-    from .shared.stale import check_structural_staleness
-
-    db_path = _db_path(root)
-    if not db_path.exists():
-        return False, []
-
-    # Read-only quick open: a full open_db would run ensure_schema's
-    # unconditional executescript — a write transaction on every check
-    # interval — causing lock contention with the executor.  This path
-    # only reads.
-    try:
-        conn = _quick_open_readonly(db_path)
-    except sqlite3.Error:
-        return False, []
-    try:
-        reasons: list[str] = []
-        project_id = derive_project_id(root)
-        cfg = get_active_config(conn, project_id)
-        if not cfg:
-            return False, []
-        config_hash = cfg["config_hash"]
-
-        # 1-4. Structural checks (shared with daemon._staleness_check):
-        #      compile_commands.json, schema version, row format, refs.
-        reasons.extend(check_structural_staleness(conn, config_hash, dict(cfg), root))
-
-        # 5. Unanalyzed symbols?
-        # Uses CONFIG analyze_vendor (not stored) because this check
-        # predicts what the background reindex will do — and the
-        # background reindex uses config, not stored flags.  Using
-        # stored would cause an infinite reindex loop when a manual
-        # --analyze-vendor run stored True but config is False.
-        #
-        # count_pending_analysis shares its query with the coverage report
-        # in get_project_status, thus "N unanalyzed symbols" here and
-        # analysis.complete there can never disagree.  Both use
-        # ANALYZABLE_KINDS, and both count a skip:* sentinel as done.
-        proj_cfg = load_config(root)
-        if proj_cfg.llm.enabled and proj_cfg.llm.analyze_symbols:
-            unanalyzed = count_pending_analysis(
-                conn,
-                config_hash,
-                analyze_vendor=proj_cfg.llm.analyze_vendor,
-            )
-            if unanalyzed > 0:
-                reasons.append(f"{unanalyzed} unanalyzed symbols")
-        return len(reasons) > 0, reasons
-    finally:
-        conn.close()
-

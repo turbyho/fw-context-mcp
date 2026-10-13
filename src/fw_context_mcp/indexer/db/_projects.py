@@ -25,7 +25,6 @@ from ._schema import _ensure_column
 __all__ = [
     "ANALYZABLE_KINDS",
     "compute_analysis_coverage",
-    "count_pending_analysis",
     "delete_build_data",
     "get_active_config",
     "get_all_builds_for_project",
@@ -37,15 +36,13 @@ __all__ = [
     "upsert_project",
 ]
 
-# Kinds the LLM analysis pipeline processes.  All three consumers import
-# this tuple, thus the selection query, the coverage report, and the
-# staleness check can never drift apart again:
+# Kinds the LLM analysis pipeline processes.  The two consumers import
+# this tuple, thus the selection query and the coverage report always use
+# the same kinds:
 #   1. ``_llm_analysis._select_unanalyzed_symbols`` — selects the work.
 #   2. ``compute_analysis_coverage`` — reports the coverage.
-#   3. ``count_pending_analysis`` — the staleness signal that
-#      ``background._fast_staleness_check`` uses.
-# A kind that is in the selection query but not here made the daemon miss
-# the analysis work for that kind.
+# If a kind is in the selection query but not in this tuple, the coverage
+# report does not count the analysis work for that kind.
 ANALYZABLE_KINDS: tuple[str, ...] = (
     "function",
     "method",
@@ -81,8 +78,7 @@ def compute_analysis_coverage(conn: sqlite3.Connection, config_hash: str) -> dic
     * ``total`` — all symbols of the analyzable kinds.
 
     ``total - analyzed - skipped`` gives the symbols that the pipeline can
-    still process.  Use ``count_pending_analysis`` for that value — do not
-    compute it again in the caller.
+    still process.  ``make_analysis_summary`` uses that value.
     """
     placeholders = ", ".join("?" * len(ANALYZABLE_KINDS))
     rows = conn.execute(
@@ -116,36 +112,6 @@ def compute_analysis_coverage(conn: sqlite3.Connection, config_hash: str) -> dic
     return coverage
 
 
-def count_pending_analysis(
-    conn: sqlite3.Connection,
-    config_hash: str,
-    *,
-    analyze_vendor: bool,
-) -> int:
-    """Count the symbols that the LLM-analysis pipeline can still process.
-
-    This is the staleness signal: a value larger than 0 means that a
-    background reindex has analysis work to do.  It is the counterpart of
-    ``compute_analysis_coverage``, and it uses the same query, thus the
-    coverage report and the staleness check can never disagree.
-
-    A symbol with a ``skip:*`` sentinel counts as done.  The pipeline
-    already tried it and cannot analyze it, thus a pending count that
-    included these symbols would start a background reindex again after
-    every run.
-
-    When *analyze_vendor* is False, only project symbols count.  Pass the
-    value from the CONFIG, not the value stored in ``build_configs`` — this
-    count must predict what the next background reindex does.
-    """
-    coverage = compute_analysis_coverage(conn, config_hash)
-    sides = ("project", "vendor") if analyze_vendor else ("project",)
-    return sum(
-        max(0, coverage[side]["total"] - coverage[side]["analyzed"] - coverage[side]["skipped"])
-        for side in sides
-    )
-
-
 def make_analysis_summary(
     coverage: dict,
     analyze_vendor: bool,
@@ -162,8 +128,8 @@ def make_analysis_summary(
     * Symbols with a ``skip:*`` sentinel, which the pipeline cannot
       analyze.  ``skipped`` keeps these symbols visible in the counts.
 
-    Thus ``complete`` agrees with ``count_pending_analysis``:
-    ``complete`` is True exactly when the pending count is 0.
+    Thus ``complete`` is True exactly when ``total - analyzed - skipped``
+    is 0 or less for each side that the pipeline processes.
     """
     project_pending = (
         coverage["project"]["total"]

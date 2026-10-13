@@ -28,7 +28,7 @@ import pytest
 from fw_context_mcp.indexer._llm_analysis import _build_llm_analysis, _enrich_batch
 from fw_context_mcp.indexer.db import (
     compute_analysis_coverage,
-    count_pending_analysis,
+    make_analysis_summary,
     transaction,
     upsert_file,
 )
@@ -246,7 +246,7 @@ def _analysis_rows(conn) -> list:
 
 
 class TestAnalysisLoopSkipsBodylessSymbols:
-    """No model call, no cache write, and no new staleness."""
+    """No model call, no cache write, and no analysis that stays incomplete."""
 
     @staticmethod
     def _run(conn, tmp_path: Path) -> None:
@@ -280,12 +280,12 @@ class TestAnalysisLoopSkipsBodylessSymbols:
         assert rec.ollama_calls == []
         assert rec.cache_writes == [], "a body-less answer must never enter the cache"
 
-    def test_the_sentinel_does_not_keep_the_reindex_pending(
+    def test_the_sentinel_does_not_keep_the_analysis_incomplete(
         self, populated_db, monkeypatch, tmp_path: Path
     ):
-        """A file that a build step removed must not hold reindex_needed.
+        """A file that a build step removed must not keep the analysis incomplete.
 
-        ``skip:*`` counts as done, thus the staleness check stays clean.
+        ``skip:*`` counts as done, thus the coverage report is complete.
         """
         f = _source_file(tmp_path, lines=30)
         with transaction(populated_db):
@@ -295,9 +295,9 @@ class TestAnalysisLoopSkipsBodylessSymbols:
         _Recorder().install(monkeypatch)
         self._run(populated_db, tmp_path)
 
-        assert count_pending_analysis(populated_db, CONFIG_HASH, analyze_vendor=False) == 0
         coverage = compute_analysis_coverage(populated_db, CONFIG_HASH)
         assert coverage["project"]["skipped"] == 1
+        assert make_analysis_summary(coverage, False, None)["complete"] is True
         assert coverage["project"]["analyzed"] == 0
 
     def test_the_next_run_repairs_the_symbol(self, populated_db, monkeypatch, tmp_path: Path):
@@ -358,4 +358,4 @@ def test_every_sentinel_counts_as_skipped(populated_db, sentinel, tmp_path: Path
 
     coverage = compute_analysis_coverage(populated_db, CONFIG_HASH)
     assert coverage["project"]["skipped"] == 1
-    assert count_pending_analysis(populated_db, CONFIG_HASH, analyze_vendor=False) == 0
+    assert make_analysis_summary(coverage, False, None)["complete"] is True
