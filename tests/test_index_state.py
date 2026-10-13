@@ -50,7 +50,7 @@ def _global_config(tmp_path: Path, monkeypatch) -> None:
 
 
 def _project(
-    tmp_path: Path, builds=BUILDS, *, git_head: str = "", build_system: str = "",
+    tmp_path: Path, builds=BUILDS, *, git_head: str = "", build_system: str = "", index_table: str = "",
 ) -> tuple[Path, Path]:
     """Make a project of *builds* ``(config_hash, variant, image)``, each with one indexed file.
 
@@ -58,7 +58,7 @@ def _project(
     run: the current row format, a compile_commands.json older than the
     run, and the hash of its file.  *build_system* goes to ``[build]
     system``: without it fw-context cannot run the build, and the advice
-    names no ``--build``.
+    names no ``--build``.  *index_table* holds more lines of ``[index]``.
     """
     from fw_context_mcp.indexer.db import (
         CURRENT_ROW_FORMAT,
@@ -75,7 +75,7 @@ def _project(
     index_dir = tmp_path / "index"
     build_table = f'[build]\nsystem = "{build_system}"\n' if build_system else ""
     (root / ".fw-context" / "config.toml").write_text(
-        f'[project]\nid = "{PROJECT_ID}"\n[index]\ndb_dir = "{index_dir.as_posix()}"\n{build_table}',
+        f'[project]\nid = "{PROJECT_ID}"\n[index]\ndb_dir = "{index_dir.as_posix()}"\n{index_table}{build_table}',
         encoding="utf-8",
     )
     (root / ".fw-context" / "local.toml").write_text("", encoding="utf-8")
@@ -156,9 +156,16 @@ class TestTheAdvice:
         assert "No index run is in progress or scheduled" in text
         assert "`fw-context index`" in text
 
-    def test_a_changed_checkout_asks_for_a_build(self):
-        text = index_state_advice("not_scheduled", ["checkout changed from a to b"], needs_build=True)
-        assert "`fw-context index --build`" in text
+    def test_the_action_goes_into_the_text(self):
+        text = index_state_advice(
+            "not_scheduled", ["checkout changed from a to b"], action="run `fw-context index --build`",
+        )
+        assert "Tell the user to run `fw-context index --build`." in text
+
+    def test_an_unknown_action_sends_the_caller_to_the_status(self):
+        text = index_state_advice("not_scheduled", ["checkout changed from a to b"], action="")
+        assert "Call get_project_status" in text
+        assert "fw-context index" not in text
 
     def test_a_failed_run_gives_its_text(self):
         text = index_state_advice("failed", [], problem_text="The build failed. Run `fw-context index --build`.")
@@ -239,20 +246,19 @@ class TestTheQueryAnswer:
         assert "checkout changed from one to two" in answer[0]["warning"]
         assert "`fw-context index --build`" in answer[0]["warning"]
 
-    @pytest.mark.parametrize("backend", ["user_database", "stm32cubeide", ""])
-    def test_no_build_command_where_fw_context_does_not_build(self, tmp_path, monkeypatch, backend):
-        """`--build` fails for a database of the user, a build in an IDE, and an unknown build system."""
-        from fw_context_mcp.indexer import build, git_context
+    def test_an_unknown_build_sends_the_caller_to_the_status(self, tmp_path, monkeypatch):
+        """An error of the config costs the action, never the answer."""
+        from fw_context_mcp.indexer import autobuild, git_context
 
-        system = {"user_database": "cmake"}.get(backend, backend)
-        root, _ = _project(tmp_path, git_head="ref: refs/heads/one", build_system=system)
+        def _broken(project_root, cfg):
+            raise ValueError("bad config")
+
+        root, _ = _project(tmp_path, git_head="ref: refs/heads/one", build_system="cmake")
         monkeypatch.setattr(git_context, "read_head", lambda project_root: "ref: refs/heads/two")
-        if backend == "user_database":
-            monkeypatch.setattr(build, "user_database", lambda project_root, cfg: project_root / "cc.json")
+        monkeypatch.setattr(autobuild, "build_advice", _broken)
 
         answer = annotate_index_state([{"name": "f"}], {"project_root": str(root), "variant": "a"})
         assert answer[0]["index_state"] == "not_scheduled"
-        assert "--build" not in answer[0]["warning"]
         assert "Call get_project_status" in answer[0]["warning"]
 
     def test_a_run_wins_over_a_failed_run(self, tmp_path):
@@ -268,8 +274,146 @@ class TestTheQueryAnswer:
         assert "build_warning" not in answer, "its command starts a second run of the same work"
 
 
+# The action that each kind of build gets, in the status and in a query.
+_ACTIONS = {
+    "cmake": "run `fw-context index --build`",
+    "user_database": "make the database again (the file that [index] compile_commands names",
+    "stm32cubeide": "build the project outside of fw-context",
+    "": "build the project outside of fw-context",
+}
+
+
+class TestTheQueryAndTheStatusAgree:
+    """One function selects the build that writes the file list: the two places named two commands."""
+
+    @staticmethod
+    def _setup(tmp_path, backend: str) -> Path:
+        """A project of *backend*; "user_database" is a cmake project with its own database."""
+        if backend == "user_database":
+            # The database of build "a": the config names a file of the user.
+            root, _ = _project(
+                tmp_path, git_head="ref: refs/heads/one", build_system="cmake",
+                index_table='compile_commands = "h-a.json"\n',
+            )
+        else:
+            root, _ = _project(tmp_path, git_head="ref: refs/heads/one", build_system=backend)
+        return root
+
+    @pytest.mark.parametrize("backend", list(_ACTIONS))
+    def test_after_a_checkout(self, tmp_path, monkeypatch, backend):
+        """`--build` fails for a database of the user, a build in an IDE, and an unknown build system."""
+        from fw_context_mcp.indexer import git_context
+        from fw_context_mcp.mcp.handlers.maintenance import get_build_info
+
+        root = self._setup(tmp_path, backend)
+        monkeypatch.setattr(git_context, "read_head", lambda project_root: "ref: refs/heads/two")
+
+        query = annotate_index_state([{"name": "f"}], {"project_root": str(root), "variant": "a"})[0]
+        status = get_build_info(project_root=str(root), variant="a")
+        reason = next(r for r in status["reindex_reasons"] if r.startswith("checkout changed"))
+        assert query["index_state"] == "not_scheduled"
+        assert _ACTIONS[backend] in query["warning"]
+        assert _ACTIONS[backend] in reason
+        assert _ACTIONS[backend] in status["index_message"], "the message agrees with the reason"
+        if backend != "cmake":
+            assert "--build" not in query["warning"] + reason + status["index_message"]
+
+    @pytest.mark.parametrize(
+        ("backend", "in_background", "action"),
+        [
+            ("cmake", False, _ACTIONS["cmake"]),
+            ("cmake", True, "run `fw-context index`"),
+            ("user_database", False, _ACTIONS["user_database"]),
+            ("stm32cubeide", False, _ACTIONS["stm32cubeide"]),
+            ("", False, _ACTIONS[""]),
+        ],
+    )
+    def test_for_a_new_source_file(self, tmp_path, monkeypatch, backend, in_background, action):
+        """Only a build adds the file.  A backend that builds in the background needs only the next run."""
+        from fw_context_mcp.indexer.builders import generic_cmake
+        from fw_context_mcp.mcp.handlers import maintenance
+        from fw_context_mcp.mcp.shared.stale import annotate_stale
+
+        root = self._setup(tmp_path, backend)
+        monkeypatch.setattr(maintenance, "find_unindexed_sources", lambda *a, **k: ["src/new.c"])
+        monkeypatch.setattr(
+            generic_cmake.GenericCMakeBuildSystem, "background_build_safe", lambda self, cfg: in_background,
+        )
+
+        query = annotate_index_state(
+            annotate_stale([], [], empty_new_sources=["src/new.c"]), {"project_root": str(root), "variant": "a"},
+        )[0]
+        status = maintenance.get_build_info(project_root=str(root), variant="a")
+        reason = next(r for r in status["reindex_reasons"] if "not in compile_commands.json" in r)
+        assert f"Tell the user to {action}" in query["warning"]
+        assert action in reason
+        if action != _ACTIONS["cmake"]:
+            assert "--build" not in query["warning"] + reason + status["index_message"]
+
+    def test_a_checkout_next_to_a_new_source_that_builds_itself(self, tmp_path, monkeypatch):
+        """The message said "A plain reindex cannot see them", then named the plain run, and hid the checkout."""
+        from fw_context_mcp.indexer import git_context
+        from fw_context_mcp.indexer.builders import generic_cmake
+        from fw_context_mcp.mcp.handlers import maintenance
+
+        root = self._setup(tmp_path, "cmake")
+        monkeypatch.setattr(git_context, "read_head", lambda project_root: "ref: refs/heads/two")
+        monkeypatch.setattr(maintenance, "find_unindexed_sources", lambda *a, **k: ["src/new.c"])
+        monkeypatch.setattr(
+            generic_cmake.GenericCMakeBuildSystem, "background_build_safe", lambda self, cfg: True,
+        )
+
+        status = maintenance.get_build_info(project_root=str(root), variant="a")
+        assert "A plain reindex cannot see them" not in status["index_message"]
+        assert status["index_message"].startswith("The checkout changed")
+
+    def test_a_new_source_during_a_run_asks_to_wait(self, tmp_path, monkeypatch):
+        """The state of a query asks to wait, and the status named the command at once."""
+        from fw_context_mcp.mcp.handlers import maintenance
+
+        root, db_dir = _project(tmp_path, build_system="stm32cubeide")
+        monkeypatch.setattr(maintenance, "find_unindexed_sources", lambda *a, **k: ["src/new.c"])
+        _run(db_dir)
+
+        status = maintenance.get_build_info(project_root=str(root), variant="a")
+        reason = next(r for r in status["reindex_reasons"] if "not in compile_commands.json" in r)
+        assert "wait for it, and when this reason stays after the run" in reason
+        assert _ACTIONS["stm32cubeide"] in reason
+
+    def test_a_variant_that_names_its_build_system_builds(self, tmp_path, monkeypatch):
+        """`--build` builds the variants, also when only a variant names the build system."""
+        from fw_context_mcp.config import load as load_config
+        from fw_context_mcp.indexer.autobuild import build_advice
+
+        root, _ = _project(tmp_path)
+        config = root / ".fw-context" / "config.toml"
+        config.write_text(
+            config.read_text(encoding="utf-8") + '[[build.variants]]\nname = "a"\nsystem = "cmake"\n',
+            encoding="utf-8",
+        )
+        assert build_advice(root, load_config(root)) == _ACTIONS["cmake"]
+
+
 class TestTheStatusTools:
     """``reindex_state`` is a field of each build: one build can be current and another not."""
+
+    def test_an_old_row_format_is_not_a_changed_database(self, tmp_path):
+        """The message said "Compile commands changed" for each reason that it did not name."""
+        from fw_context_mcp.indexer.db import open_db
+        from fw_context_mcp.mcp.handlers.maintenance import get_build_info
+
+        root, db_dir = _project(tmp_path)
+        conn = open_db(db_dir / "index.db")
+        try:
+            conn.execute("UPDATE build_configs SET row_format = 'fw-context-rows/1' WHERE variant = 'a'")
+            conn.commit()
+        finally:
+            conn.close()
+
+        result = get_build_info(project_root=str(root), variant="a")
+        assert result["status"] == "reindex_needed"
+        assert "Compile commands changed" not in result["index_message"]
+        assert "row_format_mismatch" in result["index_message"]
 
     def test_each_build_has_its_state(self, tmp_path):
         from fw_context_mcp.mcp.handlers.maintenance import get_project_status
@@ -318,10 +462,16 @@ class TestTheAnswerOfANewSource:
         assert answer[0]["unindexed_sources"] == 1
         assert "When no index run is in progress or scheduled" in answer[0]["warning"]
 
-    def test_the_state_names_the_files_and_a_build(self, tmp_path):
+    def test_the_state_names_the_files_and_a_build(self, tmp_path, monkeypatch):
+        from fw_context_mcp.indexer.builders import generic_cmake
         from fw_context_mcp.mcp.shared.stale import annotate_stale
 
         root, _ = _project(tmp_path, build_system="cmake")
+        # A backend that does not build in the background: only a build adds
+        # the file (`TestTheQueryAndTheStatusAgree` has the other backends).
+        monkeypatch.setattr(
+            generic_cmake.GenericCMakeBuildSystem, "background_build_safe", lambda self, cfg: False,
+        )
         answer = annotate_stale([], [], empty_new_sources=["src/new.c"])
 
         state = annotate_index_state(answer, {"project_root": str(root), "variant": "a"})[0]
@@ -329,6 +479,20 @@ class TestTheAnswerOfANewSource:
         assert "1 source file(s) are not in compile_commands.json" in state["warning"]
         assert "files changed" not in state["warning"], "no file changed"
         assert "`fw-context index --build`" in state["warning"]
+
+    def test_a_backend_that_builds_on_its_own_needs_the_next_run(self, tmp_path, monkeypatch):
+        """The status says the same: "fw-context builds them in the next index run"."""
+        from fw_context_mcp.indexer.builders import generic_cmake
+        from fw_context_mcp.mcp.shared.stale import annotate_stale
+
+        root, _ = _project(tmp_path, build_system="cmake")
+        monkeypatch.setattr(
+            generic_cmake.GenericCMakeBuildSystem, "background_build_safe", lambda self, cfg: True,
+        )
+        answer = annotate_stale([], [], empty_new_sources=["src/new.c"])
+
+        state = annotate_index_state(answer, {"project_root": str(root), "variant": "a"})[0]
+        assert "Tell the user to run `fw-context index`." in state["warning"]
 
     def test_it_starts_the_daemon(self, tmp_path, monkeypatch):
         """The check at the start of the daemon finds the file, and its run builds it."""

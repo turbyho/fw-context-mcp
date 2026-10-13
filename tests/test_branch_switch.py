@@ -358,6 +358,14 @@ class TestTheToolAsksForABuild:
         ], state.get("reindex_reasons")
 
     def test_a_switch_asks_for_index_build(self, indexed_repo):
+        # `--build` needs a build that fw-context can run: the fixture names
+        # no build system, and for an unknown one the advice names the build
+        # of the user (`autobuild.build_advice`).
+        (indexed_repo / ".fw-context" / "config.toml").write_text(
+            '[project]\nid = "0123456789abcdef0123456789abcdef"\n'
+            '[build]\nsystem = "cmake"\n',
+            encoding="utf-8",
+        )
         _switch_to(indexed_repo, "release/4.15.1")
         state = self._state(indexed_repo)
 
@@ -408,11 +416,11 @@ class TestTheToolAsksForABuild:
     def test_a_backend_that_cannot_build_gets_the_command_alone(
         self, indexed_repo
     ):
-        # Keil detects and builds nothing, thus nothing will happen on its
-        # own and the command is the whole answer.
+        # A `[build] command` builds, but never in the background, thus
+        # nothing will happen on its own and the command is the whole answer.
         (indexed_repo / ".fw-context" / "config.toml").write_text(
             '[project]\nid = "0123456789abcdef0123456789abcdef"\n'
-            '[build]\nsystem = "keil"\n',
+            '[build]\ncommand = "make compiledb"\n',
             encoding="utf-8",
         )
         _switch_to(indexed_repo, "release/4.15.1")
@@ -517,9 +525,9 @@ class TestThePlanTakesTheBranch:
         assert (keys, config, reason) == ([], None, "")
 
     def test_a_backend_that_cannot_isolate_plans_nothing(self, repo, tmp_path):
-        # Keil detects and builds nothing, thus it must not be asked to build
-        # in the background — that refusal outranks the branch.
-        db_path = self._project(repo, tmp_path, "branch: main", system="keil")
+        # No builder knows the system, thus nothing may build in the
+        # background — that refusal outranks the branch.
+        db_path = self._project(repo, tmp_path, "branch: main", system="no-such-system")
         _switch_to(repo, "release/4.15.1")
         keys, config, reason = self._plan(repo, db_path)
         assert (keys, config, reason) == ([], None, "")
@@ -640,6 +648,14 @@ class TestTheRecordedHead:
     def test_a_checkout_of_a_tag_asks_for_a_build(self, indexed_repo):
         from fw_context_mcp.mcp.handlers.maintenance import get_project_status
 
+        # `--build` needs a build that fw-context can run: the fixture names
+        # no build system, and for an unknown one the advice names the build
+        # of the user (`autobuild.build_advice`).
+        (indexed_repo / ".fw-context" / "config.toml").write_text(
+            '[project]\nid = "0123456789abcdef0123456789abcdef"\n'
+            '[build]\nsystem = "cmake"\n',
+            encoding="utf-8",
+        )
         _git(indexed_repo, "tag", "v1.0.0")
         _git(indexed_repo, "checkout", "-q", "v1.0.0")
         state = get_project_status(project_root=str(indexed_repo))
@@ -677,14 +693,18 @@ class TestTheRunDecidesWhatItRecords:
     """`cli._index._records_checkout`."""
 
     def _decide(self, repo: Path, db_path: Path, *, build: bool = False, explicit: bool = False,
-                system: str = "cmake", **narrow) -> bool:
+                system: str = "cmake", variants: bool = False, configured: str = "", **narrow) -> bool:
         import argparse
 
         from fw_context_mcp.cli._index import _records_checkout
-        from fw_context_mcp.config.settings import Config
+        from fw_context_mcp.config.settings import BuildVariant, Config
 
         cfg = Config()
         cfg.build.system = system
+        if variants:
+            cfg.build.variants = [BuildVariant(name="one")]
+        if configured:
+            cfg.index.compile_commands = configured
         args = argparse.Namespace(build=build, **narrow)
         return _records_checkout(args, cfg, None, repo, "0123456789abcdef0123456789abcdef", db_path, explicit)
 
@@ -714,11 +734,101 @@ class TestTheRunDecidesWhatItRecords:
         _switch_to(repo, "release/4.15.1")
         assert self._decide(repo, db_path, build=True)
 
-    def test_a_database_of_the_user_records(self, repo, tmp_path):
-        # fw-context builds nothing then: the user made the database for this tree.
+    @staticmethod
+    def _database(path: Path, repo: Path, *, after_checkout: bool) -> Path:
+        """Write a database that is newer or older than the last checkout of *repo*."""
+        import os
+
+        from fw_context_mcp.indexer.git_context import head_path
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("[]", encoding="utf-8")
+        head = head_path(repo)
+        assert head is not None
+        when = head.stat().st_mtime + (100 if after_checkout else -100)
+        os.utime(path, (when, when))
+        return path
+
+    def test_a_run_of_the_user_with_a_database_of_the_user_records(self, repo, tmp_path):
+        """fw-context builds nothing then: the user made the database for this tree.
+
+        Also an older one: a database from CI or from git keeps the time of
+        its build, thus the time of the file cannot decide for the user.
+        """
         db_path = self._db(repo, tmp_path, read_head(repo))
         _switch_to(repo, "release/4.15.1")
-        assert self._decide(repo, db_path, explicit=True)
+        cc = self._database(tmp_path / "ci" / "cc.json", repo, after_checkout=False)
+        assert self._decide(repo, db_path, explicit=True, compile_commands=str(cc), background=False)
+
+    @pytest.mark.parametrize("after_checkout", [True, False])
+    def test_a_run_in_the_background_records_a_newer_database(self, repo, tmp_path, after_checkout):
+        """The daemon runs after each change, also before the user makes the database again."""
+        db_path = self._db(repo, tmp_path, read_head(repo))
+        _switch_to(repo, "release/4.15.1")
+        cc = self._database(tmp_path / "ci" / "cc.json", repo, after_checkout=after_checkout)
+        decided = self._decide(repo, db_path, explicit=True, compile_commands=str(cc), background=True)
+        assert decided is after_checkout
+
+    def test_a_relative_database_is_read_from_the_project(self, repo, tmp_path):
+        db_path = self._db(repo, tmp_path, read_head(repo))
+        _switch_to(repo, "release/4.15.1")
+        self._database(repo / "ci" / "cc.json", repo, after_checkout=True)
+        assert self._decide(repo, db_path, explicit=True, compile_commands="ci/cc.json", background=True)
+
+    @pytest.mark.parametrize("after_checkout", [True, False])
+    def test_the_database_that_the_config_names(self, repo, tmp_path, after_checkout):
+        """`[index] compile_commands`: no file on the command line, and the run reads that file."""
+        db_path = self._db(repo, tmp_path, read_head(repo))
+        _switch_to(repo, "release/4.15.1")
+        self._database(repo / "ci" / "cc.json", repo, after_checkout=after_checkout)
+        decided = self._decide(
+            repo, db_path, explicit=True, configured="ci/cc.json", compile_commands=None, background=True,
+        )
+        assert decided is after_checkout
+
+    @pytest.mark.parametrize("background", [False, True])
+    def test_a_project_of_variants_records_only_its_builds(self, repo, tmp_path, background):
+        """Each variant reads its own database, and a file of the user is not one of them."""
+        db_path = self._db(repo, tmp_path, read_head(repo))
+        _switch_to(repo, "release/4.15.1")
+        self._database(repo / "compile_commands.json", repo, after_checkout=True)
+        assert not self._decide(repo, db_path, system="stm32cubeide", variants=True, background=background)
+
+    def test_a_database_of_the_same_time_as_the_checkout_is_old(self, repo, tmp_path):
+        """A file system with a coarse time gives the two the same time: the database can be older."""
+        import os
+
+        from fw_context_mcp.indexer.git_context import head_path
+
+        db_path = self._db(repo, tmp_path, read_head(repo))
+        _switch_to(repo, "release/4.15.1")
+        cc = self._database(tmp_path / "ci" / "cc.json", repo, after_checkout=True)
+        head = head_path(repo)
+        assert head is not None
+        same = head.stat().st_mtime
+        os.utime(cc, (same, same))
+        assert not self._decide(repo, db_path, explicit=True, compile_commands=str(cc), background=True)
+
+    def test_the_time_of_a_linked_head_is_the_time_of_the_link(self, repo, tmp_path):
+        """With `core.preferSymlinkRefs` HEAD links to the ref, and each commit changes the time of the ref."""
+        import os
+
+        from fw_context_mcp.cli._index import _database_after_checkout
+        from fw_context_mcp.indexer.git_context import head_path
+
+        head = head_path(repo)
+        assert head is not None
+        target = tmp_path / "ref"
+        target.write_text("0" * 40 + "\n", encoding="utf-8")
+        head.unlink()
+        head.symlink_to(target)
+        cc = tmp_path / "cc.json"
+        cc.write_text("[]", encoding="utf-8")
+        link_time = head.lstat().st_mtime
+        os.utime(cc, (link_time + 100, link_time + 100))
+        # A commit after the build of the user: the ref is newer than the database.
+        os.utime(target, (link_time + 200, link_time + 200))
+        assert _database_after_checkout(cc, repo)
 
     def test_no_index_records(self, repo, tmp_path):
         assert self._decide(repo, tmp_path / "absent" / "index.db")
@@ -781,18 +891,41 @@ class TestABuildOutsideOfFwContext:
     def _db(self, repo: Path, tmp_path: Path) -> Path:
         return TestTheRunDecidesWhatItRecords()._db(repo, tmp_path, read_head(repo))
 
-    def test_a_plain_run_records_the_checkout(self, repo, tmp_path):
-        db_path = self._db(repo, tmp_path)
-        _switch_to(repo, "release/4.15.1")
-        decide = TestTheRunDecidesWhatItRecords()._decide
-        assert decide(repo, db_path, system="stm32cubeide")
-        assert not decide(repo, db_path, system="cmake")
+    @staticmethod
+    def _default_database(repo: Path, system: str, *, after_checkout: bool) -> None:
+        """Write the database that a plain run of a project of *system* reads."""
+        from fw_context_mcp.config.settings import Config
+        from fw_context_mcp.indexer.build import default_compile_commands
 
-    def test_an_unknown_system_is_not_a_stub(self, repo, tmp_path):
-        # No builder knows the name, thus nothing says that the build runs in an IDE.
+        cfg = Config()
+        cfg.build.system = system
+        TestTheRunDecidesWhatItRecords._database(
+            default_compile_commands(repo, cfg), repo, after_checkout=after_checkout,
+        )
+
+    @pytest.mark.parametrize("system", ["stm32cubeide", "no-such-system"])
+    def test_a_run_of_the_user_records_the_checkout(self, repo, tmp_path, system):
+        """After the build of the user.  For an unknown system no run recorded it, and the reason stayed."""
         db_path = self._db(repo, tmp_path)
         _switch_to(repo, "release/4.15.1")
-        assert not TestTheRunDecidesWhatItRecords()._decide(repo, db_path, system="no-such-system")
+        self._default_database(repo, system, after_checkout=False)
+        decide = TestTheRunDecidesWhatItRecords()._decide
+        assert decide(repo, db_path, system=system, background=False)
+        assert not decide(repo, db_path, system="cmake", background=False), (
+            "only a build of fw-context writes that database"
+        )
+
+    @pytest.mark.parametrize("system", ["stm32cubeide", "no-such-system"])
+    @pytest.mark.parametrize("after_checkout", [True, False])
+    def test_a_run_in_the_background_records_after_the_build_of_the_user(
+        self, repo, tmp_path, system, after_checkout,
+    ):
+        """The run of the daemon after a checkout recorded it, and the index read the old database."""
+        db_path = self._db(repo, tmp_path)
+        _switch_to(repo, "release/4.15.1")
+        self._default_database(repo, system, after_checkout=after_checkout)
+        decided = TestTheRunDecidesWhatItRecords()._decide(repo, db_path, system=system, background=True)
+        assert decided is after_checkout
 
     def test_the_advice_names_the_ide_and_not_build(self, indexed_repo):
         from fw_context_mcp.mcp.handlers.maintenance import get_project_status

@@ -71,20 +71,23 @@ def index_state(behind: bool, *, run_state: str | None, failed: bool) -> str | N
     return "not_scheduled"
 
 
+#: The action of ``"not_scheduled"`` when no reason needs a build.
+PLAIN_ACTION = "run `fw-context index`"
+
+
 def index_state_advice(
-    state: str, reasons: list[str], *, problem_text: str = "", needs_build: bool = False,
-    fw_context_builds: bool = True,
+    state: str, reasons: list[str], *, problem_text: str = "", action: str = PLAIN_ACTION,
 ) -> str:
     """Return the text that tells the caller what to do in *state*.
 
     *reasons* say why the index of the build is not current.
     *problem_text* is the text of the failed run, and it names the command
-    that repairs it.  *needs_build* selects ``--build`` in the advice of
-    ``"not_scheduled"``: after a checkout, and for a source file that
-    compile_commands.json does not cover, only a build writes the file
-    list.  *fw_context_builds* is False when ``--build`` does not do that
-    build (:func:`_fw_context_builds`): the advice then names no command,
-    and sends the caller to ``get_project_status``, which names it.
+    that repairs it.  *action* is the action of ``"not_scheduled"``, an
+    instruction without a subject: after a checkout, and for a source file
+    that compile_commands.json does not cover, only a build writes the file
+    list, and :func:`_build_action` names it.  An empty *action* means that
+    the action is not known: the advice then sends the caller to
+    ``get_project_status``, which names it.
     """
     if state == "failed":
         return f"{problem_text} The answer below comes from the last index run that ended well."
@@ -94,41 +97,41 @@ def index_state_advice(
     if state == "pending":
         return f"{head} The watcher scheduled an index run. {WAIT_ADVICE}"
     tail = "The answer below comes from the last index run."
-    if needs_build and not fw_context_builds:
+    if not action:
         return (
             f"{head} No index run is in progress or scheduled, and only a build "
-            "that fw-context does not run repairs this. Call get_project_status, "
-            f"and give the user the command that it names. {tail}"
+            "repairs this. Call get_project_status, and give the user the "
+            f"command that it names. {tail}"
         )
-    command = "`fw-context index --build`" if needs_build else "`fw-context index`"
     return (
-        f"{head} No index run is in progress or scheduled. Tell the user to run "
-        f"{command}. get_project_status names the command for each reason. {tail}"
+        f"{head} No index run is in progress or scheduled. Tell the user to "
+        f"{action}. get_project_status names the command for each reason. {tail}"
     )
 
 
-def _fw_context_builds(root: Path) -> bool:
-    """Say whether ``fw-context index --build`` does the build of the project at *root*.
+def _build_action(root: Path, *, checkout_moved: bool) -> str:
+    """Return the action that writes the file list of the project at *root* again.
 
-    False when fw-context cannot run the build (``build.can_run_build``):
-    a stub such as an IDE project, or a build system that no builder knows.
-    ``--build`` fails there.  False for a database of the user
-    (``[index] compile_commands``, see ``build.user_database``): the CLI
-    refuses ``--build`` there.  An error answers True, thus the advice
-    keeps ``--build``, as the status tools do.
+    The status tools give the same action (``autobuild.build_advice``): a
+    query and ``get_project_status`` must not name two commands.  A new
+    source file that fw-context builds on its own needs only the next
+    index run, as the status tools say.  After a checkout, a run without a
+    build reads compile_commands.json of the old checkout, thus only the
+    build counts.  An error gives "": the advice then sends the caller to
+    ``get_project_status``.
     """
     from ...config import load as load_config
-    from ...indexer.build import can_run_build, detect_build_system, user_database
+    from ...indexer.autobuild import AutobuildState, build_advice, project_state
     from ...utils import SAFE_EXCEPT
 
     try:
         cfg = load_config(root)
-        if not can_run_build(cfg.build, cfg.build.system or detect_build_system(root)):
-            return False
-        return user_database(root, cfg) is None
+        if not checkout_moved and project_state(root, cfg) is AutobuildState.WILL_BUILD:
+            return PLAIN_ACTION
+        return build_advice(root, cfg)
     except SAFE_EXCEPT:
-        log.debug("The backend of %s is not known", root, exc_info=True)
-        return True
+        log.debug("The build of %s is not known", root, exc_info=True)
+        return ""
 
 
 def manifest_reason(verification: str) -> str:
@@ -262,13 +265,13 @@ def _annotate(result, kw: dict, root: Path, db_path: Path):
     state = index_state(bool(reasons), run_state=run_state, failed=problem is not None)
     if state is None:
         return result
-    needs_build = checkout_moved or facts.needs_build
+    action = PLAIN_ACTION
+    if state == "not_scheduled" and (checkout_moved or facts.needs_build):
+        # The function reads the config and the markers of the build
+        # system, thus the code asks it only here.
+        action = _build_action(root, checkout_moved=checkout_moved)
     advice = index_state_advice(
-        state, reasons, problem_text=problem.text if problem is not None else "",
-        needs_build=needs_build,
-        # Asked only for the advice that names `--build`: it reads the
-        # config and the markers of the build system.
-        fw_context_builds=not (state == "not_scheduled" and needs_build) or _fw_context_builds(root),
+        state, reasons, problem_text=problem.text if problem is not None else "", action=action,
     )
     if isinstance(result, list):
         return [{"warning": advice, "index_state": state}, *result]

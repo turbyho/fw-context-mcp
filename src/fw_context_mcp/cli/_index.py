@@ -358,40 +358,97 @@ def _records_checkout(
 ) -> bool:
     """Say whether this run records the checkout of the tree on its builds (``runner.run``).
 
-    True when:
+    True when one of these is true:
 
     * the run builds (``--build``, or the plan turned it on);
-    * the user gives the database, or the build of the project runs
-      outside of fw-context (a stub such as STM32CubeIDE,
-      ``build.build_runs_outside``).
-      The build of the user runs outside of fw-context, and no run of
-      fw-context can ever build it.  A recorded old checkout gave an
-      advice to run ``--build``, which fails there, and the reason never
-      went away;
-    * no build of the run has another checkout.
+    * no build of the run has another checkout;
+    * fw-context does not make the database (the user gives it, or
+      fw-context cannot run the build: a stub such as STM32CubeIDE, or a
+      build system that no builder knows), and the user started the run.
+      No run of fw-context can build that database, thus only the user
+      can give the database of the new checkout, and a run of the user
+      says that the user did.  A database from CI or from git keeps an
+      older time, thus the time of the file cannot decide for the user;
+    * fw-context does not make the database, the run is in the background
+      (the daemon), and the database is newer than the checkout
+      (:func:`_database_after_checkout`).
+      The daemon starts a run for each change after a checkout, also
+      before the user builds again.
 
-    False after a checkout that this run does not build:
-    compile_commands.json still belongs to the old checkout, and the
+    False after a checkout that this run does not build, for a database
+    that fw-context makes: compile_commands.json still belongs to the old
+    checkout, and the
     recorded checkout keeps the reason in each answer until a build.
     Before this rule a plain run recorded the new branch and the reason
-    went away, while the index still read the old database.  A run that
-    builds on another path (a missing or stale database) records the build
-    that it made (``args.build_ran``, see ``_run_single`` and
-    ``_run_multi``).
-    """
-    from ..indexer.build import build_runs_outside
+    went away, while the index still read the old database.  That was also
+    true for a database that fw-context does not make: each plain run, the
+    run of the daemon too, recorded the checkout.  And for a build system
+    that no builder knows, no run recorded it, thus the reason never went
+    away.
 
-    if getattr(args, "build", False) or explicit_cc or not db_path.exists():
-        return True
-    if build_runs_outside(cfg.build, cfg.build.system or detected_system):
+    A project of variants records only the builds that the run made
+    (``built_pairs`` in ``_run_multi``): each variant reads its own
+    database, and a file of the user is not one of them.  A run that builds
+    on another path (a missing or stale database) records the build that it
+    made (``args.build_ran``, see ``_run_single`` and ``_run_multi``).
+    """
+    from ..indexer.build import can_run_build, default_compile_commands
+
+    if getattr(args, "build", False) or not db_path.exists():
         return True
     from ..indexer.db import open_db
 
     conn = open_db(db_path)
     try:
-        return not _checkout_moves(conn, project_id, project_root, args)
+        moved = _checkout_moves(conn, project_id, project_root, args)
     finally:
         conn.close()
+    if not moved:
+        return True
+    if cfg.build.variants:
+        return False
+    fw_context_makes_database = not explicit_cc and can_run_build(
+        cfg.build, cfg.build.system or detected_system,
+    )
+    if fw_context_makes_database:
+        return False
+    if not getattr(args, "background", False):
+        return True
+    given = getattr(args, "compile_commands", None)
+    if given:
+        database = Path(given) if Path(given).is_absolute() else (project_root / given).resolve()
+    else:
+        database = default_compile_commands(project_root, cfg)
+    return _database_after_checkout(database, project_root)
+
+
+def _database_after_checkout(database: Path, project_root: Path) -> bool:
+    """Say whether *database* is newer than the last checkout of the tree at *project_root*.
+
+    The time of the file HEAD is the time of the last checkout: git writes
+    HEAD for a checkout, and a commit on a branch changes the branch and not
+    HEAD.  A rebase, a commit on a detached HEAD and a checkout of the same
+    branch also write HEAD: the answer is then False until the user builds
+    again, and the reason stays longer than necessary, never shorter.
+
+    WHY ``>`` and not ``>=``: on a file system with a coarse time (FAT has 2
+    s), a database written just before the checkout can have the same time.
+    WHY ``lstat``: with ``core.preferSymlinkRefs`` HEAD is a link to the ref
+    of the branch, and each commit changes the time of that ref.
+
+    A tree without git has no checkout, thus True.  A database or a HEAD
+    that cannot be read answers False, thus the reason stays until the next
+    run.
+    """
+    from ..indexer.git_context import head_path
+
+    head = head_path(project_root)
+    if head is None:
+        return True
+    try:
+        return database.stat().st_mtime > head.lstat().st_mtime
+    except OSError:
+        return False
 
 
 def _note_build(args: argparse.Namespace) -> None:

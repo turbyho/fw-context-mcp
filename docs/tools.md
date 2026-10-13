@@ -135,7 +135,7 @@ build, from the full check of the build.
 | `"reindexing"` | The index is not current, and an index run is active. | Waits, and repeats the call or `get_project_status` after about 30 s. Uses the old answer only when the user says so. |
 | `"pending"` | The index is not current, and the watcher scheduled an index run. | The same as `"reindexing"`. |
 | `"failed"` | The index is not current, and the last index run failed. | Gives the text to the user: it names the command. |
-| `"not_scheduled"` | The index is not current, and no index run updates it. | Tells the user to run `fw-context index` (`--build` after a checkout, and for a new source file). Where fw-context does not do that build (a database of the user, a build in an IDE, or a build system that fw-context does not know), the warning names no command, and `get_project_status` names it. |
+| `"not_scheduled"` | The index is not current, and no index run updates it. | Tells the user to run `fw-context index` (`--build` after a checkout, and for a new source file that fw-context does not build in the background). Where fw-context does not do that build (a database of the user, a build in an IDE, or a build system that fw-context does not know), the warning tells the user to make `compile_commands.json` outside of fw-context, then to run `fw-context index`. The warning and `get_project_status` name the same action. When the query cannot read the config, the warning names no command and sends you to `get_project_status`. |
 
 An index run that is active or scheduled wins over `"failed"`: during the
 run that repairs a failed run, the command of the failed run starts a
@@ -2474,13 +2474,21 @@ command.
   fw-context will not build it by itself. The reason says why.
 - The tree is on another git branch than the index.
 
-A missing source file and a branch change need `fw-context index --build`,
-because only a build regenerates compile_commands.json. An exception is
-a database that `[index] compile_commands` names: fw-context does not
-build it, thus the reason tells you to make that file again and then run
-`fw-context index`. A schema mismatch, an older row format, and a changed
-compile_commands.json need `fw-context index`. Read the reason text: it
-names the command.
+A missing source file and a branch change need a build, because only a
+build regenerates compile_commands.json. The reason names the build:
+
+- `fw-context index --build` for a build that fw-context can run.
+- For a database that `[index] compile_commands` names: make that file
+  again, then run `fw-context index`. fw-context does not build it.
+- For a build that fw-context cannot run (a build in an IDE, or a build
+  system that fw-context does not know): build the project outside of
+  fw-context, then run `fw-context index`.
+
+A new source file that fw-context builds in the background needs only
+the next index run. A schema mismatch, an older row format, and a
+changed compile_commands.json need `fw-context index`. Read the reason
+text: it names the command. The `index_state` of a query names the same
+action (`autobuild.build_advice`).
 
 On a project of several builds, a reason that every build gives comes one
 time, without a label, for example an old schema or a failed build. Each
@@ -3084,9 +3092,8 @@ An empty result names no file, thus it gets its own message. It says that
 indexed files changed after the last index run, thus the empty result is
 not proof that the code does not exist. When source files are not in
 `compile_commands.json`, the message says so instead. It names no
-command, because the command depends on the build system:
-`index_state` names it when it can, and `get_project_status` names it
-when a command is necessary.
+command, because the command depends on the build system: `index_state`
+and `get_project_status` name it.
 
 `get_source` and `get_symbol_context` add `source_origin`: `"index"` or
 `"disk"`. When the file changed and the symbol did not move, the body

@@ -502,7 +502,7 @@ class TestModifiedCountInFastMode:
         assert result["status"] == "reindexing"
         assert result["reindex_state"] == "not_scheduled"
         assert "no command is needed" not in result["index_message"]
-        assert "no index run is in progress or scheduled — run `fw-context index`" in result["index_message"]
+        assert "no index run is in progress or scheduled; run `fw-context index`" in result["index_message"]
 
     def test_an_uncovered_source_reads_as_reindex_needed_when_it_cannot(
         self, tmp_path: Path, monkeypatch
@@ -521,7 +521,10 @@ class TestModifiedCountInFastMode:
         result = get_project_status(project_root=str(root))
 
         assert result["status"] == "reindex_needed"
-        assert "fw-context index --build" in result["index_message"]
+        # The project names no build system, thus the build of the user
+        # makes the file list (`autobuild.build_advice`): `--build` fails.
+        assert "fw-context does not build them on its own" in result["index_message"]
+        assert "build the project outside of fw-context" in result["index_message"]
 
     def test_a_failed_index_run_comes_first(self, tmp_path: Path, monkeypatch):
         """The text of the failed run outranks the "builds on its own" advice.

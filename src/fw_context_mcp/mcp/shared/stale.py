@@ -1046,9 +1046,9 @@ EMPTY_RESULT_STALE_MESSAGE = (
 # changed file: only a build writes that file.  The text names no command:
 # the command depends on the backend.  `--build` fails for a database of the
 # user (`[index] compile_commands`) and for a build that runs in an IDE.
-# The state of the answer (`index_state.annotate_index_state`) names the
-# command when it can, and `get_project_status` names it when a command is
-# necessary.
+# The state of the answer (`index_state.annotate_index_state`) and
+# `get_project_status` name it, from one function
+# (`autobuild.build_advice`).
 EMPTY_RESULT_NEW_SOURCE_MESSAGE = (
     "No result, and {count} source file(s) are not in compile_commands.json "
     "(first: {first}). They have no translation unit, and only a build adds "

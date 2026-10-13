@@ -154,6 +154,52 @@ def project_state(project_root: Path, cfg) -> AutobuildState:
     return state(builder_cls, cfg.build)
 
 
+def build_advice(project_root: Path, cfg) -> str:
+    """Return the action that makes compile_commands.json of the project again.
+
+    The status tools give it for a checkout and for a new source file, and
+    the state of a query answer gives it too.  WHY one function: each of
+    those places selected the command on its own, they did not agree, and
+    some named ``--build`` where it fails.  The cases:
+
+    * A database of the user (``build.user_database``): fw-context does not
+      build it, and the CLI refuses ``--build``.
+    * A build that fw-context cannot run (``build.can_run_build``): a stub
+      such as an IDE project, or a build system that no builder knows.
+      ``--build`` fails there.  A ``[[build.variants]]`` table can name the
+      build system or the command alone: when fw-context can run the build
+      of one variant, ``--build`` builds the variants.
+    * Each other project: ``fw-context index --build``.
+
+    The text is an instruction without a subject, thus a caller can write
+    "tell the user to <text>".
+    """
+    from .build import build_variant_config, can_run_build, detect_build_system, user_database
+
+    try:
+        system = cfg.build.system or detect_build_system(project_root)
+        # The CLI refuses a database of the user next to variants.
+        user_db = None if cfg.build.variants else user_database(project_root, cfg)
+    except (ValueError, TypeError, RuntimeError) as exc:
+        log.debug("Build system detection failed for %s: %s", project_root, exc)
+        system, user_db = None, None
+    if user_db is not None:
+        return (
+            "make the database again (the file that [index] compile_commands names, which "
+            "fw-context does not build), then run `fw-context index`"
+        )
+    variants = [build_variant_config(cfg.build, variant) for variant in cfg.build.variants]
+    if not (
+        can_run_build(cfg.build, system)
+        or any(can_run_build(variant, variant.system or system) for variant in variants)
+    ):
+        return (
+            "build the project outside of fw-context (fw-context cannot run its build, for "
+            "example the build of an IDE project), then run `fw-context index`"
+        )
+    return "run `fw-context index --build`"
+
+
 def load_excluded(db_dir: Path) -> dict[str, str]:
     """Return ``{path: source_hash}`` of files the build system does not want.
 

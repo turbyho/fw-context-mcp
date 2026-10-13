@@ -38,7 +38,7 @@ from pydantic import Field
 from ...config import derive_project_id
 from ...config import load as load_config
 from ...config.settings import Config
-from ...indexer.autobuild import AutobuildState, build_missing_reason
+from ...indexer.autobuild import AutobuildState, build_advice, build_missing_reason
 from ...indexer.autobuild import clear_problem as clear_build_problem
 from ...indexer.autobuild import project_state as project_autobuild_state
 from ...indexer.autobuild import read_problem as read_build_problem
@@ -91,43 +91,47 @@ from ..shared.variants import IMAGE_DESCRIPTION, VARIANT_DESCRIPTION
 log = logging.getLogger(__name__)
 
 
-# What to tell the caller for each outcome of the automatic build.  Two
-# different sentences, because the required action differs: none, or run the
-# build.  A build that failed is not an outcome here: the failed run writes
-# its own text (``autobuild.read_problem``), which comes first.
-_AUTOBUILD_ADVICE: dict[AutobuildState, str] = {
-    AutobuildState.WILL_BUILD: (
-        "fw-context builds them on its own; no command is needed"
-    ),
-    AutobuildState.UNSUPPORTED: (
-        "this build system cannot build in the background without touching "
-        "the output of your own build — run `fw-context index --build`"
-    ),
-    AutobuildState.USER_DATABASE: (
-        "the index reads the database that [index] compile_commands names, and "
-        "fw-context does not build it — make that file again, then run `fw-context index`"
-    ),
-}
-
-
 #: The command of the degraded `_warning` when a reason names its own
 #: command.  The message of a project of several builds looks for it.
 _REASON_COMMAND = "the command that reindex_reasons names"
 
 
-def _new_source_advice(auto_state: AutobuildState, bg_running: bool) -> str:
+def _new_source_advice(auto_state: AutobuildState, bg_running: bool, rebuild: str) -> str:
     """Return the advice for a source file that compile_commands.json does not cover.
+
+    *rebuild* is the action that makes compile_commands.json again
+    (``autobuild.build_advice``).  A build that failed is not an outcome
+    here: the failed run writes its own text (``autobuild.read_problem``),
+    which comes first.
 
     WHY *bg_running*: "fw-context builds them on its own" is true only when
     an index run comes.  The daemon schedules one for a new file
-    (`daemon._staleness_check`), and without a daemon nothing does.
+    (`daemon._staleness_check`), and without a daemon nothing does.  For
+    another backend a run in progress gets the same advice as a checkout:
+    wait, and act when the reason stays.  The state of a query also asks to
+    wait during a run.
+
+    The text comes after a dash in the reason, and after a colon in the
+    message, thus it holds no dash and no colon of its own.
     """
-    if auto_state is AutobuildState.WILL_BUILD and not bg_running:
+    if auto_state is AutobuildState.WILL_BUILD:
+        if bg_running:
+            return "fw-context builds them on its own; no command is needed"
         return (
             "fw-context builds them in the next index run, and no index run is in "
-            "progress or scheduled — run `fw-context index`"
+            "progress or scheduled; run `fw-context index`"
         )
-    return _AUTOBUILD_ADVICE[auto_state]
+    run = (
+        "index run is in progress or scheduled; wait for it, and when this reason "
+        f"stays after the run, {rebuild}"
+    )
+    if auto_state is AutobuildState.USER_DATABASE:
+        # `rebuild` says that fw-context does not build that file.
+        return f"an {run}" if bg_running else rebuild
+    if bg_running:
+        # The fact comes first: the condition of the action is the run.
+        return f"fw-context does not build them on its own. An {run}"
+    return f"fw-context does not build them on its own; {rebuild}"
 
 
 def _autobuild_state(root: Path, proj_cfg, new_sources: list[str]) -> AutobuildState:
@@ -187,21 +191,6 @@ def _background_build_allowed(root: Path, proj_cfg: Config) -> bool:
         if builder_cls is None:
             return False
         return background_build_safe(builder_cls(), proj_cfg.build)
-    except SAFE_EXCEPT:
-        return False
-
-
-def _build_runs_outside(root: Path, proj_cfg: Config) -> bool:
-    """Say whether the build of this project runs outside of fw-context by design (``build.build_runs_outside``).
-
-    Asked only to word the advice.  Any failure to decide answers no,
-    which keeps ``--build`` in the advice, as before.
-    """
-    from ...indexer.build import build_runs_outside, detect_build_system
-    from ...utils import SAFE_EXCEPT
-
-    try:
-        return build_runs_outside(proj_cfg.build, proj_cfg.build.system or detect_build_system(root))
     except SAFE_EXCEPT:
         return False
 
@@ -538,16 +527,23 @@ def _build_health(
     # Asked once, because the call reaches the build backend and is not
     # free.  Only the branch reason below reads it.
     bg_build_allowed = checkout_moved and _background_build_allowed(root, proj_cfg)
+    # The action that makes compile_commands.json again: one function for
+    # the status tools and the query answers, thus the two name the same
+    # command.  The function reads the config and the markers of the build
+    # system, thus the code asks it only when a reason needs it.
+    rebuild = build_advice(root, proj_cfg) if checkout_moved or new_sources else ""
 
     reindex_reasons: list[str] = []
     if build_problem:
         reindex_reasons.append(build_problem)
     if build_missing:
         reindex_reasons.append(_build_missing_advice(build_missing, root, proj_cfg))
+    checkout_text = ""
     if checkout_moved:
-        # Always names `--build`, never a plain reindex: that would reuse
-        # compile_commands.json, which belongs to the branch the index
-        # was built on, with its file list and its compiler flags.
+        # Never a plain reindex: that would reuse compile_commands.json,
+        # which belongs to the branch the index was built on, with its file
+        # list and its compiler flags.  `rebuild` names the build that
+        # makes it again: `--build`, or the build of the user.
         #
         # The daemon runs it on its own where the backend allows a
         # background build, so the advice says both — a checkout on a
@@ -559,22 +555,18 @@ def _build_health(
         # WHY the wording stays careful: `bg_running` says that AN INDEX
         # RUN exists, and nothing more.  The run belongs to the daemon or
         # to the operator, and its arguments are not readable from here.
-        # Only `--build` regenerates compile_commands.json, thus a plain
-        # run leaves this reason standing.
+        # A run that does not build leaves this reason standing.
         #
-        # A database of the user gets no build of fw-context, thus
-        # `--build` is no repair there: the user makes the file again.
+        # A database of the user, or a build that fw-context cannot run (a
+        # stub such as STM32CubeIDE): the user makes the file again, and the
+        # next run records the checkout when the file is newer than the
+        # checkout (`cli._index._records_checkout`).
         if user_database(root, proj_cfg) is not None:
-            branch_advice = (
-                "; the index reads the database that [index] compile_commands names — "
-                "make it again on this branch, then run `fw-context index`"
-            )
+            branch_advice = f"; {rebuild}"
         elif bg_running:
             branch_advice = (
                 "; an index run is in progress or scheduled — wait for it rather than "
-                "start a second one, and run `fw-context index --build` "
-                "afterwards only if this reason stays (a run without "
-                "--build cannot clear it)"
+                f"start a second one, and when this reason stays after the run, {rebuild}"
             )
         elif bg_build_allowed:
             branch_advice = (
@@ -582,21 +574,14 @@ def _build_health(
                 "the watcher sees a change, or run "
                 "`fw-context index --build` now"
             )
-        elif _build_runs_outside(root, proj_cfg):
-            # A stub such as STM32CubeIDE: `--build` fails there, and the
-            # run after the build of the user records the checkout
-            # (`cli._index._records_checkout`).
-            branch_advice = (
-                "; fw-context cannot run this build — build the project again "
-                "outside of fw-context (for example in the IDE), then run `fw-context index`"
-            )
         else:
-            branch_advice = ", run `fw-context index --build`"
-        reindex_reasons.append(
+            branch_advice = f"; {rebuild}"
+        checkout_text = (
             f"checkout changed: indexed at {indexed_checkout!r}, "
             f"now at {live_checkout!r} — compile_commands.json belongs to "
             f"the old checkout" + branch_advice
         )
+        reindex_reasons.append(checkout_text)
     if schema_old:
         reindex_reasons.append(f"schema_mismatch: {db_schema_ver} < {CURRENT_SCHEMA_VERSION}")
     if row_format_old:
@@ -623,7 +608,7 @@ def _build_health(
         # build that adds them is the one that must be repaired first.
         advice = (
             "repair the build first, see the first reason"
-            if build_problem or build_missing else _new_source_advice(auto_state, bg_running)
+            if build_problem or build_missing else _new_source_advice(auto_state, bg_running, rebuild)
         )
         reindex_reasons.append(
             f"{len(new_sources)} source file(s) not in compile_commands.json "
@@ -680,7 +665,7 @@ def _build_health(
         if new_sources and auto_state is AutobuildState.WILL_BUILD:
             index_message = (
                 f"{len(new_sources)} source file(s) are not in compile_commands.json "
-                f"(first: {new_sources[0]}). {_new_source_advice(auto_state, bg_running)}. "
+                f"(first: {new_sources[0]}). {_new_source_advice(auto_state, bg_running, rebuild)}. "
                 f"Queries work on existing data meanwhile."
             )
         elif modified_count:
@@ -708,17 +693,22 @@ def _build_health(
             (build_problem or _build_missing_advice(build_missing, root, proj_cfg))
             + " Queries still work on the data of the last finished index run."
         )
-    elif new_sources:
-        # Checked before the other reindex reasons: `--build` is the only
-        # command that repairs this one, and a message that says plain
-        # `index` would send the caller in a circle.  Reaching here means
-        # fw-context will NOT build them itself — _AUTOBUILD_ADVICE says
-        # which of the two reasons applies.
+    elif blocked_sources:
+        # Checked before the other reindex reasons: only a build repairs
+        # this one, and a message that says plain `index` would send the
+        # caller in a circle.  Only files that fw-context does not build on
+        # its own: the next run builds the others, and a checkout next to
+        # them needs its own message below.
         index_message = (
             f"{len(new_sources)} source file(s) are not in compile_commands.json "
-            f"(first: {new_sources[0]}). A plain reindex cannot see them — "
-            f"{_AUTOBUILD_ADVICE[auto_state]}. Queries still work on existing data."
+            f"(first: {new_sources[0]}). A plain reindex cannot see them: "
+            f"{_new_source_advice(auto_state, bg_running, rebuild)}. Queries still work on existing data."
         )
+    elif checkout_moved:
+        # Before the schema and the database: a plain `fw-context index`
+        # reads compile_commands.json of the old checkout again.  The
+        # reason names the build that makes it again.
+        index_message = f"The {checkout_text}. Queries still work on existing data."
     elif schema_old and cc_changed:
         index_message = (
             f"Schema version mismatch ({db_schema_ver} < {CURRENT_SCHEMA_VERSION}) "
@@ -729,6 +719,11 @@ def _build_health(
         index_message = (
             f"Schema version mismatch ({db_schema_ver} < {CURRENT_SCHEMA_VERSION}). "
             f"Run fw-context index. Queries still work on existing data."
+        )
+    elif row_format_old:
+        index_message = (
+            "The rows of the index have an older meaning than this version reads "
+            "(row_format_mismatch) — run fw-context index. Queries still work on existing data."
         )
     else:
         index_message = "Compile commands changed — run fw-context index. Queries still work on existing data."
