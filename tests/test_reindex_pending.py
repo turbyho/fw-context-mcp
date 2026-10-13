@@ -963,3 +963,56 @@ class TestTheHeadWatcher:
         replaced, followed = asyncio.run(_scenario())
         assert replaced, "the new git directory did not reach the daemon"
         assert followed, "a checkout in the new git directory did not reach the daemon"
+
+
+class TestTheMaintenanceAfterARun:
+    """`_optimize_db` runs in the reindex loop after each run that ended with 0."""
+
+    def test_it_does_no_integrity_check(self, monkeypatch, tmp_path):
+        """The run that just ended did the check.  A check reads the full file: 1.5 s on a database of 6.5 GB."""
+        from fw_context_mcp.indexer import db as db_mod
+        from fw_context_mcp.mcp import daemon as daemon_mod
+
+        db_mod.open_db(tmp_path / "index.db", skip_integrity_check=True).close()
+        calls = []
+        real_open_db = db_mod.open_db
+
+        def _open_db(path, **kwargs):
+            calls.append(kwargs)
+            return real_open_db(path, **kwargs)
+
+        monkeypatch.setattr(db_mod, "open_db", _open_db)
+
+        daemon_mod._optimize_db(tmp_path)
+
+        assert calls == [{"skip_integrity_check": True}]
+
+    @pytest.mark.parametrize("kind", ["database", "file", "locked"])
+    def test_an_error_of_the_open_gives_a_warning(self, monkeypatch, tmp_path, kind, caplog):
+        """An error of the open went out of the reindex loop, and the daemon stopped.
+
+        The fixture `fast_loop` replaces `_optimize_db` in the tests of the loop,
+        thus this test calls the function directly.  Its exception stopped the loop.
+        """
+        import sqlite3  # after fw_context_mcp: the import redirects it to pysqlite3
+
+        from fw_context_mcp.indexer import db as db_mod
+        from fw_context_mcp.mcp import daemon as daemon_mod
+
+        (tmp_path / "index.db").write_bytes(b"")
+        error = {
+            "database": sqlite3.OperationalError("database is locked"),
+            "file": PermissionError("index.db"),
+            "locked": db_mod.DatabaseCorruptionError("index.db", "Database locked after 4 attempts", locked=True),
+        }[kind]
+
+        def _fails(path, **kwargs):
+            raise error
+
+        monkeypatch.setattr(db_mod, "open_db", _fails)
+
+        with caplog.at_level(logging.WARNING, logger="fw_context_mcp.mcp.daemon"):
+            daemon_mod._optimize_db(tmp_path)
+
+        warnings = [r for r in caplog.records if "PRAGMA optimize" in r.getMessage()]
+        assert warnings and warnings[0].exc_info is not None, "the error must reach the log of the daemon"

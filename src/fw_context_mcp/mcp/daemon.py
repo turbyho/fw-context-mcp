@@ -1061,31 +1061,34 @@ async def _wait_index(
 # ── DB helper ────────────────────────────────────────────────────────────────
 
 
-def _open_db(db_path: Path):
-    """Open the database, returning ``None`` on corruption."""
-    from ..indexer.db import DatabaseCorruptionError, open_db
-
-    try:
-        return open_db(db_path)
-    except DatabaseCorruptionError:
-        log.warning("Database corrupt — skipping staleness check")
-        return None
-
-
 def _optimize_db(db_dir: Path) -> None:
     """Run PRAGMA optimize to shrink the WAL file and defragment indexes.
 
-    Deliberately uses a full ``open_db`` (whitelisted write path): this
-    is a rare maintenance operation outside the request path, and WAL
-    allows concurrent readers while it runs.  Not a bug — do not
+    Deliberately uses a writable ``open_db`` (whitelisted write path):
+    this is a rare maintenance operation outside the request path, and
+    WAL allows concurrent readers while it runs.  Not a bug — do not
     "convert" this to the read-only quick open; writes need a writable
     connection.
+
+    WHY no integrity check: the daemon calls this after an index run that
+    ended with 0, and that run did the check.  A second check reads the
+    full file again, and the daemon does not use its result.  The next
+    index run does the check.
+
+    WHY the errors stop here: the reindex loop calls this function, and an
+    error of the open went out of the loop.  The daemon then stopped, and
+    no change got an index run.  The maintenance is not necessary, thus a
+    warning is sufficient.
     """
+    from ..indexer.db import open_db
+
     db_path = db_dir / "index.db"
     if not db_path.exists():
         return
-    conn = _open_db(db_path)
-    if conn is None:
+    try:
+        conn = open_db(db_path, skip_integrity_check=True)
+    except (sqlite3.Error, OSError):
+        log.warning("Cannot open the database for PRAGMA optimize", exc_info=True)
         return
     try:
         conn.execute("PRAGMA optimize")
