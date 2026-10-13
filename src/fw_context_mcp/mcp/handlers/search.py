@@ -49,7 +49,7 @@ from ...indexer.db._symbols import _RE_COL_FILTER, _sanitize_body_query
 from ...llm._diag import check_setup
 from ...llm.embedder_factory import uses_ollama
 from ...utils import abs_path, resolve_project_root
-from ..shared.context import _db_path, _is_stale, _quick_open_readonly
+from ..shared.context import _db_path, _quick_open_readonly
 from ..shared.fallback import _fallback_to_search_code
 from ..shared.paging import clamp_offset, page_hint, page_notice, past_end_info, selector_args
 from ..shared.stale import _with_stale_recovery
@@ -176,48 +176,6 @@ def _with_search_context(root: Path, tool_name: str, do_search, variant: str = "
 # Directories considered "application code" by project_only filters.
 # REMOVED: _PROJECT_DIRS, _PROJECT_PATH_FILTER, _PROJECT_PATH_FILTER_FILES
 # Replaced by s.is_project = 1 / f.is_project = 1 using the DB column.
-
-
-# ── moved from server.py ──
-
-def _append_staleness_warning(
-    results: list[dict], db_path: Path, config_hash: str,
-) -> list[dict]:
-    """Check compile_commands staleness and append a warning if the index is stale.
-
-    When ``compile_commands.json`` changes after indexing (files added,
-    removed, or re-ordered), the indexed source positions, symbol extents,
-    and conditional-compilation state may be outdated. This function detects
-    that condition and appends a warning dict so the LLM can inform the
-    operator that a reindex is needed.
-
-    Uses ``_quick_open_readonly`` instead of the full ``open_db`` path
-    because ``open_db`` runs ``ensure_schema`` — a write transaction —
-    which is unnecessary overhead for reading two config columns.
-
-    Args:
-        results: Existing result list to append the warning to (mutated in place).
-        db_path: Path to the project's SQLite index database file.
-        config_hash: The build that the results come from.  The check reads
-            that build, and not the newest one: a build of several programs
-            indexes them one after the other.
-
-    Returns:
-        The results list, possibly extended with a ``warning`` dict.
-    """
-    conn = _quick_open_readonly(db_path)
-    try:
-        cfg_data = conn.execute(
-            "SELECT * FROM build_configs WHERE config_hash = ?", (config_hash,),
-        ).fetchone()
-        if cfg_data and _is_stale(cfg_data, cfg_data["compile_commands_path"])[0]:
-            results.append({
-                "warning": "Index may be stale — compile_commands.json changed since last index.",
-                "hint": "Call reindex_file() on modified files or run 'fw-context index' to update.",
-            })
-    finally:
-        conn.close()
-    return results
 
 
 def search_code(
@@ -566,10 +524,8 @@ async def smart_search(
             ),
         ))
     results += page
-    # Append staleness warning unless the LLM setup itself failed — in that
-    # case the meta rows already carry a warning.
-    if not answer.llm_failed:
-        results = _append_staleness_warning(results, ctx.db_path, ctx.config_hash)
+    # A changed compile_commands.json is a reason of the state of the index
+    # that the tool wrapper adds (`index_state.annotate_index_state`).
     return results
 
 
@@ -635,7 +591,6 @@ async def _smart_search_run(
         key=key,
         meta=tuple(r for r in rows if "name" not in r),
         symbols=tuple(r for r in rows if "name" in r),
-        llm_failed=ctx.ollama_warning is not None,
     )
 
 
@@ -979,9 +934,6 @@ async def semantic_search(
                     "_results": page,
                 },
             ]
-
-        # Add staleness warning if applicable
-        results = _append_staleness_warning(results, ctx.db_path, ctx.config_hash)
         return results
 
     except (sqlite3.Error, OSError, RuntimeError) as e:

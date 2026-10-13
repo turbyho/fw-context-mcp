@@ -344,6 +344,24 @@ def active_build(
     )
 
 
+def checked_build(
+    conn: sqlite3.Connection, project_id: str, cfg: Config, project_root: Path | None,
+) -> sqlite3.Row | dict | None:
+    """Return the build that the checks of the project read, or None without a build.
+
+    :func:`active_build`, and the newest build when no build system names
+    the application of several images, as the index run reads it
+    (``cli._index._checked_build``).  WHY one function: the status tools
+    and the check at the start of the daemon must look for new source files
+    in the same build, else one of them reports a file that the other does
+    not.
+    """
+    from ...indexer.db import get_active_config
+
+    checked, _refusal = active_build(conn, project_id, cfg, project_root)
+    return checked if checked is not None else get_active_config(conn, project_id)
+
+
 def run_scoped_query(
     root,
     db_path,

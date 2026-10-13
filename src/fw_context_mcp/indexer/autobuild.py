@@ -124,6 +124,36 @@ def state(builder_cls, build_cfg) -> AutobuildState:
     return AutobuildState.WILL_BUILD
 
 
+def project_state(project_root: Path, cfg) -> AutobuildState:
+    """Say what will happen to a source file of the project that compile_commands.json misses.
+
+    *cfg* is the config of the project.  The status tools word their advice
+    with it, and the check at the start of the daemon starts an index run
+    only when the run can build.  WHY one function: the two must agree on
+    what fw-context builds.  When the detection finds no build system, the
+    answer is UNSUPPORTED: without a backend nothing builds on its own, and
+    that answer tells the caller to act and not to wait.
+    """
+    from .build import detect_build_system, user_database
+    from .builders import registry
+
+    # The index run builds nothing for a database of the user
+    # (`build.user_database`), and the advice must not promise a build.
+    if user_database(project_root, cfg) is not None:
+        return AutobuildState.USER_DATABASE
+    # A `[build] command` is a build that the user wrote, and the index run
+    # never starts it on its own (`cli._index._may_build_in_background`).
+    if cfg.build.command:
+        return AutobuildState.UNSUPPORTED
+    try:
+        system = cfg.build.system or detect_build_system(project_root)
+    except (ValueError, TypeError, RuntimeError) as exc:
+        log.debug("Build system detection failed for %s: %s", project_root, exc)
+        system = None
+    builder_cls = registry.get(system) if system else None
+    return state(builder_cls, cfg.build)
+
+
 def load_excluded(db_dir: Path) -> dict[str, str]:
     """Return ``{path: source_hash}`` of files the build system does not want.
 

@@ -844,7 +844,9 @@ def _staleness_check(project_root: Path) -> tuple[bool, list[str]]:
     """Return ``(needs_reindex, reasons)`` for the initial daemon startup.
 
     Checks structural staleness (compile_commands.json, schema, row format,
-    refs) AND file-level staleness (on-disk mtime newer than stored mtime).
+    refs) AND file-level staleness (the stored hash against the file on
+    disk, or the stored time for a row without a hash,
+    ``_count_modified_files``).
     Without the file-level check the daemon would never detect files that
     were modified BEFORE it started — watchfiles only detects NEW changes.
 
@@ -859,11 +861,14 @@ def _staleness_check(project_root: Path) -> tuple[bool, list[str]]:
 
     A checkout that happened while no daemon ran is a reason too: the
     watcher sees a change of HEAD only while it runs
-    (``git_context.head_moved``).
+    (``git_context.head_moved``).  A new source file that the run builds on
+    its own (``_unindexed_sources``) is also a reason: the watcher sees a
+    new file only while it runs, and without this check no run came for a
+    file that the user added before the daemon started.
     """
-    from ..indexer.git_context import head_moved, read_head, stored_head
+    from ..indexer.git_context import read_head
     from .shared.context import _db_path, _quick_open_readonly
-    from .shared.stale import _count_modified_files, check_structural_staleness
+    from .shared.stale import _count_modified_files, check_structural_staleness, checkout_reason
 
     db_path = _db_path(project_root)
     if not db_path.exists():
@@ -902,15 +907,49 @@ def _staleness_check(project_root: Path) -> tuple[bool, list[str]]:
 
             # 6. Another checkout than the build: the run then builds
             #    (`cli._index._plan_auto_build`).
-            description = str(cfg["description"] or "") if "description" in cfg.keys() else ""
-            indexed, live = head_moved(stored_head(cfg), description, live_head, project_root)
-            if indexed:
-                found.append(f"checkout changed from {indexed} to {live}")
+            moved = checkout_reason(cfg, live_head, project_root)
+            if moved:
+                found.append(moved)
             reasons.extend(prefix + reason for reason in found)
+
+        # 7. Source files that compile_commands.json does not cover, which
+        #    came while no daemon ran: the watcher sees a new file only while
+        #    it runs.  Only where the run builds them on its own
+        #    (`cli._index._plan_auto_build`): for another backend a run
+        #    changes nothing, and the status tools name the command.
+        unindexed = _unindexed_sources(conn, project_id, project_root)
+        if unindexed:
+            reasons.append(f"{len(unindexed)} source file(s) not in compile_commands.json")
     finally:
         conn.close()
 
     return len(reasons) > 0, reasons
+
+
+def _unindexed_sources(conn, project_id: str, project_root: Path) -> list[str]:
+    """Return the new source files of the project that an index run builds on its own.
+
+    The function reads the build that the status tools check
+    (`variants.checked_build`), thus the daemon and `get_project_status` see
+    the same files.  The list is empty when the backend cannot build in the
+    background (`autobuild.project_state`): a run then changes nothing.
+    """
+    from ..config import load as load_config
+    from ..indexer.autobuild import AutobuildState
+    from ..indexer.autobuild import project_state as autobuild_state
+    from .shared.stale import find_unindexed_sources
+    from .shared.variants import checked_build
+
+    cfg = load_config(project_root)
+    checked = checked_build(conn, project_id, cfg, project_root)
+    if checked is None or not checked["compile_commands_path"]:
+        return []
+    found = find_unindexed_sources(
+        conn, checked["config_hash"], project_root, Path(checked["compile_commands_path"]),
+    )
+    if not found or autobuild_state(project_root, cfg) is not AutobuildState.WILL_BUILD:
+        return []
+    return found
 
 
 # ── Index subprocess ─────────────────────────────────────────────────────────

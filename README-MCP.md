@@ -114,16 +114,21 @@ installs it is at `~/.fw-context/.venv/bin/fw-context-mcp`. Run
 
 Tool errors use `isError: false`. The tool call succeeded, but the result contains an error field. Only JSON-RPC protocol errors use the top-level `error` key.
 
-### Staleness and auto-reindex
+### Staleness and the state of the index
 
-`search_code` and `lookup_symbol` detect stale files in the results automatically. These tools re-index up to 5 stale files, with a 30-second timeout. Then these tools run the query again. When auto-reindex fails, or when `compile_commands.json` itself is stale, the result includes a warning entry:
+Each query tool compares the files that its answer names with the index. When a file changed after the last index run, a list gets a leading row with `warning` and `"stale": true`, and a dict gets `stale_warning` and `stale`. The query does not reindex the file: the file-watcher daemon starts the index run.
+
+When the index of the build of the query is not current, the answer also gives the state of the index. A list gets one more leading row, and a dict gets `index_state` and `index_warning`:
 
 ```json
 [
-  {"warning": "Auto-reindex failed for 1 file(s): …"},
+  {"warning": "The index of this build is not current: files changed after the last index run. The watcher scheduled an index run. Wait until the run ends, …", "index_state": "pending"},
+  {"warning": "Results can be out of date — 1 file(s) changed after the last index run.", "stale": true},
   {"name": "spi_init", …}
 ]
 ```
+
+`index_state` is `"reindexing"` or `"pending"` (wait for the run), `"not_scheduled"` (no run updates the index: the warning names the command, or `get_project_status` names it), or `"failed"` (the last index run failed). See [The state of the index](docs/tools.md#the-state-of-the-index).
 
 #### Ghost-record purge after file deletion
 

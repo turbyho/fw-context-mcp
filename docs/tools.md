@@ -107,13 +107,50 @@ automatic build.
 
 When a run stops without an index (the build is not there, or the run
 failed), fw-context writes the reason to `build_problem.json` next to the
-index. Each answer of a query tool of the project carries it: a list gets
-a leading `warning` row, a dict gets `build_warning`. The maintenance tools
-do not carry it. `get_project_status` gives it as a reason, with the status
+index. Each answer of a query tool of the project gives the state
+`"failed"` with that text (see [The state of the index](#the-state-of-the-index)).
+`get_project_status` gives it as a reason, with the status
 `reindex_needed`. The next run that ends well with the build there removes
 the file. `get_project_status` removes a reason that said the build is not
 there when it finds the build again. A failed automatic build is not
 paused: the next background run builds again.
+
+#### The state of the index
+
+When the index of the build of a query is not current, each answer of a
+query tool says so. The maintenance tools do not:
+`get_project_status` and `get_build_info` give `reindex_state` of each
+build, from the full check of the build.
+
+- A dict gets `index_state` and `index_warning`. For `"failed"` it also
+  gets `build_warning`, the text of the failed run.
+- A list gets a leading row `{"warning": …, "index_state": …}`.
+- No `index_state` means that the quick checks of the query found no
+  reason. They can miss a changed header, a changed file that the answer
+  does not name, or a new source file when the answer is not empty.
+  `get_project_status` does the full check.
+
+| `index_state` | When | What the caller does |
+|---|---|---|
+| `"reindexing"` | The index is not current, and an index run is active. | Waits, and repeats the call or `get_project_status` after about 30 s. Uses the old answer only when the user says so. |
+| `"pending"` | The index is not current, and the watcher scheduled an index run. | The same as `"reindexing"`. |
+| `"failed"` | The index is not current, and the last index run failed. | Gives the text to the user: it names the command. |
+| `"not_scheduled"` | The index is not current, and no index run updates it. | Tells the user to run `fw-context index` (`--build` after a checkout, and for a new source file). Where fw-context does not do that build (a database of the user, a build in an IDE, or a build system that fw-context does not know), the warning names no command, and `get_project_status` names it. |
+
+An index run that is active or scheduled wins over `"failed"`: during the
+run that repairs a failed run, the command of the failed run starts a
+second run of the same work.
+
+A query checks only what costs no scan: the checkout, a changed
+`compile_commands.json`, the schema, the row format, an index without
+full header tracking, and the files that the answer names. While an index
+run is active or scheduled, and these checks find no reason, it also
+compares the hash of each file of its build: the state then tells whether
+the run changes this build. A build that the run does not change stays
+current. Changed headers, a changed file that the answer does not name
+while no run is active or scheduled, and a new source file in an answer
+that is not empty are in the status tools only (`get_project_status`,
+`get_build_info`).
 
 **When another index run is in progress:**
 
@@ -2337,11 +2374,11 @@ Output: {"project_id": "c3d4…", "project_root": "/path/to/project",
          "builds": [
            {"variant": "nrf52840-dev", "image": "app", "board": "nrf52840dk/nrf52840",
             "symbol_count": 12430, "file_count": 1502, "indexed_at": "2026-06-05 09:35:18",
-            "status": "ready", "reindex_needed": false, "stale": false,
+            "status": "ready", "reindex_state": null, "reindex_needed": false, "stale": false,
             "modified_files_count": 0, "header_affected_tus": 0, "reasons": []},
            {"variant": "nrf52840-dev", "image": "mcuboot", "board": "nrf52840dk/nrf52840",
             "symbol_count": 3120, "file_count": 480, "indexed_at": "2026-06-05 09:31:02",
-            "status": "ready", "reindex_needed": false, "stale": false,
+            "status": "ready", "reindex_state": null, "reindex_needed": false, "stale": false,
             "modified_files_count": 0, "header_affected_tus": 0, "reasons": []}],
          "bg_reindex_running": false, "vec_available": true}
 ```
@@ -2366,7 +2403,7 @@ skips the output of the build tools in the same log.
 
 **`builds`** lists every build of the index, one entry for each
 `(variant, image)` pair: `{variant, image, board, symbol_count,
-file_count, indexed_at, status, reindex_needed, stale,
+file_count, indexed_at, status, reindex_state, reindex_needed, stale,
 modified_files_count, header_affected_tus, reasons}`. A build without
 full header tracking also holds `manifest_verification`. The list shows
 what fw-context has indexed, not what the config declares. On a project
@@ -2374,6 +2411,13 @@ of more than one build, fw-context selects no build: each query tool must
 get the arguments of one build, as the error lists them (`variant`,
 `image`, or the two). Select the build from the task, and ask the user
 when the task does not identify one.
+
+**`reindex_state`** of a build has the values of `index_state` (see
+[The state of the index](#the-state-of-the-index)), and `null` when the
+index of the build is current. Read it for the build that the task needs:
+one build can be current while an index run updates another. The state of
+a build counts each reason of the build, the modified files, the stale
+headers, and an index without full header tracking.
 
 **`declared_not_indexed`** is present when `[[build.variants]]` declares
 a variant that the index does not hold. Each entry is `{variant,
@@ -2394,7 +2438,7 @@ are in `builds`. `reference_count`, `analysis`, `description`, and
 | Status | Meaning | What to do |
 |--------|---------|------------|
 | ``"ready"`` | Fully up to date, no issues | Continue normally |
-| ``"reindexing"`` | Background reindex in progress or scheduled, or fw-context is about to build a new source file by itself | Index is still usable — continue normally |
+| ``"reindexing"`` | Background reindex in progress or scheduled, or the next index run builds a new source file without a command | Queries work — read `reindex_state` of the build before you continue |
 | ``"reindex_needed"`` | A structural cause — see `reindex_reasons` below | Queries still work, but read `reindex_reasons` for the command |
 | ``"no_index"`` | Initialized, but `index.db` does not exist | Run ``fw-context index`` |
 | ``"not_initialized"`` | ``fw-context init`` was not run | Run ``fw-context init`` |
@@ -2407,9 +2451,10 @@ database that holds no build config, the result is a dict that holds only
 `error`. Read that key first.
 
 `"reindex_needed"` outranks `"reindexing"`: the answers of this moment
-come from the last finished run. When `bg_reindex_running` is `true` at
-the same time, `index_message` says to wait for the index run that is
-running or scheduled, instead of naming a command.
+come from the last finished run. When the `reindex_state` of a build is
+`"reindexing"` or `"pending"`, `index_message` starts with the advice to
+wait for the index run that is running or scheduled, instead of naming a
+command.
 
 **`reindex_reasons`** names each cause of `"reindex_needed"`:
 
@@ -2493,11 +2538,26 @@ last index with `manifest_verification: "full"`.
 
 `manifest_verification` is `"full"` when `manifest.json` is available. In
 that case, fw-context tracks header staleness with SHA-256 hashes that
-fw-context collects during indexing. `manifest_verification` is `"none"`
-when no manifest exists. In that case, fw-context cannot detect header
-changes, and the result holds a `_warning`. The `_warning` tells you to
-run `fw-context index`, which writes the index again with full dependency
-tracking.
+fw-context collects during indexing. The two other values:
+
+- `"partial"`: the last index run wrote `manifest.json`, but the
+  full-text index or the embeddings failed.
+- `"none"`: no manifest exists.
+
+In these two cases, fw-context cannot find a changed header in the
+index, the build is not current, and the result holds a `_warning`:
+
+- While an index run is in progress or scheduled, the `_warning` tells
+  you to wait for it.
+- When no index run is in progress or scheduled, and no reason in
+  `reindex_reasons` names its own command, it tells you to ask the user
+  to run `fw-context index`. That run writes the index again with full
+  header tracking.
+- When a reason in `reindex_reasons` names its own command (a failed or
+  missing build, a checkout, a new source file that fw-context does not
+  build on its own, an old row format), the
+  `_warning` tells you to give the user that command. The run of that
+  command also writes full header tracking.
 
 `analysis` splits LLM-analysis coverage by project vs vendor symbols so
 the reader can tell intentionally-skipped vendor symbols apart from
@@ -2544,7 +2604,7 @@ Output: {"variant": "nrf52840-dev", "image": "app", "board": "nrf52840dk/nrf5284
          "build_system": "zephyr", "compile_commands": "/path/.fw-context/build/nrf52840-dev/out/app/compile_commands.json",
          "indexed_at": "2026-06-05 09:35:18", "first_indexed_at": "2026-06-01 11:02:44",
          "symbol_count": 12430, "file_count": 1502,
-         "reference_count": 8900, "modified_files_count": 3,
+         "reference_count": 8900, "modified_files_count": 0,
          "header_affected_tus": 0, "manifest_verification": "full",
          "analysis": {"model": "qwen2.5-coder:14b", "analyze_vendor": false,
                       "project": {"analyzed": 8450, "skipped": 6, "total": 8570},
@@ -2552,7 +2612,7 @@ Output: {"variant": "nrf52840-dev", "image": "app", "board": "nrf52840dk/nrf5284
                       "complete": false},
          "description": "branch: main",
          "vendor_paths": [], "project_paths": [], "effective_vendor_patterns": ["zephyr/%", …],
-         "status": "ready", "reindex_needed": false, "reindex_reasons": [], "stale": false,
+         "status": "ready", "reindex_state": null, "reindex_needed": false, "reindex_reasons": [], "stale": false,
          "index_message": "Index is fully up to date (12430 symbols) | LLM analysis: project 8450/8570 (vendor skipped — analyze_vendor=false)",
          "entry_point": "__start",
          "memory": [{"name": "FLASH", "attributes": "rx", "origin": "0x0", "length": "0x100000",
@@ -2573,7 +2633,7 @@ them, the result is an `error` that lists the builds (see
 [A project of several builds](#mcp-tools)). A project of one build needs
 no selector.
 
-The health fields (`status`, `reindex_needed`, `reindex_reasons`,
+The health fields (`status`, `reindex_state`, `reindex_needed`, `reindex_reasons`,
 `index_message`, `modified_files_count`, and the others) have the meaning
 that [`get_project_status`](#get_project_status) gives them, for this
 build only. The version fields (`update_notice`, and a restart after an
@@ -3023,8 +3083,10 @@ where the warning goes:
 An empty result names no file, thus it gets its own message. It says that
 indexed files changed after the last index run, thus the empty result is
 not proof that the code does not exist. When source files are not in
-`compile_commands.json`, the message says so instead, and names
-`fw-context index --build`.
+`compile_commands.json`, the message says so instead. It names no
+command, because the command depends on the build system:
+`index_state` names it when it can, and `get_project_status` names it
+when a command is necessary.
 
 `get_source` and `get_symbol_context` add `source_origin`: `"index"` or
 `"disk"`. When the file changed and the symbol did not move, the body
@@ -3034,7 +3096,9 @@ stored line number no longer points at the symbol. `explain_symbol` and
 `read_file` also set `stale` and `stale_warning` when the file changed.
 
 The search tools start the watcher daemon in the background when they find
-a changed file, so no query has to wait for a reindex. The file watcher
+a changed file, or an empty result with a source file that
+`compile_commands.json` does not cover, so no query has to wait for a
+reindex. The file watcher
 independently handles a recently edited file within 500 ms after the
 save, so a stale result is rare in practice.
 

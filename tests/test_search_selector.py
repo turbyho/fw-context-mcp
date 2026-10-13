@@ -132,8 +132,7 @@ class TestSmartSearch:
         async def fake_run(ctx, key, _page_size, _skip):
             searched.append(ctx.config_hash)
             return CachedAnswer(key=key, meta=(), symbols=({"name": "f", "file": "a.c", "line": 1},
-                                                          {"name": "g", "file": "a.c", "line": 2}),
-                                llm_failed=True)
+                                                          {"name": "g", "file": "a.c", "line": 2}))
 
         handler.SMART_SEARCH_CACHE.clear()
         with (

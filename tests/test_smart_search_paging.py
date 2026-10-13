@@ -64,8 +64,7 @@ def _call(tmp_path: Path, runs: _Runs, query: str, offset: int = 0, *, config_ha
     runner.last_ctx = None
     with patch.object(PipelineContext, "create", return_value=_ctx(tmp_path, config_hash)), \
             patch("fw_context_mcp.search.pipeline._build_smart_search"), \
-            patch("fw_context_mcp.search.pipeline.PipelineRunner", return_value=runner), \
-            patch.object(search, "_append_staleness_warning", side_effect=lambda r, *_: r):
+            patch("fw_context_mcp.search.pipeline.PipelineRunner", return_value=runner):
         return asyncio.run(search.smart_search(query=query, limit=limit, offset=offset))
 
 

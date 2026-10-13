@@ -106,7 +106,7 @@ class TestDiagnoseOncePerQuery:
         db = _context(root, executor, db_path)
 
         result = db.execute_scoped(lambda conn, ch: [{"info": "no results"}])
-        warnings = [r for r in result if isinstance(r, dict) and set(r) == {"warning"}]
+        warnings = [r for r in result if isinstance(r, dict) and "warning" in r]
 
         assert len(warnings) == 1, f"one problem, one warning: {result}"
 

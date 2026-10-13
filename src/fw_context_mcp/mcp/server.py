@@ -92,7 +92,7 @@ from ..utils import AmbiguousProjectError, resolve_project_root
 from .background import _ensure_daemon_running
 from .handlers import callgraph, inheritance, maintenance, search, source, variables
 from .shared.context import _check_server_ready, _integrity_checked
-from .shared.stale import annotate_build_problem
+from .shared.index_state import annotate_index_state
 
 log = logging.getLogger(__name__)
 
@@ -159,10 +159,12 @@ def _wrap_tool(fn):
     the server process.  ``BrokenPipeError`` on the async path is treated
     as a clean exit (client disconnected mid-query) — the server exits 0.
 
-    Each answer of the handler gets the text of the last index run that
-    stopped without an index (``annotate_build_problem``).  It goes here,
-    and not into each handler, because every query tool passes through
-    this wrapper, and a handler that someone adds later gets it too.
+    Each answer of the handler gets the state of the index of its build
+    when that index is not current (``annotate_index_state``): an index
+    run that is active or scheduled, a failed run, or a reason that no run
+    repairs.  It goes here, and not into each handler, because every query
+    tool passes through this wrapper, and a handler that someone adds
+    later gets it too.
 
     **Why two code paths (sync vs async)?**  Sync handlers execute
     blocking SQLite queries and libclang traversal.  Running them on
@@ -224,7 +226,7 @@ def _wrap_tool(fn):
                     log.exception("Tool %s crashed", fn.__name__)
                     return [{"error": f"Internal server error in {fn.__name__}: {exception}"}]
                 return await asyncio.to_thread(
-                    annotate_build_problem, task.result(), kw.get("project_root")
+                    annotate_index_state, task.result(), kw
                 )
             finally:
                 _SERVER_LOCK.release()
@@ -281,7 +283,7 @@ def _wrap_tool(fn):
                 log.exception("Tool %s crashed", fn.__name__)
                 return [{"error": f"Internal server error in {fn.__name__}: {exception}"}]
             return await asyncio.to_thread(
-                annotate_build_problem, task.result(), kw.get("project_root")
+                annotate_index_state, task.result(), kw
             )
         finally:
             _SERVER_LOCK.release()
@@ -618,11 +620,25 @@ mcp = FastMCP(
         "• A file can come back with every line blank.  read_file marks it\n"
         "  with all_lines_inactive and a warning.  Such a file holds code,\n"
         "  and that build compiles none of it — NOT an empty file.\n\n"
-        "A MISSING OR FAILED BUILD.  When the last index run stopped because\n"
-        "the build is not there or the run failed, each query answer says so: a\n"
-        "dict gets `build_warning`, a list gets a leading `warning` row.  The\n"
-        "answers then come from the last index run that ended well.  Give\n"
-        "the text to the operator: it names the command that repairs it.\n\n"
+        "AN INDEX THAT IS NOT CURRENT.  When the index of the build of a query\n"
+        "is not current, the answer says so: a dict gets `index_state` and\n"
+        "`index_warning`, a list gets a leading row with `warning` and\n"
+        "`index_state`.  The answer then comes from the last index run.  Act\n"
+        "on `index_state`:\n"
+        '• "reindexing" or "pending" — an index run updates the index.  WAIT:\n'
+        "  repeat the call, or call get_project_status after about 30 s.  Use\n"
+        "  the old answer only when the user tells you to continue.  Do not\n"
+        "  start a second index run.\n"
+        '• "not_scheduled" — no index run updates the index.  Tell the user\n'
+        "  the command that the warning names.  When it names none, call\n"
+        "  get_project_status: it names the command.\n"
+        '• "failed" — the last index run failed, because the build is not\n'
+        "  there or the run stopped.  A dict also gets `build_warning`.  Give\n"
+        "  the text to the user: it names the command that repairs it.\n"
+        "No `index_state`: the quick checks of the query found no reason.  They\n"
+        "can miss a changed header, a changed file that the answer does not\n"
+        "name, or a new source file when the answer is not empty.\n"
+        "get_project_status does the full check of each build.\n\n"
         "TOOL SELECTION (pick the right one):\n"
         '• Symbol by exact/prefix name _____ → lookup_symbol (e.g. "uart_", "main")\n'
         '• Symbols by concept/topic _________ → search_code (e.g. "interrupt handler")\n'
@@ -862,11 +878,15 @@ mcp = FastMCP(
         "→ Trace(find_references/find_callers) — skip if context already from get_symbol_context.\n"
         "→ For body patterns use search_bodies.\n"
         "→ DECISION after get_project_status():\n"
-        '  • status="ready" or "reindexing" — fw-context is fully operational.\n'
-        "    bg_reindex_running does NOT mean the index is unavailable. Continue.\n"
-        '  • status="reindex_needed" — queries still work, but schedule fw-context index.\n'
-        '    It wins over "reindexing".  When bg_reindex_running=True, that run\n'
-        "    already does the work: do not start a second one.\n"
+        "  • reindex_state of each build in builds — the values of index_state\n"
+        "    above.  null: the index of that build is current.  Continue.\n"
+        '    "reindexing" or "pending": wait.  "not_scheduled" or "failed": tell\n'
+        "    the user the command.  Read it for the build that the task needs.\n"
+        '  • status="ready" or "reindexing" — queries work.  Read reindex_state\n'
+        "    of the build before you continue.\n"
+        '  • status="reindex_needed" — queries still work, and a reason needs a\n'
+        '    command.  It wins over "reindexing".  When bg_reindex_running=True,\n'
+        "    an index run is active or scheduled: do not start a second one.\n"
         "  • client_restart_required=True — NOT a status, and NO command repairs\n"
         "    it. This session does not run the code that it must: the index holds a\n"
         "    newer row format than this session reads, or the operator installed\n"

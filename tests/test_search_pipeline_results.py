@@ -69,7 +69,6 @@ def _semantic_search(tmp_path: Path, final_results: list[dict]) -> tuple[list[di
             patch.object(search, "load_config", return_value=cfg), \
             patch.object(search, "check_setup", return_value={"ollama_running": True}), \
             patch.object(search, "_fallback_to_search_code", fallback), \
-            patch.object(search, "_append_staleness_warning", side_effect=lambda r, *_: r), \
             patch.object(PipelineContext, "create", return_value=_ctx(tmp_path)), \
             patch.object(PipelineRunner, "run", _run):
         rows = asyncio.run(search.semantic_search(query="modem connect"))
@@ -268,7 +267,6 @@ def test_semantic_search_with_a_local_model_does_not_probe_ollama(tmp_path):
             patch.object(search, "_db_path", return_value=db_path), \
             patch.object(search, "load_config", return_value=cfg), \
             patch.object(search, "check_setup", probe), \
-            patch.object(search, "_append_staleness_warning", side_effect=lambda r, *_: r), \
             patch.object(PipelineContext, "create", return_value=_ctx(tmp_path)), \
             patch.object(PipelineRunner, "run", _run):
         results = asyncio.run(search.semantic_search(query="modem connect"))

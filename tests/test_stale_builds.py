@@ -150,7 +150,7 @@ def test_the_project_names_the_build_of_each_reason(tmp_path):
     assert project["status"] == "reindex_needed"
     assert len(project["reindex_reasons"]) == 1
     assert project["reindex_reasons"][0].startswith("build v/boot: row_format_mismatch"), project
-    assert "v/boot: reindex_needed" in project["index_message"], project["index_message"]
+    assert "v/boot: not_scheduled" in project["index_message"], project["index_message"]
     assert "v/app" not in project["index_message"], "a current build is not behind"
 
 
@@ -178,7 +178,7 @@ def test_the_project_message_names_a_build_with_modified_files(tmp_path):
     project = _project_health(builds, healths)
 
     assert project["status"] == "ready"
-    assert "v/boot: 1 modified file(s)" in project["index_message"], project["index_message"]
+    assert "v/boot: not_scheduled (1 modified file(s))" in project["index_message"], project["index_message"]
     assert "_warning" not in project["index_message"], "no build has a warning to read"
 
 

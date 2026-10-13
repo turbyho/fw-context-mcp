@@ -40,8 +40,8 @@ from ...config import load as load_config
 from ...config.settings import Config
 from ...indexer.autobuild import AutobuildState, build_missing_reason
 from ...indexer.autobuild import clear_problem as clear_build_problem
+from ...indexer.autobuild import project_state as project_autobuild_state
 from ...indexer.autobuild import read_problem as read_build_problem
-from ...indexer.autobuild import state as autobuild_state
 from ...indexer.build import checked_compile_commands, user_database
 from ...indexer.compile_commands import command_line_defines
 from ...indexer.compile_commands import parse as parse_cc
@@ -77,6 +77,7 @@ from ..shared.context import (
     get_executor,
     invalidate_executor,
 )
+from ..shared.index_state import RUN_STATES, WAIT_ADVICE, index_state, manifest_reason
 from ..shared.stale import (
     _check_header_staleness,
     _count_modified_files,
@@ -109,6 +110,26 @@ _AUTOBUILD_ADVICE: dict[AutobuildState, str] = {
 }
 
 
+#: The command of the degraded `_warning` when a reason names its own
+#: command.  The message of a project of several builds looks for it.
+_REASON_COMMAND = "the command that reindex_reasons names"
+
+
+def _new_source_advice(auto_state: AutobuildState, bg_running: bool) -> str:
+    """Return the advice for a source file that compile_commands.json does not cover.
+
+    WHY *bg_running*: "fw-context builds them on its own" is true only when
+    an index run comes.  The daemon schedules one for a new file
+    (`daemon._staleness_check`), and without a daemon nothing does.
+    """
+    if auto_state is AutobuildState.WILL_BUILD and not bg_running:
+        return (
+            "fw-context builds them in the next index run, and no index run is in "
+            "progress or scheduled — run `fw-context index`"
+        )
+    return _AUTOBUILD_ADVICE[auto_state]
+
+
 def _autobuild_state(root: Path, proj_cfg, new_sources: list[str]) -> AutobuildState:
     """Say what will happen to *new_sources*, for the message and the status.
 
@@ -118,20 +139,7 @@ def _autobuild_state(root: Path, proj_cfg, new_sources: list[str]) -> AutobuildS
     """
     if not new_sources:
         return AutobuildState.WILL_BUILD  # unused — no file to report
-
-    from ...indexer.builders import registry
-
-    # The index run builds nothing for a database of the user
-    # (`build.user_database`), and the advice must not promise a build.
-    if user_database(root, proj_cfg) is not None:
-        return AutobuildState.USER_DATABASE
-    # A `[build] command` is a build that the user wrote, and the index run
-    # never starts it on its own (`cli._index._may_build_in_background`).
-    if proj_cfg.build.command:
-        return AutobuildState.UNSUPPORTED
-    system = proj_cfg.build.system or _detect_build_system(root)
-    builder_cls = registry.get(system) if system else None
-    return autobuild_state(builder_cls, proj_cfg.build)
+    return project_autobuild_state(root, proj_cfg)
 
 
 def _build_missing_advice(reason: str, root: Path, proj_cfg) -> str:
@@ -333,13 +341,9 @@ def _project_facts(conn, target: _IndexTarget) -> _ProjectFacts:
     * HEAD is the same for each build.
     """
     from ...indexer.git_context import read_head
-    from ..shared.variants import active_build
+    from ..shared.variants import checked_build
 
-    checked, _refusal = active_build(conn, target.project_id, target.cfg, target.root)
-    if checked is None:
-        # No build system names the application of several images: the
-        # newest build, as the index run reads it (`cli._index._checked_build`).
-        checked = get_active_config(conn, target.project_id)
+    checked = checked_build(conn, target.project_id, target.cfg, target.root)
     if checked is None:
         # Both callers read a completed build first, thus only a reindex
         # that removed it in between gets here.  No build, no facts.
@@ -499,10 +503,10 @@ def _build_health(
     new_sources, auto_state = facts.new_sources, facts.auto_state
 
     # A source file that the build system never saw has no translation
-    # unit, thus a plain reindex cannot pick it up.  It forces a reindex
-    # only when fw-context will not build it on its own.  When it will,
-    # the state is "reindexing" below: work is under way, and telling the
-    # caller to run a command would only duplicate it.
+    # unit, and only a build adds it.  It forces a reindex only when
+    # fw-context does not build it on its own.  When it does, the next
+    # index run builds it, thus the status below is "reindexing" when no
+    # other reason forces a reindex, and no reason names `--build`.
     blocked_sources = bool(new_sources) and auto_state is not AutobuildState.WILL_BUILD
 
     # ── The tree has another checkout than this index ──
@@ -526,6 +530,10 @@ def _build_health(
     needs_reindex = bool(
         cc_changed or schema_old or row_format_old or blocked_sources or checkout_moved
         or build_problem or build_missing
+    )
+    # The reasons below whose text names a command (see `_warning`).
+    reason_names_command = bool(
+        build_problem or build_missing or checkout_moved or blocked_sources or row_format_old
     )
     # Asked once, because the call reaches the build backend and is not
     # free.  Only the branch reason below reads it.
@@ -615,7 +623,7 @@ def _build_health(
         # build that adds them is the one that must be repaired first.
         advice = (
             "repair the build first, see the first reason"
-            if build_problem or build_missing else _AUTOBUILD_ADVICE[auto_state]
+            if build_problem or build_missing else _new_source_advice(auto_state, bg_running)
         )
         reindex_reasons.append(
             f"{len(new_sources)} source file(s) not in compile_commands.json "
@@ -625,16 +633,31 @@ def _build_health(
     # One status that drives the decision of the caller.
     # Priority: reindex_needed > reindexing > ready.
     #
-    # A file that fw-context will build on its own counts as "reindexing":
-    # the work is under way or about to be, and every query keeps working
-    # meanwhile.  "reindex_needed" would ask the caller for a command that
-    # only duplicates it.
+    # A file that fw-context builds on its own counts as "reindexing" and
+    # not as "reindex_needed": the next index run builds it, and no other
+    # command is necessary.  `reindex_state` below tells if that run comes:
+    # without a run it is "not_scheduled", and the advice names
+    # `fw-context index`.
     if needs_reindex:
         status = "reindex_needed"
     elif bg_running or (new_sources and auto_state is AutobuildState.WILL_BUILD):
         status = "reindexing"
     else:
         status = "ready"
+
+    # ── Is the index of THIS build current, and what updates it ──
+    # `status` mixes the build with the run of the project: "reindexing"
+    # also when the run concerns another build.  `reindex_state` answers
+    # for this build alone, see `index_state`.  A header that changed and
+    # a unit that failed to parse count too: the rows of those units are
+    # older than the files.  So does an index without full header
+    # tracking: it cannot see a changed header, and the warning below asks
+    # for a run.
+    behind = bool(
+        needs_reindex or modified_count or header_affected_tus or new_sources
+        or manifest_verification != "full"
+    )
+    reindex_state = index_state(behind, run_state=target.reindex_state, failed=bool(build_problem))
 
     if status == "ready" and modified_count:
         # The index is structurally sound, thus the status stays "ready"
@@ -646,24 +669,38 @@ def _build_health(
             f"changed since the last index run. Results about those files can be "
             f"out of date — run `fw-context index`."
         )
+    elif status == "ready" and reindex_state is not None:
+        # Stale headers, or an index without full header tracking: the
+        # notes below name them.  "Fully up to date" would contradict
+        # `reindex_state`.
+        index_message = f"Index is usable ({sym_count} symbols), but it is not current"
     elif status == "ready":
         index_message = f"Index is fully up to date ({sym_count} symbols)"
     elif status == "reindexing":
         if new_sources and auto_state is AutobuildState.WILL_BUILD:
             index_message = (
                 f"{len(new_sources)} source file(s) are not in compile_commands.json "
-                f"(first: {new_sources[0]}). fw-context builds them on its own — "
-                f"no command is needed. Queries work on existing data meanwhile."
+                f"(first: {new_sources[0]}). {_new_source_advice(auto_state, bg_running)}. "
+                f"Queries work on existing data meanwhile."
             )
         elif modified_count:
+            # Not "accurate": the answers about these files come from the
+            # last run until the run ends.  `_with_project_notes` puts the
+            # advice to wait in front.
             index_message = (
-                f"Index is usable — {modified_count} file(s) being reindexed "
-                f"in background. All queries return accurate results."
+                f"Index is usable ({sym_count} symbols), but {modified_count} file(s) "
+                f"changed since the last index run, and an index run updates them."
+            )
+        elif reindex_state is None:
+            index_message = (
+                "Index is usable — background reindex in progress or scheduled, and the "
+                "index of this build is current. All queries return accurate results."
             )
         else:
-            index_message = (
-                "Index is usable — background reindex in progress or scheduled. All queries return accurate results."
-            )
+            # Stale headers, or an index without full header tracking: the
+            # run updates them, and the advice to wait comes from
+            # `_with_project_notes`.
+            index_message = "Index is usable — background reindex in progress or scheduled."
     elif build_problem or build_missing:
         # First among the reasons: without the build each unit gets no
         # answer of its compiler, and no other repair helps before it.
@@ -700,36 +737,42 @@ def _build_health(
     warning = None
     if manifest_verification != "full":
         if bg_running:
+            # The same advice as `reindex_state`: the build is not current,
+            # and a run comes.  A text that said "continue" here gave the
+            # caller two opposite actions in one answer.
             warning = (
-                "Index was built without full header dependency "
-                "tracking (manifest verification: "
-                f"{manifest_verification}). A reindex is running or "
-                "scheduled, and it updates the index when it "
-                "completes. You can continue the analysis, but the "
-                "index can miss header changes since the last "
-                "completed index run."
+                f"The index is not complete: {manifest_reason(manifest_verification)}. "
+                "An index run is in progress or scheduled, and it updates the "
+                f"index when it ends. {WAIT_ADVICE}"
             )
             index_message += (
                 f" — manifest verification: {manifest_verification} (reindex in progress or scheduled — wait for completion)"
             )
         else:
+            # Some reasons name their own command (`reason_names_command`),
+            # and a plain 'fw-context index' next to it is not sufficient:
+            # the reason names what to repair before the run, or that the
+            # run needs `--build`.  The run that the reason names also makes
+            # the index complete.  A changed compile_commands.json and an
+            # old schema name no command in `reindex_reasons`, and a plain
+            # run repairs them.
+            if reason_names_command:
+                command = _REASON_COMMAND
+                tracking = "the run that reindex_reasons names makes the index complete"
+            else:
+                command = "'fw-context index'"
+                tracking = "run 'fw-context index' to make the index complete"
             warning = (
                 "⚠️ INDEX DEGRADED — STOP ALL C/C++ ANALYSIS "
                 "IMMEDIATELY.\n\n"
-                "manifest.json is NOT available "
-                "for this index (manifest verification: "
-                f"{manifest_verification}). The index may contain "
-                "STALE data — header changes cannot be detected "
-                "without manifest.json. Continuing analysis with a "
-                "stale index WILL produce incorrect results.\n\n"
-                "REQUIRED: Tell the user to run 'fw-context index' "
-                "to rebuild with full dependency tracking. Do NOT "
-                "continue any C/C++ analysis until the user "
-                "confirms the index has been rebuilt."
+                f"The index is not complete: {manifest_reason(manifest_verification)}. "
+                "The index can hold STALE data, and an analysis with a "
+                "stale index WILL give incorrect results.\n\n"
+                f"REQUIRED: Tell the user to run {command} "
+                "to make the index complete. Do NOT continue any C/C++ "
+                "analysis until the user confirms that the index run ended."
             )
-            index_message += (
-                f" — manifest verification: {manifest_verification} (run 'fw-context index' for full tracking)"
-            )
+            index_message += f" — manifest verification: {manifest_verification} ({tracking})"
 
     if header_affected_tus:
         # A TU that failed to parse keeps its needs_reparse mark, so it
@@ -741,6 +784,14 @@ def _build_health(
             "— header changes since last index, or a TU that failed to "
             "parse (see the index log)"
         )
+        if not bg_running and not needs_reindex:
+            # No reason names this, thus without the command the caller of
+            # a project of one build got "not_scheduled" and no action.  The
+            # message of several builds names the same command.  A reason
+            # names its own command, and a plain `fw-context index` next to
+            # it is not sufficient: the reason names what to repair before
+            # the run, or that the run needs `--build`.
+            index_message += " — run `fw-context index` for a changed header"
 
     # LLM-analysis coverage, split by project/vendor, so the LLM reads
     # unanalyzed vendor symbols as expected (analyze_vendor=false), not as
@@ -775,6 +826,7 @@ def _build_health(
         "description": cfg["description"] if "description" in cfg.keys() else "",
         "first_indexed_at": cfg["first_indexed_at"] if "first_indexed_at" in cfg.keys() else "",
         "status": status,
+        "reindex_state": reindex_state,
         "reindex_needed": needs_reindex,
         "reindex_reasons": reindex_reasons,
         "stale": needs_reindex or header_affected_tus > 0,
@@ -793,25 +845,25 @@ def _with_project_notes(result: dict, target: _IndexTarget, restart_reason: str,
     The front of ``index_message`` is what a caller acts on, thus a note
     that changes the action goes there, one time for the call.
 
-    * A run in progress or scheduled, while a reason asks for a command.
-      Every message names a command, and a caller that follows it asks the
-      operator for work that is being done.  ``status`` stays "reindex_needed" on
-      purpose: the answers of THIS moment come from the rows of the last
-      finished run, and "reindexing" carries "continue" in the tool
-      instructions.  The wording promises nothing about the outcome: the
-      run belongs to the daemon or to the operator, and its arguments
-      cannot be read from here.
+    * A run in progress or scheduled, while the index of a build is not
+      current (``reindex_state`` "reindexing" or "pending").  A message
+      can name a command, and a caller that follows it asks the operator
+      for work that is being done.  ``status`` stays as it is on purpose:
+      the answers of THIS moment come from the rows of the last finished
+      run.  The wording promises nothing about the outcome: the run belongs
+      to the daemon or to the operator, and its arguments cannot be read
+      from here.
     * This process is older than the index it reads (a NEWER row format).
       No command repairs that, and a "fully up to date" message alone would
       hide the one action that helps.
     """
-    if result["reindex_needed"] and target.bg_running:
+    if any(state in RUN_STATES for state in _build_states(result)):
         result["index_message"] = (
             "An index run is in progress or scheduled — wait for it rather than start "
             "a second one, and ask the operator for no command yet. It "
             "can clear the reasons below, but a reason that needs "
             "`--build` clears only if the run uses it. Answers meanwhile "
-            "come from the last finished run. " + result["index_message"]
+            f"come from the last finished run. {WAIT_ADVICE} " + result["index_message"]
         )
     if restart_reason:
         result["index_message"] = (
@@ -841,6 +893,19 @@ def _with_project_notes(result: dict, target: _IndexTarget, restart_reason: str,
     return result
 
 
+def _build_states(result: dict) -> list[str | None]:
+    """Return the ``reindex_state`` of each build of a status answer.
+
+    ``get_build_info`` answers for one build, and a project of several
+    builds holds them in ``builds``.  A project of one build has both, with
+    the same value.  WHY a function: `_with_project_notes` serves the two
+    tools, and it must read the state from the field that each one has.
+    """
+    if "reindex_state" in result:
+        return [result["reindex_state"]]
+    return [row["reindex_state"] for row in result.get("builds", [])]
+
+
 def _public(health: dict) -> dict:
     """Return the fields of *health* that a tool gives, without the internal ones."""
     return {key: value for key, value in health.items() if not key.startswith("_restart")}
@@ -848,7 +913,7 @@ def _public(health: dict) -> dict:
 
 # The fields of one build in the `builds` list of get_project_status.
 _BUILD_ROW_FIELDS = (
-    "symbol_count", "file_count", "indexed_at", "status", "reindex_needed", "stale",
+    "symbol_count", "file_count", "indexed_at", "status", "reindex_state", "reindex_needed", "stale",
     "modified_files_count", "header_affected_tus",
 )
 
@@ -868,9 +933,18 @@ def _build_row(build, health: dict) -> dict:
 
 
 def _build_state_words(health: dict) -> str:
-    """Return the state of one build in a few words, for the message of a project of several builds."""
-    if health["status"] != "ready":
-        return health["status"]
+    """Return the state of one build in a few words, for the message of a project of several builds.
+
+    "" for a build that is current, else its ``reindex_state`` and the
+    counts that the reasons do not give.  WHY not ``status``: it is
+    "reindexing" while a run of the project is active, also for a build
+    that the run does not change, and for a new source file when no run
+    comes.  A message that said "reindexing" then made the caller wait for
+    a run that did not exist.
+    """
+    state = health["reindex_state"]
+    if state is None:
+        return ""
     parts = []
     if health.get("_warning"):
         # A build without full header tracking is not up to date: the
@@ -880,7 +954,7 @@ def _build_state_words(health: dict) -> str:
         parts.append(f"{health['modified_files_count']} modified file(s)")
     if health["header_affected_tus"]:
         parts.append(f"{health['header_affected_tus']} file(s) with stale headers")
-    return ", ".join(parts)
+    return f"{state} ({', '.join(parts)})" if parts else state
 
 
 def _project_health(builds: list, healths: list[dict]) -> dict:
@@ -908,15 +982,19 @@ def _project_health(builds: list, healths: list[dict]) -> dict:
     behind = [(label, words) for label, health in zip(labels, healths, strict=True)
               if (words := _build_state_words(health))]
     listing = "; ".join(f"{label}: {words}" for label, words in behind)
-    if not behind:
+    if not behind and status == "reindexing":
+        # The words of a project of one build, see `_build_health`.
+        message = (
+            f"Index is usable — background reindex in progress or scheduled, and the "
+            f"index of each build is current ({len(builds)} builds). All queries "
+            f"return accurate results."
+        )
+    elif not behind:
         message = f"Index is fully up to date ({len(builds)} builds)."
     elif not reasons and status == "reindexing":
-        # The words of one build in the same state: no reason to read, and
-        # nothing for the caller to do but to wait for the run.
-        message = (
-            f"Index is usable — background reindex in progress or scheduled ({listing}). "
-            f"All queries return accurate results."
-        )
+        # No reason to read, and nothing for the caller to do but to wait
+        # for the run: `_with_project_notes` puts that advice in front.
+        message = f"Index is usable — background reindex in progress or scheduled ({listing})."
     elif not reasons:
         # `_warning` only when a build has one: a pointer to an absent field
         # sends the caller to look for nothing.
@@ -940,8 +1018,13 @@ def _project_health(builds: list, healths: list[dict]) -> dict:
     }
     degraded = [label for label, health in zip(labels, healths, strict=True) if health.get("_warning")]
     if degraded:
-        first = next(health["_warning"] for health in healths if health.get("_warning"))
-        result["_warning"] = f"Builds without full header tracking: {', '.join(degraded)}. {first}"
+        # One text for the project.  The text that sends the caller to
+        # `reindex_reasons` wins: a plain 'fw-context index' is wrong for a
+        # build whose reason names its own command, and `reindex_reasons`
+        # of the project holds the reasons of each build.
+        warnings = [health["_warning"] for health in healths if health.get("_warning")]
+        chosen = next((text for text in warnings if _REASON_COMMAND in text), warnings[0])
+        result["_warning"] = f"Builds without full header tracking: {', '.join(degraded)}. {chosen}"
     return result
 
 
@@ -960,11 +1043,12 @@ def get_project_status(
     use any other fw-context tool, and call it again while you wait for a
     reindex.
 
-    Read-only with one exception, and it spawns no subprocess — the
+    Read-only with two exceptions, and it spawns no subprocess — the
     startup daemon thread and the file watcher own the background reindex.
-    The exception: the last index run can leave a marker that says that
+    The exceptions: the last index run can leave a marker that says that
     the build is not there, and when the tool finds that build again, it
-    removes the marker.  It creates no
+    removes the marker.  It also removes a ``reindex.pid`` or a
+    ``reindex.pending`` of a process that no longer runs.  It creates no
     ``.fw-context`` file in a project that is not initialized.  It takes no
     ``variant`` and no ``image``: it reports every build.  For the detail
     of one build (its ``config_hash``, memory map, defines), call
@@ -976,11 +1060,30 @@ def get_project_status(
     Select the build from the task, and
     ask the user when the task does not identify one.
 
-    Act on ``status``:
+    Act on ``reindex_state`` of the build that the task needs, in
+    ``builds`` (a project of one build has it at the top level too):
+
+    * ``null`` — the index of the build is current. Continue.
+    * ``"reindexing"`` or ``"pending"`` — the index of the build is not
+      current, and an index run is active or scheduled. Wait, and call
+      this tool again after about 30 s. Continue with the old index only
+      when the user tells you to.
+    * ``"not_scheduled"`` — the index of the build is not current, and no
+      run updates it. Tell the user the command that the reasons name.
+    * ``"failed"`` — the last index run failed. Give its text to the user:
+      it names the command that repairs it.
+
+    Each query answer carries the state of its build as ``index_state``,
+    from quick checks only. A query thus can miss a changed header, a
+    changed file that its answer does not name, or a new source file when
+    its answer is not empty. This tool does the full check.
+
+    ``status`` gives the state of the project:
 
     * ``"ready"`` — up to date. Continue.
     * ``"reindexing"`` — background reindex running or scheduled, or fw-context builds
-      new source files on its own; queries stay accurate. Continue.
+      new source files on its own. ``reindex_state`` of a build tells
+      whether that build waits for the run.
       ``reindex_progress`` holds the last log line of a running reindex.
     * ``"reindex_needed"`` — schema mismatch, an old row format, changed
       compile_commands.json, a branch change since the index, or a source
@@ -1119,8 +1222,10 @@ def get_project_status(
         build needs a reindex or has stale header dependencies),
         index_message (str — human-readable summary of index state),
         builds (list[dict] — every build: {variant, image, board,
-        symbol_count, file_count, indexed_at, status, reindex_needed,
-        stale, modified_files_count, header_affected_tus, reasons}, and
+        symbol_count, file_count, indexed_at, status, reindex_state (str
+        or None — "reindexing", "pending", "not_scheduled", "failed", or
+        None for a current index), reindex_needed, stale,
+        modified_files_count, header_affected_tus, reasons}, and
         ``manifest_verification`` on a build without full header
         tracking), declared_not_indexed (list[dict], optional — each
         variant that the config declares and the index does not hold:
@@ -1225,16 +1330,17 @@ def get_build_info(
     """Return the detail of ONE build: its identity, its health, its memory
     map and its defines.
 
-    Read-only with the one exception that ``get_project_status`` also has:
-    it removes the marker of a missing build when it finds that build
-    again.  It spawns no subprocess.  On a project of more than one
+    Read-only with the two exceptions that ``get_project_status`` also
+    has: it removes the marker of a missing build when it finds that build
+    again, and a ``reindex.pid`` or a ``reindex.pending`` of a process that
+    no longer runs.  It spawns no subprocess.  On a project of more than one
     build, give the arguments of one build as the refusal lists them: the
     ``variant``, the ``image``, or the two.  ``get_project_status`` lists
     the builds in ``builds``.  Without the arguments the answer is an
     error that lists the builds.  A project of one build
     needs no selector.
 
-    The health fields (``status``, ``reindex_needed``, ``reindex_reasons``,
+    The health fields (``status``, ``reindex_state``, ``reindex_needed``, ``reindex_reasons``,
     ``index_message``, ``modified_files_count`` and the others) have the
     meaning that ``get_project_status`` gives them, for this build only.
     The version fields (``update_notice``, a restart after an upgrade) are
@@ -1299,7 +1405,8 @@ def get_build_info(
         this build really used to mark vendor code, for example
         ``["mbed-os/%"]``; empty when the manifest cannot be read.  The two
         lists above hold what the config asks for, this one what the index
-        did), status, reindex_needed, reindex_reasons, stale,
+        did), status, reindex_state (str or None — see get_project_status),
+        reindex_needed, reindex_reasons, stale,
         index_message, entry_point (str — the `ENTRY()` of the linker
         script of the build, empty when no script names one), memory
         (list[dict] — the `MEMORY` regions of the build: {name, attributes,

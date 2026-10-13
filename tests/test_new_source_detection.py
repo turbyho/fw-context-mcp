@@ -167,12 +167,15 @@ class TestFindUnindexedSources:
 
 
 class TestAnnotateNewSources:
-    def test_the_message_names_the_file_and_the_command(self):
+    def test_the_message_names_the_file_and_where_the_command_is(self):
+        """The command depends on the backend: `--build` fails for a database of the user."""
         annotated = annotate_stale([], [], empty_new_sources=["src/sensor.c"])
 
         warning = annotated[0]["warning"]
         assert "src/sensor.c" in warning
-        assert "--build" in warning, "a plain reindex cannot repair this"
+        assert "only a build adds them" in warning
+        assert "get_project_status names the command" in warning
+        assert "--build" not in warning
 
     def test_a_new_source_wins_over_a_changed_file_count(self):
         """Only the new-source case needs a build, thus it is named first."""

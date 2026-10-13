@@ -297,7 +297,7 @@ class TestExecuteScopedAnswersForOneBuild:
 
         result = ctx.execute_scoped(lambda c, h: [{"file": str(file_path)}])
 
-        warnings = [r for r in result if set(r) == {"warning"}]
+        warnings = [r for r in result if set(r) == {"warning", "stale"}]
         assert len(warnings) == 1, f"expected one notice, got {len(warnings)}"
 
     def test_no_warning_when_nothing_changed(self, indexed_file):

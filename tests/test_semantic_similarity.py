@@ -152,7 +152,6 @@ def _run_handler(
         mock.patch.object(handler, "load_config", return_value=config or Config()),
         mock.patch.object(handler, "check_setup", return_value={"ollama_running": True}),
         mock.patch.object(handler, "_fallback_to_search_code", fallback),
-        mock.patch.object(handler, "_append_staleness_warning", side_effect=lambda r, *_: r),
         mock.patch.object(PipelineContext, "create", return_value=context),
         mock.patch("fw_context_mcp.search.phases.embedding.get_embedder", return_value=embedder),
     ):

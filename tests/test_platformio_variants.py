@@ -110,7 +110,9 @@ class TestTheEnvironmentsOfTheProject:
         code, _seen = _run(tmp_path, monkeypatch, None)
 
         assert code == 1
-        assert "cannot list the builds of the project" in capsys.readouterr().err
+        err = capsys.readouterr().err
+        assert "cannot list the builds of the project" in err
+        assert "then run 'fw-context index'" in err, "the status tools give the text as the action"
 
     def test_an_explicit_database_of_the_config_makes_no_variants(self, tmp_path: Path, monkeypatch) -> None:
         """[index] compile_commands names its build itself, as a file on the command line does."""

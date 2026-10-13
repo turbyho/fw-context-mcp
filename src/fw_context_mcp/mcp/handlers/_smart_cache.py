@@ -52,10 +52,6 @@ class CachedAnswer:
     key: str
     meta: tuple[dict, ...]
     symbols: tuple[dict, ...]
-    # True when the LLM setup or the embedding step failed (an ollama_warning
-    # of the pipeline): the meta rows then carry the warning,
-    # and no staleness warning goes with the pages.
-    llm_failed: bool = False
 
 
 class SmartSearchCache:

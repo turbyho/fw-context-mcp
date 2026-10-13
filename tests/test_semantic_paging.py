@@ -76,7 +76,6 @@ def _page(path: Path, offset: int, limit: int = 1, threshold: float = 0.5, confi
         mock.patch.object(handler, "_db_path", return_value=path),
         mock.patch.object(handler, "load_config", return_value=config or Config()),
         mock.patch.object(handler, "check_setup", return_value={"ollama_running": True}),
-        mock.patch.object(handler, "_append_staleness_warning", side_effect=lambda r, *_: r),
         mock.patch.object(PipelineContext, "create", return_value=_context(path)),
         mock.patch("fw_context_mcp.search.phases.embedding.get_embedder", return_value=_FakeEmbedder()),
     ):

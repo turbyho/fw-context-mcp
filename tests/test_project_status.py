@@ -338,6 +338,9 @@ class TestProjectMessage:
         assert result["reindex_reasons"] == []
         assert "background reindex in progress" in result["index_message"], result["index_message"]
         assert "reindex_reasons" not in result["index_message"], "there is no reason to read"
+        # The run does not change these builds, thus no build waits for it.
+        assert "the index of each build is current" in result["index_message"], result["index_message"]
+        assert [row["reindex_state"] for row in result["builds"]] == [None, None]
 
     def test_a_declared_variant_without_an_index_is_listed(self, tmp_path):
         root = _project(tmp_path, [("h-a", "a", "")])

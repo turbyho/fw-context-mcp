@@ -27,7 +27,7 @@ import pytest
 
 from fw_context_mcp.indexer.autobuild import build_missing_reason
 from fw_context_mcp.indexer.build_layout import BuildLayout
-from fw_context_mcp.indexer.db import open_db, transaction, upsert_build_config, upsert_project
+from fw_context_mcp.indexer.db import CURRENT_ROW_FORMAT, open_db, transaction, upsert_build_config, upsert_project
 
 PROJECT_ID = "0123456789abcdef0123456789abcdef"
 
@@ -127,7 +127,10 @@ def _project(root: Path, index_dir: Path, cc: Path, system: str = "cmake") -> Pa
     try:
         with transaction(conn):
             upsert_project(conn, PROJECT_ID, "p", str(root))
-            upsert_build_config(conn, "ch", PROJECT_ID, str(cc), description="", manifest_verification="full")
+            upsert_build_config(
+                conn, "ch", PROJECT_ID, str(cc), description="", manifest_verification="full",
+                row_format=CURRENT_ROW_FORMAT,
+            )
     finally:
         conn.close()
     config_dir = root / ".fw-context"
@@ -516,7 +519,7 @@ class TestTheRunOfTheUser:
 
 @pytest.mark.usefixtures("global_config")
 class TestTheMcpAnswers:
-    """Each answer carries the text of the last run that stopped without an index."""
+    """Each answer carries the state "failed" and the text of the last run that stopped without an index."""
 
     @staticmethod
     def _indexed(tmp_path: Path) -> tuple[Path, Path]:
@@ -525,32 +528,48 @@ class TestTheMcpAnswers:
         return root, _project(root, tmp_path / "index", _built(root))
 
     def test_no_marker_leaves_the_answer_as_it_is(self, tmp_path: Path) -> None:
-        from fw_context_mcp.mcp.shared.stale import annotate_build_problem
+        from fw_context_mcp.mcp.shared.index_state import annotate_index_state
 
         root, _ = self._indexed(tmp_path)
-        assert annotate_build_problem([{"name": "main"}], str(root)) == [{"name": "main"}]
-        assert annotate_build_problem({"name": "main"}, str(root)) == {"name": "main"}
+        kw = {"project_root": str(root)}
+        assert annotate_index_state([{"name": "main"}], kw) == [{"name": "main"}]
+        assert annotate_index_state({"name": "main"}, kw) == {"name": "main"}
 
-    def test_a_list_gets_a_leading_warning_and_a_dict_a_key(self, tmp_path: Path) -> None:
+    def test_a_list_gets_a_leading_warning_and_a_dict_keys(self, tmp_path: Path) -> None:
         from fw_context_mcp.indexer.autobuild import record_problem
-        from fw_context_mcp.mcp.shared.stale import annotate_build_problem
+        from fw_context_mcp.mcp.shared.index_state import annotate_index_state
+
+        root, db_path = self._indexed(tmp_path)
+        text = "The last index run failed (exit code 1)."
+        record_problem(db_path.parent, text)
+        advice = f"{text} The answer below comes from the last index run that ended well."
+        kw = {"project_root": str(root)}
+
+        assert annotate_index_state([{"name": "main"}], kw) == [
+            {"warning": advice, "index_state": "failed"}, {"name": "main"},
+        ]
+        assert annotate_index_state({"name": "main"}, kw) == {
+            "name": "main", "index_state": "failed", "index_warning": advice, "build_warning": text,
+        }
+
+    def test_an_answer_without_a_build_keeps_the_text(self, tmp_path: Path) -> None:
+        """A refusal of the selector names no build, and the index is still old."""
+        from fw_context_mcp.indexer.autobuild import record_problem
+        from fw_context_mcp.mcp.shared.index_state import annotate_index_state
 
         root, db_path = self._indexed(tmp_path)
         record_problem(db_path.parent, "The last index run failed (exit code 1).")
+        refusal = [{"error": "No build of this project has exactly the arguments ..."}]
 
-        assert annotate_build_problem([{"name": "main"}], str(root)) == [
-            {"warning": "The last index run failed (exit code 1)."}, {"name": "main"},
-        ]
-        assert annotate_build_problem({"name": "main"}, str(root)) == {
-            "name": "main", "build_warning": "The last index run failed (exit code 1).",
-        }
+        answer = annotate_index_state(refusal, {"project_root": str(root), "variant": "nope"})
+        assert answer == [{"warning": "The last index run failed (exit code 1)."}, *refusal]
 
     def test_a_project_that_does_not_resolve_gets_no_warning(self, tmp_path: Path) -> None:
         """The handler already gave the error; a warning must never fail an answer."""
-        from fw_context_mcp.mcp.shared.stale import annotate_build_problem
+        from fw_context_mcp.mcp.shared.index_state import annotate_index_state
 
         answer = [{"error": "No index found"}]
-        assert annotate_build_problem(answer, str(tmp_path / "nowhere")) == answer
+        assert annotate_index_state(answer, {"project_root": str(tmp_path / "nowhere")}) == answer
 
     def test_the_tool_wrapper_adds_it(self, tmp_path: Path) -> None:
         """Every query tool passes through _wrap_tool, thus none can miss it."""
@@ -566,7 +585,8 @@ class TestTheMcpAnswers:
             return [{"name": "main"}]
 
         answer = asyncio.run(_wrap_tool(handler)(project_root=str(root)))
-        assert answer[0] == {"warning": "The last index run failed (exit code 1)."}
+        assert answer[0]["index_state"] == "failed"
+        assert answer[0]["warning"].startswith("The last index run failed (exit code 1).")
 
     def test_get_project_status_finds_a_build_that_went_away(self, tmp_path: Path) -> None:
         """No run has seen it yet, thus there is no marker; the tool checks itself."""
@@ -775,7 +795,34 @@ class TestTheDatabaseOfTheUser:
         )
 
         assert index_mod.cmd_index(args) == 1
-        assert "[[build.variants]] build their own databases" in capsys.readouterr().err
+        err = capsys.readouterr().err
+        assert "[[build.variants]] build their own databases" in err
+        assert "then run 'fw-context index'" in err, "the status tools give the text as the action"
+
+    def test_a_wrong_transient_define_names_the_command(self, tmp_path: Path, capsys) -> None:
+        """The text of the refusal goes into the status tools and the query answers as the action."""
+        from types import SimpleNamespace
+
+        from fw_context_mcp.cli import _index as index_mod
+        from fw_context_mcp.indexer.autobuild import read_problem
+
+        root = tmp_path / "proj"
+        root.mkdir()
+        db_path = _project(root, tmp_path / "index", _write_cc(root / "cc.json", tmp_path / "build"))
+        config = root / ".fw-context" / "config.toml"
+        config.write_text(
+            config.read_text(encoding="utf-8") + '[index]\ntransient_defines = ["-DSTAMP"]\n', encoding="utf-8",
+        )
+        args = SimpleNamespace(
+            verbose=False, project=str(root), background=False, build=False,
+            compile_commands=None, no_clean=False, force=False, takeover=False,
+            vendor_paths=None, project_paths=None,
+        )
+
+        assert index_mod.cmd_index(args) == 1
+        assert "then run 'fw-context index'" in capsys.readouterr().err
+        problem = read_problem(db_path.parent)
+        assert problem is not None and problem.text.endswith("then run 'fw-context index'.")
 
     def test_init_does_not_build_a_missing_one(self, tmp_path: Path, monkeypatch) -> None:
         import fw_context_mcp.indexer.build as build_mod

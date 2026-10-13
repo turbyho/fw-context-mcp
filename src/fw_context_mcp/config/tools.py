@@ -93,13 +93,28 @@ limits:
 Never conclude that code is live because you saw it in a file. Cite
 fw-context, and check `source_origin` when the answer carries one.
 
-### A missing or failed build
+### An index that is not current
 
-When the last index run stopped because the build is not there or the
-run failed, each query answer says so: a dict gets `build_warning`, a list gets
-a leading `warning` row. The answers then come from the last index run
-that ended well. Give the text to the operator: it names the command that
-repairs it.
+When the index of the build of a query is not current, the answer says so:
+a dict gets `index_state` and `index_warning`, a list gets a leading row
+with `warning` and `index_state`. The answer then comes from the last index
+run. Act on `index_state`:
+
+- `"reindexing"` or `"pending"` — an index run updates the index. WAIT:
+  repeat the call, or call `get_project_status` after about 30 s. Use the
+  old answer only when the user tells you to continue. Do not start a
+  second index run.
+- `"not_scheduled"` — no index run updates the index. Tell the user the
+  command that the warning names. When it names none, call
+  `get_project_status`: it names the command.
+- `"failed"` — the last index run failed, because the build is not there
+  or the run stopped. A dict also gets `build_warning`. Give the text to
+  the user: it names the command that repairs it.
+
+No `index_state`: the quick checks of the query found no reason. They can
+miss a changed header, a changed file that the answer does not name, or a
+new source file when the answer is not empty. `get_project_status` does
+the full check of each build.
 
 ### Code review — use fw-review skill
 
@@ -365,11 +380,18 @@ Check(`get_project_status`) → Find(`search_code`/`lookup_symbol`)
 → Trace(`find_references`/`find_callers`) — skip if context from get_symbol_context.
 → For pattern-in-body searches use `search_bodies`.
 
+get_project_status() — `reindex_state` of each build in `builds` has the
+values of `index_state` above. `null`: the index of that build is current,
+continue. `"reindexing"` or `"pending"`: wait. `"not_scheduled"` or
+`"failed"`: tell the user the command. Read it for the build that the task
+needs.
+
 get_project_status() status:
-  • "ready" / "reindexing" — fully operational. Continue.
-  • "reindex_needed" — queries work, schedule `fw-context index`. It wins
-    over "reindexing". When `bg_reindex_running` is true, that run already
-    does the work: do not start a second one.
+  • "ready" / "reindexing" — queries work. Read `reindex_state` of the
+    build before you continue.
+  • "reindex_needed" — queries work, and a reason needs a command. It wins
+    over "reindexing". When `bg_reindex_running` is true, an index run is
+    active or scheduled: do not start a second one.
   • "not_initialized" — ask operator, then run `fw-context init` via bash.
   • "no_index" — ask operator, then run `fw-context index --build` via bash.
   • NO status, only `error` — DB corruption or access error. There is no

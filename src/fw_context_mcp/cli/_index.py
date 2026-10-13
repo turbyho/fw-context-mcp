@@ -1680,7 +1680,12 @@ def _cmd_index(args: argparse.Namespace, outside: _SigtermOutsideTheLock) -> int
 
     problems = transient_defines_problems(cfg)
     if problems:
-        text = "; ".join(problems) + ". Correct .fw-context/config.toml or the global config."
+        # Each text of the marker names the command that comes after the
+        # repair: the status tools and the query answers give it as is.
+        text = (
+            "; ".join(problems)
+            + ". Correct .fw-context/config.toml or the global config, then run 'fw-context index'."
+        )
         print(f"error: {text}", file=sys.stderr)
         autobuild.record_problem(db_path.parent, text)
         return 1
@@ -1693,7 +1698,8 @@ def _cmd_index(args: argparse.Namespace, outside: _SigtermOutsideTheLock) -> int
     if cfg.build.variants and user_database(project_root, cfg) is not None:
         text = (
             "[index] compile_commands names a database of your own, and [[build.variants]] build "
-            "their own databases. Remove one of the two from .fw-context/config.toml."
+            "their own databases. Remove one of the two from .fw-context/config.toml, then run "
+            "'fw-context index'."
         )
         print(f"error: {text}", file=sys.stderr)
         autobuild.record_problem(db_path.parent, text)
@@ -1718,7 +1724,13 @@ def _cmd_index(args: argparse.Namespace, outside: _SigtermOutsideTheLock) -> int
             found = implicit_variants(builder_cls() if builder_cls else None, project_root, cfg.build)
         except (RuntimeError, OSError) as exc:
             # OSError: the program of [build] python or of pio is not there.
-            text = f"cannot list the builds of the project: {exc}"
+            # The command comes before the error: the error can hold the
+            # output of the build system, and the command must not read as
+            # a part of it.
+            text = (
+                "cannot list the builds of the project. Repair the cause, then run "
+                f"'fw-context index'. The error:\n{exc}"
+            )
             print(f"error: {text}", file=sys.stderr)
             autobuild.record_problem(db_path.parent, text)
             return 1
