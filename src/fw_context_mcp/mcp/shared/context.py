@@ -36,7 +36,6 @@ import os
 
 from .connection import (
     HandlerContext,
-    _integrity_checked,  # noqa: F401 — re-exported for server.py
     _quick_open_readonly,
     _resolve_handler_context,
 )

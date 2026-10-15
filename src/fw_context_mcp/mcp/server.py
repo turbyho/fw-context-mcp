@@ -91,7 +91,7 @@ from pydantic import Field
 from ..utils import AmbiguousProjectError, resolve_project_root
 from .background import _ensure_daemon_running
 from .handlers import callgraph, inheritance, maintenance, search, source, variables
-from .shared.context import _check_server_ready, _integrity_checked
+from .shared.context import _check_server_ready
 from .shared.index_state import annotate_index_state
 
 log = logging.getLogger(__name__)
@@ -1404,14 +1404,12 @@ def main() -> None:
         mcp.run()
         return
 
-    # Project is ready — pre-mark integrity check and start normally.
-    # GOTCHA — the integrity check reads the full database file, thus it
-    # is I/O-bound on a large DB.  If it runs here via _open_db_safe during MCP server startup,
-    # the MCP client times out during tool discovery and fw-context tools
-    # never appear.  The check already ran during ``fw-context index``, so
-    # we skip it by pre-marking the DB — a corrupt DB will be caught by
-    # individual queries via _open_db_safe.
-    _integrity_checked.add(str(db_path.resolve()))
+    # Project is ready.  No step of the startup and no query tool does an
+    # integrity check of the database: the check reads the full database
+    # file, and on a large database the MCP client then times out during
+    # tool discovery, so the fw-context tools never appear.  `open_db` of
+    # the index run checks the database, and so does `reset_index`.  A
+    # query that reads a damaged page gets the error of SQLite.
 
     try:
         _ensure_daemon_running(root)

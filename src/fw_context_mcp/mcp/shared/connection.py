@@ -22,9 +22,6 @@ Do NOT reintroduce a connection pool here.
 
 What remains in this module:
 
-- ``_integrity_checked`` — set of db_keys pre-marked at server startup
-  (``server.main``); the integrity scan reads the full database file and
-  must never run during request handling.
 - ``_quick_open_readonly`` — short-lived read-only connections for
   per-request config reads.
 - ``HandlerContext`` + ``_resolve_handler_context`` — one-call context
@@ -38,7 +35,6 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -51,14 +47,6 @@ if TYPE_CHECKING:
     from fw_context_mcp.config.settings import Config
 
 log = logging.getLogger(__name__)
-
-# ── Integrity check cache ───────────────────────────────────────────────
-# db_keys whose database was already integrity-checked (pre-marked by
-# server.main at startup).  Kept for the startup path; request-path code
-# never runs integrity checks.
-
-_integrity_checked: set[str] = set()
-_integrity_lock = threading.Lock()
 
 
 def _quick_open_readonly(db_path: Path) -> sqlite3.Connection:
