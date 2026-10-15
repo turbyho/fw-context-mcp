@@ -1191,10 +1191,13 @@ def get_project_status(
     reason that every build gives comes one time, and any other reason
     names its build: ``build <variant>/<image>: <reason>``.
 
-    A failure sets NO ``status``.  DB corruption, no access to the index,
-    or an index with no build config gives a dict that holds ``error``
-    alone.  Read that key first: a reader that waits for
-    ``status == "error"`` waits for a value this tool does not produce.
+    A failure sets NO ``status``.  An index with no build config gives a
+    dict that holds ``error`` alone.  Read that key first: a reader that
+    waits for ``status == "error"`` waits for a value this tool does not
+    produce.  A database that fw-context cannot read (damage, no access)
+    makes the call fail with the error of SQLite.  The message of the
+    check ``db-integrity`` of ``check_dependencies`` tells if it is
+    damaged.
 
     Seven conditions set ``reindex_needed``: a failed last index run, a
     build that is not there, an outdated schema, an outdated ROW FORMAT, a

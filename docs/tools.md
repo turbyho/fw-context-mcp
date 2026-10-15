@@ -2448,9 +2448,11 @@ are in `builds`. `reference_count`, `analysis`, `description`, and
 A project of several builds gets the worst status of its builds:
 `"reindex_needed"`, then `"reindexing"`, then `"ready"`.
 
-A failure sets no `status`. On DB corruption, an access error, or a
-database that holds no build config, the result is a dict that holds only
-`error`. Read that key first.
+A failure sets no `status`. On a database that holds no build config,
+the result is a dict that holds only `error`. Read that key first. A
+database that fw-context cannot read (damage, no access) makes the call
+fail with the error of SQLite. The message of the check `db-integrity`
+of [`check_dependencies`](#check_dependencies) tells if it is damaged.
 
 `"reindex_needed"` outranks `"reindexing"`: the answers of this moment
 come from the last finished run. When the `reindex_state` of a build is
@@ -2682,6 +2684,8 @@ that [`get_project_status`](#get_project_status) gives them, for this
 build only. The version fields (`update_notice`, and a restart after an
 upgrade) are in `get_project_status`. A refusal of the selector, or an
 index with no build config, gives a dict that holds only `error`. A
+database that fw-context cannot read makes the call fail, as in
+`get_project_status`. A
 project that is not initialized, or that has no index, gets the answer
 of `get_project_status` without the version fields: only `status`,
 `project_root`, `index_message`, and, when no index exists,

@@ -394,8 +394,13 @@ get_project_status() status:
     active or scheduled: do not start a second one.
   • "not_initialized" — ask operator, then run `fw-context init` via bash.
   • "no_index" — ask operator, then run `fw-context index --build` via bash.
-  • NO status, only `error` — DB corruption or access error. There is no
-    status "error". Use other tools.
+  • NO status, only `error` — the index holds no build config. There is
+    no status "error".
+  • The call fails with an error of SQLite (for example "database disk
+    image is malformed") — fw-context cannot read the index. Call
+    check_dependencies: the message of its check db-integrity tells if the
+    database is damaged. Ask the operator before you delete it with
+    reset_index.
 
 `client_restart_required: True` is not a status, and NO command repairs it.
 This session does not run the code that it must: the index holds a newer row

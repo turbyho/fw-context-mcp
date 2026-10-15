@@ -915,8 +915,13 @@ mcp = FastMCP(
         '    get_project_status() again to confirm status="ready".\n'
         "    NOTE: init and index are NEVER combined — each requires its own\n"
         "    operator confirmation before execution.\n"
-        "  • NO status, only `error` — DB corruption or access error. There is\n"
-        '    no status="error". Use other tools.\n\n'
+        "  • NO status, only `error` — the index holds no build config. There is\n"
+        '    no status="error".\n'
+        '  • The call fails with an error of SQLite (for example "database disk\n'
+        '    image is malformed") — fw-context cannot read the index. Call\n'
+        "    check_dependencies: the message of its check db-integrity tells if the\n"
+        "    database is damaged. Ask the operator before you delete it with\n"
+        "    reset_index.\n\n"
         "REVIEW WORKFLOW — when reviewing C/C++ code changes (per changed symbol):\n"
         "0. find_hotspots(project_only=True) — identify highest-impact functions FIRST.\n"
         "   Prioritize review of hotspots (20+ callers) over leaf functions.\n"

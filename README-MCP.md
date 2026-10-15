@@ -157,24 +157,19 @@ Possible offline mount or wrong project root.
 
 ### Database corruption
 
-The server runs `PRAGMA integrity_check` on every database open. If the check finds corruption, the tools return a structured error:
+No query tool checks the integrity of the database, because the check reads the full file. A query that reads a damaged page fails with the error of SQLite, for example `database disk image is malformed`:
 
-```json
-{
-  "error": "Database corruption detected: …",
-  "action": "reset_index",
-  "hint": "Run reset_index() then fw-context index to rebuild."
-}
-```
+- A query tool gives a dict that holds `error` with that text.
+- `get_project_status` and `get_build_info` fail as a call: the client gets an error of the tool with that text.
 
-Call `reset_index(confirm=true)` to delete the database. Then run `fw-context index` to rebuild the database.
+To find if the database is damaged, call `check_dependencies`. Its check `db-integrity` runs `PRAGMA quick_check` at each call, and it does not change the database. The check has `status: "error"` when it cannot read the database, and its `message` tells the cause. When the message shows damage (for example `malformed`), call `reset_index(confirm=true)` to delete the database, and run `fw-context index` to make it again. A lock or a missing permission does not damage the database: repair that cause.
 
 ## Environment
 
 - **CWD:** The server resolves the project root from `$PWD` when the request does not provide `project_root`. Launch the server from the firmware project root.
 - **The core tools need no network connection** (search, lookup, source, graph). `smart_search` and `explain_symbol` can optionally use a local Ollama server.
 - **The server asks PyPI for a newer release** in a background thread at server start. After a request that succeeded, it asks again only after 24 hours. A request that failed has no effect on the tools, and the next server start tries again. No tool waits for the request. `[updates] check = false` in the global config, or `FW_CONTEXT_NO_UPDATE_CHECK=1`, stops it. See [`[updates]`](docs/configuration.md#updates--release-check).
-- **The server keeps no state between calls.** For each call, a tool opens the database, runs the query, and closes the database.
+- **The server keeps one connection for the queries of each index database.** It opens that connection again after a reindex or an error of the connection. A call reads the config of the build through a short read-only connection.
 
 ## Debugging
 
