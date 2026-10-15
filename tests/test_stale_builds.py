@@ -11,6 +11,8 @@ import os
 import time
 from pathlib import Path
 
+import pytest
+
 import fw_context_mcp  # noqa: F401  — must precede sqlite3
 from fw_context_mcp.indexer.db import (
     CURRENT_ROW_FORMAT,
@@ -57,12 +59,16 @@ def _index(tmp_path: Path) -> tuple:
     return conn, root
 
 
-def _health(conn, root: Path, tmp_path: Path, image: str) -> dict:
-    """The health of the build *image*, as get_project_status computes it for each build."""
+def _health(conn, root: Path, tmp_path: Path, image: str, run_state: str | None = None) -> dict:
+    """The health of the build *image*, as get_project_status computes it for each build.
+
+    *run_state* is the state of the index run of the project
+    (``read_reindex_state``): None, "pending" or "reindexing".
+    """
     from fw_context_mcp.config.settings import Config
     from fw_context_mcp.mcp.handlers.maintenance import AutobuildState, _build_health, _IndexTarget, _ProjectFacts
 
-    target = _IndexTarget(root, Config(), "pid", tmp_path / "db" / "index.db", None)
+    target = _IndexTarget(root, Config(), "pid", tmp_path / "db" / "index.db", run_state)
     build = next(r for r in latest_builds(conn, "pid") if r["image"] == image)
     facts = _ProjectFacts([], AutobuildState.WILL_BUILD, "", False, "")
     return _build_health(conn, target, build, fast=False, hash_cache={}, facts=facts)
@@ -95,7 +101,51 @@ def test_a_missing_database_needs_a_reindex(tmp_path):
     health = _health(conn, root, tmp_path, "boot")
 
     assert health["reindex_needed"] is True
-    assert health["reindex_reasons"][0] == "compile_commands_missing"
+    # A sentence with the action that makes the file again, and not the
+    # code of the check.  The project has no build system that fw-context
+    # can run, thus the action is a build outside of fw-context.
+    assert health["reindex_reasons"] == [
+        f"compile_commands.json {root / 'boot.json'} does not exist. Build the project outside of "
+        "fw-context (fw-context cannot run its build, for example the build of an IDE project), "
+        "then run `fw-context index`."
+    ]
+    assert health["index_message"].startswith(health["reindex_reasons"][0])
+
+
+def _make_newer(path: Path) -> None:
+    later = time.time() + 3600
+    os.utime(path, (later, later))
+
+
+def test_a_newer_database_names_a_plain_run(tmp_path):
+    """A plain run reads the new file, thus no build is necessary."""
+    conn, root = _index(tmp_path)
+    _make_newer(root / "boot.json")
+
+    health = _health(conn, root, tmp_path, "boot")
+
+    assert health["reindex_needed"] is True
+    assert health["reindex_reasons"] == [
+        "compile_commands.json changed after the last index run. Run `fw-context index`."
+    ]
+    assert health["index_message"].startswith(health["reindex_reasons"][0])
+
+
+@pytest.mark.parametrize("run_state", ["pending", "reindexing"])
+def test_a_reason_of_the_database_asks_to_wait_for_a_run(tmp_path, run_state):
+    """A run with `--build` writes the database again, thus it is newer during the run.
+
+    The command of the reason is then often the command that runs.
+    """
+    conn, root = _index(tmp_path)
+    _make_newer(root / "boot.json")
+
+    health = _health(conn, root, tmp_path, "boot", run_state)
+
+    assert health["reindex_reasons"] == [
+        "compile_commands.json changed after the last index run. An index run is in progress or "
+        "scheduled; wait for it, and when this reason stays after the run, run `fw-context index`."
+    ]
 
 
 def _set_row_format(conn, config_hash: str, row_format: str) -> None:
@@ -159,13 +209,64 @@ def test_a_reason_of_every_build_comes_one_time(tmp_path):
 
     conn, root = _index(tmp_path)
     for image in ("app", "boot"):
+        _make_newer(root / f"{image}.json")
+    builds = sorted(latest_builds(conn, "pid"), key=lambda r: r["image"])
+    healths = [_health(conn, root, tmp_path, build["image"]) for build in builds]
+
+    project = _project_health(builds, healths)
+
+    assert project["reindex_reasons"] == [
+        "compile_commands.json changed after the last index run. Run `fw-context index`."
+    ], project["reindex_reasons"]
+
+
+def test_a_missing_database_of_each_build_is_a_reason_of_each_build(tmp_path):
+    """The reason names the file, and each build has a file of its own."""
+    from fw_context_mcp.mcp.handlers.maintenance import _project_health
+
+    conn, root = _index(tmp_path)
+    for image in ("app", "boot"):
         (root / f"{image}.json").unlink()
     builds = sorted(latest_builds(conn, "pid"), key=lambda r: r["image"])
     healths = [_health(conn, root, tmp_path, build["image"]) for build in builds]
 
     project = _project_health(builds, healths)
 
-    assert project["reindex_reasons"].count("compile_commands_missing") == 1, project["reindex_reasons"]
+    assert [reason.split(" does not exist")[0] for reason in project["reindex_reasons"]] == [
+        f"build v/app: compile_commands.json {root / 'app.json'}",
+        f"build v/boot: compile_commands.json {root / 'boot.json'}",
+    ], project["reindex_reasons"]
+
+
+def test_a_missing_database_and_a_degraded_index_name_the_action_of_the_reason(tmp_path):
+    """A plain run reads the same missing file, thus the warning must not name it."""
+    from fw_context_mcp.mcp.handlers.maintenance import _REASON_COMMAND
+
+    conn, root = _index(tmp_path)
+    with transaction(conn):
+        conn.execute("UPDATE build_configs SET manifest_verification = 'none'")
+    (root / "boot.json").unlink()
+
+    health = _health(conn, root, tmp_path, "boot")
+
+    assert f"Tell the user to run {_REASON_COMMAND}" in health["_warning"], health["_warning"]
+    assert "'fw-context index'" not in health["_warning"]
+
+
+def test_a_missing_database_comes_before_an_old_schema_in_the_message(tmp_path, monkeypatch):
+    """The plain run that an old schema needs reads the same missing file."""
+    from fw_context_mcp.mcp.handlers import maintenance
+
+    conn, root = _index(tmp_path)
+    (root / "boot.json").unlink()
+    monkeypatch.setattr(maintenance, "get_db_schema_version", lambda conn: 0)
+
+    health = _health(conn, root, tmp_path, "boot")
+
+    assert health["reindex_reasons"][0].startswith("schema_mismatch: 0 < ")
+    assert health["index_message"].startswith(
+        f"compile_commands.json {root / 'boot.json'} does not exist. Build the project outside of fw-context"
+    ), health["index_message"]
 
 
 def test_the_project_message_names_a_build_with_modified_files(tmp_path):

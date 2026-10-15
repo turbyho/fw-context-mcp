@@ -119,6 +119,42 @@ class TestCanRunTheBuild:
         assert not can_run_build(BuildConfig(), None)
 
 
+class TestTheAdviceOfAMissingBuild:
+    """The reason names the build that brings the build back, or the run to wait for."""
+
+    @staticmethod
+    def _advice(tmp_path: Path, system: str, bg_running: bool) -> str:
+        from fw_context_mcp.config.settings import Config
+        from fw_context_mcp.mcp.handlers.maintenance import _build_missing_advice
+
+        cfg = Config()
+        cfg.build.system = system
+        return _build_missing_advice("the build is gone", tmp_path, cfg, bg_running)
+
+    def test_a_build_of_fw_context_names_the_build(self, tmp_path: Path) -> None:
+        assert self._advice(tmp_path, "cmake", False) == "the build is gone. Run `fw-context index --build`."
+
+    def test_a_stub_names_the_build_outside(self, tmp_path: Path) -> None:
+        assert self._advice(tmp_path, "stm32cubeide", False) == (
+            "the build is gone, and fw-context cannot run the build of this project. Run the build "
+            "outside of fw-context (for example in the IDE), then run `fw-context index`."
+        )
+
+    def test_a_run_asks_to_wait_and_keeps_the_build(self, tmp_path: Path) -> None:
+        assert self._advice(tmp_path, "cmake", True) == (
+            "the build is gone. An index run is in progress or scheduled; wait for it, and when "
+            "this reason stays after the run, run `fw-context index --build`."
+        )
+
+    def test_a_run_asks_to_wait_and_keeps_the_build_outside(self, tmp_path: Path) -> None:
+        """The run of a stub cannot bring the build back, thus the reason stays and names it."""
+        assert self._advice(tmp_path, "stm32cubeide", True) == (
+            "the build is gone, and fw-context cannot run the build of this project. An index run "
+            "is in progress or scheduled; wait for it, and when this reason stays after the run, "
+            "run the build outside of fw-context (for example in the IDE), then run `fw-context index`."
+        )
+
+
 def _project(root: Path, index_dir: Path, cc: Path, system: str = "cmake") -> Path:
     """A project whose index names *cc* as its compile_commands.json."""
     db_dir = index_dir / PROJECT_ID
@@ -601,7 +637,36 @@ class TestTheMcpAnswers:
         assert result["status"] == "reindex_needed"
         assert result["index_message"].startswith(f"compile_commands.json {_default_cc(root)} does not exist")
         assert "fw-context index --build" in result["index_message"]
-        assert "compile_commands_missing" not in result["reindex_reasons"], "one reason names it once"
+        assert [r for r in result["reindex_reasons"] if "does not exist" in r] == [
+            f"compile_commands.json {_default_cc(root)} does not exist. Run `fw-context index --build`."
+        ], "one reason names it once"
+
+    @pytest.mark.parametrize("run_state", ["pending", "reindexing"])
+    def test_a_build_that_is_gone_during_a_run_asks_to_wait(
+        self, tmp_path: Path, monkeypatch, run_state: str,
+    ) -> None:
+        """A run with `--build` removes the database before the build writes it again.
+
+        The command `--build` is then the command that runs.
+        """
+        import shutil
+
+        from fw_context_mcp.mcp.handlers import maintenance
+
+        root, _ = self._indexed(tmp_path)
+        shutil.rmtree(_out(root))
+        monkeypatch.setattr(maintenance, "read_reindex_state", lambda project_root: run_state)
+
+        result = maintenance.get_project_status(project_root=str(root))
+        reason = (
+            f"compile_commands.json {_default_cc(root)} does not exist. An index run is in progress "
+            "or scheduled; wait for it, and when this reason stays after the run, run "
+            "`fw-context index --build`."
+        )
+        assert [r for r in result["reindex_reasons"] if "does not exist" in r] == [reason]
+        # The message gives the same text after the note of the run.
+        assert reason in result["index_message"], result["index_message"]
+        assert "Run `fw-context index --build`" not in result["index_message"]
 
     def test_get_project_status_finds_a_missing_build_directory(self, tmp_path: Path) -> None:
         from fw_context_mcp.mcp.handlers.maintenance import get_project_status

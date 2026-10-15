@@ -2469,13 +2469,16 @@ command.
   The stored text has an older meaning. For example, an index written
   before `fw-context-rows/1` keeps every inactive `#if` branch, thus
   answers can hold dead code.
-- compile_commands.json changed.
+- compile_commands.json changed after the last index run. Or it does not
+  exist, and the check of the build above does not cover it, for example
+  the file of a build variant. The reason names the command.
 - A source file on disk is missing from compile_commands.json, and
   fw-context will not build it by itself. The reason says why.
 - The tree is on another git branch than the index.
 
-A missing source file and a branch change need a build, because only a
-build regenerates compile_commands.json. The reason names the build:
+A missing source file, a missing compile_commands.json and a branch
+change need a build, because only a build regenerates
+compile_commands.json. The reason names the build:
 
 - `fw-context index --build` for a build that fw-context can run.
 - For a database that `[index] compile_commands` names: make that file
@@ -2489,6 +2492,17 @@ the next index run. A schema mismatch, an older row format, and a
 changed compile_commands.json need `fw-context index`. Read the reason
 text: it names the command. The `index_state` of a query names the same
 action (`autobuild.build_advice`).
+
+When an index run is in progress or scheduled, some reasons tell you to
+wait for that run: a missing build, a missing source file that
+fw-context does not build by itself, a changed or missing
+compile_commands.json, and a branch change. For a database that
+`[index] compile_commands` names, the reason of a branch change does not
+tell you to wait. The command of
+such a reason is often the command that runs. For example, a run with
+`--build` removes the database of the build before the build writes it
+again. The reason still names the command, for the case that the reason
+stays after the run.
 
 On a project of several builds, a reason that every build gives comes one
 time, without a label, for example an old schema or a failed build. Each

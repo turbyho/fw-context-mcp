@@ -96,6 +96,23 @@ log = logging.getLogger(__name__)
 _REASON_COMMAND = "the command that reindex_reasons names"
 
 
+def _after_the_run(action: str) -> str:
+    """Return the advice to wait for the index run, and then to do *action*.
+
+    The text starts after the article ("an"), thus a caller puts it in the
+    middle of a sentence or at its start.  WHY a reason gives this text when
+    an index run is in progress or scheduled: the command of the reason is
+    often the command that runs, and a caller that follows it asks for the
+    same work a second time.  The run can also leave the reason standing,
+    for example a run that does not build, thus the action stays in the
+    text.
+
+    The text holds no dash and no colon, because a reason can put it after
+    either.
+    """
+    return f"index run is in progress or scheduled; wait for it, and when this reason stays after the run, {action}"
+
+
 def _new_source_advice(auto_state: AutobuildState, bg_running: bool, rebuild: str) -> str:
     """Return the advice for a source file that compile_commands.json does not cover.
 
@@ -121,10 +138,7 @@ def _new_source_advice(auto_state: AutobuildState, bg_running: bool, rebuild: st
             "fw-context builds them in the next index run, and no index run is in "
             "progress or scheduled; run `fw-context index`"
         )
-    run = (
-        "index run is in progress or scheduled; wait for it, and when this reason "
-        f"stays after the run, {rebuild}"
-    )
+    run = _after_the_run(rebuild)
     if auto_state is AutobuildState.USER_DATABASE:
         # `rebuild` says that fw-context does not build that file.
         return f"an {run}" if bg_running else rebuild
@@ -146,7 +160,19 @@ def _autobuild_state(root: Path, proj_cfg, new_sources: list[str]) -> AutobuildS
     return project_autobuild_state(root, proj_cfg)
 
 
-def _build_missing_advice(reason: str, root: Path, proj_cfg) -> str:
+def _with_action(fact: str, action: str, bg_running: bool) -> str:
+    """Return the sentence *fact* and then *action*, or the advice to wait for the run.
+
+    *action* is an instruction without a subject, in lower case, as
+    ``autobuild.build_advice`` gives it.  See :func:`_after_the_run` for the
+    reason to wait.
+    """
+    if bg_running:
+        return f"{fact}. An {_after_the_run(action)}."
+    return f"{fact}. {action[0].upper()}{action[1:]}."
+
+
+def _build_missing_advice(reason: str, root: Path, proj_cfg, bg_running: bool) -> str:
     """Give *reason* with the command that brings the build back.
 
     The same two cases as the refusal of ``fw-context index``: a build that
@@ -155,16 +181,56 @@ def _build_missing_advice(reason: str, root: Path, proj_cfg) -> str:
     run builds the missing build too (``_build_if_missing`` in the CLI), but
     ``--build`` says what happens, and it is the same command that the
     refusal of a run names.
+
+    WHY *bg_running*: an index run with ``--build`` removes the database of
+    the build before the build writes it again.  Thus during the run of the
+    daemon after a checkout, the build is missing, and the command of this
+    reason is the command that runs.
     """
     from ...indexer.build import can_run_build
 
     system = proj_cfg.build.system or _detect_build_system(root)
     if can_run_build(proj_cfg.build, system):
-        return f"{reason}. Run `fw-context index --build`."
-    return (
-        f"{reason}, and fw-context cannot run the build of this project. Run the "
-        "build outside of fw-context (for example in the IDE), then run `fw-context index`."
+        return _with_action(reason, "run `fw-context index --build`", bg_running)
+    return _with_action(
+        f"{reason}, and fw-context cannot run the build of this project",
+        "run the build outside of fw-context (for example in the IDE), then run `fw-context index`",
+        bg_running,
     )
+
+
+def _compile_commands_reason(stale_reason: str | None, cfg, root: Path, proj_cfg, bg_running: bool) -> str:
+    """Give the reason of a compile_commands.json that changed after the index of the build *cfg*.
+
+    *stale_reason* is the code of ``readiness._is_stale``.  For a missing
+    file the caller gives the reason only when the build check
+    (``_build_missing_advice``) does not cover the file, for example for
+    the file of a build variant.  WHY a sentence and not the code: each
+    other reason is a sentence that names its action, and a caller cannot
+    act on a bare code.
+
+    A missing file needs the action that makes it again
+    (``autobuild.build_advice``): a plain run reads the same missing file.
+    A newer file needs only a plain run, which reads it.
+    """
+    if stale_reason == "compile_commands_missing":
+        return _with_action(
+            f"compile_commands.json {cfg['compile_commands_path']} does not exist",
+            build_advice(root, proj_cfg),
+            bg_running,
+        )
+    if stale_reason == "compile_commands_newer":
+        fact = "compile_commands.json changed after the last index run"
+    elif stale_reason:
+        # `is_compile_commands_stale` could not compare the two times, and
+        # its code holds the error.  A run repairs a time of the index that
+        # does not parse, because it writes the time again.  A run does not
+        # repair an error of the file system (a file that this process
+        # cannot read), and the error in the text names that cause.
+        fact = f"fw-context cannot compare compile_commands.json with the index ({stale_reason})"
+    else:
+        fact = "compile_commands.json changed"
+    return _with_action(fact, "run `fw-context index`", bg_running)
 
 
 def _background_build_allowed(root: Path, proj_cfg: Config) -> bool:
@@ -520,9 +586,14 @@ def _build_health(
         cc_changed or schema_old or row_format_old or blocked_sources or checkout_moved
         or build_problem or build_missing
     )
-    # The reasons below whose text names a command (see `_warning`).
+    # The reasons below whose text names a command (see `_warning`).  A
+    # missing compile_commands.json needs the action that makes it again
+    # (`_compile_commands_reason`), and a plain run reads the same missing
+    # file.
+    cc_missing = cc_changed and stale_reason == "compile_commands_missing"
     reason_names_command = bool(
         build_problem or build_missing or checkout_moved or blocked_sources or row_format_old
+        or cc_missing
     )
     # Asked once, because the call reaches the build backend and is not
     # free.  Only the branch reason below reads it.
@@ -537,7 +608,7 @@ def _build_health(
     if build_problem:
         reindex_reasons.append(build_problem)
     if build_missing:
-        reindex_reasons.append(_build_missing_advice(build_missing, root, proj_cfg))
+        reindex_reasons.append(_build_missing_advice(build_missing, root, proj_cfg, bg_running))
     checkout_text = ""
     if checkout_moved:
         # Never a plain reindex: that would reuse compile_commands.json,
@@ -599,8 +670,10 @@ def _build_health(
     # and the build reason above (or the marker of the run that found it)
     # already names it with its command.
     database_gone = checked_cc is not None and not checked_cc.exists()
+    compile_commands_text = ""
     if cc_changed and not database_gone:
-        reindex_reasons.append(stale_reason or "compile_commands_changed")
+        compile_commands_text = _compile_commands_reason(stale_reason, cfg, root, proj_cfg, bg_running)
+        reindex_reasons.append(compile_commands_text)
     if new_sources:
         listed = ", ".join(new_sources[:3])
         more = f" and {len(new_sources) - 3} more" if len(new_sources) > 3 else ""
@@ -690,7 +763,7 @@ def _build_health(
         # First among the reasons: without the build each unit gets no
         # answer of its compiler, and no other repair helps before it.
         index_message = (
-            (build_problem or _build_missing_advice(build_missing, root, proj_cfg))
+            (build_problem or _build_missing_advice(build_missing, root, proj_cfg, bg_running))
             + " Queries still work on the data of the last finished index run."
         )
     elif blocked_sources:
@@ -709,6 +782,11 @@ def _build_health(
         # reads compile_commands.json of the old checkout again.  The
         # reason names the build that makes it again.
         index_message = f"The {checkout_text}. Queries still work on existing data."
+    elif cc_missing and compile_commands_text:
+        # Before the schema and the row format: their plain
+        # `fw-context index` reads the same missing file.  The reason names
+        # the action that makes it again.
+        index_message = f"{compile_commands_text} Queries still work on existing data."
     elif schema_old and cc_changed:
         index_message = (
             f"Schema version mismatch ({db_schema_ver} < {CURRENT_SCHEMA_VERSION}) "
@@ -725,6 +803,9 @@ def _build_health(
             "The rows of the index have an older meaning than this version reads "
             "(row_format_mismatch) — run fw-context index. Queries still work on existing data."
         )
+    elif compile_commands_text:
+        # The reason text, thus the message and the reason name one action.
+        index_message = f"{compile_commands_text} Queries still work on existing data."
     else:
         index_message = "Compile commands changed — run fw-context index. Queries still work on existing data."
 
@@ -748,9 +829,8 @@ def _build_health(
             # and a plain 'fw-context index' next to it is not sufficient:
             # the reason names what to repair before the run, or that the
             # run needs `--build`.  The run that the reason names also makes
-            # the index complete.  A changed compile_commands.json and an
-            # old schema name no command in `reindex_reasons`, and a plain
-            # run repairs them.
+            # the index complete.  A newer compile_commands.json and an old
+            # schema need only a plain run, which repairs them.
             if reason_names_command:
                 command = _REASON_COMMAND
                 tracking = "the run that reindex_reasons names makes the index complete"
