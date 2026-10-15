@@ -520,7 +520,7 @@ def _resolve_compile_commands(
         # A background run builds only with a backend that may build on its
         # own (`builders.background_build_safe`): fw-context turned the build
         # on itself, after it found a missing build, a source file that
-        # compile_commands.json does not cover, or another branch, and the
+        # compile_commands.json does not cover, or another checkout, and the
         # user did not ask for it.
         if bg and not _may_build_in_background(cfg, detected_system):
             print("error: --build and --background are mutually exclusive", file=sys.stderr)
@@ -1815,7 +1815,7 @@ def _cmd_index(args: argparse.Namespace, outside: _SigtermOutsideTheLock) -> int
         _build_if_missing(args, project_root, cfg, detected_system, indexed_cc)
 
     # ── Automatic build: a missing build, a source that the build never saw,
-    # or another branch ──
+    # or another checkout ──
     # A plain reindex cannot repair any of them.  `_plan_auto_build` returns
     # a non-empty list only when the backend may build on its own.
     auto_build_sources: list[str] = []

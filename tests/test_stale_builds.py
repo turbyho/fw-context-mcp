@@ -253,6 +253,41 @@ def test_a_missing_database_and_a_degraded_index_name_the_action_of_the_reason(t
     assert "'fw-context index'" not in health["_warning"]
 
 
+def test_an_old_schema_names_its_command(tmp_path, monkeypatch):
+    """Each reason names its action, thus a caller that reads only the reasons finds it."""
+    from fw_context_mcp.mcp.handlers import maintenance
+    from fw_context_mcp.indexer.db import CURRENT_SCHEMA_VERSION
+
+    conn, root = _index(tmp_path)
+    monkeypatch.setattr(maintenance, "get_db_schema_version", lambda conn: 0)
+
+    health = _health(conn, root, tmp_path, "boot")
+
+    assert health["reindex_reasons"] == [f"schema_mismatch: 0 < {CURRENT_SCHEMA_VERSION}. Run `fw-context index`."]
+
+
+@pytest.mark.parametrize("run_state", ["pending", "reindexing"])
+def test_an_old_schema_and_row_format_ask_to_wait_for_a_run(tmp_path, monkeypatch, run_state):
+    """Each index run writes the rows again, thus a second run asks for the same work."""
+    from fw_context_mcp.mcp.handlers import maintenance
+    from fw_context_mcp.indexer.db import CURRENT_SCHEMA_VERSION
+
+    conn, root = _index(tmp_path)
+    monkeypatch.setattr(maintenance, "get_db_schema_version", lambda conn: 0)
+    _set_row_format(conn, "h-app", "fw-context-rows/0")
+
+    health = _health(conn, root, tmp_path, "app", run_state=run_state)
+
+    wait = (
+        ". An index run is in progress or scheduled; wait for it, and when this "
+        "reason stays after the run, run `fw-context index`."
+    )
+    schema, row_format = health["reindex_reasons"]
+    assert schema == f"schema_mismatch: 0 < {CURRENT_SCHEMA_VERSION}{wait}"
+    assert row_format.startswith(f"row_format_mismatch: fw-context-rows/0 != {CURRENT_ROW_FORMAT} — ")
+    assert row_format.endswith(wait), row_format
+
+
 def test_a_missing_database_comes_before_an_old_schema_in_the_message(tmp_path, monkeypatch):
     """The plain run that an old schema needs reads the same missing file."""
     from fw_context_mcp.mcp.handlers import maintenance

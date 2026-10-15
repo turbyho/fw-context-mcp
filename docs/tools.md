@@ -2466,16 +2466,18 @@ command.
   output. The reason names the command: `fw-context index --build`, or,
   when fw-context cannot run the build of the project, a build outside of
   fw-context and then `fw-context index`.
-- Schema mismatch (`schema_mismatch: <old> < <new>`).
+- Schema mismatch (`schema_mismatch: <old> < <new>`). The reason names
+  the command.
 - Older row format (`row_format_mismatch: <old> != <new> — <effect>`).
   The stored text has an older meaning. For example, an index written
   before `fw-context-rows/1` keeps every inactive `#if` branch, thus
-  answers can hold dead code.
+  answers can hold dead code. The reason names the command.
 - compile_commands.json changed after the last index run. Or it does not
   exist, and the check of the build above does not cover it, for example
   the file of a build variant. The reason names the command.
 - A source file on disk is missing from compile_commands.json, and
-  fw-context will not build it by itself. The reason says why.
+  fw-context will not build it by itself. The reason says why, and it
+  names the command.
 - The tree has another checkout than the index (`checkout changed:
   indexed at '<old>', now at '<new>'`). A checkout is a branch, or a
   detached HEAD at a commit. The reason names a detached HEAD as
@@ -2501,7 +2503,8 @@ action (`autobuild.build_advice`).
 When an index run is in progress or scheduled, some reasons tell you to
 wait for that run: a missing build, a missing source file that
 fw-context does not build by itself, a changed or missing
-compile_commands.json, and a changed checkout. For a database that
+compile_commands.json, a schema mismatch, an older row format, and a
+changed checkout. For a database that
 `[index] compile_commands` names, the reason of a changed checkout does
 not tell you to wait. The command of
 such a reason is often the command that runs. For example, a run with
@@ -2591,15 +2594,13 @@ index, the build is not current, and the result holds a `_warning`:
 
 - While an index run is in progress or scheduled, the `_warning` tells
   you to wait for it.
-- When no index run is in progress or scheduled, and no reason in
-  `reindex_reasons` names its own command, it tells you to ask the user
-  to run `fw-context index`. That run writes the index again with full
-  header tracking.
-- When a reason in `reindex_reasons` names its own command (a failed or
-  missing build, a checkout, a new source file that fw-context does not
-  build on its own, an old row format), the
-  `_warning` tells you to give the user that command. The run of that
-  command also writes full header tracking.
+- When no index run is in progress or scheduled, and `reindex_needed`
+  is `false`, it tells you to ask the user to run `fw-context index`.
+  That run writes the index again with full header tracking.
+- When `reindex_needed` is `true`, the `_warning` tells you to give the
+  user the command that `reindex_reasons` names. Each reason names its
+  command, and some need more than a plain run, for example a build or a
+  repair. The run of that command also writes full header tracking.
 
 `analysis` splits LLM-analysis coverage by project vs vendor symbols so
 the reader can tell intentionally-skipped vendor symbols apart from

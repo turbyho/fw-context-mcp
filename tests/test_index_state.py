@@ -625,8 +625,8 @@ class TestAnIndexWithoutFullHeaderTracking:
         assert "'fw-context index'" not in result["index_message"]
         assert "`fw-context index --build`" in " ".join(result["reindex_reasons"])
 
-    def test_a_reason_without_a_command_keeps_the_plain_command(self, tmp_path):
-        """`reindex_reasons` names no command for a changed compile_commands.json, and a plain run repairs it."""
+    def test_a_reason_of_a_plain_run_names_its_command(self, tmp_path):
+        """A changed compile_commands.json names a plain run, and the warning leads to that reason."""
         from fw_context_mcp.mcp.handlers.maintenance import get_build_info
 
         root, db_dir = _project(tmp_path)
@@ -636,8 +636,10 @@ class TestAnIndexWithoutFullHeaderTracking:
 
         result = get_build_info(project_root=str(root), variant="a")
         assert result["status"] == "reindex_needed"
-        assert "run 'fw-context index' to make the index complete" in result["_warning"]
-        assert "reindex_reasons names" not in result["_warning"]
+        assert "the command that reindex_reasons names" in result["_warning"]
+        assert result["reindex_reasons"] == [
+            "compile_commands.json changed after the last index run. Run `fw-context index`."
+        ], "the pointer leads to a command"
 
     def test_the_project_names_the_command_of_a_reason(self, tmp_path):
         """One build needs a plain run, and the other has a reason with its own command."""

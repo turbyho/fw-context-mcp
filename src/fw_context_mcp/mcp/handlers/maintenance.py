@@ -91,8 +91,9 @@ from ..shared.variants import IMAGE_DESCRIPTION, VARIANT_DESCRIPTION
 log = logging.getLogger(__name__)
 
 
-#: The command of the degraded `_warning` when a reason names its own
-#: command.  The message of a project of several builds looks for it.
+#: The command of the degraded `_warning` when `reindex_needed` is true and
+#: no index run is in progress or scheduled: each reason then names its own
+#: action.  The message of a project of several builds looks for it.
 _REASON_COMMAND = "the command that reindex_reasons names"
 
 
@@ -565,7 +566,7 @@ def _build_health(
     blocked_sources = bool(new_sources) and auto_state is not AutobuildState.WILL_BUILD
 
     # ── The tree has another checkout than this index ──
-    # The only condition that a plain reindex cannot fix.
+    # A plain reindex cannot fix it.
     # compile_commands.json is a build artifact of the checkout it was
     # generated on: it carries its file list AND its compiler flags.
     # Measured on the Mbed project, a switch from 4.15.3 to 4.15.1 left two
@@ -586,17 +587,12 @@ def _build_health(
         cc_changed or schema_old or row_format_old or blocked_sources or checkout_moved
         or build_problem or build_missing
     )
-    # The reasons below whose text names a command (see `_warning`).  A
-    # missing compile_commands.json needs the action that makes it again
+    # A missing compile_commands.json needs the action that makes it again
     # (`_compile_commands_reason`), and a plain run reads the same missing
     # file.
     cc_missing = cc_changed and stale_reason == "compile_commands_missing"
-    reason_names_command = bool(
-        build_problem or build_missing or checkout_moved or blocked_sources or row_format_old
-        or cc_missing
-    )
     # Asked once, because the call reaches the build backend and is not
-    # free.  Only the branch reason below reads it.
+    # free.  Only the checkout reason below reads it.
     bg_build_allowed = checkout_moved and _background_build_allowed(root, proj_cfg)
     # The action that makes compile_commands.json again: one function for
     # the status tools and the query answers, thus the two name the same
@@ -612,7 +608,7 @@ def _build_health(
     checkout_text = ""
     if checkout_moved:
         # Never a plain reindex: that would reuse compile_commands.json,
-        # which belongs to the branch the index was built on, with its file
+        # which belongs to the checkout the index was built on, with its file
         # list and its compiler flags.  `rebuild` names the build that
         # makes it again: `--build`, or the build of the user.
         #
@@ -653,19 +649,30 @@ def _build_health(
             f"the old checkout" + branch_advice
         )
         reindex_reasons.append(checkout_text)
+    # The schema and the row format name their command as each other
+    # reason does, thus a caller that reads only `reindex_reasons` finds the
+    # action of each one.  During a run the two tell the caller to wait:
+    # each index run stamps the schema, and an index run of this build
+    # writes its rows again.  A run of another build leaves the row format
+    # old, and then the reason stays after the run with its command.
     if schema_old:
-        reindex_reasons.append(f"schema_mismatch: {db_schema_ver} < {CURRENT_SCHEMA_VERSION}")
+        reindex_reasons.append(_with_action(
+            f"schema_mismatch: {db_schema_ver} < {CURRENT_SCHEMA_VERSION}",
+            "run `fw-context index`",
+            bg_running,
+        ))
     if row_format_old:
         # Names the effect, not only the value: the caller has to know
         # what the answers it gets now are worth.  `row_format_effect`
         # picks the wording by the gap — the faults of the generations are
         # opposite, thus one fixed sentence would be false for every gap
         # but one.
-        reindex_reasons.append(
+        reindex_reasons.append(_with_action(
             f"row_format_mismatch: {stored_format or '(none)'} != "
-            f"{CURRENT_ROW_FORMAT} — {row_format_effect(stored_format)}. "
-            f"Run `fw-context index`"
-        )
+            f"{CURRENT_ROW_FORMAT} — {row_format_effect(stored_format)}",
+            "run `fw-context index`",
+            bg_running,
+        ))
     # A missing database of a build of fw-context is the missing build,
     # and the build reason above (or the marker of the run that found it)
     # already names it with its command.
@@ -825,13 +832,12 @@ def _build_health(
                 f" — manifest verification: {manifest_verification} (reindex in progress or scheduled — wait for completion)"
             )
         else:
-            # Some reasons name their own command (`reason_names_command`),
-            # and a plain 'fw-context index' next to it is not sufficient:
-            # the reason names what to repair before the run, or that the
-            # run needs `--build`.  The run that the reason names also makes
-            # the index complete.  A newer compile_commands.json and an old
-            # schema need only a plain run, which repairs them.
-            if reason_names_command:
+            # Each reason that sets `reindex_needed` names its own action,
+            # and a plain 'fw-context index' next to it is not always
+            # sufficient: a reason can name what to repair before the run,
+            # or that the run needs `--build`.  The run that the reason
+            # names also makes the index complete.
+            if needs_reindex:
                 command = _REASON_COMMAND
                 tracking = "the run that reindex_reasons names makes the index complete"
             else:
@@ -1160,17 +1166,18 @@ def get_project_status(
       new source files on its own. ``reindex_state`` of a build tells
       whether that build waits for the run.
       ``reindex_progress`` holds the last log line of a running reindex.
-    * ``"reindex_needed"`` — schema mismatch, an old row format, changed
-      compile_commands.json, a branch change since the index, or a source
-      file that compile_commands.json does not cover and fw-context will
-      not build itself. Queries still work on existing data. Read
-      ``reindex_reasons``: a missing source file and a branch change need
-      ``fw-context index --build``, the others need only
-      ``fw-context index``.
+    * ``"reindex_needed"`` — the last index run failed, the build is not
+      there, schema mismatch, an old row format, a changed or missing
+      compile_commands.json, a checkout of another branch, tag or commit
+      since the index, or a source file that compile_commands.json does
+      not cover and fw-context will not build itself. A changed
+      compile_commands.json includes one that fw-context cannot compare
+      with the index. Queries still work on existing data. Read
+      ``reindex_reasons``: each reason names the action that it needs.
 
       Read ``bg_reindex_running`` before you name any command here.  A run
       already under way does the work, thus a second one only waits on the
-      same lock, and ``index_message`` and the branch reason both say so.
+      same lock, and ``index_message`` and the checkout reason both say so.
       That field covers a run of the daemon AND a run the operator started,
       and also work that the daemon has scheduled and not yet started
       — the arguments of no run are readable, thus a reason that needs
@@ -1189,14 +1196,20 @@ def get_project_status(
     alone.  Read that key first: a reader that waits for
     ``status == "error"`` waits for a value this tool does not produce.
 
-    Five conditions set ``reindex_needed``: an outdated schema, an outdated
-    ROW FORMAT, a changed compile_commands.json, a branch change since the
-    index, and a source file that is on disk but absent from
-    compile_commands.json when fw-context will not build it on its own.
-    The last two need a build, because only the build system writes that
-    file — a plain reindex has no translation unit for a new file and skips
-    it without a word.  Modified source files are something else: they are
-    handled per query, and never set it.
+    Seven conditions set ``reindex_needed``: a failed last index run, a
+    build that is not there, an outdated schema, an outdated ROW FORMAT, a
+    changed or missing compile_commands.json, a checkout of another
+    branch, tag or commit since the index, and a source file that is on
+    disk but absent from compile_commands.json when fw-context will not
+    build it on its own.  A missing build, a missing
+    compile_commands.json, a checkout and such a source file need the
+    action that makes compile_commands.json again: a build, or for a
+    database of the user (``[index] compile_commands``) a new file from the
+    user.  A plain reindex reads the same file again, and it has no
+    translation unit for a new source file and skips it without a word.  A
+    failed run needs the repair that its reason names first.  Modified
+    source files are something else: they are handled per query, and
+    never set it.
 
     ``row_format_mismatch`` means that the same columns hold text with an
     older meaning.  Take it seriously: an index written before
@@ -1288,12 +1301,12 @@ def get_project_status(
         alone), reindex_needed (bool), reindex_reasons (list[str] — why a
         reindex is needed, empty when False, except that a new source file
         that fw-context builds on its own is listed while
-        ``reindex_needed`` is False.  One of them asks for
-        `fw-context index --build` rather than a plain reindex: when the
-        tree is on a different branch than the index, compile_commands.json
-        belongs to the OLD branch and carries its file list and its
-        compiler flags, so only a build regenerates it.  Read the reason
-        text — it names the command it needs), stale (bool — True when a
+        ``reindex_needed`` is False.  Some of them ask for a build rather
+        than a plain reindex.  For example, after a checkout of another
+        branch, tag or commit, compile_commands.json belongs to the OLD
+        checkout and carries its file list and its compiler flags, so only
+        a build regenerates it.  Read the reason text — it names the
+        command it needs), stale (bool — True when a
         build needs a reindex or has stale header dependencies),
         index_message (str — human-readable summary of index state),
         builds (list[dict] — every build: {variant, image, board,
