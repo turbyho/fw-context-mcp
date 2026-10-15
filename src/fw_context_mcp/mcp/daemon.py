@@ -761,8 +761,13 @@ async def _setup_unix_socket(db_dir: Path, on_ping) -> tuple[asyncio.Server, Pat
 
     try:
         server = await asyncio.start_unix_server(_handle_ping, path=str(sock_path))
-    except OSError:
-        log.error("Cannot bind socket %s — daemon already running?", sock_path)
+    except OSError as exc:
+        # Not "daemon already running": this process holds `watcher.lock`,
+        # thus no other daemon of the project runs.  The error says the
+        # cause, for example "AF_UNIX path too long" for a socket path that
+        # is longer than `sun_path` (108 bytes on Linux, 104 on macOS).  The
+        # index directory sets that path.
+        log.error("Cannot bind the socket %s: %s", sock_path, exc)
         raise
 
     os.chmod(sock_path, 0o600)

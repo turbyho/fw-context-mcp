@@ -444,6 +444,28 @@ class TestTheCheckAtTheStart:
             readiness._db_path(tmp_path)
 
 
+class TestTheSocketOfTheDaemon:
+    def test_a_socket_path_that_is_too_long_logs_the_cause(self, tmp_path, caplog):
+        """The daemon holds `watcher.lock` before the bind, thus no other daemon runs.
+
+        The log said "daemon already running?" for each error of the bind,
+        and that sent the operator to look for a process that was not there.
+        """
+        from fw_context_mcp.mcp import daemon as daemon_mod
+
+        # Longer than `sun_path` on Linux (108 bytes) and on macOS (104 bytes).
+        db_dir = tmp_path / ("d" * 120)
+        db_dir.mkdir()
+
+        with caplog.at_level(logging.ERROR, logger="fw_context_mcp.mcp.daemon"), pytest.raises(OSError):
+            asyncio.run(daemon_mod._setup_unix_socket(db_dir, lambda: None))
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert len(messages) == 1, messages
+        assert "AF_UNIX path too long" in messages[0]
+        assert "already running" not in messages[0]
+
+
 class TestTheStartOfTheDaemon:
     @staticmethod
     def _start(monkeypatch, tmp_path) -> dict:
