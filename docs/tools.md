@@ -95,8 +95,10 @@ A run also builds when an index exists and one of these conditions is true:
 - The build is not there (a background run).
 - A source file on disk is not in `compile_commands.json`. Such a file has
   no translation unit, thus a reindex skips it.
-- The tree is on a different git branch than the index.
-  `compile_commands.json` belongs to the old branch.
+- The tree has a different checkout than the index: another branch, or
+  a detached HEAD at another commit (for example the commit of a tag).
+  `compile_commands.json` belongs to the old checkout. For the rules of
+  this comparison, see [`get_project_status`](#get_project_status).
 
 The run builds only when the backend can build on its own (see
 [Build Configuration](build.md#automatic-build)). Each build, this one and
@@ -2474,10 +2476,13 @@ command.
   the file of a build variant. The reason names the command.
 - A source file on disk is missing from compile_commands.json, and
   fw-context will not build it by itself. The reason says why.
-- The tree is on another git branch than the index.
+- The tree has another checkout than the index (`checkout changed:
+  indexed at '<old>', now at '<new>'`). A checkout is a branch, or a
+  detached HEAD at a commit. The reason names a detached HEAD as
+  `commit <sha>`, also when a tag names that commit.
 
-A missing source file, a missing compile_commands.json and a branch
-change need a build, because only a build regenerates
+A missing source file, a missing compile_commands.json and a changed
+checkout need a build, because only a build regenerates
 compile_commands.json. The reason names the build:
 
 - `fw-context index --build` for a build that fw-context can run.
@@ -2496,9 +2501,9 @@ action (`autobuild.build_advice`).
 When an index run is in progress or scheduled, some reasons tell you to
 wait for that run: a missing build, a missing source file that
 fw-context does not build by itself, a changed or missing
-compile_commands.json, and a branch change. For a database that
-`[index] compile_commands` names, the reason of a branch change does not
-tell you to wait. The command of
+compile_commands.json, and a changed checkout. For a database that
+`[index] compile_commands` names, the reason of a changed checkout does
+not tell you to wait. The command of
 such a reason is often the command that runs. For example, a run with
 `--build` removes the database of the build before the build writes it
 again. The reason still names the command, for the case that the reason
@@ -2516,9 +2521,24 @@ other reason starts with the label of its build:
 The `reasons` of each entry in `builds` hold the reasons of that build.
 fw-context reads the marker of the last index run and finds the new
 source files one time for the project. For the two, it uses the build
-that `fw-context index` checks. fw-context reads the git branch of the
-tree one time, and compares it with the indexed branch of each build.
-The indexed branch comes from the description of that build.
+that `fw-context index` checks. fw-context reads HEAD of the tree one
+time, and compares it with the HEAD that each build recorded:
+
+- fw-context compares the commit of a detached HEAD, not a tag. Two
+  tags of one commit are one checkout. A branch and a detached HEAD at
+  the commit of that branch are two checkouts.
+- A commit on a branch does not change the checkout.
+- `git commit`, also with `--amend`, on a detached HEAD does not change
+  the checkout when the reflog of HEAD shows only such commits after the
+  recorded HEAD. Each other move of a detached HEAD changes the
+  checkout, for example `git cherry-pick`, `git merge` or `git revert`.
+- During a rebase of a branch, the checkout is the branch that the
+  rebase updates. A rebase of a detached HEAD changes the checkout.
+- A run that does not build keeps the recorded HEAD of a build that
+  fw-context makes. Thus the reason stays until a run builds again.
+- An index of an older version recorded no HEAD. Then fw-context
+  compares the branch in the description of the build, and does not
+  compare a detached HEAD.
 
 One reason does not set `"reindex_needed"`: a new source file that is
 missing from compile_commands.json, when fw-context will build it by

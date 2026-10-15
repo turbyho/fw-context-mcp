@@ -156,7 +156,10 @@ reindex cannot:
 
 - The build is not there. This applies to a background run.
 - Source files are on disk that `compile_commands.json` does not cover.
-- The tree is on a different git branch than the index.
+- The tree has a different checkout than the index: another branch, or
+  a detached HEAD at another commit (for example the commit of a tag).
+  For the rules of this comparison, see
+  [`get_project_status`](tools.md#get_project_status).
 
 When a run stops without an index (the build is not there, or the run
 failed), fw-context keeps the reason next to the index. Each answer of a
