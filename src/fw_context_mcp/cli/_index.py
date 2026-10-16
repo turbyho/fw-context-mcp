@@ -1935,7 +1935,7 @@ def _cmd_index(args: argparse.Namespace, outside: _SigtermOutsideTheLock) -> int
         autobuild.clear_problem(db_path.parent)
 
     if not multi and getattr(args, "build", False):
-        _record_still_uncovered(project_root, db_path)
+        _record_still_uncovered(project_root, db_path, cfg)
 
     _ensure_watcher_after_index(project_root)
     return 0
@@ -2129,7 +2129,7 @@ def _images_of_build(builder, out_dir: Path, build_cfg, compile_commands: Path) 
     return [(image, named[image]) for image in sorted(named) if image != main[0]] + [(main[0], named[main[0]])]
 
 
-def _record_still_uncovered(project_root: Path, db_path: Path) -> None:
+def _record_still_uncovered(project_root: Path, db_path: Path, cfg) -> None:
     """Remember the sources a build ran for and still did not cover.
 
     Called only after a run that built.  What is left uncovered then is not
@@ -2147,16 +2147,22 @@ def _record_still_uncovered(project_root: Path, db_path: Path) -> None:
 
     Best-effort: a marker that cannot be written costs one repeated report,
     never a wrong answer, thus no failure here may break the index run.
+
+    The build is the one that the status tools check for new sources
+    (`_checked_build`, the application of a build of several images).  The
+    newest build was the program that the run did last, for example the
+    bootloader of `--image bootloader`: a file of the bootloader that the
+    application does not compile then stayed out of the marker, and the
+    status reported it as a new source after each build.
     """
-    from ..config import derive_project_id
-    from ..indexer.db import get_active_config, open_db
+    from ..indexer.db import open_db
     from ..mcp.shared.stale import find_unindexed_sources
     from ..utils import compute_source_hash
 
     try:
         conn = open_db(db_path)
         try:
-            active = get_active_config(conn, derive_project_id(project_root))
+            active = _checked_build(conn, project_root, cfg)
             if not active or not active["compile_commands_path"]:
                 return
             # limit=None, and that is not a detail.  record_excluded

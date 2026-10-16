@@ -66,6 +66,20 @@ class MiningResult:
     elapsed_s: float = 0.0
 
 
+# The build that the training data comes from: the COMPLETED build whose
+# first index run is the newest.  WHY not every build: the embedding model is one for
+# the project, and the code of one complete build is enough to train it.
+# WHY completed: a row that an index run writes, or that a stopped run
+# left, can hold a part of the symbols only.  WHY first_indexed_at and not
+# created_at: a run of one image (`--image bootloader`) sets created_at of
+# that image, and a small bootloader can give too few triples to train.
+_NEWEST_COMPLETED_BUILD = (
+    "SELECT config_hash FROM build_configs "
+    "WHERE manifest_verification IS NULL OR manifest_verification != 'indexing' "
+    "ORDER BY first_indexed_at DESC LIMIT 1"
+)
+
+
 def _generate_queries(conn: sqlite3.Connection, config_hash: str) -> list[tuple[str, int]]:
     """Generate synthetic queries from symbol descriptions.
 
@@ -190,9 +204,7 @@ def mine_disagreements(
         with conn:
             conn.row_factory = sqlite3.Row
 
-        config_hash = conn.execute(
-            "SELECT config_hash FROM build_configs ORDER BY first_indexed_at DESC LIMIT 1"
-        ).fetchone()
+        config_hash = conn.execute(_NEWEST_COMPLETED_BUILD).fetchone()
         if config_hash is None:
             log.warning("No build config found in database — skipping mining")
             return result
@@ -346,9 +358,7 @@ def train_step(
 
     with sqlite3.connect(str(db_path)) as conn:
         conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            "SELECT config_hash FROM build_configs ORDER BY first_indexed_at DESC LIMIT 1"
-        ).fetchone()
+        row = conn.execute(_NEWEST_COMPLETED_BUILD).fetchone()
         if row is None:
             log.error("No build config found in database")
             return None

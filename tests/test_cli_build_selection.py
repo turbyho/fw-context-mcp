@@ -340,3 +340,45 @@ def test_db_shows_and_guards_a_row_of_an_index_run(two_builds, capsys):  # noqa:
     assert cmd_db_delete(args) == 1
     assert "An index run writes this row of build b" in capsys.readouterr().out
     assert _hash_of(root, "b") == hash_b, "nothing was deleted"
+
+
+def test_the_uncovered_sources_are_recorded_for_the_checked_build(two_builds, monkeypatch):  # noqa: F811
+    """The marker came from the newest build, while the status checks the build of `_checked_build`."""
+    import fw_context_mcp.mcp.shared.stale as stale_mod
+    from fw_context_mcp.cli import _index
+    from fw_context_mcp.config import load as load_config
+    from fw_context_mcp.indexer.db import open_db
+
+    root, db_path = two_builds
+    hash_a = _hash_of(root, "a")  # build b is the newest
+    seen: list[str] = []
+
+    def _checked(conn, project_root, cfg):
+        return conn.execute("SELECT * FROM build_configs WHERE config_hash = ?", (hash_a,)).fetchone()
+
+    def _scan(conn, config_hash, *args, **kwargs):
+        seen.append(config_hash)
+        return []
+
+    monkeypatch.setattr(_index, "_checked_build", _checked)
+    monkeypatch.setattr(stale_mod, "find_unindexed_sources", _scan)
+    open_db(db_path, skip_integrity_check=True).close()
+
+    _index._record_still_uncovered(root, db_path, load_config(project_root=root))
+
+    assert seen == [hash_a]
+
+
+def test_the_training_data_comes_from_a_completed_build(two_builds):  # noqa: F811
+    """A row of an index run can hold a part of the symbols only."""
+    from fw_context_mcp.indexer.db import open_db
+    from fw_context_mcp.indexer.finetune import _NEWEST_COMPLETED_BUILD
+
+    root, db_path = two_builds
+    conn = open_db(db_path, skip_integrity_check=True)
+    try:
+        conn.execute("UPDATE build_configs SET manifest_verification = 'indexing' WHERE variant = 'b'")
+        conn.commit()
+        assert conn.execute(_NEWEST_COMPLETED_BUILD).fetchone()[0] == _hash_of(root, "a")
+    finally:
+        conn.close()

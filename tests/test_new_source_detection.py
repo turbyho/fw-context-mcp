@@ -676,7 +676,9 @@ class TestEveryUncoveredFileIsRecorded:
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(db_path, target)
 
-        _record_still_uncovered(root, target)
+        from fw_context_mcp.config import load as load_config
+
+        _record_still_uncovered(root, target, load_config(project_root=root))
 
         assert seen.get("limit", "absent") is None, (
             f"the recorder must lift the report cap; it passed {seen!r}"
