@@ -215,7 +215,7 @@ Exceptions:
 | `clean` | `bool` | `true` | all | Run a clean build before fw-context generates the file. **Recommended.** A clean build ensures a complete `compile_commands.json` file. |
 | `command` | `str` | — | all | A full override for the shell command. Highest priority: fw-context ignores all other settings. |
 | `python` | `str` | (auto-detect) | all | The Python interpreter for pip-based CLI tools, such as `mbed-cli`, `platformio`, `keil2clangd`, or `compiledb`. `fw-context init` detects this automatically, from pyenv, venv, and common install paths. Set this parameter manually when automatic detection fails. |
-| `activate` | `str` | (auto-detect) | all | A shell script that fw-context sources before the build, for example `nordic_minimal_setup.sh` for NCS, or `export.sh` for ESP-IDF. `fw-context init` detects this automatically, from common install paths. Set this parameter manually when automatic detection fails. |
+| `activate` | `str` | (auto-detect) | all | A shell script that fw-context sources before the build, for example the toolchain environment of NCS, or `export.sh` for ESP-IDF. `fw-context init` detects this automatically. Set this parameter manually when automatic detection fails. |
 | `pre_build` | `str` | — | all | A shell command that fw-context runs before the build, the convert step, or the generate step. Put it in `config.toml` when the whole team uses it, or in `local.toml` when it is specific to your machine. |
 
 The build process does not get an inherited `BASH_ENV`. fw-context removes
@@ -699,15 +699,34 @@ bear -- /path/to/python -m mbed compile -t GCC_ARM -m TARGET ...
 The Nordic nRF Connect SDK, and ESP-IDF in a similar way, needs a toolchain
 setup script. fw-context must source this script before `west build`.
 
+`fw-context init` finds the environment in this order:
+
+1. An `activate` that the config already holds. A new run of
+   `fw-context init` shows it and keeps it by default.
+2. The Zephyr SDK of the current environment: the `environment-setup-*`
+   script of `ZEPHYR_SDK_INSTALL_DIR`.
+3. The nRF Connect SDK versions that `nrfutil sdk-manager list` gives. You
+   select the version, and `fw-context init` writes
+   `.fw-context/ncs-env.sh` from `nrfutil sdk-manager toolchain env` and
+   `ZEPHYR_BASE`.
+4. `zephyr-env.sh` in the directory that `west config zephyr.base` names,
+   or `~/zephyr-sdk-*/environment-setup-*`.
+5. When it finds nothing, `fw-context init` asks for the path of the
+   script.
+
+When detection fails, or you use another setup script, set it in
+`.fw-context/local.toml` (gitignored, machine-specific):
+
 ```toml
-# In .fw-context/local.toml (gitignored, machine-specific)
 [build]
-activate = "/home/user/ncs_tools/nordic_minimal_setup.sh"
+activate = "/home/user/ncs-v3.2.3-env.sh"
 ```
 
-`fw-context init` detects this automatically, from paths such as
-`~/ncs_tools/nordic_minimal_setup.sh`, `west config zephyr.base`, and
-`~/zephyr-sdk-*/environment-setup-*`.
+For the nRF Connect SDK, `nrfutil` writes such a script:
+
+```bash
+nrfutil sdk-manager toolchain env --ncs-version v3.2.3 --as-script sh > ~/ncs-v3.2.3-env.sh
+```
 
 When you set `activate`, the builder wraps the command:
 ```
@@ -891,12 +910,29 @@ python = "/home/user/.pyenv/versions/3.11.8/bin/python"
 
 ### `west: command not found` (Zephyr/NCS)
 
-Zephyr builds need an active toolchain environment. `fw-context init`
-detects common setup scripts automatically: `~/ncs_tools/nordic_minimal_setup.sh`,
-`west config zephyr.base`, and `~/zephyr-sdk-*/environment-setup-*`.
+Zephyr builds need an active toolchain environment. `fw-context init` finds the environment in this order:
+
+1. An `activate` that the config already holds. A new run of
+   `fw-context init` shows it and keeps it by default.
+2. The Zephyr SDK of the current environment: the `environment-setup-*`
+   script of `ZEPHYR_SDK_INSTALL_DIR`.
+3. The nRF Connect SDK versions that `nrfutil sdk-manager list` gives. You
+   select the version, and `fw-context init` writes
+   `.fw-context/ncs-env.sh` from `nrfutil sdk-manager toolchain env` and
+   `ZEPHYR_BASE`.
+4. `zephyr-env.sh` in the directory that `west config zephyr.base` names,
+   or `~/zephyr-sdk-*/environment-setup-*`.
+5. When it finds nothing, `fw-context init` asks for the path of the
+   script.
 
 If detection fails, set the activation script manually in `.fw-context/local.toml`:
 ```toml
 [build]
-activate = "/home/user/ncs_tools/nordic_minimal_setup.sh"
+activate = "/home/user/ncs-v3.2.3-env.sh"
+```
+
+For the nRF Connect SDK, `nrfutil` writes such a script:
+
+```bash
+nrfutil sdk-manager toolchain env --ncs-version v3.2.3 --as-script sh > ~/ncs-v3.2.3-env.sh
 ```

@@ -170,11 +170,14 @@ xcode-select --install   # ships clang as part of Command Line Tools
 
 `fw-context` runs `west build -b <board>`. `fw-context` enables `CMAKE_EXPORT_COMPILE_COMMANDS=ON` automatically.
 
-> **Nordic NCS users:** `fw-context init` detects the NCS toolchain setup script
-> automatically, at `~/ncs_tools/nordic_minimal_setup.sh`. `fw-context init`
-> writes this script path to `.fw-context/local.toml`, as `activate`. For plain
-> Zephyr, `fw-context init` checks `west config zephyr.base` and
-> `~/zephyr-sdk-*/` for the environment setup script.
+> **Nordic NCS users:** `fw-context init` lists the NCS versions that
+> `nrfutil sdk-manager list` gives, and you select one. It then writes an
+> activation script for that toolchain, `.fw-context/ncs-env.sh`, from
+> `nrfutil sdk-manager toolchain env` and `ZEPHYR_BASE`, and writes its path
+> to `.fw-context/local.toml`, as `activate`. For plain Zephyr,
+> `fw-context init` uses `ZEPHYR_SDK_INSTALL_DIR`, `west config zephyr.base`
+> (`zephyr-env.sh`) or `~/zephyr-sdk-*/` (`environment-setup-*`).
+> See [Build Configuration](build.md#west-command-not-found-zephyrncs).
 
 ### PlatformIO
 

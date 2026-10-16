@@ -136,13 +136,16 @@ On this machine the Nordic Connect SDK is installed at:
 ```
 ~/ncs/v3.2.3/zephyr          (Zephyr RTOS)
 ~/ncs/toolchains/2ac5840438/opt/zephyr-sdk   (Zephyr SDK toolchain)
-~/ncs_tools/                  (environment setup scripts)
 ```
 
-The `one_line_setup.sh` script sets `ZEPHYR_BASE`, `ZEPHYR_SDK_INSTALL_DIR`,
-and `PATH` for the active NCS version.
+The toolchain environment of NCS sets `ZEPHYR_SDK_INSTALL_DIR` and `PATH`
+for one NCS version:
 
-Manual environment (without the setup script):
+```bash
+nrfutil sdk-manager toolchain launch --ncs-version v3.2.3 --shell
+```
+
+Manual environment (without the toolchain shell):
 
 ```bash
 export PYENV_VERSION=3.11.8
@@ -264,7 +267,7 @@ python3 -m fw_context_mcp.cli index --build --no-refs --no-analyze \
 
 # zephyr — build first, then index
 export PYENV_VERSION=3.11.8
-source ~/ncs_tools/one_line_setup.sh
+nrfutil sdk-manager toolchain launch --ncs-version v3.2.3 --shell   # then in that shell:
 cd tests/builds/zephyr
 rm -rf build
 west build -b nrf52840dk/nrf52840

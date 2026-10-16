@@ -814,7 +814,7 @@ def cmd_init(args: argparse.Namespace) -> int:
 
     # Reload so the python/activate/idf_path written by resolve_build_env are
     # visible to the auto-build below.  Without this the ESP-IDF/Zephyr build
-    # runs without sourcing export.sh / nordic_minimal_setup.sh — the toolchain
+    # runs without sourcing export.sh / the NCS environment script — the toolchain
     # is then missing from PATH and the build fails at configure time.
     _proj_cfg = load_project_config(project_root=project_root)
 

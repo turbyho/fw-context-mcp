@@ -701,7 +701,7 @@ class ZephyrBuildSystem:
 
         Searches every PATH entry — not just the first hit, since a machine
         can carry several unrelated ``nrfutil`` binaries — then the standard
-        install locations (``~/.nrfutil/bin/``, ``~/ncs_tools/``).  Each
+        install location (``~/.nrfutil/bin/``).  Each
         candidate is probed; the first that answers to ``sdk-manager`` wins.
 
         Version-manager shims are tried last.  The path found here is baked
@@ -750,7 +750,6 @@ class ZephyrBuildSystem:
         for cand in (
             Path.home() / ".nrfutil" / "bin" / "nrfutil-sdk-manager",
             Path.home() / ".nrfutil" / "bin" / "nrfutil",
-            Path.home() / "ncs_tools" / "nrfutil",
         ):
             add(cand)
 
@@ -1061,9 +1060,12 @@ class ZephyrBuildSystem:
             "Zephyr builds require an activated toolchain environment.\n"
             "For Nordic NCS this is detected automatically via\n"
             "  nrfutil sdk-manager toolchain env\n"
-            "and ZEPHYR_BASE.  To use a custom setup script instead, set:\n"
+            "and ZEPHYR_BASE.  To use another setup script, set it in\n"
+            ".fw-context/local.toml, for example the one that\n"
+            "  nrfutil sdk-manager toolchain env --ncs-version <version> --as-script sh\n"
+            "writes:\n"
             "  [build]\n"
-            '  activate = "~/ncs_tools/nordic_minimal_setup.sh"'
+            '  activate = "/path/to/env.sh"'
         )
 
 

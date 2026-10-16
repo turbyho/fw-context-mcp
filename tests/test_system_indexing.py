@@ -785,10 +785,6 @@ class TestZephyrInitAndIndex:
     _ZEPHYR_BASE = Path(os.path.expanduser("~/ncs/v3.2.3/zephyr"))
     _ZEPHYR_SDK = Path(os.path.expanduser("~/ncs/toolchains/2ac5840438/opt/zephyr-sdk"))
     _WEST_BIN = Path(os.path.expanduser("~/.pyenv/versions/3.11.8/bin/west"))
-    # The environment script for this host.  It reads the NCS version from the
-    # fixture's own ci/sdk.env, so the version stays with the fixture, and it
-    # exports the whole toolchain — cmake, ninja, dtc, gperf and the SDK's own
-    # Python — not just the compiler that _ZEPHYR_ENV below names.
 
     _ZEPHYR_ENV = {
         "PYENV_VERSION": "3.11.8",

@@ -388,7 +388,7 @@ Keep this file out of git. `fw-context init` already ignores it: its `.gitignore
 # Set manually only if auto-detection fails.
 [build]
 # python = "/home/user/.pyenv/versions/3.11.8/bin/python"  # for mbed-cli, platformio, keil2clangd
-# activate = "/home/user/ncs_tools/nordic_minimal_setup.sh"  # for Zephyr/NCS, ESP-IDF
+# activate = "/home/user/ncs-v3.2.3-env.sh"  # for Zephyr/NCS, ESP-IDF
 
 [llm]
 # enabled = false                        # set false if you don't use Ollama

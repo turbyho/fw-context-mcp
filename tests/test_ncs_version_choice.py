@@ -238,7 +238,7 @@ class TestAlreadyConfigured:
     choice can be moved to a standard SDK without editing the file.
     """
 
-    _SCRIPT = "/home/u/ncs_tools/nordic_minimal_setup.sh"
+    _SCRIPT = "/home/u/env/custom_setup.sh"
 
     def test_the_configured_script_is_shown_first_and_kept_by_default(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture

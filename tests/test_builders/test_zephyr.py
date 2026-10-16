@@ -124,9 +124,9 @@ class TestFindNrfutil:
     def test_the_standard_install_locations_are_searched_after_path(
         self, isolated_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
-        """~/ncs_tools/nrfutil is found even when PATH holds nothing usable."""
+        """~/.nrfutil/bin/nrfutil is found even when PATH holds nothing usable."""
         bad = _fake_nrfutil(isolated_path / "first", works=False)
         monkeypatch.setenv("PATH", str(bad.parent))
-        good = _fake_nrfutil(isolated_path / "home" / "ncs_tools", works=True)
+        good = _fake_nrfutil(isolated_path / "home" / ".nrfutil" / "bin", works=True)
 
         assert ZephyrBuildSystem._find_nrfutil() == str(good)
