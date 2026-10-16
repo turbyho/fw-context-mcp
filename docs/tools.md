@@ -3067,6 +3067,19 @@ and which model it names. When it is configured, `chat_api` also holds
 `endpoint` and `format`, and a `compliance_warning` for a host that is not
 local.
 
+`check_ollama` looks for the chat model on the Ollama server of the chat
+calls: the server of `ollama_url`, or the Ollama server that
+`chat_api_base` names. When `chat_api_base` names an OpenAI-compatible
+API, that API runs the chat model, and an Ollama server does not have to
+hold it. When the server of `ollama_url` does not answer, `check_ollama`
+does not look for the chat model; `fw-context doctor` does.
+
+`status: "model_missing"` has a `message` that names the command for each
+missing model. The command sets `OLLAMA_HOST` to the server of the check,
+in the syntax of PowerShell on Windows and of a POSIX shell on other
+systems. `status: "error"` also means that the Ollama server of
+`chat_api_base` gives no model list.
+
 `embedding_backend` is `"ollama"` for an Ollama embedding model, and
 `"local"` for a sentence-transformers or `ft://` model. A local model needs
 no Ollama: it counts as installed, and with chat on an external API the

@@ -98,11 +98,12 @@ def _ollama_pull(model: str, url: str) -> tuple[bool, str]:
 
 def _stalled(model: str, url: str) -> str:
     """Return the message of a pull that made no progress, with the manual command for the server at *url*."""
-    from ._instructions import get_platform_info, ollama_pull_command
+    from ..llm.ollama import ollama_pull_command
+    from ._instructions import get_platform_info
 
     return (
         f"pull stalled — no progress for {STALL_TIMEOUT}s; "
-        f"run `{ollama_pull_command(model, url, get_platform_info())}` manually"
+        f"run `{ollama_pull_command(model, url, get_platform_info()['system'])}` manually"
     )
 
 

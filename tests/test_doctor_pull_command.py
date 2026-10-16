@@ -27,9 +27,9 @@ REMOTE = "http://gpu-box:11434"
     ("we'ird;x", REMOTE, "linux", f"OLLAMA_HOST={REMOTE} ollama pull 'we'\"'\"'ird;x'"),
 ])
 def test_the_command_names_the_server_and_quotes_each_value(model, url, system, command):
-    from fw_context_mcp.deps._instructions import ollama_pull_command
+    from fw_context_mcp.llm.ollama import ollama_pull_command
 
-    assert ollama_pull_command(model, url, {"system": system}) == command
+    assert ollama_pull_command(model, url, system) == command
 
 
 class _Tags:

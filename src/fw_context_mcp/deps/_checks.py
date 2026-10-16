@@ -29,7 +29,6 @@ from ._instructions import (
     libclang_python_instructions,
     libclang_so_instructions,
     ollama_instructions,
-    ollama_pull_command,
     pysqlite3_instructions,
     sqlite_ext_instructions,
     vec0_load_error_instructions,
@@ -454,6 +453,7 @@ def check_ollama_chat_model(cfg) -> DepCheckResult:
     from ..llm._diag import installed_models
     from ..llm.auto_model import _model_name_matches
     from ..llm.chat_router import chat_ollama_server
+    from ..llm.ollama import ollama_pull_command
 
     try:
         server = chat_ollama_server(cfg)
@@ -478,7 +478,7 @@ def check_ollama_chat_model(cfg) -> DepCheckResult:
             critical=False,
         )
     if not any(_model_name_matches(m, cfg.model) for m in models):
-        command = ollama_pull_command(cfg.model, server, get_platform_info())
+        command = ollama_pull_command(cfg.model, server, get_platform_info()["system"])
         return DepCheckResult(
             name="chat-model",
             status="missing",
@@ -501,12 +501,13 @@ def check_ollama_embed_model(cfg) -> DepCheckResult:
         return DepCheckResult(name="embed-model", status="skipped", message="LLM disabled in config", critical=False)
 
     from ..llm._diag import check_setup
+    from ..llm.ollama import ollama_pull_command
 
     result = check_setup(cfg)
     if result.get("status") == "error":
         return DepCheckResult(name="embed-model", status="skipped", message="Ollama not reachable", critical=False)
     if not result.get("embedding_installed"):
-        command = ollama_pull_command(cfg.embed_model, cfg.ollama_url, get_platform_info())
+        command = ollama_pull_command(cfg.embed_model, cfg.ollama_url, get_platform_info()["system"])
         return DepCheckResult(
             name="embed-model",
             status="missing",

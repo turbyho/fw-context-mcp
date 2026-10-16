@@ -34,6 +34,9 @@ def check_setup(cfg: LLMConfig) -> dict:
         embedding_installed}.
     """
     import httpx
+
+    from fw_context_mcp.llm.ollama import ollama_pull_command
+
     base_url = cfg.ollama_url.rstrip("/")
     try:
         resp = httpx.get(base_url + "/api/tags", timeout=5.0)
@@ -80,7 +83,7 @@ def check_setup(cfg: LLMConfig) -> dict:
     if not model_found:
         result["message"] = (
             f"Model '{cfg.model}' is not installed. "
-            f"Run: ollama pull {cfg.model}"
+            f"Run: {ollama_pull_command(cfg.model, cfg.ollama_url)}"
         )
         result["available_code_models"] = [
             m for m in installed
@@ -90,7 +93,7 @@ def check_setup(cfg: LLMConfig) -> dict:
     if not embed_found:
         embed_msg = (
             f"Embedding model '{cfg.embed_model}' is not installed. "
-            f"Run: ollama pull {cfg.embed_model}"
+            f"Run: {ollama_pull_command(cfg.embed_model, cfg.ollama_url)}"
         )
         if "message" in result:
             result["message"] += " " + embed_msg

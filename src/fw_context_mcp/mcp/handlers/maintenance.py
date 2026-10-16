@@ -3240,6 +3240,16 @@ def check_ollama(
         vec_error (str, optional), debug_log (str, optional — only when
         debug logging is enabled)}
 
+        The chat model is looked for on the Ollama server of the chat
+        calls: ``ollama_url``, or the Ollama server that ``chat_api_base``
+        names.  An OpenAI-compatible ``chat_api_base`` runs the model
+        itself, and no Ollama server is asked for it.  ``"model_missing"``:
+        ``message`` names a command for each missing model, which sets
+        ``OLLAMA_HOST`` to the server that must hold the model.
+        ``"error"`` also means that the Ollama server of ``chat_api_base``
+        gives no model list.  When the server of ``ollama_url`` does not
+        answer, the chat model is not looked for.
+
         ollama_url, num_ctx, installed_models, model_details,
         configured_embed_model, and embedding_installed are present only
         when Ollama runs; configured_model also needs chat on Ollama.
