@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import argparse
 import shutil
-import sqlite3
 import sys
 from pathlib import Path
 
@@ -56,45 +55,48 @@ def cmd_search(args: argparse.Namespace) -> int:
 def cmd_list(args: argparse.Namespace) -> int:
     """List all indexed firmware projects found under the configured index directory.
 
-    Prints a table with project name, root path, symbol count, file count,
-    and index timestamp. Stale projects (compile_commands.json changed since
-    last index) are marked with ``*``.
+    Prints a table with project name, root path, the number of builds, the
+    symbol and file counts, and the time of the newest build.  A project
+    whose schema or row format is old, or whose compile_commands.json of a
+    build changed, is marked with ``*``.  ``fw-context status`` gives each
+    reason.
+
+    WHY the MCP tool ``list_projects``: the CLI computed its own counts and
+    its own staleness, from the newest build only.  The table now shows
+    what the MCP tool gives, thus the two cannot disagree.  A project of
+    several builds shows no counts (``-``): a file that two builds compile
+    is in the index of each, thus a sum counts it two times.  ``fw-context
+    status`` gives the counts of each build.
     """
-    from ..config import load as load_config
-    from ..indexer.db import get_all_projects, open_db
+    from ..mcp.handlers.maintenance import list_projects
     from ..utils import fmt_count, truncate_path_middle
 
-    cfg = load_config()
-    index_dir = cfg.index.db_dir
-    db_files = sorted(index_dir.glob("*/index.db")) if index_dir.exists() else []
-
-    if not db_files:
-        print(f"No indexed projects under {index_dir}.")
+    projects = list_projects()
+    if len(projects) == 1 and "info" in projects[0]:
+        print(projects[0]["info"])
         return 0
 
     # --- Collect all rows first so we can compute column widths ---
-    header = ("PROJECT", "PATH", "SYMBOLS", "FILES", "INDEXED")
-    rows: list[tuple[str, str, str, str, str]] = []
+    header = ("PROJECT", "PATH", "BUILDS", "SYMBOLS", "FILES", "INDEXED")
+    rows: list[tuple[str, ...]] = []
 
-    for db_path in db_files:
-        try:
-            conn = open_db(db_path)
-            for r in get_all_projects(conn):
-                name = r["name"] or r["project_id"]
-                if _cli_is_stale(r):
-                    name += " *"
-                rows.append((
-                    name,
-                    r["root_path"] or "",
-                    fmt_count(r["symbol_count"]),
-                    fmt_count(r["file_count"]),
-                    r["created_at"] or "",
-                ))
-                if args.verbose:
-                    rows.append(("", f"  db={db_path}", "", "", ""))
-                    rows.append(("", f"  cc={r['compile_commands_path']}", "", "", ""))
-        except (sqlite3.Error, OSError) as e:
-            print(f"[error] {db_path}: {e}", file=sys.stderr)
+    for project in projects:
+        if "error" in project:
+            print(f"[error] {project['db']}: {project['error']}", file=sys.stderr)
+            continue
+        name = project["name"] or project["project_id"]
+        if project["reindex_needed"]:
+            name += " *"
+        rows.append((
+            name,
+            project["root_path"] or "",
+            str(project["build_count"]),
+            "-" if project["symbol_count"] is None else fmt_count(project["symbol_count"]),
+            "-" if project["file_count"] is None else fmt_count(project["file_count"]),
+            project["indexed_at"] or "",
+        ))
+        if args.verbose:
+            rows.append(("", f"  db={project['db']}", "", "", "", ""))
 
     if not rows:
         return 0
@@ -118,8 +120,8 @@ def cmd_list(args: argparse.Namespace) -> int:
         parts: list[str] = []
         for i, val in enumerate(vals):
             w = col_widths[i]
-            # Left-align everything except SYMBOLS and FILES (right-align)
-            align = ">" if header[i] in ("SYMBOLS", "FILES") else "<"
+            # Left-align everything except the counts (right-align)
+            align = ">" if header[i] in ("BUILDS", "SYMBOLS", "FILES") else "<"
             parts.append(f"{val:{align}{w}}")
         return "  ".join(parts)
 
@@ -138,57 +140,49 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    """Show index status for the current project.
+    """Show the state of the index of the current project, and of each of its builds.
 
-    Prints project root, symbol count, file count, index timestamp,
-    and whether the index is stale (compile_commands.json changed
-    since last index).
+    WHY the MCP tool ``get_project_status``: the CLI showed the counts of
+    the newest build only, and called the index stale only when that
+    build's compile_commands.json was newer.  It did not show the other
+    builds, an old schema or row format, the modified files, or an index
+    run that is in progress or scheduled.  The command now prints what the
+    MCP tool gives, with the same message and the same reasons.
     """
-    from ..config import derive_project_id
-    from ..config import load as load_config
-    from ..indexer.db import get_active_config, open_db
-    from ..utils import resolve_project_root
+    from ..mcp.handlers.maintenance import get_project_status
+    from ..mcp.shared.stale import build_label
+    from ..utils import fmt_count, resolve_project_root
 
     project_root = resolve_project_root(args.project)
-    cfg = load_config(project_root=project_root)
-
-    project_id = derive_project_id(project_root)
-
-    db_path = cfg.index.db_dir / project_id / "index.db"
-    if not db_path.exists():
-        print("No index found. Run 'fw-context index' first.")
+    state = get_project_status(project_root=str(project_root))
+    if "error" in state:
+        print(state["error"], file=sys.stderr)
+        return 1
+    if state["status"] in ("not_initialized", "no_index"):
+        print(state["index_message"])
         return 1
 
-    conn = open_db(db_path)
-    active = get_active_config(conn, project_id)
-    if not active:
-        print("No build config indexed.")
-        return 1
-
-    sym_count = conn.execute("SELECT COUNT(*) FROM symbols WHERE config_hash=?", (active["config_hash"],)).fetchone()[0]
-    file_count = conn.execute("SELECT COUNT(*) FROM files WHERE config_hash=?", (active["config_hash"],)).fetchone()[0]
-
-    stale = _cli_is_stale(active)
-
-    print(f"Project : {project_root}")
-    print(f"Symbols : {sym_count}  files={file_count}")
-    print(f"Indexed : {active['created_at']}{'  [STALE]' if stale else ''}")
-    print(f"DB      : {db_path}")
-    if stale:
-        print("  compile_commands.json changed — run 'fw-context index' to update")
+    print(f"Project : {state['project_root']}")
+    print(f"Status  : {state['status']}")
+    print(f"          {state['index_message']}")
+    builds = state.get("builds") or []
+    print(f"Builds  : {len(builds)}")
+    names = [build_label(b) or "(no name)" for b in builds]
+    # The state of a build: its status, and the state of the index run
+    # when the index of that build is not current.
+    words = [f"{b['status']} ({b['reindex_state']})" if b["reindex_state"] else b["status"] for b in builds]
+    name_width = max((len(name) for name in names), default=0)
+    word_width = max((len(word) for word in words), default=0)
+    for build, name, word in zip(builds, names, words, strict=True):
+        print(
+            f"  {name:<{name_width}}  {word:<{word_width}}  symbols={fmt_count(build['symbol_count'])}"
+            f"  files={fmt_count(build['file_count'])}  indexed={build['indexed_at']}"
+        )
+        for reason in build["reasons"]:
+            # A project of one build gives the text of its reason in the
+            # message too; the line above already holds it.
+            if reason not in state["index_message"]:
+                print(f"      {reason}")
+    for missing in state.get("declared_not_indexed") or []:
+        print(f"  {missing['variant']}  not indexed — run '{missing['command']}'")
     return 0
-
-
-def _cli_is_stale(row) -> bool:
-    """Check if a project's compile_commands.json is newer than its index timestamp.
-
-    Delegates to :func:`fw_context_mcp.utils.is_compile_commands_stale`.
-    Returns False on any error so staleness checks don't block CLI output.
-    """
-    from ..utils import is_compile_commands_stale
-
-    cc = row.get("compile_commands_path", "")
-    if not cc:
-        return False
-    stale, _ = is_compile_commands_stale(row["created_at"], cc)
-    return stale

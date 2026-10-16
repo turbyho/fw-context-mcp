@@ -246,15 +246,28 @@ fw-context search '"i2c read"'           # exact phrase
 
 ### `fw-context status`
 
-Show index freshness and statistics.
+Show the state of the index, and of each build of the project.
 
 ```bash
 $ fw-context status
 Project : /home/user/firmware
-Symbols : 8586  files=952
-Indexed : 2026-06-05 09:35:18
-DB      : ~/.fw-context/index/a1b2c3d4/index.db
+Status  : reindex_needed
+          1 of 2 builds are not up to date — nrf52840-dev/app: not_scheduled. Read reindex_reasons for the action, and builds for each build.
+Builds  : 2
+  nrf52840-dev/app      reindex_needed (not_scheduled)  symbols=29 464  files=896  indexed=2026-10-07 23:23:56
+      compile_commands.json changed after the last index run. Run `fw-context index`.
+  nrf52840-dev/mcuboot  ready                           symbols=14 329  files=778  indexed=2026-10-07 23:00:25
 ```
+
+The command prints what the MCP tool
+[`get_project_status`](#get_project_status) gives: the status and the
+message of the project, then one line for each build with its status, the
+state of the index run (`reindex_state`) when the build is not current,
+its counts, and its reasons. A build without a variant name and an image
+name shows as `(no name)`. A variant that the config declares and the index
+does not hold gets the command that indexes it. A project that is not
+initialized, or that has no index, gets the message and the command
+returns 1.
 
 ### `fw-context list`
 
@@ -262,9 +275,18 @@ List all indexed projects.
 
 ```bash
 $ fw-context list
-my-zephyr-app   /home/user/zephyr-app     symbols=12430  files=1502  indexed=2026-06-05 09:35:18
-my-platformio-app /home/user/pio-app      symbols=8586   files=952   indexed=2026-06-04 16:20:45
+PROJECT     PATH                    BUILDS  SYMBOLS  FILES  INDEXED
+zephyr-app  /home/user/zephyr-app        7        -      -  2026-10-08 00:18:04
+pio-app *   /home/user/pio-app           1    8 586    952  2026-10-04 16:20:45
 ```
+
+The table shows what the MCP tool [`list_projects`](#list_projects)
+gives. A project of several builds shows no counts (`-`): a file that two
+builds compile is in the index of each, thus a sum counts it two times.
+`fw-context status` gives the counts of each build. `*` marks a project
+whose schema or row format is old, or whose compile_commands.json of a
+build changed. `fw-context status` gives each reason, also a checkout, a
+failed run and modified files. `INDEXED` is the time of the newest build.
 
 ### `fw-context db`
 

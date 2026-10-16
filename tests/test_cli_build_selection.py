@@ -9,6 +9,7 @@ the other builds.  The fixture ``two_builds`` (from
 from __future__ import annotations
 
 import argparse
+import re
 from pathlib import Path
 
 from tests.test_reindex_each_build import two_builds  # noqa: F401  (fixture)
@@ -76,3 +77,63 @@ def test_analyze_stores_the_vendor_scope_and_keeps_the_time_of_the_index_run(two
 
     assert code == 0 and analysed, "the analysis ran"
     assert _rows(db_path)[newest] == (1, OLD, OLD)
+
+
+def test_status_shows_each_build(two_builds, capsys):  # noqa: F811
+    """The status showed the counts of the build that the last index run wrote, and no other build."""
+    from fw_context_mcp.cli._search import cmd_status
+
+    root, _ = two_builds
+
+    code = cmd_status(argparse.Namespace(project=str(root)))
+
+    out = capsys.readouterr().out
+    assert code == 0, out
+    assert "Builds  : 2" in out
+    lines = out.splitlines()
+    assert any(line.startswith("  a ") for line in lines) and any(line.startswith("  b ") for line in lines), out
+
+
+def test_list_shows_the_builds_and_no_sum(two_builds, monkeypatch, capsys):  # noqa: F811
+    """The list showed the counts of the newest build for a project of several builds."""
+    from fw_context_mcp.cli._search import cmd_list
+    from fw_context_mcp.mcp.handlers import maintenance
+
+    root, _ = two_builds
+    real = maintenance.list_projects
+    # The fixture keeps its index next to the project; the list reads the
+    # index directory of the config of that project.
+    monkeypatch.setattr(maintenance, "list_projects", lambda project_root=None: real(project_root=str(root)))
+
+    code = cmd_list(argparse.Namespace(verbose=False))
+
+    out = capsys.readouterr().out
+    assert code == 0, out
+    # Columns are two or more spaces apart; a count can hold one space ("1 294").
+    header, row = (re.split(r"\s{2,}", line.strip()) for line in out.splitlines()[:2])
+    assert header == ["PROJECT", "PATH", "BUILDS", "SYMBOLS", "FILES", "INDEXED"]
+    cells = dict(zip(header, row, strict=True))
+    assert (cells["BUILDS"], cells["SYMBOLS"], cells["FILES"]) == ("2", "-", "-"), row
+
+
+def test_status_of_a_project_without_an_index_returns_1(two_builds, capsys):  # noqa: F811
+    import shutil
+
+    from fw_context_mcp.cli._search import cmd_status
+
+    root, db_path = two_builds
+    shutil.rmtree(db_path.parent)
+
+    assert cmd_status(argparse.Namespace(project=str(root))) == 1
+    assert "No symbol index found" in capsys.readouterr().out
+
+
+def test_status_names_a_declared_variant_without_an_index(two_builds, capsys):  # noqa: F811
+    from fw_context_mcp.cli._search import cmd_status
+
+    root, _ = two_builds
+    config = root / ".fw-context" / "config.toml"
+    config.write_text(config.read_text(encoding="utf-8") + '\n[[build.variants]]\nname = "c"\n', encoding="utf-8")
+
+    assert cmd_status(argparse.Namespace(project=str(root))) == 0
+    assert "  c  not indexed — run 'fw-context index --build --variant c'" in capsys.readouterr().out
