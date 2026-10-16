@@ -1947,7 +1947,7 @@ def _reindex_cleanup_deleted_file(
     target: Path,
     root: Path,
     db_path: Path,
-) -> dict:
+) -> dict | None:
     """Remove index records for a file that no longer exists on disk.
 
     Called when ``reindex_file`` is invoked for a path that the user
@@ -1957,6 +1957,10 @@ def _reindex_cleanup_deleted_file(
 
     Pauses background reindex to avoid a race: the bg thread might
     also detect the deletion and attempt its own cleanup.
+
+    Returns None when this build does not know the file.  Each build of the
+    project has its own rows, and a file of one build is not a file of the
+    other builds; the caller decides from all builds together.
     """
     config_hash = cfg_data["config_hash"]
     from ...indexer.db import get_file_mtimes, purge_file_records
@@ -1967,7 +1971,7 @@ def _reindex_cleanup_deleted_file(
     known = get_file_mtimes(conn, config_hash)
     file_path_str = _normalize_file_path(str(target), root)
     if file_path_str not in known:
-        return {"error": f"File not found on disk or in index: {target}"}
+        return None
 
     file_id_old, _ = known[file_path_str]
     symbol_count = conn.execute(
@@ -2501,8 +2505,8 @@ def _reindex_post_write_phases(
     The coverage warning for a header is NOT set here.  It used to be, and
     that put it behind two gates it has nothing to do with: this function
     returns early when ``total_symbols <= 0``, and the caller skips it
-    entirely when ``with_analysis=False`` — the mode the background
-    auto-reindex uses.  A caller that re-parsed a header through one unit
+    entirely when ``with_analysis=False``, the fast symbol-only update.  A
+    caller that re-parsed a header through one unit
     has to hear about it whether or not the enrichment phases ran, thus
     _header_coverage_warning() is applied by the caller.
     """
@@ -2542,6 +2546,19 @@ def _header_coverage_warning(
     )
 
 
+# The selector of the two reindex tools.  Not VARIANT_DESCRIPTION: a query
+# answers for ONE build and refuses without one, while a reindex without a
+# selector re-parses each build that compiles the file.
+REINDEX_VARIANT_DESCRIPTION = (
+    "Variant of the one build to re-parse. Omit it and image to re-parse the file in "
+    "each build that compiles it. A part of a pair gets an error that lists the builds."
+)
+REINDEX_IMAGE_DESCRIPTION = (
+    "Image of the one build to re-parse: a separate program, such as the application or "
+    "the bootloader. Give it when that build has an image name."
+)
+
+
 # ── moved from server.py ──
 def reindex_file_impl(
     file_path: Annotated[
@@ -2554,11 +2571,13 @@ def reindex_file_impl(
     project_root: Annotated[
         str | None, Field(description="Project root directory. Auto-detected from cwd if omitted.")
     ] = None,
+    variant: Annotated[str | None, Field(description=REINDEX_VARIANT_DESCRIPTION)] = None,
+    image: Annotated[str | None, Field(description=REINDEX_IMAGE_DESCRIPTION)] = None,
     *,
     with_analysis: Annotated[
         bool,
         Field(
-            description="When True (default), also regenerates LLM symbol analysis and method override relationships — slower but produces a fully up-to-date index. Set False for a fast symbol-only update (used by background auto-reindex)."
+            description="When True (default), also regenerates LLM symbol analysis, method override relationships, PageRank and embeddings — slower but produces a fully up-to-date index. Set False for a fast symbol-only update."
         ),
     ] = True,
 ) -> dict:
@@ -2567,15 +2586,23 @@ def reindex_file_impl(
     Not read-only — uses the exact compiler flags from ``compile_commands.json``.
     Use after editing a file to keep the index current without a full rebuild.
 
+    Without ``variant`` and ``image`` the file is re-parsed in EACH build
+    of the project that compiles it: an edit on disk changes the file for
+    every build of the tree.  A build that does not compile the file is
+    named in ``builds_without_file``.  With the two arguments of one build,
+    as ``get_project_status`` lists them, only that build is re-parsed; a
+    part of a pair gets an error that lists the builds.
+
     A source file must be listed in ``compile_commands.json``.  A header is
     not listed there — compile_commands.json names translation units — so it
-    is re-parsed through one unit that includes it, taken from the manifest.
-    That answer describes a single compilation context, thus the result
-    carries a ``warning``: another unit can see the header under a different
-    set of ``#define`` values and still hold stale symbols.  Only a full
-    ``fw-context index`` covers every context.  One unit and not all of them
-    is a cost decision — an application header reaches a median of 3 units
-    but as many as 266 on a real project, at tens of seconds each.
+    is re-parsed through one unit that includes it, taken from the manifest
+    of each build.  That answer describes a single compilation context,
+    thus the result carries a ``warning``: another unit can see the header
+    under a different set of ``#define`` values and still hold stale
+    symbols.  Only a full ``fw-context index`` covers every context.  One
+    unit and not all of them is a cost decision — an application header
+    reaches a median of 3 units but as many as 266 on a real project, at
+    tens of seconds each.
 
     Also regenerates LLM analysis and method override relationships for
     affected symbols when ``with_analysis=True``.  The analysis is
@@ -2585,98 +2612,65 @@ def reindex_file_impl(
         file_path: Path to the file to re-parse.  A source file must be in
             compile_commands.json; a header goes through one including unit.
         project_root: Project root directory. Auto-detected if omitted.
+        variant: The variant of the one build to re-parse.  Omit it, and
+            ``image``, to re-parse each build that compiles the file.
+        image: The image of the one build to re-parse.
         with_analysis: When True (default), also regenerates LLM symbol analysis,
             method override relationships, PageRank, and embeddings. Set False
-            for a fast symbol-only update (used by background auto-reindex).
+            for a fast symbol-only update.
 
     A file that is gone from disk but still in the index has its records
-    removed; the result is then {file, symbols_removed, action: "deleted"}.
+    removed in each build that holds it; the result is then {file,
+    symbols_removed, action: "deleted", builds}.
 
     Returns:
-        dict: {file, translation_units, symbols_updated, elapsed_s}, plus
-        when they apply: skipped_tus and skipped_count (units that failed to
-        parse), warning (header coverage), analysis_updated and
+        dict: {file, translation_units, symbols_updated, elapsed_s, builds},
+        plus builds_without_file when a build does not compile the file.
+        ``builds`` has one entry for each build that compiles the file:
+        {variant, image, translation_units, symbols_updated, elapsed_s},
+        plus when they apply: skipped_tus and skipped_count (units that
+        failed to parse), warning (header coverage), analysis_updated and
         embeddings_updated (counts for the whole build, not this file), and
         analysis_warning, overrides_warning, pagerank_warning, or
-        embedding_warning when a phase failed.
+        embedding_warning when a phase failed, or ``error`` when the
+        re-parse of that build failed.
 
-        On failure the dict holds ``error`` with the reason, and can add
-        ``skipped_tus`` or ``action``.
+        When one build compiles the file, the top level holds the full
+        result of that build.  When several do, the top level holds the
+        sums of the builds that did not fail, ``elapsed_s`` of the whole
+        call, the sum of ``skipped_count``, ``warning`` only when each of
+        those builds has it, and ``failed_builds`` with the label of each
+        build whose entry holds ``error``.
+
+        On failure the dict holds ``error`` with the reason: a refusal of
+        the selector, no build that compiles the file, or an update that
+        failed in each build.  It can add ``skipped_tus`` or ``action``.
     """
     db_path, cfg, project_id, root = _resolve_context(project_root, skip_ready_check=True)
     if not db_path.exists():
         return {"error": f"No index found for {root}. Run 'fw-context index' first."}
+    target, error = _reindex_resolve_target(file_path, root)
+    if error:
+        return error
 
-    # Config read via a short-lived read-only connection.
-    ro_conn = _quick_open_readonly(db_path)
-    try:
-        cfg_data = get_active_config(ro_conn, project_id)
-        if not cfg_data:
-            return {"error": "No build config indexed."}
-        config_hash = cfg_data["config_hash"]
-    finally:
-        ro_conn.close()
+    builds, refusal = _reindex_builds(db_path, project_id, cfg, variant or "", image or "")
+    if refusal:
+        return {"error": refusal}
+    if not builds:
+        return {"error": "No build config indexed."}
 
     executor = get_executor(db_path)
-
-    def _query(conn, config_hash):
-        # WRITE path: the executor is not read-only — writes are
-        # serialized with reads by the same lock.  A collision with a
-        # concurrently running CLI indexer is absorbed by the executor's
-        # 120 s busy_timeout (the CLI indexer keeps its own 10 s
-        # fail-fast).  Timeout is enforced by _wrap_tool, not here.
-        target, error = _reindex_resolve_target(file_path, root)
-        if error:
-            return error
-        if not target.exists():
-            return _reindex_cleanup_deleted_file(conn, cfg_data, target, root, db_path)
-
-        # The manifest of THIS build carries the vendor set the index run
-        # applied.  reindex_file must write is_project with that same
-        # boundary, or one file ends up on the other side of it.
-        #
-        # Loaded before the match because it answers a second question:
-        # compile_commands.json lists no headers, so a header target finds
-        # its translation unit only through the manifest.  One load serves
-        # both — it costs 14 ms on a 9.3 MB manifest.
-        from ...indexer.manifest import load as load_manifest
-
-        build_manifest = load_manifest(db_path.parent, config_hash)
-
-        matching, via_header, error = _reindex_match_tus(
-            target, cfg_data, manifest=build_manifest, project_root=root,
-        )
-        if error:
-            return error
-
-        vendor_patterns, project_patterns_list = _reindex_build_patterns(
-            cfg, root, build_manifest
-        )
-        total_symbols, result = _reindex_parse_and_store(
-            conn, matching, cfg_data, cfg.index.index_refs,
-            root, db_path, target, vendor_patterns, project_patterns_list,
-            cfg.index.transient_defines,
-        )
-        if "error" in result:
-            return result
-
-        # Set before the with_analysis gate: the warning describes how much
-        # of the header the re-parse covered, which does not depend on
-        # whether the enrichment phases run.
-        coverage_warning = _header_coverage_warning(target, matching, via_header)
-        if coverage_warning:
-            result["warning"] = coverage_warning
-
-        if not with_analysis:
-            return result
-
-        return _reindex_post_write_phases(
-            conn, config_hash, cfg, total_symbols, db_path.parent,
-            target, result, root,
-        )
-
+    t0 = time.monotonic()
+    answers: list[tuple[sqlite3.Row, dict | None]] = []
     try:
-        return executor.execute_sync(_query, config_hash)
+        # One call of the executor for each build: its lock is free between
+        # two builds, thus a query of another tool does not wait for all of
+        # them.
+        for build in builds:
+            answers.append((build, executor.execute_sync(
+                _reindex_one_build, build["config_hash"],
+                build, target, cfg, root, db_path, with_analysis,
+            )))
     finally:
         # Best-effort statistics refresh after the write.  Runs through
         # the executor so it serializes with other queries.
@@ -2684,9 +2678,183 @@ def reindex_file_impl(
             conn.execute("PRAGMA optimize")
 
         try:
-            executor.execute_sync(_optimize, config_hash)
+            executor.execute_sync(_optimize, builds[0]["config_hash"])
         except sqlite3.Error:
             pass
+    return _reindex_answer(target, answers, round(time.monotonic() - t0, 2))
+
+
+def _reindex_builds(
+    db_path: Path, project_id: str, cfg: Config, variant: str, image: str,
+) -> tuple[list[sqlite3.Row], str | None]:
+    """Return the builds that ``reindex_file`` re-parses, or the refusal of the selector.
+
+    Without a selector: each build of the project (`latest_builds`).  An
+    edit changes the file for the whole tree, thus each build that
+    compiles it must read it again, or its answers stay old while the
+    others are new.  With a selector: the build that ``resolve_build``
+    gives, with the refusal that each query tool gives for a part of a
+    pair.  Ordered by label, as `get_project_status` lists them, and not
+    by the time of the index run: the order of ``builds`` in the answer
+    then does not change with each run.
+    """
+    from ..shared.variants import resolve_build
+
+    conn = _quick_open_readonly(db_path)
+    try:
+        builds = sorted(latest_builds(conn, project_id), key=build_label)
+        if not (variant or image):
+            return builds, None
+        config_hash, refusal = resolve_build(conn, project_id, cfg, variant, image)
+    finally:
+        conn.close()
+    if refusal:
+        return [], refusal
+    return [build for build in builds if build["config_hash"] == config_hash], None
+
+
+def _reindex_one_build(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    cfg_data: sqlite3.Row,
+    target: Path,
+    cfg: Config,
+    root: Path,
+    db_path: Path,
+    with_analysis: bool,
+) -> dict | None:
+    """Re-parse *target* in the build *cfg_data*, or remove it when it is gone from disk.
+
+    Returns None when this build does not compile the file (or does not
+    know a deleted file).  WRITE path: the executor is not read-only —
+    writes are serialized with reads by the same lock.  A collision with a
+    concurrently running CLI indexer is absorbed by the executor's 120 s
+    busy_timeout (the CLI indexer keeps its own 10 s fail-fast).
+    """
+    if not target.exists():
+        return _reindex_cleanup_deleted_file(conn, cfg_data, target, root, db_path)
+
+    # The manifest of THIS build carries the vendor set the index run
+    # applied.  reindex_file must write is_project with that same
+    # boundary, or one file ends up on the other side of it.
+    #
+    # Loaded before the match because it answers a second question:
+    # compile_commands.json lists no headers, so a header target finds
+    # its translation unit only through the manifest.  One load serves
+    # both — it costs 14 ms on a 9.3 MB manifest.
+    from ...indexer.manifest import load as load_manifest
+
+    build_manifest = load_manifest(db_path.parent, config_hash)
+
+    matching, via_header, error = _reindex_match_tus(
+        target, cfg_data, manifest=build_manifest, project_root=root,
+    )
+    if error:
+        return error
+    if not matching:
+        return None
+
+    vendor_patterns, project_patterns_list = _reindex_build_patterns(
+        cfg, root, build_manifest
+    )
+    total_symbols, result = _reindex_parse_and_store(
+        conn, matching, cfg_data, cfg.index.index_refs,
+        root, db_path, target, vendor_patterns, project_patterns_list,
+        cfg.index.transient_defines,
+    )
+    if "error" in result:
+        return result
+
+    # Set before the with_analysis gate: the warning describes how much
+    # of the header the re-parse covered, which does not depend on
+    # whether the enrichment phases run.
+    coverage_warning = _header_coverage_warning(target, matching, via_header)
+    if coverage_warning:
+        result["warning"] = coverage_warning
+
+    if not with_analysis:
+        return result
+
+    return _reindex_post_write_phases(
+        conn, config_hash, cfg, total_symbols, db_path.parent,
+        target, result, root,
+    )
+
+
+def _reindex_answer(
+    target: Path, answers: list[tuple[sqlite3.Row, dict | None]], elapsed_s: float,
+) -> dict:
+    """Join the result of each build into the answer of ``reindex_file``.
+
+    WHY the top level of one build is its full result: the answer of a
+    project of one build keeps each field that it had before builds were
+    a part of it.  For several builds the top level holds the sums, and the
+    detail of each build is in ``builds``.
+    """
+    done = [(build, result) for build, result in answers if result is not None]
+    missing = [build_label(build) or "(no name)" for build, result in answers if result is None]
+    if not done:
+        if target.exists():
+            return _not_built_error(target)
+        return {"error": f"File not found on disk or in index: {target}"}
+
+    entries = [
+        {"variant": build["variant"] or "", "image": build["image"] or "",
+         **{key: value for key, value in result.items() if key != "file"}}
+        for build, result in done
+    ]
+    if len(done) == 1:
+        answer = dict(done[0][1])
+    else:
+        answer = _reindex_sums(target, done, elapsed_s)
+    answer["builds"] = entries
+    if missing:
+        answer["builds_without_file"] = missing
+    return answer
+
+
+def _reindex_sums(target: Path, done: list[tuple[sqlite3.Row, dict]], elapsed_s: float) -> dict:
+    """Return the top level of an answer of several builds: the sums, and what each build shares.
+
+    The sums come from the builds that did not fail.  WHY ``failed_builds``
+    and the sum of ``skipped_count`` at the top level: a caller reads the
+    top level first, and sums that left out a failed build, or the units
+    that did not parse, look like a complete update.
+    """
+    good = [result for _, result in done if "error" not in result]
+    failed = [build_label(build) or "(no name)" for build, result in done if "error" in result]
+    if not good:
+        answer: dict = {
+            "file": str(target),
+            "error": "fw-context could not update the file in each build that it tried. Each entry of builds holds its error.",
+            "failed_builds": failed,
+        }
+        actions = {result.get("action") for _, result in done}
+        if len(actions) == 1 and None not in actions:
+            answer["action"] = actions.pop()
+        return answer
+    if not target.exists():
+        answer = {
+            "file": str(target),
+            "symbols_removed": sum(result.get("symbols_removed", 0) for result in good),
+            "action": "deleted",
+        }
+    else:
+        answer = {
+            "file": str(target),
+            "translation_units": sum(result.get("translation_units", 0) for result in good),
+            "symbols_updated": sum(result.get("symbols_updated", 0) for result in good),
+            "elapsed_s": elapsed_s,
+        }
+        skipped = sum(result.get("skipped_count", 0) for result in good)
+        if skipped:
+            answer["skipped_count"] = skipped
+        warnings = {result.get("warning") for result in good}
+        if len(warnings) == 1 and None not in warnings:
+            answer["warning"] = warnings.pop()
+    if failed:
+        answer["failed_builds"] = failed
+    return answer
 
 
 def _reindex_resolve_target(
@@ -2779,9 +2947,11 @@ def _reindex_match_tus(
 
     Returns ``(matching_tus, via_header, None)`` on success, where
     *via_header* says the units came from the manifest fallback and the
-    result therefore describes a single compilation context.  On failure
-    it returns an empty list with an ``error_dict`` — the
-    compile_commands.json is missing, or nothing builds the target.
+    result therefore describes a single compilation context.  A build that
+    does not compile the target gives ``([], False, None)``: the file can
+    belong to another build of the project, and only the caller sees all
+    of them (`_not_built_error`).  A missing compile_commands.json gives an
+    empty list with an ``error_dict``.
     """
     cc_path = Path(cfg_data["compile_commands_path"])
     if not cc_path.exists():
@@ -2801,13 +2971,18 @@ def _reindex_match_tus(
         via = [u for u in units if Path(u.file).resolve() == tu_path]
         if via:
             return via[:1], True, None
+    return [], False, None
 
-    # The whole path, not target.name.  The basename made the refusal name
-    # something the caller never wrote: "../../../../etc/passwd" came back
-    # as "passwd not found in compile_commands.json", which reads as a fact
-    # about a file of the project and says nothing about the path that was
-    # refused.
-    return [], False, {"error": f"{target} is not built by this project — it has no entry in compile_commands.json, and no indexed translation unit includes it."}
+
+def _not_built_error(target: Path) -> dict:
+    """Return the error for *target* when no build of the project compiles it.
+
+    The whole path, not target.name.  The basename made the refusal name
+    something the caller never wrote: "../../../../etc/passwd" came back as
+    "passwd not found in compile_commands.json", which reads as a fact about
+    a file of the project and says nothing about the path that was refused.
+    """
+    return {"error": f"{target} is not built by this project — it has no entry in compile_commands.json, and no indexed translation unit includes it."}
 
 
 def _effective_vendor_patterns(
@@ -2890,11 +3065,17 @@ def _reindex_build_patterns(
 def reindex_file(
     file_path: Annotated[str, Field(description="Path to the file to re-parse. A source file must be in compile_commands.json. A header goes through one translation unit that includes it, and the result then carries a warning about the other units.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
+    variant: Annotated[str | None, Field(description=REINDEX_VARIANT_DESCRIPTION)] = None,
+    image: Annotated[str | None, Field(description=REINDEX_IMAGE_DESCRIPTION)] = None,
 ) -> dict:
     """Re-parse a single source file with libclang and update its symbols in the index.
 
     Not read-only — uses the exact compiler flags from ``compile_commands.json``.
     Use after editing a file to keep the index current without a full rebuild.
+
+    Without ``variant`` and ``image`` the file is re-parsed in EACH build
+    that compiles it, because an edit changes the file for every build of
+    the tree.  With the arguments of one build, only that build.
 
     A source file must be listed in ``compile_commands.json``.  A header is
     not listed there, thus it is re-parsed through one unit that includes
@@ -2910,18 +3091,22 @@ def reindex_file(
         file_path: Path to the file to re-parse.  A source file must be in
             compile_commands.json; a header goes through one including unit.
         project_root: Project root directory. Auto-detected if omitted.
+        variant: The variant of the one build to re-parse.  Omit it, and
+            ``image``, to re-parse each build that compiles the file.
+        image: The image of the one build to re-parse.
 
     A file that is gone from disk but still in the index has its records
-    removed; the result is then {file, symbols_removed, action: "deleted"}.
+    removed in each build that holds it; the result is then {file,
+    symbols_removed, action: "deleted", builds}.
 
     Returns:
-        dict: {file, translation_units, symbols_updated, elapsed_s}, plus
-        optional skipped_tus, skipped_count, warning, analysis_updated,
-        embeddings_updated, and per-phase ``*_warning`` keys — the same
-        shape as ``reindex_file_impl``.  On failure the dict holds
-        ``error``.
+        dict: {file, translation_units, symbols_updated, elapsed_s, builds},
+        plus builds_without_file, failed_builds, and the optional keys of
+        each build — the same shape as ``reindex_file_impl``.  ``builds``
+        holds the result of each build that compiles the file.  On failure
+        the dict holds ``error``.
     """
-    return reindex_file_impl(file_path, project_root, with_analysis=True)
+    return reindex_file_impl(file_path, project_root, variant, image, with_analysis=True)
 
 
 # ── moved from server.py ──

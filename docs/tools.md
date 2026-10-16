@@ -2751,16 +2751,47 @@ for `fw-context doctor` without `--fix`, and it repairs nothing.
 Re-index a single file after editing.
 
 ```
-Input:  {"file_path": "/abs/path/to/src/main.c", "project_root?": "/path/to/project"}
-Output: {"file": "/abs/path/to/src/main.c", "translation_units": 1,
-         "symbols_updated": 28, "elapsed_s": 2.5}
+Input:  {"file_path": "/abs/path/to/src/main.c", "project_root?": "/path/to/project",
+         "variant?": "a", "image?": "app"}
+Output (no selector, the builds a, b and c, and c does not compile the file):
+        {"file": "/abs/path/to/src/main.c", "translation_units": 2,
+         "symbols_updated": 56, "elapsed_s": 5.1,
+         "builds": [{"variant": "a", "image": "", "translation_units": 1,
+                     "symbols_updated": 28, "elapsed_s": 2.5},
+                    {"variant": "b", "image": "", "translation_units": 1,
+                     "symbols_updated": 28, "elapsed_s": 2.4}],
+         "builds_without_file": ["c"]}
 ```
+
+Without `variant` and `image`, the tool re-parses the file in each build
+of the project that compiles it. An edit changes the file on disk for each
+build of the tree, thus each build must read it again. `builds` holds the
+result of each build that compiles the file, and `builds_without_file`
+names the builds that do not. With the arguments of one build, as
+`get_project_status` lists them, the tool re-parses only that build. A
+selector that names no build gets the `error` of each query tool: the
+list of the builds, or, for a variant that the config declares and the
+index does not hold, the command that indexes it.
+
+When one build compiles the file, the top level holds the full result of
+that build, as before. When several builds do, the top level holds:
+
+- The sums of the builds that did not fail, and `elapsed_s` of the whole
+  call.
+- `skipped_count`, the sum of the units that did not parse.
+- `warning` only when each of those builds has it.
+- `failed_builds`, the label of each build whose entry holds `error`.
+
+The top level holds `error` only when no build compiles the file, or the
+update failed in each build that it tried. In the second case it also
+holds `failed_builds`, and, when each build gives the same `action`, that
+`action`.
 
 **Limitation:** A source file must appear in `compile_commands.json`.
 compile_commands.json lists no headers, thus fw-context re-parses a header
 through ONE translation unit that includes it, from the manifest: the unit
-with the lowest path in sort order. The result then holds a `warning`
-("Header re-indexed via one TU…"). Other units can include the header
+with the lowest path in sort order, in each build. The result then
+holds a `warning` ("Header re-indexed via one TU…"). Other units can include the header
 with other `#define` values and still hold stale symbols. Run a full
 `fw-context index` for full accuracy. A file that no unit builds or
 includes gives an `error`.
@@ -2768,19 +2799,24 @@ includes gives an `error`.
 #### `reindex_file_impl`
 
 The shared implementation that `reindex_file` uses (the public tool, with
-full analysis) and that the background auto-reindex uses (the fast path,
-with no LLM). Prefer `reindex_file` for interactive use. Use this tool
-only when you need to control `with_analysis` explicitly.
+full analysis). Prefer `reindex_file` for interactive use. Use this tool
+only when you need to control `with_analysis` explicitly. The background
+reindex does not use it: the daemon starts `fw-context index --background`.
 
 ```
-Input:  {"file_path": "/abs/path/to/src/main.c", "project_root?": "/path/to/project", "with_analysis?": true}
-Output: {"file": "/abs/path/to/src/main.c", "translation_units": 1,
+Input:  {"file_path": "/abs/path/to/src/main.c", "project_root?": "/path/to/project",
+         "variant?": "a", "image?": "app", "with_analysis?": true}
+Output (no selector, and only the build a compiles the file):
+        {"file": "/abs/path/to/src/main.c", "translation_units": 1,
          "symbols_updated": 28, "elapsed_s": 2.5,
-         "analysis_updated": 12, "embeddings_updated": 12}
+         "analysis_updated": 12, "embeddings_updated": 12,
+         "builds": [{"variant": "a", "image": "", "translation_units": 1, …}]}
 ```
 
-Optional keys are present only when they apply. They are absent
-otherwise, never `null`:
+The builds that it re-parses, `builds`, `builds_without_file` and the top
+level are as in [`reindex_file`](#reindex_file). Optional keys of a result
+are present only when they apply. They are absent otherwise, never
+`null`:
 
 - `skipped_tus` and `skipped_count` — translation units that failed to
   parse.
@@ -2791,9 +2827,13 @@ otherwise, never `null`:
   `embedding_warning` — a phase failed.
 
 A file that is gone from disk but is still in the index has its records
-removed. The result is then `{"file": …, "symbols_removed": 28,
-"action": "deleted"}`. On failure, the dict holds `error`, and can also
-hold `skipped_tus` or `action`. `reindex_file` gives the same shape.
+removed in each build that holds it. The result is then `{"file": …,
+"symbols_removed": 28, "action": "deleted", "builds": [{"variant": …,
+"image": …, "symbols_removed": 28, "action": "deleted"}]}`. For a deleted
+file, `builds_without_file` names the builds that do not hold it. On
+failure, the dict holds `error`,
+and can also hold `skipped_tus` or `action`. `reindex_file` gives the same
+shape.
 
 When `with_analysis=True` (the default), this tool also regenerates the
 LLM symbol analysis and the method override relationships. This is

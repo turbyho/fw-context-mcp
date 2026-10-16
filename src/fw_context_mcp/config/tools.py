@@ -176,6 +176,9 @@ nearly every row.
   `--variant` is listed even when config.toml no longer declares it.
 - Pass `variant` and `image` to every tool that answers about code,
   `smart_search` and `semantic_search` included.
+- `reindex_file` is not a query: without `variant` and `image` it re-parses
+  the file in each build that compiles it. Give the arguments of one build
+  to re-parse only that build.
 - To learn whether a symbol is in the bootloader TOO, ask twice — once per
   build. Two plain answers beat one blended answer.
 

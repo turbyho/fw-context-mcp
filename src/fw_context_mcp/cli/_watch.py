@@ -2,8 +2,8 @@
 
 Manages the file-watching daemon that keeps the symbol index current by
 reindexing modified source files automatically.  The daemon monitors the
-project directory for changes and calls ``reindex_file_impl`` for each
-changed file.
+project directory for changes and starts ``fw-context index --background``,
+which re-parses the changed units of each build.
 
 WHY a daemon: during development, the index quickly falls out of sync with
 source files if the user must remember to reindex manually.  The daemon
