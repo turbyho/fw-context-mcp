@@ -2593,6 +2593,13 @@ def reindex_file_impl(
     as ``get_project_status`` lists them, only that build is re-parsed; a
     part of a pair gets an error that lists the builds.
 
+    The call runs in a thread of the server and sends a notice each 5 s.
+    It holds the lock of the query tools: another query waits 5 s, then
+    gets "server busy".  After 300 s the call returns an ``error``, and a
+    part of the work can continue or fail.  Call ``get_project_status``
+    for the state of each build, and repeat the call for a build that is
+    not current.  The answer holds no ``index_state``.
+
     A source file must be listed in ``compile_commands.json``.  A header is
     not listed there — compile_commands.json names translation units — so it
     is re-parsed through one unit that includes it, taken from the manifest
@@ -3076,6 +3083,13 @@ def reindex_file(
     Without ``variant`` and ``image`` the file is re-parsed in EACH build
     that compiles it, because an edit changes the file for every build of
     the tree.  With the arguments of one build, only that build.
+
+    The call runs in a thread of the server and sends a notice each 5 s.
+    It holds the lock of the query tools: another query waits 5 s, then
+    gets "server busy".  After 300 s the call returns an ``error``, and a
+    part of the work can continue or fail.  Call ``get_project_status``
+    for the state of each build, and repeat the call for a build that is
+    not current.  The answer holds no ``index_state``.
 
     A source file must be listed in ``compile_commands.json``.  A header is
     not listed there, thus it is re-parsed through one unit that includes

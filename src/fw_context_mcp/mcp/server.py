@@ -144,7 +144,7 @@ def _busy_error(tool: str) -> list[dict]:
     )}]
 
 
-def _wrap_tool(fn):
+def _wrap_tool(fn, *, annotate: bool = True):
     """Wrap a tool handler: error boundary + async dispatch + MCP progress.
 
     Sync handlers are dispatched to a background thread via
@@ -164,7 +164,10 @@ def _wrap_tool(fn):
     run that is active or scheduled, a failed run, or a reason that no run
     repairs.  It goes here, and not into each handler, because every query
     tool passes through this wrapper, and a handler that someone adds
-    later gets it too.
+    later gets it too.  ``annotate=False`` leaves it out, for a tool that
+    writes the index and does not answer from it: the state of a reindex
+    told the caller that its answer came from the last index run, and a
+    run that waits told it to repeat the reindex.
 
     **Why two code paths (sync vs async)?**  Sync handlers execute
     blocking SQLite queries and libclang traversal.  Running them on
@@ -225,6 +228,8 @@ def _wrap_tool(fn):
                         sys.exit(0)
                     log.exception("Tool %s crashed", fn.__name__)
                     return [{"error": f"Internal server error in {fn.__name__}: {exception}"}]
+                if not annotate:
+                    return task.result()
                 return await asyncio.to_thread(
                     annotate_index_state, task.result(), kw
                 )
@@ -236,9 +241,9 @@ def _wrap_tool(fn):
     # Dispatched to ``asyncio.to_thread`` so the event loop stays free
     # for progress notifications and the ping thread.
     @functools.wraps(fn, assigned=("__module__", "__name__", "__qualname__", "__doc__"))
-    async def _wrapper(*a, ctx: MCPContext | None = None, **kw):
+    async def _sync_wrapper(*a, ctx: MCPContext | None = None, **kw):
         start = time.monotonic()
-        _wrap_debug(f"[sync] {fn.__name__} ctx={'P' if ctx is not None else 'N'} ann={list(_wrapper.__annotations__.keys())}")
+        _wrap_debug(f"[sync] {fn.__name__} ctx={'P' if ctx is not None else 'N'} ann={list(_sync_wrapper.__annotations__.keys())}")
         try:
             await asyncio.wait_for(_SERVER_LOCK.acquire(), timeout=_SERVER_LOCK_TIMEOUT)
         except TimeoutError:
@@ -282,12 +287,14 @@ def _wrap_tool(fn):
                     sys.exit(0)
                 log.exception("Tool %s crashed", fn.__name__)
                 return [{"error": f"Internal server error in {fn.__name__}: {exception}"}]
+            if not annotate:
+                return task.result()
             return await asyncio.to_thread(
                 annotate_index_state, task.result(), kw
             )
         finally:
             _SERVER_LOCK.release()
-    return _wrapper
+    return _sync_wrapper
 
 
 # ── Project selector ──────────────────────────────────────────────────
@@ -1120,6 +1127,13 @@ mcp = FastMCP(
 # would serialize fast queries behind slow ones (e.g., a 30 s search_bodies
 # query blocking a 10 ms get_project_status check).
 #
+# The exception: reindex_file and reindex_file_impl.  A re-parse runs
+# libclang for each build that compiles the file, tens of seconds each on a
+# large project.  Without the wrapper the call ran on the event loop: no
+# notice reached the client, which can close the connection after about
+# 15 s without one, and no other coroutine ran.  They get no index state
+# (annotate=False): they write the index and do not answer from it.
+#
 # All search, call graph, symbol source, inheritance, and variable tools
 # ARE wrapped — they may run for seconds to minutes (BFS traversal,
 # Ollama HTTP calls, libclang re-parsing) and need progress notifications
@@ -1141,8 +1155,8 @@ mcp.tool()(_with_project_selector(maintenance.get_build_info))
 mcp.tool()(_with_project_selector(maintenance.get_project_info))
 mcp.tool()(_with_project_selector(maintenance.get_project_status))
 mcp.tool()(_with_project_selector(maintenance.list_projects))
-mcp.tool()(_with_project_selector(maintenance.reindex_file))
-mcp.tool()(_with_project_selector(maintenance.reindex_file_impl))
+mcp.tool()(_with_project_selector(_wrap_tool(maintenance.reindex_file, annotate=False)))
+mcp.tool()(_with_project_selector(_wrap_tool(maintenance.reindex_file_impl, annotate=False)))
 mcp.tool()(_with_project_selector(maintenance.reset_index))
 
 # search.py

@@ -273,3 +273,45 @@ def test_a_declared_variant_without_an_index_names_the_command(two_builds):
 
     assert list(result) == ["error"], result
     assert "--variant c" in result["error"]
+
+
+@pytest.mark.parametrize("tool", ["reindex_file", "reindex_file_impl"])
+def test_the_mcp_tool_runs_in_a_thread(two_builds, monkeypatch, tool):
+    """The call ran on the event loop: no progress notice, and no other coroutine, until the end."""
+    import asyncio
+    import threading
+
+    from fw_context_mcp.mcp import server
+    from fw_context_mcp.mcp.handlers import maintenance
+
+    root, _ = two_builds
+    threads = []
+
+    def _builds(*args, **kwargs):
+        threads.append(threading.current_thread())
+        return [], None
+
+    monkeypatch.setattr(maintenance, "_reindex_builds", _builds)
+
+    asyncio.run(server.mcp.call_tool(tool, {"file_path": "src/main.c", "project_root": str(root)}))
+
+    assert threads and threads[0] is not threading.main_thread(), threads
+
+
+@pytest.mark.parametrize("tool", ["reindex_file", "reindex_file_impl"])
+def test_the_mcp_tool_gives_no_index_state(two_builds, monkeypatch, tool):
+    """The state told a reindex that its answer came from the last index run, or to repeat the reindex."""
+    import asyncio
+
+    from fw_context_mcp.mcp import server
+    from fw_context_mcp.mcp.handlers import maintenance
+
+    root, _ = two_builds
+    calls = []
+    monkeypatch.setattr(maintenance, "_reindex_builds", lambda *args, **kwargs: ([], None))
+    monkeypatch.setattr(server, "annotate_index_state", lambda result, kw: calls.append(kw) or result)
+
+    asyncio.run(server.mcp.call_tool(tool, {"file_path": "src/main.c", "project_root": str(root)}))
+    asyncio.run(server.mcp.call_tool("lookup_symbol", {"name": "main_value", "project_root": str(root), "variant": "a"}))
+
+    assert [kw.get("name") for kw in calls] == ["main_value"], "only the query gets the state"

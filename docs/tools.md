@@ -2787,6 +2787,13 @@ update failed in each build that it tried. In the second case it also
 holds `failed_builds`, and, when each build gives the same `action`, that
 `action`.
 
+The call runs in a thread of the server and sends a notice each 5 s. It
+holds the lock of the query tools: another query waits 5 s, then gets
+"server busy". After 300 s the call returns an `error`, and a part of the
+work can continue or fail. Call `get_project_status` for the state of
+each build, and repeat the call for a build that is not current. The
+answer holds no `index_state`.
+
 **Limitation:** A source file must appear in `compile_commands.json`.
 compile_commands.json lists no headers, thus fw-context re-parses a header
 through ONE translation unit that includes it, from the manifest: the unit
