@@ -152,7 +152,9 @@ def test_a_missing_chat_model_on_the_server_of_ollama_url_is_reported(servers, c
     result = _check(_cfg(chat_api_base=chat_api_base))
 
     assert result.status == "missing", result
-    assert result.fix_cmd == f"ollama pull {CHAT}"
+    from fw_context_mcp.deps._instructions import get_platform_info, ollama_pull_command
+
+    assert result.fix_cmd == ollama_pull_command(CHAT, LOCAL, get_platform_info())
 
 
 def test_a_chat_model_on_the_server_of_ollama_url_is_ok(servers):

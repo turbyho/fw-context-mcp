@@ -96,6 +96,16 @@ def _ollama_pull(model: str, url: str) -> tuple[bool, str]:
     return _pull_via_api(model, url)
 
 
+def _stalled(model: str, url: str) -> str:
+    """Return the message of a pull that made no progress, with the manual command for the server at *url*."""
+    from ._instructions import get_platform_info, ollama_pull_command
+
+    return (
+        f"pull stalled — no progress for {STALL_TIMEOUT}s; "
+        f"run `{ollama_pull_command(model, url, get_platform_info())}` manually"
+    )
+
+
 def _kill(proc: subprocess.Popen) -> None:
     """Terminate a subprocess, escalating to SIGKILL when it ignores SIGTERM."""
     try:
@@ -184,10 +194,7 @@ def _pull_via_cli(model: str, url: str) -> tuple[bool, str]:
             if time.monotonic() - last > STALL_TIMEOUT:
                 _kill(proc)
                 reader.join(timeout=1.0)
-                return False, (
-                    f"pull stalled — no progress for {STALL_TIMEOUT}s; "
-                    f"run `ollama pull {model}` manually"
-                )
+                return False, _stalled(model, url)
             time.sleep(1.0)
         reader.join(timeout=5.0)
         # End the progress bar on a clean line — a trailing ``\r`` update
@@ -246,10 +253,7 @@ def _pull_via_api(model: str, url: str) -> tuple[bool, str]:
     except httpx.ConnectError:
         return False, f"Ollama not reachable at {url}"
     except httpx.ReadTimeout:
-        return False, (
-            f"pull stalled — no progress for {STALL_TIMEOUT}s; "
-            f"run `ollama pull {model}` manually"
-        )
+        return False, _stalled(model, url)
     except httpx.HTTPError as e:
         return False, str(e)
     except OSError as e:
@@ -308,22 +312,26 @@ def fix_chat_model(result, _project_root=None) -> tuple[bool, str]:
 
     if refused := _no_model_to_pull(result):
         return refused
-    server = chat_ollama_server(load_project_config(_project_root).llm)
+    cfg = load_project_config(_project_root).llm
+    server = chat_ollama_server(cfg)
     if server is None:
         return False, "an OpenAI-compatible API (chat_api_base) runs the chat model; Ollama cannot pull it"
-    # Extract model name from the result message or fix_cmd
-    model = _extract_model_name(result, "ollama")
-    return _ollama_pull(model, server)
+    return _ollama_pull(cfg.model, server)
 
 
 def fix_embed_model(result, _project_root=None) -> tuple[bool, str]:
-    """Pull the configured embedding model onto the server of ``[llm] ollama_url``."""
+    """Pull the configured embedding model onto the server of ``[llm] ollama_url``.
+
+    WHY the model name comes from the config and not from ``fix_cmd``:
+    ``fix_cmd`` is a shell command for a person, and it starts with the
+    setting of ``OLLAMA_HOST``.  The check read the same config.
+    """
     from . import load_project_config
 
     if refused := _no_model_to_pull(result):
         return refused
-    model = _extract_model_name(result, "ollama")
-    return _ollama_pull(model, load_project_config(_project_root).llm.ollama_url)
+    cfg = load_project_config(_project_root).llm
+    return _ollama_pull(cfg.embed_model, cfg.ollama_url)
 
 
 
@@ -375,14 +383,6 @@ def fix_obsolete_files(_result, project_root=None) -> tuple[bool, str]:
         failed = "; ".join(f"cannot clean {path}: {reason}" for path, reason in report.failures)
         return False, f"{removed}; {failed}" if report.lines() else failed
     return True, removed
-
-
-def _extract_model_name(result, default_url: str) -> str:
-    """Extract model name from fix_cmd like 'ollama pull <model>'."""
-    if result.fix_cmd and result.fix_cmd.startswith("ollama pull "):
-        return result.fix_cmd[len("ollama pull "):].strip()
-    # Fallback: parse from message
-    return result.message.split("'")[1] if "'" in result.message else "unknown"
 
 
 # ── Registry ────────────────────────────────────────────────────────────

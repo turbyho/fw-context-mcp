@@ -726,9 +726,21 @@ When you run this command with `--fix`, it attempts to repair fixable
 issues automatically. The command reports issues that it cannot fix, and
 tells you how to fix them manually.
 
-`--fix` pulls a missing chat model or embedding model onto the Ollama
-server of `[llm] ollama_url`, also when that server is on a different
-machine. The checks ask that server for the models.
+`--fix` pulls a missing model onto the Ollama server that the check
+asks, also when that server is on a different machine:
+
+- The embedding model: the server of `[llm] ollama_url`.
+- The chat model: the Ollama server of the chat calls. This is the server
+  of `ollama_url`, or the Ollama server that `chat_api_base` names. When
+  `chat_api_base` names an OpenAI-compatible API, that API runs the chat
+  model, and the check `chat-model` is `skipped`.
+
+The manual command sets `OLLAMA_HOST`, because the `ollama` CLI reads the
+server from it. It sets it also for the default server, because the
+`OLLAMA_HOST` of your shell can name a different server. For example:
+`OLLAMA_HOST=http://gpu-box:11434 ollama pull qwen2.5-coder:14b`. On
+Windows, the command has the syntax of PowerShell. In `cmd.exe`, first
+run `set OLLAMA_HOST=<url>`, and then `ollama pull <model>`.
 
 ### `fw-context cleanup`
 

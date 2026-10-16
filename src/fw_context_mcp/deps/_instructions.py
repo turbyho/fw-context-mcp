@@ -201,6 +201,29 @@ def ollama_instructions(ctx: dict) -> str:
     return "curl -fsSL https://ollama.com/install.sh | sh  &&  ollama serve"
 
 
+def ollama_pull_command(model: str, url: str, ctx: dict) -> str:
+    """Return the shell command that pulls *model* onto the Ollama server at *url*.
+
+    The ``ollama`` CLI has no option for the server: it reads
+    ``OLLAMA_HOST``.  The command always sets it, in the syntax of
+    PowerShell on Windows and of a POSIX shell on the other systems.
+
+    WHY always, also for the default ``ollama_url``: a plain ``ollama pull``
+    uses the ``OLLAMA_HOST`` of the shell of the person.  When that names
+    a different server, the model goes there, and the check still finds
+    it missing.  The process that makes the command cannot know that
+    shell: the MCP server runs in the environment of its client.
+    """
+    import shlex
+
+    if ctx.get("system", sys.platform) == "win32":
+        # A PowerShell string in single quotes: a quote in it is doubled.
+        host = url.replace("'", "''")
+        name = model.replace("'", "''")
+        return f"$env:OLLAMA_HOST='{host}'; ollama pull '{name}'"
+    return f"OLLAMA_HOST={shlex.quote(url)} ollama pull {shlex.quote(model)}"
+
+
 def _vec_check_cmd(ctx: dict) -> str:
     """Platform-specific command to inspect shared library dependencies."""
     system = ctx.get("system", sys.platform)

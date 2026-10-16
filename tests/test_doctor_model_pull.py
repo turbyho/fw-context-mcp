@@ -18,7 +18,8 @@ def _project(tmp_path):
     """A project with a remote ``ollama_url`` in ``local.toml``, the documented place for it."""
     root = tmp_path / "proj"
     (root / ".fw-context").mkdir(parents=True)
-    (root / ".fw-context" / "local.toml").write_text(f'[llm]\nollama_url = "{REMOTE}"\n', encoding="utf-8")
+    (root / ".fw-context" / "local.toml").write_text(
+        f'[llm]\nollama_url = "{REMOTE}"\nmodel = "chat:7b"\nembed_model = "emb:1"\n', encoding="utf-8")
     return root
 
 
@@ -66,7 +67,10 @@ def test_the_fixes_pull_onto_the_server_of_the_project_config(tmp_path, monkeypa
     calls = []
     monkeypatch.setattr(_fixes, "_ollama_pull", lambda model, url: calls.append((model, url)) or (True, "pulled"))
 
-    _fixes.fix_embed_model(DepCheckResult("embed-model", "missing", "", fix_cmd="ollama pull emb:1"), str(root))
-    _fixes.fix_chat_model(DepCheckResult("chat-model", "missing", "", fix_cmd="ollama pull chat:7b"), str(root))
+    # The model name comes from the config: fix_cmd is a command for a person.
+    _fixes.fix_embed_model(DepCheckResult("embed-model", "missing", "", fix_cmd=f"OLLAMA_HOST={REMOTE} ollama pull x"),
+                           str(root))
+    _fixes.fix_chat_model(DepCheckResult("chat-model", "missing", "", fix_cmd=f"OLLAMA_HOST={REMOTE} ollama pull y"),
+                          str(root))
 
     assert calls == [("emb:1", REMOTE), ("chat:7b", REMOTE)]

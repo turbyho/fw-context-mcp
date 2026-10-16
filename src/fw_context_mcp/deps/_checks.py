@@ -29,6 +29,7 @@ from ._instructions import (
     libclang_python_instructions,
     libclang_so_instructions,
     ollama_instructions,
+    ollama_pull_command,
     pysqlite3_instructions,
     sqlite_ext_instructions,
     vec0_load_error_instructions,
@@ -477,12 +478,13 @@ def check_ollama_chat_model(cfg) -> DepCheckResult:
             critical=False,
         )
     if not any(_model_name_matches(m, cfg.model) for m in models):
+        command = ollama_pull_command(cfg.model, server, get_platform_info())
         return DepCheckResult(
             name="chat-model",
             status="missing",
             message=f"model '{cfg.model}' not installed",
-            fix_cmd=f"ollama pull {cfg.model}",
-            instructions=f"ollama pull {cfg.model}",
+            fix_cmd=command,
+            instructions=command,
             critical=False,
         )
     return DepCheckResult(
@@ -504,12 +506,13 @@ def check_ollama_embed_model(cfg) -> DepCheckResult:
     if result.get("status") == "error":
         return DepCheckResult(name="embed-model", status="skipped", message="Ollama not reachable", critical=False)
     if not result.get("embedding_installed"):
+        command = ollama_pull_command(cfg.embed_model, cfg.ollama_url, get_platform_info())
         return DepCheckResult(
             name="embed-model",
             status="missing",
             message=f"embedding model '{cfg.embed_model}' not installed",
-            fix_cmd=f"ollama pull {cfg.embed_model}",
-            instructions=f"ollama pull {cfg.embed_model}",
+            fix_cmd=command,
+            instructions=command,
             critical=False,
         )
     return DepCheckResult(
