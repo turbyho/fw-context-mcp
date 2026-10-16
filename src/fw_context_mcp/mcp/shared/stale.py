@@ -915,6 +915,68 @@ def _check_header_staleness(
     return stale_count, affected
 
 
+def after_the_run(action: str) -> str:
+    """Return the advice to wait for the index run, and then to do *action*.
+
+    The text starts after the article ("an"), thus a caller puts it in the
+    middle of a sentence or at its start.  WHY a reason gives this text when
+    an index run is in progress or scheduled: the command of the reason is
+    often the command that runs, and a caller that follows it asks for the
+    same work a second time.  The run can also leave the reason standing,
+    for example a run that does not build, thus the action stays in the
+    text.
+
+    The text holds no dash and no colon, because a reason can put it after
+    either.
+    """
+    return f"index run is in progress or scheduled; wait for it, and when this reason stays after the run, {action}"
+
+
+def with_action(fact: str, action: str, bg_running: bool) -> str:
+    """Return the sentence *fact* and then *action*, or the advice to wait for the run.
+
+    *action* is an instruction without a subject, in lower case, as
+    ``autobuild.build_advice`` gives it.  See :func:`after_the_run` for the
+    reason to wait.
+    """
+    if bg_running:
+        return f"{fact}. An {after_the_run(action)}."
+    return f"{fact}. {action[0].upper()}{action[1:]}."
+
+
+def outdated_index_fact(conn) -> str | None:
+    """Return the fact of an index that an older version wrote, or None.
+
+    Such an index lacks the columns of this version (`missing_columns`),
+    and a read of a build row fails.  Each entry path of the server asks
+    this before it reads a row: a query, the state of a query, the status
+    tools, the list of the projects and the check at the start of the
+    daemon.  When the daemon starts, that check starts the index run whose
+    `open_db` adds the columns.  WHY a reason and not columns that read as
+    empty: the old rows are not the index of this version, and only a run
+    makes them that.
+    """
+    from ...indexer.db import missing_columns
+
+    missing = missing_columns(conn)
+    if not missing:
+        return None
+    shown = ", ".join(missing[:5]) + (f" and {len(missing) - 5} more" if len(missing) > 5 else "")
+    return f"schema_mismatch: an older version wrote this index; it lacks the columns {shown} of this version"
+
+
+def outdated_index_reason(conn, bg_running: bool) -> str | None:
+    """Return :func:`outdated_index_fact` with its action, or None.
+
+    *bg_running* is the state of an index run of the project, as the
+    caller read it: during a run the reason tells the caller to wait
+    (`with_action`), because a second run would take over the run that
+    adds the columns.
+    """
+    fact = outdated_index_fact(conn)
+    return with_action(fact, "run `fw-context index`", bg_running) if fact else None
+
+
 def latest_builds(conn, project_id: str) -> list:
     """Return the newest completed build of each ``(variant, image)`` of *project_id*.
 

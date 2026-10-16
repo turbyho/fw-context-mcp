@@ -84,8 +84,12 @@ from ..shared.stale import (
     build_label,
     find_unindexed_sources,
     latest_builds,
+    outdated_index_fact,
+    outdated_index_reason,
     stored_row_format,
 )
+from ..shared.stale import after_the_run as _after_the_run
+from ..shared.stale import with_action as _with_action
 from ..shared.variants import IMAGE_DESCRIPTION, VARIANT_DESCRIPTION
 
 log = logging.getLogger(__name__)
@@ -95,23 +99,6 @@ log = logging.getLogger(__name__)
 #: no index run is in progress or scheduled: each reason then names its own
 #: action.  The message of a project of several builds looks for it.
 _REASON_COMMAND = "the command that reindex_reasons names"
-
-
-def _after_the_run(action: str) -> str:
-    """Return the advice to wait for the index run, and then to do *action*.
-
-    The text starts after the article ("an"), thus a caller puts it in the
-    middle of a sentence or at its start.  WHY a reason gives this text when
-    an index run is in progress or scheduled: the command of the reason is
-    often the command that runs, and a caller that follows it asks for the
-    same work a second time.  The run can also leave the reason standing,
-    for example a run that does not build, thus the action stays in the
-    text.
-
-    The text holds no dash and no colon, because a reason can put it after
-    either.
-    """
-    return f"index run is in progress or scheduled; wait for it, and when this reason stays after the run, {action}"
 
 
 def _new_source_advice(auto_state: AutobuildState, bg_running: bool, rebuild: str) -> str:
@@ -159,18 +146,6 @@ def _autobuild_state(root: Path, proj_cfg, new_sources: list[str]) -> AutobuildS
     if not new_sources:
         return AutobuildState.WILL_BUILD  # unused — no file to report
     return project_autobuild_state(root, proj_cfg)
-
-
-def _with_action(fact: str, action: str, bg_running: bool) -> str:
-    """Return the sentence *fact* and then *action*, or the advice to wait for the run.
-
-    *action* is an instruction without a subject, in lower case, as
-    ``autobuild.build_advice`` gives it.  See :func:`_after_the_run` for the
-    reason to wait.
-    """
-    if bg_running:
-        return f"{fact}. An {_after_the_run(action)}."
-    return f"{fact}. {action[0].upper()}{action[1:]}."
 
 
 def _build_missing_advice(reason: str, root: Path, proj_cfg, bg_running: bool) -> str:
@@ -1354,6 +1329,35 @@ def get_project_status(
     return _with_version_state(_project_state(project_root, fast))
 
 
+def _outdated_state(target: _IndexTarget, reason: str) -> dict:
+    """Return the state of an index that an older version wrote (`outdated_index_reason`).
+
+    No other field: each one comes from a build row, and the rows lack the
+    columns of this version.  The status is ``reindex_needed`` because
+    only the index run that adds the columns repairs it.  When the daemon
+    starts, it starts that run.
+
+    WHY the marker of a failed run comes first: some refusals of
+    ``fw-context index`` (no build, a retired key of the config) stop the
+    run before `open_db` adds the columns.  The marker names the repair, and
+    a plain run without it is refused again.  A run that is in progress or
+    scheduled wins over the marker, as in `index_state`.
+    """
+    problem = read_build_problem(target.db_path.parent)
+    failed = problem if problem is not None and not target.bg_running else None
+    reasons = [failed.text, reason] if failed else [reason]
+    message = failed.text if failed else reason
+    return {
+        "project_id": target.project_id,
+        "project_root": str(target.root),
+        "status": "reindex_needed",
+        "reindex_needed": True,
+        "reindex_reasons": reasons,
+        "reindex_state": "failed" if failed else (target.reindex_state or "not_scheduled"),
+        "index_message": f"{message} No tool reads a build of this index until a run adds the columns.",
+    }
+
+
 def _project_state(project_root: str | None, fast: bool) -> dict:
     """Return the state of :func:`get_project_status`, before the version fields."""
     target = _index_target(project_root)
@@ -1361,6 +1365,11 @@ def _project_state(project_root: str | None, fast: bool) -> dict:
         return target
 
     def _query(conn, _config_hash):
+        # Before the first read of a build row: a row of an older version
+        # lacks the columns that the reads below take.
+        outdated = outdated_index_reason(conn, target.bg_running)
+        if outdated:
+            return _outdated_state(target, outdated)
         builds = sorted(latest_builds(conn, target.project_id), key=build_label)
         if not builds:
             return {"error": f"No build config indexed for project at {target.root}."}
@@ -1520,6 +1529,9 @@ def get_build_info(
 
     conn = _quick_open_readonly(target.db_path)
     try:
+        outdated = outdated_index_reason(conn, target.bg_running)
+        if outdated:
+            return _outdated_state(target, outdated)
         config_hash, refusal = resolve_build(conn, target.project_id, target.cfg, variant or "", image or "")
     finally:
         conn.close()
@@ -1703,6 +1715,12 @@ def list_projects(
             def _query(conn, _config_hash):
                 # Runs under the executor lock on the single shared
                 # connection; must not open its own connection.
+                # The fact only: the list does not read the state of a run,
+                # and a command during the run that adds the columns would
+                # take that run over.
+                outdated = outdated_index_fact(conn)
+                if outdated:
+                    return f"{outdated}. To see the action, call get_project_status for that project."
                 rows = get_all_projects(conn)
                 schema_ver = get_db_schema_version(conn)
                 coverage_map = {
@@ -1718,7 +1736,13 @@ def list_projects(
                 builds = {row["project_id"]: latest_builds(conn, row["project_id"]) for row in rows}
                 return rows, schema_ver, coverage_map, builds
 
-            rows, db_schema_ver, coverage_map, builds = executor.execute_sync(_query, "")
+            answer = executor.execute_sync(_query, "")
+            if isinstance(answer, str):
+                # The rows of an older version lack the columns that the
+                # list reads; the other projects stay in the list.
+                results.append({"db": str(db_path), "error": answer})
+                continue
+            rows, db_schema_ver, coverage_map, builds = answer
             for r in rows:
                 project_builds = builds[r["project_id"]]
                 # A changed or missing compile_commands.json of a build: the
@@ -2660,7 +2684,7 @@ def reindex_file_impl(
     if error:
         return error
 
-    builds, refusal = _reindex_builds(db_path, project_id, cfg, variant or "", image or "")
+    builds, refusal = _reindex_builds(db_path, project_id, cfg, variant or "", image or "", root)
     if refusal:
         return {"error": refusal}
     if not builds:
@@ -2692,7 +2716,7 @@ def reindex_file_impl(
 
 
 def _reindex_builds(
-    db_path: Path, project_id: str, cfg: Config, variant: str, image: str,
+    db_path: Path, project_id: str, cfg: Config, variant: str, image: str, root: Path,
 ) -> tuple[list[sqlite3.Row], str | None]:
     """Return the builds that ``reindex_file`` re-parses, or the refusal of the selector.
 
@@ -2709,6 +2733,9 @@ def _reindex_builds(
 
     conn = _quick_open_readonly(db_path)
     try:
+        outdated = outdated_index_reason(conn, read_reindex_state(root) is not None)
+        if outdated:
+            return [], outdated
         builds = sorted(latest_builds(conn, project_id), key=build_label)
         if not (variant or image):
             return builds, None

@@ -171,6 +171,15 @@ def resolve_build(
 
     *cli* gives a refusal in the words of a command line (`_refusal`).
 
+    An index that an older version wrote gets the fact of the old schema
+    as its refusal (`stale.outdated_index_fact`): its rows lack the columns
+    that the build choice reads.  Each query tool selects a build here,
+    thus one check covers them.  (The CLI opens the index with `open_db`,
+    which adds the columns first.)  The refusal names the status tool and
+    no command: this function does not know the state of an index run, and
+    a command during the run that adds the columns would take that run
+    over.
+
     The answer is ONE build, thus the answer is one ``config_hash``.  Three
     outcomes, and the two fields tell them apart:
 
@@ -202,8 +211,12 @@ def resolve_build(
     (``cleanup_retired_builds``).  Until then no call can select it, and
     the list says so.
     """
-    from .stale import latest_builds
+    from .stale import latest_builds, outdated_index_fact
 
+    outdated = outdated_index_fact(conn)
+    if outdated:
+        status = "run 'fw-context status'" if cli else f"call {STATUS_TOOL}()"
+        return None, f"{outdated}. To see the action, {status}."
     builds = latest_builds(conn, project_id)
     asked = (variant or "", image or "")
     if len(builds) == 1 and asked == ("", ""):

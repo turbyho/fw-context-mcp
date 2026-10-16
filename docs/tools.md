@@ -2532,6 +2532,17 @@ command.
   fw-context and then `fw-context index`.
 - Schema mismatch (`schema_mismatch: <old> < <new>`). The reason names
   the command.
+- An index that an older version wrote, and that lacks the columns of this
+  version (`schema_mismatch: an older version wrote this index; it lacks
+  the columns …`). No tool reads a build of such an index. The status
+  tools give this reason with the action: wait for an index run that is
+  in progress or scheduled, else run `fw-context index`. When the last
+  run failed before it could add the columns, the text of that failure
+  comes first, with its repair, and `reindex_state` is `"failed"`.
+  `list_projects` gives the fact as the `error` of that database.
+  `reindex_file` gives the same text as its `error`. Each query gives the
+  fact as its `error`, and names `get_project_status` for the action.
+  When the daemon starts, it starts the index run that adds the columns.
 - Older row format (`row_format_mismatch: <old> != <new> — <effect>`).
   The stored text has an older meaning. For example, an index written
   before `fw-context-rows/1` keeps every inactive `#if` branch, thus

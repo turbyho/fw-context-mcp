@@ -56,6 +56,7 @@ __all__ = [
     "ROW_FORMAT_PAIRED_WITH",
     "_ensure_column",
     "drop_fts_triggers",
+    "missing_columns",
     "row_format_effect",
     "row_format_is_newer",
     "row_format_is_older",
@@ -1107,6 +1108,34 @@ _CRITICAL_TABLES = _build_critical_tables()
 
 
 CURRENT_SCHEMA_VERSION = _derive_schema_version(_SCHEMA, _MIGRATION_ADD_COLUMNS)
+
+def missing_columns(conn: sqlite3.Connection) -> list[str]:
+    """Return ``table.column`` of each column of this version that the database does not have.
+
+    Only `open_db` of an index run adds the columns of
+    ``_MIGRATION_ADD_COLUMNS``.  The MCP server reads the database without
+    a migration, thus an index that an older version wrote lacks them, and
+    a read of such a column fails with ``IndexError``.  The callers check
+    this before they read a row, and name the old schema in place of the
+    failure.
+
+    WHY the columns and not CURRENT_SCHEMA_VERSION: the version is a hash
+    and has no direction.  An index of a newer version has each column of
+    this one, and a server that is older than the index must still answer
+    (``client_restart_required``).  The ``_schema_bump_`` columns only move
+    the version, and no code reads them.  A table that the database does
+    not have is not checked: each version since the columns came creates
+    every table.
+    """
+    missing: list[str] = []
+    for table, columns in _MIGRATED_COLUMNS.items():
+        present = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}  # nosec B608 — table names come from this module
+        if present:
+            missing.extend(
+                f"{table}.{column}" for column in sorted(columns)
+                if column not in present and not column.startswith("_schema_bump_")
+            )
+    return missing
 
 
 def _run_data_migrations(conn: sqlite3.Connection) -> None:

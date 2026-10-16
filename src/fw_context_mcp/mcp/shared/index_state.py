@@ -309,7 +309,7 @@ def _build_reasons(
     from ...config import load as load_config
     from ...indexer.git_context import read_head
     from .context import get_executor
-    from .stale import _count_modified_files, checkout_reason, quick_structural_reasons
+    from .stale import _count_modified_files, checkout_reason, outdated_index_fact, quick_structural_reasons
     from .variants import resolve_build
 
     cfg = load_config(root)
@@ -321,6 +321,11 @@ def _build_reasons(
     live_head = read_head(root)
 
     def _query(conn, _config_hash):
+        # No build of an index of an older version: the refusal of
+        # `resolve_build` names the old schema and the status tool, and a
+        # state here would read as the state of one build.
+        if outdated_index_fact(conn):
+            return None
         config_hash, _refusal = resolve_build(conn, project_id, cfg, variant, image)
         if config_hash is None:
             return None

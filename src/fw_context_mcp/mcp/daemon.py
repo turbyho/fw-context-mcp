@@ -904,7 +904,13 @@ def _staleness_check(project_root: Path) -> tuple[bool, list[str]]:
         return False, []
     reasons: list[str] = []
     try:
-        from .shared.stale import build_label, latest_builds
+        from .shared.stale import build_label, latest_builds, outdated_index_fact
+
+        # Before the first read of a build row.  The run that this reason
+        # starts opens the index with `open_db`, which adds the columns.
+        outdated = outdated_index_fact(conn)
+        if outdated:
+            return True, [outdated]
 
         project_id = derive_project_id(project_root)
         live_head = read_head(project_root)
