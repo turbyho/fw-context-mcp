@@ -226,8 +226,9 @@ def upsert_build_config(
         compile_commands_path: Absolute path to ``compile_commands.json``.
         embedding_dim: Embedding vector dimension detected from the model.
             ``None`` when embeddings are disabled or not yet generated.
-        manifest_verification: ``"full"`` or ``"none"`` —
-            indicates whether manifest.json was available during indexing.
+        manifest_verification: ``"full"``, ``"partial"`` or ``"none"`` —
+            ``"none"`` when manifest.json was not available during indexing,
+            ``"partial"`` when it was and the embeddings are not complete.
         description: Human-readable build description (git branch + tag).
             ``None`` keeps whatever the row already holds.
 

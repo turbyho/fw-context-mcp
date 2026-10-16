@@ -2468,8 +2468,8 @@ skips the output of the build tools in the same log.
 **`builds`** lists every build of the index, one entry for each
 `(variant, image)` pair: `{variant, image, board, symbol_count,
 file_count, indexed_at, status, reindex_state, reindex_needed, stale,
-modified_files_count, header_affected_tus, reasons}`. A build without
-full header tracking also holds `manifest_verification`. The list shows
+modified_files_count, header_affected_tus, reasons}`. A build whose
+manifest is not `"full"` also holds `manifest_verification`. The list shows
 what fw-context has indexed, not what the config declares. On a project
 of more than one build, fw-context selects no build: each query tool must
 get the arguments of one build, as the error lists them (`variant`,
@@ -2654,18 +2654,30 @@ the index. Both modes count it. `fast` controls only the header check:
 `header_affected_tus` reports how many source files have stale header
 dependencies. A file that `compile_commands.json` lists more than once
 counts once. This count is non-zero when headers changed since the
-last index with `manifest_verification: "full"`.
+last index with `manifest_verification: "full"` or `"partial"`.
 
 `manifest_verification` is `"full"` when `manifest.json` is available. In
 that case, fw-context tracks header staleness with SHA-256 hashes that
 fw-context collects during indexing. The two other values:
 
-- `"partial"`: the last index run wrote `manifest.json`, but the
-  full-text index or the embeddings failed.
+- `"partial"`: the last index run wrote `manifest.json`, but its
+  embeddings are not complete: the embedding model was not reachable (for
+  example Ollama does not run), or batches of the model failed. The
+  symbols, the references and the header tracking are complete, thus the
+  build is current, and no query answer carries a state for it. Only
+  `semantic_search` and `smart_search` can miss symbols. The `_warning`
+  of the status tools asks you to tell the user, and names the repair:
+  `fw-context doctor --fix`, which does a check of each dependency and
+  installs a missing embedding model, and then `fw-context index`.
+  `fw-context doctor --fix` also installs the other missing dependencies,
+  for example the chat model. `fw-context index` does not install the
+  model, because `[llm] auto_pull` is `false` by default. `fw-context index` prints the cause in its log. A failed full-text index is not
+  `"partial"`: it stops the run, and the marker of the failed run names
+  the error.
 - `"none"`: no manifest exists.
 
-In these two cases, fw-context cannot find a changed header in the
-index, the build is not current, and the result holds a `_warning`:
+For `"none"`, the build is not current: fw-context cannot find a changed
+header in the index, and the result holds a `_warning`:
 
 - While an index run is in progress or scheduled, the `_warning` tells
   you to wait for it.

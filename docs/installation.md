@@ -351,7 +351,7 @@ With the default configuration, Ollama does three jobs:
 
 | Job | Used by | Without Ollama |
 |-----|---------|----------------|
-| Vector embeddings (`[index] index_embeddings = true`, default) | `semantic_search`, the re-rank step of `smart_search` | `fw-context index` logs a warning and stores no vectors. `semantic_search` falls back to `search_code`, with a `warning`. |
+| Vector embeddings (`[index] index_embeddings = true`, default) | `semantic_search`, the re-rank step of `smart_search` | `fw-context index` logs the error, stores no vectors, and marks the build `"partial"`. The status tools then ask the LLM to tell you. `semantic_search` falls back to `search_code`, with a `warning`. When you use no embedding model and no LLM, set `[llm] enabled = false`. |
 | Symbol analysis (`[llm] analyze_symbols = true`, default) | `explain_symbol`, symbol descriptions in search results | `fw-context index` logs a warning and skips the analysis. |
 | Search query generation | `smart_search` | `smart_search` uses FTS5 only. |
 

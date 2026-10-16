@@ -39,7 +39,7 @@ The case study includes the review output, methodology and per-tool token analys
 - a project that can produce `compile_commands.json`
 - an MCP-capable coding agent such as Claude Code or OpenCode
 
-Ollama is optional for the core index: symbols, full-text search, call graph and source come from libclang and SQLite only. With the default configuration, Ollama also computes the vector embeddings (`semantic_search`, the re-rank step of `smart_search`) and the symbol analysis (`explain_symbol`, symbol descriptions). Without Ollama, these features fall back to full-text search or return raw prompts. See [Ollama](docs/installation.md#ollama-optional).
+Ollama is optional for the core index: symbols, full-text search, call graph and source come from libclang and SQLite only. With the default configuration, Ollama also computes the vector embeddings (`semantic_search`, the re-rank step of `smart_search`) and the symbol analysis (`explain_symbol`, symbol descriptions). Without Ollama, these features fall back to full-text search or return raw prompts, and the status tools tell you that the embeddings are not complete. When you use no embedding model and no LLM, set `[llm] enabled = false`. See [Ollama](docs/installation.md#ollama-optional).
 
 ### Install via pip (recommended)
 

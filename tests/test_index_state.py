@@ -549,7 +549,11 @@ class TestAWarningNeverFailsTheAnswer:
 
 
 class TestAnIndexWithoutFullHeaderTracking:
-    """Such an index cannot see a changed header, thus it is not current."""
+    """Such an index ("none") cannot see a changed header, thus it is not current.
+
+    A "partial" index has the manifest, and only its embeddings are not
+    complete: it is current (`tests/test_partial_manifest.py`).
+    """
 
     def test_the_state_and_the_message_agree(self, tmp_path):
         from fw_context_mcp.indexer.db import open_db
@@ -569,32 +573,31 @@ class TestAnIndexWithoutFullHeaderTracking:
         assert "the index of this build is current" not in result["index_message"]
         assert result["index_message"].startswith("An index run is in progress or scheduled")
 
-    @pytest.mark.parametrize("verification", ["none", "partial"])
-    def test_a_run_gives_no_contrary_advice(self, tmp_path, verification):
+    def test_a_run_gives_no_contrary_advice(self, tmp_path):
         """``_warning`` said "continue" while ``reindex_state`` said "wait"."""
         from fw_context_mcp.mcp.handlers.maintenance import get_build_info
         from fw_context_mcp.mcp.shared.index_state import manifest_reason
 
         root, db_dir = _project(tmp_path)
-        _set_manifest(db_dir, verification)
+        _set_manifest(db_dir, "none")
         _run(db_dir)
 
         result = get_build_info(project_root=str(root), variant="a")
         assert "continue the analysis" not in result["_warning"]
-        assert manifest_reason(verification) in result["_warning"]
+        assert manifest_reason("none") in result["_warning"]
         assert result["_warning"].endswith(WAIT_ADVICE)
 
     @pytest.mark.parametrize(("schedule", "expected"), [(False, "not_scheduled"), (True, "pending")])
     def test_a_query_agrees_with_the_status(self, tmp_path, schedule, expected):
         """The status gave a state for this build, and the query gave none."""
         root, db_dir = _project(tmp_path)
-        _set_manifest(db_dir, "partial")
+        _set_manifest(db_dir, "none")
         if schedule:
             _schedule(db_dir)
 
         answer = annotate_index_state({"name": "f"}, {"project_root": str(root), "variant": "a"})
         assert answer["index_state"] == expected
-        assert "manifest verification: partial" in answer["index_warning"]
+        assert "manifest verification: none" in answer["index_warning"]
         other = annotate_index_state({"name": "f"}, {"project_root": str(root), "variant": "b"})
         assert other == {"name": "f"}, "the other build has full header tracking"
 
@@ -760,16 +763,14 @@ class TestARefusalDuringARun:
 
 
 class TestTheTextOfTheManifest:
-    """``"partial"`` has a manifest.json: the full-text index or the embeddings failed."""
+    """``"partial"`` has a manifest.json: the embeddings failed."""
 
     def test_each_value_has_its_text(self):
         from fw_context_mcp.mcp.shared.index_state import manifest_reason
 
         assert manifest_reason("full") == ""
         assert "wrote no manifest.json" in manifest_reason("none")
-        partial = manifest_reason("partial")
-        assert "full-text index or the embeddings" in partial
-        assert "manifest.json" not in partial
+        assert manifest_reason("partial") == "", "an index without complete embeddings is current"
 
     def test_the_status_uses_it(self, tmp_path):
         from fw_context_mcp.mcp.handlers.maintenance import get_build_info
@@ -778,4 +779,4 @@ class TestTheTextOfTheManifest:
         _set_manifest(db_dir, "partial")
 
         result = get_build_info(project_root=str(root), variant="a")
-        assert "full-text index or the embeddings" in result["_warning"]
+        assert "The embeddings of the last index run are not complete" in result["_warning"]

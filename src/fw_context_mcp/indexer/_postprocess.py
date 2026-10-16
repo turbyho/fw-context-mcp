@@ -1434,9 +1434,10 @@ def _step_finalize_manifest(conn: sqlite3.Connection, ctx: dict) -> None:
 
     - ``"full"`` — manifest.json exists and no critical steps failed;
       all data (symbols, embeddings, FTS) is consistent.
-    - ``"partial"`` — manifest exists but critical steps (FTS,
-      embeddings) failed; the index is usable but some features are
-      degraded.
+    - ``"partial"`` — manifest exists but the embeddings are not complete
+      (``EmbeddingsIncomplete``, or another error of that step).  The
+      symbols, the references and the header tracking are complete.  A
+      failed FTS rebuild stops the run, thus it never gets this stamp.
     - ``"none"`` — no manifest.json was written (e.g. build system
       detection failed); the index cannot support incremental updates.
     """
@@ -1816,17 +1817,18 @@ def _run_postprocess(
     """Run all post-processing phases via a data-driven pipeline.
 
     Each step in ``_STEPS`` is executed in order.  Conditional steps
-    are skipped when their guard returns ``False``.  Runtime errors in
-    individual steps are logged (not fatal) so the remaining steps
-    always execute.
+    are skipped when their guard returns ``False``.
 
-    **Error classification:**  Steps are divided into *critical* and
-    *non-critical*.  Critical steps (FTS5, embeddings) are core features
-    — if they fail, the index is marked ``"partial"`` in the manifest
-    so the server can report degraded functionality (e.g. "semantic
-    search is unavailable") instead of serving a silently-broken index.
-    Non-critical step failures are logged at WARNING level and do not
-    affect the manifest status.
+    **Error classification:**
+    - *Fatal* (``fts5``): the error stops the run.  WHY: a text search of
+      the build then misses each symbol, and the integrity check that
+      follows does not see a full-text table that the failure left out.
+    - *Critical* (``embeddings``): the error is logged, the other steps
+      continue, and ``finalize_manifest`` stamps the build ``"partial"``.
+      The status tools then tell the user that the search by meaning can
+      miss symbols.
+    - *Non-critical*: the error is logged at WARNING level, and the stamp
+      does not change.
     """
     ctx = {
         "config_hash": config_hash,
@@ -1878,8 +1880,18 @@ def _run_postprocess(
     if defer_cleanup:
         defer_skip.add("cleanup_old")
 
+    # In the context before the loop: `finalize_manifest` is a step of the
+    # loop, and it reads the set to stamp "partial".  The set was copied in
+    # after the loop, thus the stamp saw it empty and wrote "full" also
+    # after failed embeddings.
     failed_critical: set[str] = set()
-    critical_steps = {"fts5", "embeddings"}
+    ctx["failed_critical"] = failed_critical
+    critical_steps = {"embeddings"}
+    # A failed full-text index stops the run: each text search of the build
+    # then misses, and the integrity check does not see a table that the
+    # failure left out.  The run that stops leaves the marker of a failed
+    # run, which names the error and the command.
+    fatal_steps = {"fts5"}
 
     for step_name, step_fn, guard in _STEPS:
         if step_name in defer_skip:
@@ -1892,13 +1904,11 @@ def _run_postprocess(
             elapsed = time.monotonic() - t0
             log.info("Post-process: %s (%.1fs)", step_name, elapsed)
         except SAFE_EXCEPT as e:
-            if is_fatal(e):
+            if is_fatal(e) or step_name in fatal_steps:
                 raise
             if step_name in critical_steps:
                 failed_critical.add(step_name)
                 log.error("Postprocess CRITICAL step %s failed: %s", step_name, e)
             else:
                 log.warning("Postprocess step %s failed: %s", step_name, e)
-
-    ctx["failed_critical"] = failed_critical
 

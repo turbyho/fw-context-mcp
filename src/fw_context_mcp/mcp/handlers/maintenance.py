@@ -100,6 +100,11 @@ log = logging.getLogger(__name__)
 #: action.  The message of a project of several builds looks for it.
 _REASON_COMMAND = "the command that reindex_reasons names"
 
+#: What a build with ``manifest_verification = "partial"`` misses: the
+#: embedding step failed (`_embedding.EmbeddingsIncomplete`), and the rest
+#: of the index is complete.
+PARTIAL_EMBEDDINGS = "semantic_search and smart_search can miss symbols (manifest verification: partial)"
+
 
 def _new_source_advice(auto_state: AutobuildState, bg_running: bool, rebuild: str) -> str:
     """Return the advice for a source file that compile_commands.json does not cover.
@@ -484,7 +489,9 @@ def _build_health(
     # The header check is NOT cheap: it hashes every header of every
     # translation unit, which is 22,693 files and 749 ms on the Mbed
     # project.  `fast` only gives it a cache, and does not skip it.
-    if manifest_verification == "full":
+    # "partial" has the manifest with the headers too: only the embeddings
+    # are not complete.
+    if manifest_verification in ("full", "partial"):
         header_affected_tus, _ = _check_header_staleness(
             conn, config_hash, root, use_cache=fast, hash_cache=hash_cache,
         )
@@ -690,12 +697,14 @@ def _build_health(
     # also when the run concerns another build.  `reindex_state` answers
     # for this build alone, see `index_state`.  A header that changed and
     # a unit that failed to parse count too: the rows of those units are
-    # older than the files.  So does an index without full header
-    # tracking: it cannot see a changed header, and the warning below asks
-    # for a run.
+    # older than the files.  So does an index without a manifest: it cannot
+    # see a changed header, and the warning below asks for a run.  An index
+    # whose embeddings are not complete ("partial") is current: its symbols,
+    # references and headers are complete, and the warning below asks the
+    # caller to tell the user.
     behind = bool(
         needs_reindex or modified_count or header_affected_tus or new_sources
-        or manifest_verification != "full"
+        or manifest_verification not in ("full", "partial")
     )
     reindex_state = index_state(behind, run_state=target.reindex_state, failed=bool(build_problem))
 
@@ -715,7 +724,10 @@ def _build_health(
         # `reindex_state`.
         index_message = f"Index is usable ({sym_count} symbols), but it is not current"
     elif status == "ready":
-        index_message = f"Index is fully up to date ({sym_count} symbols)"
+        index_message = (
+            f"Index is current ({sym_count} symbols), but its embeddings are not complete"
+            if manifest_verification == "partial" else f"Index is fully up to date ({sym_count} symbols)"
+        )
     elif status == "reindexing":
         if new_sources and auto_state is AutobuildState.WILL_BUILD:
             index_message = (
@@ -793,7 +805,27 @@ def _build_health(
 
     # When manifest verification is not full, warn the LLM.
     warning = None
-    if manifest_verification != "full":
+    if manifest_verification == "partial":
+        # Not a STOP and not a reason to wait: only the search by meaning
+        # can miss symbols.  The text names the repair, and the user
+        # decides.  WHY not `index_embeddings = false` as a repair: the run
+        # then skips the step that deletes vectors, thus the incomplete
+        # vectors stay, the stamp says "full", and the search by meaning
+        # misses without a word.  WHY the full `doctor --fix` and not only
+        # the model: a failed embedding step can have more than one cause,
+        # and the full check finds each.  `auto_pull` is off by default,
+        # thus a plain 'fw-context index' does not install the model.
+        warning = (
+            f"The embeddings of the last index run are not complete: {PARTIAL_EMBEDDINGS}. "
+            "Tell the user. The repair: run 'fw-context doctor --fix', which does a check "
+            "of each dependency and installs a missing embedding model, and then run "
+            "'fw-context index'. 'fw-context doctor --fix' also installs the other missing "
+            "dependencies, for example the chat model."
+        )
+        if not (status == "ready" and reindex_state is None):
+            # The message of a current build already says it.
+            index_message += " — manifest verification: partial (the embeddings are not complete)"
+    elif manifest_verification != "full":
         if bg_running:
             # The same advice as `reindex_state`: the build is not current,
             # and a run comes.  A text that said "continue" here gave the
@@ -1002,9 +1034,10 @@ def _build_state_words(health: dict) -> str:
     if state is None:
         return ""
     parts = []
-    if health.get("_warning"):
-        # A build without full header tracking is not up to date: the
-        # warning of the project says so, and the message must agree.
+    if health.get("_warning") and health["manifest_verification"] != "partial":
+        # A build without a manifest is not up to date: the warning of the
+        # project says so, and the message must agree.  Not "partial": its
+        # embeddings are not a reason why the build is behind.
         parts.append(f"manifest verification {health['manifest_verification']}")
     if health["modified_files_count"]:
         parts.append(f"{health['modified_files_count']} modified file(s)")
@@ -1037,20 +1070,29 @@ def _project_health(builds: list, healths: list[dict]) -> dict:
         status = "ready"
     behind = [(label, words) for label, health in zip(labels, healths, strict=True)
               if (words := _build_state_words(health))]
+    incomplete = [label for label, health in zip(labels, healths, strict=True)
+                  if health["manifest_verification"] == "partial"]
+    # A partial build is current, thus it is not in `behind`: without this
+    # sentence, "fully up to date" stands next to a `_warning` about it.
+    incomplete_note = (
+        f" The embeddings of {', '.join(incomplete)} are not complete: read _warning." if incomplete else ""
+    )
     listing = "; ".join(f"{label}: {words}" for label, words in behind)
     if not behind and status == "reindexing":
         # The words of a project of one build, see `_build_health`.
         message = (
             f"Index is usable — background reindex in progress or scheduled, and the "
             f"index of each build is current ({len(builds)} builds). All queries "
-            f"return accurate results."
+            f"return accurate results.{incomplete_note}"
         )
+    elif not behind and incomplete:
+        message = f"Index is current ({len(builds)} builds).{incomplete_note}"
     elif not behind:
         message = f"Index is fully up to date ({len(builds)} builds)."
     elif not reasons and status == "reindexing":
         # No reason to read, and nothing for the caller to do but to wait
         # for the run: `_with_project_notes` puts that advice in front.
-        message = f"Index is usable — background reindex in progress or scheduled ({listing})."
+        message = f"Index is usable — background reindex in progress or scheduled ({listing}).{incomplete_note}"
     elif not reasons:
         # `_warning` only when a build has one: a pointer to an absent field
         # sends the caller to look for nothing.
@@ -1063,7 +1105,7 @@ def _project_health(builds: list, healths: list[dict]) -> dict:
     else:
         message = (
             f"{len(behind)} of {len(builds)} builds are not up to date — {listing}. "
-            f"Read reindex_reasons for the action, and builds for each build."
+            f"Read reindex_reasons for the action, and builds for each build.{incomplete_note}"
         )
     result = {
         "status": status,
@@ -1072,15 +1114,25 @@ def _project_health(builds: list, healths: list[dict]) -> dict:
         "stale": any(health["stale"] for health in healths),
         "index_message": message,
     }
-    degraded = [label for label, health in zip(labels, healths, strict=True) if health.get("_warning")]
-    if degraded:
-        # One text for the project.  The text that sends the caller to
+    texts = {label: health["_warning"] for label, health in zip(labels, healths, strict=True) if health.get("_warning")}
+    partial = [label for label, health in zip(labels, healths, strict=True)
+               if label in texts and health["manifest_verification"] == "partial"]
+    missing = [label for label in texts if label not in partial]
+    parts = []
+    if missing:
+        # One text for these builds.  The text that sends the caller to
         # `reindex_reasons` wins: a plain 'fw-context index' is wrong for a
         # build whose reason names its own command, and `reindex_reasons`
         # of the project holds the reasons of each build.
-        warnings = [health["_warning"] for health in healths if health.get("_warning")]
-        chosen = next((text for text in warnings if _REASON_COMMAND in text), warnings[0])
-        result["_warning"] = f"Builds without full header tracking: {', '.join(degraded)}. {chosen}"
+        pool = [texts[label] for label in missing]
+        chosen = next((text for text in pool if _REASON_COMMAND in text), pool[0])
+        parts.append(f"Builds without full header tracking: {', '.join(missing)}. {chosen}")
+    if partial:
+        # Apart: their headers are tracked, and the text only asks the
+        # caller to tell the user.
+        parts.append(f"Builds whose embeddings are not complete: {', '.join(partial)}. {texts[partial[0]]}")
+    if parts:
+        result["_warning"] = " ".join(parts)
     return result
 
 
@@ -1292,8 +1344,8 @@ def get_project_status(
         or None — "reindexing", "pending", "not_scheduled", "failed", or
         None for a current index), reindex_needed, stale,
         modified_files_count, header_affected_tus, reasons}, and
-        ``manifest_verification`` on a build without full header
-        tracking), declared_not_indexed (list[dict], optional — each
+        ``manifest_verification`` on a build whose manifest is not "full"),
+        declared_not_indexed (list[dict], optional — each
         variant that the config declares and the index does not hold:
         {variant, command}; no query reaches it until the command ran),
         bg_reindex_running (bool), reindex_progress (str or
@@ -1312,7 +1364,8 @@ def get_project_status(
         both modes), header_affected_tus (int — number of source files with
         stale header dependencies; a file that compile_commands.json lists
         more than once counts once), manifest_verification (str — "full"
-        when manifest.json exists, "none" otherwise), analysis (dict — LLM
+        when manifest.json exists, "partial" when it exists and the
+        embeddings are not complete, "none" without one), analysis (dict — LLM
         analysis coverage split by project/vendor: {model, analyze_vendor,
         project: {analyzed, skipped, total}, vendor: {analyzed, skipped,
         total}, complete}), description (str).  A project of several
@@ -2500,7 +2553,7 @@ def _reindex_embeddings(
         ).fetchone()[0]
         result["embeddings_updated"] = reembedded
     except (sqlite3.Error, RuntimeError, OSError) as exc:
-        result["embedding_warning"] = f"Embedding regeneration skipped: {exc}"
+        result["embedding_warning"] = f"Embeddings not complete: {exc}"
 
 
 def _reindex_post_write_phases(

@@ -137,22 +137,17 @@ def _build_action(root: Path, *, checkout_moved: bool) -> str:
 def manifest_reason(verification: str) -> str:
     """Return why an index with the manifest verification *verification* is not current.
 
-    "" for ``"full"``.  WHY two texts: ``"none"`` means that the run wrote
-    no manifest.json, and ``"partial"`` means that it wrote one, but the
-    full-text index or the embeddings failed (``_postprocess``).  The
-    status tools do the header check only for ``"full"``, thus in either
-    case fw-context cannot find a changed header.  WHY "fw-context" and not
+    "" for ``"full"`` and for ``"partial"``.  ``"none"`` means that the run
+    wrote no manifest.json, thus fw-context cannot find a changed header.
+    ``"partial"`` means that it wrote one, with the headers, and that the
+    embeddings are not complete (``_postprocess``): the index is current,
+    and the status tools ask the caller to tell the user
+    (``maintenance.PARTIAL_EMBEDDINGS``).  WHY "fw-context" and not
     a tool: the text goes into the answers of the two status tools and of
     each query.
     """
-    if verification == "full":
+    if verification in ("full", "partial"):
         return ""
-    if verification == "partial":
-        return (
-            "the last index run did not complete the full-text index or the embeddings, "
-            "and fw-context cannot find a changed header in this index "
-            "(manifest verification: partial)"
-        )
     return (
         "the last index run wrote no manifest.json, and fw-context cannot find a "
         f"changed header in this index (manifest verification: {verification})"
