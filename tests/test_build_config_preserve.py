@@ -4,7 +4,7 @@ The UPDATE arm assigns every column from ``excluded``, thus a caller that
 omits one writes the default of the parameter over the stored value. Three
 columns carried a default of ``''``: ``variant``, ``image`` and ``board``.
 
-``cmd_analyze`` omits all three, because it only wants to update
+``cmd_analyze`` omitted all three, because it only wants to update
 ``analyze_vendor`` on an index that another run built. It therefore erased
 the three, and ``get_active_config`` then matched no row for a build that
 names a variant — every tool called with an explicit variant failed on an
@@ -59,7 +59,7 @@ def _row(connection) -> dict:
 
 class TestAnOmittedColumnSurvives:
     def test_the_analyze_call_keeps_the_build_identity(self, conn) -> None:
-        """The shape of the call that `cmd_analyze` makes."""
+        """The shape of the call that `cmd_analyze` made before `set_analyze_vendor`."""
         from fw_context_mcp.indexer.db import transaction, upsert_build_config
 
         with transaction(conn):

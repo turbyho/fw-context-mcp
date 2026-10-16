@@ -56,8 +56,9 @@ class TestOnlyTheContentWriterStampsTheFormat:
     Only the step that wrote the text may say what the text means.
     ``_run_postprocess`` is that step and passes ``CURRENT_ROW_FORMAT``.
     ``runner.run`` writes the row before it reads any translation unit, and
-    ``cmd_analyze`` only updates ``analyze_vendor`` on an index that another
-    version built — neither may stamp.
+    ``cmd_analyze`` called it to update only ``analyze_vendor`` on an index
+    that another version built (now ``set_analyze_vendor``) — neither may
+    stamp.
     """
 
     def test_the_default_does_not_claim_a_format(self, tmp_path: Path):

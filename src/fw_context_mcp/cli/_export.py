@@ -136,7 +136,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     from ..config import load as load_config
     from ..indexer._llm_analysis import _build_llm_analysis
     from ..indexer._postprocess import _build_overrides
-    from ..indexer.db import get_active_config, open_db, upsert_build_config
+    from ..indexer.db import get_active_config, open_db, set_analyze_vendor
     from ..utils import resolve_project_root
 
     if args.verbose:
@@ -219,14 +219,10 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         conn.commit()
 
         # Update stored analyze_vendor so get_project_status reports
-        # consistent state.  Only manifest_verification and description
-        # are preserved from the existing row (not overwritten).
-        upsert_build_config(
-            conn, config_hash, project_id, build_cfg["compile_commands_path"],
-            description=build_cfg["description"] if "description" in build_cfg.keys() else "",
-            manifest_verification=build_cfg["manifest_verification"] if "manifest_verification" in build_cfg.keys() else "none",
-            analyze_vendor=int(analyze_vendor),
-        )
+        # consistent state.  The time of the index run stays: no symbol
+        # changed (see set_analyze_vendor).
+        set_analyze_vendor(conn, config_hash, analyze_vendor)
+        conn.commit()
     finally:
         conn.close()
 

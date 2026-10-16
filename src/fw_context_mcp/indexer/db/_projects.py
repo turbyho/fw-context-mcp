@@ -32,6 +32,7 @@ __all__ = [
     "get_build_stats",
     "get_builds_for_scope",
     "make_analysis_summary",
+    "set_analyze_vendor",
     "upsert_build_config",
     "upsert_project",
 ]
@@ -246,9 +247,10 @@ def upsert_build_config(
 
             WHY None is the default: the UPDATE arm assigns this column from
             ``excluded``, thus a caller that omits it writes the default over
-            the stored value.  ``cmd_analyze`` omits this column and the two
-            below, because it only updates ``analyze_vendor`` on an index
-            that another run built.  It erased the three, and
+            the stored value.  ``cmd_analyze`` omitted this column and the
+            two below, because it only updates ``analyze_vendor`` on an index
+            that another run built (now `set_analyze_vendor`).  It erased the
+            three, and
             ``get_active_config`` then matched no row for a build that names
             a variant — every tool called with an explicit variant failed on
             an index that is fully present.
@@ -264,8 +266,9 @@ def upsert_build_config(
             it runs after the last translation unit.  Two callers must not
             stamp: ``runner.run`` writes this row before it reads a single
             unit, thus a run that fails would leave the new format over the
-            old rows; ``cmd_analyze`` only updates ``analyze_vendor`` on an
-            index that another version built.  A missed stamp costs one
+            old rows; ``cmd_analyze`` called it to update only
+            ``analyze_vendor`` on an index that another version built (now
+            `set_analyze_vendor`).  A missed stamp costs one
             reindex that was not needed — a wrong stamp costs silence over
             an index that answers with dead code.
         board: Concrete board string per-(variant, image) — captures per-image
@@ -349,6 +352,22 @@ def upsert_build_config(
             "UPDATE build_configs SET git_head = ? WHERE config_hash = ?",
             (git_head, config_hash),
         )
+
+
+def set_analyze_vendor(conn: sqlite3.Connection, config_hash: str, analyze_vendor: bool) -> None:
+    """Record whether the LLM analysis of the build *config_hash* covers vendor code.
+
+    WHY not `upsert_build_config`: its UPDATE arm sets ``created_at`` to
+    the time of the call.  ``fw-context analyze`` writes no symbol, thus
+    that would make an old index look new: the analysed build would become
+    the newest build, and a compile_commands.json newer than the index run
+    would no longer look newer.  This function changes the one column that
+    the analysis changes.
+    """
+    conn.execute(
+        "UPDATE build_configs SET analyze_vendor = ? WHERE config_hash = ?",
+        (int(analyze_vendor), config_hash),
+    )
 
 
 def get_active_config(

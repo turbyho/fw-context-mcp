@@ -123,6 +123,7 @@ __all__ = [
     "search_similar_vec",
     "search_similar_vec_all",
     "search_symbols",
+    "set_analyze_vendor",
     "set_entry_point",
     "split_tokens",
     "transaction",
@@ -231,6 +232,7 @@ from ._projects import (
     get_build_stats,
     get_builds_for_scope,
     make_analysis_summary,
+    set_analyze_vendor,
     upsert_build_config,
     upsert_project,
 )
