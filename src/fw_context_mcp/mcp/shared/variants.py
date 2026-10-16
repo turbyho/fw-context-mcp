@@ -90,50 +90,69 @@ def build_arguments(variant: str, image: str) -> str:
     return ", ".join(parts) if parts else "no variant and no image"
 
 
+def cli_build_arguments(variant: str, image: str) -> str:
+    """Return the options of the build ``(variant, image)`` as a command line of the CLI gives them."""
+    parts = [f"--{key} {value}" for key, value in (("variant", variant), ("image", image)) if value]
+    return " ".join(parts) if parts else "no --variant and no --image"
+
+
 # The line of a build without a name in the list of a project of several
 # builds.  No call can name it, see :func:`resolve_build`.
 _UNNAMED_BUILD = (
     "a build without a variant and an image name, from an older index run. "
     "No call can select it. Run 'fw-context index' to replace it"
 )
+_UNNAMED_BUILD_CLI = _UNNAMED_BUILD.replace("No call", "No command")
 
 
 def _pair(row) -> tuple[str, str]:
     return (row["variant"] or "", row["image"] or "")
 
 
-def _refusal(builds: list, asked: tuple[str, str]) -> str:
+def _refusal(builds: list, asked: tuple[str, str], cli: bool = False) -> str:
     """Return the refusal of a selector that names no build of *builds*.
 
     One shape for every refusal: what the call asked, and the arguments of
     each build to repeat it with.  WHY the list is in the refusal and not
     only in a status tool: the caller can repeat the call at once, without
     one more call to find the names.
+
+    *cli* gives the words of a command line: options in place of
+    arguments, ``fw-context status`` in place of the status tool, and no
+    sentence for an LLM.  The person at the shell selects the build.
     """
+    arguments = cli_build_arguments if cli else build_arguments
+    call, args = ("command", "options") if cli else ("call", "arguments")
     pairs = sorted(_pair(row) for row in builds)
-    status = f"To see the state of each build, call {STATUS_TOOL}()."
+    status = (
+        "To see the state of each build, run 'fw-context status'." if cli
+        else f"To see the state of each build, call {STATUS_TOOL}()."
+    )
     if len(pairs) == 1:
-        listing = f"  {build_arguments(*pairs[0])}"
+        listing = f"  {arguments(*pairs[0])}"
         return (
-            f"This project holds one build, and no build has the arguments "
-            f"{build_arguments(*asked)}. Remove the build arguments, or repeat the "
-            f"call with the arguments of that build:\n{listing}\n{status}"
+            f"This project holds one build, and no build has the {args} "
+            f"{arguments(*asked)}. Remove the build {args}, or repeat the "
+            f"{call} with the {args} of that build:\n{listing}\n{status}"
         )
+    unnamed = _UNNAMED_BUILD_CLI if cli else _UNNAMED_BUILD
     listing = "\n".join(
-        f"  {build_arguments(*pair) if pair != ('', '') else _UNNAMED_BUILD}" for pair in pairs
+        f"  {arguments(*pair) if pair != ('', '') else unnamed}" for pair in pairs
     )
     if asked == ("", ""):
         head = (
             f"This project holds {len(pairs)} builds, and a query about code "
-            f"answers for one build. This call names no build."
+            f"answers for one build. This {call} names no build."
         )
     else:
         head = (
-            f"No build of this project has exactly the arguments "
-            f"{build_arguments(*asked)}. A query about code answers for one build."
+            f"No build of this project has exactly the {args} "
+            f"{arguments(*asked)}. A query about code answers for one build."
         )
+    if cli:
+        return f"{head} Repeat the {call} with the {args} of one build:\n{listing}\n{status}"
     return (
-        f"{head} Repeat the call with the arguments of one build:\n{listing}\n"
+        f"{head} Repeat the {call} with the {args} of one build:\n{listing}\n"
         f"Select the build from the task. If the task does not identify one "
         f"build, ask the user. Do not select a build from its position in this "
         f"list. {status}"
@@ -146,8 +165,11 @@ def resolve_build(
     cfg: Config,
     variant: str = "",
     image: str = "",
+    cli: bool = False,
 ) -> tuple[str | None, str | None]:
     """Resolve ``(variant, image)`` → ``(config_hash, error)``.
+
+    *cli* gives a refusal in the words of a command line (`_refusal`).
 
     The answer is ONE build, thus the answer is one ``config_hash``.  Three
     outcomes, and the two fields tell them apart:
@@ -201,13 +223,15 @@ def resolve_build(
     if not builds:
         if asked == ("", ""):
             return None, None
+        arguments = cli_build_arguments if cli else build_arguments
+        call, args = ("command", "options") if cli else ("call", "arguments")
         return None, (
             f"The index of this project holds no completed build, thus no build has "
-            f"the arguments {build_arguments(*asked)}. When an index run is in "
+            f"the {args} {arguments(*asked)}. When an index run is in "
             f"progress, wait until it ends. Else run 'fw-context index'. Then repeat "
-            f"the call."
+            f"the {call}."
         )
-    return None, _refusal(builds, asked)
+    return None, _refusal(builds, asked, cli)
 
 
 @dataclass(frozen=True)

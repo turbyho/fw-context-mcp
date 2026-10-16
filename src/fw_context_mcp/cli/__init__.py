@@ -263,12 +263,14 @@ def main() -> None:
     )
     p_index.set_defaults(func=cmd_index)
 
+    from ._builds import add_build_selector  # noqa: I001
     from ._search import cmd_list, cmd_search, cmd_status  # noqa: I001
     p_search = sub.add_parser("search", help="Search indexed symbols")
     p_search.add_argument("-v", "--verbose", action="store_true")
     p_search.add_argument("query")
     p_search.add_argument("--project", metavar="DIR")
     p_search.add_argument("--limit", type=int, default=20)
+    add_build_selector(p_search, "to search")
     p_search.set_defaults(func=cmd_search)
 
     from ._init import cmd_init  # noqa: I001
@@ -367,6 +369,7 @@ def main() -> None:
     p_export.add_argument("--project", metavar="DIR")
     p_export.add_argument("-o", "--output", metavar="PATH", help="Output file (default: stdout)")
     p_export.add_argument("--no-refs", action="store_true", help="Omit cross-references")
+    add_build_selector(p_export, "to export")
     p_export.set_defaults(func=cmd_export)
 
     p_analyze = sub.add_parser("analyze", help="Re-run LLM symbol analysis on existing index (idempotent)")
@@ -380,6 +383,7 @@ def main() -> None:
         "--no-analyze-vendor", action="store_true", dest="no_analyze_vendor",
         help="Skip vendor/SDK analysis (overrides config)",
     )
+    add_build_selector(p_analyze, "to analyze", each_build=True)
     p_analyze.set_defaults(func=cmd_analyze)
 
     # Cache management subcommands

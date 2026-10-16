@@ -242,7 +242,17 @@ fw-context search "uart_init"
 fw-context search "spi transfer" --limit 10
 fw-context search "ble_*"                # prefix wildcard
 fw-context search '"i2c read"'           # exact phrase
+fw-context search "uart_init" --variant nrf52840-dev --image app
 ```
+
+The search reads ONE build, as each MCP query does. On a project of
+several builds, give `--variant` and `--image` of one build. A search
+without them, or with the options of no build, gets an error that lists
+each build with its options, and the command returns 1. A variant that
+the config declares and the index does not hold gets the command that
+indexes it.
+`fw-context status` lists the builds. A project of one build needs no
+option.
 
 ### `fw-context status`
 
@@ -483,10 +493,15 @@ Export the symbol index as portable JSON.
 fw-context export                     # stdout
 fw-context export -o index.json       # file
 fw-context export --no-refs           # symbols only
+fw-context export --variant nrf52840-dev --image app -o app.json
 ```
 
 The format is `fw-context-export/1`. This format is suitable for sharing
 between machines, for debugging, or as input to other tools.
+
+An export holds ONE build. `--variant` and `--image` select it as in
+`fw-context search`. The JSON names the build: `config_hash`, `variant`,
+`image` and `board`.
 
 ### `fw-context analyze`
 
@@ -498,7 +513,16 @@ the analysis for all symbols.
 ```bash
 fw-context analyze                        # analyze current project
 fw-context analyze --project /path        # specific project
+fw-context analyze --variant nrf52840-dev --image app   # one build
 ```
+
+Without `--variant` and `--image`, the command analyzes each build of the
+project, and prints one line for each build. The analysis is
+content-addressed, thus a symbol that one build already analyzed is not
+sent to the model again. With the options of one build, it analyzes only
+that build. Options that name no build get the error of
+`fw-context search`, and the command returns 1. The command does not
+change the time of the index run of a build.
 
 fw-context generates the analysis for each function or method. fw-context
 uses the full function body (through the libclang extent) and the callee

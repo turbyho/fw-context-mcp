@@ -25,8 +25,9 @@ def cmd_search(args: argparse.Namespace) -> int:
     """
     from ..config import derive_project_id
     from ..config import load as load_config
-    from ..indexer.db import get_active_config, open_db, search_symbols
+    from ..indexer.db import open_db, search_symbols
     from ..utils import resolve_project_root
+    from ._builds import selected_build
 
     project_root = resolve_project_root(args.project)
     cfg = load_config(project_root=project_root)
@@ -34,16 +35,18 @@ def cmd_search(args: argparse.Namespace) -> int:
 
     db_path = cfg.index.db_dir / project_id / "index.db"
     if not db_path.exists():
-        print(f"No index found at {db_path}. Run 'fw-context index' first.")
+        print(f"No index found at {db_path}. Run 'fw-context index' first.", file=sys.stderr)
         return 1
 
     conn = open_db(db_path)
-    build_cfg = get_active_config(conn, project_id)
-    if not build_cfg:
-        print("No build config indexed.")
-        return 1
-
-    results = search_symbols(conn, args.query, build_cfg["config_hash"], limit=args.limit)
+    try:
+        build_cfg, error = selected_build(conn, project_id, cfg, args)
+        if build_cfg is None:
+            print(error, file=sys.stderr)
+            return 1
+        results = search_symbols(conn, args.query, build_cfg["config_hash"], limit=args.limit)
+    finally:
+        conn.close()
     for r in results:
         print(f"[{r['kind']:15}] {r['qualified_name']}  @ {Path(r['file_path']).name}:{r['line']}")
         if args.verbose and r["signature"]:

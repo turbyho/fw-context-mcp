@@ -37,8 +37,9 @@ def cmd_export(args: argparse.Namespace) -> int:
     from ..config import derive_project_id
     from ..config import load as load_config
     from ..indexer.build import detect_build_system
-    from ..indexer.db import count_refs, get_active_config, open_db
+    from ..indexer.db import count_refs, open_db
     from ..utils import resolve_project_root
+    from ._builds import NO_BUILD, selected_build
 
     project_root = resolve_project_root(args.project)
     cfg = load_config(project_root=project_root)
@@ -51,12 +52,15 @@ def cmd_export(args: argparse.Namespace) -> int:
 
     conn = open_db(db_path)
     try:
-        build_cfg = get_active_config(conn, project_id)
-        if not build_cfg:
-            print(f"No build config indexed for {project_root}.", file=sys.stderr)
+        build_cfg, error = selected_build(conn, project_id, cfg, args)
+        if build_cfg is None:
+            print(f"No build config indexed for {project_root}." if error == NO_BUILD else error, file=sys.stderr)
             return 1
         config_hash = build_cfg["config_hash"]
 
+        # variant, image and board name the build of the export.  They are
+        # new keys, and no key changes, thus the format stays
+        # fw-context-export/1.
         output: dict = {
             "_format": "fw-context-export/1",
             "project": {
@@ -67,6 +71,9 @@ def cmd_export(args: argparse.Namespace) -> int:
                 "indexed_at": build_cfg["created_at"],
             },
             "config_hash": config_hash,
+            "variant": build_cfg["variant"] or "",
+            "image": build_cfg["image"] or "",
+            "board": build_cfg["board"] or "",
         }
 
         # Symbols
@@ -136,8 +143,9 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     from ..config import load as load_config
     from ..indexer._llm_analysis import _build_llm_analysis
     from ..indexer._postprocess import _build_overrides
-    from ..indexer.db import get_active_config, open_db, set_analyze_vendor
+    from ..indexer.db import open_db, set_analyze_vendor
     from ..utils import resolve_project_root
+    from ._builds import label, selected_builds
 
     if args.verbose:
         handler = logging.StreamHandler()
@@ -170,13 +178,12 @@ def cmd_analyze(args: argparse.Namespace) -> int:
 
     conn = open_db(db_path)
     try:
-        build_cfg = get_active_config(conn, project_id)
-        if not build_cfg:
-            print("No build config indexed.", file=sys.stderr)
-            return 1
-        config_hash = build_cfg["config_hash"]
+        builds, error = selected_builds(conn, project_id, cfg, args)
     finally:
         conn.close()
+    if error:
+        print(error, file=sys.stderr)
+        return 1
 
     # Resolve analyze_vendor: CLI flag takes precedence, config falls back.
     analyze_vendor = (
@@ -187,9 +194,9 @@ def cmd_analyze(args: argparse.Namespace) -> int:
 
     # Re-open connection for the analysis (uses its own transactions)
     conn = open_db(db_path)
+    cc = None
     try:
         # Create CacheClient from config if available
-        cc = None
         if cfg.cache_server and cfg.cache_server.url:
             try:
                 from ..cache_client import CacheClient
@@ -203,30 +210,34 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             except (ValueError, TypeError, AttributeError) as e:
                 logging.getLogger(__name__).warning("Failed to create CacheClient: %s", e)
 
-        _build_llm_analysis(
-            conn,
-            config_hash,
-            cfg.llm,
-            db_path.parent,
-            project_root=project_root,
-            project_only=not analyze_vendor,
-            cache_client=cc,
-            retry_unparseable=True,
-        )
+        # Each build without options, as a reindex does: the analysis is
+        # content-addressed, thus a symbol that one build already
+        # analysed is not sent to the model again.
+        for build in builds:
+            config_hash = build["config_hash"]
+            _build_llm_analysis(
+                conn,
+                config_hash,
+                cfg.llm,
+                db_path.parent,
+                project_root=project_root,
+                project_only=not analyze_vendor,
+                cache_client=cc,
+                retry_unparseable=True,
+            )
+            _build_overrides(conn, config_hash, db_path.parent)
+            conn.commit()
+
+            # Update stored analyze_vendor so get_project_status reports
+            # consistent state.  The time of the index run stays: no symbol
+            # changed (see set_analyze_vendor).
+            set_analyze_vendor(conn, config_hash, analyze_vendor)
+            conn.commit()
+            print(f"LLM analysis complete for {project_root}, build {label(build)}")
+    finally:
         if cc:
             cc.close()
-        _build_overrides(conn, config_hash, db_path.parent)
-        conn.commit()
-
-        # Update stored analyze_vendor so get_project_status reports
-        # consistent state.  The time of the index run stays: no symbol
-        # changed (see set_analyze_vendor).
-        set_analyze_vendor(conn, config_hash, analyze_vendor)
-        conn.commit()
-    finally:
         conn.close()
-
-    print(f"LLM analysis complete for {project_root}")
     return 0
 
 
