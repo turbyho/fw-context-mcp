@@ -726,6 +726,10 @@ When you run this command with `--fix`, it attempts to repair fixable
 issues automatically. The command reports issues that it cannot fix, and
 tells you how to fix them manually.
 
+`--fix` pulls a missing chat model or embedding model onto the Ollama
+server of `[llm] ollama_url`, also when that server is on a different
+machine. The checks ask that server for the models.
+
 ### `fw-context cleanup`
 
 Remove the files, directories and config keys that an older fw-context

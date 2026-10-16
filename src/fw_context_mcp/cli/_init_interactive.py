@@ -350,11 +350,12 @@ def _prompt_ollama_setup(project_root: Path, cfg) -> None:
 
     from ..deps._fixes import _ollama_pull
 
+    # The server of the config: the checks ask it for the two models.
     if _confirm(f"Pull {chat} now? (multi-GB)"):
-        ok, msg = _ollama_pull(chat)
+        ok, msg = _ollama_pull(chat, cfg.llm.ollama_url)
         print(f"  [{'ok' if ok else 'warn'}] {msg}")
     if _confirm(f"Pull {embed} now? (multi-GB)"):
-        ok, msg = _ollama_pull(embed)
+        ok, msg = _ollama_pull(embed, cfg.llm.ollama_url)
         print(f"  [{'ok' if ok else 'warn'}] {msg}")
 
     res = configure_llm_core(

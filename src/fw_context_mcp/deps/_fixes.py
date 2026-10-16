@@ -67,8 +67,13 @@ def _pip_install(package: str) -> tuple[bool, str]:
         return False, "timed out after 180 s"
 
 
-def _ollama_pull(model: str, url: str | None = None) -> tuple[bool, str]:
-    """Pull an Ollama model. Returns (ok, output).
+def _ollama_pull(model: str, url: str) -> tuple[bool, str]:
+    """Pull an Ollama model onto the server at *url*. Returns (ok, output).
+
+    *url* is ``[llm] ollama_url``: the checks ask that server for the
+    model.  WHY no default: without the url, the pull goes to the local
+    server.  With a remote ``ollama_url``, the model is then on the wrong
+    server, or the pull fails.  The recheck then finds the model missing.
 
     WHY (CLI-first): The ``ollama pull`` CLI shows a progress bar and
     is already authenticated for self-hosted registries.  The HTTP API
@@ -82,12 +87,9 @@ def _ollama_pull(model: str, url: str | None = None) -> tuple[bool, str]:
     """
     if which("ollama"):
         try:
-            return _pull_via_cli(model)
+            return _pull_via_cli(model, url)
         except FileNotFoundError:
             pass
-
-    if url is None:
-        url = "http://localhost:11434"
 
     return _pull_via_api(model, url)
 
@@ -123,8 +125,12 @@ def _extract_cli_error(tail: bytes) -> str:
     return parts[-1] if parts else ""
 
 
-def _pull_via_cli(model: str) -> tuple[bool, str]:
+def _pull_via_cli(model: str, url: str) -> tuple[bool, str]:
     """Pull *model* via the ``ollama`` CLI with a stall-based timeout.
+
+    The CLI asks the server that ``OLLAMA_HOST`` names, thus the call sets
+    it to *url*.  Without it, the CLI uses its own default server, or the
+    ``OLLAMA_HOST`` of the shell, and not ``[llm] ollama_url``.
 
     Reads the merged stdout+stderr stream from a background thread and
     echoes it to stderr, so the CLI progress bar stays visible during the
@@ -143,6 +149,7 @@ def _pull_via_cli(model: str) -> tuple[bool, str]:
         ["ollama", "pull", model],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
+        env={**os.environ, "OLLAMA_HOST": url},
     )
     # Progress state is shared between the reader thread and this loop, so it
     # is guarded by a lock — a plain closure variable would be a data race.
@@ -276,16 +283,20 @@ def fix_tomli_w(_result, _project_root=None) -> tuple[bool, str]:
 
 
 def fix_chat_model(result, _project_root=None) -> tuple[bool, str]:
-    """Pull the configured chat model."""
+    """Pull the configured chat model onto the server of ``[llm] ollama_url``."""
+    from . import load_project_config
+
     # Extract model name from the result message or fix_cmd
     model = _extract_model_name(result, "ollama")
-    return _ollama_pull(model)
+    return _ollama_pull(model, load_project_config(_project_root).llm.ollama_url)
 
 
 def fix_embed_model(result, _project_root=None) -> tuple[bool, str]:
-    """Pull the configured embedding model."""
+    """Pull the configured embedding model onto the server of ``[llm] ollama_url``."""
+    from . import load_project_config
+
     model = _extract_model_name(result, "ollama")
-    return _ollama_pull(model)
+    return _ollama_pull(model, load_project_config(_project_root).llm.ollama_url)
 
 
 

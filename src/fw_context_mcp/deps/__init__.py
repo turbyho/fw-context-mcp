@@ -29,6 +29,10 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..config.settings import Config
 
 # ── Data model ──────────────────────────────────────────────────────────
 
@@ -112,14 +116,7 @@ def run_full_check(
         try:
             if name in ("ollama", "chat-model", "embed-model"):
                 if "cfg" not in ctx:
-                    from ..config import load as load_config
-                    from ..utils import resolve_project_root
-
-                    try:
-                        root = resolve_project_root(str(project_root) if project_root else None)
-                    except OSError:
-                        root = None
-                    ctx["cfg"] = load_config(root)
+                    ctx["cfg"] = load_project_config(project_root)
                 r = fn(ctx["cfg"].llm)
             elif name in ("db-integrity", "disk-space", "obsolete-files"):
                 r = fn(project_root)
@@ -139,6 +136,24 @@ def run_full_check(
             )
 
     return results
+
+
+def load_project_config(project_root: str | Path | None = None) -> Config:
+    """Load the config of the project of *project_root*, or of the current directory.
+
+    The Ollama checks, the recheck after a fix, and the model pulls of
+    ``doctor --fix`` read it.  WHY one function: the three must read the
+    same config.  A pull that reads a different config can send the model
+    to a different Ollama server.  The recheck then finds the model missing.
+    """
+    from ..config import load as load_config
+    from ..utils import resolve_project_root
+
+    try:
+        root = resolve_project_root(str(project_root) if project_root else None)
+    except OSError:
+        root = None
+    return load_config(root)
 
 
 # ── Fixes ───────────────────────────────────────────────────────────────
@@ -226,14 +241,7 @@ def _recheck(name: str, project_root: str | Path | None = None) -> DepCheckResul
 
     cfg = None
     if name in ("ollama", "chat-model", "embed-model"):
-        from ..config import load as load_config
-        from ..utils import resolve_project_root
-
-        try:
-            root = resolve_project_root(str(project_root) if project_root else None)
-        except OSError:
-            root = None
-        cfg = load_config(root)
+        cfg = load_project_config(project_root)
 
     _map: dict = {
         "pysqlite3": check_pysqlite3,
