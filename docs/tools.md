@@ -312,22 +312,28 @@ fw-context db cleanup                # remove orphaned per-build artifacts
 
 #### `fw-context db list`
 
-List all builds for a project, with per-build statistics. The active build
-shows with a `*` marker.
+List all rows of builds for a project, with per-row statistics. Each row
+shows its label (`variant/image`, or `(no name)`), its state and its
+description:
+
+- `queried`, with a `*` marker: the row that the queries of its build
+  read, the newest completed row of that `(variant, image)` pair.
+- `indexing`: a row that an index run writes, or that a stopped run left.
+- `older row`: an older row of a pair, which an interrupted run left.
 
 ```bash
 $ fw-context db list
 Project: my-zephyr-app  path=/home/user/zephyr-app
 
-*a1b2c3d4e5f6  main: add UART driver
-  First indexed:  2026-06-01 12:00:00      Last indexed:    2026-06-05 09:35:18
-  Symbols:        12,430                   Files:           1,502  Refs:    8,900
+*a1b2c3d4e5f6  nrf52840-dev/app  queried  branch: main
+  First indexed:   2026-10-07 23:00:31     Last indexed:   2026-10-07 23:23:56
+  Symbols:         29,464                  Files:          896  Refs:    81,203
 
-7f8e9d0c1b2a  feature/spi: WIP SPI rewrite
-  First indexed:  2026-06-03 14:22:10      Last indexed:    2026-06-04 18:10:05
-  Symbols:        12,318                   Files:           1,498  Refs:    8,756
+*7f8e9d0c1b2a  nrf52840-dev/mcuboot  queried  branch: main
+  First indexed:   2026-10-07 22:50:12     Last indexed:   2026-10-07 23:00:25
+  Symbols:         14,329                  Files:          778  Refs:    40,117
 
-* = active build (a1b2c3d4e5f6...)
+* = the row that the queries of its build read
 ```
 
 #### `fw-context db stats`
@@ -339,31 +345,36 @@ and more.
 ```bash
 $ fw-context db stats a1b2c3d4e5f6
 Build:          a1b2c3d4e5f6...
-  Description:  main: add UART driver
-  First indexed: 2026-06-01 12:00:00
-  Last indexed: 2026-06-05 09:35:18
+  Label:        nrf52840-dev/app
+  Board:        nrf52840dk/nrf52840
+  Description:  branch: main
+  First indexed: 2026-10-07 23:00:31
+  Last indexed: 2026-10-07 23:23:56
   ...
 
 Symbols by kind:
-  function                  5 212
-  method                    3 108
-  class                       482
+  function                   9874
+  macro                      7012
+  variable                   4203
   ...
-  TOTAL                    12 430
-  Definitions (is_definition=1): 8 450
+  ---                         ---
+  TOTAL                     29464
+  Definitions (is_definition=1): 18950
 
-LLM analysis:   8 450 / 8 450 definitions analyzed
-  Coverage:     100%
-  Unanalyzed:   0
-Embeddings:     12 430 symbols with embeddings
-Files:          1 502
-References:     8 900
-Macros:         1 234
+LLM analysis (project): 2980/2980 analyzed
+LLM analysis (vendor):  0/5470 analyzed
+  Skipped:        0 project, 0 vendor
+  analyze_vendor: False
+  Complete:       True
+Embeddings:     29464 symbols with embeddings
+Files:          896
+References:     81203
+Macros:         7012
 Indirect calls: 156
 FP assignments: 89
 Overrides:      42
 Hotspot cache:  20
-PageRank cov:   12 430 / 12 430 symbols
+PageRank cov:   29464 / 29464 symbols
 ```
 
 #### `fw-context db delete`
@@ -378,8 +389,12 @@ fw-context db delete --all              # delete the entire index
 fw-context db delete --all -y           # delete all without confirmation
 ```
 
-You cannot delete the active build without `--force`. You cannot delete
-the only build: use `--all` instead.
+You cannot delete a row that the queries of its build read (`queried` in
+`fw-context db list`) without `--force`. The queries of that build then
+read an older row of the build, or no row. You cannot delete an
+`indexing` row without `--force`: a run that still writes it writes it
+again when it ends, without the data of the delete. You cannot delete the
+only build that the queries read: use `--all` instead.
 
 #### `fw-context db cleanup`
 
@@ -744,8 +759,8 @@ fw-context watch restart --project /path  # specific project
 #### `fw-context watch status`
 
 Show the watcher daemon status for the current project: whether the daemon
-is running, its PID and uptime, the modified file count, and the state of
-the index:
+is running, its PID and uptime, the modified file count of each build, and
+the state of the index:
 
 - `Index:      running`: an index run holds the index, or a `reindex_file`
   or a `reset_index` writes to it.
@@ -761,7 +776,8 @@ Path:       /home/user/zephyr-app
 DB dir:     /home/user/.fw-context/index/a1b2c3d4
 Daemon:     running (pid 12345, uptime 3600s)
 Socket:     /home/user/.fw-context/index/a1b2c3d4/daemon.sock (active)
-Modified:   3 file(s)
+Modified:   3 file(s) in build nrf52840-dev/app
+Modified:   0 file(s) in build nrf52840-dev/mcuboot
 Index:      idle
 Last index: 09:35:18 INFO [45/45] main.cpp: unchanged
 ```

@@ -5,16 +5,44 @@ needing to run raw SQL queries.  Operations: listing all builds with stats,
 detailed per-build statistics, safe deletion of builds, and cleanup of
 orphaned artifacts.
 
-WHY a separate ``db`` command group: the index database accumulates
-multiple builds over time (different branches, different configs).  Users
-need visibility into what exists and a safe way to free disk space by
-deleting obsolete builds without corrupting the database.
+WHY a separate ``db`` command group: the index database holds the builds
+of a project, one ``(variant, image)`` pair each, and also older rows of a
+pair that an interrupted run left, and rows that an index run writes now.
+Users need visibility into what exists and a safe way to free disk space
+by deleting obsolete builds without corrupting the database.
+
+A query reads one row of each pair: the newest completed row
+(``latest_builds``).  These commands mark that row, in place of the newest
+build of the project, which is not one build that the queries read.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+
+#: The marker of a row that the queries of its build read.
+QUERIED_FOOTER = "* = the row that the queries of its build read"
+
+
+def _row_label(row) -> str:
+    """Return the label of a build row: ``variant/image``, or ``(no name)``."""
+    from ..mcp.shared.stale import build_label
+
+    return build_label(row) or "(no name)"
+
+
+def _row_state(row, queried: set[str]) -> str:
+    """Return what a row is: read by the queries, a row of an index run, or an older row.
+
+    ``indexing`` is a row that an index run writes, or that a stopped run
+    left: the run sets ``manifest_verification`` when it ends.
+    """
+    if row["config_hash"] in queried:
+        return "queried"
+    if row["manifest_verification"] == "indexing":
+        return "indexing"
+    return "older row"
 
 
 def _resolve_config_hash(conn, prefix: str) -> str | None:
@@ -56,8 +84,10 @@ def cmd_db(args: argparse.Namespace) -> int:
 def cmd_db_list(args: argparse.Namespace) -> int:
     """List all builds for a project with per-build statistics.
 
-    Each build is shown with hash, description (git branch+tag), timestamps,
-    and symbol/file/reference counts.  The active build is marked with ``*``.
+    Each build is shown with hash, label (``variant/image``), its state,
+    description (git branch+tag), timestamps, and symbol/file/reference
+    counts.  The row that the queries of its build read is marked with
+    ``*``.
 
     WHY multi-line block format: build descriptions can be long (branch +
     commit message), so a simple table would truncate them.  Block format
@@ -65,7 +95,8 @@ def cmd_db_list(args: argparse.Namespace) -> int:
     """
     from ..config import derive_project_id
     from ..config import load as load_config
-    from ..indexer.db import get_active_config, get_all_builds_for_project, open_db
+    from ..indexer.db import get_all_builds_for_project, open_db
+    from ..mcp.shared.stale import latest_builds
     from ..utils import resolve_project_root
 
     project_root = resolve_project_root(args.project)
@@ -79,8 +110,7 @@ def cmd_db_list(args: argparse.Namespace) -> int:
 
     conn = open_db(db_path)
     try:
-        active = get_active_config(conn, project_id)
-        active_hash = active["config_hash"] if active else None
+        queried = {build["config_hash"] for build in latest_builds(conn, project_id)}
         builds = get_all_builds_for_project(conn, project_id)
     finally:
         conn.close()
@@ -100,10 +130,10 @@ def cmd_db_list(args: argparse.Namespace) -> int:
         desc = b["description"] or "-"
         first_at = b["first_indexed_at"] or "-"
         last_at = b["created_at"] or "-"
-        active_marker = "*" if b["config_hash"] == active_hash else " "
+        marker = "*" if b["config_hash"] in queried else " "
 
-        # Header line: *HASH  DESCRIPTION
-        print(f"{active_marker}{ch}  {desc}")
+        # Header line: *HASH  LABEL  STATE  DESCRIPTION
+        print(f"{marker}{ch}  {_row_label(b)}  {_row_state(b, queried)}  {desc}")
 
         # Info line: timestamps
         print(f"  {'First indexed:':<16} {first_at:<22}  {'Last indexed:':<15} {last_at}")
@@ -115,8 +145,8 @@ def cmd_db_list(args: argparse.Namespace) -> int:
         if len(builds) > 1:
             print()  # blank line between builds
 
-    if active_hash:
-        print(f"\n* = active build ({active_hash[:12]}...)")
+    if queried:
+        print(f"\n{QUERIED_FOOTER}")
     return 0
 
 
@@ -160,6 +190,8 @@ def cmd_db_stats(args: argparse.Namespace) -> int:
         return 1
 
     print(f"Build:          {stats['config_hash']}")
+    print(f"  Label:        {_row_label(stats)}")
+    print(f"  Board:        {stats.get('board') or '-'}")
     desc = stats.get("description") or "(no git context)"
     print(f"  Description:  {desc}")
     print(f"  First indexed: {stats.get('first_indexed_at') or '-'}")
@@ -202,9 +234,12 @@ def cmd_db_stats(args: argparse.Namespace) -> int:
 def cmd_db_delete(args: argparse.Namespace) -> int:
     """Delete a specific build (by config_hash) or all builds (``--all``).
 
-    Single-build delete refuses to delete the active build without ``--force``
-    and refuses to delete the only build entirely — both guards prevent
-    accidental data loss.
+    Single-build delete refuses to delete a row that the queries of its
+    build read without ``--force``, and refuses to delete the only build
+    entirely — both guards prevent accidental data loss.  WHY each queried
+    row and not the newest build of the project: each build of a project
+    of several builds has its own queries, and the guard protected only the
+    build that the last index run wrote.
 
     WHY pause file during --all delete: the background reindex daemon may
     try to write to the database while we delete it.  Writing a
@@ -215,11 +250,11 @@ def cmd_db_delete(args: argparse.Namespace) -> int:
     from ..config import load as load_config
     from ..indexer.db import (
         delete_build_data,
-        get_active_config,
         get_all_builds_for_project,
         open_db,
         transaction,
     )
+    from ..mcp.shared.stale import latest_builds
     from ..utils import resolve_project_root
 
     project_root = resolve_project_root(args.project)
@@ -236,8 +271,7 @@ def cmd_db_delete(args: argparse.Namespace) -> int:
         conn = open_db(db_path)
         try:
             builds = get_all_builds_for_project(conn, project_id)
-            active = get_active_config(conn, project_id)
-            active_hash = active["config_hash"] if active else None
+            queried = {build["config_hash"] for build in latest_builds(conn, project_id)}
         finally:
             conn.close()
 
@@ -249,8 +283,7 @@ def cmd_db_delete(args: argparse.Namespace) -> int:
         print(f"  {len(builds)} build(s) found:")
         for b in builds:
             desc = b["description"] or "-"
-            marker = " (ACTIVE)" if b["config_hash"] == active_hash else ""
-            print(f"  {b['config_hash'][:12]}...  {desc}{marker}")
+            print(f"  {b['config_hash'][:12]}...  {_row_label(b)}  {_row_state(b, queried)}  {desc}")
 
         if not args.yes:
             answer = input(f"\nThis will delete the ENTIRE index including all {len(builds)} builds.\n"
@@ -309,13 +342,23 @@ def cmd_db_delete(args: argparse.Namespace) -> int:
                 print("Run 'fw-context db list' to see available builds.")
             return 1
 
-        active = get_active_config(conn, project_id)
+        queried = {build["config_hash"] for build in latest_builds(conn, project_id)}
+        target = conn.execute(
+            "SELECT config_hash, variant, image, manifest_verification, description, created_at, first_indexed_at "
+            "FROM build_configs WHERE config_hash = ?",
+            (config_hash,),
+        ).fetchone()
+        if target is None:
+            print(f"error: config_hash '{config_hash[:12]}...' not found.")
+            return 1
 
-        # Check if this is the active build
-        if active and active["config_hash"] == config_hash:
+        # A row that the queries of its build read
+        if config_hash in queried:
             if not args.force:
-                print("error: Cannot delete the active build without --force.")
-                print("  Use --force to proceed (another build will become active).")
+                print(f"error: The queries of build {_row_label(target)} read this row. "
+                      "Cannot delete it without --force.")
+                print(f"  Use --force to proceed. The queries of {_row_label(target)} then read "
+                      "an older row of that build, or no row.")
                 return 1
             # Check that at least one other build exists
             other = conn.execute(
@@ -327,15 +370,19 @@ def cmd_db_delete(args: argparse.Namespace) -> int:
                 print("  Use 'fw-context db delete --all' to delete the entire index.")
                 return 1
 
-        # Show what will be deleted
-        row = conn.execute(
-            "SELECT config_hash, description, created_at, first_indexed_at "
-            "FROM build_configs WHERE config_hash = ?",
-            (config_hash,),
-        ).fetchone()
-        if row is None:
-            print(f"error: config_hash '{config_hash[:12]}...' not found.")
+        # A row of an index run.  WHY a guard: the delete of one build
+        # writes no reindex.pause, and a run that still writes the row
+        # writes it again when it ends, as complete, without the data that
+        # the delete removed.
+        if _row_state(target, queried) == "indexing" and not args.force:
+            print(f"error: An index run writes this row of build {_row_label(target)}, or a stopped run "
+                  "left it. Cannot delete it without --force.")
+            print("  Wait for the run to end ('fw-context watch status'), or use --force for a row "
+                  "that a stopped run left.")
             return 1
+
+        # Show what will be deleted
+        row = target
 
         sym_count = conn.execute(
             "SELECT COUNT(*) FROM symbols WHERE config_hash = ?", (config_hash,)
@@ -348,17 +395,16 @@ def cmd_db_delete(args: argparse.Namespace) -> int:
         ).fetchone()[0]
 
         desc = row["description"] or "-"
-        is_active = active and active["config_hash"] == config_hash
-        status = "ACTIVE" if is_active else "INACTIVE"
 
         print(f"Build:          {row['config_hash']}")
+        print(f"  Label:        {_row_label(target)}")
         print(f"  Description:  {desc}")
         print(f"  First indexed: {row['first_indexed_at'] or '-'}")
         print(f"  Last indexed: {row['created_at']}")
         print(f"  Symbols:      {sym_count}")
         print(f"  Files:        {file_count}")
         print(f"  References:   {ref_count}")
-        print(f"  Status:       {status}")
+        print(f"  State:        {_row_state(target, queried)}")
 
         if not args.yes:
             answer = input("\nDelete this build? [y/N] ").strip().lower()

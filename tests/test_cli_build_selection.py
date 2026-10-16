@@ -264,3 +264,79 @@ def test_search_of_a_declared_variant_without_an_index_names_the_command(two_bui
 
     assert _search(root, "main_value", variant="c") == 1
     assert "Run 'fw-context index --build --variant c'." in capsys.readouterr().err
+
+
+def test_db_list_marks_the_row_of_each_build(two_builds, capsys):  # noqa: F811
+    """The list marked the newest build of the project as the one active build."""
+    from fw_context_mcp.cli._db import QUERIED_FOOTER, cmd_db_list
+
+    root, _ = two_builds
+
+    assert cmd_db_list(argparse.Namespace(project=str(root), verbose=False)) == 0
+
+    out = capsys.readouterr().out
+    heads = [line for line in out.splitlines() if line.startswith("*") and line != QUERIED_FOOTER]
+    assert [head.split()[1:3] for head in sorted(heads, key=lambda h: h.split()[1])] == [
+        ["a", "queried"], ["b", "queried"],
+    ], out
+    assert QUERIED_FOOTER in out
+
+
+def test_db_delete_guards_the_row_of_each_build(two_builds, capsys):  # noqa: F811
+    """The guard protected only the build that the last index run wrote."""
+    from fw_context_mcp.cli._db import cmd_db_delete
+
+    root, _ = two_builds
+    hash_a = _hash_of(root, "a")
+
+    args = argparse.Namespace(project=str(root), all=False, config_hash=hash_a, force=False, yes=True)
+    assert cmd_db_delete(args) == 1
+    out = capsys.readouterr().out
+    assert "The queries of build a read this row." in out, out
+    assert _hash_of(root, "a") == hash_a, "nothing was deleted"
+
+
+def test_db_stats_names_the_build(two_builds, capsys):  # noqa: F811
+    from fw_context_mcp.cli._db import cmd_db_stats
+
+    root, _ = two_builds
+
+    assert cmd_db_stats(argparse.Namespace(project=str(root), config_hash=_hash_of(root, "b"))) == 0
+    assert "  Label:        b\n" in capsys.readouterr().out
+
+
+def test_watch_status_counts_the_modified_files_of_each_build(two_builds, capsys):  # noqa: F811
+    """The count was of the newest build only: an edit of a file of the other build did not show."""
+    from fw_context_mcp.cli._watch import cmd_watch_status
+
+    root, _ = two_builds
+    (root / "src/only_a.c").write_text("int only_a_value(void) { return 30; }\n", encoding="utf-8")
+
+    assert cmd_watch_status(argparse.Namespace(project=str(root))) == 0
+
+    out = capsys.readouterr().out
+    assert "Modified:   1 file(s) in build a\n" in out, out
+    assert "Modified:   0 file(s) in build b\n" in out, out
+
+
+def test_db_shows_and_guards_a_row_of_an_index_run(two_builds, capsys):  # noqa: F811
+    """A delete of a row that a run still writes: the run wrote it again, complete, without the deleted data."""
+    from fw_context_mcp.cli._db import cmd_db_delete, cmd_db_list
+    from fw_context_mcp.indexer.db import open_db
+
+    root, db_path = two_builds
+    conn = open_db(db_path, skip_integrity_check=True)
+    try:
+        conn.execute("UPDATE build_configs SET manifest_verification = 'indexing' WHERE variant = 'b'")
+        conn.commit()
+    finally:
+        conn.close()
+    hash_b = _hash_of(root, "b")
+
+    assert cmd_db_list(argparse.Namespace(project=str(root), verbose=False)) == 0
+    assert f" {hash_b[:12]}  b  indexing  " in capsys.readouterr().out
+
+    args = argparse.Namespace(project=str(root), all=False, config_hash=hash_b, force=False, yes=True)
+    assert cmd_db_delete(args) == 1
+    assert "An index run writes this row of build b" in capsys.readouterr().out
+    assert _hash_of(root, "b") == hash_b, "nothing was deleted"
