@@ -941,6 +941,13 @@ mcp = FastMCP(
         '    get_project_status() again to confirm status="ready".\n'
         "    NOTE: init and index are NEVER combined — each requires its own\n"
         "    operator confirmation before execution.\n"
+        '  • status="config_error" — a config file of fw-context cannot be used:\n'
+        "    it cannot be read, it is not UTF-8 or not valid TOML, or a URL in it\n"
+        "    is not valid. `config_file` names it, and `index_message` gives the\n"
+        "    problem (for TOML also the line). Tell the operator the file and the\n"
+        "    problem. Do NOT run `fw-context init` or `fw-context index`: they\n"
+        "    cannot repair the file. Correct the file only with the approval of\n"
+        "    the operator, then call get_project_status() again.\n"
         "  • NO status, only `error` — the index holds no build config. There is\n"
         '    no status="error".\n'
         '  • The call fails with an error of SQLite (for example "database disk\n'
@@ -1353,6 +1360,10 @@ def main() -> None:
          agent can ask the operator and run index via bash.  The ping
          thread starts, thus the watcher daemon starts as soon as the
          operator creates the index.
+       - If a config file cannot be used (``ConfigError``): server starts
+         normally — ``get_project_status()`` returns ``config_error``, and
+         the other tools give the error.  The ping thread starts, thus the
+         watcher daemon starts when the operator corrects the file.
     2. When ready, pre-marks the database as integrity-checked.
     3. Ensures the persistent watcher daemon is running for the project
        (spawns it if this is the first MCP server).
@@ -1432,8 +1443,9 @@ def main() -> None:
     except ConfigError as exc:
         # NOT the path of a project that is not initialized: that one tells
         # the caller to run `fw-context init`, which wrote a new project ID
-        # over the file.  The tools give the error.  The ping thread starts
-        # the watcher when the operator corrects the file.
+        # over the file.  get_project_status() gives "config_error", and the
+        # other tools give the error.  The ping thread starts the watcher
+        # when the operator corrects the file.
         log.error("A config file cannot be used: %s — each tool gives this error", exc)
         try:
             _start_ping_thread(root)

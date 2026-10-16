@@ -276,8 +276,8 @@ state of the index run (`reindex_state`) when the build is not current,
 its counts, and its reasons. A build without a variant name and an image
 name shows as `(no name)`. A variant that the config declares and the index
 does not hold gets the command that indexes it. A project that is not
-initialized, or that has no index, gets the message and the command
-returns 1.
+initialized, that has no index, or whose config file cannot be used
+(`config_error`) gets the message and the command returns 1.
 
 ### `fw-context list`
 
@@ -2522,6 +2522,7 @@ are in `builds`. `reference_count`, `analysis`, `description`, and
 | ``"reindex_needed"`` | A structural cause — see `reindex_reasons` below | Queries still work, but read `reindex_reasons` for the command |
 | ``"no_index"`` | Initialized, but `index.db` does not exist | Run ``fw-context index`` |
 | ``"not_initialized"`` | ``fw-context init`` was not run | Run ``fw-context init`` |
+| ``"config_error"`` | A config file cannot be read, is not UTF-8 or not valid TOML, or has a URL that is not valid. `config_file` names it | Tell the operator the file and the problem. Do not run ``fw-context init`` or ``fw-context index``: they cannot repair the file. Correct the file only with the approval of the operator |
 
 A project of several builds gets the worst status of its builds:
 `"reindex_needed"`, then `"reindexing"`, then `"ready"`.
@@ -2645,7 +2646,8 @@ that it must run. Two causes set the field:
 - The index holds a NEWER row format than this server process reads.
 - The operator installed a different fw-context after the LLM client
   started this server process. This cause needs no index, thus it shows
-  also with `status` `"not_initialized"` and `"no_index"`.
+  also with `status` `"not_initialized"`, `"no_index"` and
+  `"config_error"`.
 
 The result then holds `client_restart_required: true` and
 `client_restart_reason`, which names each cause that applies, and
@@ -2735,7 +2737,8 @@ newer than `indexed_at`. To find modified files, use `modified_files_count`.
 
 For a project that is not initialized, the result holds only `status`,
 `project_root`, and `index_message`. When no index exists, the result
-also holds `project_id`. The two version fields (`client_restart_*` for an
+also holds `project_id`. For `"config_error"`, it also holds
+`config_file`. The two version fields (`client_restart_*` for an
 upgrade, and `update_notice`) can come with each result.
 
 #### `get_build_info`
@@ -2786,11 +2789,11 @@ build only. The version fields (`update_notice`, and a restart after an
 upgrade) are in `get_project_status`. A refusal of the selector, or an
 index with no build config, gives a dict that holds only `error`. A
 database that fw-context cannot read makes the call fail, as in
-`get_project_status`. A
-project that is not initialized, or that has no index, gets the answer
-of `get_project_status` without the version fields: only `status`,
+`get_project_status`. A project that is not initialized, that has no
+index, or whose config file cannot be used gets the answer of
+`get_project_status` without the version fields: only `status`,
 `project_root`, `index_message`, and, when no index exists,
-`project_id`.
+`project_id`, or for `"config_error"`, `config_file`.
 
 `config_hash` identifies the build in the index. `compile_commands` is
 the `compile_commands.json` that the index run read for this build.

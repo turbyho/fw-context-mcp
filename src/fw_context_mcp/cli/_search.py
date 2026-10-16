@@ -161,7 +161,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     if "error" in state:
         print(state["error"], file=sys.stderr)
         return 1
-    if state["status"] in ("not_initialized", "no_index"):
+    if state["status"] in ("not_initialized", "no_index", "config_error"):
         print(state["index_message"])
         return 1
 

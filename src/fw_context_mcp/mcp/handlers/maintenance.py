@@ -35,7 +35,7 @@ from typing import Annotated
 
 from pydantic import Field
 
-from ...config import derive_project_id
+from ...config import ConfigError, derive_project_id
 from ...config import load as load_config
 from ...config.settings import Config
 from ...indexer.autobuild import AutobuildState, build_advice, build_missing_reason
@@ -310,9 +310,26 @@ def _index_target(project_root: str | None) -> _IndexTarget | dict:
     ``derive_project_id``: that call raises for a project that is not
     initialized, and these two tools report that state instead.  The other
     tools fail fast in that case, and these diagnostic tools explain it.
+
+    A config file that ``load`` cannot use gives the status
+    ``"config_error"``.  WHY its own status: without the file the project
+    reads as not initialized, and the answer for that state tells the
+    caller to run ``fw-context init``, which cannot repair the file.  An
+    answer with ``error`` alone tells that the index holds no build.
     """
     root = resolve_project_root(project_root)
-    fw_cfg = load_config(root)
+    try:
+        fw_cfg = load_config(root)
+    except ConfigError as exc:
+        return {
+            "status": "config_error",
+            "project_root": str(root),
+            "config_file": str(exc.path),
+            "index_message": (
+                f"{exc} Do not run `fw-context init` or `fw-context index`: they cannot "
+                "repair the file."
+            ),
+        }
     if not fw_cfg.project.id:
         return {
             "status": "not_initialized",
@@ -337,7 +354,9 @@ def _index_target(project_root: str | None) -> _IndexTarget | dict:
         }
     # Read BEFORE the database: while a run is in progress the cache of
     # modified files can hold the counts from before it started.
-    return _IndexTarget(root, fw_cfg, derive_project_id(root), db_path, read_reindex_state(root))
+    # The ID of this read of the config: a second read can meet a file
+    # that an editor writes at this moment.
+    return _IndexTarget(root, fw_cfg, fw_cfg.project.id, db_path, read_reindex_state(root))
 
 
 @dataclass(frozen=True)
@@ -1213,6 +1232,10 @@ def get_project_status(
       the rows of the last FINISHED run.
     * ``"no_index"`` — initialized, never indexed. Run ``fw-context index``.
     * ``"not_initialized"`` — run ``fw-context init``.
+    * ``"config_error"`` — a config file cannot be used: it cannot be read,
+      it is not UTF-8 or not valid TOML, or a URL in it is not valid.
+      ``config_file`` names it, and ``index_message`` gives the problem.
+      Correct the file; ``fw-context init`` cannot repair it.
 
     A project of several builds gets the worst status of its builds.  A
     reason that every build gives comes one time, and any other reason
@@ -1273,7 +1296,8 @@ def get_project_status(
       nothing wrong with it.
     * The operator installed a different fw-context after the LLM client
       started this process.  This cause does not need an index, thus it
-      shows also for ``not_initialized`` and ``no_index``.
+      shows also for ``not_initialized``, ``no_index`` and
+      ``config_error``.
 
     ``status`` therefore stays as it is and ``reindex_needed`` stays False
     — every query keeps working.  Do NOT run a reindex for this field.
@@ -1327,8 +1351,9 @@ def get_project_status(
         vendor_paths (list[str] — config index.vendor_paths),
         project_paths (list[str] — config index.project_paths),
         status (str — "ready"|"reindexing"|"reindex_needed"|"no_index"|
-        "not_initialized"; a failure sets no status and gives ``error``
-        alone), reindex_needed (bool), reindex_reasons (list[str] — why a
+        "not_initialized"|"config_error"; a failure sets no status and
+        gives ``error`` alone), config_file (str — only with
+        "config_error": the file that cannot be used), reindex_needed (bool), reindex_reasons (list[str] — why a
         reindex is needed, empty when False, except that a new source file
         that fw-context builds on its own is listed while
         ``reindex_needed`` is False.  Some of them ask for a build rather
@@ -1375,7 +1400,8 @@ def get_project_status(
 
         For a project that is not initialized, the result holds only
         ``status``, ``project_root``, and ``index_message``.  When no index
-        exists, the result adds ``project_id``.  The two version fields
+        exists, the result adds ``project_id``.  For ``"config_error"``, it
+        adds ``config_file``.  The two version fields
         (``client_restart_*`` for an upgrade, ``update_notice``) can come
         with every result, these two included.
     """
@@ -1572,8 +1598,8 @@ def get_build_info(
 
         A refusal of the selector, or an index with no build config, gives
         a dict that holds ``error`` alone.  A project that is not
-        initialized or has no index gets the answer of
-        ``get_project_status``.
+        initialized, that has no index, or whose config file cannot be used
+        (``"config_error"``) gets the answer of ``get_project_status``.
     """
     target = _index_target(project_root)
     if isinstance(target, dict):

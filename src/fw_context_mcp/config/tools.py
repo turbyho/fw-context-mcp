@@ -397,6 +397,11 @@ get_project_status() status:
     active or scheduled: do not start a second one.
   • "not_initialized" — ask operator, then run `fw-context init` via bash.
   • "no_index" — ask operator, then run `fw-context index --build` via bash.
+  • "config_error" — a config file cannot be used. `config_file` names it,
+    and `index_message` gives the problem. Tell the operator. Do NOT run
+    `fw-context init` or `fw-context index`: they cannot repair the file.
+    Correct it only with the approval of the operator, then call
+    get_project_status() again.
   • NO status, only `error` — the index holds no build config. There is
     no status "error".
   • The call fails with an error of SQLite (for example "database disk
