@@ -31,6 +31,7 @@ Subpackage layout:
 from .settings import (
     CacheServerConfig,
     Config,
+    ConfigError,
     IndexConfig,
     LLMConfig,
     ProjectMeta,
@@ -43,6 +44,7 @@ from .settings import (
 __all__ = [
     "CacheServerConfig",
     "Config",
+    "ConfigError",
     "IndexConfig",
     "LLMConfig",
     "ProjectMeta",

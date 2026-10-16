@@ -94,6 +94,25 @@ class ProjectNotInitializedError(RuntimeError):
         )
 
 
+class ConfigError(ValueError):
+    """Raised for a config file that fw-context cannot use.
+
+    The file is not UTF-8 or not valid TOML.  The message names the file
+    and the problem; a TOML error also names the line and the column.
+
+    WHY an error and not the defaults: when fw-context ignores a file, it
+    loses each setting in it, the project ID too.  The project then reads
+    as not initialized.  ``fw-context init`` then writes a new ID over the
+    file: the config of the team is lost, and the index is no longer
+    linked to the project.
+    """
+
+    def __init__(self, path: Path, problem: str) -> None:
+        self.path = path
+        self.problem = problem
+        super().__init__(f"{path}: {problem}. Correct the file, then do the command again.")
+
+
 _GLOBAL_CONFIG_PATH = fw_context_home() / "config.toml"
 _PROJECT_CONFIG_DIR = ".fw-context"
 _PROJECT_CONFIG_NAME = "config.toml"

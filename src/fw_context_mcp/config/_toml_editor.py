@@ -22,6 +22,11 @@ WHY ``merge_template`` preserves existing keys: ``fw-context init`` may
 be re-run on an already-initialised project (e.g. after a colleague
 checked out the repo).  The template adds new keys that appeared in
 a newer version, but must not overwrite the team's existing settings.
+
+WHY a file that is not valid TOML stops each write (``ConfigError``): the
+two writers read the file, change the data and write it again.  A file
+that they took as empty was replaced by the new data alone, and each
+setting in it was lost.
 """
 
 from __future__ import annotations
@@ -50,16 +55,13 @@ def set_key(
     Uses ``tomli_w`` for output, so comments in the original file are
     NOT preserved.  All TOML data types are supported — strings are
     automatically quoted.
+
+    Raises:
+        ConfigError: *config_path* is not valid TOML.  The file does not
+            change.
     """
     config_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Load existing config (or start fresh)
-    data: dict[str, Any] = {}
-    if config_path.exists():
-        try:
-            data = tomllib.loads(config_path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            log.warning("Could not parse %s, starting fresh: %s", config_path, exc)
+    data = _read_existing(config_path)
 
     # Ensure section exists
     if section not in data:
@@ -94,6 +96,10 @@ def merge_template(
     comment handling).
 
     Returns the list of key names that were added.
+
+    Raises:
+        ConfigError: *config_path* is not valid TOML.  The file does not
+            change.
     """
     config_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -104,13 +110,7 @@ def merge_template(
         log.error("Invalid template TOML: %s", exc)
         return []
 
-    # Load existing config
-    existing_data: dict[str, Any] = {}
-    if config_path.exists():
-        try:
-            existing_data = tomllib.loads(config_path.read_text(encoding="utf-8"))
-        except Exception:
-            log.debug("Could not parse %s, treating as empty", config_path)
+    existing_data = _read_existing(config_path)
 
     # Merge: add missing sections and keys
     added: list[str] = []
@@ -137,6 +137,26 @@ def merge_template(
     new_content = tomli_w.dumps(existing_data)
     _atomic_write(config_path, new_content)
     return added
+
+
+def _read_existing(config_path: Path) -> dict[str, Any]:
+    """Return the data of *config_path*, or ``{}`` when the file does not exist.
+
+    Raises:
+        ConfigError: the file is not UTF-8 or not valid TOML.
+    """
+    from .settings import ConfigError
+
+    try:
+        text = config_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except UnicodeDecodeError as exc:
+        raise ConfigError(config_path, f"not UTF-8: {exc}") from exc
+    try:
+        return tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(config_path, f"not valid TOML: {exc}") from exc
 
 
 def _atomic_write(path: Path, content: str) -> None:
