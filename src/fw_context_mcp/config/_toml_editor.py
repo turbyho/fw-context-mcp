@@ -143,20 +143,12 @@ def _read_existing(config_path: Path) -> dict[str, Any]:
     """Return the data of *config_path*, or ``{}`` when the file does not exist.
 
     Raises:
-        ConfigError: the file is not UTF-8 or not valid TOML.
+        ConfigError: the file cannot be read, or it is not UTF-8 or not
+            valid TOML (`settings.read_config_file`).
     """
-    from .settings import ConfigError
+    from .settings import read_config_file
 
-    try:
-        text = config_path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return {}
-    except UnicodeDecodeError as exc:
-        raise ConfigError(config_path, f"not UTF-8: {exc}") from exc
-    try:
-        return tomllib.loads(text)
-    except tomllib.TOMLDecodeError as exc:
-        raise ConfigError(config_path, f"not valid TOML: {exc}") from exc
+    return read_config_file(config_path)
 
 
 def _atomic_write(path: Path, content: str) -> None:

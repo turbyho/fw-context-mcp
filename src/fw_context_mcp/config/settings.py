@@ -97,8 +97,9 @@ class ProjectNotInitializedError(RuntimeError):
 class ConfigError(ValueError):
     """Raised for a config file that fw-context cannot use.
 
-    The file is not UTF-8 or not valid TOML.  The message names the file
-    and the problem; a TOML error also names the line and the column.
+    The file cannot be read, it is not UTF-8 or not valid TOML, or a URL
+    in it is not valid.  The message names the file and the problem; a
+    TOML error also names the line and the column.
 
     WHY an error and not the defaults: when fw-context ignores a file, it
     loses each setting in it, the project ID too.  The project then reads
@@ -1191,6 +1192,32 @@ def _validate_config_safety(proj_data: dict, proj_path: Path) -> None:
         # a second print showed the warning two times.
         log.warning(msg)
 
+#: The ``[llm]`` keys that hold a URL.  ``load`` reads the host of each.
+_URL_KEYS = ("ollama_url", "chat_api_base")
+
+
+def _check_url_values(layer: dict, path: Path) -> None:
+    """Raise ``ConfigError`` for a URL in one config file that cannot be parsed.
+
+    WHY one file at a time: the error must name the file that holds the
+    value.  ``load`` reads the host of each URL (`_is_loopback_url`), and
+    ``urlparse`` raises ``ValueError`` for a value such as
+    ``"http://[::1"``.  That error named no file, and it stopped the MCP
+    server before its tools were there.
+    """
+    llm = layer.get("llm")
+    if not isinstance(llm, dict):
+        return
+    for key in _URL_KEYS:
+        value = llm.get(key)
+        if not isinstance(value, str):
+            continue
+        try:
+            _ = urlparse(value).hostname  # urlparse checks the host, and raises ValueError
+        except ValueError as exc:
+            raise ConfigError(path, f"[llm] {key} is not a valid URL ({exc})") from exc
+
+
 def _drop_malformed_sections(layer: dict, path: Path) -> None:
     """Remove a known section that is not a table from one config file, and warn.
 
@@ -1357,13 +1384,27 @@ _config_cache: OrderedDict[tuple, tuple[tuple[float | None, ...], Config]] = Ord
 _CONFIG_CACHE_MAX = 50
 
 
-def _read_toml_if_present(path: Path) -> dict:
-    """Parse *path*, or return ``{}`` when the file does not exist."""
+def read_config_file(path: Path) -> dict:
+    """Parse the config file *path*, or return ``{}`` when it does not exist.
+
+    Raises:
+        ConfigError: the file cannot be read, or it is not UTF-8 or not
+            valid TOML.  The config readers (``load``) and writers
+            (``_toml_editor``) use this one function, thus the two give the
+            same message for one file.
+    """
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return {}
-    return tomllib.loads(text)
+    except UnicodeDecodeError as exc:
+        raise ConfigError(path, f"not UTF-8: {exc}") from exc
+    except OSError as exc:
+        raise ConfigError(path, f"cannot be read: {exc.strerror or exc}") from exc
+    try:
+        return tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(path, f"not valid TOML: {exc}") from exc
 
 
 def load_update_settings() -> UpdatesConfig:
@@ -1384,8 +1425,8 @@ def load_update_settings() -> UpdatesConfig:
     settings = UpdatesConfig()
     path = _GLOBAL_CONFIG_PATH
     try:
-        data = _read_toml_if_present(path)
-    except (OSError, ValueError):
+        data = read_config_file(path)
+    except ConfigError:
         log.debug("Cannot read %s — [updates] uses the defaults", path, exc_info=True)
         return settings
     if isinstance(data.get("updates"), dict):
@@ -1438,9 +1479,12 @@ def load(project_root: Path | None = None) -> Config:
     missing ``.fw-context/config.toml`` or ``local.toml`` reads as empty.
     A read-only tool on a project that ``fw-context init`` never saw must
     not write into it; ``init`` and the writers (``_write_project_id``,
-    ``update_local_toml``) create the files they write.  TOML parse errors
-    in user configs are logged and the built-in defaults are used instead —
-    a broken config file must not prevent the MCP tools from loading.
+    ``update_local_toml``) create the files they write.
+
+    Raises:
+        ConfigError: a config file (global, project or local) cannot be
+            read, or it is not UTF-8 or not valid TOML.  The message names
+            the file, and for TOML the line and the column.
 
     Results are cached per (global_path, proj_path, local_path) tuple and
     invalidated when any source file's mtime changes.
@@ -1450,11 +1494,12 @@ def load(project_root: Path | None = None) -> Config:
     ``[llm] num_ctx = 8192`` — shallow merge would overwrite the entire
     ``[llm]`` dict, discarding ``embed_model``.  Deep merge preserves both.
 
-    **Why graceful degradation?**  The MCP server is a plumbing tool — if
-    it fails to start because of a typo in ``local.toml``, the developer
-    loses all fw-context tools in their AI assistant.  A more frustrating
-    failure mode: the bug is in the tool they'd use to debug the config.
-    Log loudly, continue with defaults.
+    **Why an error and not the defaults?**  A file that ``load`` ignored
+    lost each setting in it, the project ID too: the project read as not
+    initialized, and ``fw-context init`` then wrote a new ID over the
+    file.  A different ``db_dir`` or ``ollama_url`` from the defaults is
+    also a silent change of the index or of the server.  The MCP server
+    still starts: each tool gives the error, which names the file.
     """
     data: dict = {}
 
@@ -1477,13 +1522,11 @@ def load(project_root: Path | None = None) -> Config:
 
     # Phase 1: load global config (always present — _ensure_global_config
     # creates it from template if missing).
-    try:
-        data = tomllib.loads(global_path.read_text(encoding="utf-8"))
-        _drop_malformed_sections(data, global_path)
-        _drop_retired_keys(data, global_path)
-        _drop_selection_keys(data, global_path)
-    except (OSError, ValueError):
-        log.exception("Failed to parse %s — using defaults", global_path)
+    data = read_config_file(global_path)
+    _drop_malformed_sections(data, global_path)
+    _check_url_values(data, global_path)
+    _drop_retired_keys(data, global_path)
+    _drop_selection_keys(data, global_path)
 
     if project_root is not None:
         assert proj_path is not None
@@ -1491,32 +1534,28 @@ def load(project_root: Path | None = None) -> Config:
         # Phase 2: deep-merge project config (shared via git).
         # Uses _deep_merge so nested sections accumulate — [index] keys
         # from global and project config coexist.
-        try:
-            proj_data = _read_toml_if_present(proj_path)
-            _drop_malformed_sections(proj_data, proj_path)
-            _drop_retired_keys(proj_data, proj_path)
-            _drop_selection_keys(proj_data, proj_path)
-            _warn_project_updates_once(proj_data, proj_path)
-            data = _deep_merge(data, proj_data)
-            # A non-loopback ollama_url in the committed config.toml sends
-            # source code to a host that the repository selects.
-            _validate_config_safety(proj_data, proj_path)
-        except (OSError, ValueError):
-            log.exception("Failed to parse %s — ignoring project config", proj_path)
+        proj_data = read_config_file(proj_path)
+        _drop_malformed_sections(proj_data, proj_path)
+        _check_url_values(proj_data, proj_path)
+        _drop_retired_keys(proj_data, proj_path)
+        _drop_selection_keys(proj_data, proj_path)
+        _warn_project_updates_once(proj_data, proj_path)
+        data = _deep_merge(data, proj_data)
+        # A non-loopback ollama_url in the committed config.toml sends
+        # source code to a host that the repository selects.
+        _validate_config_safety(proj_data, proj_path)
 
         assert local_path is not None
 
         # Phase 3: deep-merge local config (gitignored, per-developer).
         # This is the last merge — local.toml values have highest precedence.
-        try:
-            local_data = _read_toml_if_present(local_path)
-            _drop_malformed_sections(local_data, local_path)
-            _drop_retired_keys(local_data, local_path)
-            _drop_selection_keys(local_data, local_path)
-            _warn_project_updates_once(local_data, local_path)
-            data = _deep_merge(data, local_data)
-        except (OSError, ValueError):
-            log.exception("Failed to parse %s — ignoring local config", local_path)
+        local_data = read_config_file(local_path)
+        _drop_malformed_sections(local_data, local_path)
+        _check_url_values(local_data, local_path)
+        _drop_retired_keys(local_data, local_path)
+        _drop_selection_keys(local_data, local_path)
+        _warn_project_updates_once(local_data, local_path)
+        data = _deep_merge(data, local_data)
 
         # Security: a committed or local config can redirect LLM calls (which
         # include source-code snippets) to an arbitrary host. Warn loudly.

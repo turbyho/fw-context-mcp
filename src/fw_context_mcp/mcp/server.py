@@ -88,6 +88,7 @@ from mcp.server.fastmcp import Context as MCPContext
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
+from ..config import ConfigError
 from ..utils import AmbiguousProjectError, resolve_project_root
 from .background import _ensure_daemon_running
 from .handlers import callgraph, inheritance, maintenance, search, source, variables
@@ -142,6 +143,17 @@ def _busy_error(tool: str) -> list[dict]:
         "because a different tool is already executing). Wait for the active query to complete, "
         "then retry. A query that runs longer than 300 s is cancelled."
     )}]
+
+
+def _config_error(tool: str, exc: ConfigError) -> list[dict]:
+    """The answer of a tool that stopped on a config file it cannot use.
+
+    WHY not "Internal server error" with a traceback: the cause is a file
+    of the user, not fw-context.  The message names the file and the
+    problem, and the action is to correct the file.
+    """
+    log.warning("Tool %s: %s", tool, exc)
+    return [{"error": str(exc)}]
 
 
 def _wrap_tool(fn, *, annotate: bool = True):
@@ -226,6 +238,8 @@ def _wrap_tool(fn, *, annotate: bool = True):
                 if exception is not None:
                     if isinstance(exception, BrokenPipeError):
                         sys.exit(0)
+                    if isinstance(exception, ConfigError):
+                        return _config_error(fn.__name__, exception)
                     log.exception("Tool %s crashed", fn.__name__)
                     return [{"error": f"Internal server error in {fn.__name__}: {exception}"}]
                 if not annotate:
@@ -285,6 +299,8 @@ def _wrap_tool(fn, *, annotate: bool = True):
             if exception is not None:
                 if isinstance(exception, BrokenPipeError):
                     sys.exit(0)
+                if isinstance(exception, ConfigError):
+                    return _config_error(fn.__name__, exception)
                 log.exception("Tool %s crashed", fn.__name__)
                 return [{"error": f"Internal server error in {fn.__name__}: {exception}"}]
             if not annotate:
@@ -1376,6 +1392,9 @@ def main() -> None:
         _check_server_ready()
     except RuntimeError as exc:
         log.info("Project not ready at startup: %s", exc)
+    except ConfigError as exc:
+        # The server must start: each tool then gives this error.
+        log.error("A config file cannot be used: %s", exc)
 
     # Phase 2: fast dependency pre-flight — warn on degraded deps, never exit.
     # Missing optional dependencies (e.g., nvidia-smi for GPU detection) are
@@ -1405,8 +1424,21 @@ def main() -> None:
         from ..config import load as load_config
         from ..config.settings import ProjectNotInitializedError
         project_id = derive_project_id(root)
+        cfg = load_config(project_root=root)
     except ProjectNotInitializedError:
         log.info("Project not initialized at %s — get_project_status() will report not_initialized", root)
+        mcp.run()
+        return
+    except ConfigError as exc:
+        # NOT the path of a project that is not initialized: that one tells
+        # the caller to run `fw-context init`, which wrote a new project ID
+        # over the file.  The tools give the error.  The ping thread starts
+        # the watcher when the operator corrects the file.
+        log.error("A config file cannot be used: %s — each tool gives this error", exc)
+        try:
+            _start_ping_thread(root)
+        except (RuntimeError, OSError):
+            log.exception("Ping thread startup failed — no automatic reindex until the server restarts")
         mcp.run()
         return
 
@@ -1414,7 +1446,6 @@ def main() -> None:
     # If not, we DON'T set the sentinel — the server starts normally so
     # that get_project_status() can return status="no_index", allowing the
     # agent to ask the operator and run `fw-context index` via bash.
-    cfg = load_config(project_root=root)
     db_path = cfg.index.db_dir / project_id / "index.db"
     if not db_path.exists():
         log.info("No index found at %s — get_project_status() will report no_index", db_path)
@@ -1485,12 +1516,14 @@ def _start_ping_thread(root: Path) -> None:
                     continue
                 log.debug("Daemon ping failed — the ping thread spawns a new watcher daemon")
                 _ensure_daemon_running(root)
-            except (RuntimeError, OSError):
+            except (RuntimeError, OSError, ConfigError):
                 # RuntimeError — the project is not initialized, or it
                 # has no index yet.  _db_path() raises it through
-                # _check_server_ready().  The two states are temporary,
-                # because the operator can still run init or index.  The
-                # loop must stay alive and try again on the next tick.
+                # _check_server_ready().  ConfigError — a config file is
+                # not valid, also for one tick while the user edits it.
+                # The states are temporary, because the operator can
+                # still run init or index, or correct the file.  The loop
+                # must stay alive and try again on the next tick.
                 log.debug("Could not start the watcher daemon", exc_info=True)
 
     # daemon=True: killed on process exit — no explicit stop mechanism needed
