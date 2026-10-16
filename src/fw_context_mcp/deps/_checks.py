@@ -433,16 +433,50 @@ def check_ollama_running(cfg) -> DepCheckResult:
 
 
 def check_ollama_chat_model(cfg) -> DepCheckResult:
-    """Verify the configured chat model is installed."""
+    """Verify the configured chat model is installed on the Ollama server of the chat calls.
+
+    That server is ``ollama_url``, or the Ollama server of ``chat_api_base``
+    (`chat_router.chat_ollama_server`).  WHY ``skipped`` for an
+    OpenAI-compatible ``chat_api_base``: that API runs the model, and
+    ``doctor --fix`` must not try to pull its name from Ollama.
+
+    WHY this check asks the chat server itself, and not
+    ``_diag.check_setup``: ``semantic_search`` calls ``check_setup`` on each
+    query, and the embeddings do not use the chat server.  If
+    ``check_setup`` asked the chat server, a chat server that does not
+    answer would make each query wait.  Also, the check of a
+    remote chat server does not depend on the server of ``ollama_url``.
+    """
     if not cfg.enabled:
         return DepCheckResult(name="chat-model", status="skipped", message="LLM disabled in config", critical=False)
 
-    from ..llm._diag import check_setup
+    from ..llm._diag import installed_models
+    from ..llm.auto_model import _model_name_matches
+    from ..llm.chat_router import chat_ollama_server
 
-    result = check_setup(cfg)
-    if result.get("status") == "error":
-        return DepCheckResult(name="chat-model", status="skipped", message="Ollama not reachable", critical=False)
-    if result.get("status") == "model_missing":
+    try:
+        server = chat_ollama_server(cfg)
+    except ValueError as exc:
+        return DepCheckResult(name="chat-model", status="error", message=str(exc), critical=False)
+    if server is None:
+        return DepCheckResult(
+            name="chat-model",
+            status="skipped",
+            message=f"chat model '{cfg.model}' runs on an OpenAI-compatible API (chat_api_base), not on Ollama",
+            critical=False,
+        )
+    models = installed_models(server)
+    if models is None:
+        if server.rstrip("/") == cfg.ollama_url.rstrip("/"):
+            # The check "ollama" reports this server.
+            return DepCheckResult(name="chat-model", status="skipped", message="Ollama not reachable", critical=False)
+        return DepCheckResult(
+            name="chat-model",
+            status="degraded",
+            message=f"the Ollama server {server} of chat_api_base gives no model list (/api/tags)",
+            critical=False,
+        )
+    if not any(_model_name_matches(m, cfg.model) for m in models):
         return DepCheckResult(
             name="chat-model",
             status="missing",

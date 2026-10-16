@@ -70,10 +70,12 @@ def _pip_install(package: str) -> tuple[bool, str]:
 def _ollama_pull(model: str, url: str) -> tuple[bool, str]:
     """Pull an Ollama model onto the server at *url*. Returns (ok, output).
 
-    *url* is ``[llm] ollama_url``: the checks ask that server for the
-    model.  WHY no default: without the url, the pull goes to the local
-    server.  With a remote ``ollama_url``, the model is then on the wrong
-    server, or the pull fails.  The recheck then finds the model missing.
+    *url* is the server that the check asks for the model: ``[llm]
+    ollama_url`` for the embedding model, and the Ollama server of the
+    chat calls for the chat model.  WHY no default: without the url, the
+    pull goes to the local server.  With a remote ``ollama_url``, the
+    model is then on the wrong server, or the pull fails.  The recheck
+    then finds the model missing.
 
     WHY (CLI-first): The ``ollama pull`` CLI shows a progress bar and
     is already authenticated for self-hosted registries.  The HTTP API
@@ -130,7 +132,7 @@ def _pull_via_cli(model: str, url: str) -> tuple[bool, str]:
 
     The CLI asks the server that ``OLLAMA_HOST`` names, thus the call sets
     it to *url*.  Without it, the CLI uses its own default server, or the
-    ``OLLAMA_HOST`` of the shell, and not ``[llm] ollama_url``.
+    ``OLLAMA_HOST`` of the shell, and not the server of the check.
 
     Reads the merged stdout+stderr stream from a background thread and
     echoes it to stderr, so the CLI progress bar stays visible during the
@@ -282,19 +284,44 @@ def fix_tomli_w(_result, _project_root=None) -> tuple[bool, str]:
     return _pip_install("tomli-w")
 
 
+def _no_model_to_pull(result) -> tuple[bool, str] | None:
+    """Refuse a pull when the check did not find the model missing.
+
+    WHY: ``run_fixes`` also calls a fix for ``degraded``, for example a
+    chat server that gives no model list.  Such a result names no model,
+    thus the pull took the name ``"unknown"``.  The message of the failed
+    pull then replaced the message of the check.
+    """
+    if result.status == "missing":
+        return None
+    return False, f"no model to pull: {result.message}"
+
+
 def fix_chat_model(result, _project_root=None) -> tuple[bool, str]:
-    """Pull the configured chat model onto the server of ``[llm] ollama_url``."""
+    """Pull the configured chat model onto the Ollama server of the chat calls.
+
+    That server is ``ollama_url``, or the Ollama server of ``chat_api_base``
+    (`chat_router.chat_ollama_server`), the server that the check asks.
+    """
+    from ..llm.chat_router import chat_ollama_server
     from . import load_project_config
 
+    if refused := _no_model_to_pull(result):
+        return refused
+    server = chat_ollama_server(load_project_config(_project_root).llm)
+    if server is None:
+        return False, "an OpenAI-compatible API (chat_api_base) runs the chat model; Ollama cannot pull it"
     # Extract model name from the result message or fix_cmd
     model = _extract_model_name(result, "ollama")
-    return _ollama_pull(model, load_project_config(_project_root).llm.ollama_url)
+    return _ollama_pull(model, server)
 
 
 def fix_embed_model(result, _project_root=None) -> tuple[bool, str]:
     """Pull the configured embedding model onto the server of ``[llm] ollama_url``."""
     from . import load_project_config
 
+    if refused := _no_model_to_pull(result):
+        return refused
     model = _extract_model_name(result, "ollama")
     return _ollama_pull(model, load_project_config(_project_root).llm.ollama_url)
 

@@ -109,6 +109,31 @@ def detect_chat_endpoint(cfg: LLMConfig) -> tuple[str, str]:
     return ("openai", base + "/v1/chat/completions")
 
 
+def chat_ollama_server(cfg: LLMConfig) -> str | None:
+    """Return the URL of the Ollama server that runs the chat model.
+
+    Without ``chat_api_base``, this is ``ollama_url``.  With it, the
+    format of :func:`detect_chat_endpoint` decides.  For ``"ollama"``,
+    the server is the endpoint without ``/api/generate``.  For
+    ``"openai"``, the return value is ``None``: an OpenAI-compatible API
+    runs the model, and no Ollama server holds it.
+
+    WHY: the check and the pull of the chat model must use the server
+    that the chat calls use.  A check of ``ollama_url`` gave the wrong
+    answer when ``chat_api_base`` named a different server or a cloud API.
+
+    Raises:
+        ValueError: ``chat_api_format`` is not valid.
+    """
+    if not cfg.chat_api_base:
+        return cfg.ollama_url
+    fmt, endpoint = detect_chat_endpoint(cfg)
+    if fmt != "ollama":
+        return None
+    # Each "ollama" endpoint of detect_chat_endpoint ends with /api/generate.
+    return endpoint[: -len("/api/generate")]
+
+
 def _is_sse_response(resp: httpx.Response) -> bool:
     """Check whether an HTTP response is Server-Sent Events (SSE).
 

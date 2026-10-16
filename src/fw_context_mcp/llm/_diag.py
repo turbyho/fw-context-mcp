@@ -100,3 +100,23 @@ def check_setup(cfg: LLMConfig) -> dict:
     return result
 
 
+def installed_models(url: str) -> list[str] | None:
+    """Return the model names of the Ollama server at *url*, or ``None`` when it gives no list.
+
+    ``None`` covers a server that does not answer, an HTTP error, a URL
+    that is not valid, and an answer that is not the JSON of ``/api/tags``
+    (for example the HTML page of a proxy).  WHY no exception: the caller
+    reports the server, and a doctor check must not crash on it.
+    """
+    import httpx
+
+    try:
+        resp = httpx.get(url.rstrip("/") + "/api/tags", timeout=5.0)
+        resp.raise_for_status()
+        data = resp.json()
+    except (httpx.HTTPError, httpx.InvalidURL, OSError, ValueError):
+        return None
+    models = data.get("models") if isinstance(data, dict) else None
+    if not isinstance(models, list):
+        return None
+    return [m["name"] for m in models if isinstance(m, dict) and isinstance(m.get("name"), str)]
