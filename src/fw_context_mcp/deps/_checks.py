@@ -378,6 +378,21 @@ def check_watchfiles() -> DepCheckResult:
         )
 
 
+def check_config(problem: Exception | None) -> DepCheckResult:
+    """Report if the config files of fw-context can be used.
+
+    *problem* is the ``ConfigError`` of ``load`` for the project, or
+    ``None`` when the files load.  ``run_full_check`` loads the config one
+    time, and the checks that read the config are ``skipped`` after this
+    check fails.  WHY its own check: those checks reported "check crashed"
+    with the same message, each with ``critical=True``, and ``db-integrity``
+    among them read as a damaged database.
+    """
+    if problem is None:
+        return DepCheckResult(name="config", status="ok", message="the config files load", critical=False)
+    return DepCheckResult(name="config", status="error", message=str(problem), critical=True)
+
+
 def check_tomli_w() -> DepCheckResult:
     """Verify tomli-w is installed — required for config writes during init.
 
@@ -712,6 +727,7 @@ CHECK_ORDER: list[tuple[str, Any]] = [
     ("clang-resource", check_clang_resource),
     ("watchfiles", check_watchfiles),
     ("tomli-w", check_tomli_w),
+    ("config", check_config),
     ("ollama", check_ollama_running),
     ("chat-model", check_ollama_chat_model),
     ("embed-model", check_ollama_embed_model),

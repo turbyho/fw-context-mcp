@@ -3374,6 +3374,11 @@ def check_dependencies(
     project config run: the Python packages and libclang.  The Ollama,
     model, database and build checks need the config.
 
+    The check ``config`` names a config file that cannot be used.  The
+    checks that read the config are then ``skipped``.  When a config file
+    cannot be used, the tool cannot know if the project is initialized,
+    thus it runs every check.
+
     Args:
         project_root: Project root directory. Auto-detected from CWD if omitted.
 
@@ -3385,7 +3390,13 @@ def check_dependencies(
     from ...deps import run_full_check
 
     root = resolve_project_root(project_root)
-    if load_config(root).project.id:
+    try:
+        initialized = bool(load_config(root).project.id)
+    except ConfigError:
+        # The full audit: its check "config" names the file, and the
+        # checks that need no config still run.
+        initialized = True
+    if initialized:
         results = run_full_check(project_root=str(root))
     else:
         results = run_full_check(project_root=str(root), subset=set(_PRE_INIT_CHECKS))

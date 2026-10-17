@@ -717,7 +717,12 @@ fw-context doctor --project /path    # audit specific project
 - The libclang shared library and its version
 - The SQLite version and FTS5 support
 - Index database integrity and schema compatibility
-- Configuration file syntax and key validity
+- Configuration file syntax. The check `config` names a
+  config file that cannot be read, that is not UTF-8 or not valid TOML,
+  or that has a URL that is not valid. The checks that read the config
+  (Ollama, the models, the database and the disk) are then `skipped`.
+  When `--only` names one of these checks and the config does not load,
+  the command also gives the check `config`.
 - File permissions for the index directory and config files
 - The files, directories and config keys of an older fw-context
   (`obsolete-files`). `--fix` removes them.

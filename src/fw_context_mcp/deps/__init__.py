@@ -93,30 +93,68 @@ def run_full_check(
     """Complete dependency audit.
 
     Checks in dependency order; dependent checks return ``"skipped"``
-    when a prerequisite failed.  Loads config once for Ollama/model checks.
+    when a prerequisite failed.  Loads config once for the checks of
+    ``_NEEDS_CONFIG``.  When that load raises ``ConfigError``, the check
+    ``config`` gives the error, and the checks of ``_NEEDS_CONFIG`` are
+    ``skipped``.
 
     When *subset* is given, only checks whose ``name`` is in *subset* run
     (in ``CHECK_ORDER`` order).  Used by ``check_dependencies`` for the
     ``not_initialized`` path — pip-only checks that do not depend on a
     project config.  Default ``None`` runs the full audit (unchanged for
-    ``doctor``).
+    ``doctor``).  When *subset* holds a check of ``_NEEDS_CONFIG`` and
+    the config does not load, the check ``config`` also runs.  WHY: if
+    not, the subset gives only ``skipped`` rows, and ``exit_code``
+    reports no error.
 
     WHY: Loading config is slow (it triggers TOML parsing and build
     system detection).  Doing it once and sharing across multiple
     checks avoids redundant I/O.
     """
+    from ..config import ConfigError
     from ._checks import CHECK_ORDER
 
     results: list[DepCheckResult] = []
     ctx: dict = {}  # mutable state shared across checks (e.g. cfg)
 
+    def _config_problem() -> ConfigError | None:
+        # One load for all checks.  When the load raises ConfigError, the
+        # loop skips each check that reads the config: the check "config"
+        # reports it.  A different error is not kept: each check that
+        # reads the config then reports it as "check crashed".
+        if "config_problem" not in ctx:
+            try:
+                ctx["cfg"] = load_project_config(project_root)
+                ctx["config_problem"] = None
+            except ConfigError as exc:
+                ctx["config_problem"] = exc
+        return ctx["config_problem"]
+
+    def _config_row_is_necessary() -> bool:
+        # A subset that skips a check for a config that does not load must
+        # give the row "config" too.  Without it, `doctor --only
+        # db-integrity` gave "All checks passed." and exit code 0.
+        return subset is not None and bool(subset & _NEEDS_CONFIG) and _config_problem() is not None
+
     for name, fn in CHECK_ORDER:
-        if subset is not None and name not in subset:
+        if subset is not None and name not in subset and name != "config":
             continue
         try:
-            if name in ("ollama", "chat-model", "embed-model"):
-                if "cfg" not in ctx:
-                    ctx["cfg"] = load_project_config(project_root)
+            if name == "config":
+                # In the try: the load can raise an error that is not a
+                # ConfigError, for example a project name of two projects.
+                # The row "check crashed" then reports it.
+                if subset is not None and name not in subset and not _config_row_is_necessary():
+                    continue
+                r = fn(_config_problem())
+            elif name in _NEEDS_CONFIG and (problem := _config_problem()) is not None:
+                r = DepCheckResult(
+                    name=name,
+                    status="skipped",
+                    message=f"the config file {problem.path} cannot be used (check config)",
+                    critical=False,
+                )
+            elif name in ("ollama", "chat-model", "embed-model"):
                 r = fn(ctx["cfg"].llm)
             elif name in ("db-integrity", "disk-space", "obsolete-files"):
                 r = fn(project_root)
@@ -136,6 +174,14 @@ def run_full_check(
             )
 
     return results
+
+
+#: The checks that read the config of the project through ``load``.  When
+#: the load raises ``ConfigError``, ``run_full_check`` gives them ``skipped``.
+#: ``obsolete-files`` is not one of them: it catches the error of ``load``,
+#: and it reports a config file that it cannot parse.  A skip hides that
+#: result.
+_NEEDS_CONFIG = frozenset({"ollama", "chat-model", "embed-model", "db-integrity", "disk-space"})
 
 
 def load_project_config(project_root: str | Path | None = None) -> Config:
