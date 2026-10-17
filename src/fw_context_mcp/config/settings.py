@@ -1210,12 +1210,22 @@ def _check_url_values(layer: dict, path: Path) -> None:
         return
     for key in _URL_KEYS:
         value = llm.get(key)
-        if not isinstance(value, str):
-            continue
-        try:
-            _ = urlparse(value).hostname  # urlparse checks the host, and raises ValueError
-        except ValueError as exc:
-            raise ConfigError(path, f"[llm] {key} is not a valid URL ({exc})") from exc
+        if isinstance(value, str) and (problem := url_problem(value)) is not None:
+            raise ConfigError(path, f"[llm] {key} is not a valid URL ({problem})")
+
+
+def url_problem(value: str) -> str | None:
+    """Return why ``urlparse`` cannot read the host of *value*, or None.
+
+    ``load`` and the writers of the LLM settings use the same check.  WHY
+    a writer checks before it writes: a value that ``load`` refuses makes
+    the file unusable, and each tool then stops on it.
+    """
+    try:
+        _ = urlparse(value).hostname  # urlparse checks the host, and raises ValueError
+    except ValueError as exc:
+        return str(exc)
+    return None
 
 
 def _drop_malformed_sections(layer: dict, path: Path) -> None:
@@ -1656,20 +1666,24 @@ def _format_toml_value(key: str, value: object) -> str:
     Args:
         key: TOML key name.
         value: Value to format (str → quoted, bool → true/false,
-            int/float → unquoted number).
+            int/float → unquoted number).  A value of a different type is
+            written as the string that ``str()`` gives.
 
     Returns:
         ``"key = value\\n"`` string suitable for insertion into a TOML file.
+
+    WHY ``tomli_w`` and not a quote around the text: a ``"`` or a ``\\``
+    in a value (a model name, an API key) made a line that is not valid
+    TOML.  ``tomli_w`` escapes them, and a ``\\n`` too, thus the value
+    stays on one line (the line ends at the first ``\\n``).  It keeps
+    U+0085, U+2028 and U+2029, thus the reader of the file must split
+    only on ``\\n`` (``_update_local_toml``).
     """
-    if isinstance(value, bool):
-        val = "true" if value else "false"
-    elif isinstance(value, int):
-        val = str(value)
-    elif isinstance(value, float):
-        val = str(value)
-    else:
-        val = f'"{value}"'
-    return f"{key} = {val}\n"
+    import tomli_w  # lazy — only needed when actually writing
+
+    if not isinstance(value, (bool, int, float)):
+        value = str(value)
+    return tomli_w.dumps({key: value})
 
 
 def _update_local_toml(
@@ -1707,7 +1721,15 @@ def _update_local_toml(
     if not local_path.exists():
         _ensure_project_local_config(project_root)
 
-    lines = local_path.read_text(encoding="utf-8").splitlines(keepends=True)
+    # A split on "\n" only, not `splitlines`: that splits also on U+0085,
+    # U+2028 and U+2029, which `tomli_w` keeps in a string value.  Before,
+    # the next write replaced a part of such a line, and the rest made the
+    # file not valid TOML.  `read_text` already gives "\n" for "\r\n".
+    lines = re.findall(r"[^\n]*\n|[^\n]+\Z", local_path.read_text(encoding="utf-8"))
+    # A file whose last line has no "\n" (some editors write it so): a key
+    # inserted after that line joined it, and the file was not valid TOML.
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
 
     to_write = {k: v for k, v in updates.items() if v is not None}
     to_clear = set(clear_keys or ())
@@ -1753,8 +1775,6 @@ def _update_local_toml(
 
     if llm_start == -1 and to_write:
         # No [llm] section — append one at the end of the file
-        if lines and not lines[-1].endswith("\n"):
-            lines[-1] += "\n"
         lines.append("\n[llm]\n")
         llm_start = len(lines)
         llm_end = len(lines)

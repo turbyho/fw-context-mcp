@@ -58,7 +58,14 @@ def configure_llm_core(
         message (str — present on both success and error)}.  Never raises.
     """
     from ..config import load as load_config
-    from ..config.settings import _is_loopback_url, _update_local_toml
+    from ..config.settings import _URL_KEYS, _is_loopback_url, _update_local_toml, url_problem
+
+    # Before the compliance check and the write: `_is_loopback_url` raised
+    # ValueError for "http://[::1", and the caller got "Internal server
+    # error".  A written value of that kind makes `load` refuse local.toml.
+    for key, value in [*((key, updates.get(key)) for key in _URL_KEYS), ("chat_api_base", chat_api_base)]:
+        if isinstance(value, str) and (problem := url_problem(value)) is not None:
+            return {"status": "error", "message": f"{key} is not a valid URL ({problem}). Nothing was changed."}
 
     result: dict = {}
     if chat_api_base and not _is_loopback_url(chat_api_base):
@@ -103,7 +110,7 @@ def configure_llm_core(
     except Exception as e:
         return {
             "status": "error",
-            "message": f"The new settings could not be read back: {e}.{_roll_back()}",
+            "message": f"The new settings could not be read back: {str(e).rstrip('.')}.{_roll_back()}",
         }
 
     try:

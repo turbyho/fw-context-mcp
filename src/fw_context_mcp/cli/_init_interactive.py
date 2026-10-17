@@ -310,8 +310,11 @@ def prompt_llm_config(project_root: Path, cfg, *, non_interactive: bool) -> None
     elif choice == "3":
         from ..llm.configure import configure_llm_core
 
-        configure_llm_core(project_root, {"enabled": False})
-        print("  [ok] LLM disabled — embedding still works")
+        res = configure_llm_core(project_root, {"enabled": False})
+        if res.get("status") == "ok":
+            print("  [ok] LLM disabled — embedding still works")
+        else:
+            print(f"  [warn] {res.get('message', 'LLM setup failed')}")
     else:
         print("  [skip] LLM configuration skipped")
 
@@ -365,20 +368,28 @@ def _prompt_ollama_setup(project_root: Path, cfg) -> None:
         # configured cloud endpoint, otherwise chat keeps routing externally.
         clear_keys=["chat_api_base", "chat_api_key", "chat_api_format"],
     )
+    # An error means that no new setting is saved (see the cloud setup).
     if res.get("status") != "ok":
         print(f"  [warn] {res.get('message', 'LLM test call failed')}")
+        return
     print(f"  [ok] LLM configured: ollama + {chat} + {embed}")
     print("  [ok] Saved to .fw-context/local.toml")
 
 
 def _prompt_cloud_setup(project_root: Path) -> None:
     """Interactive cloud-API setup: URL, key, model."""
-    from ..config.settings import _is_loopback_url
+    from ..config.settings import _is_loopback_url, url_problem
     from ..llm.configure import configure_llm_core
 
     url = prompt_text("API URL") or ""
     if not url:
         print("  [skip] Cloud API setup skipped")
+        return
+    # Before `_is_loopback_url`: it raised ValueError for "http://[::1",
+    # and init stopped with a traceback.
+    problem = url_problem(url)
+    if problem is not None:
+        print(f"  [warn] {url} is not a valid URL ({problem}). Cloud API setup skipped")
         return
     key = prompt_text("API key") or ""
     model = prompt_text("Model", default="deepseek-chat") or "deepseek-chat"
@@ -390,7 +401,14 @@ def _prompt_cloud_setup(project_root: Path) -> None:
     updates: dict[str, object] = {"enabled": True, "chat_api_base": url, "model": model}
     if key:
         updates["chat_api_key"] = key
-    configure_llm_core(project_root, updates, chat_api_base=url)
+    res = configure_llm_core(project_root, updates, chat_api_base=url)
+    # An error means that no new setting is saved: the core puts the old
+    # settings back, or the write itself failed.  Before, "[ok] Saved" came
+    # after an error too, and named a setting that was not in the file.
+    # When the core cannot put the old settings back, its message says so.
+    if res.get("status") != "ok":
+        print(f"  [warn] {res.get('message', 'Cloud API setup failed')}")
+        return
     print(f"  [ok] LLM configured: cloud API {model} @ {url}")
     print("  [ok] Saved to .fw-context/local.toml")
 
