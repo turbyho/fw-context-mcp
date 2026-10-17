@@ -3542,6 +3542,11 @@ def configure_llm(
                 f"project root first. ({e.root})"
             ),
         }
+    except ConfigError as exc:
+        # The documented answer, not the list of the error boundary of
+        # `_wrap_tool`: the caller reads `status`.  The tool cannot load the
+        # config.  The message names the file that the user must correct.
+        return {"status": "error", "message": str(exc)}
 
     # Collect only the parameters the caller passed: None means "keep
     # current".  A value equal to the current one is not a change, so a

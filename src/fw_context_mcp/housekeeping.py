@@ -393,8 +393,8 @@ def _clean_project_files(project_root: Path, keep: Iterable[Path], report: Clean
     retired ``.fw-context/toolchains.toml``.  A database that a build of the
     index still reads stays (see :func:`databases_in_use`): a run that
     ``--variant`` narrowed leaves the other variants on their old copies.
-    When the index cannot be read, the build output stays, because an old
-    copy can be the only database of a build.
+    When fw-context cannot use the config or read the index, the build
+    output stays, because an old copy can be the only database of a build.
     """
     from .indexer.build_layout import _legacy_candidates, _protects
 
@@ -407,7 +407,9 @@ def _clean_project_files(project_root: Path, keep: Iterable[Path], report: Clean
         return
     in_use = databases_in_use(project_root)
     if in_use is None:
-        report.failures.append((project_root, "the index cannot be read, thus the old build output stays"))
+        report.failures.append(
+            (project_root, "fw-context cannot use the config or read the index, thus the old build output stays")
+        )
         candidates = [path for path in candidates if path.name == "toolchains.toml"]
         in_use = []
     kept = [*keep, *in_use]
@@ -425,8 +427,9 @@ def databases_in_use(project_root: Path) -> list[Path] | None:
     old layout by its name.  A cleanup before the first index of such a
     project removed it.
 
-    None when the index cannot be read: then no database may go.  The index
-    stores absolute paths; a relative one is relative to the project root.
+    None when fw-context cannot use the config or read the index: then no
+    database may go.  The index stores absolute paths; a relative one is
+    relative to the project root.
 
     The index opens read-only, not through ``open_db``: that runs the
     schema migrations, and ``doctor``, ``cleanup --dry-run`` and the MCP
@@ -459,7 +462,7 @@ def databases_in_use(project_root: Path) -> list[Path] | None:
         finally:
             conn.close()
     except SAFE_EXCEPT:
-        log.debug("Cannot read the index of %s", project_root, exc_info=True)
+        log.debug("Cannot use the config or read the index of %s", project_root, exc_info=True)
         return None
     return in_use + [path if path.is_absolute() else project_root / path for path in stored]
 

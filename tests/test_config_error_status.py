@@ -57,3 +57,18 @@ def test_the_two_copies_of_the_llm_instructions_name_the_status():
     for text in (BASE_INSTRUCTIONS, server.mcp.instructions):
         assert "config_error" in text
         assert "Do NOT run `fw-context init` or `fw-context index`" in " ".join(text.split())
+
+
+def test_configure_llm_gives_its_own_answer_for_a_config_error(broken):
+    """The error boundary gave a list with `error`: the caller reads `status` of a dict."""
+    from fw_context_mcp.mcp.handlers.maintenance import configure_llm
+
+    before = (broken / ".fw-context" / "config.toml").read_bytes()
+
+    answer = configure_llm(project_root=str(broken), model="m:1b")
+
+    path = broken / ".fw-context" / "config.toml"
+    assert answer == {"status": "error", "message": answer["message"]}, answer
+    assert answer["message"].startswith(f"{path}: not valid TOML"), answer
+    assert path.read_bytes() == before
+    assert not (broken / ".fw-context" / "local.toml").exists()

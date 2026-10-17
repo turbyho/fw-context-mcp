@@ -561,6 +561,20 @@ class TestFiles:
         assert not toolchains.exists() and flat.exists()
         assert [path for path, _ in report.failures] == [tmp_path]
 
+    def test_the_build_output_stays_for_a_config_that_does_not_parse(self, tmp_path: Path, home) -> None:
+        """The failure named the index: the index was not the cause."""
+        config = _project(tmp_path, "[index\n")
+        flat = tmp_path / ".fw-context" / "build" / "compile_commands.json"
+        flat.parent.mkdir(parents=True)
+        flat.write_text("[]", encoding="utf-8")
+
+        report = clean(tmp_path)
+
+        assert flat.exists()
+        failures = dict(report.failures)
+        assert set(failures) == {config, tmp_path}, failures
+        assert failures[tmp_path] == "fw-context cannot use the config or read the index, thus the old build output stays"
+
     def test_a_retired_global_file_goes_and_the_others_stay(self, tmp_path: Path, home: Path) -> None:
         (home / "platformio-shared.ini").write_text("[env]\n", encoding="utf-8")
         (home / "llm-debug.jsonl").write_text("{}\n", encoding="utf-8")

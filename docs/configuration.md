@@ -302,7 +302,7 @@ These commands do the cleanup:
 - `fw-context cleanup` (`--dry-run` shows the list and changes nothing)
 - `fw-context doctor --fix`, and `fw-context init`, which runs the same fixes. `fw-context doctor` shows the list as the check `obsolete-files`.
 
-The MCP server and the watcher daemon remove nothing. The background runs of the daemon are `fw-context index` runs, thus the cleanup runs in them too. When the cleanup cannot read or write a file, it logs a warning and continues: the index run does not stop for it. When the index cannot be read (for example an index of an older schema), the old build output stays until an index run migrates the index.
+The MCP server and the watcher daemon remove nothing. The background runs of the daemon are `fw-context index` runs, thus the cleanup runs in them too. When the cleanup cannot read or write a file, it logs a warning and continues: the index run does not stop for it. When fw-context cannot use the config or read the index (for example a config file that is not valid TOML, or an index of an older schema), the old build output stays. It stays until you correct the config file, or until an index run migrates the index.
 
 ## Examples
 
