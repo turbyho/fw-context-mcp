@@ -261,10 +261,11 @@ def watchfiles_instructions(ctx: dict) -> str:
 def db_integrity_instructions(ctx: dict) -> str:
     """How to recover when the check cannot read the index database.
 
-    WHY the text names the two cases: the check gives these instructions
-    for each error of the read, and a lock or a missing permission does
-    not damage the database.  A delete of such a database removes a good
-    index.
+    The check gives these instructions only for an error that shows damage
+    (``indexer.db.error_shows_damage``).  WHY the text still names the
+    two cases: a user can also read it for the message of a different tool.
+    A lock or a missing permission does not damage the database, and a
+    delete of such a database removes a good index.
     """
     return (
         "When the message shows damage (for example 'malformed'), delete the\n"

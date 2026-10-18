@@ -615,7 +615,14 @@ def check_obsolete_files(project_root: str | Path | None = None) -> DepCheckResu
 
 
 def check_db_integrity(project_root: str | Path | None = None) -> DepCheckResult:
-    """Verify the index database is not corrupt."""
+    """Verify the index database is not corrupt.
+
+    A read that fails with a lock, a missing permission or a fault of the
+    disk gives ``degraded``, not critical (``error_shows_damage``).  WHY:
+    the check reported each such failure as a critical ``error``, and the
+    exit code 2 of doctor then said "damaged" for a good index that an
+    index run held.
+    """
     platform_ctx = get_platform_info()
     from ..config import derive_project_id
     from ..config import load as load_config
@@ -663,9 +670,15 @@ def check_db_integrity(project_root: str | Path | None = None) -> DepCheckResult
                     message=f"quick_check: ok (index.db, {size_mb:.0f} MB)",
                     critical=True,
                 )
-            # quick_check returned an error — run full integrity_check
-            detail = conn.execute("PRAGMA integrity_check").fetchone()
-            detail_msg = detail[0] if detail else "unknown error"
+            # quick_check returned an error — run full integrity_check.
+            # quick_check found damage: an error of the second read (a lock,
+            # an I/O error) must not make it "not damage".
+            quick_msg = row[0] if row else "unknown error"
+            try:
+                detail = conn.execute("PRAGMA integrity_check").fetchone()
+            except sqlite3.Error:
+                detail = None
+            detail_msg = detail[0] if detail else quick_msg
             return DepCheckResult(
                 name="db-integrity",
                 status="error",
@@ -673,24 +686,34 @@ def check_db_integrity(project_root: str | Path | None = None) -> DepCheckResult
                 instructions=db_integrity_instructions(platform_ctx),
                 critical=True,
             )
-        except sqlite3.OperationalError as e:
-            return DepCheckResult(
-                name="db-integrity",
-                status="error",
-                message=f"cannot open database: {e}",
-                instructions=db_integrity_instructions(platform_ctx),
-                critical=True,
-            )
         finally:
             conn.close()
     except sqlite3.Error as e:
+        return _read_failure(e, platform_ctx)
+
+
+def _read_failure(error: sqlite3.Error, platform_ctx: dict) -> DepCheckResult:
+    """The result for a read of the index that failed: damage, or a cause that is not damage."""
+    from ..indexer.db import error_shows_damage
+
+    if error_shows_damage(error):
         return DepCheckResult(
             name="db-integrity",
             status="error",
-            message=f"database error: {e}",
+            message=f"database error: {error}",
             instructions=db_integrity_instructions(platform_ctx),
             critical=True,
         )
+    return DepCheckResult(
+        name="db-integrity",
+        status="degraded",
+        message=(
+            f"cannot read the index now: {error}. This does not show damage: the cause can be a lock, "
+            "a missing permission, a fault of the host (disk, memory) or a fault of the program. "
+            "Repair that cause, and do not delete the database."
+        ),
+        critical=False,
+    )
 
 
 def check_disk_space(project_root: str | Path | None = None) -> DepCheckResult:

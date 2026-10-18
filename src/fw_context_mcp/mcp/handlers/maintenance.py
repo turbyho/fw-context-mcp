@@ -52,6 +52,7 @@ from ...indexer.db import (
     WriteLockTimeout,
     compute_analysis_coverage,
     count_refs,
+    error_shows_damage,
     get_active_config,
     get_all_projects,
     get_db_schema_version,
@@ -1902,17 +1903,6 @@ def list_projects(
     return results
 
 
-# SQLite result codes (the low byte of an extended code) that do not show
-# damage of the database file:
-#   - a fault of the host: SQLITE_PERM, SQLITE_NOMEM, SQLITE_READONLY,
-#     SQLITE_IOERR, SQLITE_FULL, SQLITE_CANTOPEN, SQLITE_NOLFS
-#   - a different connection or a stop: SQLITE_ABORT, SQLITE_BUSY,
-#     SQLITE_LOCKED, SQLITE_INTERRUPT, SQLITE_PROTOCOL, SQLITE_SCHEMA
-#     (a run changed the schema), SQLITE_AUTH
-#   - a fault of the code: SQLITE_MISUSE, SQLITE_RANGE
-_FAULT_CODES = frozenset({3, 4, 5, 6, 7, 8, 9, 10, 13, 14, 15, 17, 21, 22, 23, 25})
-
-
 def _shows_damage(exc: sqlite3.DatabaseError) -> bool:
     """Tell if *exc* shows a damaged database, and not a lock or a fault of the disk.
 
@@ -1936,8 +1926,7 @@ def _shows_damage(exc: sqlite3.DatabaseError) -> bool:
         if not isinstance(exc.__cause__, sqlite3.Error):
             return True
         error = exc.__cause__
-    code = getattr(error, "sqlite_errorcode", None)
-    return code is not None and (code & 0xFF) not in _FAULT_CODES
+    return error_shows_damage(error)
 
 
 # ── moved from server.py ──

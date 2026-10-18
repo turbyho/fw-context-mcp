@@ -61,6 +61,7 @@ __all__ = [
     "delete_symbols_for_file",
     "drop_fts_triggers",
     "ensure_schema",
+    "error_shows_damage",
     "find_all_callers_recursive",
     "find_call_path",
     "find_callees_recursive",
@@ -161,6 +162,7 @@ from ._callgraph import (
 from ._connection import (
     DatabaseCorruptionError,
     ensure_schema,
+    error_shows_damage,
     get_db_schema_version,
     open_db,
     transaction,
