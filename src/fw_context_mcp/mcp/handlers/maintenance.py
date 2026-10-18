@@ -639,17 +639,23 @@ def _build_health(
         # to the operator, and its arguments are not readable from here.
         # A run that does not build leaves this reason standing.
         #
+        # A run in progress comes first, also for a database of the user
+        # (decision of the user, 2026-10-18): `rebuild` ends with "run
+        # `fw-context index`", and during a run this text asks for a
+        # second run.  The advice to wait is the one of
+        # each other reason (a missing file, a new source file).
+        #
         # A database of the user, or a build that fw-context cannot run (a
         # stub such as STM32CubeIDE): the user makes the file again, and the
         # next run records the checkout when the file is newer than the
         # checkout (`cli._index._records_checkout`).
-        if user_database(root, proj_cfg) is not None:
-            branch_advice = f"; {rebuild}"
-        elif bg_running:
+        if bg_running:
             branch_advice = (
                 "; an index run is in progress or scheduled — wait for it rather than "
                 f"start a second one, and when this reason stays after the run, {rebuild}"
             )
+        elif user_database(root, proj_cfg) is not None:
+            branch_advice = f"; {rebuild}"
         elif bg_build_allowed:
             branch_advice = (
                 "; a background reindex regenerates it with --build when "

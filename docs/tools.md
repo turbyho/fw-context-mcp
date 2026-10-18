@@ -2614,9 +2614,9 @@ When an index run is in progress or scheduled, some reasons tell you to
 wait for that run: a missing build, a missing source file that
 fw-context does not build by itself, a changed or missing
 compile_commands.json, a schema mismatch, an older row format, and a
-changed checkout. For a database that
-`[index] compile_commands` names, the reason of a changed checkout does
-not tell you to wait. The command of
+changed checkout. This is also true for a database that
+`[index] compile_commands` names: you can make the file again during the
+run, and run `fw-context index` after it. The command of
 such a reason is often the command that runs. For example, a run with
 `--build` removes the database of the build before the build writes it
 again. The reason still names the command, for the case that the reason
