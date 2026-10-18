@@ -3340,7 +3340,28 @@ def check_ollama(
     return result
 
 
-def _dep_to_schema(r) -> dict:
+def _with_project(command: str, root: Path) -> str:
+    """Add ``--project <root>`` to a ``fw-context doctor`` command; give each other command as it is.
+
+    WHY: the caller runs the command in its own shell, and its current
+    directory is not always the project of the call.  ``doctor`` then
+    checked and repaired a different project, or none.  The quotes are the
+    ones of PowerShell on Windows and of a POSIX shell on the other systems,
+    as in ``ollama_pull_command``.
+    """
+    import shlex
+    import sys
+
+    if not command.startswith("fw-context doctor"):
+        return command
+    if sys.platform == "win32":
+        quoted = "'" + str(root).replace("'", "''") + "'"
+    else:
+        quoted = shlex.quote(str(root))
+    return f"{command} --project {quoted}"
+
+
+def _dep_to_schema(r, root: Path) -> dict:
     """Map one ``DepCheckResult`` to the ``{name, status, critical, message, action}`` schema.
 
     The optional ``action`` carries a human-readable ``message`` (what is
@@ -3356,7 +3377,7 @@ def _dep_to_schema(r) -> dict:
         human = r.instructions or r.message
         if r.fix_cmd and human.strip() == r.fix_cmd.strip():
             human = r.message
-        d["action"] = {"message": human, "command": r.fix_cmd}
+        d["action"] = {"message": human, "command": _with_project(r.fix_cmd, root) if r.fix_cmd else r.fix_cmd}
     return d
 
 
@@ -3413,7 +3434,7 @@ def check_dependencies(
         results = run_full_check(project_root=str(root))
     else:
         results = run_full_check(project_root=str(root), subset=set(_PRE_INIT_CHECKS))
-    return [_dep_to_schema(r) for r in results]
+    return [_dep_to_schema(r, root) for r in results]
 
 
 def get_project_info(

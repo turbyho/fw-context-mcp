@@ -2869,7 +2869,8 @@ for each session, because it runs every check of the installation.
 Each entry holds `name`, `status`, `critical`, and `message`. An entry
 that has a repair also holds `action`: a `message` for a human, and the
 shell `command` that repairs it. Give both to the user without
-interpretation. A `status` of `"skipped"` means that a prerequisite is
+interpretation. A `fw-context doctor` command holds `--project <root>`:
+the shell of the user can be in a different directory. A `status` of `"skipped"` means that a prerequisite is
 missing. For example, the audit skips `libclang-so` when
 `libclang-python` is absent. A skipped check is not a failure.
 
