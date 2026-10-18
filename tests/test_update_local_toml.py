@@ -251,3 +251,36 @@ class TestUpdateLocalTomlNoSpaces:
         assert 'chat_api_base = "https://new.example.com/v1"' in content
         assert 'model="old"' not in content
         assert 'chat_api_base = "old_url"' not in content
+
+
+# ── Symlink and unchanged file ───────────────────────────────────────────────
+
+
+def test_a_symlinked_local_toml_stays_a_symlink(tmp_path: Path):
+    """The atomic write renamed a temporary file over the symlink.
+
+    The link was then a regular file, and the file that a dotfile manager
+    links no longer got the edit.
+    """
+    root = _make_project(tmp_path)
+    target = tmp_path / "dotfiles" / "local.toml"
+    target.parent.mkdir()
+    target.write_text("[llm]\n", encoding="utf-8")
+    link = root / ".fw-context" / "local.toml"
+    link.symlink_to(target)
+
+    _update_local_toml(root, {"model": "x:1b"})
+
+    assert link.is_symlink()
+    assert 'model = "x:1b"' in target.read_text(encoding="utf-8")
+
+
+def test_an_edit_that_changes_nothing_does_not_write(tmp_path: Path):
+    root = _make_project(tmp_path, local_toml="[llm]\nnum_ctx = 4096\n")
+    local = root / ".fw-context" / "local.toml"
+    before = local.stat()
+
+    _update_local_toml(root, {}, clear_keys=["chat_api_key"])
+
+    after = local.stat()
+    assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)

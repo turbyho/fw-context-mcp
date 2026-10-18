@@ -1675,6 +1675,50 @@ def read_config_file(path: Path) -> dict:
         raise ConfigError(path, f"not valid TOML: {exc}") from exc
 
 
+#: The ``[llm]`` keys that select the LLM backend: on or off, the chat model
+#: or the chat API, and the embedding model.  ``fw-context init`` reads them
+#: to tell which config file selects the backend, and its option "use the
+#: global settings" removes them from ``local.toml``.
+LLM_BACKEND_KEYS: tuple[str, ...] = (
+    "enabled", "model", "embed_model", "chat_api_base", "chat_api_key", "chat_api_format",
+)
+
+
+def llm_key_sources(project_root: Path) -> dict[str, str]:
+    """Return the config file that sets each key of ``LLM_BACKEND_KEYS``.
+
+    The value is ``"global"``, ``"project"`` (``config.toml``) or ``"local"``
+    (``local.toml``): the last file that sets the key, thus the file whose
+    value applies, because ``load`` merges the three in this order.  A key
+    that no file sets is absent: its value comes from the defaults or from
+    the automatic detection.
+
+    WHY a function and not a field of ``Config``: the merged config does
+    not keep where a value came from, and ``fw-context init`` must tell a
+    project that selects its own backend from a project that uses the
+    global settings.  WHY the paths are read at each call: tests point
+    ``_GLOBAL_CONFIG_PATH`` and ``_PROJECT_CONFIG_DIR`` to their own files
+    after the import.
+
+    Raises:
+        ConfigError: a config file cannot be read, or it is not valid TOML.
+    """
+    layers = (
+        ("global", _GLOBAL_CONFIG_PATH),
+        ("project", project_root / _PROJECT_CONFIG_DIR / _PROJECT_CONFIG_NAME),
+        ("local", project_root / _PROJECT_CONFIG_DIR / _PROJECT_LOCAL_CONFIG_NAME),
+    )
+    sources: dict[str, str] = {}
+    for layer, path in layers:
+        table = read_config_file(path).get("llm")
+        if not isinstance(table, dict):
+            continue
+        for key in LLM_BACKEND_KEYS:
+            if key in table:
+                sources[key] = layer
+    return sources
+
+
 def load_update_settings() -> UpdatesConfig:
     """Read ``[updates]`` from the global config file, and nothing else.
 
@@ -1941,7 +1985,7 @@ def _format_toml_value(key: str, value: object) -> str:
     TOML.  ``tomli_w`` escapes them, and a ``\\n`` too, thus the value
     stays on one line (the line ends at the first ``\\n``).  It keeps
     U+0085, U+2028 and U+2029, thus the reader of the file must split
-    only on ``\\n`` (``_update_local_toml``).
+    only on ``\\n`` (``_edit_llm_table``).
     """
     import tomli_w  # lazy — only needed when actually writing
 
@@ -1984,12 +2028,56 @@ def _update_local_toml(
     local_path = project_root / _PROJECT_CONFIG_DIR / _PROJECT_LOCAL_CONFIG_NAME
     if not local_path.exists():
         _ensure_project_local_config(project_root)
+    _edit_llm_table(local_path, updates, clear_keys=clear_keys, uncomment=True)
 
+
+def update_global_llm_key(key: str, value: object) -> Path:
+    """Set one key of ``[llm]`` in the global config, and keep its comments.
+
+    Only an active line of *key* is replaced; else the line goes to the end
+    of ``[llm]``.  WHY not a commented line, as ``local.toml`` does: the
+    global template holds several commented examples of one key, for
+    example one ``embed_model`` for each kind of machine, and the comment
+    above each describes it.  A value written over the first example then
+    stood under the text of a different machine.  WHY not
+    ``_toml_editor.set_key``: it writes through ``tomli_w``, which removes
+    every comment of the file.
+
+    Returns the path of the global config.
+
+    Raises:
+        ConfigError: the global config cannot be read, or it is not valid TOML.
+        OSError: the file cannot be written.
+    """
+    path = _ensure_global_config()
+    # Before the edit: a line editor cannot see that a file is not valid
+    # TOML, and it would write more text into it.
+    read_config_file(path)
+    _edit_llm_table(path, {key: value}, clear_keys=None, uncomment=False)
+    return path
+
+
+def _edit_llm_table(
+    path: Path,
+    updates: dict[str, object],
+    *,
+    clear_keys: list[str] | None,
+    uncomment: bool,
+) -> None:
+    """Write *updates* to the ``[llm]`` table of *path* and remove *clear_keys*, line by line.
+
+    The shared editor of ``_update_local_toml`` and
+    ``update_global_llm_key``: it keeps each comment, blank line and other
+    section.  *uncomment* True lets a value replace a commented line of
+    its key (``# key = …``), thus a template default becomes active in its
+    place.  False replaces only an active line.
+    """
     # A split on "\n" only, not `splitlines`: that splits also on U+0085,
     # U+2028 and U+2029, which `tomli_w` keeps in a string value.  Before,
     # the next write replaced a part of such a line, and the rest made the
     # file not valid TOML.  `read_text` already gives "\n" for "\r\n".
-    lines = re.findall(r"[^\n]*\n|[^\n]+\Z", local_path.read_text(encoding="utf-8"))
+    original_text = path.read_text(encoding="utf-8")
+    lines = re.findall(r"[^\n]*\n|[^\n]+\Z", original_text)
     # A file whose last line has no "\n" (some editors write it so): a key
     # inserted after that line joined it, and the file was not valid TOML.
     if lines and not lines[-1].endswith("\n"):
@@ -2044,13 +2132,15 @@ def _update_local_toml(
         llm_end = len(lines)
 
     # For each key: find and replace existing line, or insert before llm_end.
-    # Regex matches both active and commented-out keys (``# key = value``)
-    # so the user can uncomment a template default by running configure_llm.
+    # With *uncomment*, the regex matches both active and commented-out keys
+    # (``# key = value``) so the user can uncomment a template default by
+    # running configure_llm.
+    key_prefix = r"#?\s*" if uncomment else ""
     for key, value in to_write.items():
         found = False
         for i in range(llm_start, llm_end):
             stripped = lines[i].strip()
-            if re.match(rf"^#?\s*{re.escape(key)}\s*=", stripped):
+            if re.match(rf"^{key_prefix}{re.escape(key)}\s*=", stripped):
                 lines[i] = _format_toml_value(key, value)
                 found = True
                 break
@@ -2058,4 +2148,27 @@ def _update_local_toml(
             lines.insert(llm_end, _format_toml_value(key, value))
             llm_end += 1
 
-    local_path.write_text("".join(lines), encoding="utf-8")
+    # The editor finds the table only by the line "[llm]".  Another form of
+    # the same table (`[llm]  # note`, `["llm"]`, `llm = {…}`, `llm.model =
+    # …`) made it append a second [llm] table, and a removed line of a
+    # multi-line string left its end behind: the file was then not valid
+    # TOML, and `load` refused it.  For the global config that stops each
+    # project of the machine.  Thus the new text must parse, else the file
+    # does not change.
+    new_text = "".join(lines)
+    try:
+        tomllib.loads(new_text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(
+            path, f"the edit of [llm] gives text that is not valid TOML ({exc}); the file is not changed",
+        ) from exc
+    if new_text == original_text:
+        return
+    # Atomic: a reader in another process (the MCP server, the daemon) saw
+    # an empty file during a plain write, and cached the defaults.  To the
+    # file that a symlink points to: a rename over the symlink replaced it
+    # with a regular file, and a config that a dotfile manager links was
+    # then no longer linked.
+    from fw_context_mcp.config._toml_editor import _atomic_write
+
+    _atomic_write(path.resolve(), new_text)

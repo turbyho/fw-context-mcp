@@ -240,25 +240,26 @@ def _confirm(question: str, *, default: bool = True) -> bool:
     return answer in ("y", "yes")
 
 
-def _llm_configured(project_root: Path) -> bool:
-    """Return True when local.toml has an explicit (uncommented) LLM key."""
-    import re
+# The name of each config layer, as the LLM step of init gives it.
+_LAYER_FILES = {
+    "global": "the global config",
+    "project": ".fw-context/config.toml",
+    "local": ".fw-context/local.toml",
+}
 
-    local = project_root / ".fw-context" / "local.toml"
-    if not local.exists():
-        return False
-    in_llm = False
-    for line in local.read_text(encoding="utf-8").splitlines():
-        s = line.strip()
-        if s == "[llm]":
-            in_llm = True
-            continue
-        if in_llm and s.startswith("["):
-            in_llm = False
-            continue
-        if in_llm and re.match(r"^(model|chat_api_base|embed_model|enabled)\s*=", s):
-            return True
-    return False
+
+def _llm_layers(project_root: Path) -> list[str]:
+    """Return the config layers that select the LLM backend, in merge order.
+
+    A layer selects the backend when it sets a key of ``LLM_BACKEND_KEYS``.
+    Before, init read only ``local.toml``, thus a project that used a
+    complete ``[llm]`` table of the global config got "LLM: not
+    configured", and the menu gave no way to keep the global settings.
+    """
+    from ..config.settings import llm_key_sources
+
+    found = set(llm_key_sources(project_root).values())
+    return [layer for layer in _LAYER_FILES if layer in found]
 
 
 def _llm_summary(cfg) -> str:
@@ -278,32 +279,64 @@ def _llm_summary(cfg) -> str:
 def prompt_llm_config(project_root: Path, cfg, *, non_interactive: bool) -> None:
     """Configure the LLM backend interactively.  Idempotent.
 
-    Non-interactive mode prints manual-edit instructions (when unconfigured)
-    and returns.  Interactive mode shows the current config (when present)
-    with a "Change? [y/N]" prompt, otherwise runs the Local Ollama / Cloud
-    API / Disable menu.
+    The step tells where the backend comes from: the project
+    (``config.toml`` or ``local.toml``), the global config, or nowhere.
+
+    * The project selects the backend: a "Change? [y/N]" prompt, with the
+      file named.  On "y", the menu.
+    * Only the global config selects it: the menu, with option 0 "Use the
+      global settings" as the default (Enter), which writes nothing.
+    * Nothing selects it: the menu, and Enter skips the step.
+
+    In a project that selects the backend in ``local.toml`` and not in
+    ``config.toml``, option 0 removes the keys of ``LLM_BACKEND_KEYS``
+    from ``local.toml``, and the global settings then apply.  Enter keeps
+    the settings there: a removal must be a choice.  Option 0 is not given
+    when ``config.toml`` selects the backend: init writes only
+    ``local.toml``, and a committed setting applies to each user.
+
+    Non-interactive mode writes nothing.  It prints where the settings come
+    from, or the manual-edit instructions when nothing selects the backend.
     """
-    configured = _llm_configured(project_root)
+    layers = _llm_layers(project_root)
+    project_layers = [layer for layer in layers if layer != "global"]
+    from_global = "global" in layers
+    use_global_offered = from_global and "project" not in project_layers
 
     if non_interactive:
-        if not configured:
+        if not project_layers and from_global:
+            print(f"  LLM: {_llm_summary(cfg)} (from the global config)")
+        elif not project_layers:
             print("  LLM: not configured")
             print("    Configure it by running `fw-context init` interactively,")
             print("    or edit .fw-context/local.toml manually (see template).")
         return
 
-    if configured and not confirm_change("LLM", _llm_summary(cfg)):
-        return
-
-    print(f"  LLM: {'re-configure' if configured else 'not configured'}")
+    if project_layers:
+        where = " and ".join(_LAYER_FILES[layer] for layer in project_layers)
+        if not confirm_change("LLM", f"{_llm_summary(cfg)} (set in {where})"):
+            return
+        print("  LLM: re-configure")
+    elif from_global:
+        print(f"  LLM: {_llm_summary(cfg)} (from the global config)")
+    else:
+        print("  LLM: not configured")
     print("  fw-context can use an LLM for symbol analysis and smart search.")
     print("  How would you like to configure it?\n")
+    if use_global_offered and "local" in project_layers:
+        print("    0. Use the global settings (removes the [llm] backend keys of .fw-context/local.toml)")
+    elif use_global_offered:
+        print("    0. Use the global settings — Enter")
     print("    1. Local Ollama (recommended for offline use)")
     print("    2. Cloud API (DeepSeek, OpenAI, LiteLLM, ...)")
     print("    3. Disable LLM analysis (embedding still works)")
     choice = _input("  > ")
 
-    if choice == "1":
+    if use_global_offered and (choice == "0" or (choice == "" and not project_layers)):
+        _use_global_llm(
+            project_root, remove_local="local" in project_layers, old_embed_model=cfg.llm.embed_model,
+        )
+    elif choice == "1":
         _prompt_ollama_setup(project_root, cfg)
     elif choice == "2":
         _prompt_cloud_setup(project_root)
@@ -317,6 +350,68 @@ def prompt_llm_config(project_root: Path, cfg, *, non_interactive: bool) -> None
             print(f"  [warn] {res.get('message', 'LLM setup failed')}")
     else:
         print("  [skip] LLM configuration skipped")
+
+
+def _use_global_llm(project_root: Path, *, remove_local: bool, old_embed_model: str) -> None:
+    """Let the global LLM settings apply to the project (option 0 of the menu).
+
+    *remove_local*: remove the keys of ``LLM_BACKEND_KEYS`` from
+    ``local.toml``.  Else nothing is written: no project file selects the
+    backend.  No test call: the global settings are the ones that the
+    other projects use, and ``fw-context doctor`` does the check.
+    *old_embed_model* is the model that applied before: a note tells the
+    user when the removal changes it.
+    """
+    from ..config.settings import LLM_BACKEND_KEYS, ConfigError, _update_local_toml, llm_key_sources
+
+    if not remove_local:
+        print("  [ok] LLM: the global settings apply")
+        return
+    from ..config import load
+
+    local = project_root / ".fw-context" / "local.toml"
+    try:
+        previous = local.read_bytes()
+        _update_local_toml(project_root, {}, clear_keys=list(LLM_BACKEND_KEYS))
+        # The editor finds only the line "[llm]".  For another form of the
+        # table (`[llm]  # note`, an inline table) it removed nothing, and
+        # the step said "[ok]".  Thus read the file again.
+        left = sorted(key for key, layer in llm_key_sources(project_root).items() if layer == "local")
+    except (ConfigError, OSError) as exc:
+        print(f"  [warn] .fw-context/local.toml cannot be changed ({exc}). Nothing was changed.")
+        return
+    if left:
+        try:
+            # Only when the editor removed a part: an unchanged file is
+            # not written again.  Atomic, as the edit itself.
+            if local.read_bytes() != previous:
+                from ..config._toml_editor import _atomic_write
+
+                _atomic_write(local.resolve(), previous.decode("utf-8"))
+        except OSError as exc:
+            print(
+                f"  [warn] init cannot remove {', '.join(left)} from .fw-context/local.toml, and cannot "
+                f"write its old text back ({exc}). Read the file before the next command."
+            )
+            return
+        print(
+            f"  [warn] init cannot remove {', '.join(left)} from .fw-context/local.toml: its [llm] table "
+            "has a form that init does not edit. Nothing was changed. Remove the keys yourself."
+        )
+        return
+    print("  [ok] LLM: removed the [llm] backend keys of .fw-context/local.toml — the global settings apply")
+    # A different model gives vectors of a different meaning, and often of
+    # a different dimension: the next index run embeds each definition
+    # again.  The user must know that before the run, not after it.
+    try:
+        new_embed_model = load(project_root).llm.embed_model
+    except ConfigError:
+        return
+    if old_embed_model and new_embed_model and new_embed_model != old_embed_model:
+        print(
+            f"  [note] The embedding model changes from {old_embed_model} to {new_embed_model}: "
+            "the next index run embeds each definition again"
+        )
 
 
 def _prompt_ollama_setup(project_root: Path, cfg) -> None:

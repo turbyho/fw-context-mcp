@@ -25,6 +25,14 @@ The environment variable `FW_CONTEXT_HOME` moves the global `config.toml`, the l
 
 Run `fw-context init` to create the project config files with commented-out default values. This command also adds the necessary entries to `.gitignore`. On first use, fw-context creates only the global `~/.fw-context/config.toml`. The MCP tools and `fw-context index` create no config file in a project that `init` did not set up, and read a missing project file as empty.
 
+The LLM step of `fw-context init` tells which file selects the LLM backend. The backend keys are `enabled`, `model`, `embed_model`, `chat_api_base`, `chat_api_key` and `chat_api_format` of `[llm]`:
+
+- Only the global config sets them: the step shows the global values, and option 0 "Use the global settings" is the default (Enter). It writes nothing.
+- `local.toml` sets them: the step asks "Change? [y/N]". In the menu, option 0 removes these keys from `local.toml`, and the global settings then apply. Enter keeps the keys.
+- `config.toml` sets them: the menu has no option 0, because `init` writes only `local.toml`, and a committed setting applies to each developer.
+
+When no file sets `embed_model`, fw-context detects the model from the hardware: `qwen3-embedding:8b` with a GPU, `qwen3-embedding:0.6b` without one. `fw-context init` saves the detected name one time to the global config. Thus the model stays the same when a detection fails one time, which would embed the whole index again with a different dimension. The name goes to the global config and not to `local.toml`, because the hardware is a fact of the machine: each project then uses the global settings, and a later change of the global config applies to it. Earlier versions of `init` saved the name to `local.toml` of each project. Option 0 of the LLM step removes it.
+
 ### A config file that fw-context cannot use
 
 fw-context stops with an error when one of the three files has one of these problems:
