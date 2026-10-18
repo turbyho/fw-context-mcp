@@ -495,10 +495,12 @@ def _build_health(
     ``_analysis_of`` takes 55 ms for the 7 builds of one project together).
 
     The result holds the fields of the build that the two status tools
-    report, and three internal ones: ``_restart_reason`` (the index holds a
-    NEWER row format than this process reads), ``_restart_format``, and
-    ``_analysis_advice`` (what the message of a project needs for the
-    advice of :func:`_project_analysis_note`).
+    report, and the internal ones of ``_INTERNAL_HEALTH_KEYS``:
+    ``_restart_reason`` (the index holds a NEWER row format than this
+    process reads), ``_restart_format``, and ``_analysis_advice`` and
+    ``_embeddings_missing`` (what the message of a project needs for the
+    advice of :func:`_project_analysis_note` and
+    :func:`_project_embedding_note`).
     ``index_message`` comes without the two leading notes that concern the
     project, a run in progress and a restart of the client:
     :func:`_with_project_notes` adds them one time.
@@ -932,10 +934,11 @@ def _build_health(
             index_message += " — run `fw-context index` for a changed header"
 
     # Another action of this message comes first: the run of a reason or
-    # of a degraded index also does the analysis, and a newer row format
-    # needs a restart and no run.  Not "partial": its warning is advice in
-    # `_warning`, and `index_message` names no run for it.
-    analysis_other_run = needs_reindex or manifest_verification not in ("full", "partial")
+    # of a degraded index also does the analysis and the embeddings, and a
+    # newer row format needs a restart and no run.  Not "partial": its
+    # warning is advice in `_warning`, and `index_message` names no run
+    # for it.
+    run_named_above = needs_reindex or manifest_verification not in ("full", "partial")
     # LLM-analysis coverage, split by project/vendor, so the LLM reads
     # unanalyzed vendor symbols as expected (analyze_vendor=false), not as
     # a defect.
@@ -943,8 +946,17 @@ def _build_health(
         index_message += _analysis_message(analysis, stored_analyze_vendor)
         index_message += _analysis_advice(
             analysis, target.cfg, bg_running,
-            other_run=analysis_other_run,
+            other_run=run_named_above,
             restart=row_format_newer, stored_analyze_vendor=stored_analyze_vendor,
+        )
+    # Definitions without an embedding, in the two modes: the message of a
+    # project names each build that has them (`_project_embedding_note`).
+    embeddings_missing = _embeddings_missing(conn, cfg, proj_cfg, restart=row_format_newer)
+    if detail and embeddings_missing:
+        index_message += (
+            f" | Embeddings: {embeddings_missing} definition(s) have no embedding, "
+            "and the search by meaning does not find them"
+            + _run_action(bg_running, other_run=run_named_above, plain=_EMBEDDING_PLAIN_ACTION)
         )
 
     # ── This process is older than the index it reads ──
@@ -984,8 +996,9 @@ def _build_health(
         "_analysis_advice": {
             "waiting": _analysis_waiting(analysis, proj_cfg, restart=row_format_newer),
             "vendor_note": _analysis_vendor_note(proj_cfg, stored_analyze_vendor),
-            "other_run": analysis_other_run,
+            "other_run": run_named_above,
         },
+        "_embeddings_missing": embeddings_missing,
     }
     if warning is not None:
         health["_warning"] = warning
@@ -1067,7 +1080,9 @@ def _public(health: dict) -> dict:
 # The fields of a build health that only the status code reads.  A list of
 # names and not a prefix: `_warning` also starts with an underscore, and a
 # tool gives it.
-_INTERNAL_HEALTH_KEYS = frozenset({"_restart_reason", "_restart_format", "_analysis_advice"})
+_INTERNAL_HEALTH_KEYS = frozenset({
+    "_restart_reason", "_restart_format", "_analysis_advice", "_embeddings_missing",
+})
 
 
 # The fields of one build in the `builds` list of get_project_status.
@@ -1149,6 +1164,31 @@ def _project_analysis_note(labels: list[str], healths: list[dict], bg_running: b
     )
 
 
+def _project_embedding_note(labels: list[str], healths: list[dict], bg_running: bool) -> str:
+    """Return the embedding advice of a project of several builds, or "".
+
+    The counterpart of :func:`_project_analysis_note`, with the same rules:
+    one number for each build and no sum, and the run of the message when
+    any build has a reason or a degraded index.  The rules of one build are
+    in :func:`_embeddings_missing`.
+    """
+    missing = [
+        (label, health["_embeddings_missing"])
+        for label, health in zip(labels, healths, strict=True)
+        if health["_embeddings_missing"]
+    ]
+    if not missing:
+        return ""
+    listing = ", ".join(f"{label}: {count}" for label, count in missing)
+    other_run = any(health["_analysis_advice"]["other_run"] for health in healths)
+    return (
+        f" Definitions have no embedding in {len(missing)} of {len(healths)} builds ({listing}), "
+        "and the search by meaning does not find them"
+        + _run_action(bg_running, other_run=other_run, plain=_EMBEDDING_PLAIN_ACTION)
+        + "."
+    )
+
+
 def _project_health(builds: list, healths: list[dict], bg_running: bool) -> dict:
     """Join the health of several builds into the health of the project.
 
@@ -1211,6 +1251,7 @@ def _project_health(builds: list, healths: list[dict], bg_running: bool) -> dict
             f"Read reindex_reasons for the action, and builds for each build.{incomplete_note}"
         )
     message += _project_analysis_note(labels, healths, bg_running)
+    message += _project_embedding_note(labels, healths, bg_running)
     result = {
         "status": status,
         "reindex_needed": status == "reindex_needed",
@@ -1873,15 +1914,63 @@ def _analysis_action(bg_running: bool, *, other_run: bool, several: bool) -> str
     give the same action.  *several* selects the plural: the message of a
     project gives one number for each build.
     """
+    numbers = "the numbers do not go down" if several else "the number does not go down"
+    return _run_action(
+        bg_running, other_run=other_run,
+        plain=(
+            ": run `fw-context index` with the approval of the user, because the LLM can need "
+            f"hours. The analysis needs a running LLM: when {numbers} after the run, call check_ollama"
+        ),
+    )
+
+
+def _run_action(bg_running: bool, *, other_run: bool, plain: str) -> str:
+    """Return the end of an advice that an index run satisfies.
+
+    During a run, or when another action of the message names a run, the
+    text names that run: a second command next to it made the caller
+    start a second run, or a run without ``--build``.  Else *plain*.
+    """
     if bg_running:
         return ", and the index run in progress or scheduled does it"
     if other_run:
         return ", and the index run that the action above names does it"
-    numbers = "the numbers do not go down" if several else "the number does not go down"
-    return (
-        ": run `fw-context index` with the approval of the user, because the LLM can need "
-        f"hours. The analysis needs a running LLM: when {numbers} after the run, call check_ollama"
-    )
+    return plain
+
+
+# The plain action of the embedding advice.  An index run embeds each
+# definition that has no embedding (``_build_embeddings`` skips only an
+# unchanged content hash).  When Ollama cannot serve the run, the run
+# stamps the build "partial", and that warning names the repair.
+_EMBEDDING_PLAIN_ACTION = ": run `fw-context index`"
+
+
+def _embeddings_missing(conn, cfg, proj_cfg: Config, *, restart: bool) -> int:
+    """Return how many definitions of one build have no embedding, for the advice.
+
+    0 when no advice applies:
+
+    * The config does not ask for embeddings (``[llm] enabled`` and
+      ``[index] index_embeddings``): the user turned them off.
+    * The build has no ``embedding_dim``: no embedding step wrote to it,
+      thus each definition is without one, and the next run with
+      embeddings does them all.
+    * The stamp is "partial": its own warning names the repair.
+    * A newer row format needs a restart of the client, and no run.
+
+    WHY a count from the data and not a stamp: a re-parse of one file
+    (``reindex_file`` with ``with_analysis=False``, or a failed model)
+    leaves definitions without an embedding, and the stamp of the last
+    index run still says "full".  The search by meaning then did not find
+    them, and nothing told the user.
+    """
+    if restart or not (proj_cfg.llm.enabled and proj_cfg.index.index_embeddings):
+        return 0
+    if (cfg["manifest_verification"] or "none") == "partial":
+        return 0
+    if ("embedding_dim" not in cfg.keys()) or cfg["embedding_dim"] is None:
+        return 0
+    return len(symbols_without_embedding(conn, cfg["config_hash"]))
 
 
 def _list_status(db_schema_ver: int, cc_stale: bool, row_format_old: bool) -> str:
@@ -2781,7 +2870,7 @@ def _reindex_post_write_phases(
     *,
     missing_before: frozenset[int],
 ) -> dict:
-    """Run post-write enrichment phases after reindex_file.
+    """Run the model phases after reindex_file, when ``with_analysis`` is True.
 
     *missing_before* holds the definitions of the build that had no
     embedding before the re-parse (see :func:`_reindex_embeddings`).
@@ -2790,9 +2879,13 @@ def _reindex_post_write_phases(
     from running.  The phases are:
 
     1. LLM symbol analysis (function descriptions)
-    2. Virtual method override relationships
-    3. PageRank scores and hotspot cache
-    4. Vector embeddings for semantic search
+    2. Vector embeddings for semantic search — after the analysis, because
+       the text of an embedding holds the summary of the analysis.
+
+    The two need a model and can take minutes, thus ``with_analysis=False``
+    skips them.  The status tools report the symbols that they left
+    without an analysis or an embedding.  The graph phases do not need a
+    model: :func:`_reindex_graph_phases` runs them in the two modes.
 
     When ``total_symbols <= 0``, all phases are skipped (nothing was
     added or updated).
@@ -2809,11 +2902,39 @@ def _reindex_post_write_phases(
         return result
 
     _reindex_llm_analysis(conn, config_hash, cfg, db_dir, result, project_root=root)
-    _reindex_overrides(conn, config_hash, cfg, db_dir, result)
-    _reindex_pagerank(conn, config_hash, cfg, result)
-
     _reindex_embeddings(conn, config_hash, cfg, db_dir, target, root, result, missing_before)
     return result
+
+
+def _reindex_graph_phases(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    cfg: Config,
+    total_symbols: int,
+    db_dir: Path,
+    result: dict,
+) -> None:
+    """Rebuild the virtual method overrides, the PageRank scores and the hotspot cache after reindex_file.
+
+    Runs also with ``with_analysis=False``.  WHY: the re-parse deletes the
+    symbols of the translation unit and its headers and inserts them again
+    with new IDs.  ``ON DELETE CASCADE`` removes their rows of the hotspot
+    cache, and the new rows start with PageRank 0.  Measured on a project
+    of 7 builds: after a fast re-parse ``memset``, with 684 references,
+    was not in ``find_hotspots``, and nothing reported it.  No status can
+    see a missing score, because many symbols have PageRank 0 in a
+    complete index.  The phases need no model, and they are fast: at most
+    2 s for PageRank and the hotspot cache and 0.1 s for the overrides on
+    an index of 60 000 symbols (``indexer/_postprocess.py``).
+
+    Each phase is independent — a failure in one adds its warning to
+    *result* and does not stop the other.  Skipped when
+    ``total_symbols <= 0`` (nothing was added or updated).
+    """
+    if total_symbols <= 0:
+        return
+    _reindex_overrides(conn, config_hash, cfg, db_dir, result)
+    _reindex_pagerank(conn, config_hash, cfg, result)
 
 
 def _header_coverage_warning(
@@ -2872,7 +2993,7 @@ def reindex_file_impl(
     with_analysis: Annotated[
         bool,
         Field(
-            description="When True (default), also regenerates LLM symbol analysis, method override relationships, PageRank and embeddings — slower but produces a fully up-to-date index. Set False for a fast symbol-only update."
+            description="When True (default), also regenerates the LLM symbol analysis and the embeddings — slower, because the two need a model. Set False for a fast update: the tool skips the two, and get_project_status then reports the symbols that wait for them. The method overrides, the PageRank scores and the hotspot cache are rebuilt in the two modes."
         ),
     ] = True,
 ) -> dict:
@@ -2906,9 +3027,11 @@ def reindex_file_impl(
     reaches a median of 3 units but as many as 266 on a real project, at
     tens of seconds each.
 
-    Also regenerates LLM analysis and method override relationships for
-    affected symbols when ``with_analysis=True``.  The analysis is
-    content-addressed, thus an unchanged symbol is never re-analysed.
+    Also rebuilds the method override relationships, the PageRank scores
+    and the hotspot cache (in the two modes), and regenerates the LLM
+    analysis and the embeddings of the affected symbols when
+    ``with_analysis=True``.  The analysis is content-addressed, thus an
+    unchanged symbol is never re-analysed.
 
     Args:
         file_path: Path to the file to re-parse.  A source file must be in
@@ -2917,9 +3040,10 @@ def reindex_file_impl(
         variant: The variant of the one build to re-parse.  Omit it, and
             ``image``, to re-parse each build that compiles the file.
         image: The image of the one build to re-parse.
-        with_analysis: When True (default), also regenerates LLM symbol analysis,
-            method override relationships, PageRank, and embeddings. Set False
-            for a fast symbol-only update.
+        with_analysis: When True (default), also regenerates the LLM symbol
+            analysis and the embeddings, which need a model. Set False for a
+            fast update: the status tools then report the symbols that wait
+            for the two.
 
     A file that is gone from disk but still in the index has its records
     removed in each build that holds it; the result is then {file,
@@ -3084,6 +3208,7 @@ def _reindex_one_build(
     if coverage_warning:
         result["warning"] = coverage_warning
 
+    _reindex_graph_phases(conn, config_hash, cfg, total_symbols, db_path.parent, result)
     if not with_analysis:
         return result
 

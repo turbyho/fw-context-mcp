@@ -870,6 +870,18 @@ def test_every_copy_of_the_instructions_says_one_query_one_build():
         assert "twice" in text, f"{label}: no way given to compare two builds"
 
 
+def test_every_copy_of_the_instructions_names_the_missing_embeddings():
+    """The status names definitions without an embedding, and the reader must tell the operator.
+
+    The search by meaning does not find such a definition, thus a reader
+    that does not know the text takes an empty answer of semantic_search
+    as "no such code".
+    """
+    for label, text in _instruction_copies():
+        assert "definitions have no embedding" in text, label
+        assert "Tell the operator the command that the message names" in text, label
+
+
 def test_every_copy_of_the_instructions_teaches_paging():
     """A reader that misses this stops at the first page and calls it all.
 

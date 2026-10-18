@@ -414,6 +414,9 @@ get_project_status() status:
     symbols. When `index_message` says that symbols wait for the analysis
     and names `fw-context index`, tell the operator, and run it only
     with the approval of the operator: the LLM can need hours.
+  • `index_message` says that definitions have no embedding — the
+    search by meaning (semantic_search, smart_search) does not find
+    them. Tell the operator the command that the message names.
   • NO status, only `error` — the index holds no build config. There is
     no status "error".
   • The call fails with an error of SQLite (for example "database disk

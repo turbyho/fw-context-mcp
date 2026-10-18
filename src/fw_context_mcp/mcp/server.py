@@ -962,6 +962,9 @@ mcp = FastMCP(
         "    symbols. When `index_message` says that symbols wait for the analysis\n"
         "    and names `fw-context index`, tell the operator, and run it only\n"
         "    with the approval of the operator: the LLM can need hours.\n"
+        "  • `index_message` says that definitions have no embedding — the\n"
+        "    search by meaning (semantic_search, smart_search) does not find\n"
+        "    them. Tell the operator the command that the message names.\n"
         "  • NO status, only `error` — the index holds no build config. There is\n"
         '    no status="error".\n'
         '  • The call fails with an error of SQLite (for example "database disk\n'

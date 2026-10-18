@@ -2771,6 +2771,17 @@ analysis in 2 of 7 builds (board-a/app: 6, board-a/mcuboot: 2)`, and
 the same action. The message gives no sum, because a file that two
 builds compile is in the index of each build.
 
+`index_message` also names the definitions that have no embedding, when
+the config asks for embeddings (`[llm] enabled` and `[index]
+index_embeddings`) and an embedding step wrote to the build before. The
+search by meaning (`semantic_search`, `smart_search`) does not find these
+definitions. A re-parse with `reindex_file_impl(with_analysis=False)`
+leaves them, and the stamp of the last index run does not show it. The
+action is `fw-context index`, and the run in progress, or the run of a
+reason, does the embeddings too. A project of several builds names each
+build with its number, as for the analysis. A build with the stamp
+`partial` gets no such text: its `_warning` names the repair.
+
 When `analyze_vendor` is `false`, vendor symbols are skipped by design —
 a large unanalyzed vendor count is normal, not a defect.
 
@@ -2994,10 +3005,15 @@ failure, the dict holds `error`,
 and can also hold `skipped_tus` or `action`. `reindex_file` gives the same
 shape.
 
-When `with_analysis=True` (the default), this tool also regenerates the
-LLM symbol analysis and the method override relationships. This is
-slower, but produces a fully up-to-date index. Set `with_analysis=False`
-for a fast, symbol-only update. This tool requires an existing index. A
+In the two modes, this tool rebuilds the method override relationships,
+the PageRank scores and the hotspot cache of each build that it
+re-parses. When `with_analysis=True` (the default), it also regenerates
+the LLM symbol analysis and the embeddings of the symbols that the
+re-parse inserted, also the symbols of the headers that the unit
+includes. The two need a model, thus this is slower. Set
+`with_analysis=False` for a fast update. The symbols then wait for the
+analysis and the embeddings, and `get_project_status` names them with
+`fw-context index` as the action. This tool requires an existing index. A
 source file must appear in `compile_commands.json`. A header goes through
 one including translation unit, with the same `warning` as in
 `reindex_file`.
