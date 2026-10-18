@@ -542,9 +542,10 @@ class IndexConfig:
             trust dense-only routing in ``AdaptiveFusionPhase``.  Below this
             threshold FTS5 is used as fallback.  Set higher for projects
             with immature embedding quality (default 3, tuned on the Mbed project).
-        max_symbol_body_lines: Maximum number of source lines stored per
-            function/method body in the index.  Bodies longer than this are
-            truncated.  Default 1000.
+        max_symbol_body_lines: Maximum number of lines of one symbol body
+            that ``get_source`` and ``get_symbol_context`` return (the
+            config of the project of the query).  The index stores the
+            whole body.  Default 1000.
     """
 
     db_dir: Path = field(default_factory=lambda: Path.home() / ".fw-context" / "index")

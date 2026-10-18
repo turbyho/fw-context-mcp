@@ -20,12 +20,18 @@ from pathlib import Path
 
 import pytest
 
+from fw_context_mcp.mcp.handlers import source as _source
 from fw_context_mcp.mcp.handlers.source import (
     _body_matches_symbol,
     _read_probe_lines,
-    _read_verified_body,
     _stored_file_state,
 )
+
+
+def _read_verified_body(row, file_path: str, stored_state: tuple[float, str]):
+    """``source._read_verified_body`` with the default cap: these tests are not about the cap."""
+    return _source._read_verified_body(row, file_path, stored_state, body_cap=_source._MAX_SYMBOL_BODY_LINES)
+
 
 # The two functions are deliberately adjacent.  After the shift below, the
 # stored line number of `modem_init` lands on `other_function` — the exact
@@ -557,13 +563,12 @@ class TestTheLineCapReachesTheIndexBody:
     cuts in the middle of a line.
     """
 
-    def test_a_long_stored_body_is_capped(self, monkeypatch) -> None:
+    def test_a_long_stored_body_is_capped(self) -> None:
         from fw_context_mcp.mcp.handlers import source as mod
 
-        monkeypatch.setattr(mod, "_get_max_body_lines", lambda: 10)
         body = "".join(f"line {n}\n" for n in range(1, 101))
 
-        numbered = mod._number_lines(body, 1)
+        numbered = mod._number_lines(body, 1, 10)
 
         assert len(numbered.splitlines()) == 10, (
             "the stored body holds 100 lines and the cap is 10, thus the "
@@ -572,14 +577,13 @@ class TestTheLineCapReachesTheIndexBody:
         assert "line 1" in numbered
         assert "line 100" not in numbered
 
-    def test_a_short_body_is_untouched(self, monkeypatch) -> None:
+    def test_a_short_body_is_untouched(self) -> None:
         """The cap must bound the long body only."""
         from fw_context_mcp.mcp.handlers import source as mod
 
-        monkeypatch.setattr(mod, "_get_max_body_lines", lambda: 10)
         body = "a\nb\nc\n"
 
-        numbered = mod._number_lines(body, 5)
+        numbered = mod._number_lines(body, 5, 10)
 
         assert len(numbered.splitlines()) == 3
         assert numbered.splitlines()[0].endswith("a")
