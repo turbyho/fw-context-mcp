@@ -48,11 +48,6 @@ def _check_server_ready(project_root: Path | None = None) -> Path:
     global _project_ready_cache
     now = time.monotonic()
 
-    from fw_context_mcp.mcp.shared import context as _ctx
-
-    if _ctx._server_init_error is not None:
-        raise RuntimeError(_ctx._server_init_error)
-
     root = resolve_project_root(project_root)
     if root is None:
         msg = (

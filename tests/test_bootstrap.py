@@ -76,16 +76,6 @@ def _create_index_db(db_path: Path, project_id: str, root: Path) -> None:
         conn.close()
 
 
-@pytest.fixture(autouse=True)
-def _reset_sentinel():
-    """Ensure no leftover sentinel from other tests."""
-    from fw_context_mcp.mcp.shared import context as ctx
-
-    ctx._server_init_error = None
-    yield
-    ctx._server_init_error = None
-
-
 # ── not_initialized ──────────────────────────────────────────────────────────
 
 
@@ -389,35 +379,6 @@ class TestOtherToolsFailFast:
             from fw_context_mcp.mcp.handlers.maintenance import reindex_file
 
             reindex_file("test.c", project_root=str(root))
-
-
-# ── Sentinel bypass ──────────────────────────────────────────────────────────
-
-
-class TestSentinelBypass:
-    """get_project_status must work even when a sentinel is set (fatal error case)."""
-
-    def test_works_with_sentinel_set(self, tmp_path: Path):
-        """Even if _server_init_error is set, get_project_status should not be blocked."""
-        from fw_context_mcp.mcp.shared import context as ctx
-
-        ctx._server_init_error = "Some fatal error from main()"
-        root = _make_project_root(tmp_path, project_id=None)
-        result = get_project_status(project_root=str(root))
-        # get_project_status bypasses _check_server_ready, so it still works
-        assert result["status"] == "not_initialized"
-
-    def test_other_tools_blocked_by_sentinel(self, tmp_path: Path):
-        """When sentinel is set, other tools should raise RuntimeError."""
-        from fw_context_mcp.mcp.shared import context as ctx
-
-        ctx._server_init_error = "Fatal error"
-        pid = generate_project_id()
-        root = _make_project_root(tmp_path, project_id=pid)
-        with pytest.raises(RuntimeError, match="Fatal error"):
-            from fw_context_mcp.mcp.handlers.maintenance import reset_index
-
-            reset_index(project_root=str(root))
 
 
 # ── Modified files in fast mode ────────────────────────────────────

@@ -31,15 +31,6 @@ BUILDS = [("h-a", "a", ""), ("h-b", "b", "")]
 
 
 @pytest.fixture(autouse=True)
-def _reset_sentinel():
-    from fw_context_mcp.mcp.shared import context as ctx
-
-    ctx._server_init_error = None
-    yield
-    ctx._server_init_error = None
-
-
-@pytest.fixture(autouse=True)
 def _global_config(tmp_path: Path, monkeypatch) -> None:
     """Keep load() away from the global config of the operator (the path is fixed at import)."""
     import fw_context_mcp.config.settings as settings

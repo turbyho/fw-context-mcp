@@ -70,15 +70,6 @@ def _project(
 TWO_IMAGES = [("h-boot", "", "boot"), ("h-app", "", "app")]
 
 
-@pytest.fixture(autouse=True)
-def _reset_sentinel():
-    from fw_context_mcp.mcp.shared import context as ctx
-
-    ctx._server_init_error = None
-    yield
-    ctx._server_init_error = None
-
-
 class TestProjectStatus:
     def test_one_build_gives_its_fields_and_a_list_of_one(self, tmp_path):
         root = _project(tmp_path, [("h-only", "", "")])
