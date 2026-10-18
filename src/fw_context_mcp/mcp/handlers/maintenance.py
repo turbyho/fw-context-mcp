@@ -814,22 +814,26 @@ def _build_health(
         # `fw-context index` reads the same missing file.  The reason names
         # the action that makes it again.
         index_message = f"{compile_commands_text} Queries still work on existing data."
+    # The three take the action of their reason (`_with_action`).  WHY: a
+    # bare "Run fw-context index" stood after the advice to wait that
+    # `_with_project_notes` puts in front during a run, and a caller that
+    # read the end of the message started a second run.
     elif schema_old and cc_changed:
-        index_message = (
+        index_message = _with_action(
             f"Schema version mismatch ({db_schema_ver} < {CURRENT_SCHEMA_VERSION}) "
-            f"and compile_commands.json changed. Run fw-context index. "
-            f"Queries still work on existing data."
-        )
+            "and compile_commands.json changed",
+            "run `fw-context index`", bg_running,
+        ) + " Queries still work on existing data."
     elif schema_old:
-        index_message = (
-            f"Schema version mismatch ({db_schema_ver} < {CURRENT_SCHEMA_VERSION}). "
-            f"Run fw-context index. Queries still work on existing data."
-        )
+        index_message = _with_action(
+            f"Schema version mismatch ({db_schema_ver} < {CURRENT_SCHEMA_VERSION})",
+            "run `fw-context index`", bg_running,
+        ) + " Queries still work on existing data."
     elif row_format_old:
-        index_message = (
-            "The rows of the index have an older meaning than this version reads "
-            "(row_format_mismatch) — run fw-context index. Queries still work on existing data."
-        )
+        index_message = _with_action(
+            "The rows of the index have an older meaning than this version reads (row_format_mismatch)",
+            "run `fw-context index`", bg_running,
+        ) + " Queries still work on existing data."
     elif compile_commands_text:
         # The reason text, thus the message and the reason name one action.
         index_message = f"{compile_commands_text} Queries still work on existing data."
