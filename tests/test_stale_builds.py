@@ -195,7 +195,7 @@ def test_the_project_names_the_build_of_each_reason(tmp_path):
     builds = sorted(latest_builds(conn, "pid"), key=lambda r: r["image"])
     healths = [_health(conn, root, tmp_path, build["image"]) for build in builds]
 
-    project = _project_health(builds, healths)
+    project = _project_health(builds, healths, bg_running=False)
 
     assert project["status"] == "reindex_needed"
     assert len(project["reindex_reasons"]) == 1
@@ -213,7 +213,7 @@ def test_a_reason_of_every_build_comes_one_time(tmp_path):
     builds = sorted(latest_builds(conn, "pid"), key=lambda r: r["image"])
     healths = [_health(conn, root, tmp_path, build["image"]) for build in builds]
 
-    project = _project_health(builds, healths)
+    project = _project_health(builds, healths, bg_running=False)
 
     assert project["reindex_reasons"] == [
         "compile_commands.json changed after the last index run. Run `fw-context index`."
@@ -230,7 +230,7 @@ def test_a_missing_database_of_each_build_is_a_reason_of_each_build(tmp_path):
     builds = sorted(latest_builds(conn, "pid"), key=lambda r: r["image"])
     healths = [_health(conn, root, tmp_path, build["image"]) for build in builds]
 
-    project = _project_health(builds, healths)
+    project = _project_health(builds, healths, bg_running=False)
 
     assert [reason.split(" does not exist")[0] for reason in project["reindex_reasons"]] == [
         f"build v/app: compile_commands.json {root / 'app.json'}",
@@ -311,7 +311,7 @@ def test_the_project_message_names_a_build_with_modified_files(tmp_path):
     builds = sorted(latest_builds(conn, "pid"), key=lambda r: r["image"])
     healths = [_health(conn, root, tmp_path, build["image"]) for build in builds]
 
-    project = _project_health(builds, healths)
+    project = _project_health(builds, healths, bg_running=False)
 
     assert project["status"] == "ready"
     assert "v/boot: not_scheduled (1 modified file(s))" in project["index_message"], project["index_message"]

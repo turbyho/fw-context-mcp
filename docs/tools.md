@@ -2764,6 +2764,13 @@ analysis off, or a newer row format needs a restart of the client, the
 message gives no advice. The vendor symbols count when `[llm]
 analyze_vendor` of the config is true, as for the run.
 
+A project of several builds gives no `analysis` field and no coverage in
+`index_message`. When symbols wait for the analysis, its `index_message`
+names each build with its number, for example `Symbols wait for the LLM
+analysis in 2 of 7 builds (board-a/app: 6, board-a/mcuboot: 2)`, and
+the same action. The message gives no sum, because a file that two
+builds compile is in the index of each build.
+
 When `analyze_vendor` is `false`, vendor symbols are skipped by design —
 a large unanalyzed vendor count is normal, not a defect.
 

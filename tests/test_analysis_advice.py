@@ -97,6 +97,76 @@ def test_the_vendor_flag_of_the_config_counts(tmp_path, monkeypatch):
     assert "52 symbol(s) (with the vendor symbols: [llm] analyze_vendor is now true) wait" in message, message
 
 
+def _project_message(tmp_path, monkeypatch, llm: str, *, scheduled: bool = False) -> str:
+    """The ``index_message`` of get_project_status for the project of the two builds ``a`` and ``b``."""
+    from fw_context_mcp.mcp.handlers import maintenance
+
+    root, db_dir = _project(tmp_path)
+    (root / ".fw-context" / "local.toml").write_text(llm, encoding="utf-8")
+    monkeypatch.setattr(maintenance, "compute_analysis_coverage", lambda conn, config_hash: COVERAGE)
+    if scheduled:
+        _schedule(db_dir)
+    return maintenance.get_project_status(project_root=str(root))["index_message"]
+
+
+def test_a_project_of_several_builds_names_each_waiting_build(tmp_path, monkeypatch):
+    """Before: the status of a project of several builds gave no advice, only "fully up to date".
+
+    No sum over the builds: a file that two builds compile is in the index
+    of each, thus the count of each build stands alone.
+    """
+    message = _project_message(tmp_path, monkeypatch, ON)
+
+    assert (
+        "Symbols wait for the LLM analysis in 2 of 2 builds (a: 2, b: 2): run `fw-context index` "
+        "with the approval of the user" in message
+    ), message
+    assert "when the numbers do not go down after the run, call check_ollama" in message, message
+
+
+def test_a_project_of_several_builds_without_the_analysis_gets_no_advice(tmp_path, monkeypatch):
+    message = _project_message(tmp_path, monkeypatch, "[llm]\nenabled = true\nanalyze_symbols = false\n")
+
+    assert "wait for the LLM analysis" not in message, message
+
+
+def test_a_project_of_several_builds_waits_for_its_run(tmp_path, monkeypatch):
+    message = _project_message(tmp_path, monkeypatch, ON, scheduled=True)
+
+    assert "in 2 of 2 builds (a: 2, b: 2), and the index run in progress or scheduled does it" in message, message
+    assert "wait for the LLM analysis in 2 of 2 builds (a: 2, b: 2): run" not in message, message
+
+
+def test_a_reason_of_another_build_names_its_run(tmp_path, monkeypatch):
+    """Build ``b`` has a reason and no waiting symbol, build ``a`` waits.
+
+    One index run indexes each build, thus the advice for ``a`` names the
+    run of the reason.  Before: a bare `fw-context index` stood next to the
+    action of the reason of ``b``.
+    """
+    from fw_context_mcp.indexer.db import open_db
+    from fw_context_mcp.mcp.handlers import maintenance
+
+    root, db_dir = _project(tmp_path)
+    (root / ".fw-context" / "local.toml").write_text(ON, encoding="utf-8")
+    done = {"project": {"total": 10, "analyzed": 10, "skipped": 0}, "vendor": {"total": 0, "analyzed": 0, "skipped": 0}}
+    monkeypatch.setattr(
+        maintenance, "compute_analysis_coverage",
+        lambda conn, config_hash: COVERAGE if config_hash == "h-a" else done,
+    )
+    conn = open_db(db_dir / "index.db")
+    try:
+        conn.execute("UPDATE build_configs SET row_format = ? WHERE variant = 'b'", ("fw-context-rows/1",))
+        conn.commit()
+    finally:
+        conn.close()
+
+    message = maintenance.get_project_status(project_root=str(root))["index_message"]
+
+    assert "in 1 of 2 builds (a: 2), and the index run that the action above names does it" in message, message
+    assert "wait for the LLM analysis in 1 of 2 builds (a: 2): run" not in message, message
+
+
 def test_partial_embeddings_are_no_other_run(tmp_path, monkeypatch):
     """The warning of "partial" is advice: the message named no run, and the analysis advice said "the action above"."""
     from fw_context_mcp.mcp.handlers import maintenance

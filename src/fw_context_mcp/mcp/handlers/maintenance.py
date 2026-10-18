@@ -488,11 +488,17 @@ def _build_health(
     *detail* False leaves out what only a report of this one build gives:
     ``reference_count`` and ``analysis`` (None), and the analysis part of
     ``index_message``.  WHY: the list of the builds of a project shows
-    neither, and each costs queries over every symbol of the build.
+    neither, and the count of references costs a query over every
+    reference of the build.  The coverage of the LLM analysis is computed
+    in the two modes: the message of a project names the builds whose
+    symbols wait for it, and the queries are cheap (measured:
+    ``_analysis_of`` takes 55 ms for the 7 builds of one project together).
 
     The result holds the fields of the build that the two status tools
-    report, and two internal ones: ``_restart_reason`` (the index holds a
-    NEWER row format than this process reads) and ``_restart_format``.
+    report, and three internal ones: ``_restart_reason`` (the index holds a
+    NEWER row format than this process reads), ``_restart_format``, and
+    ``_analysis_advice`` (what the message of a project needs for the
+    advice of :func:`_project_analysis_note`).
     ``index_message`` comes without the two leading notes that concern the
     project, a run in progress and a restart of the client:
     :func:`_with_project_notes` adds them one time.
@@ -533,7 +539,7 @@ def _build_health(
         header_affected_tus = 0
     db_schema_ver = get_db_schema_version(conn)
 
-    analysis, stored_analyze_vendor = _analysis_of(conn, config_hash) if detail else (None, False)
+    analysis, stored_analyze_vendor = _analysis_of(conn, config_hash)
 
     cc_changed, stale_reason = _is_stale(cfg, cfg["compile_commands_path"])
     schema_old = db_schema_ver < CURRENT_SCHEMA_VERSION
@@ -925,19 +931,19 @@ def _build_health(
             # the run, or that the run needs `--build`.
             index_message += " — run `fw-context index` for a changed header"
 
+    # Another action of this message comes first: the run of a reason or
+    # of a degraded index also does the analysis, and a newer row format
+    # needs a restart and no run.  Not "partial": its warning is advice in
+    # `_warning`, and `index_message` names no run for it.
+    analysis_other_run = needs_reindex or manifest_verification not in ("full", "partial")
     # LLM-analysis coverage, split by project/vendor, so the LLM reads
     # unanalyzed vendor symbols as expected (analyze_vendor=false), not as
     # a defect.
-    if analysis is not None:
+    if detail:
         index_message += _analysis_message(analysis, stored_analyze_vendor)
         index_message += _analysis_advice(
             analysis, target.cfg, bg_running,
-            # Another action of this message comes first: the run of a
-            # reason or of a degraded index also does the analysis, and a
-            # newer row format needs a restart and no run.  Not "partial":
-            # its warning is advice in `_warning`, and `index_message` names
-            # no run for it.
-            other_run=needs_reindex or manifest_verification not in ("full", "partial"),
+            other_run=analysis_other_run,
             restart=row_format_newer, stored_analyze_vendor=stored_analyze_vendor,
         )
 
@@ -963,7 +969,7 @@ def _build_health(
         "reference_count": ref_count,
         "modified_files_count": modified_count,
         "header_affected_tus": header_affected_tus,
-        "analysis": analysis,
+        "analysis": analysis if detail else None,
         "manifest_verification": manifest_verification,
         "description": cfg["description"] if "description" in cfg.keys() else "",
         "first_indexed_at": cfg["first_indexed_at"] if "first_indexed_at" in cfg.keys() else "",
@@ -975,6 +981,11 @@ def _build_health(
         "index_message": index_message,
         "_restart_reason": restart_reason,
         "_restart_format": stored_format,
+        "_analysis_advice": {
+            "waiting": _analysis_waiting(analysis, proj_cfg, restart=row_format_newer),
+            "vendor_note": _analysis_vendor_note(proj_cfg, stored_analyze_vendor),
+            "other_run": analysis_other_run,
+        },
     }
     if warning is not None:
         health["_warning"] = warning
@@ -1050,7 +1061,13 @@ def _build_states(result: dict) -> list[str | None]:
 
 def _public(health: dict) -> dict:
     """Return the fields of *health* that a tool gives, without the internal ones."""
-    return {key: value for key, value in health.items() if not key.startswith("_restart")}
+    return {key: value for key, value in health.items() if key not in _INTERNAL_HEALTH_KEYS}
+
+
+# The fields of a build health that only the status code reads.  A list of
+# names and not a prefix: `_warning` also starts with an underscore, and a
+# tool gives it.
+_INTERNAL_HEALTH_KEYS = frozenset({"_restart_reason", "_restart_format", "_analysis_advice"})
 
 
 # The fields of one build in the `builds` list of get_project_status.
@@ -1100,7 +1117,39 @@ def _build_state_words(health: dict) -> str:
     return f"{state} ({', '.join(parts)})" if parts else state
 
 
-def _project_health(builds: list, healths: list[dict]) -> dict:
+def _project_analysis_note(labels: list[str], healths: list[dict], bg_running: bool) -> str:
+    """Return the analysis advice of a project of several builds, or "".
+
+    Before, the message of such a project gave no advice: the list of
+    builds computed no analysis, thus "Index is fully up to date" stood
+    over builds whose symbols waited for the analysis.  One number for
+    each build and no sum: a file that two builds compile is in the index
+    of each.  The rules and the action are the ones of
+    :func:`_analysis_advice`.  The action names the run of the message
+    when any build of the project has a reason or a degraded index, also a
+    build whose symbols do not wait: one index run indexes each build
+    (``cli/_index.py``), and a plain ``fw-context index`` next to the
+    action of a reason is not sufficient (the reason can need ``--build``).
+    """
+    waiting = [
+        (label, health["_analysis_advice"])
+        for label, health in zip(labels, healths, strict=True)
+        if health["_analysis_advice"]["waiting"]
+    ]
+    if not waiting:
+        return ""
+    listing = ", ".join(f"{label}: {advice['waiting']}" for label, advice in waiting)
+    vendor_note = next((advice["vendor_note"] for _, advice in waiting if advice["vendor_note"]), "")
+    other_run = any(health["_analysis_advice"]["other_run"] for health in healths)
+    return (
+        f" Symbols wait for the LLM analysis in {len(waiting)} of {len(healths)} builds "
+        f"({listing}){vendor_note}"
+        + _analysis_action(bg_running, other_run=other_run, several=True)
+        + "."
+    )
+
+
+def _project_health(builds: list, healths: list[dict], bg_running: bool) -> dict:
     """Join the health of several builds into the health of the project.
 
     No sums: a file that two images compile is in the index of each, thus
@@ -1161,6 +1210,7 @@ def _project_health(builds: list, healths: list[dict]) -> dict:
             f"{len(behind)} of {len(builds)} builds are not up to date — {listing}. "
             f"Read reindex_reasons for the action, and builds for each build.{incomplete_note}"
         )
+    message += _project_analysis_note(labels, healths, bg_running)
     result = {
         "status": status,
         "reindex_needed": status == "reindex_needed",
@@ -1497,14 +1547,18 @@ def _project_state(project_root: str | None, fast: bool) -> dict:
         hash_cache: dict[str, str] = {}
         facts = _project_facts(conn, target)
         # One build gives its whole health at the top level, as get_build_info
-        # does.  The list of several builds shows no analysis and no count of
-        # references, thus it does not pay for them.
+        # does.  The list of several builds shows no analysis field and no
+        # count of references, thus it does not pay for the count.  Its
+        # message names the builds whose symbols wait for the analysis.
         detail = len(builds) == 1
         healths = [
             _build_health(conn, target, build, fast=fast, hash_cache=hash_cache, facts=facts, detail=detail)
             for build in builds
         ]
-        result = _public(healths[0]) if len(builds) == 1 else _project_health(builds, healths)
+        result = (
+            _public(healths[0]) if len(builds) == 1
+            else _project_health(builds, healths, target.bg_running)
+        )
         result["builds"] = [_build_row(build, health) for build, health in zip(builds, healths, strict=True)]
         # A variant that the config declares and the index does not hold: no
         # query reaches it, and nothing else says that it exists.
@@ -1780,26 +1834,53 @@ def _analysis_advice(
     the two differ, the text says it: the coverage part before it describes
     the build as it was indexed ("vendor skipped").
     """
-    if restart or not (proj_cfg.llm.enabled and proj_cfg.llm.analyze_symbols):
+    waiting = _analysis_waiting(analysis, proj_cfg, restart=restart)
+    if not waiting:
         return ""
+    vendor_note = _analysis_vendor_note(proj_cfg, stored_analyze_vendor)
+    return (
+        f" — {waiting} symbol(s){vendor_note} wait for the analysis"
+        + _analysis_action(bg_running, other_run=other_run, several=False)
+    )
+
+
+def _analysis_waiting(analysis: dict, proj_cfg: Config, *, restart: bool) -> int:
+    """Return how many symbols of one build wait for the LLM analysis, for the advice.
+
+    0 when no advice applies: the config does not ask for the analysis, or
+    a newer row format needs a restart of the client.  The rules are the
+    ones of :func:`_analysis_advice`.
+    """
+    if restart or not (proj_cfg.llm.enabled and proj_cfg.llm.analyze_symbols):
+        return 0
     counts = [analysis["project"]]
     if proj_cfg.llm.analyze_vendor:
         counts.append(analysis["vendor"])
-    waiting = sum(max(0, c["total"] - c["analyzed"] - c["skipped"]) for c in counts)
-    if not waiting:
-        return ""
-    vendor_note = (
-        " (with the vendor symbols: [llm] analyze_vendor is now true)"
-        if proj_cfg.llm.analyze_vendor and not stored_analyze_vendor else ""
-    )
+    return sum(max(0, c["total"] - c["analyzed"] - c["skipped"]) for c in counts)
+
+
+def _analysis_vendor_note(proj_cfg: Config, stored_analyze_vendor: bool) -> str:
+    """Return the note that the vendor symbols count now, or "" (see :func:`_analysis_advice`)."""
+    if proj_cfg.llm.analyze_vendor and not stored_analyze_vendor:
+        return " (with the vendor symbols: [llm] analyze_vendor is now true)"
+    return ""
+
+
+def _analysis_action(bg_running: bool, *, other_run: bool, several: bool) -> str:
+    """Return the end of the analysis advice: the run that does the analysis.
+
+    One text for a build and for a project of several builds, thus the two
+    give the same action.  *several* selects the plural: the message of a
+    project gives one number for each build.
+    """
     if bg_running:
-        return f" — {waiting} symbol(s){vendor_note} wait for the analysis, and the index run in progress or scheduled does it"
+        return ", and the index run in progress or scheduled does it"
     if other_run:
-        return f" — {waiting} symbol(s){vendor_note} wait for the analysis, and the index run that the action above names does it"
+        return ", and the index run that the action above names does it"
+    numbers = "the numbers do not go down" if several else "the number does not go down"
     return (
-        f" — {waiting} symbol(s){vendor_note} wait for the analysis: run `fw-context index` "
-        "with the approval of the user, because the LLM can need hours. The analysis needs "
-        "a running LLM: when the number does not go down after the run, call check_ollama"
+        ": run `fw-context index` with the approval of the user, because the LLM can need "
+        f"hours. The analysis needs a running LLM: when {numbers} after the run, call check_ollama"
     )
 
 
