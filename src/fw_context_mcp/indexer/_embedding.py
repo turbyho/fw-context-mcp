@@ -27,6 +27,7 @@ from ..utils import SAFE_EXCEPT, is_fatal, remove_stale_tmp
 from . import _run_marker
 from .db import open_db
 from .db._embeddings import _vec_to_blob
+from .db._projects import EMBEDDABLE_KINDS
 
 log = logging.getLogger(__name__)
 
@@ -397,6 +398,7 @@ def _build_embeddings(
             pass  # content_hash column missing (pre-migration) — fall back to full embed
 
     # ── Phase 1: SELECT symbols to embed (read-only) ──
+    kind_placeholders = ", ".join("?" * len(EMBEDDABLE_KINDS))
     if symbol_ids:
         id_placeholders = ",".join("?" * len(symbol_ids))
         rows = conn.execute(
@@ -407,25 +409,23 @@ def _build_embeddings(
                 WHERE s.config_hash = ?
                   AND s.is_definition = 1
                   AND s.id IN ({id_placeholders})
-                  AND s.kind IN ('function', 'method', 'constructor', 'destructor',
-                                'class', 'struct', 'union', 'typedef', 'enum', 'varglobal')
+                  AND s.kind IN ({kind_placeholders})
                 ORDER BY CASE WHEN s.docstring IS NOT NULL AND LENGTH(s.docstring) > 30
                           THEN 0 ELSE 1 END""",
-            (config_hash, *symbol_ids),
+            (config_hash, *symbol_ids, *EMBEDDABLE_KINDS),
         ).fetchall()
     else:
         rows = conn.execute(
-            """SELECT s.id, s.name, s.qualified_name, s.kind, s.file_path,
-                      s.signature, s.is_definition, s.docstring, s.summary,
-                      s.source, s.is_project
-               FROM symbols s
-               WHERE s.config_hash = ?
-                 AND s.is_definition = 1
-                 AND s.kind IN ('function', 'method', 'constructor', 'destructor',
-                               'class', 'struct', 'union', 'typedef', 'enum', 'varglobal')
-               ORDER BY CASE WHEN s.docstring IS NOT NULL AND LENGTH(s.docstring) > 30
-                         THEN 0 ELSE 1 END""",
-            (config_hash,),
+            f"""SELECT s.id, s.name, s.qualified_name, s.kind, s.file_path,
+                       s.signature, s.is_definition, s.docstring, s.summary,
+                       s.source, s.is_project
+                FROM symbols s
+                WHERE s.config_hash = ?
+                  AND s.is_definition = 1
+                  AND s.kind IN ({kind_placeholders})
+                ORDER BY CASE WHEN s.docstring IS NOT NULL AND LENGTH(s.docstring) > 30
+                          THEN 0 ELSE 1 END""",
+            (config_hash, *EMBEDDABLE_KINDS),
         ).fetchall()
     if not rows:
         log.info("No definition symbols to embed (model=%s)", model)

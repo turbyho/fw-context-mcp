@@ -128,6 +128,7 @@ __all__ = [
     "set_analyze_vendor",
     "set_entry_point",
     "split_tokens",
+    "symbols_without_embedding",
     "transaction",
     "upsert_build_config",
     "upsert_embeddings",
@@ -236,6 +237,7 @@ from ._projects import (
     get_builds_for_scope,
     make_analysis_summary,
     set_analyze_vendor,
+    symbols_without_embedding,
     upsert_build_config,
     upsert_project,
 )

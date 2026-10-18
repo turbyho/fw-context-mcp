@@ -63,6 +63,7 @@ from ...indexer.db import (
     row_format_effect,
     row_format_is_newer,
     row_format_is_older,
+    symbols_without_embedding,
     transaction,
 )
 from ...indexer.git_context import head_moved, stored_head
@@ -2623,14 +2624,33 @@ def _reindex_embeddings(
     target: Path,
     root: Path,
     result: dict,
+    missing_before: frozenset[int],
 ) -> None:
-    """Regenerate vector embeddings for symbols in the reindexed file.
+    """Regenerate vector embeddings for the symbols that the re-parse inserted.
 
     Only runs when ``cfg.llm.enabled`` is True (the embedding model is
-    configured through the LLM subsystem).  Queries for all symbol IDs
-    belonging to the file path, then calls ``_build_embeddings`` with
-    the filtered ID set to avoid recomputing embeddings for the entire
-    index.
+    configured through the LLM subsystem).  Calls ``_build_embeddings``
+    with a set of IDs, to avoid recomputing embeddings for the entire
+    index.  The set holds two parts:
+
+    * The symbols of the file path.  An edit can change their text, and
+      ``_build_embeddings`` embeds a symbol again when its content hash
+      changed.
+    * Each definition that lost its embedding in this re-parse: it has
+      none now, and it is not in *missing_before*.  WHY: the re-parse also
+      deletes the symbols of the headers that the unit includes, for
+      example a ``static inline`` function, and inserts them again with
+      new IDs.  ``ON DELETE CASCADE`` removed their embeddings, and a set
+      of the file path alone left them without one.
+
+    WHY not each definition without an embedding: a build can have an
+    older gap of thousands of definitions, for example after a run that
+    could not reach Ollama, or with ``index_embeddings = false``.  One call
+    of this tool then embedded the whole build, which can take tens of
+    minutes.  ``fw-context index`` closes an older gap, and the status
+    tools report it.  WHY a set of gaps and not a set of IDs: SQLite can
+    give a new symbol the ID of a deleted one (no AUTOINCREMENT), thus an
+    ID that existed before can belong to a new symbol.
 
     When no symbols are found for the file path (possible for symlink
     or out-of-root files), the warning is logged but no error is raised.
@@ -2646,14 +2666,17 @@ def _reindex_embeddings(
                 (config_hash, _normalize_file_path(str(target), root)),
             ).fetchall()
         ]
-        if file_symbol_ids:
-            _reembed(conn, config_hash, cfg.llm, db_dir, symbol_ids=file_symbol_ids)
-        else:
+        if not file_symbol_ids:
             log.warning(
                 "No symbols found for path %s in DB — skipping embedding regeneration "
-                "(this may happen for files outside the project root or after a symlink change)",
+                "of its symbols (this may happen for files outside the project root "
+                "or after a symlink change)",
                 target,
             )
+        new_gaps = set(symbols_without_embedding(conn, config_hash)) - missing_before
+        symbol_ids = sorted(set(file_symbol_ids) | new_gaps)
+        if symbol_ids:
+            _reembed(conn, config_hash, cfg.llm, db_dir, symbol_ids=symbol_ids)
         conn.commit()
         reembedded = conn.execute(
             "SELECT COUNT(DISTINCT symbol_id) FROM embeddings e "
@@ -2674,8 +2697,13 @@ def _reindex_post_write_phases(
     target: Path,
     result: dict,
     root: Path,
+    *,
+    missing_before: frozenset[int],
 ) -> dict:
     """Run post-write enrichment phases after reindex_file.
+
+    *missing_before* holds the definitions of the build that had no
+    embedding before the re-parse (see :func:`_reindex_embeddings`).
 
     Each phase is independent — failure in one does not prevent others
     from running.  The phases are:
@@ -2703,7 +2731,7 @@ def _reindex_post_write_phases(
     _reindex_overrides(conn, config_hash, cfg, db_dir, result)
     _reindex_pagerank(conn, config_hash, cfg, result)
 
-    _reindex_embeddings(conn, config_hash, cfg, db_dir, target, root, result)
+    _reindex_embeddings(conn, config_hash, cfg, db_dir, target, root, result, missing_before)
     return result
 
 
@@ -2953,6 +2981,13 @@ def _reindex_one_build(
     vendor_patterns, project_patterns_list = _reindex_build_patterns(
         cfg, root, build_manifest
     )
+    # The gaps before the re-parse, thus the embedding step can tell the
+    # gaps that this re-parse makes from older ones (see
+    # `_reindex_embeddings`).
+    missing_before = (
+        frozenset(symbols_without_embedding(conn, config_hash))
+        if with_analysis and cfg.llm.enabled else frozenset()
+    )
     total_symbols, result = _reindex_parse_and_store(
         conn, matching, cfg_data, cfg.index.index_refs,
         root, db_path, target, vendor_patterns, project_patterns_list,
@@ -2973,7 +3008,7 @@ def _reindex_one_build(
 
     return _reindex_post_write_phases(
         conn, config_hash, cfg, total_symbols, db_path.parent,
-        target, result, root,
+        target, result, root, missing_before=missing_before,
     )
 
 
