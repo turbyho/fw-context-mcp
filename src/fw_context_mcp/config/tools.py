@@ -409,6 +409,11 @@ get_project_status() status:
     that fw-context did not use: a lower file or the default applies, and
     the tools work. Tell the operator each line. With the approval of the
     operator, `fw-context doctor --fix --only config` removes them.
+  • `analysis.complete: false` — the LLM analysis of some symbols is
+    missing. The tools work, and they give no llm_analysis for those
+    symbols. When `index_message` says that symbols wait for the analysis
+    and names `fw-context index`, tell the operator, and run it only
+    with the approval of the operator: the LLM can need hours.
   • NO status, only `error` — the index holds no build config. There is
     no status "error".
   • The call fails with an error of SQLite (for example "database disk

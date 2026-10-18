@@ -957,6 +957,11 @@ mcp = FastMCP(
         "    or the default applies, and the tools work. Tell the operator each\n"
         "    line. With the approval of the operator, `fw-context doctor --fix\n"
         "    --only config` removes them.\n"
+        "  • `analysis.complete: false` — the LLM analysis of some symbols is\n"
+        "    missing. The tools work, and they give no llm_analysis for those\n"
+        "    symbols. When `index_message` says that symbols wait for the analysis\n"
+        "    and names `fw-context index`, tell the operator, and run it only\n"
+        "    with the approval of the operator: the LLM can need hours.\n"
         "  • NO status, only `error` — the index holds no build config. There is\n"
         '    no status="error".\n'
         '  • The call fails with an error of SQLite (for example "database disk\n'

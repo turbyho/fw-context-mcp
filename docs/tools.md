@@ -2750,7 +2750,19 @@ project symbols that still need analysis:
   vendor symbol too).
 
 `index_message` also gives the analysis coverage, split into project and
-vendor symbols. An unanalyzed symbol is not a reindex reason.
+vendor symbols. An unanalyzed symbol is not a reindex reason. When the
+config asks for the analysis (`[llm] enabled` and `analyze_symbols`) and
+symbols wait for it, `index_message` says how many, and names
+`fw-context index`: each index run analyzes the symbols that wait, and
+an analyzed symbol does not go to the model again. Run it only with the
+approval of the user, because the LLM can need hours. The analysis needs
+a running LLM: when the number does not go down after the run, call
+`check_ollama`. During an index run, or when another action of the
+message needs an index run (a reindex reason, a degraded index), the
+message says that the run does the analysis. When the config turns the
+analysis off, or a newer row format needs a restart of the client, the
+message gives no advice. The vendor symbols count when `[llm]
+analyze_vendor` of the config is true, as for the run.
 
 When `analyze_vendor` is `false`, vendor symbols are skipped by design —
 a large unanalyzed vendor count is normal, not a defect.

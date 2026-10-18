@@ -929,6 +929,16 @@ def _build_health(
     # a defect.
     if analysis is not None:
         index_message += _analysis_message(analysis, stored_analyze_vendor)
+        index_message += _analysis_advice(
+            analysis, target.cfg, bg_running,
+            # Another action of this message comes first: the run of a
+            # reason or of a degraded index also does the analysis, and a
+            # newer row format needs a restart and no run.  Not "partial":
+            # its warning is advice in `_warning`, and `index_message` names
+            # no run for it.
+            other_run=needs_reindex or manifest_verification not in ("full", "partial"),
+            restart=row_format_newer, stored_analyze_vendor=stored_analyze_vendor,
+        )
 
     # ── This process is older than the index it reads ──
     # No command repairs this, thus it is a warning and not a reindex
@@ -1736,6 +1746,59 @@ def _analysis_message(analysis: dict, analyze_vendor: bool) -> str:
     return (
         f" | LLM analysis: project {p['analyzed']}/{p['total']}{skipped_note} "
         "(vendor skipped — analyze_vendor=false)"
+    )
+
+
+def _analysis_advice(
+    analysis: dict, proj_cfg: Config, bg_running: bool, *, other_run: bool, restart: bool, stored_analyze_vendor: bool,
+) -> str:
+    """Return the advice for an LLM analysis that is not complete, or "".
+
+    Decision of the user (2026-10-18): only advice.  The analysis is not a
+    reason to reindex, the status stays as it is, and the daemon starts no
+    run for it: the LLM can need hours, and that needs the approval of the
+    user, as a pull of a model does (``auto_pull`` is false).  Before, the
+    status gave ``complete: false`` and the counts, but no action, and
+    nothing analyzed the symbols until another cause started an index run.
+
+    The command is ``fw-context index``: each index run analyzes the
+    symbols that wait, when the config asks for the analysis, and the
+    analysis is content-addressed, thus an analyzed symbol does not go to
+    the model again.  No advice when the config does not ask for the
+    analysis: the user turned it off.  During an index run, the run
+    analyzes the symbols, thus the advice names no command.
+
+    *other_run*: a reason to reindex, or a degraded index, names its own
+    run, and that run also does the analysis.  A bare ``fw-context index``
+    next to it was not sufficient (the reason can need ``--build``).
+    *restart*: a newer row format needs a restart of the client, and no
+    run at all, thus no advice.
+
+    The vendor symbols count with ``[llm] analyze_vendor`` of the config,
+    as the run reads it, not with the value that the build stored.  When
+    the two differ, the text says it: the coverage part before it describes
+    the build as it was indexed ("vendor skipped").
+    """
+    if restart or not (proj_cfg.llm.enabled and proj_cfg.llm.analyze_symbols):
+        return ""
+    counts = [analysis["project"]]
+    if proj_cfg.llm.analyze_vendor:
+        counts.append(analysis["vendor"])
+    waiting = sum(max(0, c["total"] - c["analyzed"] - c["skipped"]) for c in counts)
+    if not waiting:
+        return ""
+    vendor_note = (
+        " (with the vendor symbols: [llm] analyze_vendor is now true)"
+        if proj_cfg.llm.analyze_vendor and not stored_analyze_vendor else ""
+    )
+    if bg_running:
+        return f" — {waiting} symbol(s){vendor_note} wait for the analysis, and the index run in progress or scheduled does it"
+    if other_run:
+        return f" — {waiting} symbol(s){vendor_note} wait for the analysis, and the index run that the action above names does it"
+    return (
+        f" — {waiting} symbol(s){vendor_note} wait for the analysis: run `fw-context index` "
+        "with the approval of the user, because the LLM can need hours. The analysis needs "
+        "a running LLM: when the number does not go down after the run, call check_ollama"
     )
 
 
