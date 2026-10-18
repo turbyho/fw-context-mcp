@@ -3309,12 +3309,11 @@ def check_ollama(
     except RuntimeError:
         # Project has no index — irrelevant for check_ollama (only needs
         # LLM config).  Fall back to loading config directly without
-        # requiring an active index.
-        from pathlib import Path
-
-        from fw_context_mcp.config.settings import load
-
-        cfg = load(Path(project_root) if project_root else None)
+        # requiring an active index.  WHY resolve_project_root: `load(None)`
+        # reads the global config only, thus the [llm] keys of local.toml
+        # of the project had no effect.  A project name went to `load` as a
+        # path relative to the current directory.
+        cfg = load_config(resolve_project_root(project_root))
     if not cfg.llm.enabled:
         # LLM is explicitly disabled in config.  Return immediately
         # with a message that explains the implications for tools that
