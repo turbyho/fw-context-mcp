@@ -169,3 +169,72 @@ def test_a_failed_restore_does_not_say_nothing_was_changed(project, monkeypatch,
 
     assert "cannot write its old text back (disk full)" in out, out
     assert "Nothing was changed" not in out, out
+
+
+def _ollama_defaults(monkeypatch, capsys, root: Path) -> tuple[list[str | None], str]:
+    """Choose option 1 (Ollama), accept each default; return the defaults of the model prompts and the output."""
+    from fw_context_mcp.cli import _init_interactive
+    from fw_context_mcp.config import load
+    from fw_context_mcp.llm import auto_model, configure, ollama
+
+    defaults: list[str | None] = []
+
+    def _prompt_text(label, default=None, **kwargs):
+        defaults.append(default)
+        return default
+
+    monkeypatch.setattr(configure, "configure_llm_core", lambda *a, **k: {"status": "ok"})
+    monkeypatch.setattr(_init_interactive, "prompt_text", _prompt_text)
+    monkeypatch.setattr(_init_interactive, "_confirm", lambda question, **kwargs: False)
+    monkeypatch.setattr(auto_model, "_gpu_available", lambda: False)
+    monkeypatch.setattr(ollama, "check_setup", lambda cfg: {"status": "ok", "installed_models": []})
+    replies = iter(["1"])
+    monkeypatch.setattr(_init_interactive, "_input", lambda prompt: next(replies))
+    _init_interactive.prompt_llm_config(root, load(root), non_interactive=False)
+    return defaults, capsys.readouterr().out
+
+
+def test_the_ollama_setup_offers_the_models_of_the_config(project, monkeypatch, capsys):
+    """Before: Enter replaced the models of the global config with the recommended ones."""
+    defaults, out = _ollama_defaults(monkeypatch, capsys, project)
+
+    assert defaults == ["global-chat:1b", "global-embed:1b"], out
+    assert "Current config: chat global-chat:1b, embedding global-embed:1b — Enter keeps them" in out, out
+
+
+def test_the_ollama_setup_offers_the_recommendation_without_a_config(project, monkeypatch, capsys):
+    from fw_context_mcp.config import settings
+
+    settings._GLOBAL_CONFIG_PATH.write_text("[index]\n", encoding="utf-8")
+
+    defaults, out = _ollama_defaults(monkeypatch, capsys, project)
+
+    assert defaults == ["qwen2.5-coder:14b", "qwen3-embedding:0.6b"], out
+    assert "Current config" not in out, out
+
+
+def test_the_chat_model_of_a_cloud_api_is_not_an_ollama_default(project, monkeypatch, capsys):
+    from fw_context_mcp.config import settings
+
+    settings._GLOBAL_CONFIG_PATH.write_text(
+        '[llm]\nenabled = true\nmodel = "deepseek-chat"\nchat_api_base = "http://127.0.0.1:9/v1"\n'
+        'embed_model = "global-embed:1b"\n',
+        encoding="utf-8",
+    )
+
+    defaults, _ = _ollama_defaults(monkeypatch, capsys, project)
+
+    assert defaults == ["qwen2.5-coder:14b", "global-embed:1b"]
+
+
+def test_an_embedding_model_that_ollama_does_not_serve_is_not_an_ollama_default(project, monkeypatch, capsys):
+    """The step offered to pull it from Ollama, and Enter said yes."""
+    from fw_context_mcp.config import settings
+
+    settings._GLOBAL_CONFIG_PATH.write_text(
+        '[llm]\nenabled = true\nmodel = "global-chat:1b"\nembed_model = "BAAI/bge-small-en-v1.5"\n', encoding="utf-8",
+    )
+
+    defaults, _ = _ollama_defaults(monkeypatch, capsys, project)
+
+    assert defaults == ["global-chat:1b", "qwen3-embedding:0.6b"]

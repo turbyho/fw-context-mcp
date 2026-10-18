@@ -31,6 +31,8 @@ The LLM step of `fw-context init` tells which file selects the LLM backend. The 
 - `local.toml` sets them: the step asks "Change? [y/N]". In the menu, option 0 removes these keys from `local.toml`, and the global settings then apply. Enter keeps the keys.
 - `config.toml` sets them: the menu has no option 0, because `init` writes only `local.toml`, and a committed setting applies to each developer.
 
+Option 1 (local Ollama) gives the models that a config file sets as the defaults of its prompts, thus Enter keeps them. Without such a file, the defaults are the recommended models. The chat model of a cloud API (`chat_api_base`) is not a default, because it is not a model of Ollama.
+
 When no file sets `embed_model`, fw-context detects the model from the hardware: `qwen3-embedding:8b` with a GPU, `qwen3-embedding:0.6b` without one. `fw-context init` saves the detected name one time to the global config. Thus the model stays the same when a detection fails one time, which would embed the whole index again with a different dimension. The name goes to the global config and not to `local.toml`, because the hardware is a fact of the machine: each project then uses the global settings, and a later change of the global config applies to it. Earlier versions of `init` saved the name to `local.toml` of each project. Option 0 of the LLM step removes it.
 
 ### A config file that fw-context cannot use

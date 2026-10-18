@@ -415,14 +415,30 @@ def _use_global_llm(project_root: Path, *, remove_local: bool, old_embed_model: 
 
 
 def _prompt_ollama_setup(project_root: Path, cfg) -> None:
-    """Interactive local-Ollama setup: recommend models, pull with consent."""
+    """Interactive local-Ollama setup: recommend models, pull with consent.
+
+    The default of each prompt is the model that a config file sets now,
+    else the recommendation.  WHY: before, the defaults were always the
+    recommendation, thus Enter replaced a model of the global config, for
+    example a larger chat model, with the recommended one.  Not a model
+    that Ollama does not serve: the chat model of a cloud API
+    (``chat_api_base``), or an embedding model of sentence-transformers or
+    ``ft://``.  The step would offer to pull it from Ollama.
+    """
+    from ..config.settings import llm_key_sources
     from ..llm.auto_model import _gpu_available
     from ..llm.configure import configure_llm_core
+    from ..llm.embedder_factory import uses_ollama
     from ..llm.ollama import check_setup
 
     gpu = _gpu_available()
-    chat_default = _DEFAULT_CHAT_MODEL
-    embed_default = "qwen3-embedding:8b" if gpu else "qwen3-embedding:0.6b"
+    chat_recommended = _DEFAULT_CHAT_MODEL
+    embed_recommended = "qwen3-embedding:8b" if gpu else "qwen3-embedding:0.6b"
+    sources = llm_key_sources(project_root)
+    chat_from_config = "model" in sources and cfg.llm.model and not cfg.llm.chat_api_base
+    chat_default = cfg.llm.model if chat_from_config else chat_recommended
+    embed_from_config = "embed_model" in sources and cfg.llm.embed_model and uses_ollama(cfg.llm)
+    embed_default = cfg.llm.embed_model if embed_from_config else embed_recommended
 
     result = check_setup(cfg.llm)
     status = result.get("status")
@@ -444,8 +460,10 @@ def _prompt_ollama_setup(project_root: Path, cfg) -> None:
 
     print(f"  Hardware: {'NVIDIA GPU detected' if gpu else 'CPU only (no GPU detected)'}")
     print("  Recommended:")
-    print(f"    chat:      {chat_default} (fixed default)")
-    print(f"    embedding: {embed_default}")
+    print(f"    chat:      {chat_recommended} (fixed default)")
+    print(f"    embedding: {embed_recommended}")
+    if (chat_default, embed_default) != (chat_recommended, embed_recommended):
+        print(f"  Current config: chat {chat_default}, embedding {embed_default} — Enter keeps them")
 
     chat = prompt_text("Chat model", default=chat_default) or chat_default
     embed = prompt_text("Embedding model", default=embed_default) or embed_default
