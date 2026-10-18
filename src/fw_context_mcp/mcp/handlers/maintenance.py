@@ -303,6 +303,19 @@ class _IndexTarget:
         return self.reindex_state is not None
 
 
+def _with_config_warnings(result: dict, cfg: Config) -> dict:
+    """Add ``config_warnings`` to *result* when ``load`` did not use a value of a config file.
+
+    WHY in the status: a warning only in the log was the defect of the
+    old "warning + default" rule, because nobody read it.  The caller
+    tells the user, and ``fw-context doctor --fix --only config`` removes
+    the values.
+    """
+    if cfg.config_warnings:
+        result["config_warnings"] = list(cfg.config_warnings)
+    return result
+
+
 def _index_target(project_root: str | None) -> _IndexTarget | dict:
     """Find the index of the project, or give the answer for a project without one.
 
@@ -331,7 +344,7 @@ def _index_target(project_root: str | None) -> _IndexTarget | dict:
             ),
         }
     if not fw_cfg.project.id:
-        return {
+        return _with_config_warnings({
             "status": "not_initialized",
             "project_root": str(root),
             "index_message": (
@@ -339,10 +352,10 @@ def _index_target(project_root: str | None) -> _IndexTarget | dict:
                 "Run `fw-context init` via bash to create a project ID and config, "
                 "then call get_project_status() again."
             ),
-        }
+        }, fw_cfg)
     db_path = fw_cfg.index.db_dir / fw_cfg.project.id / "index.db"
     if not db_path.exists():
-        return {
+        return _with_config_warnings({
             "status": "no_index",
             "project_root": str(root),
             "project_id": fw_cfg.project.id,
@@ -351,7 +364,7 @@ def _index_target(project_root: str | None) -> _IndexTarget | dict:
                 "Run `fw-context index <path/to/compile_commands.json>` via bash "
                 "to build the index, then call get_project_status() again."
             ),
-        }
+        }, fw_cfg)
     # Read BEFORE the database: while a run is in progress the cache of
     # modified files can hold the counts from before it started.
     # The ID of this read of the config: a second read can meet a file
@@ -997,7 +1010,7 @@ def _with_project_notes(result: dict, target: _IndexTarget, restart_reason: str,
     result["vec_available"] = vec_ok
     if vec_err is not None:
         result["vec_error"] = vec_err
-    return result
+    return _with_config_warnings(result, target.cfg)
 
 
 def _build_states(result: dict) -> list[str | None]:
@@ -1233,8 +1246,9 @@ def get_project_status(
     * ``"no_index"`` — initialized, never indexed. Run ``fw-context index``.
     * ``"not_initialized"`` — run ``fw-context init``.
     * ``"config_error"`` — a config file cannot be used: it cannot be read,
-      it is not UTF-8 or not valid TOML, or a value in it has the wrong type
-      or is not a valid URL.  ``config_file`` names it, and
+      it is not UTF-8 or not valid TOML, a section is not a table, a key
+      that selects the data or where data goes has a value of the wrong
+      type, or a URL is not valid.  ``config_file`` names it, and
       ``index_message`` gives the problem.  Correct the file, or run
       ``fw-context doctor --fix --only config`` when the message names
       it: it removes each value that cannot be used.  ``fw-context init``
@@ -1406,7 +1420,10 @@ def get_project_status(
         exists, the result adds ``project_id``.  For ``"config_error"``, it
         adds ``config_file``.  The two version fields
         (``client_restart_*`` for an upgrade, ``update_notice``) can come
-        with every result, these two included.
+        with every result, these two included.  ``config_warnings`` (a
+        list) can come with each result that has a ``status`` other than
+        ``"config_error"``: values of a config file that fw-context did not
+        use.  Tell the user each line.
     """
     return _with_version_state(_project_state(project_root, fast))
 
@@ -1429,7 +1446,7 @@ def _outdated_state(target: _IndexTarget, reason: str) -> dict:
     failed = problem if problem is not None and not target.bg_running else None
     reasons = [failed.text, reason] if failed else [reason]
     message = failed.text if failed else reason
-    return {
+    return _with_config_warnings({
         "project_id": target.project_id,
         "project_root": str(target.root),
         "status": "reindex_needed",
@@ -1437,7 +1454,7 @@ def _outdated_state(target: _IndexTarget, reason: str) -> dict:
         "reindex_reasons": reasons,
         "reindex_state": "failed" if failed else (target.reindex_state or "not_scheduled"),
         "index_message": f"{message} No tool reads a build of this index until a run adds the columns.",
-    }
+    }, target.cfg)
 
 
 def _project_state(project_root: str | None, fast: bool) -> dict:
@@ -1603,6 +1620,7 @@ def get_build_info(
         a dict that holds ``error`` alone.  A project that is not
         initialized, that has no index, or whose config file cannot be used
         (``"config_error"``) gets the answer of ``get_project_status``.
+        ``config_warnings`` (a list) comes as in ``get_project_status``.
     """
     target = _index_target(project_root)
     if isinstance(target, dict):

@@ -942,8 +942,9 @@ mcp = FastMCP(
         "    NOTE: init and index are NEVER combined — each requires its own\n"
         "    operator confirmation before execution.\n"
         '  • status="config_error" — a config file of fw-context cannot be used:\n'
-        "    it cannot be read, it is not UTF-8 or not valid TOML, or a value in\n"
-        "    it has the wrong type or is not a valid URL. `config_file` names it,\n"
+        "    it cannot be read, it is not UTF-8 or not valid TOML, a section is\n"
+        "    not a table, a key that selects the data or where data goes has a\n"
+        "    value of the wrong type, or a URL is not valid. `config_file` names it,\n"
         "    and `index_message` gives the problem (for TOML also the line). Tell\n"
         "    the operator the file and the problem. Do NOT run `fw-context init`\n"
         "    or `fw-context index`: they cannot repair the file. When\n"
@@ -951,6 +952,11 @@ mcp = FastMCP(
         "    command removes each value that cannot be used. Run it, or correct\n"
         "    the file, only with the approval of the operator, then call\n"
         "    get_project_status() again.\n"
+        "  • `config_warnings` (a list, with a status other than config_error) —\n"
+        "    values of a config file that fw-context did not use: a lower file\n"
+        "    or the default applies, and the tools work. Tell the operator each\n"
+        "    line. With the approval of the operator, `fw-context doctor --fix\n"
+        "    --only config` removes them.\n"
         "  • NO status, only `error` — the index holds no build config. There is\n"
         '    no status="error".\n'
         '  • The call fails with an error of SQLite (for example "database disk\n'

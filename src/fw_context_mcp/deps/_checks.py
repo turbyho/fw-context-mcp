@@ -395,10 +395,12 @@ def check_config(problem: Exception | None, project_root: str | Path | None = No
     without write permission).  The row has a fix command when the fix can
     remove a value.  A file that is not valid TOML needs the user: the row
     then gives the error of ``load`` and no fix command.
+
+    When the files load, a value of a key of ``_TUNING_KEYS`` with the wrong
+    type can still be there: ``load`` did not use it (a warning).  The row
+    is then ``degraded`` and not critical, with the same list and fix.
     """
-    if problem is None:
-        return DepCheckResult(name="config", status="ok", message="the config files load", critical=False)
-    if not getattr(problem, "values", False):
+    if problem is not None and not getattr(problem, "values", False):
         return DepCheckResult(name="config", status="error", message=str(problem), critical=True)
     from ..housekeeping import remove_unusable_values
     from ..utils import resolve_project_root
@@ -410,14 +412,20 @@ def check_config(problem: Exception | None, project_root: str | Path | None = No
     report = remove_unusable_values(root, dry_run=True)
     parts = [f"{path}: {label}" for path, label in report.removed_keys]
     parts += [f"{path}: {reason}" for path, reason in report.failures]
+    if problem is None and not parts:
+        return DepCheckResult(name="config", status="ok", message="the config files load", critical=False)
+    if problem is None:
+        lead = "config values that fw-context does not use (a lower file or the default applies): "
+    else:
+        lead = "config values that fw-context cannot use: "
     return DepCheckResult(
         name="config",
-        status="error",
-        message="config values that fw-context cannot use: " + "; ".join(parts),
+        status="error" if problem is not None else "degraded",
+        message=lead + "; ".join(parts),
         # --only config: a full `doctor --fix` also pulls the missing models,
         # after the fix of the config lets their checks run.
         fix_cmd="fw-context doctor --fix --only config" if report.removed_keys else None,
-        critical=True,
+        critical=problem is not None,
     )
 
 

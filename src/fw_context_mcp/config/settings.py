@@ -654,6 +654,10 @@ class Config:
     index: IndexConfig = field(default_factory=IndexConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     cache_server: CacheServerConfig | None = None
+    #: One line for each value that ``load`` did not use: ``<file>: <problem>``.
+    #: The value of a lower file, or the default, applies to the key.  See
+    #: ``_TUNING_KEYS``.  The status tools give it to the caller.
+    config_warnings: list[str] = field(default_factory=list)
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -1207,6 +1211,46 @@ _IMAGE_FIELDS: tuple[str, ...] = ("name", "description", "dir", "type", "board")
 _OVERRIDE_CONVERTERS: dict[str, str] = {key: conv for key, _, conv in (*_BUILD_FIELDS, *_INDEX_FIELDS)}
 
 
+#: The keys whose default does not change which data fw-context reads or
+#: makes, or where the data goes.  A value of the wrong type there gives a
+#: warning: the key keeps the value of a lower file, or its default, and
+#: the tools keep working.  Each other key gives a ConfigError.
+#:
+#: WHY two levels (decision of the user, 2026-10-18): with a ConfigError for
+#: each value, one typo in a timeout stopped every MCP tool.  A default of
+#: the index path, of the build or of the embedding model gives answers
+#: about other data, and must stop.  A new key is critical until it is in
+#: this list.
+_TUNING_KEYS: frozenset[tuple[str, str]] = frozenset({
+    ("project", "name"),
+    ("index", "index_refs"),
+    ("index", "index_embeddings"),
+    ("index", "rerank_top_k"),
+    ("index", "min_dense_count"),
+    ("index", "max_symbol_body_lines"),
+    ("index", "purge_max_missing_percent"),
+    ("build", "timeout"),
+    ("build", "clean"),
+    ("llm", "enabled"),
+    ("llm", "model"),
+    ("llm", "num_ctx"),
+    ("llm", "timeout"),
+    ("llm", "keep_alive"),
+    ("llm", "analyze_symbols"),
+    ("llm", "analyze_vendor"),
+    ("llm", "reranker_model"),
+    ("llm", "ollama_max_concurrent"),
+    ("llm", "chat_api_key"),
+    ("llm", "chat_api_format"),
+    ("llm", "auto_pull"),
+    ("llm", "stream"),
+    ("cache_server", "token"),
+    ("cache_server", "batch_size"),
+    ("cache_server", "force"),
+    ("updates", "check"),
+})
+
+
 @dataclass(frozen=True)
 class ValueProblem:
     """A value of one config file that ``load`` cannot use.
@@ -1219,11 +1263,15 @@ class ValueProblem:
     *removable* is False for ``[project] id``.  Without an ID the project
     reads as not initialized, and ``fw-context init`` then writes a new ID:
     the index of the project is lost.  The user must correct the ID.
+
+    *critical* is False for a key of ``_TUNING_KEYS``: ``load`` then gives
+    a warning, not a ConfigError.
     """
 
     keys: tuple[str | int, ...]
     message: str
     removable: bool = True
+    critical: bool = True
 
 
 def config_value_problems(layer: dict) -> list[ValueProblem]:
@@ -1245,11 +1293,17 @@ def config_value_problems(layer: dict) -> list[ValueProblem]:
             problems.append(ValueProblem(
                 keys, f"{label} must be {expected}, not {_toml_type(value, conv, strict=strict)}",
                 removable=keys != ("project", "id"),
+                # A key of a variant table is always critical: it changes the build.
+                critical=keys not in _TUNING_KEYS,
             ))
 
     for name in sorted(_KNOWN_SECTIONS):
         if name in layer and not isinstance(layer[name], dict):
-            problems.append(ValueProblem((name,), f"'{name}' must be a table ([{name}]), not {_toml_type(layer[name])}"))
+            problems.append(ValueProblem(
+                (name,), f"'{name}' must be a table ([{name}]), not {_toml_type(layer[name])}",
+                # [updates] holds only a key of _TUNING_KEYS, and load does not read it.
+                critical=name != "updates",
+            ))
     for section, fields in _CHECKED_SECTIONS:
         table = layer.get(section)
         if isinstance(table, dict):
@@ -1407,8 +1461,19 @@ def _toml_type(value: object, conv: str = "", *, strict: bool = False) -> str:
     return f"a {type(value).__name__}"  # a date or a time of TOML
 
 
-def _check_layer(layer: dict, path: Path) -> None:
-    """Raise ``ConfigError`` for the first value of one config file that ``load`` cannot use.
+#: The (file, problem) pairs that got a log line in this process: ``load``
+#: runs many times in one MCP session.
+_value_warned: set[tuple[Path, str]] = set()
+
+
+def _check_layer(layer: dict, path: Path, warnings: list[str]) -> None:
+    """Raise ``ConfigError`` for the first critical value of one config file that ``load`` cannot use.
+
+    A value of a key of ``_TUNING_KEYS`` is removed from *layer* instead:
+    the value of a lower file, or the default, then applies.  Its problem
+    goes to *warnings* (``Config.config_warnings``), and to the log one
+    time.  ``fw-context doctor`` lists it, and the status tools give it to
+    the caller.
 
     WHY one file at a time, before the merge: only then is the file of a
     value known, and the error must name it.  These values gave a crash
@@ -1418,9 +1483,29 @@ def _check_layer(layer: dict, path: Path) -> None:
     that stopped the MCP server before its tools were there.
     """
     problems = config_value_problems(layer)
-    if problems:
-        more = f" (and {len(problems) - 1} more)" if len(problems) > 1 else ""
-        raise ConfigError(path, problems[0].message + more, removable=all(p.removable for p in problems), values=True)
+    critical = [problem for problem in problems if problem.critical]
+    if critical:
+        more = f" (and {len(critical) - 1} more)" if len(critical) > 1 else ""
+        raise ConfigError(path, critical[0].message + more, removable=all(p.removable for p in critical), values=True)
+    for problem in problems:
+        # A key of _TUNING_KEYS, or the section [updates].
+        if len(problem.keys) == 1:
+            layer.pop(problem.keys[0])
+        else:
+            section, key = problem.keys
+            layer[section].pop(key)
+        warnings.append(f"{path}: {problem.message}")
+        if (path, problem.message) not in _value_warned:
+            _value_warned.add((path, problem.message))
+            # A warning, one time for each file and problem: each command
+            # shows it, also `fw-context index`, which can run for hours with
+            # the default of a switch.  The MCP status tools give it to the
+            # caller in `config_warnings`.
+            log.warning(
+                "%s: %s. fw-context uses the value of a lower file or the default. "
+                "Run 'fw-context doctor --fix --only config' to remove the value.",
+                path, problem.message,
+            )
 
 
 #: ``[index]`` keys that fw-context does not use any more.  They were an
@@ -1713,7 +1798,8 @@ def load(project_root: Path | None = None) -> Config:
     # Phase 1: load global config (always present — _ensure_global_config
     # creates it from template if missing).
     data = read_config_file(global_path)
-    _check_layer(data, global_path)
+    warnings: list[str] = []
+    _check_layer(data, global_path, warnings)
     _drop_retired_keys(data, global_path)
     _drop_selection_keys(data, global_path)
 
@@ -1724,7 +1810,7 @@ def load(project_root: Path | None = None) -> Config:
         # Uses _deep_merge so nested sections accumulate — [index] keys
         # from global and project config coexist.
         proj_data = read_config_file(proj_path)
-        _check_layer(proj_data, proj_path)
+        _check_layer(proj_data, proj_path, warnings)
         _drop_retired_keys(proj_data, proj_path)
         _drop_selection_keys(proj_data, proj_path)
         _warn_project_updates_once(proj_data, proj_path)
@@ -1738,7 +1824,7 @@ def load(project_root: Path | None = None) -> Config:
         # Phase 3: deep-merge local config (gitignored, per-developer).
         # This is the last merge — local.toml values have highest precedence.
         local_data = read_config_file(local_path)
-        _check_layer(local_data, local_path)
+        _check_layer(local_data, local_path, warnings)
         _drop_retired_keys(local_data, local_path)
         _drop_selection_keys(local_data, local_path)
         _warn_project_updates_once(local_data, local_path)
@@ -1773,6 +1859,7 @@ def load(project_root: Path | None = None) -> Config:
         _warn_retired_toolchains_file(project_root)
 
     cfg = _from_dict(data)
+    cfg.config_warnings = warnings
     from ..llm.auto_model import resolve_embed_model
     resolve_embed_model(cfg.llm)
     cfg.index.db_dir = cfg.index.db_dir.expanduser().resolve()

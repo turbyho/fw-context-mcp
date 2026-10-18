@@ -277,7 +277,9 @@ its counts, and its reasons. A build without a variant name and an image
 name shows as `(no name)`. A variant that the config declares and the index
 does not hold gets the command that indexes it. A project that is not
 initialized, that has no index, or whose config file cannot be used
-(`config_error`) gets the message and the command returns 1.
+(`config_error`) gets the message and the command returns 1. A value of a
+config file that fw-context did not use gives a warning in the log on
+stderr, as in each other command, and the exit code does not change.
 
 ### `fw-context list`
 
@@ -729,7 +731,10 @@ fw-context doctor --project /path    # audit specific project
   a missing model. The checks
   that read the config (Ollama, the models, the database and the disk)
   are `skipped` while the config does not load. After `--fix` repairs
-  the config, they run. When `--only` names one of these checks and the
+  the config, they run. A value that fw-context did not use, because a
+  lower file or the default applies (a timeout or a switch, for
+  example), makes the check `degraded` and not critical: the other checks
+  run. When `--only` names one of these checks and the
   config does not load, the command also gives the check `config`.
 - File permissions for the index directory and config files
 - The files, directories and config keys of an older fw-context
@@ -2535,7 +2540,7 @@ are in `builds`. `reference_count`, `analysis`, `description`, and
 | ``"reindex_needed"`` | A structural cause — see `reindex_reasons` below | Queries still work, but read `reindex_reasons` for the command |
 | ``"no_index"`` | Initialized, but `index.db` does not exist | Run ``fw-context index`` |
 | ``"not_initialized"`` | ``fw-context init`` was not run | Run ``fw-context init`` |
-| ``"config_error"`` | A config file cannot be read, is not UTF-8 or not valid TOML, or has a value of the wrong type or a URL that is not valid. `config_file` names it | Tell the operator the file and the problem. Do not run ``fw-context init`` or ``fw-context index``: they cannot repair the file. When the message names ``fw-context doctor --fix --only config``, that command removes each value that cannot be used. Run it, or correct the file, only with the approval of the operator |
+| ``"config_error"`` | A config file cannot be read, is not UTF-8 or not valid TOML, a section is not a table, a key that selects the data or where data goes has a value of the wrong type, or a URL is not valid. `config_file` names it | Tell the operator the file and the problem. Do not run ``fw-context init`` or ``fw-context index``: they cannot repair the file. When the message names ``fw-context doctor --fix --only config``, that command removes each value that cannot be used. Run it, or correct the file, only with the approval of the operator |
 
 A project of several builds gets the worst status of its builds:
 `"reindex_needed"`, then `"reindexing"`, then `"ready"`.
@@ -2678,6 +2683,13 @@ writes nothing, thus the next server start tries again. The tool reads
 only the stored answer, thus it never waits for the network. An editable install gets no `update_notice`. To stop the
 check, see [`[updates]`](configuration.md#updates--release-check).
 
+**`config_warnings`.** A list, one line for each value of a config file
+that fw-context did not use: `<file>: <problem>`. The value of a lower
+file, or the default of the key, applies, and every tool keeps working.
+The field is not a status. Tell the user each line. With the approval of
+the user, `fw-context doctor --fix --only config` removes the values. See
+[A config file that fw-context cannot use](configuration.md#a-config-file-that-fw-context-cannot-use).
+
 `modified_files_count` counts the files whose content no longer matches
 the index. Both modes count it. `fast` controls only the header check:
 `fast=true` (the default) reuses the cached manifest hashes, and
@@ -2753,6 +2765,8 @@ For a project that is not initialized, the result holds only `status`,
 also holds `project_id`. For `"config_error"`, it also holds
 `config_file`. The two version fields (`client_restart_*` for an
 upgrade, and `update_notice`) can come with each result.
+[`config_warnings`](#get_project_status) can come with each result that
+has a status other than `"config_error"`.
 
 #### `get_build_info`
 
@@ -2806,7 +2820,8 @@ database that fw-context cannot read makes the call fail, as in
 index, or whose config file cannot be used gets the answer of
 `get_project_status` without the version fields: only `status`,
 `project_root`, `index_message`, and, when no index exists,
-`project_id`, or for `"config_error"`, `config_file`.
+`project_id`, or for `"config_error"`, `config_file`. `config_warnings`
+comes as in `get_project_status`.
 
 `config_hash` identifies the build in the index. `compile_commands` is
 the `compile_commands.json` that the index run read for this build.

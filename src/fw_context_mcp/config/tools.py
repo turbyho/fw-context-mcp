@@ -404,6 +404,11 @@ get_project_status() status:
     that command removes each value that cannot be used. Run it, or
     correct the file, only with the approval of the operator, then call
     get_project_status() again.
+  • `config_warnings` (a list, with a status other than config_error) —
+    values of a config file
+    that fw-context did not use: a lower file or the default applies, and
+    the tools work. Tell the operator each line. With the approval of the
+    operator, `fw-context doctor --fix --only config` removes them.
   • NO status, only `error` — the index holds no build config. There is
     no status "error".
   • The call fails with an error of SQLite (for example "database disk

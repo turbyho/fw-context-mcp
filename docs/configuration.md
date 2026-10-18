@@ -30,12 +30,19 @@ Run `fw-context init` to create the project config files with commented-out defa
 fw-context stops with an error when one of the three files has one of these problems:
 
 - fw-context cannot read the file, the file is not UTF-8, or the file is not valid TOML.
-- A value has the wrong type, for example `db_dir = 5` or `timeout = "x"`.
-- A section is not a table, for example `build = "x"`.
+- A section other than `[updates]` is not a table, for example `build = "x"`.
+- A value of the wrong type in a key that selects the data that fw-context reads or makes, or the place where data goes. For example `db_dir = 5`. These keys are:
+  - `[project] id`
+  - `[index]` `db_dir`, `compile_commands`, `config_header`, `vendor_paths`, `project_paths` and `transient_defines`
+  - each key of `[build]` except `timeout` and `clean`, and each key of a `[[build.variants]]` table
+  - `[llm]` `ollama_url`, `chat_api_base`, `embed_model`, `embed_dim`, `embed_query_prompt`, `embed_doc_prompt` and `debug_log`
+  - `[cache_server] url` and `[call_graph] dispatch_bridges`
 - A `[[build.variants]]` table has no `name`.
 - A URL is not valid, for example `ollama_url = "http://[::1"`.
 
-The error names the file and the key, but not the value, because a key such as `chat_api_key` can hold a secret. `fw-context status` gives exit code 1, and the MCP status tools give the status `config_error`. fw-context does not use the default value in place of the value of the file: a default hides a setting of the team, and the project ID too.
+The error names the file and the key, but not the value, because a key such as `chat_api_key` can hold a secret. `fw-context status` gives exit code 1, and the MCP status tools give the status `config_error`. fw-context does not use the default value in place of these values: a default gives answers about other data, or sends the source code to a different place.
+
+A value of the wrong type in a different key gives a warning: for example a timeout, a limit, the chat model or a switch (`timeout = "x"`, `enabled = "flase"`). A section `[updates]` that is not a table gives a warning too. fw-context then uses the value of a lower file, or the default of the key, and the tools work. Each command writes the warning to the log one time (a CLI command to stderr), `fw-context doctor` shows it, and the MCP status tools give it in the list `config_warnings`.
 
 An older form of a value still works: a string that holds a number (`num_ctx = "4096"`), and `"yes"`, `"no"`, `"on"`, `"off"`, `"1"` and `"0"` for a switch. A key of a `[[build.variants]]` table goes to the build as it is, thus it must have the TOML type.
 

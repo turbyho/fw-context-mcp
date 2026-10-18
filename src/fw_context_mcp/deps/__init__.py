@@ -270,8 +270,11 @@ def _run_fixes(
             updated.append(r)
             continue
         # An "error" has a fix only when the check gives a fix command:
-        # "config" for a value that the fix can remove.
-        if r.status in ("ok", "skipped") or (r.status == "error" and not r.fix_cmd) or r.name not in FIXABLE:
+        # "config" for a value that the fix can remove.  A row of "config"
+        # without one (a file without write permission) gets no fix either:
+        # the fix only said "fix failed".
+        no_fix = (r.status == "error" or r.name == "config") and not r.fix_cmd
+        if r.status in ("ok", "skipped") or no_fix or r.name not in FIXABLE:
             updated.append(r)
             continue
         ok, msg = run_fix(r.name, r, project_root)

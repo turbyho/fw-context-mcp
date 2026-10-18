@@ -189,3 +189,4 @@ def cmd_status(args: argparse.Namespace) -> int:
     for missing in state.get("declared_not_indexed") or []:
         print(f"  {missing['variant']}  not indexed — run '{missing['command']}'")
     return 0
+
