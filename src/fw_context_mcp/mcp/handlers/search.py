@@ -798,7 +798,9 @@ async def semantic_search(
         if not setup.get("ollama_running"):
             return _fallback_to_search_code(
                 root, db_path, query, limit, offset=skip, hint_args=args, config_hash=config_hash,
-                warning="LLM is not running. Start it to use semantic search.",
+                # The message of the check: a server that runs and is not
+                # Ollama (a proxy page) has nothing to start.
+                warning=setup.get("message") or "LLM is not running. Start it to use semantic search.",
             )
 
         # Delegate to the semantic search pipeline (EmbeddingPhase + FormatPhase).

@@ -331,17 +331,21 @@ def _prompt_ollama_setup(project_root: Path, cfg) -> None:
 
     result = check_setup(cfg.llm)
     status = result.get("status")
-    # not_configured / embedding_unavailable also mean Ollama is down — only
-    # "ok" and "model_missing" imply a reachable server.
-    if status in ("error", "not_configured", "embedding_unavailable"):
-        print(f"  [warn] Ollama not reachable: {result.get('message', '')}")
+    # `ollama_running`, not the status: "ok" also comes for a setup that
+    # needs no Ollama (chat on an API, local embeddings), and it then said
+    # "Ollama running" for a server that does not run.
+    if not result.get("ollama_running"):
+        print(f"  [warn] Ollama cannot be used: {result.get('message') or 'no Ollama server at ' + cfg.llm.ollama_url}")
     else:
         print(f"  [ok] Ollama running at {cfg.llm.ollama_url}")
         installed = result.get("installed_models")
         if installed:
             print(f"  Installed models: {', '.join(installed)}")
-        if status == "model_missing":
-            print(f"  [info] {result.get('message', '')}")
+        # "error" with a running server: the Ollama server of chat_api_base
+        # gives no model list.  Its message also names a missing embedding
+        # model.
+        if status in ("model_missing", "error") and result.get("message"):
+            print(f"  [info] {result['message']}")
 
     print(f"  Hardware: {'NVIDIA GPU detected' if gpu else 'CPU only (no GPU detected)'}")
     print("  Recommended:")

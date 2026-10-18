@@ -3115,7 +3115,11 @@ systems. `status: "error"` also means that the Ollama server of
 `"local"` for a sentence-transformers or `ft://` model. A local model needs
 no Ollama: it counts as installed, and with chat on an external API the
 status is `"ok"` even when Ollama does not run. `"embedding_unavailable"`
-thus means an Ollama embedding model and a stopped Ollama.
+thus means an Ollama embedding model and an Ollama that fw-context cannot
+use. `"not_configured"` and `"embedding_unavailable"` come when Ollama does
+not run, and also when `ollama_url` names a server that is not Ollama, for
+example a proxy that gives its own page or an HTTP error. `message` names
+the cause and the repair.
 
 Note: `explain_symbol`, with pre-computed analysis (the default), returns
 instantly, and does not require Ollama at query time. `num_ctx` is 16384

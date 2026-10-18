@@ -697,6 +697,36 @@ def _parse_parameter_size(size_str: str) -> float:
 
 
 
+def _without_ollama(result: dict, cfg: LLMConfig, ollama_embedding: bool, cause: str, *, server_runs: bool) -> dict:
+    """Complete *result* for an ``ollama_url`` that fw-context cannot use, and return it.
+
+    *cause* is the sentence that tells why: the server does not run, or it
+    does not give the answer of Ollama.  The status depends on what needs
+    Ollama: nothing when the chat goes to an API and the embedding model
+    runs locally.  *server_runs* selects the advice: a server that runs and
+    is not Ollama (a proxy page) needs a correct ``ollama_url``, not a
+    start of Ollama.
+    """
+    result["ollama_running"] = False
+    repair = "Correct ollama_url so that it names an Ollama server" if server_runs else "Install and start Ollama"
+    if cfg.chat_api_base and not ollama_embedding:
+        result["status"] = "ok"
+    elif cfg.chat_api_base:
+        result["status"] = "embedding_unavailable"
+        link = "." if server_runs else ": https://ollama.com"
+        result["message"] = (
+            f"{cause} Chat is configured on an external API, but embedding "
+            f"requires local Ollama. Semantic search is disabled. {repair}{link}"
+        )
+    else:
+        result["status"] = "not_configured"
+        result["message"] = (
+            f"{cause} No chat API is configured. Options: (1) {repair[0].lower()}{repair[1:]}, "
+            "(2) configure a cloud API via the configure_llm tool."
+        )
+    return result
+
+
 def check_setup(cfg: LLMConfig) -> dict:
     """Check LLM backend connectivity and model availability.
 
@@ -716,10 +746,13 @@ def check_setup(cfg: LLMConfig) -> dict:
         ``status`` values:
             - ``"ok"`` — chat and embedding backends ready.
             - ``"disabled"`` — ``cfg.enabled`` is False.
-            - ``"not_configured"`` — Ollama not running and no chat_api_base.
-            - ``"embedding_unavailable"`` — Ollama down, chat on external
-              API, and the embedding model is an Ollama model.  With a
-              local embedding model the status is ``"ok"``.
+            - ``"not_configured"`` — Ollama cannot be used and no
+              chat_api_base.  Ollama does not run, or ``ollama_url`` names
+              a server that is not Ollama; ``message`` says which.
+            - ``"embedding_unavailable"`` — Ollama cannot be used (as
+              above), chat on external API, and the embedding model is an
+              Ollama model.  With a local embedding model the status is
+              ``"ok"``.
             - ``"model_missing"`` — Ollama running, and the chat model is not
               on the Ollama server of the chat calls (``ollama_url``, or the
               Ollama server of ``chat_api_base``), or the Ollama embedding
@@ -768,24 +801,12 @@ def check_setup(cfg: LLMConfig) -> dict:
         resp = httpx.get(base_url + "/api/tags", timeout=5.0)
         resp.raise_for_status()
     except httpx.ConnectError:
-        result["ollama_running"] = False
-        if cfg.chat_api_base and not ollama_embedding:
-            result["status"] = "ok"
-        elif cfg.chat_api_base:
-            result["status"] = "embedding_unavailable"
-            result["message"] = (
-                "Ollama is not running. Chat is configured on an external "
-                "API, but embedding requires local Ollama. Semantic search "
-                "will be disabled. Start Ollama: https://ollama.com"
-            )
-        else:
-            result["status"] = "not_configured"
-            result["message"] = (
-                "Ollama is not running and no chat API is configured. "
-                "Options: (1) install and start Ollama, (2) configure a "
-                "cloud API via the configure_llm tool."
-            )
-        return result
+        return _without_ollama(result, cfg, ollama_embedding, "Ollama is not running.", server_runs=False)
+    except httpx.HTTPStatusError as e:
+        # A server answers, with an HTTP error: the same case as the page of
+        # a proxy below, thus the same status and the same advice.
+        cause = f"{base_url}/api/tags gave HTTP {e.response.status_code}, not the model list of Ollama."
+        return _without_ollama(result, cfg, ollama_embedding, cause, server_runs=True)
     except Exception as e:
         result["ollama_running"] = False
         result["status"] = "error"
@@ -793,18 +814,29 @@ def check_setup(cfg: LLMConfig) -> dict:
         return result
 
     # ── Ollama running — check models ──
-    models = resp.json().get("models", [])
+    from ._diag import not_ollama_message, tag_models
+
+    models = tag_models(resp)
+    if models is None:
+        # The same answer as for a server that does not run: a setup that
+        # needs no Ollama (chat on an API, local embeddings) is "ok".
+        return _without_ollama(result, cfg, ollama_embedding, not_ollama_message(cfg.ollama_url), server_runs=True)
     installed = [m["name"] for m in models]
     result["ollama_running"] = True
     result["ollama_url"] = cfg.ollama_url
     result["installed_models"] = installed
     result["num_ctx"] = cfg.num_ctx
+
+    def _details(model: dict) -> dict:
+        details = model.get("details")
+        return details if isinstance(details, dict) else {}
+
     model_details = [
         {
             "name": m["name"],
-            "parameter_size": m.get("details", {}).get("parameter_size", "unknown"),
-            "family": m.get("details", {}).get("family", "unknown"),
-            "quantization": m.get("details", {}).get("quantization_level", "unknown"),
+            "parameter_size": _details(m).get("parameter_size", "unknown"),
+            "family": _details(m).get("family", "unknown"),
+            "quantization": _details(m).get("quantization_level", "unknown"),
         }
         for m in models
     ]

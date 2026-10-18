@@ -135,11 +135,15 @@ def _model_installed(ollama_url: str, model: str) -> bool:
             timeout=httpx.Timeout(connect=3.0, read=5.0, write=3.0, pool=3.0),
         )
         resp.raise_for_status()
-        models = resp.json().get("models", [])
-        installed = [m["name"] for m in models]
-        return any(_model_name_matches(m, model) for m in installed)
-    except (ValueError, TypeError, RuntimeError, AttributeError, OSError, httpx.HTTPError):
+    except (ValueError, TypeError, RuntimeError, AttributeError, OSError, httpx.HTTPError, httpx.InvalidURL):
         return False
+    from ._diag import tag_models
+
+    # WHY tag_models: an entry without a name raised KeyError out of this
+    # function, and thus out of `load` when it chose the embedding model.
+    # Then each tool failed.
+    models = tag_models(resp)
+    return models is not None and any(_model_name_matches(m["name"], model) for m in models)
 
 
 def _try_pull(model: str, ollama_url: str) -> bool:
