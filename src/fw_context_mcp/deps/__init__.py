@@ -146,7 +146,7 @@ def run_full_check(
                 # The row "check crashed" then reports it.
                 if subset is not None and name not in subset and not _config_row_is_necessary():
                     continue
-                r = fn(_config_problem())
+                r = fn(_config_problem(), project_root)
             elif name in _NEEDS_CONFIG and (problem := _config_problem()) is not None:
                 r = DepCheckResult(
                     name=name,
@@ -209,6 +209,7 @@ def run_fixes(
     results: list[DepCheckResult],
     project_root: str | Path | None = None,
     skip_model_pulls: bool = False,
+    fix_config: bool = True,
 ) -> list[DepCheckResult]:
     """Attempt auto-repair for every non-ok result that has a fix.
 
@@ -222,25 +223,62 @@ def run_fixes(
     interactive ``prompt_llm_config`` flow and must never happen without
     consent.  ``doctor --fix`` keeps the default False (unchanged behaviour).
 
+    When *fix_config* is False, the row ``config`` stays as it is: its fix
+    removes values from the config files, ``config.toml`` of the team too.
+    ``fw-context init`` passes False, and ``doctor --fix --only <checks>``
+    passes False when the list does not name ``config``.  Then the row
+    ``config`` only names the error (``run_full_check``).
+
+    The run of the fixes keeps the first ``.bak`` copy of each config file
+    (``housekeeping.one_copy_per_file``).
+
     WHY: A fix may succeed (pip install works) but the installation may
     still be broken (wrong architecture, missing .so dependency).
     Re-checking after every fix gives the user accurate status rather
     than falsely reporting success.
     """
+    from ..housekeeping import one_copy_per_file
+
+    with one_copy_per_file():
+        return _run_fixes(results, project_root, skip_model_pulls=skip_model_pulls, fix_config=fix_config)
+
+
+def _run_fixes(
+    results: list[DepCheckResult],
+    project_root: str | Path | None,
+    *,
+    skip_model_pulls: bool,
+    fix_config: bool,
+) -> list[DepCheckResult]:
+    """The loop of :func:`run_fixes`."""
     from ._fixes import FIXABLE, run_fix
 
     updated: list[DepCheckResult] = []
+    config_fixed = False
     for r in results:
+        if config_fixed and r.status == "skipped" and r.name in _NEEDS_CONFIG:
+            # The check skipped a config that did not load.  After the fix
+            # of "config" it can run, and its own fix can follow.
+            try:
+                r = _recheck(r.name, project_root)
+            except Exception as exc:
+                r = DepCheckResult(name=r.name, status="error", message=f"recheck failed: {exc}", critical=r.critical)
         if skip_model_pulls and r.name in ("chat-model", "embed-model"):
             updated.append(r)  # leave as-is — prompt_llm_config owns model pulls
             continue
-        if r.status in ("ok", "skipped", "error") or r.name not in FIXABLE:
+        if not fix_config and r.name == "config":
+            updated.append(r)
+            continue
+        # An "error" has a fix only when the check gives a fix command:
+        # "config" for a value that the fix can remove.
+        if r.status in ("ok", "skipped") or (r.status == "error" and not r.fix_cmd) or r.name not in FIXABLE:
             updated.append(r)
             continue
         ok, msg = run_fix(r.name, r, project_root)
         if ok:
             try:
                 updated.append(_recheck(r.name, project_root))
+                config_fixed = config_fixed or (r.name == "config" and updated[-1].status == "ok")
                 if r.name == "sqlite-vec":
                     _reset_vec_cache()
             except Exception as exc:
@@ -253,12 +291,21 @@ def run_fixes(
                     )
                 )
         else:
+            # The fix of config can remove a part of the values.  The fix
+            # command of the row before the fix then told to run it again,
+            # and the next run removed nothing.
+            fix_cmd = r.fix_cmd
+            if r.name == "config":
+                try:
+                    fix_cmd = _recheck(r.name, project_root).fix_cmd
+                except Exception:
+                    fix_cmd = None
             updated.append(
                 DepCheckResult(
                     name=r.name,
                     status=r.status,
                     message=f"fix failed: {msg}",
-                    fix_cmd=r.fix_cmd,
+                    fix_cmd=fix_cmd,
                     instructions=r.instructions,
                     critical=r.critical,
                 )
@@ -268,8 +315,10 @@ def run_fixes(
 
 def _recheck(name: str, project_root: str | Path | None = None) -> DepCheckResult:
     """Re-run a single check by name after a successful fix."""
+    from ..config import ConfigError
     from ._checks import (
         check_clang_resource,
+        check_config,
         check_db_integrity,
         check_disk_space,
         check_libclang_python,
@@ -284,6 +333,13 @@ def _recheck(name: str, project_root: str | Path | None = None) -> DepCheckResul
         check_tomli_w,
         check_watchfiles,
     )
+
+    if name == "config":
+        try:
+            load_project_config(project_root)
+        except ConfigError as exc:
+            return check_config(exc, project_root)
+        return check_config(None, project_root)
 
     cfg = None
     if name in ("ollama", "chat-model", "embed-model"):

@@ -694,7 +694,7 @@ class TestDoctor:
         result = check_obsolete_files(tmp_path)
 
         assert result.status == "degraded" and not result.critical
-        assert result.fix_cmd == "fw-context doctor --fix"
+        assert result.fix_cmd == "fw-context doctor --fix --only obsolete-files"
         assert "[index] query_driver" in result.message
         assert "query_driver" in config.read_text(encoding="utf-8")
 

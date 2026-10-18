@@ -717,12 +717,20 @@ fw-context doctor --project /path    # audit specific project
 - The libclang shared library and its version
 - The SQLite version and FTS5 support
 - Index database integrity and schema compatibility
-- Configuration file syntax. The check `config` names a
-  config file that cannot be read, that is not UTF-8 or not valid TOML,
-  or that has a URL that is not valid. The checks that read the config
-  (Ollama, the models, the database and the disk) are then `skipped`.
-  When `--only` names one of these checks and the config does not load,
-  the command also gives the check `config`.
+- Configuration file syntax and value types. The check `config` names a
+  config file that cannot be read, or that is not UTF-8 or not valid
+  TOML. It also lists each value that fw-context cannot use: a value of
+  the wrong type, a section that is not a table, a variant without a
+  name, a URL that is not valid. See
+  [A config file that fw-context cannot use](configuration.md#a-config-file-that-fw-context-cannot-use).
+  `--fix` removes each such value. Then the value of a lower file, or
+  the default, applies. Use
+  `--fix --only config` to do only this fix: a full `--fix` can also pull
+  a missing model. The checks
+  that read the config (Ollama, the models, the database and the disk)
+  are `skipped` while the config does not load. After `--fix` repairs
+  the config, they run. When `--only` names one of these checks and the
+  config does not load, the command also gives the check `config`.
 - File permissions for the index directory and config files
 - The files, directories and config keys of an older fw-context
   (`obsolete-files`). `--fix` removes them.
@@ -2527,7 +2535,7 @@ are in `builds`. `reference_count`, `analysis`, `description`, and
 | ``"reindex_needed"`` | A structural cause — see `reindex_reasons` below | Queries still work, but read `reindex_reasons` for the command |
 | ``"no_index"`` | Initialized, but `index.db` does not exist | Run ``fw-context index`` |
 | ``"not_initialized"`` | ``fw-context init`` was not run | Run ``fw-context init`` |
-| ``"config_error"`` | A config file cannot be read, is not UTF-8 or not valid TOML, or has a URL that is not valid. `config_file` names it | Tell the operator the file and the problem. Do not run ``fw-context init`` or ``fw-context index``: they cannot repair the file. Correct the file only with the approval of the operator |
+| ``"config_error"`` | A config file cannot be read, is not UTF-8 or not valid TOML, or has a value of the wrong type or a URL that is not valid. `config_file` names it | Tell the operator the file and the problem. Do not run ``fw-context init`` or ``fw-context index``: they cannot repair the file. When the message names ``fw-context doctor --fix --only config``, that command removes each value that cannot be used. Run it, or correct the file, only with the approval of the operator |
 
 A project of several builds gets the worst status of its builds:
 `"reindex_needed"`, then `"reindexing"`, then `"ready"`.

@@ -97,21 +97,36 @@ class ProjectNotInitializedError(RuntimeError):
 class ConfigError(ValueError):
     """Raised for a config file that fw-context cannot use.
 
-    The file cannot be read, it is not UTF-8 or not valid TOML, or a URL
-    in it is not valid.  The message names the file and the problem; a
-    TOML error also names the line and the column.
+    The file cannot be read, it is not UTF-8 or not valid TOML, or a value
+    in it cannot be used (see :func:`config_value_problems`).  The message
+    names the file and the problem; a TOML error also names the line and
+    the column.
 
     WHY an error and not the defaults: when fw-context ignores a file, it
     loses each setting in it, the project ID too.  The project then reads
     as not initialized.  ``fw-context init`` then writes a new ID over the
     file: the config of the team is lost, and the index is no longer
-    linked to the project.
+    linked to the project.  Before this check, ``load`` handled a value of
+    the wrong type in one of three ways.  It stopped with no file name, it
+    kept the value, or it used the default and wrote a warning to the log.
+
+    *removable* says that ``fw-context doctor --fix --only config`` can
+    remove each value that the message names.  The message then says so.
+    *values* says that the problem is a value (``config_value_problems``),
+    not the file: ``doctor`` then lists each such value of the files.
     """
 
-    def __init__(self, path: Path, problem: str) -> None:
+    def __init__(self, path: Path, problem: str, *, removable: bool = False, values: bool = False) -> None:
         self.path = path
         self.problem = problem
-        super().__init__(f"{path}: {problem}. Correct the file, then do the command again.")
+        self.removable = removable
+        self.values = values
+        # --only config: a full `doctor --fix` also pulls missing models.
+        action = (
+            "Correct the file, or remove each such value with 'fw-context doctor --fix --only config'"
+            if removable else "Correct the file"
+        )
+        super().__init__(f"{path}: {problem}. {action}, then do the command again.")
 
 
 _GLOBAL_CONFIG_PATH = fw_context_home() / "config.toml"
@@ -659,30 +674,6 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
-def _safe_int(val, default: int = 0) -> int:
-    """Coerce *val* to int, returning *default* on failure.
-
-    **Why safe?**  TOML values come from user-edited files — typos like
-    ``num_ctx = "auto"`` or ``timeout = "inf"`` crash the server if not
-    caught.  ``_safe_int`` logs a warning and returns the default so the
-    server starts with a working (but potentially wrong) value.
-    """
-    try:
-        return int(val)
-    except (ValueError, TypeError):
-        log.warning("Invalid int value %r — using default %d", val, default)
-        return default
-
-
-def _safe_float(val, default: float = 0.0) -> float:
-    """Coerce *val* to float, returning *default* on failure."""
-    try:
-        return float(val)
-    except (ValueError, TypeError):
-        log.warning("Invalid float value %r — using default %.3f", val, default)
-        return default
-
-
 def _apply_section(
     data: dict,
     section_name: str,
@@ -700,19 +691,15 @@ def _apply_section(
     list[str], Optional[int] with sentinel values).  The converter strings
     provide a compact, self-documenting mapping from TOML types to Python
     dataclass attribute types — no per-field handler functions needed.
+
+    ``load`` checks each file before (``_check_layer``), thus a conversion
+    does not fail.  A value of the wrong type is an error that names the
+    file, not a warning and the default.
     """
     if section := data.get(section_name, {}):
         for key, attr, conv in fields:
             if key in section:
-                try:
-                    setattr(target, attr, _convert(section[key], conv))
-                except _InvalidListValue:
-                    # The same rule as _safe_int: the key keeps its default,
-                    # and the warning names the key that the user must correct.
-                    log.warning(
-                        "[%s] %s must be a list or a string, not %r — using the default",
-                        section_name, key, section[key],
-                    )
+                setattr(target, attr, _convert(section[key], conv))
 
 
 def _build_cache_server_config(data: dict) -> CacheServerConfig | None:
@@ -750,15 +737,15 @@ def _build_cache_server_config(data: dict) -> CacheServerConfig | None:
     return CacheServerConfig(
         url=cs.get("url", ""),
         token=token,
-        batch_size=cs.get("batch_size", 100),
-        force=cs.get("force", False),
+        batch_size=int(cs.get("batch_size", 100)),
+        force=_convert_bool(cs.get("force", False)),
     )
 
 def _from_dict(data: dict) -> Config:
     """Convert merged TOML dict to Config with field mapping tables.
 
     Each mapping entry: (toml_key, attr_name, converter).
-    Converters: "str" | "bool" | "list" | "dict" | "path" | "int(N)" | "float(N)"
+    Converters: "str" | "bool" | "list" | "dict" | "str_table" | "path" | "int" | "float"
 
     Why table-driven instead of reflection-based?
     - Reflection (``setattr(cfg.__dict__[k], ...)``) couples TOML key names
@@ -812,55 +799,33 @@ def _convert(value, conv: str):
         ``"bool"`` — coerce to bool (handles strings "true"/"false"/"yes"/"no"/"1"/"0")
         ``"list"`` — coerce to list (wraps scalar in list)
         ``"dict"`` — coerce to dict
+        ``"str_table"`` — coerce to dict (a table of strings)
         ``"path"`` — wrap in ``Path`` and expand ``~``
-        ``"int(N)"`` — coerce to int, default N on failure
-        ``"float(N)"`` — coerce to float, default N on failure
+        ``"int"`` — coerce to int (also a string such as ``"4096"``)
+        ``"float"`` — coerce to float (also a string such as ``"1.5"``)
+
+    The value passed ``_expected_type`` first.  WHY no default on a
+    failure: the default hid the value of the user, and a warning in a log
+    is not seen.
     """
-    # Exact-match converters (fast path) — dict lookup instead of if/elif chain.
-    # Each converter is a lambda or builtin, stored once at module load.
-    if conv in _CONVERTERS:
-        return _CONVERTERS[conv](value)
-
-    # Prefix-match converters: "int(N)" / "float(N)".
-    # Format: "int(16384)" → int conversion, default 16384 on failure.
-    if conv.startswith("int("):
-        return _safe_int(value, int(conv[4:-1]))
-    if conv.startswith("float("):
-        return _safe_float(value, float(conv[6:-1]))
-
-    return value  # fallback — unknown converter, pass through
+    return _CONVERTERS[conv](value)
 
 
 def _convert_bool(value) -> bool:
     """Coerce *value* to bool, handling string representations."""
-    if isinstance(value, bool):
-        return value
     if isinstance(value, str):
-        v = value.strip().lower()
-        if v in ("true", "yes", "1", "on"):
-            return True
-        if v in ("false", "no", "0", "off", ""):
-            return False
+        return value.strip().lower() in _TRUE_STRINGS
     return bool(value)
-
-
-class _InvalidListValue(TypeError):
-    """A list key holds a value that is neither a list nor a string."""
 
 
 def _convert_list(value) -> list:
     """Coerce *value* to list — wraps a string in a list.
 
-    Any other type raises :class:`_InvalidListValue`, and the caller keeps
-    the default.  ``list(value)`` made a list of the keys of a TOML table
-    (``key = {X = 1}`` became ``["X"]``) without a word, and stopped the
-    load with a TypeError on a number.
+    ``_expected_type`` refuses each other type.  ``list(value)`` made a
+    list of the keys of a TOML table (``key = {X = 1}`` became ``["X"]``)
+    without a word.
     """
-    if isinstance(value, list):
-        return value
-    if isinstance(value, str):
-        return [value]
-    raise _InvalidListValue(value)
+    return [value] if isinstance(value, str) else value
 
 
 # Dispatch table for exact-match converters — dict lookup is O(1) and
@@ -870,7 +835,10 @@ _CONVERTERS: dict[str, Callable[..., Any]] = {
     "bool": _convert_bool,
     "list": _convert_list,
     "dict": dict,
+    "str_table": dict,
     "path": lambda v: Path(v).expanduser(),
+    "int": int,
+    "float": float,
 }
 
 
@@ -915,12 +883,12 @@ _BUILD_FIELDS: list[tuple[str, str, str]] = [
     ("pre_build", "pre_build", "str"),
     ("activate", "activate", "str"),
     ("python", "python", "str"),
-    ("timeout", "timeout", "float(7200)"),
+    ("timeout", "timeout", "float"),
     ("source_dir", "source_dir", "str"),
     ("sysbuild", "sysbuild", "bool"),
     ("environment", "environment", "str"),
     ("build_dir", "build_dir", "str"),
-    ("env", "env", "dict"),
+    ("env", "env", "str_table"),
 ]
 
 _INDEX_FIELDS: list[tuple[str, str, str]] = [
@@ -931,10 +899,10 @@ _INDEX_FIELDS: list[tuple[str, str, str]] = [
     ("project_paths", "project_paths", "list"),
     ("index_refs", "index_refs", "bool"),
     ("index_embeddings", "index_embeddings", "bool"),
-    ("rerank_top_k", "rerank_top_k", "int(50)"),
-    ("min_dense_count", "min_dense_count", "int(3)"),
-    ("max_symbol_body_lines", "max_symbol_body_lines", "int(1000)"),
-    ("purge_max_missing_percent", "purge_max_missing_percent", "int(20)"),
+    ("rerank_top_k", "rerank_top_k", "int"),
+    ("min_dense_count", "min_dense_count", "int"),
+    ("max_symbol_body_lines", "max_symbol_body_lines", "int"),
+    ("purge_max_missing_percent", "purge_max_missing_percent", "int"),
     ("transient_defines", "transient_defines", "list"),
 ]
 
@@ -945,15 +913,15 @@ _LLM_FIELDS: list[tuple[str, str, str]] = [
     ("embed_model", "embed_model", "str"),
     ("embed_query_prompt", "embed_query_prompt", "str"),
     ("embed_doc_prompt", "embed_doc_prompt", "str"),
-    ("embed_dim", "embed_dim", "int(-1)"),  # -1 = auto-detect (maps to None)
-    ("num_ctx", "num_ctx", "int(16384)"),
-    ("timeout", "timeout", "float(600.0)"),
+    ("embed_dim", "embed_dim", "int"),  # -1 = auto-detect (maps to None)
+    ("num_ctx", "num_ctx", "int"),
+    ("timeout", "timeout", "float"),
     ("keep_alive", "keep_alive", "str"),
     ("debug_log", "debug_log", "path"),
     ("analyze_symbols", "analyze_symbols", "bool"),
     ("analyze_vendor", "analyze_vendor", "bool"),
     ("reranker_model", "reranker_model", "str"),
-    ("ollama_max_concurrent", "ollama_max_concurrent", "int(1)"),
+    ("ollama_max_concurrent", "ollama_max_concurrent", "int"),
     ("chat_api_base", "chat_api_base", "str"),
     ("chat_api_key", "chat_api_key", "str"),
     ("chat_api_format", "chat_api_format", "str"),
@@ -1002,19 +970,12 @@ def _build_variants(data: dict) -> list[BuildVariant]:
         return []
 
     variants: list[BuildVariant] = []
+    # `_variant_problems` checked each table of each file before the merge.
     for table in raw:
-        if not isinstance(table, dict):
-            log.warning("[[build.variants]] entry is not a table — skipping %r", table)
-            continue
-        name = table.get("name")
-        if not name:
-            log.warning("[[build.variants]] entry missing required 'name' — skipping")
-            continue
+        name = table["name"]
 
         images: list[BuildImage] = []
         for img in table.get("images") or []:
-            if not isinstance(img, dict):
-                continue
             images.append(
                 BuildImage(
                     name=img.get("name", ""),
@@ -1040,14 +1001,13 @@ def _build_variants(data: dict) -> list[BuildVariant]:
                 continue
             overrides[_BUILD_KEY_TO_ATTR.get(key, key)] = value
 
-        env = table.get("env") or {}
         variants.append(
             BuildVariant(
                 name=name,
                 description=table.get("description", ""),
                 board=table.get("board"),
                 build_dir=table.get("build_dir"),
-                env=dict(env) if isinstance(env, dict) else {},
+                env=dict(table.get("env") or {}),
                 images=images,
                 overrides=overrides,
                 index_overrides=index_overrides,
@@ -1196,24 +1156,6 @@ def _validate_config_safety(proj_data: dict, proj_path: Path) -> None:
 _URL_KEYS = ("ollama_url", "chat_api_base")
 
 
-def _check_url_values(layer: dict, path: Path) -> None:
-    """Raise ``ConfigError`` for a URL in one config file that cannot be parsed.
-
-    WHY one file at a time: the error must name the file that holds the
-    value.  ``load`` reads the host of each URL (`_is_loopback_url`), and
-    ``urlparse`` raises ``ValueError`` for a value such as
-    ``"http://[::1"``.  That error named no file, and it stopped the MCP
-    server before its tools were there.
-    """
-    llm = layer.get("llm")
-    if not isinstance(llm, dict):
-        return
-    for key in _URL_KEYS:
-        value = llm.get(key)
-        if isinstance(value, str) and (problem := url_problem(value)) is not None:
-            raise ConfigError(path, f"[llm] {key} is not a valid URL ({problem})")
-
-
 def url_problem(value: str) -> str | None:
     """Return why ``urlparse`` cannot read the host of *value*, or None.
 
@@ -1228,26 +1170,256 @@ def url_problem(value: str) -> str | None:
     return None
 
 
-def _drop_malformed_sections(layer: dict, path: Path) -> None:
-    """Remove a known section that is not a table from one config file, and warn.
+#: The strings that ``_convert_bool`` reads as a switch.  A TOML bool is
+#: the normal form.  The strings are older forms, and they still work.
+_TRUE_STRINGS = frozenset({"true", "yes", "1", "on"})
+_FALSE_STRINGS = frozenset({"false", "no", "0", "off", ""})
 
-    WHY at the entry point: every reader of a section assumes a table.  A
-    typo such as ``build = "x"`` (a string where ``[build]`` belongs) made
-    ``_build_variants`` raise AttributeError, which left ``load()`` and took
-    down every tool, and ``_apply_section`` read ``key in "x"`` as a
-    substring test.  A typo in a key name only gives a warning, and a typo
-    in a section must do the same.  The other sections of the file and the
-    other files still apply.
+#: The keys of ``[cache_server]`` (``_build_cache_server_config``).
+_CACHE_SERVER_FIELDS: list[tuple[str, str, str]] = [
+    ("url", "url", "str"),
+    ("token", "token", "str"),
+    ("batch_size", "batch_size", "int"),
+    ("force", "force", "bool"),
+]
+
+#: The sections that ``_check_layer`` checks against their field table.
+_CHECKED_SECTIONS: tuple[tuple[str, list[tuple[str, str, str]]], ...] = (
+    ("project", _PROJECT_FIELDS),
+    ("build", _BUILD_FIELDS),
+    ("index", _INDEX_FIELDS),
+    ("llm", _LLM_FIELDS),
+    ("cache_server", _CACHE_SERVER_FIELDS),
+    ("updates", _UPDATES_FIELDS),
+)
+
+#: The keys of a ``[[build.variants]]`` table that are not a ``[build]`` or
+#: an ``[index]`` key, with their converter (``_build_variants``).
+_VARIANT_FIELDS: dict[str, str] = {
+    "name": "str", "description": "str", "board": "str", "build_dir": "str", "env": "str_table",
+}
+
+#: The keys of an image of a variant; each is a string (``BuildImage``).
+_IMAGE_FIELDS: tuple[str, ...] = ("name", "description", "dir", "type", "board")
+
+#: The converter of each key of ``[build]`` and ``[index]``, for an override in a variant.
+_OVERRIDE_CONVERTERS: dict[str, str] = {key: conv for key, _, conv in (*_BUILD_FIELDS, *_INDEX_FIELDS)}
+
+
+@dataclass(frozen=True)
+class ValueProblem:
+    """A value of one config file that ``load`` cannot use.
+
+    *keys* is the place of the value in the file: the section, the key,
+    and in an array the position of the table.  ``fw-context doctor --fix
+    --only config`` removes the value at that place
+    (``housekeeping.remove_unusable_values``).
+
+    *removable* is False for ``[project] id``.  Without an ID the project
+    reads as not initialized, and ``fw-context init`` then writes a new ID:
+    the index of the project is lost.  The user must correct the ID.
     """
+
+    keys: tuple[str | int, ...]
+    message: str
+    removable: bool = True
+
+
+def config_value_problems(layer: dict) -> list[ValueProblem]:
+    """Return each value of one config file that ``load`` cannot use, in the order of the file.
+
+    *layer* is the parsed TOML of one file.  The types come from the field
+    tables, thus a new key needs no change here.  A key that fw-context
+    does not know is not a problem here: ``load`` warns about it.
+
+    WHY a list and not the first problem: ``fw-context doctor`` shows each
+    value, and ``doctor --fix --only config`` removes each one in one run.  The message
+    holds no value, because a key such as ``chat_api_key`` holds a secret.
+    """
+    problems: list[ValueProblem] = []
+
+    def check(keys: tuple[str | int, ...], label: str, value: object, conv: str, *, strict: bool = False) -> None:
+        expected = _expected_type(value, conv, strict=strict)
+        if expected is not None:
+            problems.append(ValueProblem(
+                keys, f"{label} must be {expected}, not {_toml_type(value, conv, strict=strict)}",
+                removable=keys != ("project", "id"),
+            ))
+
     for name in sorted(_KNOWN_SECTIONS):
         if name in layer and not isinstance(layer[name], dict):
-            msg = (
-                f"{path}: '{name}' must be a table ([{name}]), not a "
-                f"{type(layer[name]).__name__}; fw-context ignores it."
-            )
-            # The log only, see _validate_config_safety.
-            log.warning(msg)
-            del layer[name]
+            problems.append(ValueProblem((name,), f"'{name}' must be a table ([{name}]), not {_toml_type(layer[name])}"))
+    for section, fields in _CHECKED_SECTIONS:
+        table = layer.get(section)
+        if isinstance(table, dict):
+            for key, _attr, conv in fields:
+                if key in table:
+                    check((section, key), f"[{section}] {key}", table[key], conv)
+    llm = layer.get("llm")
+    if isinstance(llm, dict):
+        for key in _URL_KEYS:
+            value = llm.get(key)
+            if isinstance(value, str) and (problem := url_problem(value)) is not None:
+                problems.append(ValueProblem(("llm", key), f"[llm] {key} is not a valid URL ({problem})"))
+    build = layer.get("build")
+    if isinstance(build, dict) and "variants" in build:
+        _variant_problems(build["variants"], problems, check)
+    graph = layer.get("call_graph")
+    if isinstance(graph, dict) and "dispatch_bridges" in graph:
+        check(("call_graph", "dispatch_bridges"), "[call_graph] dispatch_bridges", graph["dispatch_bridges"], "str_table")
+    return problems
+
+
+def _variant_problems(variants: object, problems: list[ValueProblem], check: Callable[..., None]) -> None:
+    """Add the problems of ``[build] variants`` to *problems*; *check* adds the problem of a value.
+
+    A table without a name is a problem of the whole table: no query can
+    name its build, and ``_build_variants`` cannot read it.  An override is
+    checked with *strict*: ``build_variant_config`` uses its value as it
+    is, without the converters of ``[build]``, thus ``"4096"`` is not a
+    number there.
+    """
+    if not isinstance(variants, list):
+        problems.append(ValueProblem(
+            ("build", "variants"), f"[build] variants must be an array of tables ([[build.variants]]), not {_toml_type(variants)}",
+        ))
+        return
+    for position, table in enumerate(variants):
+        keys: tuple[str | int, ...] = ("build", "variants", position)
+        if not isinstance(table, dict):
+            problems.append(ValueProblem(keys, f"[[build.variants]] entry {position + 1} must be a table, not {_toml_type(table)}"))
+            continue
+        name = table.get("name")
+        if not isinstance(name, str) or not name:
+            problems.append(ValueProblem(keys, f"[[build.variants]] entry {position + 1} must have a name (a string that is not empty)"))
+            continue
+        label = f"[[build.variants]] {name!r}"
+        for key, value in table.items():
+            if key == "images":
+                _image_problems(value, (*keys, "images"), label, problems, check)
+            elif (conv := _VARIANT_FIELDS.get(key) or _OVERRIDE_CONVERTERS.get(key)) is not None:
+                check((*keys, key), f"{label} {key}", value, conv, strict=True)
+
+
+def _image_problems(
+    images: object, keys: tuple[str | int, ...], label: str, problems: list[ValueProblem], check: Callable[..., None],
+) -> None:
+    """Add the problems of the ``images`` of one variant to *problems*; *check* adds the problem of a value."""
+    if not isinstance(images, list):
+        problems.append(ValueProblem(keys, f"{label} images must be an array of tables, not {_toml_type(images)}"))
+        return
+    for position, image in enumerate(images):
+        if not isinstance(image, dict):
+            problems.append(ValueProblem(
+                (*keys, position), f"{label} image {position + 1} must be a table, not {_toml_type(image)}",
+            ))
+            continue
+        for key in _IMAGE_FIELDS:
+            if key in image:
+                check((*keys, position, key), f"{label} image {position + 1} {key}", image[key], "str")
+
+
+def _expected_type(value: object, conv: str, *, strict: bool = False) -> str | None:
+    """Return what *value* must be for the converter *conv*, or None when ``_convert`` can use it.
+
+    Without *strict*, a string that holds a number or a switch passes too
+    (``"4096"``, ``"yes"``): an older config wrote them, and ``_convert``
+    reads them.  With *strict* only the TOML type passes.
+    """
+    if conv == "str":
+        return None if isinstance(value, str) else "a string"
+    if conv == "path":
+        if not isinstance(value, str):
+            return "a string"
+        try:
+            Path(value).expanduser()
+        except RuntimeError:
+            # "~name/x" for a user that does not exist on this machine.
+            return "a path whose home directory (~) is known"
+        return None
+    if conv == "bool":
+        if isinstance(value, bool) or (
+            not strict and isinstance(value, str) and value.strip().lower() in _TRUE_STRINGS | _FALSE_STRINGS
+        ):
+            return None
+        return "true or false"
+    if conv == "list":
+        if isinstance(value, list) and all(isinstance(item, str) for item in value):
+            return None
+        if not strict and isinstance(value, str):
+            return None
+        return "an array of strings" if strict else "an array of strings, or a string"
+    if conv == "dict":
+        # make_vars: `NAME=value` on the make command line, thus a number works too.
+        if isinstance(value, dict) and all(_is_number(item) or isinstance(item, str) for item in value.values()):
+            return None
+        return "a table of strings and numbers"
+    if conv == "str_table":
+        # env: the environment of a process holds strings only.
+        if isinstance(value, dict) and all(isinstance(item, str) for item in value.values()):
+            return None
+        return "a table of strings"
+    if conv in ("int", "float"):
+        kind: type = int if conv == "int" else float
+        if _is_number(value) and (conv == "float" or isinstance(value, int)):
+            return None
+        if not strict and isinstance(value, str) and _reads_as(value, kind):
+            return None
+        return "an integer" if conv == "int" else "a number"
+    raise ValueError(f"unknown converter {conv!r}")  # a fault of a field table, not of the file
+
+
+def _is_number(value: object) -> bool:
+    """Say if *value* is a TOML integer or float.  A bool is a subclass of int in Python, and no number."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _reads_as(text: str, kind: type) -> bool:
+    """Say if ``kind(text)`` gives a value."""
+    try:
+        kind(text)
+    except ValueError:
+        return False
+    return True
+
+
+def _toml_type(value: object, conv: str = "", *, strict: bool = False) -> str:
+    """Name the TOML type of *value* for a message, without the value: it can be a secret.
+
+    With *strict* a string is only "a string": ``"9"`` holds a number, but
+    an override of a variant must be a TOML number.
+    """
+    if isinstance(value, bool):
+        return "a boolean"
+    if isinstance(value, int):
+        return "an integer"
+    if isinstance(value, float):
+        return "a number"
+    if isinstance(value, str):
+        if conv in ("int", "float") and not strict:
+            return "a string that holds no integer" if conv == "int" else "a string that holds no number"
+        return "a string"
+    if isinstance(value, list):
+        return "an array with an item of a different type" if conv == "list" else "an array"
+    if isinstance(value, dict):
+        return "a table with a value of a different type" if conv in ("dict", "str_table") else "a table"
+    return f"a {type(value).__name__}"  # a date or a time of TOML
+
+
+def _check_layer(layer: dict, path: Path) -> None:
+    """Raise ``ConfigError`` for the first value of one config file that ``load`` cannot use.
+
+    WHY one file at a time, before the merge: only then is the file of a
+    value known, and the error must name it.  These values gave a crash
+    with no file name (``db_dir = 5``, ``variants = 3``), a value of the
+    wrong type in the config (``[project] id = 5``), or a warning and the
+    default.  ``urlparse`` raised ``ValueError`` for ``"http://[::1"``, and
+    that stopped the MCP server before its tools were there.
+    """
+    problems = config_value_problems(layer)
+    if problems:
+        more = f" (and {len(problems) - 1} more)" if len(problems) > 1 else ""
+        raise ConfigError(path, problems[0].message + more, removable=all(p.removable for p in problems), values=True)
 
 
 #: ``[index]`` keys that fw-context does not use any more.  They were an
@@ -1427,10 +1599,10 @@ def load_update_settings() -> UpdatesConfig:
     ``fw-context version`` must answer at once.  This function reads one
     file and writes nothing.
 
-    A missing file, a file that does not parse, and a section that is not a
-    table give the defaults.  The log gets only a debug line: ``load``
-    reports the same file at each command, and ``get_project_status`` calls
-    this function at each call.
+    A missing file, a file that does not parse, a section that is not a
+    table, and a value of the wrong type give the defaults.  The log gets
+    only a debug line: ``load`` reports the same file at each command, and
+    ``get_project_status`` calls this function at each call.
     """
     settings = UpdatesConfig()
     path = _GLOBAL_CONFIG_PATH
@@ -1439,8 +1611,15 @@ def load_update_settings() -> UpdatesConfig:
     except ConfigError:
         log.debug("Cannot read %s — [updates] uses the defaults", path, exc_info=True)
         return settings
-    if isinstance(data.get("updates"), dict):
-        _apply_section(data, "updates", _UPDATES_FIELDS, settings)
+    section = data.get("updates")
+    if isinstance(section, dict):
+        usable = {
+            key: section[key] for key, _, conv in _UPDATES_FIELDS
+            if key in section and _expected_type(section[key], conv) is None
+        }
+        if len(usable) < len(section.keys() & {key for key, _, _ in _UPDATES_FIELDS}):
+            log.debug("%s: a value of [updates] has the wrong type — it uses the default", path)
+        _apply_section({"updates": usable}, "updates", _UPDATES_FIELDS, settings)
     return settings
 
 
@@ -1533,8 +1712,7 @@ def load(project_root: Path | None = None) -> Config:
     # Phase 1: load global config (always present — _ensure_global_config
     # creates it from template if missing).
     data = read_config_file(global_path)
-    _drop_malformed_sections(data, global_path)
-    _check_url_values(data, global_path)
+    _check_layer(data, global_path)
     _drop_retired_keys(data, global_path)
     _drop_selection_keys(data, global_path)
 
@@ -1545,8 +1723,7 @@ def load(project_root: Path | None = None) -> Config:
         # Uses _deep_merge so nested sections accumulate — [index] keys
         # from global and project config coexist.
         proj_data = read_config_file(proj_path)
-        _drop_malformed_sections(proj_data, proj_path)
-        _check_url_values(proj_data, proj_path)
+        _check_layer(proj_data, proj_path)
         _drop_retired_keys(proj_data, proj_path)
         _drop_selection_keys(proj_data, proj_path)
         _warn_project_updates_once(proj_data, proj_path)
@@ -1560,8 +1737,7 @@ def load(project_root: Path | None = None) -> Config:
         # Phase 3: deep-merge local config (gitignored, per-developer).
         # This is the last merge — local.toml values have highest precedence.
         local_data = read_config_file(local_path)
-        _drop_malformed_sections(local_data, local_path)
-        _check_url_values(local_data, local_path)
+        _check_layer(local_data, local_path)
         _drop_retired_keys(local_data, local_path)
         _drop_selection_keys(local_data, local_path)
         _warn_project_updates_once(local_data, local_path)

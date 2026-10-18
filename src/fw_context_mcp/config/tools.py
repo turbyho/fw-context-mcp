@@ -400,7 +400,9 @@ get_project_status() status:
   • "config_error" — a config file cannot be used. `config_file` names it,
     and `index_message` gives the problem. Tell the operator. Do NOT run
     `fw-context init` or `fw-context index`: they cannot repair the file.
-    Correct it only with the approval of the operator, then call
+    When `index_message` names `fw-context doctor --fix --only config`,
+    that command removes each value that cannot be used. Run it, or
+    correct the file, only with the approval of the operator, then call
     get_project_status() again.
   • NO status, only `error` — the index holds no build config. There is
     no status "error".

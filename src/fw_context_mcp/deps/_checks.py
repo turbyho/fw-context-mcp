@@ -378,7 +378,7 @@ def check_watchfiles() -> DepCheckResult:
         )
 
 
-def check_config(problem: Exception | None) -> DepCheckResult:
+def check_config(problem: Exception | None, project_root: str | Path | None = None) -> DepCheckResult:
     """Report if the config files of fw-context can be used.
 
     *problem* is the ``ConfigError`` of ``load`` for the project, or
@@ -387,10 +387,38 @@ def check_config(problem: Exception | None) -> DepCheckResult:
     check fails.  WHY its own check: those checks reported "check crashed"
     with the same message, each with ``critical=True``, and ``db-integrity``
     among them read as a damaged database.
+
+    For a value of the wrong type, the message lists each such value of the
+    three files (``housekeeping.remove_unusable_values`` with ``dry_run``),
+    not only the first one of ``load``.  The list also names a value that
+    ``doctor --fix --only config`` cannot remove (``[project] id``, a file
+    without write permission).  The row has a fix command when the fix can
+    remove a value.  A file that is not valid TOML needs the user: the row
+    then gives the error of ``load`` and no fix command.
     """
     if problem is None:
         return DepCheckResult(name="config", status="ok", message="the config files load", critical=False)
-    return DepCheckResult(name="config", status="error", message=str(problem), critical=True)
+    if not getattr(problem, "values", False):
+        return DepCheckResult(name="config", status="error", message=str(problem), critical=True)
+    from ..housekeeping import remove_unusable_values
+    from ..utils import resolve_project_root
+
+    try:
+        root: Path | None = resolve_project_root(str(project_root) if project_root else None)
+    except OSError:
+        root = None
+    report = remove_unusable_values(root, dry_run=True)
+    parts = [f"{path}: {label}" for path, label in report.removed_keys]
+    parts += [f"{path}: {reason}" for path, reason in report.failures]
+    return DepCheckResult(
+        name="config",
+        status="error",
+        message="config values that fw-context cannot use: " + "; ".join(parts),
+        # --only config: a full `doctor --fix` also pulls the missing models,
+        # after the fix of the config lets their checks run.
+        fix_cmd="fw-context doctor --fix --only config" if report.removed_keys else None,
+        critical=True,
+    )
 
 
 def check_tomli_w() -> DepCheckResult:
@@ -571,7 +599,9 @@ def check_obsolete_files(project_root: str | Path | None = None) -> DepCheckResu
         name="obsolete-files",
         status="degraded",
         message="; ".join(parts),
-        fix_cmd=None if report.empty else "fw-context doctor --fix",
+        # --only: a full `doctor --fix` also removes config values and
+        # pulls models.
+        fix_cmd=None if report.empty else "fw-context doctor --fix --only obsolete-files",
         critical=False,
     )
 

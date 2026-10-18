@@ -25,12 +25,19 @@ def _run_deps_auto_fix(project_root: Path, *, dry_run: bool = False) -> tuple[li
     are owned exclusively by ``prompt_llm_config``; init must never pull a
     model without consent.  Pip packages (pysqlite3, sqlite-vec, libclang,
     watchfiles, tomli-w) are fixed without consent — small and standard.
+    ``fix_config=False``: the fix of ``config`` removes values from the
+    config files, ``config.toml`` of the team too.  Only
+    ``fw-context doctor --fix --only config`` does that, or a full
+    ``doctor --fix``.
 
     In *dry_run* mode, only the check runs (no ``pip install`` side
     effects) — ``after`` equals ``before``.
     """
     before = run_full_check(project_root=project_root)
-    after = run_fixes(before, project_root=project_root, skip_model_pulls=True) if not dry_run else list(before)
+    after = (
+        run_fixes(before, project_root=project_root, skip_model_pulls=True, fix_config=False)
+        if not dry_run else list(before)
+    )
     _print_deps_summary(after)
     return before, after
 

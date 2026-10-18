@@ -1233,9 +1233,12 @@ def get_project_status(
     * ``"no_index"`` — initialized, never indexed. Run ``fw-context index``.
     * ``"not_initialized"`` — run ``fw-context init``.
     * ``"config_error"`` — a config file cannot be used: it cannot be read,
-      it is not UTF-8 or not valid TOML, or a URL in it is not valid.
-      ``config_file`` names it, and ``index_message`` gives the problem.
-      Correct the file; ``fw-context init`` cannot repair it.
+      it is not UTF-8 or not valid TOML, or a value in it has the wrong type
+      or is not a valid URL.  ``config_file`` names it, and
+      ``index_message`` gives the problem.  Correct the file, or run
+      ``fw-context doctor --fix --only config`` when the message names
+      it: it removes each value that cannot be used.  ``fw-context init``
+      cannot repair it.
 
     A project of several builds gets the worst status of its builds.  A
     reason that every build gives comes one time, and any other reason

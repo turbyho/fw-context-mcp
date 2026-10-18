@@ -25,6 +25,22 @@ The environment variable `FW_CONTEXT_HOME` moves the global `config.toml`, the l
 
 Run `fw-context init` to create the project config files with commented-out default values. This command also adds the necessary entries to `.gitignore`. On first use, fw-context creates only the global `~/.fw-context/config.toml`. The MCP tools and `fw-context index` create no config file in a project that `init` did not set up, and read a missing project file as empty.
 
+### A config file that fw-context cannot use
+
+fw-context stops with an error when one of the three files has one of these problems:
+
+- fw-context cannot read the file, the file is not UTF-8, or the file is not valid TOML.
+- A value has the wrong type, for example `db_dir = 5` or `timeout = "x"`.
+- A section is not a table, for example `build = "x"`.
+- A `[[build.variants]]` table has no `name`.
+- A URL is not valid, for example `ollama_url = "http://[::1"`.
+
+The error names the file and the key, but not the value, because a key such as `chat_api_key` can hold a secret. `fw-context status` gives exit code 1, and the MCP status tools give the status `config_error`. fw-context does not use the default value in place of the value of the file: a default hides a setting of the team, and the project ID too.
+
+An older form of a value still works: a string that holds a number (`num_ctx = "4096"`), and `"yes"`, `"no"`, `"on"`, `"off"`, `"1"` and `"0"` for a switch. A key of a `[[build.variants]]` table goes to the build as it is, thus it must have the TOML type.
+
+`fw-context doctor` lists each value that fw-context cannot use, in each of the three files. `fw-context doctor --fix --only config` removes each value. Then the value of a lower file applies, for example of `config.toml` for a value of `local.toml`, or else the default of the key. A `fw-context doctor --fix` without `--only` also does the other fixes, and it can pull a missing Ollama model of several GB. `fw-context init` and `doctor --fix --only <checks>` without `config` remove no value. Before the change, `local.toml` and the global config get a copy of the old text in `<name>.bak`. When one `doctor --fix` changes a file two times, the copy holds the text before the first change. `config.toml` of a project gets no copy, because git holds its old text. The fix does not remove a `[project] id` of the wrong type: without an ID, the project is not initialized, and the index of the project is lost. Correct the ID yourself. A file that is not valid TOML also needs you: the fix cannot read its values.
+
 ## Settings reference
 
 ### `[build]` — Build system

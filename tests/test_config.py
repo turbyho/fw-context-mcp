@@ -306,10 +306,12 @@ class TestRetiredQueryDriverKeys:
 
 
 class TestMalformedSection:
-    """A section that is not a table is a typo, and a typo must not crash load().
+    """A section that is not a table gives a ConfigError that names the file.
 
     ``build = "x"`` made ``_build_variants`` raise AttributeError out of
-    ``load()``, which took down every MCP tool.
+    ``load()``, which took down every MCP tool.  After that, the loader
+    removed the section with a warning: each setting of the section was
+    lost, and only a log said so.
     """
 
     def _load(self, tmpdir, monkeypatch, *, committed: str = "", local: str = "", global_text: str = ""):
@@ -329,18 +331,24 @@ class TestMalformedSection:
 
     @pytest.mark.parametrize("layer", ["committed", "local", "global_text"])
     @pytest.mark.parametrize("bad", ['build = "x"', "build = []", "index = 3", 'llm = "x"', 'cache_server = "x"'])
-    def test_a_section_that_is_not_a_table_is_ignored(self, tmpdir, monkeypatch, caplog, layer, bad):
+    def test_a_section_that_is_not_a_table_names_the_file(self, tmpdir, monkeypatch, layer, bad):
+        from fw_context_mcp.config import ConfigError
+
         good = '[project]\nname = "kept"\n'
         files = {"committed": "", "local": "", "global_text": ""}
         files[layer] = bad + "\n" + good
-        cfg = self._load(tmpdir, monkeypatch, **files)
-        assert cfg.project.name == "kept", "the other sections of the file still apply"
-        assert "must be a table" in caplog.text
+        with pytest.raises(ConfigError, match="must be a table") as caught:
+            self._load(tmpdir, monkeypatch, **files)
+        name = {"committed": "config.toml", "local": "local.toml", "global_text": "global.toml"}[layer]
+        assert caught.value.path.name == name
+        assert caught.value.removable
 
     def test_a_string_section_is_not_read_as_a_substring(self, tmpdir, monkeypatch):
         """``_apply_section`` tested ``key in section``; on a string that is a substring test."""
-        cfg = self._load(tmpdir, monkeypatch, local='index = "vendor_paths"\n')
-        assert cfg.index.vendor_paths == []
+        from fw_context_mcp.config import ConfigError
+
+        with pytest.raises(ConfigError, match="'index' must be a table"):
+            self._load(tmpdir, monkeypatch, local='index = "vendor_paths"\n')
 
 
 class TestVendorProjectPaths:
@@ -433,11 +441,12 @@ class TestTransientDefines:
         assert kwargs["transient_defines"] == ["MY_STAMP"]
 
     @pytest.mark.parametrize("value", ["{ X = 1 }", "5", "true"])
-    def test_a_value_that_is_not_a_list_keeps_the_default(self, tmpdir, monkeypatch, caplog, value):
+    def test_a_value_that_is_not_a_list_names_the_file(self, tmpdir, monkeypatch, value):
         """``list(value)`` made ``["X"]`` of a table, and a number stopped the load."""
-        cfg = self._load(tmpdir, monkeypatch, committed=f"[index]\ntransient_defines = {value}\n")
-        assert cfg.index.transient_defines == list(DEFAULT_TRANSIENT_DEFINES)
-        assert "[index] transient_defines must be a list or a string" in caplog.text
+        from fw_context_mcp.config import ConfigError
+
+        with pytest.raises(ConfigError, match=r"\[index\] transient_defines must be an array of strings, or a string"):
+            self._load(tmpdir, monkeypatch, committed=f"[index]\ntransient_defines = {value}\n")
 
     def test_a_string_is_a_list_of_one_name(self):
         cfg = _from_dict({"index": {"transient_defines": "MY_STAMP"}})

@@ -44,7 +44,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     results = run_full_check(project_root=args.project, subset=subset)
 
     if args.fix:
-        results = run_fixes(results, project_root=args.project)
+        # `--only` without `config` changes no config file: the row
+        # `config` is there only to name the error.
+        results = run_fixes(results, project_root=args.project, fix_config=subset is None or "config" in subset)
         print(format_results(results))
         ok = sum(1 for r in results if r.status == "ok")
         fixed = ok  # approximation — items that were missing and are now ok

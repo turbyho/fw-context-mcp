@@ -26,9 +26,12 @@ import os
 import shutil
 import sqlite3
 import stat
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import tomlkit
 import tomlkit.exceptions
@@ -66,6 +69,28 @@ RETIRED_KEYS: tuple[RetiredKey, ...] = (
     # effect, and an index run refused a config that held it.
     RetiredKey("build", "build_dir", "build layout .fw-context/build/<variant>/out", in_variants=True),
 )
+
+#: The config files that got a ``.bak`` copy in the current run of the
+#: fixes (``one_copy_per_file``); None outside such a run.
+_copied_in_run: ContextVar[set[Path] | None] = ContextVar("_copied_in_run", default=None)
+
+
+@contextmanager
+def one_copy_per_file() -> Iterator[None]:
+    """Keep the first ``.bak`` copy of each config file until the block ends.
+
+    ``doctor --fix`` can change one file two times: the fix of ``config``
+    and the fix of ``obsolete-files``.  The second copy held the text after
+    the first change, and the value that the first change removed was
+    lost.  The label of a removed value holds no value (a secret), thus
+    the copy is the only way back for ``local.toml`` and the global config.
+    """
+    token = _copied_in_run.set(set())
+    try:
+        yield
+    finally:
+        _copied_in_run.reset(token)
+
 
 #: Files in the global directory that an older fw-context wrote.
 #: ``platformio-shared.ini``: the PlatformIO dependency tracking of 2026-07,
@@ -129,24 +154,7 @@ def clean(
     # current file give; at the start, the built-in default.
     lower_database: str | None = _BUILD_DATABASE_VALUES[-1].as_posix()
     runnable: bool | None = None
-    global_config = settings._GLOBAL_CONFIG_PATH
-    # (path, of the project, gets a .bak): config.toml of a project is in
-    # git, which holds the old text; local.toml and the global config are not.
-    config_files: list[tuple[Path, bool, bool]] = [(global_config, False, True)]
-    if project_root is not None:
-        config_dir = project_root / settings._PROJECT_CONFIG_DIR
-        # In the home directory (a dotfiles repository makes it a git
-        # root), the config of the "project" is the global config: it must
-        # not come a second time, as a file of a project.
-        config_files += [
-            (path, True, backup)
-            for path, backup in (
-                (config_dir / settings._PROJECT_CONFIG_NAME, False),
-                (config_dir / settings._PROJECT_LOCAL_CONFIG_NAME, True),
-            )
-            if not _is_the_same_file(path, global_config)
-        ]
-    for path, of_project, backup in config_files:
+    for path, of_project, backup in _config_files(project_root):
         document, unknown = _parse_config_file(path, report)
         if document is None:
             if unknown:
@@ -181,6 +189,105 @@ def clean(
         for path, reason in report.failures:
             log.warning("Cannot clean %s: %s", path, reason)
     return report
+
+
+def _config_files(project_root: Path | None) -> list[tuple[Path, bool, bool]]:
+    """Return ``(path, of the project, gets a .bak)`` for each config file, in the order of the layers.
+
+    ``config.toml`` of a project is in git, which holds the old text.
+    ``local.toml`` and the global config are not, thus they get a copy.
+    """
+    from .config import settings
+
+    global_config = settings._GLOBAL_CONFIG_PATH
+    config_files: list[tuple[Path, bool, bool]] = [(global_config, False, True)]
+    if project_root is not None:
+        config_dir = project_root / settings._PROJECT_CONFIG_DIR
+        # In the home directory (a dotfiles repository makes it a git
+        # root), the config of the "project" is the global config: it must
+        # not come a second time, as a file of a project.
+        config_files += [
+            (path, True, backup)
+            for path, backup in (
+                (config_dir / settings._PROJECT_CONFIG_NAME, False),
+                (config_dir / settings._PROJECT_LOCAL_CONFIG_NAME, True),
+            )
+            if not _is_the_same_file(path, global_config)
+        ]
+    return config_files
+
+
+def remove_unusable_values(project_root: Path | None, *, dry_run: bool = False) -> CleanupReport:
+    """Remove each config value that ``load`` cannot use, and return the report.
+
+    ``fw-context doctor --fix --only config`` calls it for the check
+    ``config``, and the check calls it with *dry_run* for its list.  The
+    values are the ones of ``config.settings.config_value_problems``: a
+    value of the wrong type, a URL that is not valid, a section that is
+    not a table.  The value of a lower file, or the default, then applies.  A label in ``removed_keys`` is the
+    problem, without the value: a key such as ``chat_api_key`` holds a
+    secret.  The ``.bak`` copy holds the old text (``config.toml`` has git).
+
+    A file that cannot be parsed is a failure: the fix cannot know its
+    values.  ``[project] id`` is a failure too, see ``ValueProblem``.  A
+    file that the fix cannot write gives a failure for each value, thus the
+    list of the check names the values also then.
+    """
+    from .config.settings import config_value_problems
+
+    report = CleanupReport()
+    for path, _of_project, backup in _config_files(project_root):
+        document, _unknown = _parse_config_file(path, report)
+        if document is None:
+            continue
+        original = document.as_string()
+        problems = config_value_problems(document.unwrap())
+        removable = [problem for problem in problems if problem.removable]
+        report.failures += [
+            (path, f"{problem.message}. Correct it by hand: without an ID the project is not initialized, "
+                   "and the index of the project is lost")
+            for problem in problems if not problem.removable
+        ]
+        if not removable:
+            continue
+        # The last place first: a removed table of an array moves the
+        # position of each table after it.  The sort compares two places
+        # only up to the first item that is not the same.  Both items are
+        # then keys of one table, or positions in one array, never a key
+        # and a position.
+        for problem in sorted(removable, key=lambda problem: problem.keys, reverse=True):
+            _remove_at(document, problem.keys)
+        # tomlkit gives a merged copy of an array of tables when a
+        # different table stands between its tables: a removal there
+        # changes nothing.  The file then stays, and the user must correct
+        # it.  Without this check the fix said "removed", and the next
+        # check named the same value again.
+        left = {problem.message for problem in config_value_problems(tomlkit.parse(tomlkit.dumps(document)).unwrap())}
+        if any(problem.message in left for problem in removable):
+            report.failures += [
+                (path, f"{problem.message}. Correct it by hand: fw-context cannot remove all of these values "
+                       "from this file, thus it does not change the file")
+                for problem in removable
+            ]
+            continue
+        failed_before = len(report.failures)
+        _write_config_file(
+            path, document, original, [problem.message for problem in removable], report, backup=backup, dry_run=dry_run,
+        )
+        if len(report.failures) > failed_before:
+            reason = report.failures.pop()[1]
+            report.failures += [(path, f"{problem.message} ({reason})") for problem in removable]
+    return report
+
+
+def _remove_at(document: tomlkit.TOMLDocument, keys: tuple[str | int, ...]) -> None:
+    """Remove the value at the place *keys* (a section, a key, the position of a table) from *document*."""
+    # Any: on the path the container is a document, a table, an array of
+    # tables or an array, and each takes a different key type.
+    container: Any = document
+    for key in keys[:-1]:
+        container = container[key]
+    del container[keys[-1]]
 
 
 def _is_the_same_file(path: Path, other: Path) -> bool:
@@ -303,7 +410,8 @@ def _write_config_file(
 
     A file that is not in git gets a copy of the old text first, at
     ``<name>.bak`` beside *path* (the place that the user knows, also for a
-    link).  The copy replaces the copy of an earlier cleanup.  It is the
+    link).  The copy replaces the copy of an earlier cleanup, but not a
+    copy of the same run of the fixes (``one_copy_per_file``).  It is the
     only way back for a removed key there; ``config.toml`` of a project has
     git for that.  When the copy cannot be written, the config stays.
     """
@@ -314,8 +422,11 @@ def _write_config_file(
             report.failures.append((path, "the owner has no write permission, thus the file stays as it is"))
             return
         if not dry_run:
-            if backup:
+            copied = _copied_in_run.get()
+            if backup and (copied is None or path not in copied):
                 write_text_atomic(path.with_name(path.name + ".bak"), original, mode=mode)
+                if copied is not None:
+                    copied.add(path)
             write_text_atomic(target, tomlkit.dumps(document), mode=mode)
     except (OSError, RuntimeError) as exc:
         # RuntimeError: Path.resolve on a loop of links (Python 3.11, 3.12).

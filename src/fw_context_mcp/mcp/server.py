@@ -942,12 +942,15 @@ mcp = FastMCP(
         "    NOTE: init and index are NEVER combined — each requires its own\n"
         "    operator confirmation before execution.\n"
         '  • status="config_error" — a config file of fw-context cannot be used:\n'
-        "    it cannot be read, it is not UTF-8 or not valid TOML, or a URL in it\n"
-        "    is not valid. `config_file` names it, and `index_message` gives the\n"
-        "    problem (for TOML also the line). Tell the operator the file and the\n"
-        "    problem. Do NOT run `fw-context init` or `fw-context index`: they\n"
-        "    cannot repair the file. Correct the file only with the approval of\n"
-        "    the operator, then call get_project_status() again.\n"
+        "    it cannot be read, it is not UTF-8 or not valid TOML, or a value in\n"
+        "    it has the wrong type or is not a valid URL. `config_file` names it,\n"
+        "    and `index_message` gives the problem (for TOML also the line). Tell\n"
+        "    the operator the file and the problem. Do NOT run `fw-context init`\n"
+        "    or `fw-context index`: they cannot repair the file. When\n"
+        "    `index_message` names `fw-context doctor --fix --only config`, that\n"
+        "    command removes each value that cannot be used. Run it, or correct\n"
+        "    the file, only with the approval of the operator, then call\n"
+        "    get_project_status() again.\n"
         "  • NO status, only `error` — the index holds no build config. There is\n"
         '    no status="error".\n'
         '  • The call fails with an error of SQLite (for example "database disk\n'
