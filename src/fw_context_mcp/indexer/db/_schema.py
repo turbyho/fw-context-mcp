@@ -30,11 +30,13 @@ each CREATE statement explain:
 
 ── Migration strategy ──
 
-Column additions are idempotent ALTER TABLE ADD COLUMN statements.
-Complex data backfills (FTS5 rebuild, deduplication, composite PK upgrade)
-run unconditionally on every ``open_db()`` call.  This guarantees that
-a database last opened with an old fw-context version is automatically
-brought to the current schema on first use.
+Column additions are idempotent ALTER TABLE ADD COLUMN statements, and
+``open_db()`` runs them on each open.  The complex data backfills (FTS5
+rebuild, deduplication, composite PK upgrade) run when the schema version
+of the database differs from ``CURRENT_SCHEMA_VERSION`` (a hash without a
+direction, thus any difference).  Each step is idempotent, thus a database
+that another fw-context version last opened is brought to the current
+schema on first use.
 
 Note: SQL DEFAULT (datetime('now')) captures per-row INSERT timestamps.
 Rows inserted in the same transaction may share identical timestamps —
@@ -1007,10 +1009,11 @@ CREATE INDEX IF NOT EXISTS idx_hotspot_cache_config ON hotspot_cache(config_hash
 --
 -- CRITICAL_TABLE — and this annotation is load-bearing, not decoration.
 -- CURRENT_SCHEMA_VERSION is a HASH of the column set, thus a schema change
--- can make it SMALLER.  `ensure_schema` compares with `<`: a stored version
--- ABOVE the current one takes the `elif` branch, which re-stamps the version
--- and never runs _SCHEMA.  `_ensure_migrated_columns` saves every ADD COLUMN
--- unconditionally, but a new TABLE has no such net.
+-- can make it SMALLER.  `ensure_schema` compared with `<`: a stored version
+-- ABOVE the current one took the `elif` branch, which re-stamped the version
+-- and never ran _SCHEMA.  It compares with `!=` now.  `_ensure_migrated_columns`
+-- saves every ADD COLUMN unconditionally, but a new TABLE has no such net on
+-- an index whose stamp an older process wrote again.
 --
 -- Measured: adding this table moved the version from 1739388653 down to
 -- 275729191, so every existing index re-stamped itself and never created
@@ -1146,10 +1149,12 @@ def _run_data_migrations(conn: sqlite3.Connection) -> None:
     state.  The FTS5 rebuild and embeddings migration run outside the
     SAVEPOINT because ``executescript()`` implicitly issues COMMIT.
 
-    Why idempotent: this function runs on every ``open_db()`` call, not
-    just on first use.  Each step checks whether it has work to do (e.g.,
-    ``WHERE file_path = ''``) before executing.  This is cheaper than
-    maintaining a separate migration-tracking table.
+    Why idempotent: this function runs on each ``open_db()`` of a database
+    whose schema version differs, and again after a migration that stopped
+    before its stamp, and on an index of a newer version.  Each step checks
+    whether it has work to do (e.g., ``WHERE file_path = ''``) before
+    executing.  This is cheaper than maintaining a separate migration-tracking
+    table.
 
     Why SAVEPOINT over BEGIN/COMMIT: the caller holds a connection-level
     transaction.  SAVEPOINT nests within it, so a backfill failure only

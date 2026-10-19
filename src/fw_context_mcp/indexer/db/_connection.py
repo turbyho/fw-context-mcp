@@ -63,11 +63,11 @@ The database layer uses three separate mechanisms:
 Schema versioning
 ─────────────────
 The schema version is stored in ``PRAGMA user_version`` and compared
-against ``CURRENT_SCHEMA_VERSION``.  When the on-disk version is older,
-``ensure_schema`` runs the full migration pipeline.  When the on-disk
-version is NEWER (tool downgrade scenario), it is re-stamped to current
-with a warning — the expectation is that the developer downgraded and
-the database should match the current code's expectations.
+against ``CURRENT_SCHEMA_VERSION``.  The version is a hash of the tables
+and their columns, and has no direction: an on-disk version that differs
+is older or newer, and the hash cannot tell which.  ``ensure_schema``
+thus runs the full migration pipeline for each difference: each step is
+idempotent, and the database then matches the code that opened it.
 """
 
 import logging
@@ -254,13 +254,15 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     # write lock, even while a background reindex is writing.
     current_schema_ver = conn.execute("PRAGMA user_version").fetchone()[0]
 
-    if current_schema_ver < CURRENT_SCHEMA_VERSION:
+    # Each difference, not `<`: the version is a hash without a direction.
+    # About each second change of the schema gave a smaller hash, and `>`
+    # only stamped such an older index, thus its migration did not run.
+    # The stamp comes last: a migration that stops (a lock, Ctrl-C during
+    # the FTS rebuild) leaves the old stamp, and the next open runs it again.
+    if current_schema_ver != CURRENT_SCHEMA_VERSION:
         conn.executescript(_SCHEMA)
         _ensure_migrated_columns(conn)
         _run_data_migrations(conn)
-        conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
-    elif current_schema_ver > CURRENT_SCHEMA_VERSION:
-        log.warning("Schema version %d > current %d — re-stamping.", current_schema_ver, CURRENT_SCHEMA_VERSION)
         conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
 
     # ── Unconditional column sanity check ──────────────────────────────────
@@ -555,8 +557,10 @@ def open_db(path: Path, *, skip_integrity_check: bool = False, check_same_thread
 def get_db_schema_version(conn: sqlite3.Connection) -> int:
     """Return the schema version stored in the database (``PRAGMA user_version``).
 
-    Compare with ``CURRENT_SCHEMA_VERSION`` — if lower, the index was built
-    with an older schema and may miss data populated by newer migrations.
+    Compare with ``CURRENT_SCHEMA_VERSION`` for equality: the version is a
+    hash without a direction.  A version that differs is of another
+    fw-context, and its index may miss data that the migrations of this
+    version add.
     """
     return conn.execute("PRAGMA user_version").fetchone()[0]
 

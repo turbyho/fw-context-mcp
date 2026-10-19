@@ -2691,8 +2691,10 @@ command.
   output. The reason names the command: `fw-context index --build`, or,
   when fw-context cannot run the build of the project, a build outside of
   fw-context and then `fw-context index`.
-- Schema mismatch (`schema_mismatch: <old> < <new>`). The reason names
-  the command.
+- Schema mismatch (`schema_mismatch: <index> != <this version>`): another
+  version of fw-context wrote the index. The schema version is a hash
+  without a direction, thus the reason does not tell older from newer. The
+  reason names the command.
 - An index that an older version wrote, and that lacks the columns of this
   version (`schema_mismatch: an older version wrote this index; it lacks
   the columns …`). No tool reads a build of such an index. The status

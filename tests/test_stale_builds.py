@@ -263,7 +263,7 @@ def test_an_old_schema_names_its_command(tmp_path, monkeypatch):
 
     health = _health(conn, root, tmp_path, "boot")
 
-    assert health["reindex_reasons"] == [f"schema_mismatch: 0 < {CURRENT_SCHEMA_VERSION}. Run `fw-context index`."]
+    assert health["reindex_reasons"] == [f"schema_mismatch: 0 != {CURRENT_SCHEMA_VERSION}. Run `fw-context index`."]
 
 
 @pytest.mark.parametrize("run_state", ["pending", "reindexing"])
@@ -283,7 +283,7 @@ def test_an_old_schema_and_row_format_ask_to_wait_for_a_run(tmp_path, monkeypatc
         "reason stays after the run, run `fw-context index`."
     )
     schema, row_format = health["reindex_reasons"]
-    assert schema == f"schema_mismatch: 0 < {CURRENT_SCHEMA_VERSION}{wait}"
+    assert schema == f"schema_mismatch: 0 != {CURRENT_SCHEMA_VERSION}{wait}"
     assert row_format.startswith(f"row_format_mismatch: fw-context-rows/0 != {CURRENT_ROW_FORMAT} — ")
     assert row_format.endswith(wait), row_format
 
@@ -298,7 +298,7 @@ def test_a_missing_database_comes_before_an_old_schema_in_the_message(tmp_path, 
 
     health = _health(conn, root, tmp_path, "boot")
 
-    assert health["reindex_reasons"][0].startswith("schema_mismatch: 0 < ")
+    assert health["reindex_reasons"][0].startswith("schema_mismatch: 0 != ")
     assert health["index_message"].startswith(
         f"compile_commands.json {root / 'boot.json'} does not exist. Build the project outside of fw-context"
     ), health["index_message"]

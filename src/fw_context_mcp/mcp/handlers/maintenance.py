@@ -554,7 +554,9 @@ def _build_health(
     analysis, stored_analyze_vendor = _analysis_of(conn, config_hash)
 
     cc_changed, stale_reason = _is_stale(cfg, cfg["compile_commands_path"])
-    schema_old = db_schema_ver < CURRENT_SCHEMA_VERSION
+    # A difference, not `<`: the version is a hash without a direction, and
+    # an index run of this version migrates each other version.
+    schema_old = db_schema_ver != CURRENT_SCHEMA_VERSION
     # Does the stored text still mean what this version reads it to mean?
     # The schema version above cannot answer that: it hashes the column
     # SET, thus it moves only when a column appears or goes, while the
@@ -697,7 +699,7 @@ def _build_health(
     # old, and then the reason stays after the run with its command.
     if schema_old:
         reindex_reasons.append(_with_action(
-            f"schema_mismatch: {db_schema_ver} < {CURRENT_SCHEMA_VERSION}",
+            f"schema_mismatch: {db_schema_ver} != {CURRENT_SCHEMA_VERSION}",
             "run `fw-context index`",
             bg_running,
         ))
@@ -845,13 +847,13 @@ def _build_health(
     # read the end of the message started a second run.
     elif schema_old and cc_changed:
         index_message = _with_action(
-            f"Schema version mismatch ({db_schema_ver} < {CURRENT_SCHEMA_VERSION}) "
+            f"Schema version mismatch ({db_schema_ver} != {CURRENT_SCHEMA_VERSION}) "
             "and compile_commands.json changed",
             "run `fw-context index`", bg_running,
         ) + " Queries still work on existing data."
     elif schema_old:
         index_message = _with_action(
-            f"Schema version mismatch ({db_schema_ver} < {CURRENT_SCHEMA_VERSION})",
+            f"Schema version mismatch ({db_schema_ver} != {CURRENT_SCHEMA_VERSION})",
             "run `fw-context index`", bg_running,
         ) + " Queries still work on existing data."
     elif row_format_old:
@@ -1996,7 +1998,7 @@ def _list_status(db_schema_ver: int, cc_stale: bool, row_format_old: bool) -> st
     changes.  Without this check ``list_projects`` reported "ready" over an
     index for which ``get_project_status`` and the daemon ask for a reindex.
     """
-    needs = (db_schema_ver < CURRENT_SCHEMA_VERSION) or cc_stale or row_format_old
+    needs = (db_schema_ver != CURRENT_SCHEMA_VERSION) or cc_stale or row_format_old
     return "reindex_needed" if needs else "ready"
 
 

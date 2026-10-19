@@ -1403,8 +1403,8 @@ def _step_verify_integrity(conn: sqlite3.Connection, ctx: dict) -> None:
     - When this raises, the pipeline stops here, so ``finalize_manifest`` is
       skipped — which is the intent — but ``cleanup_old`` and
       ``wal_checkpoint`` are skipped too.  The WAL stays without a
-      checkpoint and ``PRAGMA user_version`` is never set, and the next
-      reader sees that as ``reindex_needed`` because of the schema version.
+      checkpoint.  The schema version is set anyway: ``open_db`` at the
+      start of the run stamps it.
     """
     problems: list[str] = []
 

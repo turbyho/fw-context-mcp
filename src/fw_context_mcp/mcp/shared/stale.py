@@ -150,9 +150,10 @@ def quick_structural_reasons(conn, cfg) -> list[str]:
         reasons.append("compile_commands.json changed")
 
     # 2. Schema version mismatch?
+    # A difference, not `<`: the version is a hash without a direction.
     schema_ver = get_db_schema_version(conn)
-    if schema_ver < CURRENT_SCHEMA_VERSION:
-        reasons.append(f"schema {schema_ver} < {CURRENT_SCHEMA_VERSION}")
+    if schema_ver != CURRENT_SCHEMA_VERSION:
+        reasons.append(f"schema {schema_ver} != {CURRENT_SCHEMA_VERSION}")
 
     # 3. Does the stored text still mean what this version reads it to mean?
     # The columns can keep every name while their content changes — the text
