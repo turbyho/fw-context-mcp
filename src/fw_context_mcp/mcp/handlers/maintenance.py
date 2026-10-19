@@ -2993,7 +2993,7 @@ def reindex_file_impl(
     with_analysis: Annotated[
         bool,
         Field(
-            description="When True (default), also regenerates the LLM symbol analysis and the embeddings — slower, because the two need a model. Set False for a fast update: the tool skips the two, and get_project_status then reports the symbols that wait for them. The method overrides, the PageRank scores and the hotspot cache are rebuilt in the two modes."
+            description="When True (default), also regenerates the LLM symbol analysis and the embeddings — slower, because the two need a model. Set False for a fast update: the tool skips the two, and get_project_status then reports the symbols that wait for them. The method overrides, the PageRank scores and the hotspot cache are rebuilt in the two modes when reference indexing is on (`[index] index_refs`)."
         ),
     ] = True,
 ) -> dict:
@@ -3527,9 +3527,13 @@ def reindex_file(
     carries a ``warning`` — only a full ``fw-context index`` covers every
     unit that includes the header.
 
-    Also regenerates LLM analysis and method override relationships for
-    affected symbols when those features are enabled in config.  An
-    unchanged symbol keeps its stored analysis.
+    Also rebuilds the method override relationships, the PageRank scores
+    and the hotspot cache when reference indexing is on
+    (``[index] index_refs``).  It also regenerates the LLM analysis and
+    the embeddings of the affected symbols (``with_analysis=True`` of
+    ``reindex_file_impl``) when the LLM is on (``[llm] enabled``).  The
+    analysis also needs ``[llm] analyze_symbols``.  An unchanged symbol
+    keeps its stored analysis.
 
     Args:
         file_path: Path to the file to re-parse.  A source file must be in

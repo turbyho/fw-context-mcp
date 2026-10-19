@@ -477,8 +477,10 @@ async def smart_search(
         and is not stored, thus a next page searches again.  Make the query
         more specific, or increase the LLM timeout.
 
-        When compile_commands.json changed after the last index run, a
-        trailing dict holds a ``warning`` and a ``hint`` to reindex.
+        When the index of the build of the query is not current (for
+        example, compile_commands.json changed after the last index run),
+        a leading dict holds ``warning`` and ``index_state``.  The answer
+        then comes from the last index run.
 
         No match gives the metadata entries and a dict with ``info``.  One
         dict with ``error`` means the query failed — check that key first.
@@ -719,8 +721,10 @@ async def semantic_search(
         fact to quote — and ``_rerank_score`` when
         ``llm.reranker_model`` is set.
 
-        When compile_commands.json changed after the last index run, a
-        trailing dict holds a ``warning`` and a ``hint`` to reindex.
+        When the index of the build of the query is not current (for
+        example, compile_commands.json changed after the last index run),
+        a leading dict holds ``warning`` and ``index_state``.  The answer
+        then comes from the last index run.
 
         Fallback: when the LLM is disabled or not running, or the index
         holds no embeddings, or the embedding model fails, this tool runs
@@ -1086,7 +1090,7 @@ def search_bodies(
     """Find patterns in the TEXT OF A DEFINITION — the code inside its extent.
 
     Searches **ifdef-filtered** text — only the code that compiles for the
-    current build.  A line of an inactive ``#if`` branch holds nothing, thus
+    build of the query.  A line of an inactive ``#if`` branch holds nothing, thus
     a pattern that lives only in a dead branch gives no result here.  That
     empty answer is the correct one: the code does not compile.
 
@@ -1425,7 +1429,7 @@ def search_content(
     text that belongs to a definition.
 
     Searches **ifdef-filtered** file text — only code that actually compiles
-    for the current build configuration.  Inactive ``#ifdef`` branches are
+    for the build of the query.  Inactive ``#ifdef`` branches are
     replaced with blank lines (preserving original line numbers).  A pattern
     that lives only in a dead branch therefore gives no result, and that
     empty answer is the correct one: the code does not compile.

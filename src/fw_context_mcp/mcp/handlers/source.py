@@ -1882,7 +1882,7 @@ def read_file(
     image: Annotated[str | None, Field(description=IMAGE_DESCRIPTION)] = None,
 ) -> dict:
     """Read a C/C++ source file, one page at a time, with **ifdef-filtered** content —
-    only code that actually compiles for the current build configuration.
+    only code that actually compiles for the build of the query.
     Inactive ``#ifdef`` branches are replaced with blank lines (preserving
     original line numbers).
 
