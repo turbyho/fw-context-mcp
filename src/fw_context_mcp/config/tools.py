@@ -453,16 +453,17 @@ Do NOT use fw-context in Python, JS, Go, or other non-C/C++ projects.
 ### Tool categories
 
 Search: lookup_symbol, search_code, search_bodies, search_content,
-smart_search, semantic_search, explain_symbol.
-Source: get_symbol_context, get_source, get_file_map, read_file.
+smart_search, semantic_search, find_variables.
+Source: get_symbol_context, get_source, get_file_map, explain_symbol, read_file.
 Call graph: find_callers, find_references, find_call_path,
 find_all_callers_recursive, find_callees_recursive, find_hotspots,
-find_dead_code, find_wrapper_callers, trace_data_flow,
+find_dead_code, find_wrapper_callers, trace_data_flow, get_vector_table,
 find_indirect_call_sites, find_indirect_targets.
 Inheritance: get_inheritance_chain, get_class_members,
 get_template_instances, get_method_overrides.
-Maintenance: get_project_status, get_build_info, reindex_file, reset_index,
-check_ollama, check_dependencies, list_projects, get_project_info.
+Maintenance: get_project_status, get_build_info, check_dependencies,
+list_projects, get_project_info, check_ollama, configure_llm, reindex_file,
+reindex_file_impl, reset_index.
 
 Individual tool descriptions are in the MCP tool listings —
 discover them at runtime.

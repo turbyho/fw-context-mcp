@@ -870,6 +870,17 @@ def test_every_copy_of_the_instructions_says_one_query_one_build():
         assert "twice" in text, f"{label}: no way given to compare two builds"
 
 
+def test_every_copy_of_the_instructions_names_each_tool():
+    """The tool categories of the two copies lost tools that the server registers.
+
+    Before 0.35.0, BASE_INSTRUCTIONS lacked get_vector_table, configure_llm
+    and reindex_file_impl, and the server copy lacked find_variables.
+    """
+    for label, text in _instruction_copies():
+        missing = [name for name in TOOL_IDS if not re.search(rf"\b{re.escape(name)}\b", text)]
+        assert not missing, f"{label} names no {missing}"
+
+
 def test_every_copy_of_the_instructions_names_the_missing_embeddings():
     """The status names definitions without an embedding, and the reader must tell the operator.
 
