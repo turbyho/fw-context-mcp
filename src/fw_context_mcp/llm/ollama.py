@@ -276,12 +276,22 @@ def _stream_ollama_generate(
                         _pull_model(cfg.model, base_url)
                         # Retry with streaming
                         with httpx.stream("POST", url, json=payload, timeout=cfg.timeout) as resp2:
+                            if resp2.status_code == 400:
+                                resp2.read()
+                                too_long = _prompt_too_long(resp2)
+                                if too_long is not None:
+                                    raise too_long
                             resp2.raise_for_status()
                             for line in resp2.iter_lines():
                                 _extract_ollama_chunk(line, chunks)
                     else:
                         raise OllamaModelNotFoundError(cfg.model, base_url) from None
                 else:
+                    if resp.status_code == 400:
+                        resp.read()
+                        too_long = _prompt_too_long(resp)
+                        if too_long is not None:
+                            raise too_long
                     resp.raise_for_status()
                     for line in resp.iter_lines():
                         _extract_ollama_chunk(line, chunks)
@@ -310,7 +320,7 @@ def _stream_ollama_generate(
             {
                 "ts": datetime.now(UTC).isoformat(),
                 "model": cfg.model,
-                "num_ctx": cfg.num_ctx,
+                "num_ctx": payload["options"]["num_ctx"],
                 "latency_s": round(time.monotonic() - t0, 2),
                 "prompt": prompt,
                 "response": response_text,
@@ -342,6 +352,7 @@ def call_ollama(
     *,
     temperature: float = 0.0,
     num_predict: int | None = None,
+    num_ctx: int | None = None,
 ) -> str:
     """Send a prompt to the configured chat backend and return the response text.
 
@@ -373,8 +384,15 @@ def call_ollama(
         cfg: LLM configuration.
         temperature: Sampling temperature (0.0 = deterministic, default).
         num_predict: Maximum tokens to generate (None = model default).
+        num_ctx: The context of this request (None = ``cfg.num_ctx``).  The
+            Ollama-native path only.  A request with another context than
+            the loaded model makes the server load the model again.
 
-    Raises OllamaError on network or API failure.
+    The Ollama-native path asks the server not to cut the prompt
+    (``truncate: false``), see :class:`OllamaPromptTooLong`.
+
+    Raises OllamaError on network or API failure, and OllamaPromptTooLong
+    when the prompt has more tokens than the context.
     """
     if cfg.chat_api_base:
         from .chat_router import call_openai_chat, detect_chat_endpoint
@@ -400,13 +418,15 @@ def call_ollama(
         url = cfg.ollama_url.rstrip("/") + "/api/generate"
         base_url = cfg.ollama_url
 
-    options: dict = {"num_ctx": cfg.num_ctx, "temperature": temperature}
+    context = num_ctx if num_ctx is not None else cfg.num_ctx
+    options: dict = {"num_ctx": context, "temperature": temperature}
     if num_predict is not None:
         options["num_predict"] = num_predict
     payload: dict = {
         "model": cfg.model,
         "prompt": prompt,
         "stream": False,
+        "truncate": False,
         "keep_alive": cfg.keep_alive,
         "options": options,
     }
@@ -429,6 +449,9 @@ def call_ollama(
                     resp = httpx.post(url, json=payload, timeout=cfg.timeout)
             else:
                 raise OllamaModelNotFoundError(cfg.model, base_url) from None
+        too_long = _prompt_too_long(resp)
+        if too_long is not None:
+            raise too_long
         resp.raise_for_status()
 
         # Plan A: detect streaming response even when stream:false was requested
@@ -445,7 +468,7 @@ def call_ollama(
                 {
                     "ts": datetime.now(UTC).isoformat(),
                     "model": cfg.model,
-                    "num_ctx": cfg.num_ctx,
+                    "num_ctx": context,
                     "latency_s": round(time.monotonic() - t0, 2),
                     "prompt": prompt,
                     "response": response_text,
@@ -464,6 +487,143 @@ def call_ollama(
         raise OllamaError(f"Ollama HTTP {e.response.status_code}: {e.response.text[:200]}") from e
     except (httpx.HTTPError, OSError, KeyError, json.JSONDecodeError, ValueError) as e:
         raise OllamaError(str(e)) from e
+
+
+def generate_endpoint(cfg: LLMConfig) -> str | None:
+    """Return the URL of ``/api/generate`` that :func:`call_ollama` uses, or None.
+
+    None for an OpenAI-compatible chat endpoint: it has no ``truncate``,
+    and it gives no count of the tokens of a prompt that it refuses.
+    """
+    if cfg.chat_api_base:
+        from .chat_router import detect_chat_endpoint
+
+        fmt, endpoint = detect_chat_endpoint(cfg)
+        return endpoint if fmt == "ollama" else None
+    return cfg.ollama_url.rstrip("/") + "/api/generate"
+
+
+def count_prompt_tokens(prompt: str, cfg: LLMConfig, num_ctx: int) -> int:
+    """Return the number of tokens of *prompt* for the chat model of *cfg*.
+
+    A request with ``num_predict: 1`` and ``truncate: false``.  A prompt that
+    fits the context gives ``prompt_eval_count``; a longer one gives the
+    count in the error of the server (:class:`OllamaPromptTooLong`).  The
+    count comes from the tokenizer of the model, not from a ratio of
+    characters to tokens.
+
+    WHY it costs almost nothing: the server keeps the evaluated prompt, and
+    a request with the same prompt right after it evaluates one token only.
+    Measured with qwen2.5-coder:14b: 8626 tokens took 7.7 s for the count,
+    and 0.08 s in the request that followed.
+
+    *num_ctx* is the context of the request that follows; another value
+    makes the server load the model again.
+
+    Raises:
+        OllamaError: The chat endpoint is not Ollama-native, or the request
+            failed.
+    """
+    url = generate_endpoint(cfg)
+    if url is None:
+        raise OllamaError("an OpenAI-compatible chat endpoint gives no count of the tokens of a prompt")
+    payload = {
+        "model": cfg.model, "prompt": prompt, "stream": False, "truncate": False,
+        "keep_alive": cfg.keep_alive, "options": {"num_ctx": num_ctx, "num_predict": 1},
+    }
+    try:
+        with ollama_guard():
+            resp = httpx.post(url, json=payload, timeout=cfg.timeout)
+        too_long = _prompt_too_long(resp)
+        if too_long is not None:
+            return too_long.prompt_tokens
+        resp.raise_for_status()
+        return int(resp.json()["prompt_eval_count"])
+    except httpx.TimeoutException:
+        raise OllamaError(f"Ollama request timed out after {cfg.timeout:.0f}s") from None
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            raise OllamaModelNotFoundError(cfg.model, url.removesuffix("/api/generate")) from e
+        raise OllamaError(f"Ollama HTTP {e.response.status_code}: {e.response.text[:200]}") from e
+    except (httpx.HTTPError, OSError, KeyError, json.JSONDecodeError, ValueError, TypeError) as e:
+        raise OllamaError(str(e)) from e
+
+
+def pull_chat_model(cfg: LLMConfig) -> None:
+    """Pull the chat model of *cfg* onto its Ollama server (``auto_pull``).
+
+    Raises:
+        OllamaError: The chat endpoint is not Ollama-native, or the pull failed.
+    """
+    url = generate_endpoint(cfg)
+    if url is None:
+        raise OllamaError("an OpenAI-compatible chat endpoint has no pull")
+    log.info("LLM model '%s' not found, pulling...", cfg.model)
+    _pull_model(cfg.model, url.removesuffix("/api/generate"))
+
+
+# The oldest Ollama that the LLM analysis and the embeddings can use.  Read
+# from the source of Ollama:
+# * v0.30.0 runs GGUF models in llama-server, and a prompt longer than the
+#   context then gets HTTP 400 with the count of its tokens
+#   (``exceed_context_size_error``, ``n_prompt_tokens``).
+# * v0.30.1 counts the cached tokens of a prompt in ``prompt_eval_count``.
+#   In v0.30.0 the count of a prompt that shares a start with the prompt
+#   before it was too small, thus the answer budget too.
+# The analysis counts each prompt from the two (``count_prompt_tokens``).
+# Before them, a ``/api/generate`` request with ``truncate: false`` (v0.12.6)
+# got an error without a count, and a server before v0.12.6 cut the prompt
+# without an error.  ``/api/ps`` names the context of a loaded model from
+# v0.10.0.  Tested with v0.35.1.
+MIN_OLLAMA_VERSION = (0, 30, 1)
+
+
+def ollama_version(base_url: str) -> tuple[int, int, int] | None:
+    """Return the version of the Ollama server at *base_url* (``/api/version``), or None.
+
+    None when the server does not answer, or gives a version that is not
+    ``X.Y.Z`` (a build from source gives ``0.0.0``, which is a valid answer).
+    A suffix such as ``-rc0`` does not count.
+    """
+    try:
+        resp = httpx.get(base_url.rstrip("/") + "/api/version", timeout=5.0)
+        resp.raise_for_status()
+        version = resp.json().get("version")
+    except (httpx.HTTPError, OSError, ValueError, AttributeError):
+        return None
+    match = re.match(r"(\d+)\.(\d+)\.(\d+)", version) if isinstance(version, str) else None
+    return (int(match[1]), int(match[2]), int(match[3])) if match else None
+
+
+def ollama_version_problem(base_url: str) -> str | None:
+    """Return a sentence about an Ollama server that is too old for fw-context, or None.
+
+    None also when the version is not known: the check of the server
+    reports a server that does not answer.  ``0.0.0`` (a build from source)
+    is not known to be old, thus it is None too.
+    """
+    version = ollama_version(base_url)
+    if version is None or version == (0, 0, 0) or version >= MIN_OLLAMA_VERSION:
+        return None
+    have, need = ".".join(map(str, version)), ".".join(map(str, MIN_OLLAMA_VERSION))
+    return (
+        f"Ollama {have} at {base_url} is older than {need}: the LLM analysis cannot count the tokens "
+        f"of a prompt, and the server can cut a long prompt or a long embedding input without an error. "
+        f"Update Ollama"
+    )
+
+
+def trained_context(cfg: LLMConfig) -> int | None:
+    """Return the context length that the chat model of *cfg* was trained for, or None.
+
+    The largest context that the server gives the model: a request with a
+    larger ``num_ctx`` gets the trained one.  None for an OpenAI-compatible
+    chat endpoint, and when the server does not answer.
+    """
+    url = generate_endpoint(cfg)
+    if url is None:
+        return None
+    return _trained_context(url.removesuffix("/api/generate"), cfg.model)
 
 
 def _call_ollama_embed_impl(
@@ -1004,6 +1164,45 @@ def check_setup(cfg: LLMConfig) -> dict:
 
 class OllamaError(RuntimeError):
     """Base exception for Ollama API and network failures."""
+
+
+class OllamaPromptTooLong(OllamaError):
+    """The prompt has more tokens than the context of the request (HTTP 400).
+
+    The request asks the server not to cut the prompt (``truncate: false``).
+    Without it, the server cuts a long prompt without an error, and the
+    model answers about a part of it: measured, a prompt of 6413 tokens got
+    1026 tokens to the model.  The server gives the exact count of the
+    tokenizer of the model, thus the caller can select a larger context.
+    """
+
+    def __init__(self, prompt_tokens: int, context: int) -> None:
+        super().__init__(f"the prompt has {prompt_tokens} tokens, the context of the request has {context}")
+        self.prompt_tokens = prompt_tokens
+        self.context = context
+
+
+def _prompt_too_long(resp: httpx.Response) -> OllamaPromptTooLong | None:
+    """Return the error of a 400 answer that says the prompt is too long, else None.
+
+    Ollama 0.35 puts the error of its runner as a JSON string into the
+    field ``error``: ``{"error": {"type": "exceed_context_size_error",
+    "n_prompt_tokens": 6413, "n_ctx": 2048, ...}}``.
+    """
+    if resp.status_code != 400:
+        return None
+    try:
+        outer = resp.json().get("error")
+        inner = json.loads(outer) if isinstance(outer, str) else outer
+        error = inner.get("error") if isinstance(inner, dict) else None
+    except (ValueError, TypeError, AttributeError):
+        return None
+    if not isinstance(error, dict) or error.get("type") != "exceed_context_size_error":
+        return None
+    prompt_tokens, context = error.get("n_prompt_tokens"), error.get("n_ctx")
+    if not isinstance(prompt_tokens, int) or not isinstance(context, int):
+        return None
+    return OllamaPromptTooLong(prompt_tokens, context)
 
 
 class ChatApiError(OllamaError):

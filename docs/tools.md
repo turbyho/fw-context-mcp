@@ -13,8 +13,10 @@ Build or update the symbol index from `compile_commands.json`.
 > `--build` to force a clean build and a full re-index when needed, for
 > example after an SDK update or a build system change. Use `--force` to
 > skip the hash checks and force a re-index of all files, embeddings,
-> LLM analysis, overrides, and caches, without rebuilding, for example
-> after a schema change or a tool update.
+> overrides, and caches, without rebuilding, for example after a schema
+> change or a tool update. `--force` keeps the LLM analysis: it comes
+> from the cache. Use `--force-llm` to make the analysis again. That
+> takes much longer than an index run.
 
 A file is changed when its content, the content of a header that it
 includes, or its compiler flags changed. fw-context compares hashes and no
@@ -36,9 +38,12 @@ fw-context index
 # Force clean build + full re-index:
 fw-context index --build
 
-# Force full re-index of all files, embeddings, analysis, and caches
+# Force full re-index of all files, embeddings, and caches
 # (skips the hash checks — use after schema changes or tool updates):
 fw-context index --force
+
+# Make the LLM analysis of each symbol again (takes hours on a large project):
+fw-context index --force-llm
 
 # Explicit path, verbose
 fw-context index compile_commands.json -v
@@ -73,7 +78,8 @@ fw-context index --vendor-paths sdk third_party --project-paths src lib
 | `--analyze-vendor` | `[llm] analyze_vendor` (`false`) | Also analyze the vendor and SDK code |
 | `--no-analyze-vendor` | off | Skip the analysis of the vendor and SDK code. Wins over `--analyze-vendor` and the config. |
 | `--background` | off | The mode of the file-watcher daemon. The run does not rebuild a stale `compile_commands.json`, does not repair it, and prunes no registry rows. It builds only when the backend can build on its own. |
-| `--force` | off | Force re-index of all files, embeddings, LLM analysis, overrides, PageRank, and hotspot cache (skips the hash checks) |
+| `--force` | off | Force re-index of all files, embeddings, overrides, PageRank, and hotspot cache (skips the hash checks). The LLM analysis comes from the cache. |
+| `--force-llm` | off | Make the LLM analysis of each symbol again. The analyses of the caches from before the command do not apply, and the new ones replace the entries of the local cache, and of the cache server when the token has `can_overwrite`. It turns on the analysis. With `--no-analyze`, the command stops with an error. A command that stops, or that does not reach each symbol (Ollama did not answer), leaves the old analyses of the symbols that it did not reach. The next `--force-llm` with the same chat model continues from the time of the first command: the file `force_llm.json` of the index keeps it until a command reaches each symbol. Needs Ollama 0.30.1 or later. |
 | `--variant NAME` | all variants | Restrict indexing to one build variant (name from `[[build.variants]]`) |
 | `--variants A,B` | all variants | Comma-separated list of build variants to index |
 | `--image NAME` | all images | Index only this image of the build (Zephyr sysbuild, ESP-IDF). The build stays complete. |

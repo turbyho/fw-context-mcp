@@ -35,6 +35,7 @@ from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ..indexer import _force_llm_marker as force_llm_marker
 from ..indexer import autobuild
 from ..mcp.shared.pid_file import PidFile
 from ..utils import (
@@ -1517,9 +1518,14 @@ def _layered_paths(base: list[str], variant_extra: list[str]) -> list[str]:
 def _build_run_kwargs(
     args, cfg, project_root, project_id, vendor_paths, project_paths, cs_config,
 ) -> dict:
-    """Build the shared ``runner.run()`` kwargs from config + CLI flags."""
+    """Build the shared ``runner.run()`` kwargs from config + CLI flags.
+
+    ``force_llm_since`` is None here: ``_cmd_index`` sets it from the marker
+    of the index, under the index lock (``indexer._force_llm_marker``).
+    """
     from ..indexer.build import detect_build_system
 
+    force_llm = bool(getattr(args, "force_llm", False))
     return dict(
         vendor_paths=vendor_paths,
         project_paths=project_paths,
@@ -1533,7 +1539,7 @@ def _build_run_kwargs(
         analyze_symbols=(
             False
             if getattr(args, "no_analyze", False)
-            else getattr(args, "analyze", False) or cfg.llm.analyze_symbols
+            else force_llm or getattr(args, "analyze", False) or cfg.llm.analyze_symbols
         ),
         analyze_overrides=True,
         project_root=project_root,
@@ -1542,6 +1548,7 @@ def _build_run_kwargs(
         cache_server_config=cs_config,
         config_header=cfg.index.config_header,
         force=args.force,
+        force_llm_since=None,
         analyze_vendor=(
             False
             if getattr(args, "no_analyze_vendor", False)
@@ -1682,6 +1689,11 @@ def _cmd_index(args: argparse.Namespace, outside: _SigtermOutsideTheLock) -> int
     # Suppress httpx INFO logs (one per HTTP request — extremely noisy during
     # embedding generation, LLM analysis, and cache server communication).
     logging.getLogger("httpx").setLevel(logging.WARNING)
+
+    if getattr(args, "force_llm", False) and getattr(args, "no_analyze", False):
+        print("error: --force-llm makes the LLM analysis again, and --no-analyze skips it: "
+              "give one of the two", file=sys.stderr)
+        return 2
 
     project_root = resolve_project_root(args.project)
     # Before the config loads: a retired key such as build_dir goes from the
@@ -1847,10 +1859,7 @@ def _cmd_index(args: argparse.Namespace, outside: _SigtermOutsideTheLock) -> int
     vendor_paths = list(getattr(args, "vendor_paths", None) or cfg.index.vendor_paths)
     project_paths = list(getattr(args, "project_paths", None) or cfg.index.project_paths)
 
-    cs_config = cfg.cache_server
-    if cs_config is not None and getattr(args, "force", False):
-        from dataclasses import replace
-        cs_config = replace(cs_config, force=True)
+    cs_config = _cache_server_config(args, cfg)
 
     run_kwargs = _build_run_kwargs(
         args, cfg, project_root, project_id, vendor_paths, project_paths, cs_config,
@@ -1858,6 +1867,9 @@ def _cmd_index(args: argparse.Namespace, outside: _SigtermOutsideTheLock) -> int
     run_kwargs["record_git"] = _records_checkout(
         args, cfg, detected_system, project_root, project_id, db_path, explicit_cc,
     )
+    force_llm = bool(getattr(args, "force_llm", False))
+    if force_llm and not cfg.llm.enabled:
+        print("warning: --force-llm does nothing: [llm] enabled is false", file=sys.stderr)
     multi = bool(cfg.build.variants)
 
     # The index is owned BEFORE anything is built, on both paths below.  A
@@ -1868,6 +1880,12 @@ def _cmd_index(args: argparse.Namespace, outside: _SigtermOutsideTheLock) -> int
     outside.db_dir = db_path.parent
     try:
         with _owned_index(db_path.parent, args):
+            if force_llm:
+                # Under the lock: a command that the lock refuses writes no marker.
+                since, continues = force_llm_marker.since_for(db_path.parent, cfg.llm.model)
+                if continues:
+                    print(f"--force-llm continues the command of {since} UTC", file=sys.stderr)
+                run_kwargs["force_llm_since"] = since
             # ── Multi-variant: dispatch BEFORE single-build resolution ──
             # WHY: [[build.variants]] replaces the single [build] board/source
             # flow.  build_multi() builds each variant; the single-build path
@@ -1892,6 +1910,9 @@ def _cmd_index(args: argparse.Namespace, outside: _SigtermOutsideTheLock) -> int
             # and the old index reads the old copies.
             if exit_code == 0:
                 _clean_obsolete(args, project_root)
+                if force_llm and not force_llm_marker.finish(db_path.parent):
+                    print("warning: --force-llm did not reach each symbol (see the log); "
+                          "run it again to continue", file=sys.stderr)
     except IndexRunLocked as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_ALREADY_RUNNING
@@ -1939,6 +1960,21 @@ def _cmd_index(args: argparse.Namespace, outside: _SigtermOutsideTheLock) -> int
 
     _ensure_watcher_after_index(project_root)
     return 0
+
+
+def _cache_server_config(args: argparse.Namespace, cfg):
+    """Return the cache server config of the run: `--force-llm` replaces the entries of the server.
+
+    The cache server holds the LLM analysis only, thus a new analysis
+    replaces its entries, when the token permits it (``can_overwrite``).
+    ``--force`` keeps the analyses, thus it does not.
+    """
+    cs_config = cfg.cache_server
+    if cs_config is not None and getattr(args, "force_llm", False):
+        from dataclasses import replace
+
+        cs_config = replace(cs_config, force=True)
+    return cs_config
 
 
 def _clean_obsolete(args: argparse.Namespace, project_root: Path) -> None:

@@ -475,6 +475,18 @@ def check_ollama_running(cfg) -> DepCheckResult:
             instructions=ollama_instructions(platform_ctx),
             critical=False,
         )
+    from ..llm.ollama import ollama_version_problem
+
+    # Also in `fw-context init`, which runs these checks.
+    problem = ollama_version_problem(cfg.ollama_url)
+    if problem:
+        return DepCheckResult(
+            name="ollama",
+            status="degraded",
+            message=problem,
+            instructions=ollama_instructions(platform_ctx),
+            critical=False,
+        )
     return DepCheckResult(
         name="ollama",
         status="ok",
@@ -528,6 +540,13 @@ def check_ollama_chat_model(cfg) -> DepCheckResult:
             message=f"the Ollama server {server} of chat_api_base gives no model list (/api/tags)",
             critical=False,
         )
+    if server.rstrip("/") != cfg.ollama_url.rstrip("/"):
+        # The check "ollama" reports the version of ollama_url only.
+        from ..llm.ollama import ollama_version_problem
+
+        problem = ollama_version_problem(server)
+        if problem:
+            return DepCheckResult(name="chat-model", status="degraded", message=problem, critical=False)
     if not any(_model_name_matches(m, cfg.model) for m in models):
         command = ollama_pull_command(cfg.model, server, get_platform_info()["system"])
         return DepCheckResult(

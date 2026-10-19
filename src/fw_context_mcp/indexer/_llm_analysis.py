@@ -1,7 +1,7 @@
 """LLM analysis batch processing extracted from runner.py.
 
 WHY separate module: the LLM analysis loop is complex (hash-based caching,
-two-tier cache lookup, body truncation, context-window budgeting, sentinel
+two-tier cache lookup, token counts and context selection, sentinel
 management).  Extracting it from runner.py keeps the runner focused on the
 parse→store pipeline and makes the analysis logic testable in isolation.
 
@@ -15,10 +15,19 @@ import logging
 import os
 import time
 from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from ..cache_client import get_local_cache_db, local_cache_lookup, local_cache_upsert
-from ..llm.ollama import call_ollama
+from ..llm.ollama import (
+    OllamaPromptTooLong,
+    call_ollama,
+    count_prompt_tokens,
+    generate_endpoint,
+    pull_chat_model,
+    trained_context,
+)
 from ..utils import SAFE_EXCEPT, is_fatal, read_file_lines
 from ._embedding import _fmt_dur
 from .db import transaction, upsert_llm_analysis_batch, write_lock
@@ -195,29 +204,63 @@ def _enrich_batch(conn, batch_rows, config_hash: str, *, project_root: Path | No
         enriched.append(d)
     return enriched
 
-def _resolve_model_context_size(llm_config) -> int:
-    """Resolve the model context window size from the Ollama API.
+# The tokens of the answer (num_predict), and thus the tokens of the context
+# that a prompt must leave free.  Measured with qwen2.5-coder:14b on 14 long
+# bodies: an answer has 139 to 465 tokens; the budget is about twice the
+# largest.  WHY a fixed budget: the budget was the rest of the context, and
+# the largest prompt of the second pass, whose context is made to fit it,
+# then had 300 tokens: a cut JSON, and a sentinel on each run.
+_ANSWER_TOKENS = 1024
 
-    Falls back to ``llm_config.num_ctx`` when the API is unreachable.
+
+def _analysis_contexts(llm_config) -> tuple[int, int] | None:
+    """Return the context of the run and the largest context of the model, or None.
+
+    The context of the run is ``num_ctx`` of the config: the server loads
+    the model with it.  The largest one is the context that the model was
+    trained for (POST ``/api/show``); a prompt that does not fit the
+    context of the run goes in a second pass with a larger one.
+
+    Before, the context came from ``details.context_length`` of
+    ``/api/tags``: the trained context (32768 for qwen2.5-coder:14b), while
+    each request had ``num_ctx`` (16384).  The answer budget thus counted
+    on a context that the server did not use.
+
+    An OpenAI-compatible chat endpoint gives no trained context and no
+    token count: the run then has ``num_ctx`` only.  None when the Ollama
+    server does not answer, or does not have the model: the run then makes
+    no analysis.
     """
-    import httpx
+    if generate_endpoint(llm_config) is None:
+        return llm_config.num_ctx, llm_config.num_ctx
+    largest = trained_context(llm_config)
+    if largest is None and llm_config.auto_pull:
+        # /api/show gives 404 for a model that is not installed.
+        try:
+            pull_chat_model(llm_config)
+        except SAFE_EXCEPT as e:
+            if is_fatal(e):
+                raise
+            log.warning("The pull of %s failed: %s", llm_config.model, e)
+        else:
+            largest = trained_context(llm_config)
+    if largest is None:
+        log.warning("Ollama did not give the context of %s (not reachable, or the model is not installed) "
+                    "— skipping LLM analysis generation", llm_config.model)
+        return None
+    return min(llm_config.num_ctx, largest), largest
 
-    try:
-        resp = httpx.get(llm_config.ollama_url.rstrip("/") + "/api/tags", timeout=5.0)
-        resp.raise_for_status()
-        for m in resp.json().get("models", []):
-            if m.get("name") == llm_config.model:
-                ctx = m.get("details", {}).get("context_length", 0)
-                if ctx > 0:
-                    log.debug("Resolved model context from Ollama: %d tokens", ctx)
-                    return ctx
-                break
-    except SAFE_EXCEPT as e:
-        if is_fatal(e):
-            raise
-        log.warning("Ollama not reachable — skipping LLM analysis generation")
-        return 0
-    return llm_config.num_ctx
+
+@dataclass(frozen=True)
+class _LongPrompt:
+    """A symbol whose prompt does not fit the context of the run: the second pass analyses it."""
+
+    position: int
+    qname: str
+    symbol: dict[str, Any]
+    content_hash: str
+    prompt: str
+    prompt_tokens: int
 
 
 def _clear_skip_sentinels(
@@ -300,7 +343,8 @@ def _build_llm_analysis(
     write_lock_held: bool = False,
     cache_client=None,
     retry_unparseable: bool = False,
-) -> None:
+    force_since: str | None = None,
+) -> bool:
     """Generate structured LLM analysis (summary, inputs, outputs) for each
     project-definition symbol using Ollama, one symbol per request.
 
@@ -309,9 +353,9 @@ def _build_llm_analysis(
     reduce ~10K symbols from ~10K HTTP round trips to O(batches).
     reliable format adherence. Only project symbols (non-SDK) are analyzed.
 
-    The prompt includes the full function body (read from disk via exact
-    libclang extents) and callee names (from the reference index), which
-    dramatically improves description quality.
+    The prompt includes the full function body (the stored ``source``,
+    which is ifdef-filtered) and callee names (from the reference index),
+    which dramatically improves description quality.
 
     *db_dir* is the directory containing the index database — used for the
     write lock that serializes DB access across processes.
@@ -322,6 +366,44 @@ def _build_llm_analysis(
     *retry_unparseable* when True clears all ``skip:unparseable`` sentinels
     so previously-failed symbols are re-attempted. Set True for manual
     indexing, False for background reindex (safe: retries only on model change).
+
+    The prompt holds the full body.  Before, a body over 5000 characters
+    went to the model as its first 60 lines, and the summary told only what
+    those lines do: the summary of a ``main`` of 42000 characters had the
+    start-up and not the main loop.  The comment of that cut said that a
+    model gives no JSON for a long prompt.  Measured with
+    qwen2.5-coder:14b on 14 bodies of 5300 to 92000 characters: each
+    answer was JSON, with the full body and with the cut one.
+
+    The tokens of each prompt are counted by the tokenizer of the model
+    (``count_prompt_tokens``), not estimated from its characters.  A prompt
+    that does not fit the context of the run waits for a second pass, after
+    each other symbol.  That pass has one context: the smallest one that
+    holds each waiting prompt, and at most the trained context.  WHY one
+    pass, and not a context for each prompt: a request with another context
+    makes the server load the model again.  A prompt that does not fit the
+    trained context gets the sentinel ``skip:toolarge:<context>``.
+
+    *force_since* (``fw-context index --force-llm``) makes each analysis
+    again.  The stored analyses of the build and an entry of a cache from
+    before that time do not apply, and the new analysis replaces the entry
+    of the local cache.  An entry from after that time applies: a symbol
+    of two builds gets one analysis in one command, and a command that
+    continues a stopped one keeps what the stopped one made.  The value has
+    the format of ``analyzed_at`` of the local cache (UTC, ``YYYY-MM-DD
+    HH:MM:SS``).  Each analysis of the build is replaced when its new one
+    is stored, thus a stopped run keeps the old analyses of the symbols
+    that it did not reach.
+
+    Each answer gets ``_ANSWER_TOKENS`` tokens, also from an
+    OpenAI-compatible endpoint, which gives no token count.  A prompt that
+    such an endpoint refuses is logged, and the next run tries again.
+
+    Returns True when each symbol got its analysis or a sentinel, and False
+    when the server did not answer, or a symbol got neither: a forced
+    command then keeps its marker (``_force_llm_marker``).  In a forced run,
+    an entry of the local cache applies only for the same model, because
+    the content hash does not hold the model.
     """
     from ..indexer.prompts import build_analysis_prompt, parse_analysis_response
     from ..utils import compute_content_hash
@@ -329,23 +411,24 @@ def _build_llm_analysis(
     # Suppress httpx INFO logs (one per symbol — noisy during analysis)
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
-    # Check Ollama reachability and resolve model context size.
-    _model_ctx_size = _resolve_model_context_size(llm_config)
-    if _model_ctx_size == 0:
-        return
+    # Check Ollama reachability and resolve the contexts of the model.
+    contexts = _analysis_contexts(llm_config)
+    if contexts is None:
+        return False
+    run_ctx, largest_ctx = contexts
+    token_counts = generate_endpoint(llm_config) is not None
 
     model = llm_config.model
 
     # Clear skip sentinels that are no longer applicable
-    _clear_skip_sentinels(conn, model, _model_ctx_size, retry_unparseable)
+    _clear_skip_sentinels(conn, model, largest_ctx, retry_unparseable)
 
     # Select symbols needing analysis
     rows = _select_unanalyzed_symbols(conn, config_hash, project_only)
     if not rows:
         log.info("All project symbols already analyzed — nothing to do")
-        return
+        return True
 
-    model = llm_config.model
     total_symbols = len(rows)
     total = 0
 
@@ -353,6 +436,100 @@ def _build_llm_analysis(
 
 
     local_db = get_local_cache_db()  # single connection for all symbols
+    long_prompts: list[_LongPrompt] = []
+    # The symbols that got neither an analysis nor a sentinel.
+    failed = 0
+
+    def _count_tokens(prompt: str) -> int:
+        """Count the tokens of *prompt*; a failed request goes again, three times in all, as a call of the model."""
+        for _c_attempt in range(3):
+            try:
+                return count_prompt_tokens(prompt, llm_config, run_ctx)
+            except SAFE_EXCEPT as _e:
+                if is_fatal(_e) or _c_attempt == 2:
+                    raise
+                time.sleep(2)
+        raise AssertionError("unreachable: the last attempt returns or raises")
+
+    def _ask_model(idx: int, qname: str, d: dict[str, Any], h: str, prompt: str, num_ctx: int, t0: float) -> int:
+        """Analyse one symbol with the model, store the answer, and return the count to add to the total.
+
+        Raises:
+            OllamaPromptTooLong: The prompt does not fit *num_ctx*; the
+                caller sends it again with a larger context.
+        """
+        nonlocal failed
+        response = None
+        _last_exc: BaseException | None = None
+        for _a_attempt in range(3):
+            try:
+                response = call_ollama(prompt, llm_config, temperature=0.1, num_predict=_ANSWER_TOKENS,
+                                       num_ctx=num_ctx)
+                break
+            except OllamaPromptTooLong:
+                # The same request fails again: the caller selects a larger context.
+                raise
+            except SAFE_EXCEPT as _e:
+                _last_exc = _e
+                if is_fatal(_e):
+                    raise
+                if _a_attempt < 2:
+                    time.sleep(2)
+        if response is None:
+            failed += 1
+            elapsed = time.monotonic() - t0
+            log.warning("[%d/%d] %s: err %s: %s", idx + 1, total_symbols, qname, _fmt_dur(elapsed), _last_exc)
+            return 0
+
+        parsed = parse_analysis_response(response, [d])
+        if not parsed:
+            # Store sentinel in the per-build analysis table only —
+            # NOT in the content-addressable cache.  If we store it in
+            # the cache, the next run with a DIFFERENT prompt (e.g.
+            # after an Ollama model upgrade or prompt fix) will hit
+            # the cache and silently reuse the sentinel, skipping the
+            # re-analysis.  The sentinel protects the CURRENT build
+            # from infinite retries; the cache protects across builds
+            # and should only hold successful analyses.
+            with write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext():
+                with transaction(conn, checkpoint=False):
+                    sentinel = f"skip:unparseable:{model}"
+                    upsert_llm_analysis_batch(conn, [(d["id"], "", "", "", sentinel, h)])
+            elapsed = time.monotonic() - t0
+            log.warning(
+                "[%d/%d] %s: err %s: unparseable response", idx + 1, total_symbols, qname, _fmt_dur(elapsed)
+            )
+            return 1
+
+        r = parsed[0]
+        with write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext():
+            with transaction(conn, checkpoint=False):
+                db_rows = [(r["symbol_id"], r["summary"], r["inputs"], r["outputs"], model, h)]
+                inserted = upsert_llm_analysis_batch(conn, db_rows)
+                entry = {"hash": h, "summary": r["summary"], "inputs": r["inputs"],
+                         "outputs": r["outputs"], "model": model}
+                # Store in local global cache
+                try:
+                    local_cache_upsert(local_db, [entry], overwrite=force_since is not None)
+                except SAFE_EXCEPT as e:
+                    if is_fatal(e):
+                        raise
+                    log.debug("Local global cache write failed: %s", e)
+                # Store on remote cache server (fire-and-forget)
+                if cache_client is not None:
+                    try:
+                        cache_client.batch_put([entry])
+                    except SAFE_EXCEPT as e:
+                        if is_fatal(e):
+                            raise
+                        log.debug("Remote cache write failed: %s", e)
+
+        elapsed = time.monotonic() - t0
+        log.info("[%d/%d] %s: ok %s", idx + 1, total_symbols, qname, _fmt_dur(elapsed))
+        log.debug("  summary: %s", r["summary"])
+        log.debug("  inputs : %s", r["inputs"])
+        log.debug("  outputs: %s", r["outputs"])
+        return inserted
 
     for idx, row in enumerate(rows):
         t0 = time.monotonic()
@@ -365,7 +542,9 @@ def _build_llm_analysis(
             #    hash below decides whether the model runs again, and a
             #    body from the disk would differ for every symbol that
             #    holds an inactive #ifdef branch.
-            existing_hash = row.get("existing_hash")
+            # A forced run makes each analysis again, thus the stored hash
+            # does not apply.
+            existing_hash = row.get("existing_hash") if force_since is None else None
             if existing_hash:
                 source_body = row["source"] or ""
                 if not source_body:
@@ -443,9 +622,14 @@ def _build_llm_analysis(
                 if is_fatal(e):
                     raise
                 log.debug("Local global cache lookup failed: %s", e)
+            if cached and force_since is not None and (
+                cached["analyzed_at"] < force_since or cached["model"] != model
+            ):
+                cached = None
 
-            # Tier 2: remote cache server
-            if not cached and cache_client is not None:
+            # Tier 2: remote cache server.  A forced run does not read it:
+            # its entries have no time of this machine.
+            if not cached and cache_client is not None and force_since is None:
                 try:
                     remote_hits = cache_client.batch_get([h])
                     cached = remote_hits.get(h)
@@ -486,151 +670,53 @@ def _build_llm_analysis(
                 log.info("[%d/%d] %s: ok %s", idx + 1, total_symbols, qname, _fmt_dur(elapsed))
                 continue
 
-            # Cache miss — build prompt, check context fit, then call Ollama
+            # Cache miss — build the prompt with the full body, count its
+            # tokens, then call the model.
             prompt = build_analysis_prompt(batch_dicts)
-
-            # If the symbol body is very large (>5000 chars), truncate it
-            # regardless of context budget.  Models struggle to produce
-            # structured JSON when the prompt contains hundreds of lines
-            # of C++ declarations — they default to reproducing field lists
-            # instead of summarising.  Keeping ~60 lines gives enough
-            # structure for a useful analysis without overwhelming the model.
-            body = d.get("body", "")
-            if body and len(body) > 5000:
-                body_lines = body.split("\n")
-                truncated = "\n".join(body_lines[:60])
-                if len(truncated) > 9000:  # safety: raw cutoff if 60 lines is still huge
-                    truncated = body[:9000]
-                truncated += f"\n// ... ({len(body)} total chars, {len(body_lines)} lines — truncated for analysis)\n"
-                d["body"] = truncated
-                prompt = build_analysis_prompt(batch_dicts)
-                _est_prompt_tokens = len(prompt) / 2.5  # conservative for C++ code
-                log.debug(
-                    "[%d/%d] %s: body truncated %d → %d chars, prompt %d chars",
-                    idx + 1,
-                    total_symbols,
-                    qname,
-                    len(body),
-                    len(truncated),
-                    len(prompt),
-                )
-
-            # Compute response budget — how many tokens remain after the prompt
-            # inside the model context window.
-            _est_prompt_tokens = len(prompt) / 2.5  # conservative for C++ code
-            _safety_margin = 300
-            _ctx_size = _model_ctx_size
-            num_predict = max(500, int(_ctx_size - _est_prompt_tokens - _safety_margin))
-
-            # If the prompt STILL doesn't fit after truncation, skip.
-            # The model needs at least 300 tokens of response space.
-            if _est_prompt_tokens + 300 + _safety_margin > _ctx_size:
-                with write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext():
-                    with transaction(conn, checkpoint=False):
-                        upsert_llm_analysis_batch(conn, [(d["id"], "", "", "", f"skip:toolarge:{_model_ctx_size}", h)])
-                total += 1
-                elapsed = time.monotonic() - t0
-                log.warning(
-                    "[%d/%d] %s: skip %s (body too large even after trunc, prompt=%d chars, ctx=%d tokens)",
-                    idx + 1,
-                    total_symbols,
-                    qname,
-                    _fmt_dur(elapsed),
-                    len(prompt),
-                    _ctx_size,
-                )
-                continue
-
-            response = None
-            _last_exc = None
-            for _a_attempt in range(3):
+            prompt_tokens = _count_tokens(prompt) if token_counts else None
+            if prompt_tokens is None or prompt_tokens + _ANSWER_TOKENS <= run_ctx:
                 try:
-                    response = call_ollama(prompt, llm_config, temperature=0.1, num_predict=num_predict)
-                    break
-                except SAFE_EXCEPT as _e:
-                    _last_exc = _e
-                    if is_fatal(_e):
-                        raise
-                    if _a_attempt < 2:
-                        time.sleep(2)
-            if response is None:
-                elapsed = time.monotonic() - t0
-                log.warning("[%d/%d] %s: err %s: %s", idx + 1, total_symbols, qname, _fmt_dur(elapsed), _last_exc)
-                continue
-
-            parsed = parse_analysis_response(response, batch_dicts)
-            if not parsed:
-                # Store sentinel in the per-build analysis table only —
-                # NOT in the content-addressable cache.  If we store it in
-                # the cache, the next run with a DIFFERENT prompt (e.g.
-                # after an Ollama model upgrade or prompt fix) will hit
-                # the cache and silently reuse the sentinel, skipping the
-                # re-analysis.  The sentinel protects the CURRENT build
-                # from infinite retries; the cache protects across builds
-                # and should only hold successful analyses.
-                total += 1
-                with write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext():
-                    with transaction(conn, checkpoint=False):
-                        sentinel = f"skip:unparseable:{model}"
-                        upsert_llm_analysis_batch(conn, [(d["id"], "", "", "", sentinel, h)])
-                elapsed = time.monotonic() - t0
-                log.warning(
-                    "[%d/%d] %s: err %s: unparseable response", idx + 1, total_symbols, qname, _fmt_dur(elapsed)
-                )
-                continue
-
-            r = parsed[0]
-            with write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext():
-                with transaction(conn, checkpoint=False):
-                    db_rows = [(r["symbol_id"], r["summary"], r["inputs"], r["outputs"], model, h)]
-                    inserted = upsert_llm_analysis_batch(conn, db_rows)
-                    # Store in local global cache
-                    try:
-                        local_cache_upsert(
-                            local_db,
-                            [
-                                {
-                                    "hash": h,
-                                    "summary": r["summary"],
-                                    "inputs": r["inputs"],
-                                    "outputs": r["outputs"],
-                                    "model": model,
-                                }
-                            ],
-                        )
-                    except SAFE_EXCEPT as e:
-                        if is_fatal(e):
-                            raise
-                        log.debug("Local global cache write failed: %s", e)
-                    # Store on remote cache server (fire-and-forget)
-                    if cache_client is not None:
-                        try:
-                            cache_client.batch_put(
-                                [
-                                    {
-                                        "hash": h,
-                                        "summary": r["summary"],
-                                        "inputs": r["inputs"],
-                                        "outputs": r["outputs"],
-                                        "model": model,
-                                    }
-                                ]
-                            )
-                        except SAFE_EXCEPT as e:
-                            if is_fatal(e):
-                                raise
-                            log.debug("Remote cache write failed: %s", e)
-                    total += inserted
-
-            elapsed = time.monotonic() - t0
-            log.info("[%d/%d] %s: ok %s", idx + 1, total_symbols, qname, _fmt_dur(elapsed))
-            log.debug("  summary: %s", r["summary"])
-            log.debug("  inputs : %s", r["inputs"])
-            log.debug("  outputs: %s", r["outputs"])
+                    total += _ask_model(idx, qname, d, h, prompt, run_ctx, t0)
+                    continue
+                except OllamaPromptTooLong as e:
+                    prompt_tokens = e.prompt_tokens
+            long_prompts.append(_LongPrompt(idx, qname, d, h, prompt, prompt_tokens))
+            log.info("[%d/%d] %s: later (prompt %d tokens, context %d)",
+                     idx + 1, total_symbols, qname, prompt_tokens, run_ctx)
         except SAFE_EXCEPT as e:
+            failed += 1
             elapsed = time.monotonic() - t0
             log.warning("[%d/%d] %s: err %s: %s", idx + 1, total_symbols, qname, _fmt_dur(elapsed), e)
             continue
+
+    # ── Second pass: the prompts that do not fit the context of the run ──
+    too_large: list[_LongPrompt] = []
+    fitting: list[_LongPrompt] = []
+    for p in long_prompts:
+        (too_large if p.prompt_tokens + _ANSWER_TOKENS > largest_ctx else fitting).append(p)
+    for p in too_large:
+        with write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext():
+            with transaction(conn, checkpoint=False):
+                upsert_llm_analysis_batch(
+                    conn, [(p.symbol["id"], "", "", "", f"skip:toolarge:{largest_ctx}", p.content_hash)],
+                )
+        total += 1
+        log.warning("[%d/%d] %s: skip (prompt %d tokens, the model has a context of %d)",
+                    p.position + 1, total_symbols, p.qname, p.prompt_tokens, largest_ctx)
+    fitting.sort(key=lambda p: p.prompt_tokens)
+    if fitting:
+        long_ctx = fitting[-1].prompt_tokens + _ANSWER_TOKENS
+        log.info("LLM analysis: %d symbols with a long prompt, context %d tokens", len(fitting), long_ctx)
+        for p in fitting:
+            t0 = time.monotonic()
+            try:
+                total += _ask_model(p.position, p.qname, p.symbol, p.content_hash, p.prompt, long_ctx, t0)
+            except SAFE_EXCEPT as e:
+                if is_fatal(e):
+                    raise
+                failed += 1
+                log.warning("[%d/%d] %s: err %s: %s", p.position + 1, total_symbols, p.qname,
+                            _fmt_dur(time.monotonic() - t0), e)
 
     try:
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -641,4 +727,5 @@ def _build_llm_analysis(
         pass  # non-fatal — continue
     finally:
         local_db.close()
+    return failed == 0
 

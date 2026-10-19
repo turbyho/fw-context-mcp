@@ -301,7 +301,7 @@ Configure a remote cache server, to share `llm_analysis` data across developers.
 | `url` | *(none)* | global, local | The cache server URL. Example: `"https://fw-cache.example.com"`. |
 | `token` | *(none)* | global, local | A bearer token with `can_read` and `can_write` permissions. Create this token with the `fw-cache-admin token create` command. |
 | `batch_size` | `100` | global, local | The maximum number of hashes or entries in each HTTP request. |
-| `force` | `false` | global, local | When this key is `true`, fw-context sends the `X-Cache-Overwrite` header, and overwrites existing entries. This key applies to the writes during `fw-context index` and `fw-context analyze`. `fw-context index --force` also turns it on. `fw-context cache push` does not read this key: use `fw-context cache push --overwrite`. This key requires a `can_overwrite` token. |
+| `force` | `false` | global, local | When this key is `true`, fw-context sends the `X-Cache-Overwrite` header, and overwrites existing entries. This key applies to the writes during `fw-context index` and `fw-context analyze`. `fw-context index --force-llm` also turns it on. `fw-context cache push` does not read this key: use `fw-context cache push --overwrite`. This key requires a `can_overwrite` token. |
 
 ```toml
 [cache_server]

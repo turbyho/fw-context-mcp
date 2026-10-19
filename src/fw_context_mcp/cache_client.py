@@ -281,10 +281,25 @@ def local_cache_lookup(conn: sqlite3.Connection, hashes: list[str]) -> dict[str,
     return result
 
 
-def local_cache_upsert(conn: sqlite3.Connection, entries: list[dict]) -> int:
-    """Insert or ignore entries into the local cache.
+_LOCAL_CACHE_INSERT = (
+    "INSERT OR IGNORE INTO llm_analysis_cache "
+    "(content_hash, summary, inputs, outputs, model) VALUES (?, ?, ?, ?, ?)"
+)
+_LOCAL_CACHE_REPLACE = (
+    "INSERT OR REPLACE INTO llm_analysis_cache "
+    "(content_hash, summary, inputs, outputs, model) VALUES (?, ?, ?, ?, ?)"
+)
 
-    Returns the number of rows inserted (not updated — uses INSERT OR IGNORE).
+
+def local_cache_upsert(conn: sqlite3.Connection, entries: list[dict], *, overwrite: bool = False) -> int:
+    """Insert entries into the local cache; an existing entry stays, unless *overwrite*.
+
+    Returns the number of rows written.
+
+    *overwrite* (``fw-context index --force-llm``) replaces an existing
+    entry, and its ``analyzed_at`` gets the time of the write.  The person
+    asked for a new analysis: without it, the old entry stays, and each
+    later run reads the old analysis back from the cache.
 
     Why INSERT OR IGNORE (not INSERT OR REPLACE)?
     ---------------------------------------------
@@ -303,13 +318,10 @@ def local_cache_upsert(conn: sqlite3.Connection, entries: list[dict]) -> int:
     while the remaining entries are inserted normally.
     """
     inserted = 0
+    sql = _LOCAL_CACHE_REPLACE if overwrite else _LOCAL_CACHE_INSERT
     for e in entries:
         try:
-            cur = conn.execute(
-                "INSERT OR IGNORE INTO llm_analysis_cache "
-                "(content_hash, summary, inputs, outputs, model) VALUES (?, ?, ?, ?, ?)",
-                (e["hash"], e["summary"], e["inputs"], e["outputs"], e["model"]),
-            )
+            cur = conn.execute(sql, (e["hash"], e["summary"], e["inputs"], e["outputs"], e["model"]))
             if cur.rowcount:
                 inserted += 1
         except SAFE_EXCEPT as e:

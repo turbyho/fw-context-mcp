@@ -216,7 +216,16 @@ def main() -> None:
     p_index.add_argument(
         "--force",
         action="store_true",
-        help="Force re-index of all files, embeddings, LLM analysis, overrides, and caches (skip the hash checks)",
+        help="Force re-index of all files, embeddings, overrides, and caches (skip the hash checks). "
+        "The LLM analysis comes from the cache: use --force-llm for a new analysis",
+    )
+    p_index.add_argument(
+        "--force-llm",
+        action="store_true",
+        dest="force_llm",
+        default=False,
+        help="Make the LLM analysis of each symbol again, and replace the entries of the cache. "
+        "It turns on the analysis. It takes much longer than an index run",
     )
     p_index.add_argument(
         "--background",

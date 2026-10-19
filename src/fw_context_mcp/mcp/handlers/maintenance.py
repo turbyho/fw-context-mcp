@@ -2288,9 +2288,12 @@ def reset_index(
         # its last run stopped, and the files a build ran for and did not
         # cover.  Left behind they would warn about, or hide, work on a
         # fresh index that knows nothing about either.
+        from ...indexer import _force_llm_marker
         from ...indexer.autobuild import clear_excluded, clear_problem
         clear_problem(db_path.parent)
         clear_excluded(db_path.parent)
+        # A --force-llm of the old index: its analyses went with the index.
+        _force_llm_marker.remove(db_path.parent)
         from ...mcp.shared.stale import _invalidate_modified_cache
         _invalidate_modified_cache()  # clear all entries — DB is gone
         info["action"] = "deleted"

@@ -233,12 +233,14 @@ class _Recorder:
                 raise AssertionError("the model must not be called for a body-less symbol")
             return response
 
-        monkeypatch.setattr(mod, "_resolve_model_context_size", lambda cfg: 32768)
+        monkeypatch.setattr(mod, "_analysis_contexts", lambda cfg: (16384, 32768))
+        monkeypatch.setattr(mod, "generate_endpoint", lambda cfg: "http://ollama.test/api/generate")
+        monkeypatch.setattr(mod, "count_prompt_tokens", lambda prompt, cfg, num_ctx: 100)
         monkeypatch.setattr(mod, "call_ollama", _call_ollama)
         # The loop closes the cache handle at the end, thus a bare None fails.
         monkeypatch.setattr(mod, "get_local_cache_db", lambda: SimpleNamespace(close=lambda: None))
         monkeypatch.setattr(mod, "local_cache_lookup", lambda db, hashes: {})
-        monkeypatch.setattr(mod, "local_cache_upsert", lambda db, rows: self.cache_writes.append(rows))
+        monkeypatch.setattr(mod, "local_cache_upsert", lambda db, rows, **_: self.cache_writes.append(rows))
 
 
 def _analysis_rows(conn) -> list:

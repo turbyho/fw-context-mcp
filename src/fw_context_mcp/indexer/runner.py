@@ -682,6 +682,7 @@ def run(
     llm_config=None,
     cache_server_config=None,
     force: bool = False,
+    force_llm_since: str | None = None,
     index_macros_expanded: bool = True,
     config_header: str = "",
     build_dir_patterns: list[str] | None = None,
@@ -742,6 +743,10 @@ def run(
         llm_config: Configuration dataclass for Ollama connection (URL,
             model names, enabled flag).  Required when any ``index_*`` or
             ``analyze_*`` option is enabled.
+        force_llm_since: ``fw-context index --force-llm``: the time of the
+            command (UTC, ``YYYY-MM-DD HH:MM:SS``).  The LLM analysis of
+            each symbol is made again, and an analysis of the caches from
+            before it does not apply.  ``force`` alone keeps the analyses.
         transient_defines: ``[index] transient_defines`` — the ``-D`` macros
             that the config_hash and the flags hash of each unit ignore.  The
             CLI passes the value of the config.  The default is the default
@@ -1406,6 +1411,7 @@ def run(
         llm_config=llm_config,
         cache_server_config=cache_server_config,
         force=force,
+        force_llm_since=force_llm_since,
         purge_max_missing_percent=purge_max_missing_percent,
         variant=variant,
         image=image,

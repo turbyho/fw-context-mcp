@@ -54,7 +54,8 @@ def servers(monkeypatch):
     """Map of the server URL to its model names, or to an answer object.
 
     A URL that is not in the map does not answer.  ``servers.asked`` lists
-    the servers that a call asked.
+    the servers that a call asked, for ``/api/tags`` and ``/api/version``;
+    a version request gets no version, thus the version is not known.
     """
 
     class _Servers(dict):
@@ -64,7 +65,7 @@ def servers(monkeypatch):
     known.asked = []
 
     def _get(url, timeout):
-        server = url.removesuffix("/api/tags")
+        server = url.removesuffix("/api/tags").removesuffix("/api/version")
         known.asked.append(server)
         if server not in known:
             raise httpx.ConnectError("connection refused")
@@ -168,7 +169,8 @@ def test_the_chat_model_is_looked_for_on_the_ollama_server_of_chat_api_base(serv
     servers[REMOTE] = [CHAT]
 
     assert _check(_cfg(chat_api_base=REMOTE)).status == "ok"
-    assert servers.asked == [REMOTE]
+    # The model list and the version of the chat server; never ollama_url.
+    assert set(servers.asked) == {REMOTE}
 
 
 def test_a_chat_model_that_only_ollama_url_holds_is_missing_on_chat_api_base(servers):

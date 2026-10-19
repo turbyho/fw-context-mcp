@@ -1,0 +1,450 @@
+"""The LLM analysis sends the full body, counts the tokens, and has --force-llm.
+
+Before:
+
+* A body over 5000 characters went to the model as its first 60 lines.
+  The summary told what those lines do: for a ``main`` of 42000 characters
+  the start-up, and not the main loop.
+* The budget came from ``len(prompt) / 2.5`` and from the trained context
+  of ``/api/tags``, while each request had ``num_ctx`` of the config, and
+  the server cut a longer prompt without an error.
+* ``fw-context index --force`` deleted the analyses of the build, and the
+  run read each one back from the local cache: no analysis was made again.
+
+No Ollama: the model, the token count and the contexts are stand-ins.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from fw_context_mcp.cache_client import get_local_cache_db, local_cache_lookup, local_cache_upsert
+from fw_context_mcp.indexer import _llm_analysis as mod
+from fw_context_mcp.indexer._llm_analysis import _build_llm_analysis
+from fw_context_mcp.indexer.db import transaction, upsert_file
+from fw_context_mcp.indexer.db._symbols import insert_symbols_batch
+from fw_context_mcp.utils import write_text_atomic
+
+CONFIG_HASH = "hash-deadbeef"
+RUN_CTX, LARGEST_CTX = 3000, 16000
+
+
+class _Model:
+    """Stands in for the chat model: one token for each 10 characters of a prompt."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, int | None, int | None]] = []
+
+    @staticmethod
+    def tokens(prompt: str) -> int:
+        return len(prompt) // 10
+
+    def call(self, prompt, cfg, *, temperature=0.0, num_predict=None, num_ctx=None):
+        self.calls.append((prompt, num_ctx, num_predict))
+        symbol_id = int(prompt.split("(id: ")[1].split(")")[0])
+        return json.dumps([{"id": symbol_id, "summary": f"summary {len(self.calls)}", "inputs": "x", "outputs": "y"}])
+
+    def install(self, monkeypatch) -> None:
+        monkeypatch.setattr(mod, "_analysis_contexts", lambda cfg: (RUN_CTX, LARGEST_CTX))
+        monkeypatch.setattr(mod, "generate_endpoint", lambda cfg: "http://ollama.test/api/generate")
+        monkeypatch.setattr(mod, "count_prompt_tokens", lambda prompt, cfg, num_ctx: self.tokens(prompt))
+        monkeypatch.setattr(mod, "call_ollama", self.call)
+
+
+class _Config:
+    model = "test-model"
+
+
+def _body(name: str, lines: int) -> str:
+    return f"void {name}(void) {{\n" + "".join(f"    step_{i}();\n" for i in range(lines)) + f"    last_{name}();\n}}\n"
+
+
+def _seed(conn, tmp_path: Path, bodies: dict[str, str]) -> dict[str, int]:
+    src = tmp_path / "src"
+    src.mkdir(exist_ok=True)
+    f = src / "work.c"
+    f.write_text("// file\n", encoding="utf-8")
+    with transaction(conn):
+        file_id = upsert_file(conn, CONFIG_HASH, str(f), "c")
+        insert_symbols_batch(conn, [
+            (CONFIG_HASH, file_id, str(f), name, f"usr-{name}", name, name, "function", 1, 1,
+             body.count("\n"), 1, f"void {name}(void)", "", None, 0, 0, "", 0, "", 1, 0.0, body, 0)
+            for name, body in bodies.items()
+        ])
+    return {r["name"]: r["id"] for r in conn.execute("SELECT id, name FROM symbols WHERE config_hash = ?",
+                                                     (CONFIG_HASH,))}
+
+
+def _run(conn, tmp_path: Path, **kwargs) -> None:
+    _build_llm_analysis(conn, CONFIG_HASH, _Config(), tmp_path, project_root=tmp_path,
+                        write_lock_held=True, **kwargs)
+
+
+def _models(conn) -> dict[str, str]:
+    return {r["name"]: r["model"] for r in conn.execute(
+        "SELECT s.name, a.model FROM llm_analysis a JOIN symbols s ON s.id = a.symbol_id")}
+
+
+def test_a_long_body_goes_to_the_model_in_full(populated_db, monkeypatch, tmp_path: Path):
+    model = _Model()
+    model.install(monkeypatch)
+    _seed(populated_db, tmp_path, {"long_one": _body("long_one", 400)})  # about 6000 characters
+
+    _run(populated_db, tmp_path)
+
+    prompt = model.calls[0][0]
+    assert "last_long_one();" in prompt, "the end of the body must reach the model"
+    assert "truncated for analysis" not in prompt
+
+
+def test_a_prompt_that_does_not_fit_waits_for_one_larger_context(populated_db, monkeypatch, tmp_path: Path):
+    model = _Model()
+    model.install(monkeypatch)
+    _seed(populated_db, tmp_path, {
+        "middle": _body("middle", 1500),  # about 2500 tokens: no fit with the answer of 1024
+        "short": _body("short", 5),
+        "large": _body("large", 4000),  # about 6500 tokens
+    })
+
+    _run(populated_db, tmp_path)
+
+    order = [p.split("] ")[1].split(" ")[0] for p, _, _ in model.calls]
+    assert order == ["short", "middle", "large"], "the long prompts go last, the shortest first"
+    contexts = [ctx for _, ctx, _ in model.calls]
+    large_ctx = model.tokens(model.calls[2][0]) + mod._ANSWER_TOKENS
+    assert contexts == [RUN_CTX, large_ctx, large_ctx], "one context for the second pass: one load of the model"
+    # Before, the largest prompt of the second pass had 300 tokens for its answer.
+    assert [num_predict for _, _, num_predict in model.calls] == [mod._ANSWER_TOKENS] * 3
+
+
+def test_a_prompt_larger_than_the_model_gets_the_sentinel(populated_db, monkeypatch, tmp_path: Path):
+    model = _Model()
+    model.install(monkeypatch)
+    _seed(populated_db, tmp_path, {"huge": _body("huge", 10000)})  # about 16000 tokens
+
+    _run(populated_db, tmp_path)
+
+    assert model.calls == []
+    assert _models(populated_db) == {"huge": f"skip:toolarge:{LARGEST_CTX}"}
+
+
+def _cached_summaries(hashes: list[str]) -> dict[str, str]:
+    db = get_local_cache_db()
+    try:
+        return {h: entry["summary"] for h, entry in local_cache_lookup(db, hashes).items() if entry}
+    finally:
+        db.close()
+
+
+def test_force_llm_makes_each_analysis_again_and_replaces_the_cache(populated_db, monkeypatch, tmp_path: Path):
+    model = _Model()
+    model.install(monkeypatch)
+    # A name of its own: the local cache is one for the session of the tests.
+    _seed(populated_db, tmp_path, {"force_again": _body("force_again", 5)})
+    _run(populated_db, tmp_path)
+    _run(populated_db, tmp_path)
+    assert len(model.calls) == 1, "the precondition: an unchanged symbol is not analysed again"
+    stored_hash = populated_db.execute("SELECT content_hash FROM llm_analysis").fetchone()[0]
+
+    _run(populated_db, tmp_path, force_since="9999-01-01 00:00:00")
+
+    assert len(model.calls) == 2
+    assert _cached_summaries([stored_hash]) == {stored_hash: "summary 2"}, "the new analysis replaces the entry"
+
+
+def test_force_llm_takes_an_analysis_of_the_same_command(populated_db, monkeypatch, tmp_path: Path):
+    """A symbol of two builds gets one analysis in one command."""
+    model = _Model()
+    model.install(monkeypatch)
+    _seed(populated_db, tmp_path, {"force_same_command": _body("force_same_command", 5)})
+    _run(populated_db, tmp_path)
+
+    _run(populated_db, tmp_path, force_since="2000-01-01 00:00:00")
+
+    assert len(model.calls) == 1
+
+
+def test_local_cache_upsert_keeps_the_first_entry_unless_it_overwrites():
+    db = get_local_cache_db()
+    try:
+        entry = {"hash": "h-overwrite", "summary": "old", "inputs": "", "outputs": "", "model": "m"}
+        local_cache_upsert(db, [entry])
+        local_cache_upsert(db, [{**entry, "summary": "new"}])
+        assert local_cache_lookup(db, ["h-overwrite"])["h-overwrite"]["summary"] == "old"
+        local_cache_upsert(db, [{**entry, "summary": "new"}], overwrite=True)
+        assert local_cache_lookup(db, ["h-overwrite"])["h-overwrite"]["summary"] == "new"
+    finally:
+        db.close()
+
+
+# ── The contexts of the run ──
+
+
+def test_the_run_has_the_context_of_the_config_and_the_trained_one_as_the_limit(monkeypatch):
+    from fw_context_mcp.config.settings import LLMConfig
+
+    monkeypatch.setattr(mod, "trained_context", lambda cfg: 32768)
+    assert mod._analysis_contexts(LLMConfig(num_ctx=16384)) == (16384, 32768)
+    assert mod._analysis_contexts(LLMConfig(num_ctx=65536)) == (32768, 32768)
+
+
+def test_a_server_that_does_not_answer_gives_no_analysis(monkeypatch):
+    from fw_context_mcp.config.settings import LLMConfig
+
+    monkeypatch.setattr(mod, "trained_context", lambda cfg: None)
+    assert mod._analysis_contexts(LLMConfig()) is None
+
+
+def test_an_openai_endpoint_has_the_context_of_the_config(monkeypatch):
+    from fw_context_mcp.config.settings import LLMConfig
+
+    monkeypatch.setattr(mod, "generate_endpoint", lambda cfg: None)
+    assert mod._analysis_contexts(LLMConfig(num_ctx=8192)) == (8192, 8192)
+
+
+# ── The CLI ──
+
+
+def _index_args(**flags: bool) -> SimpleNamespace:
+    """The arguments of ``fw-context index`` that the code under test reads."""
+    return SimpleNamespace(**{"force": False, "force_llm": False, "no_analyze": False, "analyze": False,
+                              "name": None, "no_refs": False, "verbose": False, **flags})
+
+
+def test_force_llm_and_no_analyze_stop_the_command(capsys):
+    from fw_context_mcp.cli._index import cmd_index
+
+    assert cmd_index(_index_args(force_llm=True, no_analyze=True)) == 2
+    assert "--force-llm" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(("flags", "analyses"), [({"force": True}, False), ({"force_llm": True}, True)])
+def test_force_llm_turns_on_the_analysis(flags, analyses, tmp_path: Path):
+    from fw_context_mcp.cli._index import _build_run_kwargs
+    from fw_context_mcp.config.settings import Config
+
+    cfg = Config()
+    cfg.llm.analyze_symbols = False
+    kwargs = _build_run_kwargs(_index_args(**flags), cfg, tmp_path, "p", [], [], None)
+    assert kwargs["analyze_symbols"] is analyses
+
+
+@pytest.mark.parametrize(("flags", "overwrite"), [({"force": True}, False), ({"force_llm": True}, True)])
+def test_only_force_llm_overwrites_the_cache_server(flags, overwrite):
+    from fw_context_mcp.cli._index import _cache_server_config
+    from fw_context_mcp.config.settings import CacheServerConfig, Config
+
+    cfg = Config()
+    cfg.cache_server = CacheServerConfig(url="https://cache.example.test", token="t")
+    assert _cache_server_config(_index_args(**flags), cfg).force is overwrite
+
+
+def test_a_stopped_force_llm_continues_from_the_time_of_the_first_command(tmp_path: Path):
+    from fw_context_mcp.indexer import _force_llm_marker as marker
+
+    first, continues = marker.since_for(tmp_path, "model-a")
+    assert not continues and (tmp_path / marker.MARKER).is_file()
+    assert marker.since_for(tmp_path, "model-a") == (first, True), "the next command keeps the time"
+    assert marker.finish(tmp_path) is True
+    assert not (tmp_path / marker.MARKER).exists()
+
+
+def test_a_marker_of_another_model_does_not_continue(tmp_path: Path):
+    """The content hash does not hold the model: a continued command took the analyses of the old one."""
+    from fw_context_mcp.indexer import _force_llm_marker as marker
+
+    write_text_atomic(tmp_path / marker.MARKER, json.dumps({"since": "2000-01-01 00:00:00", "model": "a"}))
+    since, continues = marker.since_for(tmp_path, "b")
+    assert not continues and since != "2000-01-01 00:00:00"
+
+
+def test_an_unfinished_step_keeps_the_marker_for_the_next_command(tmp_path: Path):
+    from fw_context_mcp.indexer import _force_llm_marker as marker
+
+    since, _ = marker.since_for(tmp_path, "m")
+    marker.mark_unfinished(tmp_path)
+    assert marker.finish(tmp_path) is False, "Ollama stopped during the command: the work so far must stay"
+    assert marker.since_for(tmp_path, "m") == (since, True)
+    assert marker.finish(tmp_path) is True, "the next command starts with the flag cleared"
+
+
+def test_the_step_marks_a_forced_command_unfinished(populated_db, monkeypatch, tmp_path: Path):
+    from fw_context_mcp.indexer import _force_llm_marker as marker
+    from fw_context_mcp.indexer import _postprocess
+
+    marker.since_for(tmp_path, "m")
+    monkeypatch.setattr(_postprocess, "_build_llm_analysis", lambda *a, **kw: False)
+    ctx = {"config_hash": CONFIG_HASH, "llm_config": _Config(), "cache_server_config": None, "force": False,
+           "force_llm_since": "2026-10-19 12:00:00", "db_dir": tmp_path, "project_root": tmp_path,
+           "analyze_vendor": False}
+
+    _postprocess._step_llm_analysis(populated_db, ctx)
+
+    assert marker.finish(tmp_path) is False
+
+
+def test_a_symbol_without_an_answer_makes_the_analysis_unfinished(populated_db, monkeypatch, tmp_path: Path):
+    from fw_context_mcp.llm.ollama import OllamaError
+
+    model = _Model()
+    model.install(monkeypatch)
+    monkeypatch.setattr(mod.time, "sleep", lambda s: None)
+
+    def down(*a, **kw):
+        raise OllamaError("Ollama stopped")
+
+    monkeypatch.setattr(mod, "call_ollama", down)
+    _seed(populated_db, tmp_path, {"no_answer": _body("no_answer", 5)})
+
+    assert _build_llm_analysis(populated_db, CONFIG_HASH, _Config(), tmp_path, project_root=tmp_path,
+                               write_lock_held=True) is False
+
+
+def test_a_forced_run_takes_no_cache_entry_of_another_model(populated_db, monkeypatch, tmp_path: Path):
+    model = _Model()
+    model.install(monkeypatch)
+    _seed(populated_db, tmp_path, {"other_model": _body("other_model", 5)})
+    _run(populated_db, tmp_path)
+    stored_hash = populated_db.execute("SELECT content_hash FROM llm_analysis").fetchone()[0]
+    db = get_local_cache_db()
+    try:
+        local_cache_upsert(db, [{"hash": stored_hash, "summary": "of model b", "inputs": "", "outputs": "",
+                                 "model": "model-b"}], overwrite=True)
+    finally:
+        db.close()
+
+    _run(populated_db, tmp_path, force_since="2000-01-01 00:00:00")
+
+    assert len(model.calls) == 2, "the entry of another model must not stand for a new analysis"
+
+
+def test_a_count_that_fails_three_times_leaves_the_symbol_for_the_next_run(populated_db, monkeypatch,
+                                                                          tmp_path: Path):
+    from fw_context_mcp.llm.ollama import OllamaError
+
+    model = _Model()
+    model.install(monkeypatch)
+    monkeypatch.setattr(mod.time, "sleep", lambda s: None)
+    calls = []
+
+    def count(prompt, cfg, num_ctx):
+        calls.append(prompt)
+        raise OllamaError("timeout")
+
+    monkeypatch.setattr(mod, "count_prompt_tokens", count)
+    _seed(populated_db, tmp_path, {"never_counted": _body("never_counted", 5)})
+
+    assert _build_llm_analysis(populated_db, CONFIG_HASH, _Config(), tmp_path, project_root=tmp_path,
+                               write_lock_held=True) is False
+    assert len(calls) == 3 and model.calls == []
+
+
+@pytest.mark.parametrize("force_llm_since", [None, "2026-10-19 12:00:00"])
+def test_the_step_deletes_no_analysis_first(populated_db, monkeypatch, tmp_path: Path, force_llm_since):
+    """Before, a stopped --force-llm left the build without the analyses that it did not reach."""
+    from fw_context_mcp.indexer import _postprocess
+    from fw_context_mcp.indexer.db import upsert_llm_analysis_batch
+
+    ids = _seed(populated_db, tmp_path, {"kept_or_not": _body("kept_or_not", 5)})
+    with transaction(populated_db):
+        upsert_llm_analysis_batch(populated_db, [(ids["kept_or_not"], "s", "i", "o", "m", "h")])
+    monkeypatch.setattr(_postprocess, "_build_llm_analysis", lambda *a, **kw: None)
+    ctx = {"config_hash": CONFIG_HASH, "llm_config": _Config(), "cache_server_config": None, "force": True,
+           "force_llm_since": force_llm_since, "db_dir": tmp_path, "project_root": tmp_path,
+           "analyze_vendor": False}
+
+    _postprocess._step_llm_analysis(populated_db, ctx)
+
+    assert _models(populated_db) == {"kept_or_not": "m"}
+
+
+def test_an_openai_endpoint_gets_no_count_and_the_answer_budget(populated_db, monkeypatch, tmp_path: Path):
+    model = _Model()
+    model.install(monkeypatch)
+    monkeypatch.setattr(mod, "generate_endpoint", lambda cfg: None)
+    monkeypatch.setattr(mod, "count_prompt_tokens", lambda *a: pytest.fail("no count for an OpenAI endpoint"))
+    _seed(populated_db, tmp_path, {"openai_symbol": _body("openai_symbol", 1500)})
+
+    _run(populated_db, tmp_path)
+
+    assert [num_predict for _, _, num_predict in model.calls] == [mod._ANSWER_TOKENS]
+
+
+def test_a_prompt_that_the_server_refuses_goes_to_the_second_pass(populated_db, monkeypatch, tmp_path: Path):
+    from fw_context_mcp.llm.ollama import OllamaPromptTooLong
+
+    model = _Model()
+    model.install(monkeypatch)
+    monkeypatch.setattr(mod, "count_prompt_tokens", lambda prompt, cfg, num_ctx: 10)  # a wrong count
+    real_call = model.call
+
+    def call(prompt, cfg, **kwargs):
+        if kwargs["num_ctx"] == RUN_CTX:
+            raise OllamaPromptTooLong(5000, RUN_CTX)
+        return real_call(prompt, cfg, **kwargs)
+
+    monkeypatch.setattr(mod, "call_ollama", call)
+    _seed(populated_db, tmp_path, {"refused_symbol": _body("refused_symbol", 5)})
+
+    _run(populated_db, tmp_path)
+
+    assert [ctx for _, ctx, _ in model.calls] == [5000 + mod._ANSWER_TOKENS]
+
+
+def test_a_failed_count_goes_again(populated_db, monkeypatch, tmp_path: Path):
+    from fw_context_mcp.llm.ollama import OllamaError
+
+    model = _Model()
+    model.install(monkeypatch)
+    monkeypatch.setattr(mod.time, "sleep", lambda s: None)
+    failures = [OllamaError("timeout"), OllamaError("timeout")]
+
+    def count(prompt, cfg, num_ctx):
+        if failures:
+            raise failures.pop()
+        return 10
+
+    monkeypatch.setattr(mod, "count_prompt_tokens", count)
+    _seed(populated_db, tmp_path, {"recount_symbol": _body("recount_symbol", 5)})
+
+    _run(populated_db, tmp_path)
+
+    assert len(model.calls) == 1
+
+
+def test_a_forced_run_does_not_read_the_cache_server(populated_db, monkeypatch, tmp_path: Path):
+    model = _Model()
+    model.install(monkeypatch)
+    _seed(populated_db, tmp_path, {"remote_symbol": _body("remote_symbol", 5)})
+
+    class _Server:
+        writes: list = []
+
+        def batch_get(self, hashes):
+            raise AssertionError("a forced run must not read the cache server")
+
+        def batch_put(self, entries):
+            self.writes.extend(entries)
+
+    server = _Server()
+    _run(populated_db, tmp_path, cache_client=server, force_since="9999-01-01 00:00:00")
+
+    assert len(model.calls) == 1
+    assert len(server.writes) == 1
+
+
+def test_a_missing_model_is_pulled_when_auto_pull_is_on(monkeypatch):
+    from fw_context_mcp.config.settings import LLMConfig
+
+    answers = [None, 32768]
+    pulled = []
+    monkeypatch.setattr(mod, "generate_endpoint", lambda cfg: "http://ollama.test/api/generate")
+    monkeypatch.setattr(mod, "trained_context", lambda cfg: answers.pop(0))
+    monkeypatch.setattr(mod, "pull_chat_model", lambda cfg: pulled.append(cfg.model))
+
+    assert mod._analysis_contexts(LLMConfig(num_ctx=16384, auto_pull=True)) == (16384, 32768)
+    assert pulled == [LLMConfig().model]

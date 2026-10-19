@@ -71,6 +71,7 @@ from pathlib import Path
 
 from ..mcp.shared.pid_file import PidFile
 from ..utils import SAFE_EXCEPT, is_fatal
+from . import _force_llm_marker as force_llm_marker
 from ._dispatch_bridges import _DISPATCH_ENTRY_POINTS
 from ._embedding import _build_embeddings
 from ._llm_analysis import _build_llm_analysis
@@ -1108,19 +1109,22 @@ def _step_llm_analysis(conn: sqlite3.Connection, ctx: dict) -> None:
             if is_fatal(e):
                 raise
             pass
-    if ctx["force"]:
-        conn.execute(
-            "DELETE FROM llm_analysis WHERE symbol_id IN (SELECT id FROM symbols WHERE config_hash = ?)",
-            (config_hash,),
-        )
-        conn.commit()
-    _build_llm_analysis(
+    # ``--force`` keeps the analyses: a new analysis of each symbol takes
+    # hours, an index run minutes (``--force-llm``, ``force_llm_since``).
+    # A forced run deletes nothing first: each analysis is replaced when
+    # its new one is stored.  Before, a stopped run left the build without
+    # the analyses that it did not reach, and the next run took them back
+    # from the old entries of the cache.
+    finished = _build_llm_analysis(
         conn, config_hash, llm_config, ctx["db_dir"],
         project_root=ctx["project_root"],
         project_only=not ctx["analyze_vendor"],
         cache_client=cc,
         retry_unparseable=True,
+        force_since=ctx["force_llm_since"],
     )
+    if ctx["force_llm_since"] is not None and not finished:
+        force_llm_marker.mark_unfinished(ctx["db_dir"])
     if cc:
         cc.close()
     conn.commit()
@@ -1810,6 +1814,7 @@ def _run_postprocess(
     llm_config=None,
     cache_server_config=None,
     force: bool = False,
+    force_llm_since: str | None = None,
     purge_max_missing_percent: int = 20,
     variant: str = "",
     image: str = "",
@@ -1865,6 +1870,7 @@ def _run_postprocess(
         "llm_config": llm_config,
         "cache_server_config": cache_server_config,
         "force": force,
+        "force_llm_since": force_llm_since,
         "purge_max_missing_percent": purge_max_missing_percent,
         "variant": variant,
         "image": image,
