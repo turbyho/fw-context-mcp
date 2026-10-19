@@ -14,7 +14,6 @@ Public MCP handlers in this module:
     check_dependencies       — read-only dependency audit (structured results)
     configure_llm            — write per-developer LLM settings to local.toml
     reindex_file             — re-parse a single source file into the index
-    reindex_file_impl        — same as above with an ``--analysis`` equivalent
     reset_index              — delete the symbol database
     list_projects            — enumerate all indexed projects
     get_project_info         — look up a project by UUID4 in the global registry
@@ -2976,7 +2975,7 @@ REINDEX_IMAGE_DESCRIPTION = (
 
 
 # ── moved from server.py ──
-def reindex_file_impl(
+def reindex_file(
     file_path: Annotated[
         str,
         Field(
@@ -3028,10 +3027,12 @@ def reindex_file_impl(
     tens of seconds each.
 
     Also rebuilds the method override relationships, the PageRank scores
-    and the hotspot cache (in the two modes), and regenerates the LLM
-    analysis and the embeddings of the affected symbols when
-    ``with_analysis=True``.  The analysis is content-addressed, thus an
-    unchanged symbol is never re-analysed.
+    and the hotspot cache when reference indexing is on
+    (``[index] index_refs``), with and without ``with_analysis``.  When
+    ``with_analysis=True`` and the LLM is on (``[llm] enabled``), it also
+    regenerates the LLM analysis and the embeddings of the affected
+    symbols.  The analysis also needs ``[llm] analyze_symbols``.  It is
+    content-addressed, thus an unchanged symbol is never re-analysed.
 
     Args:
         file_path: Path to the file to re-parse.  A source file must be in
@@ -3496,65 +3497,6 @@ def _reindex_build_patterns(
         else []
     )
     return vendor_patterns, project_patterns_list
-
-
-# ── moved from server.py ──
-def reindex_file(
-    file_path: Annotated[str, Field(description="Path to the file to re-parse. A source file must be in compile_commands.json. A header goes through one translation unit that includes it, and the result then carries a warning about the other units.", min_length=1)],
-    project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    variant: Annotated[str | None, Field(description=REINDEX_VARIANT_DESCRIPTION)] = None,
-    image: Annotated[str | None, Field(description=REINDEX_IMAGE_DESCRIPTION)] = None,
-) -> dict:
-    """Re-parse a single source file with libclang and update its symbols in the index.
-
-    Not read-only — uses the exact compiler flags from ``compile_commands.json``.
-    Use after editing a file to keep the index current without a full rebuild.
-
-    Without ``variant`` and ``image`` the file is re-parsed in EACH build
-    that compiles it, because an edit changes the file for every build of
-    the tree.  With the arguments of one build, only that build.
-
-    The call runs in a thread of the server and sends a notice each 5 s.
-    It holds the lock of the query tools: another query waits 5 s, then
-    gets "server busy".  After 300 s the call returns an ``error``, and a
-    part of the work can continue or fail.  Call ``get_project_status``
-    for the state of each build, and repeat the call for a build that is
-    not current.  The answer holds no ``index_state``.
-
-    A source file must be listed in ``compile_commands.json``.  A header is
-    not listed there, thus it is re-parsed through one unit that includes
-    it.  That answer covers a single compilation context, thus the result
-    carries a ``warning`` — only a full ``fw-context index`` covers every
-    unit that includes the header.
-
-    Also rebuilds the method override relationships, the PageRank scores
-    and the hotspot cache when reference indexing is on
-    (``[index] index_refs``).  It also regenerates the LLM analysis and
-    the embeddings of the affected symbols (``with_analysis=True`` of
-    ``reindex_file_impl``) when the LLM is on (``[llm] enabled``).  The
-    analysis also needs ``[llm] analyze_symbols``.  An unchanged symbol
-    keeps its stored analysis.
-
-    Args:
-        file_path: Path to the file to re-parse.  A source file must be in
-            compile_commands.json; a header goes through one including unit.
-        project_root: Project root directory. Auto-detected if omitted.
-        variant: The variant of the one build to re-parse.  Omit it, and
-            ``image``, to re-parse each build that compiles the file.
-        image: The image of the one build to re-parse.
-
-    A file that is gone from disk but still in the index has its records
-    removed in each build that holds it; the result is then {file,
-    symbols_removed, action: "deleted", builds}.
-
-    Returns:
-        dict: {file, translation_units, symbols_updated, elapsed_s, builds},
-        plus builds_without_file, failed_builds, and the optional keys of
-        each build — the same shape as ``reindex_file_impl``.  ``builds``
-        holds the result of each build that compiles the file.  On failure
-        the dict holds ``error``.
-    """
-    return reindex_file_impl(file_path, project_root, variant, image, with_analysis=True)
 
 
 # ── moved from server.py ──

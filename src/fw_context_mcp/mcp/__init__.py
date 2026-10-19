@@ -1,4 +1,4 @@
-"""MCP server package — FastMCP stdio server with 38 tools and 4 resources.
+"""MCP server package — FastMCP stdio server with 37 tools and 4 resources.
 
 Serves build-aware code intelligence for embedded C/C++ firmware projects.
 Tools are registered as async functions on a FastMCP instance; resources

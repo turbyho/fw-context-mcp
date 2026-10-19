@@ -138,11 +138,11 @@ def test_the_fixture_embeds_each_definition(one_build):
 
 def test_a_header_symbol_of_the_reparsed_unit_keeps_an_embedding(one_build):
     """Before: ``util_clamp`` of ``util.h`` lost its embedding when ``util.c`` was re-parsed."""
-    from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
+    from fw_context_mcp.mcp.handlers.maintenance import reindex_file
 
     root, db_path = one_build
 
-    result = reindex_file_impl("src/util.c", str(root), with_analysis=True)
+    result = reindex_file("src/util.c", str(root), with_analysis=True)
 
     assert "embedding_warning" not in result, result
     assert _embedded(db_path) == ALL_EMBEDDED
@@ -156,12 +156,12 @@ def test_an_older_gap_outside_the_unit_is_left_to_the_index_run(one_build):
     then embedded the whole build.  ``step_two`` is in ``main.c``, a unit
     that the re-parse of ``util.c`` does not touch.
     """
-    from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
+    from fw_context_mcp.mcp.handlers.maintenance import reindex_file
 
     root, db_path = one_build
     _remove_embedding(db_path, "step_two")
 
-    reindex_file_impl("src/util.c", str(root), with_analysis=True)
+    reindex_file("src/util.c", str(root), with_analysis=True)
 
     assert _embedded(db_path) == [
         ("helper_a", True), ("step_one", True), ("step_two", False), ("util_clamp", True),
@@ -195,14 +195,14 @@ def test_a_fast_reparse_keeps_the_hotspots_and_the_pagerank(one_build):
     Measured on a project of 7 builds: ``memset``, with 684 references, was
     not in ``find_hotspots`` after one fast re-parse.
     """
-    from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
+    from fw_context_mcp.mcp.handlers.maintenance import reindex_file
 
     root, db_path = one_build
     before = _graph(db_path)
     # helper_a: step_one and step_two call it.  util_clamp: helper_a and step_one.
     assert ("helper_a", True, 2) in before and ("util_clamp", True, 2) in before, before
 
-    reindex_file_impl("src/util.c", str(root), with_analysis=False)
+    reindex_file("src/util.c", str(root), with_analysis=False)
 
     assert _graph(db_path) == before
 
@@ -215,12 +215,12 @@ def _status_message(root: Path) -> str:
 
 def test_the_status_names_the_definitions_that_a_fast_reparse_left_without_an_embedding(one_build):
     """Before: the stamp of the last run said "full", and the status said "fully up to date"."""
-    from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
+    from fw_context_mcp.mcp.handlers.maintenance import reindex_file
 
     root, _ = one_build
     assert "no embedding" not in _status_message(root)
 
-    reindex_file_impl("src/util.c", str(root), with_analysis=False)
+    reindex_file("src/util.c", str(root), with_analysis=False)
 
     message = _status_message(root)
     assert (
@@ -234,10 +234,10 @@ def test_the_status_names_the_definitions_that_a_fast_reparse_left_without_an_em
     ("", "enabled = false\n"),
 ])
 def test_no_embedding_advice_when_the_config_turns_the_embeddings_off(one_build, index_table, llm_table):
-    from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
+    from fw_context_mcp.mcp.handlers.maintenance import reindex_file
 
     root, db_path = one_build
-    reindex_file_impl("src/util.c", str(root), with_analysis=False)
+    reindex_file("src/util.c", str(root), with_analysis=False)
     # db_path is <index_dir>/<project id>/index.db.
     (root / ".fw-context" / "local.toml").write_text(
         f'[index]\ndb_dir = "{db_path.parent.parent.as_posix()}"\n{index_table}\n[llm]\n{llm_table}',
@@ -250,10 +250,10 @@ def test_no_embedding_advice_when_the_config_turns_the_embeddings_off(one_build,
 def test_no_embedding_advice_for_a_build_that_no_embedding_step_wrote(one_build):
     """Without embedding_dim each definition is without an embedding, and the next run does them all."""
     from fw_context_mcp.indexer.db import open_db
-    from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
+    from fw_context_mcp.mcp.handlers.maintenance import reindex_file
 
     root, db_path = one_build
-    reindex_file_impl("src/util.c", str(root), with_analysis=False)
+    reindex_file("src/util.c", str(root), with_analysis=False)
     conn = open_db(db_path, skip_integrity_check=True)
     try:
         conn.execute("UPDATE build_configs SET embedding_dim = NULL")

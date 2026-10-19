@@ -2,7 +2,7 @@
 
 Three code paths share this module:
   1. Bulk index (``runner.py``) — full Cold reindex of all TUs
-  2. Single-file reindex (``reindex_file`` / ``reindex_file_impl``) —
+  2. Single-file reindex (``reindex_file``) —
      incremental update after a source edit
   3. Auto-reindex (file watcher daemon) — background update on save
 

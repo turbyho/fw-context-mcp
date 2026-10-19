@@ -275,7 +275,7 @@ class SyncQueryExecutor:
         fatal — retrying an interrupted query would re-run the very query
         the 300 s timeout just cancelled and block the lock for another
         full timeout window.  Callers must keep ``query_fn`` idempotent;
-        the single write path (reindex_file_impl) re-applies the same
+        the single write path (reindex_file) re-applies the same
         per-file parse, which is idempotent by construction.
 
         Raises ``sqlite3.Error`` on database failure (after the single

@@ -148,11 +148,11 @@ def test_the_status_tells_to_wait_for_a_run(old_index):
 
 
 def test_reindex_file_gets_the_old_schema(old_index):
-    from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
+    from fw_context_mcp.mcp.handlers.maintenance import reindex_file
 
     root, _ = old_index
 
-    result = reindex_file_impl("src/main.c", str(root), with_analysis=False)
+    result = reindex_file("src/main.c", str(root), with_analysis=False)
 
     assert list(result) == ["error"], result
     assert result["error"].startswith("schema_mismatch: an older version wrote this index")

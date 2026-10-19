@@ -113,7 +113,7 @@ def _resolve_context(project_root: str | Path | None, *, skip_ready_check: bool 
     """Resolve all context: (db_path, config, project_id, root).
 
     When *skip_ready_check* is True, skips the server-ready validation
-    (caller handles the missing-index case itself, e.g. ``reindex_file_impl``).
+    (caller handles the missing-index case itself, e.g. ``reindex_file``).
     """
     if skip_ready_check:
         root = resolve_project_root(str(project_root) if project_root else None)

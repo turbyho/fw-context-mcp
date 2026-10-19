@@ -21,7 +21,7 @@ Key design decisions:
   a checkout and new source files.  watchfiles finds only NEW changes.
 
 - **Pause/resume protocol**: before an MCP tool writes to the index
-  (reindex_file_impl), it calls ``_request_bg_reindex_pause`` to prevent
+  (reindex_file), it calls ``_request_bg_reindex_pause`` to prevent
   the daemon's background reindex from holding the write lock.  The pause
   marker is a PID file — if the requesting process dies, the daemon detects
   the stale marker and resumes automatically.  This is safe because the

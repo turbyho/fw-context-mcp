@@ -46,7 +46,7 @@ log = logging.getLogger(__name__)
 # ── Mtime cache ──
 # Cache for _count_modified_files results with a 30-second TTL.
 # Invalidation is done explicitly by _invalidate_modified_cache after
-# write operations (reindex_file_impl, file watcher).  The background
+# write operations (reindex_file, file watcher).  The background
 # reindex is a separate OS process and cannot invalidate this cache;
 # the TTL ensures staleness is bounded to at most 30 seconds.
 #
@@ -61,7 +61,7 @@ _CACHE_TTL_S: float = 30.0  # shared TTL for mtime cache and header staleness ca
 def _invalidate_modified_cache(config_hash: str | None = None) -> None:
     """Invalidate the mtime cache.  If *config_hash* is None, clear all entries.
 
-    NOTE on who calls this: reindex_file_impl and reset_index, both in
+    NOTE on who calls this: reindex_file and reset_index, both in
     mcp/handlers/maintenance.py.  The file watcher does NOT and cannot — it
     reindexes in a subprocess, as the module docstring says — so the TTL is
     the only bound on an edit the daemon picked up.

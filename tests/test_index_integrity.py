@@ -551,10 +551,10 @@ class TestReindexIntegrity:
         conn = open_db(db_path)
         try:
             ch = _config_hash(conn)
-            from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
+            from fw_context_mcp.mcp.handlers.maintenance import reindex_file
 
             driver_c = indexed_extended / "src" / "driver.c"
-            result = reindex_file_impl(str(driver_c), str(indexed_extended))
+            result = reindex_file(str(driver_c), str(indexed_extended))
             assert "error" not in result, f"Reindex failed: {result}"
 
             dupes = conn.execute(
@@ -574,9 +574,9 @@ class TestReindexIntegrity:
                 "SELECT COUNT(*) FROM symbols WHERE config_hash=?", (ch,),
             ).fetchone()[0]
 
-            from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
+            from fw_context_mcp.mcp.handlers.maintenance import reindex_file
             main_c = indexed_extended / "src" / "main.c"
-            result = reindex_file_impl(str(main_c), str(indexed_extended))
+            result = reindex_file(str(main_c), str(indexed_extended))
             assert "error" not in result, f"Reindex failed: {result}"
 
             after = conn.execute(
@@ -603,8 +603,8 @@ class TestReindexIntegrity:
             modified = "// Added comment 1\n// Added comment 2\n// Added comment 3\n// Added comment 4\n// Added comment 5\n" + original
             driver_c.write_text(modified, encoding="utf-8")
 
-            from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
-            result = reindex_file_impl(str(driver_c), str(indexed_extended))
+            from fw_context_mcp.mcp.handlers.maintenance import reindex_file
+            result = reindex_file(str(driver_c), str(indexed_extended))
             assert "error" not in result, f"Reindex failed: {result}"
 
             new = conn.execute(
@@ -633,8 +633,8 @@ class TestReindexIntegrity:
             modified = original + "\nint new_helper(int x) {\n    return x * 2;\n}\n"
             driver_c.write_text(modified, encoding="utf-8")
 
-            from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
-            result = reindex_file_impl(str(driver_c), str(indexed_extended))
+            from fw_context_mcp.mcp.handlers.maintenance import reindex_file
+            result = reindex_file(str(driver_c), str(indexed_extended))
             assert "error" not in result, f"Reindex failed: {result}"
 
             after = conn.execute(
@@ -696,8 +696,8 @@ class TestReindexIntegrity:
 
             driver_c.write_text(modified, encoding="utf-8")
 
-            from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
-            result = reindex_file_impl(str(driver_c), str(indexed_extended))
+            from fw_context_mcp.mcp.handlers.maintenance import reindex_file
+            result = reindex_file(str(driver_c), str(indexed_extended))
             assert "error" not in result, f"Reindex failed: {result}"
 
             after = conn.execute(
@@ -718,12 +718,12 @@ class TestReindexIntegrity:
                 "SELECT COUNT(*) FROM symbols WHERE config_hash=?", (ch,),
             ).fetchone()[0]
 
-            from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
+            from fw_context_mcp.mcp.handlers.maintenance import reindex_file
             main_c = indexed_extended / "src" / "main.c"
 
-            r1 = reindex_file_impl(str(main_c), str(indexed_extended))
+            r1 = reindex_file(str(main_c), str(indexed_extended))
             assert "error" not in r1
-            r2 = reindex_file_impl(str(main_c), str(indexed_extended))
+            r2 = reindex_file(str(main_c), str(indexed_extended))
             assert "error" not in r2
 
             after = conn.execute(
@@ -743,15 +743,15 @@ class TestReindexEdgeCases:
 
     def test_reindex_deleted_file(self, indexed_extended: Path):
         nonexistent = indexed_extended / "src" / "nonexistent.c"
-        from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
-        result = reindex_file_impl(str(nonexistent), str(indexed_extended))
+        from fw_context_mcp.mcp.handlers.maintenance import reindex_file
+        result = reindex_file(str(nonexistent), str(indexed_extended))
         assert "error" in result
 
     def test_reindex_file_not_in_compile_commands(self, indexed_extended: Path):
         temp_file = indexed_extended / "src" / "unlisted.c"
         temp_file.write_text("int x;\n", encoding="utf-8")
-        from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
-        result = reindex_file_impl(str(temp_file), str(indexed_extended))
+        from fw_context_mcp.mcp.handlers.maintenance import reindex_file
+        result = reindex_file(str(temp_file), str(indexed_extended))
         assert "error" in result
 
 

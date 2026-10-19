@@ -81,9 +81,9 @@ def _names(db_path: Path, variant: str) -> set[str]:
 
 
 def _reindex(root: Path, path: str, **selector) -> dict:
-    from fw_context_mcp.mcp.handlers.maintenance import reindex_file_impl
+    from fw_context_mcp.mcp.handlers.maintenance import reindex_file
 
-    return reindex_file_impl(path, str(root), with_analysis=False, **selector)
+    return reindex_file(path, str(root), with_analysis=False, **selector)
 
 
 def test_a_file_of_the_two_builds_is_reparsed_in_each(two_builds):
@@ -275,8 +275,24 @@ def test_a_declared_variant_without_an_index_names_the_command(two_builds):
     assert "--variant c" in result["error"]
 
 
-@pytest.mark.parametrize("tool", ["reindex_file", "reindex_file_impl"])
-def test_the_mcp_tool_runs_in_a_thread(two_builds, monkeypatch, tool):
+def test_one_mcp_tool_reindexes_a_file():
+    """Two tools did one job: reindex_file was reindex_file_impl with with_analysis=True.
+
+    The second name made an LLM select between two tools that differ in
+    nothing but one argument.  reindex_file now takes ``with_analysis``.
+    """
+    import asyncio
+
+    from fw_context_mcp.mcp import server
+
+    tools = {t.name: t for t in asyncio.run(server.mcp.list_tools())}
+
+    assert "reindex_file_impl" not in tools
+    assert "with_analysis" in tools["reindex_file"].inputSchema["properties"]
+
+
+@pytest.mark.parametrize("arguments", [{}, {"with_analysis": False}], ids=["default", "fast"])
+def test_the_mcp_tool_runs_in_a_thread(two_builds, monkeypatch, arguments):
     """The call ran on the event loop: no progress notice, and no other coroutine, until the end."""
     import asyncio
     import threading
@@ -293,13 +309,15 @@ def test_the_mcp_tool_runs_in_a_thread(two_builds, monkeypatch, tool):
 
     monkeypatch.setattr(maintenance, "_reindex_builds", _builds)
 
-    asyncio.run(server.mcp.call_tool(tool, {"file_path": "src/main.c", "project_root": str(root)}))
+    asyncio.run(server.mcp.call_tool(
+        "reindex_file", {"file_path": "src/main.c", "project_root": str(root), **arguments},
+    ))
 
     assert threads and threads[0] is not threading.main_thread(), threads
 
 
-@pytest.mark.parametrize("tool", ["reindex_file", "reindex_file_impl"])
-def test_the_mcp_tool_gives_no_index_state(two_builds, monkeypatch, tool):
+@pytest.mark.parametrize("arguments", [{}, {"with_analysis": False}], ids=["default", "fast"])
+def test_the_mcp_tool_gives_no_index_state(two_builds, monkeypatch, arguments):
     """The state told a reindex that its answer came from the last index run, or to repeat the reindex."""
     import asyncio
 
@@ -311,7 +329,9 @@ def test_the_mcp_tool_gives_no_index_state(two_builds, monkeypatch, tool):
     monkeypatch.setattr(maintenance, "_reindex_builds", lambda *args, **kwargs: ([], None))
     monkeypatch.setattr(server, "annotate_index_state", lambda result, kw: calls.append(kw) or result)
 
-    asyncio.run(server.mcp.call_tool(tool, {"file_path": "src/main.c", "project_root": str(root)}))
+    asyncio.run(server.mcp.call_tool(
+        "reindex_file", {"file_path": "src/main.c", "project_root": str(root), **arguments},
+    ))
     asyncio.run(server.mcp.call_tool("lookup_symbol", {"name": "main_value", "project_root": str(root), "variant": "a"}))
 
     assert [kw.get("name") for kw in calls] == ["main_value"], "only the query gets the state"

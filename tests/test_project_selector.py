@@ -621,7 +621,7 @@ TOOL_IDS = [t.name for t in TOOLS]
 
 
 def test_the_server_registers_tools():
-    assert len(TOOLS) >= 38, TOOL_IDS
+    assert len(TOOLS) >= 37, TOOL_IDS
 
 
 def test_the_module_docstring_counts_what_the_server_serves():

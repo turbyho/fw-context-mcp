@@ -71,7 +71,7 @@ def _handler(module: str, name: str):
 
 
 def test_registry_is_not_empty():
-    assert len(TOOLS) >= 38, TOOL_IDS
+    assert len(TOOLS) >= 37, TOOL_IDS
 
 
 @pytest.mark.parametrize(("module", "name"), TOOLS, ids=TOOL_IDS)

@@ -1786,8 +1786,9 @@ ifdef-filtered body that the index holds and the callee names from the
 reference index, as context. Code in an inactive `#if` branch does not
 reach the model. When every line of a body is inactive, fw-context skips
 the symbol and calls no model, because the build compiles none of its
-code. When you re-index a file, with `reindex_file`, fw-context
-regenerates the analysis automatically.
+code. When you re-index a file with `reindex_file` and
+`with_analysis=True` (the default), fw-context regenerates the analysis
+of the changed symbols.
 
 The on-demand fallback reads a window of `context_lines` around the
 symbol from the disk. That window is not ifdef-filtered.
@@ -2878,7 +2879,7 @@ builds compile is in the index of each build.
 the config asks for embeddings (`[llm] enabled` and `[index]
 index_embeddings`) and an embedding step wrote to the build before. The
 search by meaning (`semantic_search`, `smart_search`) does not find these
-definitions. A re-parse with `reindex_file_impl(with_analysis=False)`
+definitions. A re-parse with `reindex_file(with_analysis=False)`
 leaves them, and the stamp of the last index run does not show it. The
 action is `fw-context index`, and the run in progress, or the run of a
 reason, does the embeddings too. A project of several builds names each
@@ -3021,7 +3022,7 @@ Re-index a single file after editing.
 
 ```
 Input:  {"file_path": "/abs/path/to/src/main.c", "project_root?": "/path/to/project",
-         "variant?": "a", "image?": "app"}
+         "variant?": "a", "image?": "app", "with_analysis?": true}
 Output (no selector, the builds a, b and c, and c does not compile the file):
         {"file": "/abs/path/to/src/main.c", "translation_units": 2,
          "symbols_updated": 56, "elapsed_s": 5.1,
@@ -3056,43 +3057,8 @@ update failed in each build that it tried. In the second case it also
 holds `failed_builds`, and, when each build gives the same `action`, that
 `action`.
 
-The call runs in a thread of the server and sends a notice each 5 s. It
-holds the lock of the query tools: another query waits 5 s, then gets
-"server busy". After 300 s the call returns an `error`, and a part of the
-work can continue or fail. Call `get_project_status` for the state of
-each build, and repeat the call for a build that is not current. The
-answer holds no `index_state`.
-
-**Limitation:** A source file must appear in `compile_commands.json`.
-compile_commands.json lists no headers, thus fw-context re-parses a header
-through ONE translation unit that includes it, from the manifest: the unit
-with the lowest path in sort order, in each build. The result then
-holds a `warning` ("Header re-indexed via one TU…"). Other units can include the header
-with other `#define` values and still hold stale symbols. Run a full
-`fw-context index` for full accuracy. A file that no unit builds or
-includes gives an `error`.
-
-#### `reindex_file_impl`
-
-The shared implementation that `reindex_file` uses (the public tool, with
-full analysis). Prefer `reindex_file` for interactive use. Use this tool
-only when you need to control `with_analysis` explicitly. The background
-reindex does not use it: the daemon starts `fw-context index --background`.
-
-```
-Input:  {"file_path": "/abs/path/to/src/main.c", "project_root?": "/path/to/project",
-         "variant?": "a", "image?": "app", "with_analysis?": true}
-Output (no selector, and only the build a compiles the file):
-        {"file": "/abs/path/to/src/main.c", "translation_units": 1,
-         "symbols_updated": 28, "elapsed_s": 2.5,
-         "analysis_updated": 12, "embeddings_updated": 12,
-         "builds": [{"variant": "a", "image": "", "translation_units": 1, …}]}
-```
-
-The builds that it re-parses, `builds`, `builds_without_file` and the top
-level are as in [`reindex_file`](#reindex_file). Optional keys of a result
-are present only when they apply. They are absent otherwise, never
-`null`:
+Optional keys of a result are present only when they apply. They are
+absent otherwise, never `null`:
 
 - `skipped_tus` and `skipped_count` — translation units that failed to
   parse.
@@ -3107,22 +3073,37 @@ removed in each build that holds it. The result is then `{"file": …,
 "symbols_removed": 28, "action": "deleted", "builds": [{"variant": …,
 "image": …, "symbols_removed": 28, "action": "deleted"}]}`. For a deleted
 file, `builds_without_file` names the builds that do not hold it. On
-failure, the dict holds `error`,
-and can also hold `skipped_tus` or `action`. `reindex_file` gives the same
-shape.
+failure, the dict holds `error`, and can also hold `skipped_tus` or
+`action`.
 
-In the two modes, this tool rebuilds the method override relationships,
-the PageRank scores and the hotspot cache of each build that it
-re-parses. When `with_analysis=True` (the default), it also regenerates
-the LLM symbol analysis and the embeddings of the symbols that the
-re-parse inserted, also the symbols of the headers that the unit
-includes. The two need a model, thus this is slower. Set
+When reference indexing is on (`[index] index_refs`), the tool rebuilds
+the method override relationships, the PageRank scores and the hotspot
+cache of each build that it re-parses. It does this with and without
+`with_analysis`. When `with_analysis=True` (the default) and the LLM is on
+(`[llm] enabled`), it also regenerates the LLM symbol analysis and the
+embeddings of the symbols that the re-parse inserted, also the symbols of
+the headers that the unit includes. The analysis also needs `[llm]
+analyze_symbols`. The two need a model, thus this is slower. Set
 `with_analysis=False` for a fast update. The symbols then wait for the
 analysis and the embeddings, and `get_project_status` names them with
-`fw-context index` as the action. This tool requires an existing index. A
-source file must appear in `compile_commands.json`. A header goes through
-one including translation unit, with the same `warning` as in
-`reindex_file`.
+`fw-context index` as the action. The background reindex does not use
+this tool: the daemon starts `fw-context index --background`.
+
+The call runs in a thread of the server and sends a notice each 5 s. It
+holds the lock of the query tools: another query waits 5 s, then gets
+"server busy". After 300 s the call returns an `error`, and a part of the
+work can continue or fail. Call `get_project_status` for the state of
+each build, and repeat the call for a build that is not current. The
+answer holds no `index_state`. This tool requires an existing index.
+
+**Limitation:** A source file must appear in `compile_commands.json`.
+compile_commands.json lists no headers, thus fw-context re-parses a header
+through ONE translation unit that includes it, from the manifest: the unit
+with the lowest path in sort order, in each build. The result then
+holds a `warning` ("Header re-indexed via one TU…"). Other units can include the header
+with other `#define` values and still hold stale symbols. Run a full
+`fw-context index` for full accuracy. A file that no unit builds or
+includes gives an `error`.
 
 #### `reset_index`
 

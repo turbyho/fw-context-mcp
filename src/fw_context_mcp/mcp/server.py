@@ -1,6 +1,6 @@
 """fw-context MCP server — build-aware code intelligence for embedded C/C++ projects.
 
-Serves 38 MCP tools and 4 MCP resources via FastMCP (stdio transport).
+Serves 37 MCP tools and 4 MCP resources via FastMCP (stdio transport).
 The two counts are pinned by a test — a docstring that drifts describes
 a server that no longer exists.
 
@@ -64,8 +64,7 @@ client-side connection timeouts.
 
 **Maintenance tools:** ``get_project_status``, ``get_build_info``,
 ``check_dependencies``, ``list_projects``, ``get_project_info``,
-``check_ollama``, ``configure_llm``, ``reindex_file``,
-``reindex_file_impl``, ``reset_index``.
+``check_ollama``, ``configure_llm``, ``reindex_file``, ``reset_index``.
 
 **MCP Resources:** ``fw-context://stats``, ``fw-context://projects``,
 ``fw-context://symbols/{name}``, ``fw-context://skills/fw-review``.
@@ -1022,7 +1021,7 @@ mcp = FastMCP(
         "Source: get_source, get_symbol_context, get_file_map, explain_symbol, read_file.\n"
          "Maintenance: get_project_status, get_build_info,\n"
          "check_dependencies, list_projects, get_project_info,\n"
-         "check_ollama, configure_llm, reindex_file, reindex_file_impl,\n"
+         "check_ollama, configure_llm, reindex_file,\n"
          "reset_index.\n\n"
         "REVIEW SKILL — MANDATORY (not optional): When reviewing C/C++ firmware\n"
         "code (diffs, commits, PRs, changed files), your FIRST action MUST be:\n"
@@ -1161,12 +1160,12 @@ mcp = FastMCP(
 # would serialize fast queries behind slow ones (e.g., a 30 s search_bodies
 # query blocking a 10 ms get_project_status check).
 #
-# The exception: reindex_file and reindex_file_impl.  A re-parse runs
-# libclang for each build that compiles the file, tens of seconds each on a
-# large project.  Without the wrapper the call ran on the event loop: no
-# notice reached the client, which can close the connection after about
-# 15 s without one, and no other coroutine ran.  They get no index state
-# (annotate=False): they write the index and do not answer from it.
+# The exception: reindex_file.  A re-parse runs libclang for each build
+# that compiles the file, tens of seconds each on a large project.  Without
+# the wrapper the call ran on the event loop: no notice reached the client,
+# which can close the connection after about 15 s without one, and no
+# other coroutine ran.  It gets no index state (annotate=False): it writes
+# the index and does not answer from it.
 #
 # All search, call graph, symbol source, inheritance, and variable tools
 # ARE wrapped — they may run for seconds to minutes (BFS traversal,
@@ -1190,7 +1189,6 @@ mcp.tool()(_with_project_selector(maintenance.get_project_info))
 mcp.tool()(_with_project_selector(maintenance.get_project_status))
 mcp.tool()(_with_project_selector(maintenance.list_projects))
 mcp.tool()(_with_project_selector(_wrap_tool(maintenance.reindex_file, annotate=False)))
-mcp.tool()(_with_project_selector(_wrap_tool(maintenance.reindex_file_impl, annotate=False)))
 mcp.tool()(_with_project_selector(maintenance.reset_index))
 
 # search.py

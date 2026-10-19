@@ -463,7 +463,7 @@ Inheritance: get_inheritance_chain, get_class_members,
 get_template_instances, get_method_overrides.
 Maintenance: get_project_status, get_build_info, check_dependencies,
 list_projects, get_project_info, check_ollama, configure_llm, reindex_file,
-reindex_file_impl, reset_index.
+reset_index.
 
 Individual tool descriptions are in the MCP tool listings —
 discover them at runtime.
