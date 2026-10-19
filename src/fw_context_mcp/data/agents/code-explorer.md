@@ -9,7 +9,7 @@ mode: subagent
 
 ALL C/C++ source code access MUST go through fw-context MCP tools.
 Raw source files contain unprocessed #ifdef noise; fw-context shows only
-what actually compiles for the active build configuration.
+what actually compiles for the build of the query.
 
 PROHIBITED for .c/.cpp/.h/.hpp/.s/.inc files:
 - Read, cat — raw preprocessor noise, not compiled code
@@ -26,7 +26,6 @@ REQUIRED for ALL C/C++ code access:
 - get_symbol_context → body + callers + callees in one call
 - find_callers / find_references → impact analysis
 - find_all_callers_recursive → full transitive call tree
-- get_file_map → all symbols in a file grouped by kind
 
 SELF-CORRECT: the moment you reach for Read/grep on C/C++ → STOP → use fw-context.
 <!-- /fw-context -->

@@ -9,7 +9,7 @@ mode: subagent
 
 ALL C/C++ source code access MUST go through fw-context MCP tools.
 Raw source files contain unprocessed #ifdef noise; fw-context shows only
-what actually compiles for the active build configuration.
+what actually compiles for the build of the query.
 
 PROHIBITED for .c/.cpp/.h/.hpp/.s/.inc files:
 - Read, cat — raw preprocessor noise, not compiled code

@@ -11,7 +11,7 @@ description: Review embedded C/C++ firmware changes using fw-context MCP tools. 
 ## CRITICAL — MANDATORY
 For C/C++ source code, use ONLY fw-context tools for reading, searching, and browsing files.
 MUST NOT use any other tool to read or search C/C++ source. fw-context provides
-ifdef-filtered code — only what actually compiles for the active build configuration.
+ifdef-filtered code — only what actually compiles for the build of the query.
 Other tools show unprocessed preprocessor noise including dead `#ifdef` branches.
 
 MUST NOT skip Phase 0. Every review MUST begin by creating and writing out the plan.
@@ -35,10 +35,31 @@ For every changed symbol (function, type, macro):
 **The diff shows SCOPE. fw-context verifies CORRECTNESS.**
 Never conclude a review from the diff alone.
 
+## Read every page
+A tool that gives a long list pages it. The answer holds a page notice with `total`,
+`offset`, `shown` and `more` (a dict answer holds it under the key `page`).
+
+- When `more` is true, call again with `offset=<offset + shown>`. The `hint` gives that call.
+  `read_file` pages lines: call again with the `start_line` that its `hint` names.
+- Do NOT conclude "that is all of them" from one page. Read `total`.
+
 ## Phase 0: Create a review plan (MANDATORY)
 BEFORE any detailed analysis, classify EVERY changed file and build a checklist of fw-context
 tools to run against each changed symbol. This is the single most effective guard against
 missed checks.
+
+### Step 0: Select the build
+Call `get_project_status` first. One query answers for ONE build, and fw-context selects none
+for you.
+
+- When `builds` lists more than one build, select the build from the task. If the task does
+  not identify one build, ask the user. Do not select a build from its position in the list.
+- Give `variant` and `image` exactly as `builds` lists them to EVERY call that follows. A call
+  without them fails on a project of several builds.
+- When `reindex_state` of that build is `"reindexing"` or `"pending"`, wait and call
+  `get_project_status` again. When it is `"not_scheduled"` or `"failed"`, give the user the
+  command that the answer names.
+- Write the build at the top of the review plan.
 
 ### Step 1: Classify every change
 Scan the diff and classify EVERY changed file into one or more categories. Use this table
@@ -50,7 +71,7 @@ to determine which fw-context checks are required:
 | Changed class/struct | Modified `.h` class definition | `get_inheritance_chain(transitive=true)`, `get_class_members`, `find_wrapper_callers` |
 | Changed template | Template function/class modified | `get_template_instances`, `find_callers` for each instantiation |
 | Changed enum | Enum definition changed (added/removed/reordered values) | `find_references` for each removed value, `search_content` for removed value names |
-| Changed type/sizeof | Struct layout change, field added/removed | `find_references`, `search_bodies("sizeof.*<TypeName>")` |
+| Changed type/sizeof | Struct layout change, field added/removed | `find_references`, `search_bodies("sizeof <TypeName>")` — no regex: a space is an AND of the two words, thus find the `sizeof` lines in `match_lines` |
 | Changed signature | Function signature changed (params, return type) | `find_callers` — all call sites MUST match new signature |
 | Changed virtual method | Virtual method signature or behavior changed | `get_method_overrides`, `find_callers` on base-class method |
 | New class/function | New `.h`/`.cpp` file or new symbol in existing file | `lookup_symbol(exact=true)`, `get_inheritance_chain`, `find_callers` |
@@ -185,6 +206,8 @@ Set `project_only=False` — vendor code MUST be searched.
 | Using `search_bodies` for preprocessor directives | Use `search_content` — preprocessor directives are file-scope |
 | Treating diff as the only source of truth | Verify every diff finding with fw-context |
 | Looking only at the first few `search_bodies` results | Scan ALL results |
+| Concluding "that is all" from one page | Read `total`. When `more` is true, call again with `offset` |
+| Calling a tool without `variant`/`image` on a project of several builds | Select the build in Step 0 and give it to EVERY call |
 | Skipping logic review on trivial-looking changes | Apply Phase 2 to ALL changed C/C++ functions |
 
 ## Tool selection
