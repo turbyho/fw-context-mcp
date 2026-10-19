@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import sqlite3
 
+from ._owners import delete_ownership_for_build
 from ._schema import _ensure_column
 
 __all__ = [
@@ -220,6 +221,8 @@ def delete_build_data(conn: sqlite3.Connection, config_hash: str) -> None:
     conn.execute("DELETE FROM memory_regions WHERE config_hash = ?", (config_hash,))
     conn.execute("DELETE FROM files WHERE config_hash = ?", (config_hash,))
     conn.execute("DELETE FROM build_configs WHERE config_hash = ?", (config_hash,))
+    # The claims of the units: the tables come when first used, not from _SCHEMA.
+    delete_ownership_for_build(conn, config_hash)
     # vec0 virtual table — not covered by ON DELETE CASCADE.
     # The table only exists when the sqlite-vec extension is loaded.
     try:

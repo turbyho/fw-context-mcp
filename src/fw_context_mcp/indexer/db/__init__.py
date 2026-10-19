@@ -12,6 +12,7 @@ specialized modules.  The package is split by concern:
 - ``_llm`` — LLM analysis storage
 - ``_memory`` — memory map (the MEMORY command of the linker script)
 - ``_locking`` — file-system write lock
+- ``_owners`` — the unit that claims each header (incremental runs)
 - ``_projects`` — project/build config CRUD
 - ``_schema`` — schema versioning and migration
 - ``_connection`` — connection management (open, schema, transactions)
@@ -32,6 +33,8 @@ __all__ = [
     "CURRENT_SCHEMA_VERSION",
     "DatabaseCorruptionError",
     "FileHashRecord",
+    "Ownership",
+    "UnitKey",
     "WriteLockTimeout",
     "_cosine_sim",
     "_ensure_column",
@@ -62,6 +65,8 @@ __all__ = [
     "drop_fts_triggers",
     "ensure_schema",
     "error_shows_damage",
+    "files_claimed_before",
+    "files_without_owner",
     "find_all_callers_recursive",
     "find_call_path",
     "find_callees_recursive",
@@ -71,6 +76,7 @@ __all__ = [
     "find_indirect_targets",
     "find_macro_refs",
     "find_refs_with_candidates",
+    "forget_unit",
     "get_active_config",
     "get_all_builds_for_project",
     "get_all_projects",
@@ -105,16 +111,21 @@ __all__ = [
     "insert_overrides_batch",
     "insert_refs_batch",
     "insert_symbols_batch",
+    "listing_key",
+    "load_ownership",
     "lookup_macro",
     "make_analysis_summary",
     "missing_columns",
+    "number_listings",
     "open_db",
     "purge_file_records",
     "purge_missing_files_batch",
     "rebuild_files_fts",
     "rebuild_fts",
     "rebuild_macros_fts",
+    "record_claims",
     "refs_for_symbol",
+    "release_files",
     "replace_file_data",
     "replace_memory_regions",
     "row_format_effect",
@@ -127,9 +138,11 @@ __all__ = [
     "search_symbols",
     "set_analyze_vendor",
     "set_entry_point",
+    "skip_form",
     "split_tokens",
     "symbols_without_embedding",
     "transaction",
+    "unclaimed",
     "upsert_build_config",
     "upsert_embeddings",
     "upsert_embeddings_vec",
@@ -226,6 +239,20 @@ from ._memory import (
     get_memory_regions,
     replace_memory_regions,
     set_entry_point,
+)
+from ._owners import (
+    Ownership,
+    UnitKey,
+    files_claimed_before,
+    files_without_owner,
+    forget_unit,
+    listing_key,
+    load_ownership,
+    number_listings,
+    record_claims,
+    release_files,
+    skip_form,
+    unclaimed,
 )
 from ._projects import (
     compute_analysis_coverage,

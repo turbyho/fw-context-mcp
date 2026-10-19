@@ -70,6 +70,7 @@ from fw_context_mcp.indexer.db import (
     insert_macros_batch,
     insert_refs_batch,
     insert_symbols_batch,
+    record_claims,
     replace_file_data,
     split_tokens,
     upsert_file,
@@ -1345,6 +1346,7 @@ def store_symbols_for_unit(
     hashes=None,
     build_dir_patterns: list[str] | None = None,
     skip_files: frozenset[str] | None = None,
+    listing: tuple[str, str] | None = None,
 ) -> tuple[int, int, list[dict] | None]:
     """Parse one translation unit and store its symbols + refs in the DB.
 
@@ -1383,6 +1385,12 @@ def store_symbols_for_unit(
     avoids a redundant full-scan of the files table inside the write lock.
     When ``None`` (reindex_file / watch paths), the lookup falls back to
     calling ``get_file_mtimes()``.
+
+    The files that this parse claims are recorded for *listing*, the key of
+    the listing (see db/_owners.py).  The caller gives it, because only the
+    caller sees all listings: a file that compile_commands.json lists two
+    times with the same flags has two keys (``number_listings``).  Without
+    *listing*, nothing is recorded.
     """
     from fw_context_mcp.indexer.symbols import extract_all
 
@@ -1505,13 +1513,28 @@ def store_symbols_for_unit(
     # insert_symbols_batch — a header definition would keep its first-index
     # line numbers forever and a deleted declaration would never disappear.
     owned_paths = {_normalize_file_path(p, project_root) for p in newly_seen}
-    owned_paths.add(normalized_tu_path)
+    # The source file too, also when the parse found no cursor in it (an
+    # emptied file must lose its rows).  But not when an earlier listing of
+    # this run claimed it: compile_commands.json can list one file two times
+    # with the same flags, and the second parse skips the whole file.  Its
+    # store deleted the rows that the first listing had just written.  A
+    # full run did not show it, because the files of an empty database have
+    # no id to delete by (*known* is read at the start of the run).
+    if not skip_files or file_path not in skip_files:
+        owned_paths.add(normalized_tu_path)
 
     # ── Phase 1: Save USRs of old symbols ──
     old_usrs = _save_old_state(conn, normalized_tu_path, known, owned_paths=owned_paths)
 
     # ── Phase 2: Delete old symbols ──
     _delete_old_for_tu(conn, config_hash, normalized_tu_path, known, syms, owned_paths=owned_paths)
+
+    # Record the claims of this listing in the transaction of its rows, thus
+    # the two agree also after a run that stopped.  The next incremental run
+    # gives these files to this listing again when it does not parse it (see
+    # db/_owners.py).  A caller that does not name the listing records nothing.
+    if listing is not None:
+        record_claims(conn, config_hash, listing, owned_paths)
 
     # Upsert the TU file record and capture its id.
     # The index run gives the hashes that its decision computed

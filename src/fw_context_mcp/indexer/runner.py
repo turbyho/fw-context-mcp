@@ -11,6 +11,8 @@ that runner, reindex_file, and auto-reindex all use the same code path.
 
 from __future__ import annotations
 
+import bisect
+import dataclasses
 import logging
 import os
 import sqlite3
@@ -47,6 +49,7 @@ from ._postprocess import (
     _run_postprocess,
 )
 from ._unit_processor import (
+    UnitDecision,
     _handle_unchanged,
     _parse_unit,
     _process_unit,
@@ -56,11 +59,20 @@ from .compile_commands import parse as parse_compile_commands
 from .compile_commands import validate_include_files
 from .config_hash import DEFAULT_TRANSIENT_DEFINES
 from .db import (
+    Ownership,
+    UnitKey,
     drop_fts_triggers,
+    files_without_owner,
+    forget_unit,
     get_file_hashes,
+    load_ownership,
     open_db,
     rebuild_fts,
+    release_files,
+    replace_file_data,
+    skip_form,
     transaction,
+    unclaimed,
     upsert_build_config,
     upsert_project,
     write_lock,
@@ -177,6 +189,163 @@ def _in_claim_order(
         return path, flags_hash
 
     return sorted(units, key=key)
+
+
+def _hand_over(
+    decisions: list[UnitDecision],
+    start: int,
+    paths: Collection[str],
+    conn: sqlite3.Connection,
+    config_hash: str,
+    db_dir: Path,
+) -> tuple[set[str], dict[int, set[str]]]:
+    """Give each of *paths* to the next listing that claims it in a full run.
+
+    *paths* lost their owner in this run: the owner no longer claims them,
+    or it left the build.  In a full run, the first listing at or after
+    *start* that includes the file and has a cursor in it claims it.  A
+    listing before *start* that includes it does not: in a full run it came
+    first, and it did not claim the file, thus it has no cursor in it.
+
+    * The next includer is parsed in this run: it claims the file itself,
+      because no other listing holds the file in ``skip_files``.
+    * The next includer is unchanged: it must be parsed, thus this function
+      sets it, and each listing of its file, to parsed (see the last rule of
+      ``decide_units``).
+    * No listing includes the file: it has no owner in a full run, thus its
+      rows go.
+
+    The includer can have no cursor in the file (an inactive ``#if`` around
+    all of it).  Then it does not claim the file, and the listing after it
+    must.  Thus the caller gets ``{index of the includer: paths}``, and
+    after it parsed that listing, it calls this function again from the
+    next index with each path that the listing did not claim.
+
+    Returns the files of the listings set to parsed, and the assignments.
+    A run that stops before the heir leaves the file without an owner, and
+    the next run gives it to its first includer (``files_without_owner``).
+    """
+    promoted: set[str] = set()
+    assigned: dict[int, set[str]] = {}
+    orphans: list[str] = []
+    for path in sorted(paths):
+        heir = next(
+            (j for j in range(start, len(decisions)) if path in decisions[j].includes),
+            None,
+        )
+        if heir is None:
+            orphans.append(path)
+            continue
+        assigned.setdefault(heir, set()).add(path)
+        if not decisions[heir].unchanged:
+            continue
+        # Each listing of the heir file that the loop did not reach yet: a
+        # listing before *start* was handled already, and setting it now
+        # changes nothing but the record of the decision.
+        heir_file = decisions[heir].key[0]
+        for k in range(start, len(decisions)):
+            if decisions[k].key[0] == heir_file and decisions[k].unchanged:
+                decisions[k] = dataclasses.replace(decisions[k], unchanged=False)
+        promoted.add(heir_file)
+        log.debug("%s lost its owner; %s parses again to claim it", path, heir_file)
+    if orphans:
+        with write_lock(db_dir, timeout=120.0), transaction(conn):
+            ids = [
+                row[0]
+                for path in orphans
+                for row in conn.execute(
+                    "SELECT id FROM files WHERE config_hash = ? AND path = ?", (config_hash, path),
+                )
+            ]
+            replace_file_data(conn, config_hash, ids)
+            release_files(conn, config_hash, orphans)
+        log.info("%d file(s) lost their owner and no later unit includes them: rows removed", len(orphans))
+    return promoted, assigned
+
+
+def _settle_left(
+    index: int,
+    left_at: dict[int, list[UnitKey]],
+    ownership: Ownership,
+    decisions: list[UnitDecision],
+    awaiting: dict[int, set[str]],
+    skip_files: set[str],
+    conn: sqlite3.Connection,
+    config_hash: str,
+    db_dir: Path,
+    project_root: Path,
+) -> None:
+    """At loop position *index*, give away the files of the listings that left before it.
+
+    A file that an earlier listing claimed in this run has an owner.  A
+    listing that replaces the one that left (the same file with new flags)
+    can sort before or after the old position: before, it claimed the files
+    already; after, :func:`_hand_over` finds it as the next includer,
+    because the includes of a listing hold its own source file.
+
+    The claims of a listing that left are removed here, and not at the
+    start of the run: a run that stops before this position leaves them,
+    and the next run gives the files away.
+    """
+    left = left_at.pop(index, [])
+    if not left:
+        return
+    with write_lock(db_dir, timeout=120.0), transaction(conn):
+        for unit_key in left:
+            forget_unit(conn, config_hash, unit_key)
+    paths = unclaimed(
+        (path for unit_key in left for path in ownership.files_of(unit_key)), skip_files, project_root,
+    )
+    if not paths:
+        return
+    _, assigned = _hand_over(decisions, index, paths, conn, config_hash, db_dir)
+    for heir, heir_paths in assigned.items():
+        awaiting.setdefault(heir, set()).update(heir_paths)
+
+
+def _settle_claims(
+    index: int,
+    decisions: list[UnitDecision],
+    claimed: set[str] | None,
+    ownership: Ownership,
+    awaiting: dict[int, set[str]],
+    skip_files: set[str],
+    conn: sqlite3.Connection,
+    config_hash: str,
+    db_dir: Path,
+    project_root: Path,
+) -> None:
+    """After the parse of listing *index*, find an owner for each file that has none.
+
+    Two kinds of files need one:
+
+    * The files that the listing claimed in the last run and did not claim
+      now (*claimed* holds the normalized paths of this parse).  A listing
+      whose parse failed keeps its rows, thus it loses nothing:
+      *claimed* is None.
+    * The files that :func:`_hand_over` gave to this listing and that it did
+      not claim (``awaiting[index]``).
+
+    A file that an earlier listing claimed in this run has an owner, thus
+    it is not given away again.
+
+    A listing whose parse failed (*claimed* is None) gives nothing away, also
+    not its ``awaiting`` files: a later listing could not claim them, and
+    when none includes them, :func:`_hand_over` deletes their rows.  A parse
+    can fail for a moment (a file that cannot be read now).  The files keep
+    their rows without an owner, and the next run, which parses the listing
+    again, gives them to their first includer (``files_without_owner``).
+    """
+    due = awaiting.pop(index, set())
+    if claimed is None:
+        return
+    lost = set(ownership.files_of(decisions[index].key))
+    open_paths = unclaimed((lost | due) - claimed, skip_files, project_root)
+    if not open_paths:
+        return
+    _, assigned = _hand_over(decisions, index + 1, open_paths, conn, config_hash, db_dir)
+    for heir, heir_paths in assigned.items():
+        awaiting.setdefault(heir, set()).update(heir_paths)
 
 
 def _checkpoint_manifest(
@@ -903,11 +1072,13 @@ def run(
         is not None
     )
 
-    # skip_files accumulates resolved paths of headers already processed
-    # by earlier TUs in this run.  Starts empty each run — never loaded
-    # from manifest, never persisted.  This avoids stale-header bugs
-    # where a changed header would be skipped because it was in a
-    # persist-stored skip set from a previous index run.
+    # skip_files accumulates resolved paths of the files that earlier
+    # listings claimed in this run.  A parsed listing adds what its parse
+    # walked; an unchanged listing adds the files that it claimed in the
+    # last run (db/_owners.py), at its own position in the loop.  Thus the
+    # owner of a file is the owner of a full run.  A changed header is not
+    # kept from its includers by this: each listing that includes it is
+    # parsed (header_stale_tus), and the first one claims it again.
     skip_files: set[str] = set()
 
     # An earlier run of this build that stored rows and stopped: its units
@@ -920,18 +1091,56 @@ def run(
     # Every unit is decided before the first parse: hashes only, no write.
     # A file whose listing changed is parsed in each of its listings, and
     # that needs the answer for all of them — see decide_units.
+    #
+    # The files that each listing claimed in the last runs (db/_owners.py).
+    # A listing that the run does not parse adds its files to skip_files at
+    # its position in the loop, thus a parsed listing claims only what it
+    # claims in a full run.
+    ownership = load_ownership(conn, config_hash)
     decisions = decide_units(
         units, project_root, existing_files, manifest_lookup,
         header_stale_tus | marker_units,
         force=force, hash_cache=header_hash_cache, header_table=manifest_header_table,
-        transient_defines=transient_defines,
+        transient_defines=transient_defines, claims_recorded=ownership.recorded,
     )
     flags_hashes = [decision.hashes[1] for decision in decisions]
+
+    # A listing that left the build gives its files away at its old position
+    # in the loop: a listing before that position that the run parses can
+    # claim them first, as in a full run.  The keys of the decisions are in
+    # the order of _in_claim_order, thus a bisect finds the position.
+    # {index of a listing: files that it must claim in this run}
+    awaiting: dict[int, set[str]] = {}
+    # {index of the loop: the listings that left the build before it}
+    left_at: dict[int, list[UnitKey]] = {}
+    left = sorted(ownership.recorded - {decision.key for decision in decisions})
+    if left:
+        keys = [decision.key for decision in decisions]
+        for unit_key in left:
+            left_at.setdefault(bisect.bisect_left(keys, unit_key), []).append(unit_key)
+        log.info("%d listing(s) left the build; their files go to the next includer", len(left))
+
+    # A file with rows and no owner: a run that stopped after a listing lost
+    # the file and before the next includer claimed it, or rows from a
+    # version without the owner tables.  The first includer gets it, as in
+    # a full run.  Only files that a listing includes: the rows of the
+    # assembly pass and of the linker scripts have no owner by design.
+    included = frozenset().union(*(decision.includes for decision in decisions))
+    unowned = files_without_owner(conn, config_hash) & included
+    if unowned:
+        _, assigned = _hand_over(decisions, 0, unowned, conn, config_hash, db_path.parent)
+        for heir, heir_paths in assigned.items():
+            awaiting.setdefault(heir, set()).update(heir_paths)
+        log.info("%d file(s) had rows and no owner; their first includer claims them", len(unowned))
 
     # This run writes the marker before its first row, and removes it after
     # its own post-processing.  The units of an earlier marker stay in it
     # until this run parses them.
-    marker_written = pending_run or any(not decision.unchanged for decision in decisions)
+    #
+    # A listing that left the build can set a later listing to parsed in the
+    # loop (_settle_left), thus its presence writes the marker too.  The
+    # other hand-overs happen after a parse, and the marker is there then.
+    marker_written = pending_run or bool(left_at) or any(not decision.unchanged for decision in decisions)
     if marker_written:
         _run_marker.mark_pending(db_path.parent, config_hash, marker_units)
     last_checkpoint = time.monotonic()
@@ -952,6 +1161,10 @@ def run(
         raise_if_superseded(db_path.parent)  # Give up if another process took over
         fname = unit.file.name
         processed = i + 1
+        _settle_left(
+            i, left_at, ownership, decisions, awaiting, skip_files,
+            conn, config_hash, db_path.parent, project_root,
+        )
 
         # ── Phase 1: libclang parse of a changed unit (no lock) ──
         # WHY outside lock: libclang parsing can take seconds to minutes per
@@ -977,6 +1190,10 @@ def run(
 
         if parsed_data is not None and hasattr(parsed_data, 'newly_seen_files'):
             skip_files.update(parsed_data.newly_seen_files)
+        elif decision.unchanged:
+            # Not parsed: the files that it claimed in the last run stay its
+            # own, at the same position as in a full run.
+            skip_files.update(skip_form(ownership.files_of(decision.key), project_root))
 
         if check_status == "unchanged":
             result = _handle_unchanged(
@@ -997,6 +1214,10 @@ def run(
         if check_status == "skipped":
             skipped += 1
             log.info("[%d/%d] %s: skipped", processed, len(units), fname)
+            _settle_claims(
+                i, decisions, None, ownership, awaiting, skip_files,
+                conn, config_hash, db_path.parent, project_root,
+            )
             continue
 
         # ── Phase 2: DB store (inside lock) ──
@@ -1016,6 +1237,7 @@ def run(
                 hashes=hashes,
                 build_dir_patterns=build_dir_patterns,
                 skip_files=skip_before,
+                listing=decision.key,
             )
             if status == "updated":
                 updated += 1
@@ -1058,6 +1280,15 @@ def run(
                 skipped += 1
                 log.info("[%d/%d] %s: skipped", processed, len(units), fname)
 
+        claimed = (
+            {_normalize_file_path(path, project_root) for path in parsed_data.newly_seen_files}
+            if status == "updated" and parsed_data is not None else None
+        )
+        _settle_claims(
+            i, decisions, claimed, ownership, awaiting, skip_files,
+            conn, config_hash, db_path.parent, project_root,
+        )
+
         if updated and time.monotonic() - last_checkpoint >= MANIFEST_CHECKPOINT_S:
             # A manual operation that took the index wrote its own manifest;
             # a checkpoint after it would overwrite that.  Give up first.
@@ -1073,6 +1304,13 @@ def run(
             )
             last_checkpoint = time.monotonic()
 
+
+    # The listings that left after the last listing: no listing comes after
+    # them, thus their files that nobody claimed in this run lose their rows.
+    _settle_left(
+        len(units), left_at, ownership, decisions, awaiting, skip_files,
+        conn, config_hash, db_path.parent, project_root,
+    )
 
     # ── Linker scripts, between the C units and the assembly ──
     # The position is deliberate, and both neighbours depend on it — see

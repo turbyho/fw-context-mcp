@@ -64,6 +64,8 @@ except ImportError:
 from ..utils import SAFE_EXCEPT, compute_source_hash, is_fatal
 from .config_hash import compute_flags_hash
 from .db import (
+    UnitKey,
+    listing_key,
     open_db,
     transaction,
     write_lock,
@@ -82,11 +84,19 @@ class UnitDecision:
     hash, thus the two describe the same text or the time is older (0.0
     when the file is gone).  *unchanged* is True when the index holds what a
     parse would give, and no parse is necessary.
+
+    *key* is ``(normalized path, flags_hash)``, the name of the listing in
+    the tables of ``db/_owners.py``.  *includes* holds the normalized paths
+    of each file that the listing included at its last parse, from the
+    manifest entries of its file.  The run gives a header that lost its
+    owner to the next listing that includes it (``runner._hand_over``).
     """
 
     hashes: tuple[str, str]
     mtime: float
     unchanged: bool
+    key: tuple[str, str] = ("", "")
+    includes: frozenset[str] = frozenset()
 
 
 def decide_units(
@@ -100,6 +110,7 @@ def decide_units(
     hash_cache: dict[str, str] | None,
     header_table: dict[str, dict] | None,
     transient_defines: Collection[str],
+    claims_recorded: Collection[tuple[str, str]] = frozenset(),
 ) -> list[UnitDecision]:
     """Decide for each unit, in order, if it must be parsed again.
 
@@ -112,6 +123,11 @@ def decide_units(
       listing (see :func:`_unchanged_entry`), and that entry is not stale:
       the source file and each header have the hash of the entry, and the
       entry has no ``needs_reparse`` mark.
+    * *claims_recorded* holds the listing: the run knows the files that the
+      listing claimed (``db/_owners.py``).  Without them, the run cannot
+      keep those files from a later listing, and the later listing would
+      write them in its own context.  An index from an older version has
+      no claims, thus its next run parses each listing one time.
     * No other listing of the same file must be parsed.
 
     No file time takes part.  Before, the first test was "the source file
@@ -146,9 +162,18 @@ def decide_units(
     hashes: list[tuple[str, str]] = []
     mtimes: list[float] = []
     own: list[bool] = []
+    includes: list[frozenset[str]] = []
+    keys: list[tuple[str, str]] = []
+    # How often each (path, flags_hash) came before: see number_listings.
+    listing_count: dict[tuple[str, str], int] = {}
     for unit in units:
         resolved_tu = unit.file.resolve()
         file_path = _normalize_file_path(str(resolved_tu), project_root)
+        try:
+            tu_rel = str(resolved_tu.relative_to(project_root))
+        except ValueError:
+            tu_rel = str(resolved_tu)
+        file_entries = manifest.get(tu_rel, ()) if manifest is not None else ()
         # The time first, then the hash: a save between the two leaves the
         # row with an older time than the text, and the staleness check of
         # the query side then hashes the file again.
@@ -163,30 +188,42 @@ def decide_units(
             compute_flags_hash(unit.raw_entry, transient_defines=transient_defines)
             if unit.raw_entry is not None else ""
         )
+        listing_count[(file_path, flags_hash)] = listing_count.get((file_path, flags_hash), 0) + 1
+        key = listing_key((file_path, flags_hash), listing_count[(file_path, flags_hash)])
+        keys.append(key)
         unchanged = False
         if (
             not force_all
             and file_path not in header_stale_tus
             and file_path in existing_files
             and manifest is not None
+            and key in claims_recorded
         ):
-            try:
-                tu_rel = str(resolved_tu.relative_to(project_root))
-            except ValueError:
-                tu_rel = str(resolved_tu)
             unchanged = _unchanged_entry(
-                manifest.get(tu_rel, ()), source_hash, flags_hash, project_root,
+                file_entries, source_hash, flags_hash, project_root,
                 hash_cache=hash_cache, header_table=header_table,
             ) is not None
         paths.append(file_path)
         hashes.append((source_hash, flags_hash))
         mtimes.append(mtime)
         own.append(unchanged)
+        # Every listing of the file: the index holds one set of rows for a
+        # file, and the entries of its listings together give what it read.
+        # The source file too: a listing that replaces another listing of
+        # the same file (new flags) claims that file.
+        includes.append(frozenset(
+            path for entry in file_entries for path in entry.get("headers") or ()
+        ) | {file_path})
 
     behind = {path for path, unchanged in zip(paths, own, strict=True) if not unchanged}
     decisions = [
-        UnitDecision(hashes=h, mtime=mtime, unchanged=unchanged and path not in behind)
-        for path, h, mtime, unchanged in zip(paths, hashes, mtimes, own, strict=True)
+        UnitDecision(
+            hashes=h, mtime=mtime, unchanged=unchanged and path not in behind,
+            key=key, includes=included,
+        )
+        for path, h, mtime, unchanged, included, key in zip(
+            paths, hashes, mtimes, own, includes, keys, strict=True,
+        )
     ]
     siblings = sum(1 for unchanged, d in zip(own, decisions, strict=True) if unchanged and not d.unchanged)
     if siblings:
@@ -301,6 +338,7 @@ def _process_unit(
     hashes: tuple[str, str] | None = None,
     build_dir_patterns=None,
     skip_files: frozenset[str] | None = None,
+    listing: UnitKey | None = None,
 ):
     """Store one translation unit that :func:`_parse_unit` parsed.
 
@@ -342,6 +380,8 @@ def _process_unit(
             ``time.monotonic()`` measurements around the parse step.
         hashes: ``(source_hash, flags_hash)`` of the listing, for its
             ``files`` row.
+        listing: The key of the listing (``UnitDecision.key``), under which
+            the store records the files that the parse claimed.
 
     Returns:
         A tuple ``(status, symbols_added, refs_added, timing, headers)`` where
@@ -386,6 +426,7 @@ def _process_unit(
                     hashes=hashes,
                     build_dir_patterns=build_dir_patterns,
                     skip_files=skip_files,
+                    listing=listing,
                 )
             t_write_end = time.monotonic()
             t_parse = t_parse_end - t_parse_start
