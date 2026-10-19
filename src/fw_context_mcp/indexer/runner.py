@@ -144,6 +144,41 @@ class IndexTerminated(IndexStopped):
 MANIFEST_CHECKPOINT_S: float = 60.0
 
 
+def _in_claim_order(
+    units: list, project_root: Path, transient_defines: Collection[str],
+) -> list:
+    """Return *units* in the order in which they claim the shared headers.
+
+    The first unit that walks a header owns its rows (see ``skip_files`` in
+    :func:`run`).  A header that a C unit and a C++ unit include, or that two
+    units read with different defines, has different rows for each unit.
+    Thus the order of the units decides the content of the index.
+
+    WHY a sort and not the order of compile_commands.json: ``bear`` writes
+    the units in the order in which a parallel build compiles them.
+    Measured on two Mbed projects: 36 of 321 and 44 of 449 units moved
+    between two builds.  Two full runs then gave the headers different
+    owners, and an incremental run could not repeat a full run.
+
+    The key is the normalized path and the flags hash of the listing.  The
+    flags hash keeps the listings of one file in a fixed order too: the
+    index holds the rows of the listing that the run parses last (see
+    :func:`decide_units`).  The sort is stable, thus two listings with the
+    same key keep their order, and those two give the same rows.
+    """
+    from .config_hash import compute_flags_hash
+
+    def key(unit) -> tuple[str, str]:
+        path = _normalize_file_path(str(unit.file.resolve()), project_root)
+        flags_hash = (
+            compute_flags_hash(unit.raw_entry, transient_defines=transient_defines)
+            if unit.raw_entry is not None else ""
+        )
+        return path, flags_hash
+
+    return sorted(units, key=key)
+
+
 def _checkpoint_manifest(
     *,
     manifest: dict | None,
@@ -599,7 +634,10 @@ def run(
     # suffix outside TU_EXTENSIONS is not even a candidate there, so the
     # units are invisible from that direction.  Five of the seven test
     # projects compile assembly.
-    units = [u for u in all_units if u.file.suffix in TU_EXTENSIONS]
+    units = _in_claim_order(
+        [u for u in all_units if u.file.suffix in TU_EXTENSIONS],
+        project_root, transient_defines,
+    )
     asm_units = [u for u in all_units if u.file.suffix not in TU_EXTENSIONS]
     if asm_units:
         from collections import Counter
