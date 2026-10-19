@@ -168,7 +168,9 @@ it as a reason. The next run that ends well with the build there removes it.
 When you build outside of fw-context, `get_project_status` finds the build
 and removes a reason that said it is not there. A failed automatic build
 is not paused: the next background run builds again. The daemon starts
-that run when a C/C++ file changes; a change of a build file only (for
+that run when a C/C++ file changes, and when the checkout changes (another
+branch, a tag, or a commit on a detached HEAD). A commit on the branch
+changes no checkout. A change of a build file only (for
 example `CMakeLists.txt`) starts no run. For the triggers of the background runs, see
 [`fw-context index`](tools.md#fw-context-index).
 
@@ -211,7 +213,7 @@ Exceptions:
 
 | Parameter | Type | Default | Systems | Description |
 |-----------|------|---------|---------|-------------|
-| `system` | `str` | (auto-detect) | all | Build system: `mbed-os`, `zephyr`, `platformio`, `esp-idf`, `arduino`, `cmake`, `keil-mdk`, `iar-ewarm`, `makefile`, `bare` |
+| `system` | `str` | (auto-detect) | all | Build system: `mbed-os`, `zephyr`, `platformio`, `esp-idf`, `arduino`, `cmake`, `keil-mdk`, `iar-ewarm`, `makefile`, `bare`, `stm32cubeide`, `ti-ccs` |
 | `clean` | `bool` | `true` | all | Run a clean build before fw-context generates the file. **Recommended.** A clean build ensures a complete `compile_commands.json` file. |
 | `command` | `str` | — | all | A full override for the shell command. Highest priority: fw-context ignores all other settings. |
 | `python` | `str` | (auto-detect) | all | The Python interpreter for pip-based CLI tools, such as `mbed-cli`, `platformio`, `keil2clangd`, or `compiledb`. `fw-context init` detects this automatically, from pyenv, venv, and common install paths. Set this parameter manually when automatic detection fails. |
@@ -221,12 +223,12 @@ Exceptions:
 The build process does not get an inherited `BASH_ENV`. fw-context removes
 it from the build environment, because `bash -c` reads that file before
 the command, and `activate` runs through `bash -c`. If a build needs
-`BASH_ENV`, set it in `[build] env` or in `[build] extra_env`
-(`local.toml`). A configured value is applied after the removal.
+`BASH_ENV`, set it in `[build] env`. fw-context applies a configured value
+after the removal.
 
-`[build] env`, `extra_path` and `extra_env` apply to every command that
-the build runs: the builder commands, the `pre_build` hook, and the
-`command` override. `activate` applies to the builder commands only.
+`[build] env` applies to every command that the build runs: the builder
+commands, the `pre_build` hook, and the `command` override. `activate`
+applies to the builder commands only.
 
 ### Mbed OS
 
@@ -621,8 +623,10 @@ clean = false
 non-standard installations.
 
 fw-context reads the linker scripts from the link of the application in
-`build/build.ninja`. `build/project_description.json` names the ELF of the
-application. The link names each script with `-T` and no directory, and
+`build.ninja`. `project_description.json` names the ELF of the
+application. fw-context reads the two files in the directory that holds
+`compile_commands.json`. After a build of fw-context, this directory is
+`.fw-context/build/<variant>/out/`. The link names each script with `-T` and no directory, and
 the `-L` options give the directories that hold the scripts. When
 fw-context cannot read a link input, the index keeps the memory map that
 it has.
@@ -658,8 +662,11 @@ clean = true
 ```
 
 This is the generic CMake builder. This builder runs
-`cmake -B build -G Ninja -DCMAKE_EXPORT_COMPILE_COMMANDS=ON`. This builder
-works for any CMake project that is not Zephyr or ESP-IDF.
+`cmake -B <out> -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -G Ninja`, and then
+`cmake --build <out>`. `<out>` is `.fw-context/build/<variant>/out`.
+`cmake_generator` gives the `-G` option. Without it, the builder gives no
+`-G`, and CMake uses its default generator. This builder works for any
+CMake project that is not Zephyr or ESP-IDF.
 
 ### 11. Shell override — bear wrapping a custom build
 

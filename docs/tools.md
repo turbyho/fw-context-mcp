@@ -52,8 +52,8 @@ fw-context index --no-embeddings
 # Skip LLM symbol analysis
 fw-context index --no-analyze
 
-# Custom source roots
-fw-context index --source-roots src lib drivers
+# Custom vendor and project directories
+fw-context index --vendor-paths sdk third_party --project-paths src lib
 ```
 
 | Option | Default | Description |
@@ -62,12 +62,17 @@ fw-context index --source-roots src lib drivers
 | `--project DIR` | `.` | Project root directory |
 | `--build` | off | Force a clean build and regenerate `compile_commands.json` |
 | `--no-clean` | off | With `--build`: skip the clean step, and do an incremental build |
-| `--source-roots DIR…` | auto-detected | Directories to index symbols from |
+| `--vendor-paths DIR…` | `[index] vendor_paths` | Vendor and SDK directories, added to the directories that the build system detects. The option replaces `[index] vendor_paths`. A `[[build.variants]]` entry adds its own directories to it. |
+| `--project-paths DIR…` | `[index] project_paths` | Project directories. They win over each vendor pattern. The option replaces `[index] project_paths`. A `[[build.variants]]` entry adds its own directories to it. |
 | `--name NAME` | directory name | Project name override |
 | `--no-refs` | off | Skip cross-reference / call graph indexing |
-| `--no-embeddings` | off | Skip embedding generation |
-| `--no-analyze` | off | Skip LLM symbol analysis |
-| `--analyze` | on | Force LLM symbol analysis (negates --no-analyze) |
+| `--embeddings` | `[index] index_embeddings` (`true`) | Generate symbol embeddings |
+| `--no-embeddings` | off | Skip embedding generation. Wins over `--embeddings`. |
+| `--analyze` | `[llm] analyze_symbols` (`true`) | Generate the LLM symbol analysis (summary, inputs, outputs) |
+| `--no-analyze` | off | Skip LLM symbol analysis. Wins over `--analyze`. |
+| `--analyze-vendor` | `[llm] analyze_vendor` (`false`) | Also analyze the vendor and SDK code |
+| `--no-analyze-vendor` | off | Skip the analysis of the vendor and SDK code. Wins over `--analyze-vendor` and the config. |
+| `--background` | off | The mode of the file-watcher daemon. The run does not rebuild a stale `compile_commands.json`, does not repair it, and prunes no registry rows. It builds only when the backend can build on its own. |
 | `--force` | off | Force re-index of all files, embeddings, LLM analysis, overrides, PageRank, and hotspot cache (skips the hash checks) |
 | `--variant NAME` | all variants | Restrict indexing to one build variant (name from `[[build.variants]]`) |
 | `--variants A,B` | all variants | Comma-separated list of build variants to index |
@@ -299,6 +304,8 @@ builds compile is in the index of each, thus a sum counts it two times.
 whose schema or row format is old, or whose compile_commands.json of a
 build changed. `fw-context status` gives each reason, also a checkout, a
 failed run and modified files. `INDEXED` is the time of the newest build.
+`fw-context list -v` adds a line below each project with the path of its
+index database (`db=…`).
 
 ### `fw-context db`
 
@@ -322,6 +329,9 @@ description:
   read, the newest completed row of that `(variant, image)` pair.
 - `indexing`: a row that an index run writes, or that a stopped run left.
 - `older row`: an older row of a pair, which an interrupted run left.
+
+The row shows the first 12 characters of its `config_hash`.
+`fw-context db list -v` shows the full hash of 64 characters.
 
 ```bash
 $ fw-context db list
@@ -426,18 +436,46 @@ fw-context init --skip-build            # skip compile_commands.json generation
 fw-context init --non-interactive       # disable prompts (CI/pipe)
 fw-context init --name NAME             # project name in the global registry
 fw-context init --no-prune              # keep the stale global-registry rows
+fw-context init --scope global          # write the global instruction files
+fw-context init --instructions-only     # write the instructions, skip MCP registration
 ```
+
+`--scope {all,global,project}` selects the instruction files, the skills
+and the agents that `fw-context init` writes. The default is `project`:
+only the files of the current project. `global` writes only the files in
+your home directory, and `all` writes the two. Without `--tool`, the scope
+also selects the AI tools: `global` takes the tools that fw-context
+detects on the machine, `project` and `all` also take the tools that the
+project uses.
+
+`--instructions-only` writes the instructions, and does not register the
+MCP server.
 
 `fw-context init` runs these steps, in order:
 
-1. **Project ID** — generate the ID and register the project globally.
-2. **Dependencies** — audit and auto-fix fixable issues, such as missing
+1. **Dependencies** — audit and auto-fix fixable issues, such as missing
    pip packages. Model pulls (`ollama pull`) never run in this step.
-3. **Build** — detect the build system and generate
-   `compile_commands.json` when the project is buildable.
-4. **AI tools** — register the MCP server and inject instructions, skills,
-   and agents.
-5. **Checklist** — print the remaining manual steps, grouped by category.
+   `fw-context init` never removes a config value: only
+   `fw-context doctor --fix --only config`, or a full
+   `fw-context doctor --fix`, does that. `--skip-doctor` skips this step.
+2. **Build system** — detect the build system and its parameters, or ask
+   for a missing value (see the interactive fallback below).
+3. **Project ID** — generate the ID, and register the project in the
+   global registry.
+4. **Build environment** — detect the environment that the build needs on
+   this machine, and write it to `.fw-context/local.toml`.
+5. **Config files** — create the global config, `.fw-context/config.toml`
+   and `.fw-context/local.toml` from their templates, or add the options
+   that a file does not have.
+6. **Build** — generate `compile_commands.json` when the project is
+   buildable. A project of several variants builds with
+   `fw-context index --build`.
+7. **AI tools** — register the MCP server and inject the instructions.
+8. **Project files** — add the `.gitignore` entries, and install the
+   skills and the agents.
+9. **LLM** — configure the LLM backend (see the LLM step below).
+10. **Embedding model** — detect the embedding model, and save it one time.
+11. **Checklist** — print the remaining manual steps, grouped by category.
 
 **Interactive fallback.** When build-system detection fails (no project
 markers, no board, no FQBN), `fw-context init` asks for the missing value.
@@ -445,17 +483,51 @@ Each prompt has a default; press Enter to accept it. The answers are
 written to `.fw-context/config.toml`. In a pipe, or with
 `--non-interactive`, the missing value goes to the checklist instead.
 
-The command is idempotent. Re-running it asks `Change? [y/N]` for each
-configured value, so you can press Enter to keep the current setup.
+The command is idempotent. A second run asks `Change? [y/N]` for each
+value of the build that the project config sets (the build system and its
+parameters), and for an LLM backend that a project file sets. Press Enter
+to keep the current value.
 
-`--quick` skips only step 4 (AI tool registration). It still creates the
-project ID, the config files, the `.gitignore` entries, and runs the
-dependency audit, the build, and the checklist.
+**The LLM step.** The step tells where the LLM backend comes from, and
+then shows a menu. Option 3 sets `[llm] analyze_symbols = false` in
+`.fw-context/local.toml`: the LLM analysis stops, and the embeddings
+stay. The other options depend on the file that sets the backend:
 
-| Tool | ID | Scope |
-|------|----|-------|
-| Claude Code | `claude-code` | global (`~/.claude/`) |
-| OpenCode | `opencode` | global (`~/.config/opencode/`) |
+- Only the global config sets it: option 0 "Use the global settings" is
+  the default (Enter), and writes nothing.
+- `.fw-context/local.toml` sets it: the step asks `Change? [y/N]`. When
+  the global config also sets it, option 0 after `y` removes the `[llm]`
+  backend keys from `.fw-context/local.toml`, and the global settings
+  then apply. Enter keeps the keys.
+- `.fw-context/config.toml` sets it: the step asks `Change? [y/N]`, and
+  the menu has no option 0.
+- No file sets it: Enter skips the step.
+
+In non-interactive mode, the LLM step writes nothing. When only the global
+config sets the backend, the step prints the settings. When no file sets
+it, the step prints how to configure it.
+
+**The embedding model.** When no config file sets `[llm] embed_model`,
+fw-context detects the model from the hardware. Step 10 saves that name
+one time to the global config, thus a later detection cannot select a
+different model. Nothing is saved when the LLM is off.
+
+`--quick` skips step 7, and the skills and the agents of step 8. It still
+creates the project ID, the config files, the `.gitignore` entries, and
+runs the dependency audit, the build, and the checklist.
+
+| Tool | ID | MCP registration (global) | Instructions, `--scope project` | Instructions, `--scope global` |
+|------|----|---------------------------|---------------------------------|--------------------------------|
+| Claude Code | `claude-code` | `claude mcp add --scope user` | `CLAUDE.md` | `~/.claude/CLAUDE.md` |
+| OpenCode | `opencode` | `~/.config/opencode/opencode.json` | `AGENTS.md` | `~/.config/opencode/rules/fw-context.md` |
+| Kilo Code | `kilocode` | `~/.config/kilo/kilo.json` | `AGENTS.md` | `~/.kilo/rules/fw-context.md` |
+| Codex | `codex` | `codex mcp add` | `.codex/rules/fw-context.md` | `~/.codex/rules/fw-context.md` |
+| Cursor | `cursor` | `~/.cursor/mcp.json` | `.cursor/rules/fw-context.mdc` | `~/.cursor/rules/fw-context.mdc` |
+
+The MCP registration is global for each tool, and does not change with
+`--scope`. Kilo Code inherits from OpenCode: when fw-context detects
+OpenCode, it skips Kilo Code. Only `--tool kilocode --force` sets up Kilo
+Code then.
 
 A separate instruction file that fw-context owns (`.codex`, `.cursor`)
 carries section markers. A later run updates the text between the markers
@@ -700,45 +772,66 @@ more time.
 
 ### `fw-context doctor`
 
-Audit the installation: check dependencies, file permissions, database
-integrity, and configuration. This command reports issues, and can
-attempt automatic repairs.
+Audit the installation: check dependencies, database integrity, disk
+space, and configuration. This command reports issues, and can attempt
+automatic repairs.
 
 ```bash
 fw-context doctor                    # audit, report issues
 fw-context doctor --fix              # audit and attempt repair
 fw-context doctor --json             # machine-readable JSON output
 fw-context doctor --project /path    # audit specific project
+fw-context doctor --only clang-resource,disk-space   # run only these checks
+fw-context doctor --fix --only config                # repair only the config files
 ```
 
-`fw-context doctor` checks:
+`--only NAMES` takes a comma-separated list of the check names below. An
+unknown name stops the command with exit code 2. `--fix --only <names>`
+without `config` does not repair the config files.
 
-- The Python version and required packages
-- The `tomli-w` package, which writes the config files
-- The Ollama installation and model availability
-- The libclang shared library and its version
-- The SQLite version and FTS5 support
-- Index database integrity and schema compatibility
-- Configuration file syntax and value types. The check `config` names a
-  config file that cannot be read, or that is not UTF-8 or not valid
-  TOML. It also lists each value that fw-context cannot use: a value of
-  the wrong type, a section that is not a table, a variant without a
-  name, a URL that is not valid. See
-  [A config file that fw-context cannot use](configuration.md#a-config-file-that-fw-context-cannot-use).
-  `--fix` removes each such value. Then the value of a lower file, or
-  the default, applies. Use
-  `--fix --only config` to do only this fix: a full `--fix` can also pull
-  a missing model. The checks
-  that read the config (Ollama, the models, the database and the disk)
-  are `skipped` while the config does not load. After `--fix` repairs
-  the config, they run. A value that fw-context did not use, because a
-  lower file or the default applies (a timeout or a switch, for
-  example), makes the check `degraded` and not critical: the other checks
-  run. When `--only` names one of these checks and the
-  config does not load, the command also gives the check `config`.
-- File permissions for the index directory and config files
-- The files, directories and config keys of an older fw-context
-  (`obsolete-files`). `--fix` removes them.
+`fw-context doctor` runs these checks, in this order:
+
+- `pysqlite3` — the `pysqlite3` package is installed, and the `sqlite3`
+  redirect of fw-context is active.
+- `sqlite-ext` — SQLite can load extensions (`enable_load_extension()`).
+- `sqlite-vec` — the `sqlite-vec` extension loads into SQLite.
+- `libclang-python` — the clang Python bindings are installed, version
+  18.1.1 or later.
+- `libclang-so` — fw-context finds the native libclang shared library,
+  and the library loads.
+- `clang-resource` — the clang compiler headers of the libclang major
+  version are there. Not critical: without them, some GCC headers do not
+  parse, and the index holds the errors.
+- `watchfiles` — the `watchfiles` package is installed. The background
+  file watcher needs it.
+- `tomli-w` — the `tomli-w` package is installed. `fw-context init` needs
+  it to write the config files.
+- `config` — the config files load (see below).
+- `ollama` — the Ollama server answers. `skipped` when the LLM is off.
+- `chat-model` — the chat model is installed on the Ollama server of the
+  chat calls. `skipped` when an OpenAI-compatible API runs the chat model.
+- `embed-model` — the embedding model is installed on the Ollama server.
+- `db-integrity` — `PRAGMA quick_check` of the index database. When it
+  finds damage, the check runs `PRAGMA integrity_check`.
+- `obsolete-files` — the files, directories and config keys of an older
+  fw-context. `--fix` removes them.
+- `disk-space` — the free space on the disk of the index. Less than
+  512 MB makes the check `degraded`, less than 128 MB makes it an error.
+
+The check `config` names a config file that cannot be read, or that is
+not UTF-8 or not valid TOML. It also lists each value that fw-context
+cannot use: a value of the wrong type, a section that is not a table, a
+variant without a name, a URL that is not valid. See
+[A config file that fw-context cannot use](configuration.md#a-config-file-that-fw-context-cannot-use).
+`--fix` removes each such value. Then the value of a lower file, or the
+default, applies. Use `--fix --only config` to do only this fix: a full
+`--fix` can also pull a missing model. The checks that read the config
+(Ollama, the models, the database and the disk) are `skipped` while the
+config does not load. After `--fix` repairs the config, they run. A value
+that fw-context did not use, because a lower file or the default applies
+(a timeout or a switch, for example), makes the check `degraded` and not
+critical: the other checks run. When `--only` names one of these checks
+and the config does not load, the command also gives the check `config`.
 
 When you run this command with `--fix`, it attempts to repair fixable
 issues automatically. The command reports issues that it cannot fix, and
@@ -855,14 +948,15 @@ request itself.
 
 ## MCP tools
 
-Your AI assistant calls these tools over JSON-RPC. Each tool opens the
-database, runs its query, and closes the database. These tools use no
-persistent connections.
+Your AI assistant calls these tools over JSON-RPC. The MCP server keeps
+one connection to each index database for the life of the process. A lock
+lets one query at a time use that connection.
 
-All tools accept an optional `project_root` parameter, which defaults to a
-value that fw-context detects automatically from the current working
-directory. Every input block below shows this parameter, but you typically
-omit it, because the automatic detection handles the common case.
+Each tool except `get_project_info` accepts an optional `project_root`
+parameter, which defaults to a value that fw-context detects automatically
+from the current working directory. Every input block below shows this
+parameter, but you typically omit it, because the automatic detection
+handles the common case. `get_project_info` takes only `project_id`.
 
 **A question about a different project.** Every tool answers about one
 project. To ask about a project that is not the project of the current
@@ -870,7 +964,8 @@ directory, give the `project` parameter — the `name` or the `project_id`
 that `list_projects` shows. It is an alternative to `project_root`, which
 takes the root path. Give one of the two, not both. The `project`
 parameter must go on each call, `get_project_status` included, because
-fw-context keeps no session state.
+fw-context keeps no session state. The exception is `get_project_info`,
+which takes no `project` and no `project_root`.
 
 ```
 list_projects   →  {"name": "boot-loader", "project_id": "<32 hex chars>", "root_path": "/…/boot-loader"}
@@ -1127,8 +1222,8 @@ scope. Use `search_content` for those.
 
 **The stored text is ifdef-filtered.** A line of an inactive `#if` branch
 is blank in the stored body, and line numbers do not move. An empty
-result can thus mean that the pattern is only in a dead branch: the active
-build does not compile it.
+result can thus mean that the pattern is only in a dead branch: the build
+of the query does not compile it.
 
 ```
 Input:  {"query": "attach", "project_root?": "/path/to/project", "kind?": "function", "limit?": 20, "offset?": 0, "project_only?": true}
@@ -1191,7 +1286,7 @@ Find patterns in **full file content** — the whole file, and not only the
 text that belongs to a definition.
 
 Searches **ifdef-filtered** file text: only the code that actually
-compiles for the current build configuration. fw-context replaces an
+compiles for the build of the query. fw-context replaces an
 inactive `#ifdef` branch with blank lines, and keeps the original line
 numbers. Comments and preprocessor directives stay: an include guard, a
 `#define`, and a block comment with its closing marker. A blank line is
@@ -1394,8 +1489,9 @@ When the embedding search finds no match above `threshold`, the tool runs
 the lexical fallback below, with a `warning` that suggests a lower
 threshold. When a phase of the search failed, that `warning` gives the
 error of the phase. One dict with `error` means that the query failed.
-When compile_commands.json changed after the last index run, a trailing
-dict holds a `warning` and a `hint`.
+When the index of the build is not current, a leading row holds a
+`warning` and `index_state` (see
+[The state of the index](#the-state-of-the-index)).
 
 **Threshold guidance** (mxbai-embed-large):
 - `0.50` — exploratory, more results
@@ -1788,7 +1884,7 @@ index, thus a stale result can hold an incomplete list.
 #### `read_file`
 
 Read a source file, one page at a time, with ifdef-filtered content —
-only code that actually compiles for the current build configuration.
+only code that actually compiles for the build of the query.
 fw-context replaces an inactive `#ifdef` branch with blank lines, and
 keeps the original line numbers.
 
@@ -2499,6 +2595,10 @@ run is active, `reindex_progress` holds the newest
 progress or error line that fw-context wrote for that run. fw-context
 skips the output of the build tools in the same log.
 
+**`vec_available`** is `true` when the `sqlite-vec` extension loads into
+SQLite in this server process. When it is `false`, `vec_error` (a string)
+holds the reason. `vec_error` is not there when the extension loads.
+
 **`builds`** lists every build of the index, one entry for each
 `(variant, image)` pair: `{variant, image, board, symbol_count,
 file_count, indexed_at, status, reindex_state, reindex_needed, stale,
@@ -2523,10 +2623,13 @@ command}`, and `command` is `fw-context index --build --variant <name>`.
 No query reaches such a variant until you run the command.
 
 **One build or several builds.** A project of one build also gets the
-fields of that build at the top level: `indexed_at`, `first_indexed_at`,
-`symbol_count`, `file_count`, `reference_count`, `modified_files_count`,
-`header_affected_tus`, `manifest_verification`, `analysis`, and
-`description`. A project of several builds gets no sums, because a file
+fields of that build at the top level: `status`, `reindex_state`,
+`reindex_needed`, `reindex_reasons`, `stale`, `indexed_at`,
+`first_indexed_at`, `symbol_count`, `file_count`, `reference_count`,
+`modified_files_count`, `header_affected_tus`, `manifest_verification`,
+`analysis`, and `description`. A project of several builds gets
+`status`, `reindex_needed`, `reindex_reasons`, and `stale` of the project
+at the top level, and no `reindex_state`. It gets no sums, because a file
 that two images compile is in the index of each. The counts of each build
 are in `builds`. `reference_count`, `analysis`, `description`, and
 `first_indexed_at` of one build are in `get_build_info`.
@@ -2842,8 +2945,11 @@ no selector.
 The health fields (`status`, `reindex_state`, `reindex_needed`, `reindex_reasons`,
 `index_message`, `modified_files_count`, and the others) have the meaning
 that [`get_project_status`](#get_project_status) gives them, for this
-build only. The version fields (`update_notice`, and a restart after an
-upgrade) are in `get_project_status`. A refusal of the selector, or an
+build only. When the index of this build holds a NEWER row format than
+this server process reads, the result also holds
+`client_restart_required` and `client_restart_reason`, as in
+`get_project_status`. `update_notice`, and a restart after an upgrade of
+fw-context, are only in `get_project_status`. A refusal of the selector, or an
 index with no build config, gives a dict that holds only `error`. A
 database that fw-context cannot read makes the call fail, as in
 `get_project_status`. A project that is not initialized, that has no

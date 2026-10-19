@@ -286,15 +286,15 @@ _PROJECT_DEFAULTS_TEMPLATE = """\
 # index_embeddings = false
 
 [call_graph]
-# dispatch_bridges: map dispatch-registration APIs to their event-loop
-#   entry points for call-path tracing through async dispatch
-#   (EventQueue, work queues, thread starts, timers).
-#   Built-in defaults cover mbed-os, Zephyr, FreeRTOS.
-#   Add custom bridges for other RTOS/dispatch frameworks here.
+# dispatch_bridges: map a registration API to its dispatch entry point
+#   (EventQueue, work queues, thread starts, timers). The call graph gets
+#   an edge from the entry point to each callback of the API.
+#   The built-in list covers Mbed OS, Zephyr, FreeRTOS, ESP-IDF and the
+#   STM32 HAL. An entry can only change the entry point of an API of the
+#   built-in list: the indexer records the calls of these APIs only.
 #
 # [call_graph.dispatch_bridges]
-# "my_rtos::Task::start" = "my_rtos::Task::_thread_entry"
-# "my_rtos::Timer::attach" = "my_rtos::Timer::_on_timeout"
+# "events::EventQueue::call_every" = "my_app::event_loop"
 
 # LLM and local-path settings belong in local.toml (gitignored).
 # See local.toml for ollama_url, model, db_dir, etc.

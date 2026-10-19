@@ -217,7 +217,7 @@ Traditional approach: `read file.cpp offset=100 limit=200` — you have to **gue
 
 ### 6.3 Ifdef-Filtered Content
 
-The project has `#ifdef TARGET_BOARD_V2_BOARD` / `#ifdef TARGET_BOARD_V1_BOARD` (historically). Traditional `read`/`grep` would show **all branches**, including dead code for BOARD_V1. The LLM would analyze code that never compiles. fw-context `search_content` and `get_source` show **only what actually compiles** for the active build configuration.
+The project has `#ifdef TARGET_BOARD_V2_BOARD` / `#ifdef TARGET_BOARD_V1_BOARD` (historically). Traditional `read`/`grep` would show **all branches**, including dead code for BOARD_V1. The LLM would analyze code that never compiles. fw-context `search_content` and `get_source` show **only what actually compiles** for the build of the query.
 
 ### 6.4 Automatic Deduplication
 

@@ -35,19 +35,31 @@ fw-context init
 
 ## Index your first project
 
-Go to your firmware project. Then choose one of two options.
+Go to your firmware project. Then choose one of these options.
 
-To build and index the project automatically, run:
+To do a clean build of the project and index it, run:
 
 ``` bash
 fw-context index --build
 ```
 
-To reuse an existing `compile_commands.json` file, run:
+To index a project that fw-context can build, run:
 
 ``` bash
 fw-context index
 ```
+
+This run reads `.fw-context/build/<variant>/out/compile_commands.json`.
+When the build is not there, the run builds the project first.
+
+To index an existing `compile_commands.json` file, give its path:
+
+``` bash
+fw-context index path/to/compile_commands.json
+```
+
+You can also set the path in `[index] compile_commands`. fw-context then
+runs no build. For the details, see [Build Configuration](build.md#automatic-build).
 
 The index is persistent and incremental. After the first indexing run, fw-context reprocesses only the translation units that changed.
 

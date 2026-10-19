@@ -1,6 +1,6 @@
 # Configuration
 
-This document is the complete reference for `.fw-context/config.toml` and `.fw-context/local.toml`. This document lists the global defaults, the shared project settings, the local developer overrides, and every available setting.
+This document is the complete reference for `.fw-context/config.toml` and `.fw-context/local.toml`. This document lists the global defaults, the shared project settings, the local developer overrides, and every available setting. The `[build]` keys of each build system are in [Build Configuration](build.md#configuration-reference).
 
 ## How config works
 
@@ -30,6 +30,8 @@ The LLM step of `fw-context init` tells which file selects the LLM backend. The 
 - Only the global config sets them: the step shows the global values, and option 0 "Use the global settings" is the default (Enter). It writes nothing.
 - `local.toml` sets them: the step asks "Change? [y/N]". In the menu, option 0 removes these keys from `local.toml`, and the global settings then apply. Enter keeps the keys.
 - `config.toml` sets them: the menu has no option 0, because `init` writes only `local.toml`, and a committed setting applies to each developer.
+
+Option 3 "Disable the LLM analysis" writes `[llm] analyze_symbols = false` to `local.toml`. The embeddings and the chat of `smart_search` stay. To turn off the embeddings too, set `[llm] enabled = false`.
 
 Option 1 (local Ollama) gives the models that a config file sets as the defaults of its prompts, thus Enter keeps them. Without such a file, the defaults are the recommended models. The chat model of a cloud API (`chat_api_base`) is not a default, because it is not a model of Ollama.
 
@@ -62,13 +64,13 @@ An older form of a value still works: a string that holds a number (`num_ctx = "
 
 ### `[build]` — Build system
 
-This section controls how `fw-context index` generates `compile_commands.json`. fw-context uses this section only when you run `fw-context index --build`, or when `compile_commands.json` does not yet exist.
+This section controls how `fw-context index` generates `compile_commands.json`. fw-context uses this section when a run builds: with `fw-context index --build`, and when a run builds on its own, for example when the build is not there. For the full list of cases, see [Automatic build](build.md#automatic-build).
 
 > **Incremental is the default.** `fw-context index` reuses an existing `compile_commands.json` file whenever possible. Use `fw-context index --build` to force a clean build. A clean build also forces a full re-index.
 
 | Key | Default | Scope | Description |
 |-----|---------|-------|-------------|
-| `system` | *(auto-detect)* | project | The build system: `"mbed-os"`, `"zephyr"`, or `"platformio"`. fw-context detects this automatically from project markers, such as `west.yml`, `.mbed`, or `platformio.ini`. |
+| `system` | *(auto-detect)* | project | The build system: `"mbed-os"`, `"zephyr"`, `"platformio"`, `"esp-idf"`, `"arduino"`, `"cmake"`, `"keil-mdk"`, `"iar-ewarm"`, `"makefile"`, `"bare"`, `"stm32cubeide"` or `"ti-ccs"`. fw-context detects this automatically from project markers, such as `west.yml`, `.mbed`, or `platformio.ini`. For each build system, see [Build Configuration](build.md#configuration-reference). |
 | `clean` | `true` | project | Always run a clean build before fw-context generates `compile_commands.json`. **Recommended.** A clean build ensures a complete `compile_commands.json` file. Set this key to `false`, or use `--no-clean`, for incremental builds. Note: a clean build always forces a full re-index. |
 | `command` | *(none)* | project | A full override for the build command. This key bypasses all automatic detection. Example: `"bear -- make -j4"`. |
 | `timeout` | `7200` | project | The build timeout, in seconds. Long first builds (Zephyr, ESP-IDF) must not fail at the previous 600 s limit. |
@@ -161,6 +163,10 @@ and multi-image builds](build.md).
 | `project_paths` | `[]` | project | Manual project directory patterns. These patterns override automatic detection. A path that matches one of these patterns gets `is_project=1`. Use this key for vendored code that your team maintains, for example `["src/old_hal"]`. For a path outside the project root, use an absolute path, for example `["/home/user/esp/components/muj_fork"]`. |
 | `index_refs` | `true` | project | Build the cross-reference and call graph data. This key is on by default, and it enables tools such as `find_callers`, `find_call_path`, and `find_dead_code`. Set this key to `false`, or pass `--no-refs`, for faster indexing on very large projects. |
 | `index_embeddings` | `true` | project | Generate vector embeddings during indexing. An Ollama `embed_model` requires Ollama; a sentence-transformers or `ft://` model runs locally. The embeddings power semantic search and hybrid FTS5+vector re-ranking. Disable this key with `false`, or with `--no-embeddings`. |
+| `config_header` | `""` *(none)* | project | The path to a configuration header that the build generates (for example `config.h`), relative to the project root. fw-context adds `-include <file>` to each translation unit. Use this key for a build system that does not put `-include` into `compile_commands.json`. A missing file stops `fw-context index` with an error. |
+| `rerank_top_k` | `50` | global, local | The number of rows at the top of each `semantic_search` page that `[llm] reranker_model` scores again. Without `reranker_model`, this key has no effect. |
+| `min_dense_count` | `3` | project | The minimum number of embedding results for a `smart_search` ranking from the embeddings only. With fewer results, `smart_search` uses the FTS5 results. A value below 1 counts as 1. |
+| `purge_max_missing_percent` | `20` | project | A limit for the removal of files from the index. When more than this percent of the indexed files are missing from disk, or are outside the build, `fw-context index` removes none of them and logs a warning. This limit protects the index from a network mount that is offline, or from a wrong project root. |
 | `max_symbol_body_lines` | `1000` | project | The maximum number of lines of one symbol body that `get_source` and `get_symbol_context` return. The index stores the whole body. The value of the project of the query applies. A body that a cap cut carries `_source_truncated`. |
 | `transient_defines` | `["MBED_BUILD_TIMESTAMP", "BUILD_TIMESTAMP", "BUILD_TIME", "BUILD_DATE", "BUILD_ID", "BUILD_NUMBER"]` | global, project, local | The names of the `-D` macros whose value makes each build unique, for example a build time or a build counter. When fw-context compares two builds, it ignores these macros: in the identity of the build (`config_hash`) and in the flags of each translation unit. Thus a new build that changes only such a value parses no file again. Mbed OS writes the time of the build into `MBED_BUILD_TIMESTAMP` on each unit. Write names only (`NAME`, not `-DNAME` or `NAME=1`). A project list replaces the global list, and `[]` makes every macro count. Remove a name that your code reads in an `#if`, because then a new value must change the index. A change of the list can change `config_hash` and start a full reindex. An entry that is not a macro name, or the key in a `[[build.variants]]` table, stops `fw-context index` with an error. |
 
@@ -178,11 +184,12 @@ Put these settings in `~/.fw-context/config.toml` for global defaults, or in `<p
 
 | Key | Default | Scope | Description |
 |-----|---------|-------|-------------|
-| `enabled` | `true` | global, local | Enable Ollama. When this key is `false`, `smart_search` falls back to word-split FTS5. Also, `explain_symbol` returns the source code and a prompt for the AI assistant. |
+| `enabled` | `true` | global, local | Enable Ollama. When this key is `false`, `smart_search` falls back to word-split FTS5. Also, `explain_symbol` returns the source code and a prompt for the AI assistant. `fw-context index` then skips the embeddings and the symbol analysis, also for a sentence-transformers `embed_model`. To keep the embeddings and skip only the analysis, set `analyze_symbols = false`. |
 | `ollama_url` | `"http://localhost:11434"` | global, local | The base URL for the Ollama API. Change this key for a remote GPU server. |
 | `model` | `"qwen2.5-coder:14b"` | global, local | The LLM model tag. Override this key for each project, to use a different model for different codebases. |
 | `embed_model` | `""` *(auto-detect)* | global, local | The embedding model for vector search. Empty: fw-context selects `qwen3-embedding:8b` on a machine with a GPU (about 4.7 GB of VRAM, 4096-dimension vectors), and `qwen3-embedding:0.6b` without one. A name with the prefix `BAAI/`, `ibm-granite/`, `lightonai/`, `cross-encoder/` or `sentence-transformers/` uses sentence-transformers (requires the `st` extra); `ft://` selects a fine-tuned local model; any other name is an Ollama model. When `auto_pull` is `true`, fw-context pulls an Ollama model automatically on first use; otherwise pull it manually. A change of model invalidates the stored embeddings. |
 | `embed_query_prompt` | *(auto-detect)* | global, local | An instruction that fw-context adds before the query text, before it creates the embedding. fw-context detects this instruction automatically from the model name prefix: for `mxbai-*`, fw-context uses `"Represent this sentence for searching relevant passages: "`; for `qwen3-embedding*`, fw-context uses a code-retrieval instruction. Set this key explicitly to override the default, or set it to `""` to disable it. |
+| `embed_dim` | *(none)* | global, local | The dimension of the stored vectors, for a sentence-transformers or `ft://` model with Matryoshka training. When the value is smaller than the dimension of the model, fw-context cuts each vector to this size and normalizes it again. An Ollama model ignores this key. A negative value means "not set". |
 | `embed_doc_prompt` | *(empty)* | global, local | An instruction that fw-context adds before symbol descriptions during indexing. Most models work best with an empty prompt. Set this key only when the model's training expects a per-document instruction. |
 | `auto_pull` | `false` | global, local | When `true`, fw-context pulls a model automatically from the Ollama registry when it is not installed. When `false` (default), you must pull each model explicitly. Set this key to `false` for offline or intranet environments. |
 | `num_ctx` | `16384` | global, local | The context window, in tokens. This size allows full function bodies during analysis generation. |
@@ -190,6 +197,7 @@ Put these settings in `~/.fw-context/config.toml` for global defaults, or in `<p
 | `timeout` | `600.0` | global, local | The HTTP request timeout, in seconds, for Ollama API calls. Embed requests use `timeout × 2`. |
 | `reranker_model` | *(none)* | global, local | A cross-encoder model for search result reranking. Example: `"cross-encoder/ms-marco-MiniLM-L6-v2"`. When you set this key, fw-context rescors each result with the cross-encoder for higher precision. This key requires `sentence-transformers`. Default `None` — no reranking. |
 | `analyze_symbols` | `true` | global, local | Generate an LLM analysis for each symbol during indexing. This analysis includes a summary, the inputs, and the outputs. fw-context stores this analysis in the `llm_analysis` table, so you can search for symbols by purpose. |
+| `analyze_vendor` | `false` | global, local | When this key is `true`, the LLM analysis also includes the vendor and SDK code (for example `mbed-os/` or `zephyr/`). This can add hours to an index run. When `false`, the analysis includes only the project code. `fw-context index --analyze-vendor` and `--no-analyze-vendor` override this key. Without `analyze_symbols`, this key has no effect. |
 | `ollama_max_concurrent` | `1` | global, local | The maximum number of parallel Ollama HTTP calls per process. Increase this key to 2–4 for multi-client MCP transports, such as SSE or streamable, where embedding requests (~100 ms) can overlap. Keep this key low for chat requests, which use the GPU more. |
 | `chat_api_base` | *(none)* | global, local | A chat API URL for an OpenAI-compatible cloud or proxy endpoint. Examples: DeepSeek, LiteLLM, vLLM, llama.cpp. When you set this key, fw-context sends chat requests to this URL instead of the local Ollama instance. Default `None` — fw-context uses the local Ollama server. |
 | `chat_api_key` | *(none)* | global, local | A bearer token for the cloud or proxy chat API. Leave this key empty for endpoints that need no authentication. |
@@ -270,6 +278,19 @@ proxy, to prevent idle timeouts.
 | Key | Default | Scope | Description |
 |-----|---------|-------|-------------|
 | `name` | *(directory name)* | project | A readable project name. fw-context shows this name in `fw-context list` and in status output. |
+| `id` | *(none)* | project | The unique ID of the project (32 hexadecimal characters). `fw-context init` writes it to `config.toml`, thus git shares it with the team. Without an ID, the project is not initialized, and the index of the project is lost. |
+
+### `[call_graph]` — Dispatch bridges
+
+| Key | Default | Scope | Description |
+|-----|---------|-------|-------------|
+| `dispatch_bridges` | *(built-in list)* | project | A table that maps a registration API to its dispatch entry point, for example `events::EventQueue::call_every` to `events::EventQueue::dispatch_forever`. For each call of the API, the call graph gets an edge from the entry point to the callback that the call gives. The built-in list covers Mbed OS, Zephyr, FreeRTOS, ESP-IDF and the STM32 HAL. An entry can only change the entry point of an API of the built-in list: the indexer records the calls of these APIs only, thus a key that is not in the list gives no edge. fw-context reads this key only from `.fw-context/config.toml` of the project. |
+
+```toml
+[call_graph.dispatch_bridges]
+# The callbacks of call_every run in the thread of my_app::event_loop.
+"events::EventQueue::call_every" = "my_app::event_loop"
+```
 
 ### `[cache_server]` — Shared LLM Analysis Cache
 
@@ -407,7 +428,7 @@ name = "my-mbed-app"
 # defines = ["VERSION_FW_MAJOR=4", "DEV"]  # extra -D macros
 
 [index]
-compile_commands = "compile_commands.json"
+# compile_commands = "compile_commands.json"   # only for a build that fw-context cannot run
 # vendor_paths = ["third_party"]          # additional vendor dirs (additive to auto-detection)
 # project_paths = ["src/old_hal"]        # manual project dirs (overrides auto-detection)
 ```

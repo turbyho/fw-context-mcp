@@ -66,7 +66,7 @@ claude mcp add --scope user fw-context fw-context-mcp
 claude mcp add --scope user fw-context ~/.fw-context/.venv/bin/fw-context-mcp
 ```
 
-Run `fw-context init` to do this automatically. This command also adds usage instructions to `~/.claude/CLAUDE.md`.
+Run `fw-context init` to do this automatically. This command also adds usage instructions to `CLAUDE.md` of the project (the default `--scope project`). With `--scope global`, it writes them to `~/.claude/CLAUDE.md`. With `--scope all`, it writes them to the two files.
 
 ### OpenCode
 

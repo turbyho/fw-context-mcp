@@ -74,7 +74,7 @@ editable mode.
 
 **File watcher (auto-reindex on save):**
 
-The MCP server starts a background watcher daemon automatically. This daemon reindexes an edited source file within 500 ms after you save the file. This daemon regenerates the LLM analysis after 60 s of inactivity. You do not need separate configuration.
+The MCP server starts a background watcher daemon automatically. When you save a C/C++ file, this daemon waits 2 s for more changes. Then it starts `fw-context index --background`, which updates the index. A change of the checkout (another branch, a tag, or a commit on a detached HEAD) also starts such a run. You do not need separate configuration.
 
 ## Configure your project
 
@@ -245,7 +245,9 @@ the libclang token stream. This build system does not need `.d` files.
 | **cmake** | Build + compile_commands.json | `sudo pacman -S cmake` / `sudo apt install cmake` / `sudo dnf install cmake` / `brew install cmake` |
 
 Use this build system for any CMake project that is not Zephyr or ESP-IDF.
-`fw-context` runs `cmake -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON && cmake --build build`.
+`fw-context` runs `cmake -B <out> -DCMAKE_EXPORT_COMPILE_COMMANDS=ON && cmake --build <out>`.
+`<out>` is `.fw-context/build/<variant>/out`. With `[build] cmake_generator`,
+the configure step also gets `-G <generator>`.
 
 ### Makefile
 
@@ -367,8 +369,11 @@ Alternatives:
   `semantic_search` embeds the query locally too.
 - **No LLM.** Set `enabled = false` in `[llm]`. The LLM-calling tools then
   return raw prompts, and the AI assistant processes the results with its
-  own model. Set `[index] index_embeddings = false` to skip the embedding
-  pass.
+  own model. `fw-context index` then skips the embeddings and the symbol
+  analysis. This is also true for a sentence-transformers `embed_model`.
+- **Embeddings without the analysis.** Set `[llm] analyze_symbols = false`.
+  `fw-context index` then stores the embeddings and skips the symbol
+  analysis. `[index] index_embeddings = false` skips only the embeddings.
 
 ### Install Ollama
 
@@ -475,13 +480,29 @@ fw-context quickstart              # alias for `init --quick`
 **Provisioning:** `fw-context init` now does more than AI-tool setup. It
 runs these steps, in order:
 
-1. Generate the project ID and register the project globally.
-2. Audit the dependencies, and auto-fix what it can (missing pip packages).
-   Model pulls (`ollama pull`) never run here.
-3. Detect the build system and generate `compile_commands.json` when the
-   project is buildable.
-4. Register the AI tools (steps skipped by `--quick`).
-5. Print a checklist of the remaining manual steps.
+1. Audit the dependencies, and auto-fix what it can (missing pip packages).
+   Model pulls (`ollama pull`) never run here. `--skip-doctor` skips this
+   step. This step comes first, because the next steps write config files.
+2. Detect the build system and its parameters (for example the board).
+3. Generate the project ID when the config has none, and register the
+   project in the global project registry.
+4. Detect the build environment of this machine (`python`, `activate`,
+   `idf_path`), and write it to `local.toml`.
+5. Create a missing config file from its template, and add the missing
+   keys to an existing one: the global config, `.fw-context/config.toml`
+   and `.fw-context/local.toml`.
+6. Generate `compile_commands.json` when the project is buildable.
+   `--skip-build` skips this step, and so does a project of several variants.
+7. Register the AI tools (skipped by `--quick`).
+8. Update `.gitignore`, and install the skills and the agents (the two
+   skipped by `--quick`).
+9. Configure the LLM backend (the LLM step, see
+   [Configuration](configuration.md#how-config-works)). In a pipe, or with
+   `--non-interactive`, this step writes nothing.
+10. Save the detected embedding model one time to the global config. This
+    step writes nothing when a config file sets `[llm] embed_model`, or
+    when the LLM is off.
+11. Print a checklist of the remaining manual steps.
 
 When build-system detection fails, `fw-context init` asks for the missing
 value interactively (build system, board, FQBN, and so on). In a pipe, or
