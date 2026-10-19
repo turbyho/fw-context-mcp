@@ -3217,6 +3217,24 @@ def _reindex_builds(
     return [build for build in builds if build["config_hash"] == config_hash], None
 
 
+def _clear_embedding_stash(conn: sqlite3.Connection, db_dir: Path) -> None:
+    """Empty the stash of re-parsed embeddings (indexer/db/_embeddings.py).
+
+    A lock timeout does not fail the call: the stash rows stay, and the
+    next index run or reindex_file empties the stash at its start.  The key
+    of the stash holds the content hash, thus an old row cannot give a new
+    symbol a wrong vector.
+    """
+    from ...indexer.db import clear_embedding_stash
+    from ...indexer.db import write_lock as db_write_lock
+
+    try:
+        with db_write_lock(db_dir, timeout=60.0), transaction(conn):
+            clear_embedding_stash(conn)
+    except WriteLockTimeout as e:
+        log.warning("reindex_file: the embedding stash stays until the next run: %s", e)
+
+
 def _reindex_one_build(
     conn: sqlite3.Connection,
     config_hash: str,
@@ -3275,6 +3293,8 @@ def _reindex_one_build(
         frozenset(symbols_without_embedding(conn, config_hash))
         if with_analysis and cfg.llm.enabled else frozenset()
     )
+    # The rows of a call or a run that stopped: this re-parse stashes its own.
+    _clear_embedding_stash(conn, db_path.parent)
     total_symbols, result = _reindex_parse_and_store(
         conn, matching, cfg_data, cfg.index.index_refs,
         root, db_path, target, vendor_patterns, project_patterns_list,
@@ -3290,14 +3310,19 @@ def _reindex_one_build(
     if coverage_warning:
         result["warning"] = coverage_warning
 
-    _reindex_graph_phases(conn, config_hash, cfg, total_symbols, db_path.parent, result)
-    if not with_analysis:
-        return result
-
-    return _reindex_post_write_phases(
-        conn, config_hash, cfg, total_symbols, db_path.parent,
-        target, result, root, missing_before=missing_before,
-    )
+    try:
+        _reindex_graph_phases(conn, config_hash, cfg, total_symbols, db_path.parent, result)
+        if not with_analysis:
+            return result
+        return _reindex_post_write_phases(
+            conn, config_hash, cfg, total_symbols, db_path.parent,
+            target, result, root, missing_before=missing_before,
+        )
+    finally:
+        # The re-parse stashed the embeddings of the symbols that it wrote
+        # again, for the embedding step above (indexer/db/_embeddings.py).
+        # That step is over, or it did not run.
+        _clear_embedding_stash(conn, db_path.parent)
 
 
 def _reindex_answer(

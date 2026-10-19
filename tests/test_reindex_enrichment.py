@@ -129,6 +129,122 @@ def _remove_embedding(db_path: Path, name: str) -> None:
         conn.close()
 
 
+class _CountingEmbedder(_FakeEmbedder):
+    """The fake embedder, and the texts that the step gave to it."""
+
+    def __init__(self):
+        self.texts: list[str] = []
+
+    def embed_documents(self, texts):
+        self.texts.extend(texts)
+        return super().embed_documents(texts)
+
+
+def test_an_index_run_embeds_only_the_symbols_whose_text_changed(one_build, monkeypatch):
+    """The re-parse of main.c writes step_one, step_two and util_clamp again.
+
+    Their text did not change, thus their vectors come back from the stash,
+    and the model gets the text of the new function only.  Before the stash,
+    the model got each of the four.
+    """
+    from fw_context_mcp.config.settings import LLMConfig
+    from fw_context_mcp.indexer import _embedding
+    from fw_context_mcp.indexer.runner import run
+
+    root, db_path = one_build
+    counting = _CountingEmbedder()
+    monkeypatch.setattr(_embedding, "get_embedder", lambda cfg: counting)
+    main_c = root / "src" / "main.c"
+    main_c.write_text(main_c.read_text(encoding="utf-8") + "int step_three(int v) { return v; }\n", encoding="utf-8")
+
+    run(
+        compile_commands=root / "compile_commands.json", db_path=db_path, project_root=root,
+        project_id=PROJECT_ID, index_refs=True, index_embeddings=True, analyze_symbols=False,
+        analyze_overrides=False, llm_config=LLMConfig(embed_model="fake-embedder", analyze_symbols=False),
+    )
+
+    # The description starts with "<kind> <name>, ..." (_rebuild_desc_rows).
+    assert [text.split(",", 1)[0] for text in counting.texts] == ["function step_three"]
+    # By name: step_three sorts before step_two.
+    assert _embedded(db_path) == [*ALL_EMBEDDED[:2], ("step_three", True), *ALL_EMBEDDED[2:]]
+    from fw_context_mcp.indexer.db import open_db
+
+    conn = open_db(db_path, skip_integrity_check=True)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM embedding_stash").fetchone()[0] == 0, "the run empties the stash"
+    finally:
+        conn.close()
+
+
+def _stash_rows(db_path: Path) -> int:
+    from fw_context_mcp.indexer.db import open_db
+
+    conn = open_db(db_path, skip_integrity_check=True)
+    try:
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'embedding_stash'"
+        ).fetchone()
+        return conn.execute("SELECT COUNT(*) FROM embedding_stash").fetchone()[0] if exists else 0
+    finally:
+        conn.close()
+
+
+def test_a_forced_run_embeds_each_symbol_again(one_build, monkeypatch):
+    """``--force`` promises new embeddings; the stash of its re-parse must not serve."""
+    from fw_context_mcp.config.settings import LLMConfig
+    from fw_context_mcp.indexer import _embedding
+    from fw_context_mcp.indexer.runner import run
+
+    root, db_path = one_build
+    counting = _CountingEmbedder()
+    monkeypatch.setattr(_embedding, "get_embedder", lambda cfg: counting)
+
+    run(
+        compile_commands=root / "compile_commands.json", db_path=db_path, project_root=root,
+        project_id=PROJECT_ID, index_refs=True, index_embeddings=True, analyze_symbols=False,
+        analyze_overrides=False, force=True,
+        llm_config=LLMConfig(embed_model="fake-embedder", analyze_symbols=False),
+    )
+
+    assert sorted(text.split(",", 1)[0] for text in counting.texts) == [
+        "function helper_a", "function step_one", "function step_two", "function util_clamp",
+    ]
+    assert _stash_rows(db_path) == 0
+
+
+@pytest.mark.parametrize("with_analysis", [True, False])
+def test_reindex_file_takes_the_stash_and_empties_it(one_build, monkeypatch, with_analysis):
+    """The re-parse of main.c writes three unchanged definitions again: no model call.
+
+    A row that a stopped run left in the stash goes at the start of the call.
+    """
+    from fw_context_mcp.indexer import _embedding
+    from fw_context_mcp.indexer.db import open_db
+    from fw_context_mcp.mcp.handlers.maintenance import reindex_file
+
+    root, db_path = one_build
+    counting = _CountingEmbedder()
+    monkeypatch.setattr(_embedding, "get_embedder", lambda cfg: counting)
+    conn = open_db(db_path, skip_integrity_check=True)
+    try:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS embedding_stash (model TEXT NOT NULL, content_hash TEXT NOT NULL, "
+            "is_project INTEGER NOT NULL, donor_id INTEGER NOT NULL, chunk_index INTEGER NOT NULL, "
+            "embedding BLOB NOT NULL, PRIMARY KEY (donor_id, content_hash, chunk_index))"
+        )
+        conn.execute("INSERT INTO embedding_stash VALUES ('m', 'left-over', 1, 999, 0, x'00')")
+        conn.commit()
+    finally:
+        conn.close()
+
+    reindex_file("src/main.c", str(root), with_analysis=with_analysis)
+
+    assert counting.texts == []
+    assert _stash_rows(db_path) == 0
+    if with_analysis:
+        assert _embedded(db_path) == ALL_EMBEDDED
+
+
 def test_the_fixture_embeds_each_definition(one_build):
     """The precondition of the tests below: no definition starts without an embedding."""
     _, db_path = one_build

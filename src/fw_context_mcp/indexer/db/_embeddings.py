@@ -17,16 +17,20 @@ sqlite-vec installed, at the cost of slower vector search (full scan).
 from __future__ import annotations
 
 __all__ = [
+    "StashKey",
     "_blob_to_vec",
     "_cosine_sim",
     "_vec_to_blob",
     "clean_orphan_embeddings",
+    "clear_embedding_stash",
     "get_embeddings",
     "get_vec_dim",
     "init_vec_table",
     "search_similar_hybrid",
     "search_similar_vec",
     "search_similar_vec_all",
+    "stash_embeddings_for_files",
+    "take_stashed_embeddings",
     "upsert_embeddings",
     "upsert_embeddings_vec",
 ]
@@ -478,3 +482,115 @@ def search_similar_hybrid(
     top = scored[:limit]
     # Embed distance into result dict
     return [dict(r, _similarity=round(float(1.0 - d), 4)) for d, r in top]
+
+
+# ── Embedding stash: reuse of the vectors of re-parsed symbols ──
+#
+# A re-parse deletes the symbols of each file that its unit owns and inserts
+# them again with new ids.  ON DELETE CASCADE removes their embeddings, and
+# the embedding step found no hash for the new ids, thus it called the model
+# for each symbol, also when the text of the symbol did not change.  Measured
+# on an ESP32 project: 725 symbols of one re-parsed unit, each with the same
+# content hash as before the re-parse.
+#
+# The store copies the vectors aside before it deletes the symbols, and the
+# embedding step takes a vector from here when the key of a new symbol is
+# equal.  The key is (model, content_hash, is_project): is_project selects the
+# docstring of the description and is not in content_hash.
+#
+# The table has no foreign key: the symbol of a donor row is gone.  It is made
+# when first used, not in _SCHEMA: _derive_schema_version hashes the tables of
+# _SCHEMA, and a new table there sets reindex_needed on every index.  The
+# index run (runner.run, _run_postprocess) and reindex_file empty it.
+#
+# content_hash is in the primary key: symbols.id has no AUTOINCREMENT, thus a
+# new symbol can get the id of a deleted one.  When the stash still holds the
+# rows of an earlier donor with that id (a run that stopped), a key without
+# the hash replaced only the chunks that the new donor has, and the two texts
+# shared the other chunks.
+
+_STASH_TABLE = (
+    """CREATE TABLE IF NOT EXISTS embedding_stash (
+        model        TEXT    NOT NULL,
+        content_hash TEXT    NOT NULL,
+        is_project   INTEGER NOT NULL,
+        donor_id     INTEGER NOT NULL,
+        chunk_index  INTEGER NOT NULL,
+        embedding    BLOB    NOT NULL,
+        PRIMARY KEY (donor_id, content_hash, chunk_index)
+    )""",
+    """CREATE INDEX IF NOT EXISTS idx_embedding_stash_key
+        ON embedding_stash(model, content_hash, is_project)""",
+)
+
+StashKey = tuple[str, str, int]
+"""``(model, content_hash, is_project)`` of one symbol."""
+
+
+def stash_embeddings_for_files(conn: sqlite3.Connection, file_ids: list[int]) -> None:
+    """Copy the embeddings of the symbols of *file_ids* into the stash.
+
+    Call it before the symbols go.  The copy runs in SQL, thus the vectors
+    do not go through Python, and the memory of the process does not grow.
+    ``donor_id`` is the old symbol id: it keeps the chunks of one symbol
+    together.
+    """
+    if not file_ids or not _table_exists(conn, "embeddings"):
+        return
+    for statement in _STASH_TABLE:
+        conn.execute(statement)
+    for start in range(0, len(file_ids), 500):
+        chunk = file_ids[start:start + 500]
+        placeholders = ",".join("?" * len(chunk))
+        conn.execute(
+            f"""INSERT OR REPLACE INTO embedding_stash
+                    (model, content_hash, is_project, donor_id, chunk_index, embedding)
+                SELECT e.model, e.content_hash, s.is_project, e.symbol_id, e.chunk_index, e.embedding
+                FROM embeddings e JOIN symbols s ON s.id = e.symbol_id
+                WHERE s.file_id IN ({placeholders}) AND e.content_hash != ''""",  # noqa: S608 — placeholders only
+            chunk,
+        )
+
+
+def take_stashed_embeddings(
+    conn: sqlite3.Connection, model: str, keys: set[StashKey],
+) -> dict[StashKey, list[tuple[int, bytes]]]:
+    """Return the chunks ``[(chunk_index, blob)]`` of one donor for each key in the stash.
+
+    Two donors with one key gave the same text, thus either one serves; the
+    donor with the lowest id is taken, so the answer does not depend on the
+    order of the rows.  A donor serves only with each chunk from 0 to its
+    last one: a gap would give the symbol a vector set that no embedding
+    step wrote.
+    """
+    if not keys or not _table_exists(conn, "embedding_stash"):
+        return {}
+    hashes = sorted({content_hash for _, content_hash, _ in keys})
+    # {key: {donor_id: [(chunk_index, blob)]}}
+    by_key: dict[StashKey, dict[int, list[tuple[int, bytes]]]] = {}
+    for start in range(0, len(hashes), 500):
+        chunk = hashes[start:start + 500]
+        placeholders = ",".join("?" * len(chunk))
+        for row in conn.execute(
+            f"""SELECT content_hash, is_project, donor_id, chunk_index, embedding
+                FROM embedding_stash
+                WHERE model = ? AND content_hash IN ({placeholders})""",  # noqa: S608 — placeholders only
+            (model, *chunk),
+        ):
+            key = (model, row[0], row[1])
+            if key in keys:
+                by_key.setdefault(key, {}).setdefault(row[2], []).append((row[3], row[4]))
+    found: dict[StashKey, list[tuple[int, bytes]]] = {}
+    for key, donors in by_key.items():
+        for donor in sorted(donors):
+            chunks = sorted(donors[donor])
+            if [index for index, _ in chunks] == list(range(len(chunks))):
+                found[key] = chunks
+                break
+    return found
+
+
+def clear_embedding_stash(conn: sqlite3.Connection) -> None:
+    """Remove every row of the stash: the embedding step that it serves is over."""
+    if _table_exists(conn, "embedding_stash"):
+        conn.execute("DELETE FROM embedding_stash")

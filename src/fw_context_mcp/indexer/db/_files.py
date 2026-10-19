@@ -533,6 +533,8 @@ def _delete_rows_owned_by(
     conn: sqlite3.Connection,
     config_hash: str,
     files: list[tuple[int, str]],
+    *,
+    stash_embeddings: bool = False,
 ) -> list[str]:
     """Delete every row OWNED by *files*; return the USRs that were removed.
 
@@ -558,7 +560,17 @@ def _delete_rows_owned_by(
     embedding / analysis deletes select by ``symbol_id``, so both must run
     before the symbols go.  ``vec_symbols`` is a sqlite-vec virtual table and
     may not exist at all.
+
+    *stash_embeddings*: a re-parse inserts the symbols again, mostly with
+    the same text.  Their embeddings go to the stash first, and the
+    embedding step takes them back by content instead of calling the model
+    (see ``stash_embeddings_for_files``).  The purge of a file that left
+    the build stashes nothing: nothing inserts its symbols again.  The
+    index run also removes the rows of a header that lost its owner through
+    ``replace_file_data``; its stash rows are not used, and the end of the
+    run removes them.
     """
+    from ._embeddings import stash_embeddings_for_files
     from ._inheritance import delete_inheritance_for_file
     from ._refs import (
         delete_fp_assignments_for_files,
@@ -567,6 +579,8 @@ def _delete_rows_owned_by(
     )
     from ._symbols import delete_macros_for_files
 
+    if stash_embeddings:
+        stash_embeddings_for_files(conn, [file_id for file_id, _ in files])
     purged_usrs: list[str] = []
     for file_id, _ in files:
         purged_usrs.extend(
@@ -628,7 +642,7 @@ def replace_file_data(
             ).fetchall()
         )
     if rows:
-        _delete_rows_owned_by(conn, config_hash, rows)
+        _delete_rows_owned_by(conn, config_hash, rows, stash_embeddings=True)
 
 
 def purge_file_records(

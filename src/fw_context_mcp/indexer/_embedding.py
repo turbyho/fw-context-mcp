@@ -26,7 +26,7 @@ from ..llm.embedder_factory import get_embedder
 from ..utils import SAFE_EXCEPT, is_fatal, remove_stale_tmp
 from . import _run_marker
 from .db import open_db
-from .db._embeddings import _vec_to_blob
+from .db._embeddings import _blob_to_vec, _vec_to_blob
 from .db._projects import EMBEDDABLE_KINDS
 
 log = logging.getLogger(__name__)
@@ -71,6 +71,92 @@ def _embed_content_hash(r) -> str:
         r["source"] or "",
     ])
     return hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _take_from_stash(conn, rows: list, model: str, config_hash: str, dim: int, db_dir: Path) -> list:
+    """Store the stashed vectors of each row whose key the stash holds; return the other rows.
+
+    A re-parse inserts each symbol again with a new id, and the store put
+    the old vectors into the stash (``stash_embeddings_for_files``).  A row
+    whose ``(model, content_hash, is_project)`` is in the stash gets the
+    chunks of that donor, and the model is not called.  The description of
+    the row is the description of the donor: ``content_hash`` holds each
+    field of the description, and ``is_project`` selects its docstring.
+
+    Measured on an ESP32 project: a recomputed vector of an unchanged text
+    is not bit-equal to the old one (cosine >= 0.997), thus a recomputation
+    adds noise and no quality.
+
+    The rows go in batches of 500 symbols, the read of the stash too: the
+    blobs of a few thousand symbols at once, and the list of floats that
+    the vec0 write takes for each chunk, would use a large part of the
+    memory.  Old rows of the ids go first, as in the first flush of the
+    embedding step: a row whose content changed back to a stashed text can
+    have more chunks than the donor.  The delete takes each model: the key
+    of ``embeddings`` is (symbol_id, chunk_index), thus a row of another
+    model for the same chunk is replaced anyway.
+
+    *dim* is ``build_configs.embedding_dim``.  The vec0 table is one for
+    each build of the database, and another build can make it again with
+    another dimension; a reused vector must fit the two.
+    """
+    from .db import get_vec_dim, take_stashed_embeddings, upsert_embeddings, upsert_embeddings_vec, write_lock
+    from .db._connection import transaction
+
+    try:
+        vec_dim = get_vec_dim(conn)
+    except SAFE_EXCEPT as e:
+        if is_fatal(e):
+            raise
+        vec_dim = None
+    if vec_dim is not None and vec_dim != dim:
+        return rows
+    rest: list = []
+    reused_total = 0
+    for start in range(0, len(rows), 500):
+        batch_rows = rows[start:start + 500]
+        keys = {row["id"]: (model, _embed_content_hash(row), row["is_project"]) for row in batch_rows}
+        found = take_stashed_embeddings(conn, model, set(keys.values()))
+        batch: list[tuple[sqlite3.Row, list[tuple[int, bytes]]]] = []
+        for row in batch_rows:
+            chunks = found.get(keys[row["id"]])
+            # Each chunk must have the length of the build's dimension.
+            if chunks and all(len(blob) == dim * 4 for _, blob in chunks):
+                batch.append((row, chunks))
+            else:
+                rest.append(row)
+        if not batch:
+            continue
+        reused_total += len(batch)
+        ids = [row["id"] for row, _ in batch]
+        placeholders = ",".join("?" * len(ids))
+        with write_lock(db_dir, timeout=30.0):
+            with transaction(conn):
+                conn.execute(f"DELETE FROM embeddings WHERE symbol_id IN ({placeholders})", ids)  # noqa: S608 — placeholders only
+                try:
+                    conn.execute(
+                        f"DELETE FROM vec_symbols WHERE config_hash = ? AND symbol_id IN ({placeholders})",  # noqa: S608 — placeholders only
+                        (config_hash, *ids),
+                    )
+                except sqlite3.OperationalError:
+                    pass  # sqlite-vec not loaded — the virtual table does not exist
+                upsert_embeddings(conn, [
+                    (row["id"], chunk_index, blob, model, keys[row["id"]][1])
+                    for row, chunks in batch for chunk_index, blob in chunks
+                ])
+            # As in _flush_chunk: a vec0 failure must not roll back the BLOB rows.
+            try:
+                upsert_embeddings_vec(conn, [
+                    (row["id"], chunk_index, config_hash, _blob_to_vec(blob))
+                    for row, chunks in batch for chunk_index, blob in chunks
+                ])
+            except SAFE_EXCEPT as e:
+                if is_fatal(e):
+                    raise
+                log.warning("vec0 batch insert failed (sqlite-vec may not be loaded): %s", e)
+    if reused_total:
+        log.info("Embeddings: %d symbols reused from re-parsed symbols (model=%s)", reused_total, model)
+    return rest
 
 
 def _chunk_body(source: str, max_chars: int) -> list[str]:
@@ -450,6 +536,15 @@ def _build_embeddings(
         if not rows:
             log.info("All symbols already embedded (model=%s) — nothing to do", model)
             return
+
+        # ── Phase 1b: the vectors of re-parsed symbols, from the stash ──
+        # Only with a known dimension: a stashed vector of another length
+        # (embed_dim changed) must not reach vec0.
+        if stored_dim is not None:
+            rows = _take_from_stash(conn, rows, model, config_hash, stored_dim, db_dir)
+            if not rows:
+                log.info("All symbols embedded from the stash (model=%s) — nothing to do", model)
+                return
 
     target_ids = sorted({r["id"] for r in rows})
     log.info(

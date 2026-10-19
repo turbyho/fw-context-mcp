@@ -61,6 +61,7 @@ from .config_hash import DEFAULT_TRANSIENT_DEFINES
 from .db import (
     Ownership,
     UnitKey,
+    clear_embedding_stash,
     drop_fts_triggers,
     files_without_owner,
     forget_unit,
@@ -1097,6 +1098,10 @@ def run(
     # its position in the loop, thus a parsed listing claims only what it
     # claims in a full run.
     ownership = load_ownership(conn, config_hash)
+    # A stash of embeddings that a stopped run left (see _run_postprocess):
+    # this run stashes the vectors of its own re-parse.
+    with write_lock(db_path.parent, timeout=120.0), transaction(conn):
+        clear_embedding_stash(conn)
     decisions = decide_units(
         units, project_root, existing_files, manifest_lookup,
         header_stale_tus | marker_units,

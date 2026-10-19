@@ -78,6 +78,8 @@ from ._manifest_updater import _backfill_header_source_hashes, _update_manifest_
 from .db import (
     CURRENT_ROW_FORMAT,
     CURRENT_SCHEMA_VERSION,
+    WriteLockTimeout,
+    clear_embedding_stash,
     delete_build_data,
     rebuild_files_fts,
     rebuild_fts,
@@ -1046,10 +1048,17 @@ def _step_build_embeddings(conn: sqlite3.Connection, ctx: dict) -> None:
     first.  This is necessary after incremental reindex because removed
     symbols would leave orphaned embedding rows that reference stale
     ``symbol_id`` values.
+
+    ``force`` also empties the stash of the re-parsed symbols: a forced run
+    re-parses each unit, thus the stash holds each vector of the build, and
+    the step took all of them back.  ``--force`` promises a new embedding of
+    each symbol, and it is the repair for a model setting that the model
+    key does not hold (``embed_dim``, ``embed_doc_prompt``).
     """
     config_hash = ctx["config_hash"]
     llm_config = ctx["llm_config"]
     if ctx["force"]:
+        clear_embedding_stash(conn)
         conn.execute(
             "DELETE FROM embeddings WHERE symbol_id IN (SELECT id FROM symbols WHERE config_hash = ?)",
             (config_hash,),
@@ -1911,4 +1920,16 @@ def _run_postprocess(
                 log.error("Postprocess CRITICAL step %s failed: %s", step_name, e)
             else:
                 log.warning("Postprocess step %s failed: %s", step_name, e)
+
+    # The stash of the re-parsed symbols serves the embedding step of this
+    # run only, also when the step did not run (no embeddings) or failed.
+    # A run that stops before this point leaves the stash, and the next run
+    # empties it at its start (runner.run).  For the same reason a lock
+    # timeout here does not fail a run whose steps are done: the rows stay
+    # for the next run to remove.
+    try:
+        with write_lock(db_dir, timeout=30.0), transaction(conn):
+            clear_embedding_stash(conn)
+    except WriteLockTimeout as e:
+        log.warning("The embedding stash stays until the next index run: %s", e)
 
