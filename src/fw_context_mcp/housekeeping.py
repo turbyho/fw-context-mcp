@@ -27,7 +27,7 @@ import shutil
 import sqlite3
 import stat
 from collections.abc import Iterable, Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -128,6 +128,9 @@ def clean(
     dry_run: bool = False,
     global_dir: Path | None = None,
     quiet: bool = False,
+    keys: bool = True,
+    files: bool = True,
+    lock: bool = False,
 ) -> CleanupReport:
     """Remove the retired files, directories and config keys, and return the report.
 
@@ -142,7 +145,14 @@ def clean(
 
     The config keys go first: the decision about ``[index] compile_commands``
     reads the build system of the config, and the files after them read
-    the index that the config names.  The files go in the order of the
+    the index that the config names.
+
+    *keys* and *files* select the two parts.  ``fw-context index`` removes
+    the keys before it loads the config (a retired key stops the load), and
+    the files under the index lock that it holds.  *lock* takes the index
+    lock of the project for the files (``fw-context cleanup``, ``doctor
+    --fix``): within one project each writer holds it, and the files are in
+    the build directory that an index run builds in.  The files go in the order of the
     layers (global, project, local), because the decision about
     ``compile_commands`` in a layer reads the layers below it.
     """
@@ -154,7 +164,7 @@ def clean(
     # current file give; at the start, the built-in default.
     lower_database: str | None = _BUILD_DATABASE_VALUES[-1].as_posix()
     runnable: bool | None = None
-    for path, of_project, backup in _config_files(project_root):
+    for path, of_project, backup in _config_files(project_root) if keys else ():
         document, unknown = _parse_config_file(path, report)
         if document is None:
             if unknown:
@@ -176,10 +186,10 @@ def clean(
         if removed:
             _write_config_file(path, document, original, removed, report, backup=backup, dry_run=dry_run)
 
-    if project_root is not None:
-        _clean_project_files(project_root, keep, report, dry_run=dry_run)
+    if files and project_root is not None:
+        _clean_project_files(project_root, keep, report, dry_run=dry_run, lock=lock)
     home_dir = global_dir if global_dir is not None else settings._GLOBAL_CONFIG_PATH.parent
-    for name in _RETIRED_GLOBAL_FILES:
+    for name in _RETIRED_GLOBAL_FILES if files else ():
         _remove_path(home_dir / name, report, dry_run=dry_run)
 
     if not quiet:
@@ -496,7 +506,9 @@ def _runs_its_build(project_root: Path) -> bool:
         return False
 
 
-def _clean_project_files(project_root: Path, keep: Iterable[Path], report: CleanupReport, *, dry_run: bool) -> None:
+def _clean_project_files(
+    project_root: Path, keep: Iterable[Path], report: CleanupReport, *, dry_run: bool, lock: bool = False,
+) -> None:
     """Remove the files and directories of an older layout in the project.
 
     The list and its rules are ``indexer.build_layout._legacy_candidates``:
@@ -506,8 +518,13 @@ def _clean_project_files(project_root: Path, keep: Iterable[Path], report: Clean
     ``--variant`` narrowed leaves the other variants on their old copies.
     When fw-context cannot use the config or read the index, the build
     output stays, because an old copy can be the only database of a build.
+
+    With *lock*, the removal holds the index lock of the project
+    (:func:`_index_lock_of`), only when a dry run without the lock removes
+    something: the takeover of a background run costs that run its work.  A manual run that holds the
+    index leaves the files, and the report names it.
     """
-    from .indexer.build_layout import _legacy_candidates, _protects
+    from .indexer.build_layout import _legacy_candidates
 
     try:
         candidates = _legacy_candidates(project_root)
@@ -516,6 +533,50 @@ def _clean_project_files(project_root: Path, keep: Iterable[Path], report: Clean
         return
     if not candidates:
         return
+    if lock and not dry_run:
+        from .indexer.db._locking import IndexRunLocked
+
+        # A dry run first, without the lock: a candidate that a build still
+        # reads stays, and a takeover for nothing costs a background run its
+        # work.  The removal under the lock decides again.
+        planned = CleanupReport()
+        _remove_project_files(project_root, candidates, keep, planned, dry_run=True)
+        if not planned.lines():
+            report.failures.extend(planned.failures)
+            return
+        try:
+            with _index_lock_of(project_root):
+                _remove_project_files(project_root, candidates, keep, report, dry_run=dry_run)
+        except IndexRunLocked as exc:
+            report.failures.append((project_root, f"{exc}; the old files stay"))
+        return
+    _remove_project_files(project_root, candidates, keep, report, dry_run=dry_run)
+
+
+def _index_lock_of(project_root: Path) -> AbstractContextManager[None]:
+    """Return the index lock of *project_root* (``indexer._index_owner.owned_by_operation``), or no lock.
+
+    No lock when the config cannot be used or the project has no ID: no
+    index run can run then either, because it needs the same config.
+    """
+    from .config import load
+    from .indexer import _index_owner
+
+    try:
+        cfg = load(project_root)
+    except SAFE_EXCEPT:
+        return nullcontext()
+    if not cfg.project.id:
+        return nullcontext()
+    return _index_owner.owned_by_operation(cfg.index.db_dir / cfg.project.id, log.info)
+
+
+def _remove_project_files(
+    project_root: Path, candidates: list[Path], keep: Iterable[Path], report: CleanupReport, *, dry_run: bool,
+) -> None:
+    """Remove each candidate that no build of the index and no config reads."""
+    from .indexer.build_layout import _protects
+
     in_use = databases_in_use(project_root)
     if in_use is None:
         report.failures.append(

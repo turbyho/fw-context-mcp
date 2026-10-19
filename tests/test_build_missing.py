@@ -494,6 +494,105 @@ class TestTheRunOfTheUser:
         problem = read_problem(db_path.parent)
         assert problem is not None and "[[build.variants]] 'dev' build_dir" in problem.text
 
+    def test_the_files_of_the_cleanup_go_under_the_lock(self, tmp_path: Path, monkeypatch) -> None:
+        """The config keys before the load of the config, the files of the build directory under the lock."""
+        from types import SimpleNamespace
+
+        from fw_context_mcp.cli import _index as index_mod
+        from fw_context_mcp.indexer.db._locking import index_run_lock_held
+
+        root = tmp_path / "proj"
+        root.mkdir()
+        db_path = _project(root, tmp_path / "index", _built(root))
+        cleanups: list[tuple[bool, bool, bool]] = []
+
+        def clean_obsolete(args, project_root, *, keys=True, files=True):
+            cleanups.append((keys, files, index_run_lock_held(db_path.parent)))
+
+        monkeypatch.setattr(index_mod, "_clean_obsolete", clean_obsolete)
+        monkeypatch.setattr(index_mod, "_run_single", lambda *a, **kw: 0)
+        monkeypatch.setattr(index_mod, "_build_run_kwargs", lambda *a, **kw: {})
+        monkeypatch.setattr(index_mod, "_record_still_uncovered", lambda *a, **kw: None)
+        monkeypatch.setattr(index_mod, "_ensure_watcher_after_index", lambda root: None)
+        args = SimpleNamespace(
+            verbose=False, project=str(root), background=False, build=False,
+            compile_commands=None, no_clean=False, force=False, takeover=False,
+            vendor_paths=None, project_paths=None,
+        )
+
+        assert index_mod.cmd_index(args) == 0
+        assert cleanups[0] == (True, False, False), "the keys before the lock"
+        assert all(files and held for keys, files, held in cleanups[1:]) and len(cleanups) >= 2
+
+    def test_init_stops_when_a_signal_stops_its_build(self, tmp_path: Path, monkeypatch) -> None:
+        """Before, init took the stop for a failed build, and went on with its next steps."""
+        from contextlib import contextmanager
+
+        import pytest
+
+        from fw_context_mcp.cli import _index as index_mod
+        from fw_context_mcp.cli._init_build import _auto_build_if_possible
+        from fw_context_mcp.config.settings import Config
+        from fw_context_mcp.indexer.runner import IndexTerminated
+
+        @contextmanager
+        def stopped(db_dir, args):
+            raise IndexTerminated("a SIGTERM stopped this run")
+            yield
+
+        monkeypatch.setattr(index_mod, "_owned_index", stopped)
+        cfg = Config()
+        cfg.project.id = "p"
+        cfg.index.db_dir = tmp_path / "index"
+        root = tmp_path / "proj"
+        root.mkdir()
+
+        with pytest.raises(SystemExit) as stop:
+            _auto_build_if_possible(root, None, cfg)
+        assert stop.value.code == IndexTerminated("x").exit_code
+
+    def test_a_refused_run_writes_no_marker_while_another_run_holds_the_index(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """The checks and their markers come under the index lock.
+
+        Before, a second `fw-context index` wrote its problem marker before
+        it asked for the lock, thus over the marker of the run that held
+        the index, and then gave up on the lock.
+        """
+        from types import SimpleNamespace
+
+        from fw_context_mcp import housekeeping
+        from fw_context_mcp.cli import _index as index_mod
+        from fw_context_mcp.exit_codes import EXIT_ALREADY_RUNNING
+        from fw_context_mcp.indexer.autobuild import read_problem
+        from tests.test_index_run_lock import TestTakeover
+
+        def refuse(path, *a, **k):
+            raise PermissionError(13, "Permission denied", str(path))
+
+        monkeypatch.setattr(housekeeping, "write_text_atomic", refuse)
+        root = tmp_path / "proj"
+        root.mkdir()
+        db_path = _project(root, tmp_path / "index", _built(root))
+        config = root / ".fw-context" / "config.toml"
+        config.write_text(
+            config.read_text(encoding="utf-8")
+            + '[[build.variants]]\nname = "dev"\nboard = "b"\nbuild_dir = "build/dev"\n',
+            encoding="utf-8",
+        )
+        args = SimpleNamespace(
+            verbose=False, project=str(root), background=False, build=True,
+            compile_commands=None, no_clean=False, force=False, takeover=False,
+            vendor_paths=None, project_paths=None,
+        )
+        holder = TestTakeover._holder(db_path.parent, "foreground")
+        try:
+            assert index_mod.cmd_index(args) == EXIT_ALREADY_RUNNING
+            assert read_problem(db_path.parent) is None, "a refused run must not write beside the holder"
+        finally:
+            TestTakeover._stop(holder)
+
     def test_a_missing_database_of_the_user_is_an_error_and_no_build(self, tmp_path: Path, capsys) -> None:
         """A build of fw-context writes another file; it cannot give the file that the config names."""
         from types import SimpleNamespace

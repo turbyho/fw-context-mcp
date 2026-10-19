@@ -885,6 +885,13 @@ fw-context cleanup --project /path   # clean a specific project
 The command gives one line for each item. Exit code 1 means that a path
 could not be read or changed.
 
+The files of the project are in the build directory that an index run
+builds in, thus the command removes them under the index lock of the
+project, as `fw-context index` holds it, when it has a file to remove. It
+then stops a background index run. While a manual run holds the index,
+the files stay, and the command names the run as a path that it could
+not clean.
+
 `fw-context db cleanup` is a different command: it removes the per-build
 files of the index that no build uses.
 

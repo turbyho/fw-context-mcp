@@ -820,3 +820,96 @@ class TestHome:
         )
 
         assert result.stdout.strip() == str(tmp_path / "h" / "config.toml")
+
+
+class TestTheFilesHoldTheIndexLock:
+    """The old build output is in the build directory that an index run builds in.
+
+    Within one project each writer holds the index lock: the cleanup of
+    `fw-context cleanup` and `doctor --fix` takes it, and leaves the files
+    while a manual run holds the index.
+    """
+
+    def _legacy(self, tmp_path: Path, monkeypatch) -> Path:
+        from fw_context_mcp.indexer import build_layout
+
+        old = tmp_path / "proj" / ".fw-context" / "build" / "toolchains.toml"
+        old.parent.mkdir(parents=True)
+        old.write_text("x", encoding="utf-8")
+        monkeypatch.setattr(build_layout, "_legacy_candidates", lambda root: [old])
+        return old
+
+    def test_a_manual_run_that_holds_the_index_keeps_the_files(self, tmp_path: Path, monkeypatch) -> None:
+        from fw_context_mcp import housekeeping
+        from fw_context_mcp.indexer.db._locking import IndexRunLocked
+
+        old = self._legacy(tmp_path, monkeypatch)
+
+        class _Held:
+            """The lock that a manual index run holds: entering it is refused."""
+
+            def __init__(self, root) -> None:
+                pass
+
+            def __enter__(self) -> None:
+                raise IndexRunLocked(tmp_path / "index", 4242, hint="a manual index run")
+
+            def __exit__(self, *exc) -> None:
+                return None
+
+        monkeypatch.setattr(housekeeping, "_index_lock_of", _Held)
+        report = housekeeping.CleanupReport()
+        housekeeping._clean_project_files(tmp_path / "proj", [], report, dry_run=False, lock=True)
+
+        assert old.exists()
+        assert any("in use" in reason for _path, reason in report.failures)
+
+    def test_the_files_go_under_the_lock(self, tmp_path: Path, monkeypatch) -> None:
+        from contextlib import contextmanager
+
+        from fw_context_mcp import housekeeping
+
+        old = self._legacy(tmp_path, monkeypatch)
+        steps: list[str] = []
+
+        @contextmanager
+        def held(root):
+            steps.append("locked")
+            yield
+            steps.append("released" if not old.exists() else "released before the removal")
+
+        monkeypatch.setattr(housekeeping, "_index_lock_of", held)
+        monkeypatch.setattr(housekeeping, "databases_in_use", lambda root: [])
+        housekeeping._clean_project_files(tmp_path / "proj", [], housekeeping.CleanupReport(), dry_run=False, lock=True)
+
+        assert not old.exists()
+        assert steps == ["locked", "released"], "the file goes inside the lock"
+
+    def test_a_file_that_a_build_still_reads_takes_no_lock(self, tmp_path: Path, monkeypatch) -> None:
+        """A takeover for nothing cost a background run its work."""
+        from fw_context_mcp import housekeeping
+
+        old = self._legacy(tmp_path, monkeypatch)
+        monkeypatch.setattr(housekeeping, "databases_in_use", lambda root: [old])
+        monkeypatch.setattr(housekeeping, "_index_lock_of", lambda root: pytest.fail("no lock for nothing"))
+        housekeeping._clean_project_files(tmp_path / "proj", [], housekeeping.CleanupReport(), dry_run=False, lock=True)
+
+        assert old.exists()
+
+    @pytest.mark.parametrize("caller", ["cleanup", "doctor"])
+    def test_cleanup_and_doctor_hold_the_lock(self, tmp_path: Path, monkeypatch, caller) -> None:
+        import argparse
+
+        from fw_context_mcp import housekeeping
+
+        seen: list[dict] = []
+        monkeypatch.setattr(housekeeping, "clean", lambda root, **kw: seen.append(kw) or housekeeping.CleanupReport())
+        if caller == "cleanup":
+            from fw_context_mcp.cli._cleanup import cmd_cleanup
+
+            cmd_cleanup(argparse.Namespace(project=str(tmp_path), dry_run=False))
+        else:
+            from fw_context_mcp.deps._fixes import fix_obsolete_files
+
+            fix_obsolete_files(None, project_root=tmp_path)
+        assert seen and seen[0].get("lock") is True

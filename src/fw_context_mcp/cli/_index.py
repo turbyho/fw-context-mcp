@@ -1441,7 +1441,7 @@ def _cmd_index(args: argparse.Namespace, outside: _SigtermOutsideTheLock) -> int
     """The body of :func:`cmd_index`, under its SIGTERM handler."""
     from ..config import derive_project_id
     from ..config import load as load_config
-    from ..exit_codes import EXIT_ALREADY_RUNNING, EXIT_SUPERSEDED, EXIT_TERMINATED
+    from ..exit_codes import EXIT_ALREADY_RUNNING
     from ..indexer.build import detect_build_system
     from ..indexer.db._locking import IndexRunLocked
     from ..indexer.runner import IndexStopped
@@ -1469,8 +1469,9 @@ def _cmd_index(args: argparse.Namespace, outside: _SigtermOutsideTheLock) -> int
 
     project_root = resolve_project_root(args.project)
     # Before the config loads: a retired key such as build_dir goes from the
-    # file, and the run does not stop on it.
-    _clean_obsolete(args, project_root)
+    # file, and the run does not stop on it.  The files go under the index
+    # lock (_index_owned): the path of the index is in the config.
+    _clean_obsolete(args, project_root, files=False)
     cfg = load_config(project_root=project_root)
     bg = getattr(args, "background", False)
     # The config wins over the markers, the same form _run_multi already
@@ -1496,6 +1497,50 @@ def _cmd_index(args: argparse.Namespace, outside: _SigtermOutsideTheLock) -> int
 
     project_id = derive_project_id(project_root)
     db_path = cfg.index.db_dir / project_id / "index.db"
+
+    # The index is owned from here to the last marker of the run, on each
+    # path below: the files of the cleanup, each read that can migrate the
+    # schema, each marker of a problem, each build and the run.  A build
+    # run under another index run cleans the build directory and rewrites
+    # compile_commands.json under it.  _owned_index takes over from a
+    # background run, and from a foreground one with --takeover.  Before,
+    # the checks, the reads and the markers came before the lock, and wrote
+    # beside a running run.
+    outside.db_dir = db_path.parent
+    try:
+        with _owned_index(db_path.parent, args):
+            exit_code = _index_owned(args, cfg, project_root, project_id, db_path, detected_system, bg, outside)
+    except IndexRunLocked as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_ALREADY_RUNNING
+    except IndexStopped as exc:
+        # Not a failure — see IndexStopped.  The distinct exit codes let the
+        # daemon retry a superseded run, and not a terminated one, instead
+        # of treating either as a broken run.
+        print(f"{exc.label}: {exc}", file=sys.stderr)
+        return exc.exit_code
+    if exit_code != 0:
+        return exit_code
+
+    # Outside the index lock.  The daemon does a staleness check when it
+    # starts, thus a daemon that starts inside the lock could start a second
+    # index run against the database that this run still changes.
+    _ensure_watcher_after_index(project_root)
+    return 0
+
+
+def _index_owned(
+    args: argparse.Namespace, cfg, project_root: Path, project_id: str, db_path: Path,
+    detected_system: str | None, bg: bool, outside: _SigtermOutsideTheLock,
+) -> int:
+    """The part of :func:`_cmd_index` under the index lock: return the exit code of the run.
+
+    Only the cleanup of the config keys and the load of the config come
+    before the lock: the path of the index is in the config.
+    """
+    from ..exit_codes import EXIT_SUPERSEDED, EXIT_TERMINATED
+
+    _clean_obsolete(args, project_root, keys=False)
 
     # A retired key stops the run before any build.  Each build goes to
     # .fw-context/build/<variant>/out, and a config that still names another
@@ -1644,61 +1689,38 @@ def _cmd_index(args: argparse.Namespace, outside: _SigtermOutsideTheLock) -> int
         print("warning: --force-llm does nothing: [llm] enabled is false", file=sys.stderr)
     multi = bool(cfg.build.variants)
 
-    # The index is owned BEFORE anything is built, on both paths below.  A
-    # build run under another index run cleans the build directory and
-    # rewrites compile_commands.json under it, and a run that is refused
-    # afterwards has spent the whole build for nothing.  _owned_index takes
-    # over from a background run, and from a foreground one with --takeover.
-    outside.db_dir = db_path.parent
-    try:
-        with _owned_index(db_path.parent, args):
-            if force_llm:
-                # Under the lock: a command that the lock refuses writes no marker.
-                since, continues = force_llm_marker.since_for(db_path.parent, cfg.llm.model)
-                if continues:
-                    print(f"--force-llm continues the command of {since} UTC", file=sys.stderr)
-                run_kwargs["force_llm_since"] = since
-            # ── Multi-variant: dispatch BEFORE single-build resolution ──
-            # WHY: [[build.variants]] replaces the single [build] board/source
-            # flow.  build_multi() builds each variant; the single-build path
-            # (generate_compile_commands → builder.build()) would fail on a
-            # project whose board lives per-variant (Zephyr "requires a board
-            # name").  The index stays owned across every (variant, image)
-            # build: a second run slipping in between two builds would index
-            # against a database this one is still changing.
-            if multi:
-                exit_code = _run_multi(
-                    args, cfg, project_root, project_id, db_path,
-                    detected_system, run_kwargs,
-                )
-            else:
-                exit_code = _run_single(
-                    args, cfg, project_root, project_id, db_path,
-                    detected_system, bg, run_kwargs,
-                )
-            # Again after a run that ended well, under the index lock: the
-            # builds of this run replaced the builds that read an old copy,
-            # thus that copy goes now.  A run that fails leaves the old index,
-            # and the old index reads the old copies.
-            if exit_code == 0:
-                _clean_obsolete(args, project_root)
-                if force_llm and not force_llm_marker.finish(db_path.parent):
-                    print("warning: --force-llm did not reach each symbol (see the log); "
-                          "run it again to continue", file=sys.stderr)
-    except IndexRunLocked as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return EXIT_ALREADY_RUNNING
-    except IndexStopped as exc:
-        # Not a failure — see IndexStopped.  The distinct exit codes let the
-        # daemon retry a superseded run, and not a terminated one, instead
-        # of treating either as a broken run.
-        print(f"{exc.label}: {exc}", file=sys.stderr)
-        exit_code = exc.exit_code
+    if force_llm:
+        since, continues = force_llm_marker.since_for(db_path.parent, cfg.llm.model)
+        if continues:
+            print(f"--force-llm continues the command of {since} UTC", file=sys.stderr)
+        run_kwargs["force_llm_since"] = since
+    # ── Multi-variant: dispatch BEFORE single-build resolution ──
+    # WHY: [[build.variants]] replaces the single [build] board/source
+    # flow.  build_multi() builds each variant; the single-build path
+    # (generate_compile_commands → builder.build()) would fail on a
+    # project whose board lives per-variant (Zephyr "requires a board
+    # name").  The index stays owned across every (variant, image)
+    # build: a second run slipping in between two builds would index
+    # against a database this one is still changing.
+    if multi:
+        exit_code = _run_multi(
+            args, cfg, project_root, project_id, db_path,
+            detected_system, run_kwargs,
+        )
+    else:
+        exit_code = _run_single(
+            args, cfg, project_root, project_id, db_path,
+            detected_system, bg, run_kwargs,
+        )
+    # Again after a run that ended well: the builds of this run replaced the
+    # builds that read an old copy, thus that copy goes now.  A run that
+    # fails leaves the old index, and the old index reads the old copies.
+    if exit_code == 0:
+        _clean_obsolete(args, project_root, keys=False)
+        if force_llm and not force_llm_marker.finish(db_path.parent):
+            print("warning: --force-llm did not reach each symbol (see the log); "
+                  "run it again to continue", file=sys.stderr)
 
-    # Everything below runs outside the index lock.  The daemon does a
-    # staleness check when it starts, thus a daemon that starts inside the
-    # lock could start a second index run against the database that this run
-    # still changes.
     if exit_code != 0:
         # The failed step printed its error.  The marker gives the LLM the
         # same news in each query tool answer, because a background run has no
@@ -1729,8 +1751,6 @@ def _cmd_index(args: argparse.Namespace, outside: _SigtermOutsideTheLock) -> int
 
     if not multi and getattr(args, "build", False):
         _record_still_uncovered(project_root, db_path, cfg)
-
-    _ensure_watcher_after_index(project_root)
     return 0
 
 
@@ -1749,12 +1769,15 @@ def _cache_server_config(args: argparse.Namespace, cfg):
     return cs_config
 
 
-def _clean_obsolete(args: argparse.Namespace, project_root: Path) -> None:
+def _clean_obsolete(
+    args: argparse.Namespace, project_root: Path, *, keys: bool = True, files: bool = True,
+) -> None:
     """Remove what an older fw-context wrote and no version uses, see ``housekeeping.clean``.
 
     The file on the command line stays, with each database that the index
     or the config reads.  The cleanup never stops the run: a path that
-    cannot go gives a warning.
+    cannot go gives a warning.  *keys* and *files* select the part: the
+    files go under the index lock that the caller holds.
     """
     from ..housekeeping import clean
 
@@ -1762,7 +1785,7 @@ def _clean_obsolete(args: argparse.Namespace, project_root: Path) -> None:
     if getattr(args, "compile_commands", None):
         given = Path(args.compile_commands)
         keep.append(given if given.is_absolute() else project_root / given)
-    clean(project_root, keep=keep)
+    clean(project_root, keep=keep, keys=keys, files=files)
 
 
 def _run_single(

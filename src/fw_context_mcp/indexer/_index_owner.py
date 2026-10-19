@@ -240,8 +240,8 @@ def acquire_index(
             if is_fw_context_process(pid):
                 raise IndexRunLocked(
                     db_dir, pid,
-                    hint="another fw-context operation holds the index (an MCP tool, or 'fw-context db'); "
-                    "wait for its end",
+                    hint="another fw-context operation holds the index (an MCP tool, 'fw-context db', "
+                    "cleanup, doctor --fix or init); wait for its end",
                 ) from None
             raise
         if kind == "foreground" and not takeover:

@@ -374,7 +374,8 @@ def fix_obsolete_files(_result, project_root=None) -> tuple[bool, str]:
         root: Path | None = resolve_project_root(str(project_root) if project_root else None)
     except OSError:
         root = None
-    report = clean(root, quiet=True)
+    # The files under the index lock of the project (housekeeping.clean).
+    report = clean(root, quiet=True, lock=True)
     removed = f"removed {len(report.lines())} item(s) of an older fw-context"
     if report.lines():
         removed += ": " + "; ".join(report.lines())

@@ -11,6 +11,7 @@ Two responsibilities:
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from pathlib import Path
 
 
@@ -167,8 +168,31 @@ def _auto_build_if_possible(
         return False, None, f"{cc} not found — [index] compile_commands names it, and fw-context does not build it"
 
     print("  [build] Generating compile_commands.json...")
+    import argparse
+
+    from ..indexer.db._locking import IndexRunLocked
+    from ..indexer.runner import IndexStopped
+    from ._index import _owned_index
+
+    # The index lock of the project: the build writes the build directory
+    # that `fw-context index --build` cleans and fills.  A background run is
+    # taken over; a manual run refuses the build.  No ID: no index exists.
+    held = (
+        _owned_index(cfg.index.db_dir / cfg.project.id, argparse.Namespace())
+        if cfg.project.id else nullcontext()
+    )
     try:
-        result_path = generate_compile_commands(project_root, cfg.build)
+        with held:
+            result_path = generate_compile_commands(project_root, cfg.build)
+    except IndexRunLocked as exc:
+        return False, None, f"{exc}; build via 'fw-context index --build' after it"
+    except IndexStopped as exc:
+        # SIGTERM or SIGHUP under the lock: the person or the system wants
+        # init to stop, not only its build.  Before, init went on with the
+        # next steps, and read the answer of a closed terminal.
+        _remove_partial_cc(cc)
+        print(f"{exc.label}: {exc}")
+        raise SystemExit(exc.exit_code) from exc
     except KeyboardInterrupt:
         _remove_partial_cc(cc)
         return False, None, "build interrupted (Ctrl-C)"

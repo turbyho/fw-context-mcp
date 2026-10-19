@@ -23,7 +23,9 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
         root = resolve_project_root(args.project)
     except OSError:
         root = None
-    report = clean(root, dry_run=args.dry_run, quiet=True)
+    # The files under the index lock of the project: within one project each
+    # writer holds it (housekeeping.clean).
+    report = clean(root, dry_run=args.dry_run, quiet=True, lock=True)
     verb = "would remove" if args.dry_run else "removed"
     for line in report.lines():
         print(f"{verb}: {line}")
