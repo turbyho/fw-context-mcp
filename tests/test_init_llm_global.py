@@ -238,3 +238,36 @@ def test_an_embedding_model_that_ollama_does_not_serve_is_not_an_ollama_default(
     defaults, _ = _ollama_defaults(monkeypatch, capsys, project)
 
     assert defaults == ["global-chat:1b", "qwen3-embedding:0.6b"]
+
+
+def test_option_3_turns_off_the_analysis_and_keeps_the_embeddings(project, monkeypatch, capsys):
+    """Before: it wrote enabled = false, which also turned off the embeddings, as the menu said "embedding still works"."""
+    out = _run(monkeypatch, capsys, project, ["3"])
+
+    assert "[ok] LLM analysis off ([llm] analyze_symbols = false) — the embeddings stay" in out, out
+    assert _local_llm(project) == {"analyze_symbols": False}
+    assert "[note]" not in out, out
+
+
+def test_option_3_says_when_the_llm_is_off(project, monkeypatch, capsys):
+    from fw_context_mcp.config import settings
+
+    settings._GLOBAL_CONFIG_PATH.write_text("[llm]\nenabled = false\n", encoding="utf-8")
+
+    out = _run(monkeypatch, capsys, project, ["3"])
+
+    assert "[note] The LLM is off ([llm] enabled = false): the embeddings need enabled = true" in out, out
+
+
+def test_option_3_gives_no_ok_when_local_toml_cannot_be_written(project, monkeypatch, capsys):
+    from fw_context_mcp.config import settings
+
+    def _fails(*args, **kwargs):
+        raise OSError("read-only")
+
+    monkeypatch.setattr(settings, "_update_local_toml", _fails)
+
+    out = _run(monkeypatch, capsys, project, ["3"])
+
+    assert "[warn] .fw-context/local.toml cannot be changed (read-only). Nothing was changed." in out, out
+    assert "[ok]" not in out, out

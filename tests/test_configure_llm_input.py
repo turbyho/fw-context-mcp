@@ -136,12 +136,12 @@ def _no_ok_after_an_error(monkeypatch, capsys, root: Path, choice: str) -> str:
     return capsys.readouterr().out
 
 
-@pytest.mark.parametrize("choice", ["1", "3"])
-def test_init_says_no_ok_after_an_error_of_the_ollama_or_the_disable_setup(tmp_path, monkeypatch, capsys, choice):
+def test_init_says_no_ok_after_an_error_of_the_ollama_setup(tmp_path, monkeypatch, capsys):
+    """Option 3 makes no test call any more: tests/test_init_llm_global.py covers its error."""
     root = _project(tmp_path)
     (root / ".git").mkdir()
 
-    out = _no_ok_after_an_error(monkeypatch, capsys, root, choice)
+    out = _no_ok_after_an_error(monkeypatch, capsys, root, "1")
 
     assert "[warn] test failed" in out, out
-    assert "[ok] LLM configured" not in out and "[ok] Saved" not in out and "[ok] LLM disabled" not in out, out
+    assert "[ok] LLM configured" not in out and "[ok] Saved" not in out, out

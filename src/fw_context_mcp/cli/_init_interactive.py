@@ -329,7 +329,7 @@ def prompt_llm_config(project_root: Path, cfg, *, non_interactive: bool) -> None
         print("    0. Use the global settings — Enter")
     print("    1. Local Ollama (recommended for offline use)")
     print("    2. Cloud API (DeepSeek, OpenAI, LiteLLM, ...)")
-    print("    3. Disable LLM analysis (embedding still works)")
+    print("    3. Disable the LLM analysis (the embeddings stay)")
     choice = _input("  > ")
 
     if use_global_offered and (choice == "0" or (choice == "" and not project_layers)):
@@ -341,15 +341,31 @@ def prompt_llm_config(project_root: Path, cfg, *, non_interactive: bool) -> None
     elif choice == "2":
         _prompt_cloud_setup(project_root)
     elif choice == "3":
-        from ..llm.configure import configure_llm_core
-
-        res = configure_llm_core(project_root, {"enabled": False})
-        if res.get("status") == "ok":
-            print("  [ok] LLM disabled — embedding still works")
-        else:
-            print(f"  [warn] {res.get('message', 'LLM setup failed')}")
+        _disable_llm_analysis(project_root, cfg)
     else:
         print("  [skip] LLM configuration skipped")
+
+
+def _disable_llm_analysis(project_root: Path, cfg) -> None:
+    """Turn off the LLM analysis of the project, and keep the embeddings (option 3 of the menu).
+
+    Writes ``[llm] analyze_symbols = false`` to ``local.toml``.  WHY not
+    ``enabled = false``, as before: that also turns off the embeddings and
+    the chat of ``smart_search``, but the menu said "embedding still
+    works".  WHY no test call (``configure_llm_core``): the option needs
+    no chat model, and a test of the chat model failed on a machine
+    without one, and put the old settings back.
+    """
+    from ..config.settings import ConfigError, _update_local_toml
+
+    try:
+        _update_local_toml(project_root, {"analyze_symbols": False})
+    except (ConfigError, OSError) as exc:
+        print(f"  [warn] .fw-context/local.toml cannot be changed ({exc}). Nothing was changed.")
+        return
+    print("  [ok] LLM analysis off ([llm] analyze_symbols = false) — the embeddings stay")
+    if not cfg.llm.enabled:
+        print("  [note] The LLM is off ([llm] enabled = false): the embeddings need enabled = true")
 
 
 def _use_global_llm(project_root: Path, *, remove_local: bool, old_embed_model: str) -> None:
