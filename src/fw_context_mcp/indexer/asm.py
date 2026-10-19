@@ -328,6 +328,11 @@ def _clear_previous_pass(conn, config_hash: str) -> None:
             (config_hash,),
         )
     ]
+    from fw_context_mcp.indexer.db import stash_embeddings_for_symbols
+
+    # The pass writes each symbol again with a new id; the embedding step of
+    # the run takes the vectors back by content (db/_embeddings.py).
+    stash_embeddings_for_symbols(conn, ids)
     for chunk_start in range(0, len(ids), 500):
         chunk = ids[chunk_start:chunk_start + 500]
         marks = ",".join("?" * len(chunk))

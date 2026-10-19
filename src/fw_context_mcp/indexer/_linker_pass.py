@@ -13,11 +13,14 @@ The backend gives one of three answers, see `builders.link_record`:
 * A record with scripts — the pass reads them and stores what they define.
 
 The third case can also do nothing.  The pass deletes and inserts each
-`ld:` symbol, and the delete removes the embedding of the symbol too.
-Measured on an ESP32 project: 1805 symbols, about one minute of embedding
-work on each run that changed nothing.  Thus the pass keeps a fingerprint of
-its inputs in a state file next to the database, and it does not run when
-the fingerprint and the rows in the database did not change.
+`ld:` symbol.  The delete removes the embedding of the symbol too, and the
+embedding step of the run takes the vector back from the stash
+(`db/_embeddings.py`), thus a store costs the work of the store itself.
+Before the stash, it cost the embeddings too: measured on an ESP32 project,
+1805 symbols, about one minute of embedding work on each run that changed
+nothing.  The pass keeps a fingerprint of its inputs in a state file next
+to the database, and it does not run when the fingerprint and the rows in
+the database did not change.
 
 The state file is not in the database, so that the schema stays as it is.
 It is only a hint: the pass compares its counts with the database before it

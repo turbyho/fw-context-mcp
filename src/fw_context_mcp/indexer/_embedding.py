@@ -77,7 +77,9 @@ def _take_from_stash(conn, rows: list, model: str, config_hash: str, dim: int, d
     """Store the stashed vectors of each row whose key the stash holds; return the other rows.
 
     A re-parse inserts each symbol again with a new id, and the store put
-    the old vectors into the stash (``stash_embeddings_for_files``).  A row
+    the old vectors into the stash (``stash_embeddings_for_files``).  The
+    assembly and linker script passes do the same for their ``asm:`` and
+    ``ld:`` symbols (``stash_embeddings_for_symbols``).  A row
     whose ``(model, content_hash, is_project)`` is in the stash gets the
     chunks of that donor, and the model is not called.  The description of
     the row is the description of the donor: ``content_hash`` holds each

@@ -30,6 +30,7 @@ __all__ = [
     "search_similar_vec",
     "search_similar_vec_all",
     "stash_embeddings_for_files",
+    "stash_embeddings_for_symbols",
     "take_stashed_embeddings",
     "upsert_embeddings",
     "upsert_embeddings_vec",
@@ -39,6 +40,7 @@ import logging
 import re
 import sqlite3
 import struct
+from typing import Literal
 
 from fw_context_mcp.indexer.db._schema import _table_exists
 from fw_context_mcp.indexer.db._symbols import search_symbols
@@ -493,10 +495,13 @@ def search_similar_hybrid(
 # on an ESP32 project: 725 symbols of one re-parsed unit, each with the same
 # content hash as before the re-parse.
 #
-# The store copies the vectors aside before it deletes the symbols, and the
-# embedding step takes a vector from here when the key of a new symbol is
-# equal.  The key is (model, content_hash, is_project): is_project selects the
-# docstring of the description and is not in content_hash.
+# The store of a unit copies the vectors aside before it deletes the symbols
+# (stash_embeddings_for_files), and so do the assembly and linker script
+# passes before they write their asm: and ld: symbols again
+# (stash_embeddings_for_symbols).  The embedding step takes a vector from
+# here when the key of a new symbol is equal.  The key is (model,
+# content_hash, is_project): is_project selects the docstring of the
+# description and is not in content_hash.
 #
 # The table has no foreign key: the symbol of a donor row is gone.  It is made
 # when first used, not in _SCHEMA: _derive_schema_version hashes the tables of
@@ -535,19 +540,41 @@ def stash_embeddings_for_files(conn: sqlite3.Connection, file_ids: list[int]) ->
     ``donor_id`` is the old symbol id: it keeps the chunks of one symbol
     together.
     """
-    if not file_ids or not _table_exists(conn, "embeddings"):
+    _stash(conn, "s.file_id", file_ids)
+
+
+def stash_embeddings_for_symbols(conn: sqlite3.Connection, symbol_ids: list[int]) -> None:
+    """Copy the embeddings of the symbols *symbol_ids* into the stash.
+
+    For the passes that clear their rows by USR namespace and not by file:
+    the assembly pass (``asm:``) writes each of its symbols again on each
+    run, and the linker script pass (``ld:``) after each change of its
+    inputs, also of the fw-context code.  Measured on an ESP32 project: one
+    such run of the linker pass sent 1804 unchanged symbols to the model.
+    """
+    _stash(conn, "s.id", symbol_ids)
+
+
+def _stash(conn: sqlite3.Connection, column: Literal["s.file_id", "s.id"], ids: list[int]) -> None:
+    """Copy the embeddings of the symbols whose *column* is in *ids* into the stash.
+
+    *column* is one of two fixed names, never input: ``s.file_id`` or ``s.id``.
+    """
+    if column not in ("s.file_id", "s.id"):
+        raise ValueError(f"no stash by {column!r}")
+    if not ids or not _table_exists(conn, "embeddings"):
         return
     for statement in _STASH_TABLE:
         conn.execute(statement)
-    for start in range(0, len(file_ids), 500):
-        chunk = file_ids[start:start + 500]
+    for start in range(0, len(ids), 500):
+        chunk = ids[start:start + 500]
         placeholders = ",".join("?" * len(chunk))
         conn.execute(
             f"""INSERT OR REPLACE INTO embedding_stash
                     (model, content_hash, is_project, donor_id, chunk_index, embedding)
                 SELECT e.model, e.content_hash, s.is_project, e.symbol_id, e.chunk_index, e.embedding
                 FROM embeddings e JOIN symbols s ON s.id = e.symbol_id
-                WHERE s.file_id IN ({placeholders}) AND e.content_hash != ''""",  # noqa: S608 — placeholders only
+                WHERE {column} IN ({placeholders}) AND e.content_hash != ''""",  # noqa: S608 — a fixed column and placeholders only
             chunk,
         )
 

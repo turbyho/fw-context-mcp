@@ -11,6 +11,8 @@ from __future__ import annotations
 from typing import Any
 from unittest import mock
 
+import pytest
+
 from fw_context_mcp.indexer._embedding import _build_embeddings, _take_from_stash
 from fw_context_mcp.indexer.db import (
     clear_embedding_stash,
@@ -197,6 +199,47 @@ def test_a_donor_with_a_gap_in_its_chunks_does_not_serve(populated_db, tmpdir):
     found = take_stashed_embeddings(conn, "m", {("m", "h1", 1)})
 
     assert found == {("m", "h1", 1): [(0, b"x")]}, "donor 5 has no chunk 1; donor 9 serves"
+
+
+def _seed_pass_symbol(conn: Connection, usr: str) -> None:
+    """One symbol of the assembly or the linker script pass, as the pass writes it."""
+    from fw_context_mcp.indexer.db._files import upsert_file
+
+    upsert_file(conn, CONFIG, "src/start.S", "c", False, 0.0)
+    file_id = conn.execute(
+        "SELECT id FROM files WHERE path = 'src/start.S' AND config_hash = ?", (CONFIG,),
+    ).fetchone()[0]
+    conn.execute(
+        """INSERT INTO symbols
+           (config_hash, file_id, file_path, name_tokens, usr, name, qualified_name,
+            kind, line, col, end_line, is_definition, signature, docstring, enum_value,
+            is_virtual, is_pure_virtual, parent_usr, is_template, template_usr,
+            is_project, pagerank, source)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (CONFIG, file_id, "src/start.S", "reset", usr, "reset_handler", "reset_handler",
+         "function", 1, 1, 3, 1, "", "", None, 0, 0, "", 0, "", 1, 0.0, "reset_handler:\n    b main\n"),
+    )
+    conn.commit()
+
+
+@pytest.mark.parametrize(("module", "usr"), [("asm", "asm:reset_handler"), ("linker_script", "ld:reset_handler")])
+def test_a_pass_that_writes_its_symbols_again_takes_the_stash(populated_db, tmpdir, module, usr):
+    """The assembly pass writes each symbol again on each run, the linker pass after a change."""
+    import importlib
+
+    conn = populated_db
+    _seed_pass_symbol(conn, usr)
+    fake = _FakeEmbedder()
+    _run(conn, fake, tmpdir)
+    first_calls = fake.calls
+    assert first_calls > 0
+
+    with transaction(conn):
+        importlib.import_module(f"fw_context_mcp.indexer.{module}")._clear_previous_pass(conn, CONFIG)
+    _seed_pass_symbol(conn, usr)
+    _run(conn, fake, tmpdir)
+
+    assert fake.calls == first_calls
 
 
 def test_clear_empties_the_stash(populated_db, tmpdir):

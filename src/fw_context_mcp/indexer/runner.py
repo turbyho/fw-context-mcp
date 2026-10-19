@@ -578,7 +578,8 @@ def _store_linker_scripts(
     ``builders._linker``.
 
     A run whose inputs did not change since the last full run stores
-    nothing, because each store removes the embeddings of the `ld:` rows.
+    nothing: a store deletes and inserts each `ld:` row (the embedding step
+    takes their vectors back from the stash, see ``_linker_pass``).
     *force* (``fw-context index --force``) always stores.  That run is the
     documented repair of an old index, and it computes every embedding
     again anyway, thus the skip would save nothing there.
