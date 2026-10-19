@@ -211,8 +211,13 @@ def suggest(
             if score > 0:
                 results.append((c, score))
 
-        # Sort by score descending, then by name length (shorter = less noise)
-        results.sort(key=lambda x: (-x[1], len(x[0])))
+        # Sort by score descending, then by name length (shorter = less noise),
+        # then by name.  WHY the name: the candidates came out of a set of
+        # tokens, whose order depends on the random hash seed of the process.
+        # Without it, candidates that tie kept that order, thus two server
+        # processes gave a different order, and at the limit a different
+        # name, for the same query over the same index.
+        results.sort(key=lambda x: (-x[1], len(x[0]), x[0]))
 
         matches = [r[0] for r in results[:limit]]
 

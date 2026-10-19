@@ -153,3 +153,42 @@ class TestSuggest:
         """Single-letter query may or may not return results."""
         result = suggest(populated_db, "hash-deadbeef", "x", limit=5)
         assert isinstance(result, list)
+
+
+class TestSuggestOrderIsStable:
+    """The same query over the same names gives the same suggestions in each process.
+
+    The candidates came out of a ``set`` of tokens, and the order of a set
+    of strings depends on the random hash seed of each process.  The sort
+    key (score, length) kept that order for candidates that tie, thus two
+    MCP server processes gave a different order, and at the limit a
+    different name (measured: ``println`` in one process, ``printTo`` in
+    the next, for the query ``prin``).
+    """
+
+    # Eight names with the same score and the same length, each with its
+    # own token: the limit of 5 cuts between candidates that tie.
+    _CHILD = (
+        "import json\n"
+        "from fw_context_mcp.search import did_you_mean as d\n"
+        "names = ['print' + c for c in 'hgfedcba']\n"
+        "d._load_names = lambda conn, config_hash: names\n"
+        "print(json.dumps(d.suggest(None, 'h', 'prin', limit=5)))\n"
+    )
+
+    def _suggest_in_process(self, seed: int) -> list[str]:
+        import json
+        import os
+        import subprocess  # noqa: S404 — the test runs its own interpreter
+        import sys
+
+        env = {**os.environ, "PYTHONHASHSEED": str(seed)}
+        out = subprocess.run(  # noqa: S603 — fixed program and code
+            [sys.executable, "-c", self._CHILD], env=env, capture_output=True, text=True, check=True, timeout=60,
+        ).stdout
+        return json.loads(out.strip().splitlines()[-1])
+
+    def test_the_hash_seed_does_not_change_the_suggestions(self):
+        results = {tuple(self._suggest_in_process(seed)) for seed in range(6)}
+
+        assert results == {("printa", "printb", "printc", "printd", "printe")}, results
