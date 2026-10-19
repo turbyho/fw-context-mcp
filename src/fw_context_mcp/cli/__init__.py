@@ -392,6 +392,14 @@ def main() -> None:
         "--no-analyze-vendor", action="store_true", dest="no_analyze_vendor",
         help="Skip vendor/SDK analysis (overrides config)",
     )
+    p_analyze.add_argument(
+        "--force-llm",
+        action="store_true",
+        dest="force_llm",
+        default=False,
+        help="Make the LLM analysis of each symbol again, and replace the entries of the cache, "
+        "as 'fw-context index --force-llm' does, without an index run",
+    )
     add_build_selector(p_analyze, "to analyze", each_build=True)
     p_analyze.set_defaults(func=cmd_analyze)
 

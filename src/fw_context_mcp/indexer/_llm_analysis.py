@@ -384,7 +384,7 @@ def _build_llm_analysis(
     makes the server load the model again.  A prompt that does not fit the
     trained context gets the sentinel ``skip:toolarge:<context>``.
 
-    *force_since* (``fw-context index --force-llm``) makes each analysis
+    *force_since* (``--force-llm`` of ``fw-context index`` and ``fw-context analyze``) makes each analysis
     again.  The stored analyses of the build and an entry of a cache from
     before that time do not apply, and the new analysis replaces the entry
     of the local cache.  An entry from after that time applies: a symbol

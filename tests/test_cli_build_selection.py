@@ -12,6 +12,8 @@ import argparse
 import re
 from pathlib import Path
 
+import pytest
+
 from tests.test_reindex_each_build import two_builds  # noqa: F401  (fixture)
 
 OLD = "2000-01-01 00:00:00"
@@ -382,3 +384,112 @@ def test_the_training_data_comes_from_a_completed_build(two_builds):  # noqa: F8
         assert conn.execute(_NEWEST_COMPLETED_BUILD).fetchone()[0] == _hash_of(root, "a")
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize(("results", "marker_kept"), [([True, True], False), ([True, False], True)])
+def test_analyze_force_llm_gives_each_build_one_time_and_keeps_an_unfinished_marker(
+    two_builds, monkeypatch, results, marker_kept,  # noqa: F811
+):
+    """`analyze --force-llm` makes each analysis again, as `index --force-llm`, without an index run."""
+    import fw_context_mcp.indexer._llm_analysis as llm_mod
+    from fw_context_mcp.cli._export import cmd_analyze
+    from fw_context_mcp.indexer import _force_llm_marker as marker
+
+    root, db_path = two_builds
+    _enable_llm(root)
+    since_values: list[str | None] = []
+    answers = list(results)
+
+    def build(conn, config_hash, *a, force_since=None, **k):
+        since_values.append(force_since)
+        return answers.pop(0)
+
+    monkeypatch.setattr(llm_mod, "_build_llm_analysis", build)
+    args = argparse.Namespace(project=str(root), verbose=False, analyze_vendor=False, no_analyze_vendor=False,
+                              force_llm=True)
+
+    assert cmd_analyze(args) == 0
+    assert len(since_values) == 2 and since_values[0] is not None and len(set(since_values)) == 1
+    assert (db_path.parent / marker.MARKER).exists() is marker_kept
+
+
+def test_analyze_waits_for_the_run_that_holds_the_index(two_builds, monkeypatch, capsys):  # noqa: F811
+    """Two operations on one project must not write its index at the same time.
+
+    Before, `analyze` took no index lock: it wrote analyses while an index
+    run replaced the symbols.  It never takes the index over: it says that
+    an index run holds the index, and waits for its end.
+    """
+    from contextlib import ExitStack
+
+    import fw_context_mcp.cli._export as export_mod
+    from fw_context_mcp.indexer.db._locking import index_run_lock
+
+    root, db_path = two_builds
+    _enable_llm(root)
+    holder = ExitStack()
+    holder.enter_context(index_run_lock(db_path.parent))
+    waits: list[float] = []
+
+    def run_ends(seconds: float) -> None:
+        waits.append(seconds)
+        holder.close()  # the index run that held the index ends
+
+    monkeypatch.setattr(export_mod.time, "sleep", run_ends)
+
+    code, analysed = _analyze(root, monkeypatch)
+
+    assert code == 0 and analysed, "after the end of the run, the analysis runs"
+    assert len(waits) == 1
+    assert "waits" in capsys.readouterr().err
+
+
+def test_the_llm_does_not_wait_for_analyze(two_builds, monkeypatch):  # noqa: F811
+    """`analyze` pauses the background reindex, and writes no reindex.pid.
+
+    The status tools read reindex.pid as an index run, and tell the LLM to
+    wait for it; an analysis does not change the index of the code.
+    """
+    import fw_context_mcp.indexer._llm_analysis as llm_mod
+    from fw_context_mcp.cli._export import cmd_analyze
+
+    root, db_path = two_builds
+    _enable_llm(root)
+    seen: list[tuple[bool, bool]] = []
+
+    def build(conn, config_hash, *a, **k):
+        seen.append(((db_path.parent / "reindex.pause").exists(), (db_path.parent / "reindex.pid").exists()))
+        return True
+
+    monkeypatch.setattr(llm_mod, "_build_llm_analysis", build)
+    args = argparse.Namespace(project=str(root), verbose=False, analyze_vendor=False, no_analyze_vendor=False)
+
+    assert cmd_analyze(args) == 0
+    assert seen and all(entry == (True, False) for entry in seen)
+
+
+def test_the_daemon_waits_for_analyze_also_without_the_pause_marker(two_builds, monkeypatch):  # noqa: F811
+    """A reindex_file replaces reindex.pause with its own PID and removes it at its end.
+
+    Before, the daemon then saw no marker during `analyze`, and started a
+    background run each 2 s, and each run ended on the index lock.
+    """
+    import fw_context_mcp.indexer._llm_analysis as llm_mod
+    from fw_context_mcp.cli._export import cmd_analyze
+    from fw_context_mcp.mcp.daemon import _index_held
+
+    root, db_path = two_builds
+    _enable_llm(root)
+    seen: list[bool] = []
+
+    def build(conn, config_hash, *a, **k):
+        (db_path.parent / "reindex.pause").unlink(missing_ok=True)  # as reindex_file leaves it
+        seen.append(_index_held(db_path.parent))
+        return True
+
+    monkeypatch.setattr(llm_mod, "_build_llm_analysis", build)
+    args = argparse.Namespace(project=str(root), verbose=False, analyze_vendor=False, no_analyze_vendor=False)
+
+    assert cmd_analyze(args) == 0
+    assert seen and all(seen)
+    assert not _index_held(db_path.parent), "after analyze, the index is free"

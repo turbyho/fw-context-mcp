@@ -78,6 +78,7 @@ from typing import TextIO
 from ..config import derive_project_id
 from ..config import load as load_config
 from ..exit_codes import EXIT_ALREADY_RUNNING, EXIT_SUPERSEDED
+from ..indexer.db._locking import index_run_lock_held
 from ..utils import HEADER_EXTENSIONS, TU_EXTENSIONS, remove_stale_tmp
 from .background import PENDING_MARKER
 from .shared.pid_file import PidFile
@@ -705,8 +706,19 @@ def _index_held(db_dir: Path) -> bool:
     Between two turns no run of this daemon owns either file: the run
     removes them when it ends, and ``_wait_index`` removes the files of a
     run that a kill stopped.
+
+    The index lock itself counts too (``index_run_lock_held``):
+    ``fw-context analyze`` holds it and writes no ``reindex.pid``, and a
+    ``reindex_file`` that replaced and removed ``reindex.pause`` left no
+    marker.  Before, the daemon then started a background run each 2 s,
+    and each one ended on the lock, for the whole analysis.  Between two
+    turns no run of this daemon holds the lock.
     """
-    return PidFile.is_active(db_dir / "reindex.pause") or PidFile.is_active(db_dir / "reindex.pid")
+    return (
+        PidFile.is_active(db_dir / "reindex.pause")
+        or PidFile.is_active(db_dir / "reindex.pid")
+        or index_run_lock_held(db_dir)
+    )
 
 
 async def _index_is_free(

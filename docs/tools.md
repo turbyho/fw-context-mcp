@@ -602,14 +602,23 @@ An export holds ONE build. `--variant` and `--image` select it as in
 
 Run LLM symbol analysis on an already-indexed project. This command is
 useful when the index was built with `--no-analyze` and you want to add
-analysis later. This command is also useful when you want to regenerate
-the analysis for all symbols.
+analysis later. Without options, it analyzes only the symbols that have
+no current analysis. To make the analysis of each symbol again, without
+an index run, use `--force-llm`. It does what `fw-context index
+--force-llm` does to the analysis, and the two continue each other.
 
 ```bash
 fw-context analyze                        # analyze current project
 fw-context analyze --project /path        # specific project
 fw-context analyze --variant nrf52840-dev --image app   # one build
+fw-context analyze --force-llm            # make each analysis again (takes hours on a large project)
 ```
+
+The command holds the index lock of the project, as `fw-context index`
+does. When an index run (also a background run) holds the index, the
+command says so and waits for its end: it never stops the run. While the
+command runs, the background reindex does not start. The status tools do
+not report the analysis as an index run, thus an LLM does not wait for it.
 
 Without `--variant` and `--image`, the command analyzes each build of the
 project, and prints one line for each build. The analysis is

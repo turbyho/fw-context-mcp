@@ -1,4 +1,4 @@
-"""The marker of a ``fw-context index --force-llm`` command that did not reach each symbol.
+"""The marker of a ``--force-llm`` command (``fw-context index`` or ``fw-context analyze``) that did not reach each symbol.
 
 A new LLM analysis of each symbol takes hours, and a run that a watchdog
 or a person stops is not rare, as is an Ollama server that stops during
@@ -8,7 +8,7 @@ model continues: an analysis from after that time comes from the local
 cache, and only the other symbols go to the model.  Without the marker,
 each new command began again from the first symbol.
 
-* The CLI writes the marker under the index lock (:func:`since_for`).
+* The two commands write the marker under the index lock (:func:`since_for`).
 * The analysis step of a build sets ``unfinished`` when it did not reach
   each symbol (:func:`mark_unfinished`): Ollama did not answer, or some
   symbols got no analysis.  A command can end with exit code 0 in that

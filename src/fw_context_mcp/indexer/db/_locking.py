@@ -29,6 +29,7 @@ __all__ = [
     "IndexRunLocked",
     "WriteLockTimeout",
     "index_run_lock",
+    "index_run_lock_held",
     "write_lock",
 ]
 
@@ -93,6 +94,31 @@ def index_run_lock(db_dir: Path) -> Generator[None, None, None]:
         if acquired:
             os.ftruncate(fd, 0)
             fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def index_run_lock_held(db_dir: Path) -> bool:
+    """Return True while another process holds :func:`index_run_lock` of *db_dir*.
+
+    A try of the lock that releases it at once.  WHY next to the markers
+    ``reindex.pause`` and ``reindex.pid``: a ``reindex_file`` or a
+    ``reset_index`` replaces ``reindex.pause`` with its own PID and removes
+    it at its end, and ``fw-context analyze`` writes no ``reindex.pid``.
+    The lock itself stays with its holder until the holder ends.
+    """
+    lock_file = db_dir / "index.lock"
+    try:
+        fd = os.open(lock_file, os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
         os.close(fd)
 
 

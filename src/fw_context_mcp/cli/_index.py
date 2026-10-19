@@ -751,6 +751,16 @@ def _index_run_kind(pid: int) -> str | None:
     return "background" if "--background" in argv else "foreground"
 
 
+def _is_analyze_run(pid: int) -> bool:
+    """Return True when *pid* is an ``fw-context analyze`` command, for the message of a refused run."""
+    argv = _process_argv(pid)
+    if not argv:
+        return False
+    return any(arg.endswith(("fw-context", "fw_context_mcp.cli", "fw_context_mcp")) for arg in argv) and (
+        "analyze" in argv
+    )
+
+
 def _signal_index_run(pid: int, sig: signal.Signals) -> None:
     """Send *sig* to *pid* when it is still an fw-context index run.
 
@@ -863,6 +873,10 @@ def _acquire_index(db_dir: Path, stack: ExitStack, args: argparse.Namespace) -> 
             raise
         kind = _index_run_kind(pid)
         if kind is None:
+            if _is_analyze_run(pid):
+                raise IndexRunLocked(
+                    db_dir, pid, hint="'fw-context analyze' holds the index; wait for its end"
+                ) from None
             raise
         if kind == "foreground" and not getattr(args, "takeover", False):
             raise IndexRunLocked(
@@ -917,7 +931,7 @@ def _wait_for_the_lock(db_dir: Path, stack: ExitStack, pid: int) -> bool:
 
 
 @contextmanager
-def _owned_index(db_dir: Path, args: argparse.Namespace) -> Iterator[None]:
+def _owned_index(db_dir: Path, args: argparse.Namespace, *, pid_marker: bool = True) -> Iterator[None]:
     """Own the index for the whole block: lock, markers, SIGTERM → superseded or terminated.
 
     The ONE place where ``cmd_index`` takes the index, for the single build
@@ -932,6 +946,12 @@ def _owned_index(db_dir: Path, args: argparse.Namespace) -> Iterator[None]:
     IndexTerminated and exits ``EXIT_TERMINATED``.  The handler ignores a
     second SIGTERM, so the unwinding itself is not interrupted.  On exit the
     handler, the markers and the lock are released in that order.
+
+    *pid_marker* False (``fw-context analyze``) writes ``reindex.pause`` and
+    not ``reindex.pid``: the status tools read ``reindex.pid`` as an index
+    run, and tell the LLM to wait for it.  An analysis does not change the
+    index of the code, thus the LLM must not wait for it.  The pause marker
+    still keeps the background reindex from starting.
 
     The handler goes in BEFORE the lock is taken.  The lock writes the PID
     of this run as soon as it is won, and a taker can read it and send its
@@ -979,7 +999,7 @@ def _owned_index(db_dir: Path, args: argparse.Namespace) -> Iterator[None]:
             # _release_index removes only the markers of this process, thus
             # it is safe for a marker that _claim_index did not write yet.
             stack.callback(_release_index, db_dir)
-            _claim_index(db_dir)
+            _claim_index(db_dir, pid_marker=pid_marker)
             # The index is ours now, thus a build that a dead owner left is
             # ours to stop, before this run builds in the same directory.
             _reap_orphan_build_group(db_dir)
@@ -1080,7 +1100,7 @@ def _reap_orphan_build_group(db_dir: Path) -> None:
     record.unlink(missing_ok=True)
 
 
-def _claim_index(db_dir: Path) -> None:
+def _claim_index(db_dir: Path, *, pid_marker: bool = True) -> None:
     """Write the pause marker and the pid marker.
 
     Call this function ONLY while the caller holds index_run_lock.  The pause
@@ -1092,7 +1112,8 @@ def _claim_index(db_dir: Path) -> None:
     the lock.
     """
     PidFile(db_dir / "reindex.pause").write()
-    PidFile(db_dir / "reindex.pid").write()
+    if pid_marker:
+        PidFile(db_dir / "reindex.pid").write()
 
 
 def _release_index(db_dir: Path) -> None:

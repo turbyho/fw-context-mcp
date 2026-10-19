@@ -296,7 +296,7 @@ def local_cache_upsert(conn: sqlite3.Connection, entries: list[dict], *, overwri
 
     Returns the number of rows written.
 
-    *overwrite* (``fw-context index --force-llm``) replaces an existing
+    *overwrite* (``--force-llm``) replaces an existing
     entry, and its ``analyzed_at`` gets the time of the write.  The person
     asked for a new analysis: without it, the old entry stays, and each
     later run reads the old analysis back from the cache.
