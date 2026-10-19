@@ -37,6 +37,7 @@ from pydantic import Field
 from ...config import ConfigError, derive_project_id
 from ...config import load as load_config
 from ...config.settings import Config
+from ...indexer import _index_owner as index_owner
 from ...indexer.autobuild import AutobuildState, build_advice, build_missing_reason
 from ...indexer.autobuild import clear_problem as clear_build_problem
 from ...indexer.autobuild import project_state as project_autobuild_state
@@ -67,6 +68,7 @@ from ...indexer.db import (
     symbols_without_embedding,
     transaction,
 )
+from ...indexer.db._locking import IndexRunLocked
 from ...indexer.git_context import head_moved, stored_head
 from ...llm.ollama import check_setup
 from ...utils import HEADER_EXTENSIONS, resolve_project_root
@@ -2210,6 +2212,13 @@ def reset_index(
         counts nothing and the three count fields are absent.
 
         On failure the dict holds only ``error`` with the reason.
+
+        When another process holds the index of the project, the tool
+        does nothing and ``error`` names it.  A manual ``fw-context index``
+        run adds ``index_state: "reindexing"``: wait for its end, then call
+        again.  For ``fw-context analyze``: call again after the analysis.
+        A background index run is no reason: the tool stops it, and the
+        daemon runs it again after the tool.
     """
     root = resolve_project_root(project_root)
     db_path = _db_path(root)
@@ -2267,37 +2276,43 @@ def reset_index(
         else:
             info["message"] = f"Would delete {db_path}. Call reset_index(confirm=True) to proceed."
         return info
-    from ..background import bg_reindex_pause
-
-    with bg_reindex_pause(root):
-        # Mandatory ordering:
-        # 1. The dry-run connection above is already closed (finally block).
-        # 2. Invalidate the executor BEFORE deleting the DB file —
-        #    otherwise it keeps a connection to an unlinked file and
-        #    every subsequent query silently reads stale data forever.
-        # 3. Only then delete the files.
-        invalidate_executor(str(db_path.resolve()))
-        db_path.unlink()
-        # WAL and SHM files are sidecar files managed by SQLite in WAL
-        # journal mode.  They must be deleted alongside the main DB file
-        # to prevent a zombie WAL from being replayed into a fresh index.
-        for suffix in ("-wal", "-shm", "-journal"):
-            p = db_path.with_name(db_path.name + suffix)
-            p.unlink(missing_ok=True)
-        # Both autobuild markers describe the index that just went away: why
-        # its last run stopped, and the files a build ran for and did not
-        # cover.  Left behind they would warn about, or hide, work on a
-        # fresh index that knows nothing about either.
-        from ...indexer import _force_llm_marker
-        from ...indexer.autobuild import clear_excluded, clear_problem
-        clear_problem(db_path.parent)
-        clear_excluded(db_path.parent)
-        # A --force-llm of the old index: its analyses went with the index.
-        _force_llm_marker.remove(db_path.parent)
-        from ...mcp.shared.stale import _invalidate_modified_cache
-        _invalidate_modified_cache()  # clear all entries — DB is gone
-        info["action"] = "deleted"
-        info["message"] = f"Index deleted. Run 'fw-context index' in {root} to rebuild."
+    # The index lock, as a manual index run holds it: a run of the project
+    # must not write into the database that this call removes.  Before, a
+    # pause marker let a run go on writing into the removed file.
+    try:
+        with index_owner.owned_by_operation(db_path.parent, log.info):
+            # Mandatory ordering:
+            # 1. The dry-run connection above is already closed (finally block).
+            # 2. Invalidate the executor BEFORE deleting the DB file —
+            #    otherwise it keeps a connection to an unlinked file and
+            #    every subsequent query silently reads stale data forever.
+            # 3. Only then delete the files.
+            invalidate_executor(str(db_path.resolve()))
+            db_path.unlink()
+            # WAL and SHM files are sidecar files managed by SQLite in WAL
+            # journal mode.  They must be deleted alongside the main DB file
+            # to prevent a zombie WAL from being replayed into a fresh index.
+            for suffix in ("-wal", "-shm", "-journal"):
+                p = db_path.with_name(db_path.name + suffix)
+                p.unlink(missing_ok=True)
+            # Both autobuild markers describe the index that just went away: why
+            # its last run stopped, and the files a build ran for and did not
+            # cover.  Left behind they would warn about, or hide, work on a
+            # fresh index that knows nothing about either.
+            from ...indexer import _force_llm_marker
+            from ...indexer.autobuild import clear_excluded, clear_problem
+            clear_problem(db_path.parent)
+            clear_excluded(db_path.parent)
+            # A --force-llm of the old index: its analyses went with the index.
+            _force_llm_marker.remove(db_path.parent)
+            from ...mcp.shared.stale import _invalidate_modified_cache
+            _invalidate_modified_cache()  # clear all entries — DB is gone
+            info["action"] = "deleted"
+            info["message"] = f"Index deleted. Run 'fw-context index' in {root} to rebuild."
+    except IndexRunLocked as exc:
+        return {**info, **_index_held_answer(
+            exc, "reset_index", str(db_path), after_analysis="call reset_index again after the analysis",
+        )}
     return info
 
 
@@ -2327,7 +2342,6 @@ def _reindex_cleanup_deleted_file(
     from ...indexer.db import get_file_mtimes, purge_file_records
     from ...indexer.db._locking import WriteLockTimeout
     from ...indexer.ops import _normalize_file_path
-    from ..background import bg_reindex_pause
 
     known = get_file_mtimes(conn, config_hash)
     file_path_str = _normalize_file_path(str(target), root)
@@ -2342,21 +2356,20 @@ def _reindex_cleanup_deleted_file(
     from ...mcp.shared.stale import _invalidate_modified_cache
     _invalidate_modified_cache(config_hash)
 
-    with bg_reindex_pause(root):
-        try:
-            # write_lock_held=False, transaction_held=False — this caller
-            # does NOT hold either; purge_file_records acquires its own.
-            purge_file_records(
-                conn, config_hash, file_id_old, file_path_str,
-                db_dir=db_path.parent,
-            )
-            return {
-                "file": str(target),
-                "symbols_removed": symbol_count,
-                "action": "deleted",
-            }
-        except WriteLockTimeout as e:
-            return {"error": f"Could not acquire write lock for cleanup of {target}: {e}", "action": "timeout"}
+    try:
+        # write_lock_held=False, transaction_held=False — this caller
+        # does NOT hold either; purge_file_records acquires its own.
+        purge_file_records(
+            conn, config_hash, file_id_old, file_path_str,
+            db_dir=db_path.parent,
+        )
+        return {
+            "file": str(target),
+            "symbols_removed": symbol_count,
+            "action": "deleted",
+        }
+    except WriteLockTimeout as e:
+        return {"error": f"Could not acquire write lock for cleanup of {target}: {e}", "action": "timeout"}
 
 
 def _reindex_parse_and_store(
@@ -2398,7 +2411,6 @@ def _reindex_parse_and_store(
         ExtractionResult,
         extract_all,
     )
-    from ..background import bg_reindex_pause
 
     config_hash = cfg_data["config_hash"]
     ownership = ownership or Ownership()
@@ -2459,95 +2471,94 @@ def _reindex_parse_and_store(
     from ...mcp.shared.stale import _invalidate_modified_cache
     _invalidate_modified_cache(config_hash)
 
-    with bg_reindex_pause(root):
-        t0 = time.monotonic()
-        total_symbols = 0
+    t0 = time.monotonic()
+    total_symbols = 0
 
-        try:
-            # Phase 2: acquire the write lock and store all parsed symbols
-            # in a single transaction per TU.  Each TU gets its own
-            # transaction so partial failures don't roll back all work.
-            with db_write_lock(db_path.parent, timeout=60.0):
-                # The header records of each store, for the manifest below:
-                # their hashes are the ones of the text that the parse read.
-                unit_headers: list[list[dict] | None] = []
-                # The parsed units that keep a file which they no longer
-                # claim: the next index run must parse them (see below).
-                keeps_lost_files: set[int] = set()
-                for index, ((unit, parsed), (key, skip)) in enumerate(
-                    zip(parsed_units, unit_claims, strict=True)
-                ):
-                    with transaction(conn):
-                        syms_added, _, headers = store_symbols_for_unit(
-                            conn, unit, config_hash, root,
-                            vendor_patterns=vendor_patterns,
-                            project_patterns=project_patterns_list,
-                            index_refs=cfg_refs,
-                            pre_parsed=parsed,
-                            skip_files=skip,
-                            listing=key,
-                        )
-                        total_symbols += syms_added
-                        # A file that this listing owned and does not claim
-                        # now goes, in the index run, to the next listing
-                        # that includes it.  This call parses no other
-                        # listing, thus the listing keeps the file and its
-                        # rows, and the next index run parses it again and
-                        # gives the file away (runner._settle_claims).
-                        # The same set as owned_paths of the store: the source
-                        # file only when no earlier listing claimed it.
-                        claimed = {
-                            _normalize_file_path(path, root) for path in parsed.newly_seen_files or ()
-                        }
-                        if not skip or str(unit.file.resolve()) not in skip:
-                            claimed.add(key[0])
-                        # A file in the skip set has an earlier owner: a
-                        # listing before this one, or one parsed in this call.
-                        kept = unclaimed(ownership.files_of(key) - claimed, skip or frozenset(), root)
-                        if kept:
-                            record_claims(conn, config_hash, key, claimed | kept)
-                            keeps_lost_files.add(index)
-                    unit_headers.append(headers)
+    try:
+        # Phase 2: acquire the write lock and store all parsed symbols
+        # in a single transaction per TU.  Each TU gets its own
+        # transaction so partial failures don't roll back all work.
+        with db_write_lock(db_path.parent, timeout=60.0):
+            # The header records of each store, for the manifest below:
+            # their hashes are the ones of the text that the parse read.
+            unit_headers: list[list[dict] | None] = []
+            # The parsed units that keep a file which they no longer
+            # claim: the next index run must parse them (see below).
+            keeps_lost_files: set[int] = set()
+            for index, ((unit, parsed), (key, skip)) in enumerate(
+                zip(parsed_units, unit_claims, strict=True)
+            ):
+                with transaction(conn):
+                    syms_added, _, headers = store_symbols_for_unit(
+                        conn, unit, config_hash, root,
+                        vendor_patterns=vendor_patterns,
+                        project_patterns=project_patterns_list,
+                        index_refs=cfg_refs,
+                        pre_parsed=parsed,
+                        skip_files=skip,
+                        listing=key,
+                    )
+                    total_symbols += syms_added
+                    # A file that this listing owned and does not claim
+                    # now goes, in the index run, to the next listing
+                    # that includes it.  This call parses no other
+                    # listing, thus the listing keeps the file and its
+                    # rows, and the next index run parses it again and
+                    # gives the file away (runner._settle_claims).
+                    # The same set as owned_paths of the store: the source
+                    # file only when no earlier listing claimed it.
+                    claimed = {
+                        _normalize_file_path(path, root) for path in parsed.newly_seen_files or ()
+                    }
+                    if not skip or str(unit.file.resolve()) not in skip:
+                        claimed.add(key[0])
+                    # A file in the skip set has an earlier owner: a
+                    # listing before this one, or one parsed in this call.
+                    kept = unclaimed(ownership.files_of(key) - claimed, skip or frozenset(), root)
+                    if kept:
+                        record_claims(conn, config_hash, key, claimed | kept)
+                        keeps_lost_files.add(index)
+                unit_headers.append(headers)
 
-                # Phase 3: resolve macro definitions after all TUs are stored.
-                # Macro resolution needs the clang flags from one TU (they
-                # are identical for TUs of the same file) and runs a
-                # best-effort pass — failure is silently ignored.
-                if parsed_units:
-                    try:
-                        from ...indexer.macros import resolve_and_update
-                        first_unit = parsed_units[0][0]
-                        resolve_and_update(conn, config_hash, first_unit.clang_args, first_unit.file.resolve(), cwd=root)
-                    except Exception:  # nosec B110 — macro expansion is best-effort
-                        pass
+            # Phase 3: resolve macro definitions after all TUs are stored.
+            # Macro resolution needs the clang flags from one TU (they
+            # are identical for TUs of the same file) and runs a
+            # best-effort pass — failure is silently ignored.
+            if parsed_units:
+                try:
+                    from ...indexer.macros import resolve_and_update
+                    first_unit = parsed_units[0][0]
+                    resolve_and_update(conn, config_hash, first_unit.clang_args, first_unit.file.resolve(), cwd=root)
+                except Exception:  # nosec B110 — macro expansion is best-effort
+                    pass
 
-                # Phase 4: clean up orphan files — files that existed in
-                # the previous index but are now absent from the TU list.
-                from ...indexer.db import delete_orphan_files
-                deleted_orphans = delete_orphan_files(conn, config_hash, root)
-                if deleted_orphans:
-                    log.debug("Orphan files cleaned up: %d", deleted_orphans)
+            # Phase 4: clean up orphan files — files that existed in
+            # the previous index but are now absent from the TU list.
+            from ...indexer.db import delete_orphan_files
+            deleted_orphans = delete_orphan_files(conn, config_hash, root)
+            if deleted_orphans:
+                log.debug("Orphan files cleaned up: %d", deleted_orphans)
 
-                _update_manifest_after_reindex(
-                    parsed_units, unit_headers, root, db_path.parent, config_hash,
-                    transient_defines=transient_defines, keeps_lost_files=keeps_lost_files,
-                )
+            _update_manifest_after_reindex(
+                parsed_units, unit_headers, root, db_path.parent, config_hash,
+                transient_defines=transient_defines, keeps_lost_files=keeps_lost_files,
+            )
 
-                elapsed = round(time.monotonic() - t0, 2)
-                result = {
-                    "file": str(target),
-                    "translation_units": len(matching),
-                    "symbols_updated": total_symbols,
-                    "elapsed_s": elapsed,
-                }
-                if skipped_tus:
-                    result["skipped_tus"] = skipped_tus
-                    result["skipped_count"] = len(skipped_tus)
-                if not parsed_units and skipped_tus:
-                    return 0, {"error": f"All {len(matching)} translation unit(s) failed to parse", "skipped_tus": skipped_tus}
-            return total_symbols, result
-        except (sqlite3.Error, WriteLockTimeout) as exc:
-            return 0, {"error": f"DB error during reindex: {exc}"}
+            elapsed = round(time.monotonic() - t0, 2)
+            result = {
+                "file": str(target),
+                "translation_units": len(matching),
+                "symbols_updated": total_symbols,
+                "elapsed_s": elapsed,
+            }
+            if skipped_tus:
+                result["skipped_tus"] = skipped_tus
+                result["skipped_count"] = len(skipped_tus)
+            if not parsed_units and skipped_tus:
+                return 0, {"error": f"All {len(matching)} translation unit(s) failed to parse", "skipped_tus": skipped_tus}
+        return total_symbols, result
+    except (sqlite3.Error, WriteLockTimeout) as exc:
+        return 0, {"error": f"DB error during reindex: {exc}"}
 
 def _entries_for_listings(entries: list[dict], listings: list[tuple[str, str]]) -> list[int | None]:
     """Return the manifest entry that each parsed listing refreshes.
@@ -3149,6 +3160,14 @@ def reindex_file(
         On failure the dict holds ``error`` with the reason: a refusal of
         the selector, no build that compiles the file, or an update that
         failed in each build.  It can add ``skipped_tus`` or ``action``.
+
+        When another process holds the index of the project, the tool
+        does nothing and ``error`` names it.  A manual ``fw-context index``
+        run adds ``index_state: "reindexing"``: wait for its end, then call
+        again.  ``fw-context analyze`` does not change the index of the
+        code: do not wait for it; the index of the file stays old until an
+        index run reads it.  A background index run is no reason: the tool
+        stops it, and the daemon runs it again after the tool.
     """
     db_path, cfg, project_id, root = _resolve_context(project_root, skip_ready_check=True)
     if not db_path.exists():
@@ -3157,35 +3176,80 @@ def reindex_file(
     if error:
         return error
 
-    builds, refusal = _reindex_builds(db_path, project_id, cfg, variant or "", image or "", root)
-    if refusal:
-        return {"error": refusal}
-    if not builds:
-        return {"error": "No build config indexed."}
-
     executor = get_executor(db_path)
     t0 = time.monotonic()
     answers: list[tuple[sqlite3.Row, dict | None]] = []
+    # The index lock for the whole operation, as a manual index run holds
+    # it (see index_owner.owned_by_operation): the choice of the builds,
+    # every build, the graph, analysis and embedding phases, and the
+    # optimize.  The builds are read under the lock: a `db delete` could
+    # remove one between the read and the lock.
     try:
-        # One call of the executor for each build: its lock is free between
-        # two builds, thus a query of another tool does not wait for all of
-        # them.
-        for build in builds:
-            answers.append((build, executor.execute_sync(
-                _reindex_one_build, build["config_hash"],
-                build, target, cfg, root, db_path, with_analysis,
-            )))
-    finally:
-        # Best-effort statistics refresh after the write.  Runs through
-        # the executor so it serializes with other queries.
-        def _optimize(conn, _ch):
-            conn.execute("PRAGMA optimize")
+        with index_owner.owned_by_operation(db_path.parent, log.info):
+            builds, refusal = _reindex_builds(db_path, project_id, cfg, variant or "", image or "", root)
+            if refusal:
+                return {"error": refusal}
+            if not builds:
+                return {"error": "No build config indexed."}
+            try:
+                # One call of the executor for each build: its lock is free
+                # between two builds, thus a query of another tool does not
+                # wait for all of them.
+                for build in builds:
+                    answers.append((build, executor.execute_sync(
+                        _reindex_one_build, build["config_hash"],
+                        build, target, cfg, root, db_path, with_analysis,
+                    )))
+            finally:
+                # Best-effort statistics refresh after the write.  Runs
+                # through the executor so it serializes with other queries.
+                def _optimize(conn, _ch):
+                    conn.execute("PRAGMA optimize")
 
-        try:
-            executor.execute_sync(_optimize, builds[0]["config_hash"])
-        except sqlite3.Error:
-            pass
+                try:
+                    executor.execute_sync(_optimize, builds[0]["config_hash"])
+                except sqlite3.Error:
+                    pass
+    except IndexRunLocked as exc:
+        return _index_held_answer(
+            exc, "reindex_file", str(target),
+            after_analysis=(
+                "continue; the index of the file stays old until an index run reads it "
+                "(the background reindex after the analysis, where the daemon watches the project, "
+                "or 'fw-context index')"
+            ),
+        )
     return _reindex_answer(target, answers, round(time.monotonic() - t0, 2))
+
+
+def _index_held_answer(exc: IndexRunLocked, tool: str, subject: str, *, after_analysis: str) -> dict:
+    """Return the answer of *tool* when another process holds the index of the project.
+
+    A manual ``fw-context index`` run changes the index: the answer gets
+    ``index_state: "reindexing"``, and the LLM waits for it and calls again.
+    ``fw-context analyze`` does not change the index of the code, thus the
+    answer has no ``index_state``, and *after_analysis* tells the LLM what
+    to do: it depends on the tool.  Another tool of this server is short:
+    call again.
+    """
+    kind = index_owner.holder_kind(exc.holder_pid)
+    holder = f"pid {exc.holder_pid}" if exc.holder_pid else "another process"
+    if kind == "index":
+        return {
+            "error": f"a manual 'fw-context index' run ({holder}) holds the index; {tool} did not run for {subject}",
+            "index_state": "reindexing",
+            "index_warning": "An index run updates the index. Wait for its end, then call again.",
+        }
+    if kind == "analyze":
+        return {
+            "error": (
+                f"'fw-context analyze' ({holder}) holds the index; {tool} did not run for {subject}. "
+                f"The analysis does not change the index of the code: {after_analysis}"
+            ),
+        }
+    return {
+        "error": f"another operation ({holder}) holds the index; {tool} did not run for {subject}. Call again",
+    }
 
 
 def _reindex_builds(

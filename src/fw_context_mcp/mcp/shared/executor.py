@@ -213,7 +213,7 @@ class SyncQueryExecutor:
         - The pid-file transition catches each index run that a check
           saw, of the daemon and of the operator.  Each ``fw-context
           index`` run writes ``reindex.pid`` when it holds the index lock
-          (``cli._index._claim_index``) and removes it when it ends.
+          (``indexer._index_owner.claim_index``) and removes it when it ends.
         - The identity change catches a run that no check saw.  Such a
           run produces a new DB file (different inode) or overwrites the
           existing one (same inode, different mtime).

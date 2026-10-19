@@ -698,20 +698,19 @@ async def _reindex_loop(
 def _index_held(db_dir: Path) -> bool:
     """Return True while another process holds the index.
 
-    ``reindex.pause``: ``reindex_file`` and ``reset_index`` of an MCP
-    server write it, and each ``fw-context index`` run.  ``reindex.pid``:
+    ``reindex.pause``: each process that holds the index lock writes it
+    (``fw-context index``, ``fw-context analyze``, the MCP tools
+    ``reindex_file`` and ``reset_index``, ``fw-context db``).  ``reindex.pid``:
     each ``fw-context index`` run writes it when it holds the index lock
-    (``cli._index._claim_index``), also a run that holds no pause marker
-    any more because a ``reindex_file`` replaced it and then removed it.
+    (``indexer._index_owner.claim_index``).
     Between two turns no run of this daemon owns either file: the run
     removes them when it ends, and ``_wait_index`` removes the files of a
     run that a kill stopped.
 
     The index lock itself counts too (``index_run_lock_held``):
-    ``fw-context analyze`` holds it and writes no ``reindex.pid``, and a
-    ``reindex_file`` that replaced and removed ``reindex.pause`` left no
-    marker.  Before, the daemon then started a background run each 2 s,
-    and each one ended on the lock, for the whole analysis.  Between two
+    ``fw-context analyze`` holds it and writes no ``reindex.pid``.  Before,
+    a marker that another process removed left the daemon starting a
+    background run each 2 s, and each one ended on the lock.  Between two
     turns no run of this daemon holds the lock.
     """
     return (
@@ -1005,7 +1004,7 @@ async def _run_index_async(
     exclusive" in under a second.
 
     WHY the daemon writes no ``reindex.pid``: the run writes it when it
-    holds the index lock (``cli._index._claim_index``), and removes it when
+    holds the index lock (``indexer._index_owner.claim_index``), and removes it when
     it releases the lock.  A file that the daemon wrote before the spawn
     named a run that could lose the lock to a manual run, and the daemon
     then overwrote the file of that manual run.  Until the run holds the

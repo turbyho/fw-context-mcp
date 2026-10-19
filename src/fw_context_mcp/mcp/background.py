@@ -20,13 +20,13 @@ Key design decisions:
   time when no daemon watched: the structural reasons, files that changed,
   a checkout and new source files.  watchfiles finds only NEW changes.
 
-- **Pause/resume protocol**: before an MCP tool writes to the index
-  (reindex_file), it calls ``_request_bg_reindex_pause`` to prevent
-  the daemon's background reindex from holding the write lock.  The pause
-  marker is a PID file — if the requesting process dies, the daemon detects
-  the stale marker and resumes automatically.  This is safe because the
-  background reindex checks the marker BETWEEN translation units, not
-  mid-operation.
+- **The index lock of a project**: each writer of the index holds it
+  (``indexer._index_owner``): an index run, ``fw-context analyze``, the MCP
+  tools ``reindex_file`` and ``reset_index``, and ``fw-context db``.  A
+  manual operation takes the index over from a background run; the daemon
+  waits while another process holds the index (``daemon._index_held``).
+  Before, an MCP tool only wrote a pause marker, which a running index run
+  checked between two translation units.
 """
 
 from __future__ import annotations
@@ -37,7 +37,6 @@ import os
 import re
 import subprocess
 import sys
-from contextlib import contextmanager
 from pathlib import Path
 
 from .shared.context import _db_path
@@ -84,7 +83,7 @@ def _is_bg_reindex_running(root: Path) -> bool:
 
     1. ``<db_dir>/<project_id>/reindex.pid`` — each ``fw-context index``
        run writes it when it holds the index lock
-       (``cli._index._claim_index``), the run that the daemon started
+       (``indexer._index_owner.claim_index``), the run that the daemon started
        included, and removes it when it releases the lock.  A stale file
        (PID not alive) is cleaned up.
     2. ``<db_dir>/write.lock`` — held during write operations
@@ -281,57 +280,3 @@ def _ensure_daemon_running(root: Path) -> None:
 
     fcntl.flock(lock_fd, fcntl.LOCK_UN)
     os.close(lock_fd)
-
-# ── _request_bg_reindex_pause (was at server.py:414) ──
-def _request_bg_reindex_pause(root: Path) -> None:
-    """Signal the background reindex to release the write lock.
-
-    Writes ``<pid>`` to ``<db_dir>/<project_id>/reindex.pause`` so the
-    bg reindex can check whether the requesting process is still alive.
-    The bg process checks this marker between translation units — if the
-    requesting PID is dead, it ignores the stale marker and continues.
-    """
-    db_path = _db_path(root)
-    PidFile(db_path.parent / "reindex.pause").write()
-
-# ── _resume_bg_reindex (was at server.py:430) ──
-def _resume_bg_reindex(root: Path) -> None:
-    """Remove the pause marker — the bg reindex may now resume.
-
-    Only removes the marker when it was written by this process.
-    A concurrent caller (e.g. ``fw-context index --force``) may have
-    overwritten the marker with its own PID — in that case the marker
-    must stay so the bg reindex remains paused for that caller.
-    """
-    db_path = _db_path(root)
-    PidFile(db_path.parent / "reindex.pause").unlink_if_ours()
-
-
-# ── bg_reindex_pause — context manager for safe pause/resume ──
-@contextmanager
-def bg_reindex_pause(root: Path):
-    """Context manager: pause background reindex, auto-resume on exit.
-
-    Safe for early returns, exceptions — resume always runs in finally.
-    Usage::
-
-        with bg_reindex_pause(root):
-            ...  # critical section — bg reindex is paused
-    """
-    _request_bg_reindex_pause(root)
-    try:
-        yield
-    finally:
-        _resume_bg_reindex(root)
-
-# ── _check_bg_pause (was at server.py:440) ──
-def _check_bg_pause(root: Path) -> bool:
-    """Check whether a pause was requested and the requester is still alive.
-
-    Returns True if the bg reindex should pause (pause marker exists AND
-    the requesting PID is still running).  Returns False if there is no
-    pause marker or the requesting process has died (stale marker —
-    cleaned up automatically).
-    """
-    db_path = _db_path(root)
-    return PidFile.is_active(db_path.parent / "reindex.pause")

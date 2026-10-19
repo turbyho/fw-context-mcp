@@ -39,7 +39,10 @@ class WriteLockTimeout(RuntimeError):
 
 
 class IndexRunLocked(RuntimeError):
-    """Another indexing run already owns this index directory.
+    """Another process holds the index lock of this index directory.
+
+    An index run, ``fw-context analyze``, an MCP tool that writes the index,
+    or ``fw-context db``: within one project each writer holds the lock.
 
     Carries the PID recorded by the holder, for the message only — the
     exclusion itself comes from the kernel, not from the PID.
@@ -48,7 +51,7 @@ class IndexRunLocked(RuntimeError):
     def __init__(self, db_dir: Path, holder_pid: int | None, hint: str = "") -> None:
         self.holder_pid = holder_pid
         who = f"pid {holder_pid}" if holder_pid else "another process"
-        message = f"an index run is already in progress for {db_dir} ({who})"
+        message = f"the index {db_dir} is in use ({who})"
         super().__init__(f"{message} — {hint}" if hint else message)
 
 
@@ -101,10 +104,10 @@ def index_run_lock_held(db_dir: Path) -> bool:
     """Return True while another process holds :func:`index_run_lock` of *db_dir*.
 
     A try of the lock that releases it at once.  WHY next to the markers
-    ``reindex.pause`` and ``reindex.pid``: a ``reindex_file`` or a
-    ``reset_index`` replaces ``reindex.pause`` with its own PID and removes
-    it at its end, and ``fw-context analyze`` writes no ``reindex.pid``.
-    The lock itself stays with its holder until the holder ends.
+    ``reindex.pause`` and ``reindex.pid``: ``fw-context analyze`` writes no
+    ``reindex.pid``, and a marker can name a process that stopped while the
+    lock went to another one.  The lock itself stays with its holder until
+    the holder ends.
     """
     lock_file = db_dir / "index.lock"
     try:

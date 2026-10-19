@@ -29,15 +29,14 @@ import logging
 import os
 import signal
 import sys
-import time
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..indexer import _force_llm_marker as force_llm_marker
+from ..indexer import _index_owner as index_owner
 from ..indexer import autobuild
-from ..mcp.shared.pid_file import PidFile
 from ..utils import (
     SAFE_EXCEPT,
     build_dir_patterns_with_fw_context,
@@ -681,253 +680,30 @@ def _validate_and_fix_artifacts(
     return compile_commands, build_dir_patterns, True
 
 
-# How long a run that was asked to stop (SIGTERM) gets to release the index
-# lock, and how long a run that got SIGKILL gets after that.  A cooperative
-# run stops at its next translation unit or at the next Python bytecode after
-# a C call returns — a single libclang parse or an HTTP request to Ollama can
-# hold it for longer than that, which is what SIGKILL is for.
-_TAKEOVER_GRACE_S = 10.0
-_KILL_GRACE_S = 5.0
+# The ownership of the index lives in indexer/_index_owner.py; the names
+# below keep the callers and the tests of this module.
+_TAKEOVER_MARKER = index_owner.TAKEOVER_MARKER
+_process_argv = index_owner.process_argv
+_index_run_kind = index_owner.index_run_kind
+_is_analyze_run = index_owner.is_analyze_run
+_write_takeover_marker = index_owner.write_takeover_marker
+_taken_over = index_owner.taken_over
+_claim_index = index_owner.claim_index
+_release_index = index_owner.release_index
 
 
-def _process_argv(pid: int) -> list[str] | None:
-    """Return the argv of *pid*, or None when it cannot be read.
-
-    ``/proc/<pid>/cmdline`` where it exists (Linux).  Elsewhere — macOS has no
-    ``/proc`` — ``ps -o command=``.  The ``/proc``-only version answered None
-    for every process on macOS, so no index run was ever recognised there and
-    the takeover never happened.
-
-    ``ps`` joins argv with spaces, so an argument that contains a space is
-    split.  The caller only looks for whole words (``index``,
-    ``--background``) and for a program name suffix, which a split does not
-    create.
-    """
-    proc_cmdline = Path(f"/proc/{pid}/cmdline")
-    try:
-        # /proc joins argv with NULs.
-        return [arg for arg in proc_cmdline.read_bytes().decode(errors="replace").split("\0") if arg]
-    except FileNotFoundError:
-        if Path("/proc/self").exists():
-            return None  # /proc works, so the process is gone
-    except OSError:
-        return None
-
-    import subprocess
-
-    try:
-        result = subprocess.run(  # noqa: S603 — fixed argv, no shell
-            ["ps", "-o", "command=", "-p", str(pid)],
-            capture_output=True, text=True, timeout=5, check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if result.returncode != 0:
-        return None
-    return result.stdout.split() or None
-
-
-def _index_run_kind(pid: int) -> str | None:
-    """Return ``"background"`` or ``"foreground"`` for an fw-context index run.
-
-    None for anything else: a dead PID, a recycled PID that now belongs to an
-    unrelated process, another fw-context subcommand.  Only an index run may
-    ever be signalled — a stale PID naming an unrelated service must not take
-    it out.
-
-    WHY the argv and not the process name: this used to compare
-    ``/proc/<pid>/comm`` against ``("fw-context", "python", "python3")``.  A
-    virtualenv interpreter is named for its version — ``python3.14`` here —
-    so the comparison never matched.  Observed exactly that: a run started at
-    16:42 was still going when a second one started at 17:04.
-    """
-    argv = _process_argv(pid)
-    if not argv:
-        return None
-    if not any(arg.endswith(("fw-context", "fw_context_mcp.cli", "fw_context_mcp")) for arg in argv):
-        return None
-    if "index" not in argv:
-        return None
-    return "background" if "--background" in argv else "foreground"
-
-
-def _is_analyze_run(pid: int) -> bool:
-    """Return True when *pid* is an ``fw-context analyze`` command, for the message of a refused run."""
-    argv = _process_argv(pid)
-    if not argv:
-        return False
-    return any(arg.endswith(("fw-context", "fw_context_mcp.cli", "fw_context_mcp")) for arg in argv) and (
-        "analyze" in argv
-    )
-
-
-def _signal_index_run(pid: int, sig: signal.Signals) -> None:
-    """Send *sig* to *pid* when it is still an fw-context index run.
-
-    Checked again right before each signal: the PID was read from the lock
-    file earlier, and the process may have exited and the PID been reused
-    since.
-    """
-    if _index_run_kind(pid) is None:
-        return
-    try:
-        os.kill(pid, sig)
-    except ProcessLookupError:
-        pass
-
-
-# The marker that tells a run which SIGTERM is a takeover.  A signal handler
-# cannot see the sender of a signal (Python gives it no siginfo), thus the run
-# that takes over writes this file BEFORE it sends SIGTERM.  Without it, each
-# SIGTERM read as a takeover: a CI timeout or a `kill` printed "Superseded"
-# and exited 75, and the daemon retried work that somebody wanted stopped.
-_TAKEOVER_MARKER = "reindex.takeover"
-
-
-def _write_takeover_marker(db_dir: Path, victim: int) -> None:
-    """Write ``{"taker": <this PID>, "victim": <victim>}`` atomically.
-
-    Atomic, because the victim reads it in its signal handler at any time
-    after the signal.  The victim is named, thus a SIGTERM that a different
-    run gets at the same time does not read as a takeover.
-
-    Another marker than ``reindex.pause`` and ``reindex.pid``.  The rule
-    "write nothing before the lock is won" (see _acquire_index) keeps those
-    two from naming a run that lost.  No code reads this file except the
-    victim, and only to classify a signal, thus a run that loses harms
-    nothing with it.
-    """
-    marker = db_dir / _TAKEOVER_MARKER
-    temporary = marker.with_name(f".{marker.name}.{os.getpid()}")
-    temporary.write_text(json.dumps({"taker": os.getpid(), "victim": victim}), encoding="utf-8")
-    os.replace(temporary, marker)
-
-
-def _remove_takeover_marker(db_dir: Path) -> None:
-    """Remove the takeover marker when this process wrote it."""
-    marker = db_dir / _TAKEOVER_MARKER
-    if _read_takeover_marker(marker).get("taker") == os.getpid():
-        marker.unlink(missing_ok=True)
-
-
-def _read_takeover_marker(marker: Path) -> dict[str, int]:
-    """Return the marker as a dict, or an empty dict when it is missing or bad."""
-    try:
-        data = json.loads(marker.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    if not isinstance(data, dict):
-        return {}
-    return {key: value for key, value in data.items() if isinstance(value, int)}
-
-
-def _taken_over(db_dir: Path) -> bool:
-    """Return True when a process that still runs takes the index from this process.
-
-    The check is that the taker runs, not that it is an index run (see
-    _index_run_kind): that check reads the argv, and a signal handler must
-    stay short and must not start ``ps`` on macOS.  The rest risk is a
-    marker that a dead taker left, whose PID the system gave to another
-    process, and that names THIS process as the victim.  Then a foreign
-    SIGTERM reads as a takeover, and the run exits 75 instead of 143.
-    """
-    data = _read_takeover_marker(db_dir / _TAKEOVER_MARKER)
-    taker = data.get("taker")
-    if data.get("victim") != os.getpid() or taker is None or taker == os.getpid():
-        return False
-    return PidFile._pid_exists(taker)
+def _say(line: str) -> None:
+    print(line, file=sys.stderr)
 
 
 def _acquire_index(db_dir: Path, stack: ExitStack, args: argparse.Namespace) -> None:
-    """Enter ``index_run_lock`` on *stack*, taking the index over if needed.
-
-    A manual run always wins over a background one: the daemon starts those
-    and starts another when the work is still needed (the killed run exits
-    ``EXIT_SUPERSEDED``, which the daemon retries).  A manual run wins over
-    another MANUAL run only with ``--takeover`` — that one belongs to a person.
-    A background run takes over nothing.
-
-    The takeover asks first: SIGTERM makes the holder raise IndexSuperseded
-    (see _owned_index), which unwinds its ``finally`` blocks and drops the
-    markers and the lock.  A holder that does not release the lock within
-    _TAKEOVER_GRACE_S — stuck in a long C call, or in a handler that
-    swallowed the exception — gets SIGKILL.  The kernel drops a flock
-    however the process exits.
-
-    Writes nothing before the lock is won.  A run that wrote the pause marker
-    and then lost the lock would leave a marker naming a live process, and
-    the run that won would read it as "somebody took the index over" and
-    abandon itself — see _claim_index().
-
-    Raises IndexRunLocked when the holder may not be taken over, when it
-    survived SIGKILL, or when a third process won the lock in between.
-    """
-    from ..indexer.db._locking import IndexRunLocked, index_run_lock
-
-    try:
-        stack.enter_context(index_run_lock(db_dir))
-        return
-    except IndexRunLocked as exc:
-        pid = exc.holder_pid
-        if getattr(args, "background", False) or pid is None or pid == os.getpid():
-            raise
-        kind = _index_run_kind(pid)
-        if kind is None:
-            if _is_analyze_run(pid):
-                raise IndexRunLocked(
-                    db_dir, pid, hint="'fw-context analyze' holds the index; wait for its end"
-                ) from None
-            raise
-        if kind == "foreground" and not getattr(args, "takeover", False):
-            raise IndexRunLocked(
-                db_dir, pid, hint="a foreground run; use --takeover to terminate it and index anyway"
-            ) from None
-
-    print(f"Taking over the index from pid {pid} ({kind} run)", file=sys.stderr)
-    # The marker stays until this run releases the index, not only until it
-    # wins the lock.  A holder that released the lock before the signal
-    # arrived reads the marker in its handler after that, and the marker
-    # must still be there, or that holder takes the signal as a foreign one
-    # and dies (see _SigtermOutsideTheLock).
-    _write_takeover_marker(db_dir, pid)
-    won = False
-    try:
-        _signal_index_run(pid, signal.SIGTERM)
-        won = _wait_for_the_lock(db_dir, stack, pid)
-    finally:
-        if won:
-            stack.callback(_remove_takeover_marker, db_dir)
-        else:
-            _remove_takeover_marker(db_dir)
-    if not won:
-        raise IndexRunLocked(db_dir, pid, hint="it did not release the index even after SIGKILL")
-
-
-def _wait_for_the_lock(db_dir: Path, stack: ExitStack, pid: int) -> bool:
-    """Wait for *pid* to release the lock after SIGTERM, then SIGKILL it.
-
-    Returns True when this process holds the lock on *stack*, and False
-    when *pid* survived SIGKILL.  Raises IndexRunLocked when a third
-    process won the lock in between.
-    """
-    from ..indexer.db._locking import IndexRunLocked, index_run_lock
-
-    for grace, escalate in ((_TAKEOVER_GRACE_S, True), (_KILL_GRACE_S, False)):
-        deadline = time.monotonic() + grace
-        while time.monotonic() < deadline:
-            try:
-                stack.enter_context(index_run_lock(db_dir))
-                return True
-            except IndexRunLocked as again:
-                # None: the holder is between truncating its PID and
-                # unlocking, or a new holder has not written its PID yet.
-                if again.holder_pid not in (pid, None):
-                    raise
-            time.sleep(0.1)
-        if escalate:
-            print(f"  pid {pid} did not stop within {grace:.0f}s — sending SIGKILL", file=sys.stderr)
-            _signal_index_run(pid, signal.SIGKILL)
-    return False
+    """Take the index for a CLI command: see :func:`index_owner.acquire_index`."""
+    index_owner.acquire_index(
+        db_dir, stack,
+        background=bool(getattr(args, "background", False)),
+        takeover=bool(getattr(args, "takeover", False)),
+        say=_say,
+    )
 
 
 @contextmanager
@@ -1098,31 +874,6 @@ def _reap_orphan_build_group(db_dir: Path) -> None:
     )
     stop_process_group(pgid)
     record.unlink(missing_ok=True)
-
-
-def _claim_index(db_dir: Path, *, pid_marker: bool = True) -> None:
-    """Write the pause marker and the pid marker.
-
-    Call this function ONLY while the caller holds index_run_lock.  The pause
-    marker stops the file-watcher daemon from starting a background run, and
-    the pid marker tells every other process which run owns the index.  Both
-    are claims, and a process that lost the lock owns nothing.
-
-    Creates no directory: index_run_lock already does that before it takes
-    the lock.
-    """
-    PidFile(db_dir / "reindex.pause").write()
-    if pid_marker:
-        PidFile(db_dir / "reindex.pid").write()
-
-
-def _release_index(db_dir: Path) -> None:
-    """Drop the markers this process wrote, and only those.
-
-    unlink_if_ours checks the PID, so a marker another run owns survives.
-    """
-    PidFile(db_dir / "reindex.pid").unlink_if_ours()
-    PidFile(db_dir / "reindex.pause").unlink_if_ours()
 
 
 def _post_index_optimize(

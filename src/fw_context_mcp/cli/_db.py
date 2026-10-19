@@ -19,7 +19,9 @@ build of the project, which is not one build that the queries read.
 from __future__ import annotations
 
 import argparse
-import os
+import sys
+from collections.abc import Callable
+from pathlib import Path
 
 #: The marker of a row that the queries of its build read.
 QUERIED_FOOTER = "* = the row that the queries of its build read"
@@ -241,18 +243,16 @@ def cmd_db_delete(args: argparse.Namespace) -> int:
     of several builds has its own queries, and the guard protected only the
     build that the last index run wrote.
 
-    WHY pause file during --all delete: the background reindex daemon may
-    try to write to the database while we delete it.  Writing a
-    ``reindex.pause`` file signals the daemon to pause, preventing race
-    conditions between delete and auto-reindex.
+    WHY the index lock (``_under_index_lock``): an index run of the
+    project must not write the database that the command deletes.  Before,
+    ``--all`` wrote only ``reindex.pause``, and a running index run went on
+    writing into the removed file.
     """
     from ..config import derive_project_id
     from ..config import load as load_config
     from ..indexer.db import (
-        delete_build_data,
         get_all_builds_for_project,
         open_db,
-        transaction,
     )
     from ..mcp.shared.stale import latest_builds
     from ..utils import resolve_project_root
@@ -292,32 +292,26 @@ def cmd_db_delete(args: argparse.Namespace) -> int:
                 print("Aborted.")
                 return 0
 
-        # Pause background reindex so it doesn't try to write while we delete
-        pause_file = db_path.parent / "reindex.pause"
-        try:
-            pause_file.write_text(str(os.getpid()), encoding="utf-8")
-        except OSError:
-            pass
-        try:
-            # Delete DB files
-            db_path.unlink(missing_ok=True)
-            (db_path.parent / (db_path.name + "-wal")).unlink(missing_ok=True)
-            (db_path.parent / (db_path.name + "-shm")).unlink(missing_ok=True)
-            # Clean up compile_commands artifacts
+        def _delete_all() -> int:
+            from ..indexer import _force_llm_marker
+            from ..indexer.autobuild import clear_excluded, clear_problem
             from ..indexer.runner import _cleanup_orphaned_cc_artifacts
 
+            db_path.unlink(missing_ok=True)
+            for suffix in ("-wal", "-shm", "-journal"):
+                (db_path.parent / (db_path.name + suffix)).unlink(missing_ok=True)
             _cleanup_orphaned_cc_artifacts(db_path, project_id)
-        finally:
-            try:
-                if pause_file.exists():
-                    content = pause_file.read_text(encoding="utf-8").strip()
-                    if content == str(os.getpid()):
-                        pause_file.unlink(missing_ok=True)
-            except OSError:
-                pass
+            # The markers of the index that went away, as reset_index removes them.
+            clear_problem(db_path.parent)
+            clear_excluded(db_path.parent)
+            _force_llm_marker.remove(db_path.parent)
+            print("Index deleted. Run 'fw-context index' to rebuild.")
+            return 0
 
-        print("Index deleted. Run 'fw-context index' to rebuild.")
-        return 0
+        # The index lock after the question: a person who reads it must not
+        # hold the index.  Before, a pause marker let a running index run go
+        # on writing into the removed database.
+        return _under_index_lock(db_path.parent, args, _delete_all)
 
     # ── Single build delete ──
     if not args.config_hash:
@@ -326,6 +320,35 @@ def cmd_db_delete(args: argparse.Namespace) -> int:
         print("       fw-context db delete --all")
         return 1
 
+    decision = _delete_one_build(args, cfg, project_id, db_path, ask=True)
+    if decision is not None:
+        return decision
+
+    def _delete() -> int:
+        code = _delete_one_build(args, cfg, project_id, db_path, ask=False)
+        return 0 if code is None else code
+
+    # The checks again and the delete under the index lock: no run writes
+    # the build while the command checks and deletes it.
+    return _under_index_lock(db_path.parent, args, _delete)
+
+
+def _delete_one_build(args: argparse.Namespace, cfg, project_id: str, db_path: Path, *, ask: bool) -> int | None:
+    """Check the build of ``args.config_hash``, and show it and ask (*ask*) or delete it.
+
+    With *ask* the function runs before the index lock: it shows the build,
+    asks unless ``--yes``, and returns None when the delete goes on, or the
+    exit code.  Without it the caller holds the index lock: the same checks
+    run again, and the build goes.
+    """
+    from ..indexer.db import delete_build_data, open_db, transaction
+    from ..mcp.shared.stale import latest_builds
+
+    # Under the lock: another command can have deleted the whole index while
+    # the person read the question, and open_db makes a new empty one.
+    if not ask and not db_path.exists():
+        print("error: the index was deleted meanwhile. Nothing to delete.")
+        return 1
     conn = open_db(db_path)
     try:
         config_hash = _resolve_config_hash(conn, args.config_hash)
@@ -370,47 +393,54 @@ def cmd_db_delete(args: argparse.Namespace) -> int:
                 print("  Use 'fw-context db delete --all' to delete the entire index.")
                 return 1
 
-        # A row of an index run.  WHY a guard: the delete of one build
-        # writes no reindex.pause, and a run that still writes the row
-        # writes it again when it ends, as complete, without the data that
-        # the delete removed.
+        # A row of an index run: a background run writes it (before the
+        # lock), or a run that stopped left it (under the lock, the command
+        # took the index).  The next index run of the build continues it,
+        # thus the delete asks for --force.
         if _row_state(target, queried) == "indexing" and not args.force:
-            print(f"error: An index run writes this row of build {_row_label(target)}, or a stopped run "
-                  "left it. Cannot delete it without --force.")
-            print("  Wait for the run to end ('fw-context watch status'), or use --force for a row "
-                  "that a stopped run left.")
+            print(f"error: An index run writes this row of build {_row_label(target)}, or a run that "
+                  "stopped left it. The next index run of the build continues it. "
+                  "Cannot delete it without --force.")
             return 1
 
-        # Show what will be deleted
-        row = target
+        # The person reads and answers before the command takes the index:
+        # a person who reads must not hold it.  The checks above run again
+        # under the lock, then the delete.
+        if ask:
+            # Show what will be deleted
+            row = target
 
-        sym_count = conn.execute(
-            "SELECT COUNT(*) FROM symbols WHERE config_hash = ?", (config_hash,)
-        ).fetchone()[0]
-        file_count = conn.execute(
-            "SELECT COUNT(*) FROM files WHERE config_hash = ?", (config_hash,)
-        ).fetchone()[0]
-        ref_count = conn.execute(
-            "SELECT COUNT(*) FROM refs WHERE config_hash = ?", (config_hash,)
-        ).fetchone()[0]
+            sym_count = conn.execute(
+                "SELECT COUNT(*) FROM symbols WHERE config_hash = ?", (config_hash,)
+            ).fetchone()[0]
+            file_count = conn.execute(
+                "SELECT COUNT(*) FROM files WHERE config_hash = ?", (config_hash,)
+            ).fetchone()[0]
+            ref_count = conn.execute(
+                "SELECT COUNT(*) FROM refs WHERE config_hash = ?", (config_hash,)
+            ).fetchone()[0]
 
-        desc = row["description"] or "-"
+            desc = row["description"] or "-"
 
-        print(f"Build:          {row['config_hash']}")
-        print(f"  Label:        {_row_label(target)}")
-        print(f"  Description:  {desc}")
-        print(f"  First indexed: {row['first_indexed_at'] or '-'}")
-        print(f"  Last indexed: {row['created_at']}")
-        print(f"  Symbols:      {sym_count}")
-        print(f"  Files:        {file_count}")
-        print(f"  References:   {ref_count}")
-        print(f"  State:        {_row_state(target, queried)}")
+            print(f"Build:          {row['config_hash']}")
+            print(f"  Label:        {_row_label(target)}")
+            print(f"  Description:  {desc}")
+            print(f"  First indexed: {row['first_indexed_at'] or '-'}")
+            print(f"  Last indexed: {row['created_at']}")
+            print(f"  Symbols:      {sym_count}")
+            print(f"  Files:        {file_count}")
+            print(f"  References:   {ref_count}")
+            print(f"  State:        {_row_state(target, queried)}")
 
-        if not args.yes:
-            answer = input("\nDelete this build? [y/N] ").strip().lower()
-            if answer not in ("y", "yes"):
-                print("Aborted.")
-                return 0
+            if not args.yes:
+                answer = input("\nDelete this build? [y/N] ").strip().lower()
+                if answer not in ("y", "yes"):
+                    print("Aborted.")
+                    return 0
+            # Phase 2 deletes the build that the person confirmed, not what
+            # the prefix names then.
+            args.config_hash = config_hash
+            return None
 
         with transaction(conn):
             delete_build_data(conn, config_hash)
@@ -441,9 +471,39 @@ def cmd_db_cleanup(args: argparse.Namespace) -> int:
     project_id = derive_project_id(project_root)
     db_path = cfg.index.db_dir / project_id / "index.db"
 
-    deleted = _cleanup_orphaned_cc_artifacts(db_path, project_id)
-    if deleted:
-        print(f"Cleaned up {deleted} orphaned per-build artifact(s).")
-    else:
-        print("No orphaned artifacts found.")
-    return 0
+    def _cleanup() -> int:
+        deleted = _cleanup_orphaned_cc_artifacts(db_path, project_id)
+        if deleted:
+            print(f"Cleaned up {deleted} orphaned per-build artifact(s).")
+        else:
+            print("No orphaned artifacts found.")
+        return 0
+
+    # Under the index lock: a run writes compile_commands.<hash>.json before
+    # the row of its build, and the cleanup took such a file for an orphan.
+    if not db_path.parent.is_dir():
+        return _cleanup()
+    return _under_index_lock(db_path.parent, args, _cleanup)
+
+
+def _under_index_lock(db_dir: Path, args: argparse.Namespace, work: Callable[[], int]) -> int:
+    """Run *work* while the command holds the index lock, as a manual `fw-context index` does.
+
+    Within one project every writer holds the lock: the command takes the
+    index over from a background run, and a manual run (``fw-context
+    index``, ``fw-context analyze``) refuses it.
+    """
+    from ..exit_codes import EXIT_ALREADY_RUNNING
+    from ..indexer.db._locking import IndexRunLocked
+    from ..indexer.runner import IndexStopped
+    from ._index import _owned_index
+
+    try:
+        with _owned_index(db_dir, args):
+            return work()
+    except IndexRunLocked as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_ALREADY_RUNNING
+    except IndexStopped as exc:
+        print(f"{exc.label}: {exc}", file=sys.stderr)
+        return exc.exit_code

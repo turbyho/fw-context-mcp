@@ -412,11 +412,16 @@ def _checkpoint_manifest(
 def raise_if_superseded(db_dir: Path) -> None:
     """Raise :class:`IndexSuperseded` when another process owns the index.
 
-    The MCP server writes ``<pid>`` to ``reindex.pause`` before a manual
-    ``reindex_file`` or ``reset_index``.  An indexing run used to block here
-    until the marker cleared and then carry on from the same translation unit
-    — which is not safe.  Everything the loop decides with was captured
-    before the pause: ``existing_files`` (the snapshot of the rows), the
+    Each writer of the project now holds the index lock
+    (``indexer._index_owner``), thus while a run holds it no other process
+    writes ``reindex.pause``, and a takeover stops the run through SIGTERM.
+    The check stays for a marker that a process without the lock wrote: an
+    older fw-context during an upgrade.  The MCP server once wrote
+    ``<pid>`` to ``reindex.pause`` before a manual ``reindex_file`` or
+    ``reset_index``, and an indexing run blocked here until the marker
+    cleared and then carried on from the same translation unit — which is
+    not safe.  Everything the loop decides with was captured before the
+    pause: ``existing_files`` (the snapshot of the rows), the
     decision for each unit, the manifest lookup, the stale-header set, and
     the header ownership built up TU by TU.  After a manual operation those
     all describe an index that no longer exists.
@@ -1157,9 +1162,11 @@ def run(
     log.info("", extra={"phase": f"Parsing ({len(units)} TUs)"})
 
     # Single sequential loop with per-TU write lock for responsiveness.
-    # The lock is acquired and released for each translation unit so that
-    # manual operations (reindex_file, reset_index) can interleave via
-    # the pause marker mechanism instead of blocking for 60+ seconds.
+    # The lock is acquired and released for each translation unit, thus
+    # each store is short.  The manual operations of the project
+    # (reindex_file, reset_index, analyze) hold the index lock, thus they
+    # do not interleave with the run: they take a background run over or
+    # wait for it.
     #
     # Libclang parsing runs OUTSIDE the write lock — a single TU can take
     # seconds to minutes on large codebases (mbed-os, Zephyr).  Holding the

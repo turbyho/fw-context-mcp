@@ -307,8 +307,9 @@ class TestTakeover:
         import signal
 
         from fw_context_mcp.cli import _index as index_mod
+        from fw_context_mcp.indexer import _index_owner
 
-        monkeypatch.setattr(index_mod, "_TAKEOVER_GRACE_S", 1.0)
+        monkeypatch.setattr(_index_owner, "TAKEOVER_GRACE_S", 1.0)
         holder = self._holder(tmp_path, "background", ignore_sigterm=True)
         try:
             with index_mod._owned_index(tmp_path, self._args()):
@@ -809,3 +810,100 @@ def test_a_closed_terminal_stops_the_run_as_terminated(tmp_path: Path):
         assert holder.wait(timeout=10) == EXIT_TERMINATED
     finally:
         TestTakeover._stop(holder)
+
+
+class TestOperationsHoldTheIndex:
+    """Within one project every writer holds the index lock, as a manual `fw-context index` does.
+
+    Before, MCP reindex_file and reset_index and the CLI db delete wrote
+    only reindex.pause: a manual run went on with an old snapshot, or wrote
+    into a database that the operation removed.
+    """
+
+    _holder = staticmethod(TestTakeover._holder)
+    _stop = staticmethod(TestTakeover._stop)
+
+    def test_an_mcp_operation_takes_the_index_over_from_a_background_run(self, tmp_path: Path):
+        from fw_context_mcp.indexer import _index_owner
+
+        holder = self._holder(tmp_path, "background")
+        try:
+            with _index_owner.owned_by_operation(tmp_path, lambda line: None):
+                assert (tmp_path / "reindex.pid").read_text().strip() == str(os.getpid())
+            assert holder.wait(timeout=10) == EXIT_SUPERSEDED
+        finally:
+            self._stop(holder)
+
+    def test_an_mcp_operation_does_not_take_a_manual_run_over(self, tmp_path: Path):
+        from fw_context_mcp.indexer import _index_owner
+        from fw_context_mcp.indexer.db._locking import IndexRunLocked
+
+        holder = self._holder(tmp_path, "foreground")
+        try:
+            with pytest.raises(IndexRunLocked) as refused:
+                with _index_owner.owned_by_operation(tmp_path, lambda line: None):
+                    pytest.fail("the operation must not run while a manual index run holds the index")
+            assert _index_owner.holder_kind(refused.value.holder_pid) == "index"
+            assert holder.poll() is None, "the manual run goes on"
+        finally:
+            self._stop(holder)
+
+    @pytest.mark.parametrize(("kind", "waits"), [("index", True), ("analyze", False), ("operation", False)])
+    def test_the_answer_tells_the_llm_to_wait_only_for_an_index_run(self, monkeypatch, kind, waits):
+        """The LLM waits for an index run; an analysis does not change the index of the code."""
+        from fw_context_mcp.indexer import _index_owner
+        from fw_context_mcp.indexer.db._locking import IndexRunLocked
+        from fw_context_mcp.mcp.handlers.maintenance import _index_held_answer
+
+        monkeypatch.setattr(_index_owner, "holder_kind", lambda pid: kind)
+        answer = _index_held_answer(IndexRunLocked(Path("/x"), 4242), "reindex_file", "src/a.c",
+                                    after_analysis="do the next thing")
+
+        assert "error" in answer and "src/a.c" in answer["error"]
+        assert (answer.get("index_state") == "reindexing") is waits
+        assert ("do the next thing" in answer["error"]) is (kind == "analyze"), "the advice of the tool"
+
+    def test_the_loser_of_two_takeovers_in_one_process_keeps_the_marker_of_the_winner(self, tmp_path: Path):
+        """Two tools of one MCP server: before, the thread that lost removed the marker of the other."""
+        import threading
+
+        from fw_context_mcp.indexer import _index_owner
+
+        _index_owner.write_takeover_marker(tmp_path, victim=4242)
+        other = threading.Thread(target=_index_owner.remove_takeover_marker, args=(tmp_path,))
+        other.start()
+        other.join()
+        assert (tmp_path / _index_owner.TAKEOVER_MARKER).exists(), "another thread must not remove it"
+        _index_owner.remove_takeover_marker(tmp_path)
+        assert not (tmp_path / _index_owner.TAKEOVER_MARKER).exists()
+
+    def test_a_refusal_names_another_fw_context_operation(self, tmp_path: Path, monkeypatch):
+        """Before, `fw-context index` said "an index run is already in progress" for an MCP tool too."""
+        from contextlib import ExitStack
+
+        from fw_context_mcp.indexer import _index_owner
+        from fw_context_mcp.indexer.db._locking import IndexRunLocked
+
+        holder = self._holder(tmp_path, "foreground")
+        try:
+            monkeypatch.setattr(_index_owner, "index_run_kind", lambda pid: None)  # as for an MCP server
+            with ExitStack() as stack, pytest.raises(IndexRunLocked) as refused:
+                _index_owner.acquire_index(tmp_path, stack, background=False, takeover=False, say=print)
+            assert "another fw-context operation holds the index" in str(refused.value)
+            assert "in use" in str(refused.value)
+        finally:
+            self._stop(holder)
+
+    def test_a_cli_writer_does_not_run_while_a_manual_run_holds_the_index(self, tmp_path: Path, capsys):
+        from fw_context_mcp.cli._db import _under_index_lock
+        from fw_context_mcp.exit_codes import EXIT_ALREADY_RUNNING
+
+        holder = self._holder(tmp_path, "foreground")
+        try:
+            code = _under_index_lock(tmp_path, self._args(), lambda: pytest.fail("the work must not run"))
+            assert code == EXIT_ALREADY_RUNNING
+            assert "error" in capsys.readouterr().err
+        finally:
+            self._stop(holder)
+
+    _args = staticmethod(TestTakeover._args)

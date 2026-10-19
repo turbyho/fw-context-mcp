@@ -322,7 +322,11 @@ def test_watch_status_counts_the_modified_files_of_each_build(two_builds, capsys
 
 
 def test_db_shows_and_guards_a_row_of_an_index_run(two_builds, capsys):  # noqa: F811
-    """A delete of a row that a run still writes: the run wrote it again, complete, without the deleted data."""
+    """A row that a stopped run left: the next run of the build continues it, thus the delete asks for --force.
+
+    The command holds the index lock, thus no run writes the row while the
+    command reads it.
+    """
     from fw_context_mcp.cli._db import cmd_db_delete, cmd_db_list
     from fw_context_mcp.indexer.db import open_db
 
@@ -340,7 +344,7 @@ def test_db_shows_and_guards_a_row_of_an_index_run(two_builds, capsys):  # noqa:
 
     args = argparse.Namespace(project=str(root), all=False, config_hash=hash_b, force=False, yes=True)
     assert cmd_db_delete(args) == 1
-    assert "An index run writes this row of build b" in capsys.readouterr().out
+    assert "An index run writes this row of build b, or a run that stopped left it" in capsys.readouterr().out
     assert _hash_of(root, "b") == hash_b, "nothing was deleted"
 
 
@@ -483,7 +487,7 @@ def test_the_daemon_waits_for_analyze_also_without_the_pause_marker(two_builds, 
     seen: list[bool] = []
 
     def build(conn, config_hash, *a, **k):
-        (db_path.parent / "reindex.pause").unlink(missing_ok=True)  # as reindex_file leaves it
+        (db_path.parent / "reindex.pause").unlink(missing_ok=True)  # a marker that went away
         seen.append(_index_held(db_path.parent))
         return True
 
@@ -493,3 +497,50 @@ def test_the_daemon_waits_for_analyze_also_without_the_pause_marker(two_builds, 
     assert cmd_analyze(args) == 0
     assert seen and all(seen)
     assert not _index_held(db_path.parent), "after analyze, the index is free"
+
+
+def test_db_delete_asks_before_it_takes_the_index(two_builds, monkeypatch):  # noqa: F811
+    """A person who reads the question must not hold the index.
+
+    Before, the single-build delete held the index lock while it waited
+    for the answer: the status said "reindexing", and the LLM and the
+    daemon waited for a prompt.
+    """
+    import builtins
+
+    import fw_context_mcp.cli._db as db_mod
+
+    root, _db_path = two_builds
+    steps: list[str] = []
+    monkeypatch.setattr(builtins, "input", lambda prompt: steps.append("asked") or "y")
+
+    def locked(db_dir, args, work):
+        steps.append("locked")
+        return work()
+
+    monkeypatch.setattr(db_mod, "_under_index_lock", locked)
+    args = argparse.Namespace(project=str(root), all=False, config_hash=_hash_of(root, "a"), force=True, yes=False)
+
+    assert db_mod.cmd_db_delete(args) == 0
+    assert steps == ["asked", "locked"]
+
+
+def test_db_delete_makes_no_new_index_when_the_index_went_away_meanwhile(two_builds, monkeypatch):  # noqa: F811
+    """Another command deleted the index while the person read the question: open_db made a new empty one."""
+    import builtins
+
+    from fw_context_mcp.cli._db import cmd_db_delete
+
+    root, db_path = two_builds
+    hash_a = _hash_of(root, "a")
+
+    def answer(prompt):
+        for suffix in ("", "-wal", "-shm"):
+            (db_path.parent / (db_path.name + suffix)).unlink(missing_ok=True)
+        return "y"
+
+    monkeypatch.setattr(builtins, "input", answer)
+    args = argparse.Namespace(project=str(root), all=False, config_hash=hash_a, force=True, yes=False)
+
+    assert cmd_db_delete(args) == 1
+    assert not db_path.exists()

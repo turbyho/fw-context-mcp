@@ -3058,6 +3058,15 @@ selector that names no build gets the `error` of each query tool: the
 list of the builds, or, for a variant that the config declares and the
 index does not hold, the command that indexes it.
 
+The tool holds the index lock of the project, as `fw-context index` does.
+It stops a background index run, and the daemon runs it again after the
+tool. When a manual `fw-context index` run holds the index, the tool does
+nothing: `error` names the run, and `index_state: "reindexing"` tells the
+LLM to wait for it. When `fw-context analyze` holds the index, the tool
+does nothing either, and the LLM does not wait: an analysis does not
+change the index of the code. The index of the file stays old until an
+index run reads it.
+
 When one build compiles the file, the top level holds the full result of
 that build, as before. When several builds do, the top level holds:
 
@@ -3123,6 +3132,13 @@ includes gives an `error`.
 #### `reset_index`
 
 Delete the index. Always run a dry run first, then pass `confirm: true`.
+
+The tool holds the index lock of the project, as `fw-context index` does.
+It stops a background index run, and the daemon runs it again after the
+tool. When a manual `fw-context index` run holds the index, the tool does
+nothing: `error` names the run, and `index_state: "reindexing"` tells the
+LLM to wait for it. When `fw-context analyze` holds the index, the tool
+does nothing either: call it again after the analysis.
 
 ```
 Input:  {"project_root?": "/path/to/project", "confirm": false}     → {"action": "dry_run", "build_count": 2, "symbol_count": 8586, …}
@@ -3501,9 +3517,12 @@ For manual recovery, use `reindex_file` or `fw-context index`.
    indexer/skipped_ranges.py) → blank each inactive #if line in
    files.content and symbols.source; line numbers do not move;
    comments and preprocessor directives stay
-   Release the write lock between translation units. A manual operation,
-   such as `reindex_file`, can interleave through the pause marker
-   mechanism, without blocking.
+   Release the write lock between translation units, thus each store is
+   short. The other writers of the project hold the index lock too, thus
+   they never interleave with the run. `reindex_file`, `reset_index`,
+   `fw-context db delete` and `fw-context db cleanup` stop a background
+   run, and refuse to start while a manual run holds the index.
+   `fw-context analyze` stops no run: it waits for its end.
 
 3. Write to SQLite (atomic per-TU transaction):
    Delete old symbols for this TU
