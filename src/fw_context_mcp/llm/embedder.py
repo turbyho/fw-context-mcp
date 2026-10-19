@@ -16,10 +16,10 @@ embedding dimension until the first batch returns.  Search pipelines
 that need dimension info must handle ``None`` gracefully (delay dimension
 check until after first embed call, or use a model-specific default).
 
-WHY ``max_tokens`` is a property: Truncation decisions happen at the
-caller (search pipeline, symbol-to-description converter), not inside
-the embedder.  The embedder exposes its token limit so the caller can
-truncate before sending.
+WHY ``max_tokens`` is a property: the caller (the symbol-to-description
+converter) makes the chunks of a long body, not the embedder.  The
+embedder gives its token limit, thus the caller can make chunks that fit
+before it sends them.
 
 Implementations:
 - ``OllamaEmbedder`` — delegates to Ollama HTTP API (existing backend)
@@ -45,6 +45,35 @@ class EmbedderError(Exception):
     backend-specific exception types.  A single ``except EmbedderError``
     handles all embedding failures; the pipeline can log and fall back
     without knowing which backend failed.
+    """
+
+
+class EmbedderInputTooLong(EmbedderError, RuntimeError):
+    """An input of the batch is longer than the context of the model.
+
+    The Ollama backend asks the server not to cut a document text: a cut
+    input gives a vector without the tail of the text, and nothing tells
+    the caller.  The caller makes the input shorter and asks again
+    (``_embedding._embed_in_smaller_chunks``).  The request gives no index
+    of the input, thus the caller asks for each input of the batch on its
+    own.  The sentence-transformers backend cuts each input at the
+    ``max_seq_length`` of its model, and never raises this.
+
+    A ``RuntimeError`` too, so that a caller that handles each failure of a
+    backend as a ``RuntimeError`` still handles it.
+    """
+
+
+class EmbedderContextUnknown(EmbedderError, RuntimeError):
+    """The backend cannot give the context length of the model (``Embedder.max_tokens``).
+
+    The value sets the chunk size of a long body, and the chunk size is in
+    the content hash of its embedding.  A guessed value thus stores other
+    vectors, and the next run with the real value embeds the body again.
+    The embedding step stops instead, and the build gets the "partial"
+    stamp; the next run tries again.
+
+    A ``RuntimeError`` too, for the reason of ``EmbedderInputTooLong``.
     """
 
 
@@ -114,10 +143,14 @@ class Embedder(ABC):
     @property
     @abstractmethod
     def max_tokens(self) -> int:
-        """Approximate max token count for truncation decisions.
+        """The number of tokens of one input that the model embeds.
 
-        Truncation is applied BEFORE embedding so the model never sees
-        text longer than its context window.  This avoids silent
-        truncation by the model which would lose the end of long
-        descriptions.
+        The caller makes chunks of a long body from it (``max_tokens * 3``
+        characters) before it embeds the texts.  The Ollama backend reads
+        the value from the server, and raises ``EmbedderContextUnknown``
+        when the server gives none.  The sentence-transformers backend
+        gives a value from its table of model names, and 32768 for an
+        unknown model; the model cuts a longer input at its
+        ``max_seq_length`` without an error, and the tail is not in the
+        vector.
         """

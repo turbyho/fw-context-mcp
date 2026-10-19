@@ -54,10 +54,6 @@ Embedding prompt prepending
     input as-is; the prompt prefix is client-side prepending.
 
 Module-level state
-    ``_max_tokens_cache`` — model → context-length map, built lazily.
-    Avoids an HTTP GET per ``max_tokens`` access (called frequently
-    during truncation decisions).
-
     ``_ollama_sem`` — per-process BoundedSemaphore.  See Design
     decisions above.
 """
@@ -65,6 +61,7 @@ Module-level state
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import re
@@ -80,15 +77,9 @@ import httpx
 
 from ..config.settings import LLMConfig
 from ._debug import _write_debug_log
-from .embedder import Embedder
+from .embedder import Embedder, EmbedderContextUnknown, EmbedderInputTooLong
 
 log = logging.getLogger(__name__)
-
-# Cache for Ollama model context lengths — populated lazily by OllamaEmbedder.max_tokens.
-# Module-level (not instance-level) because context length depends only on the
-# model name, not on the config or embedder instance.  Avoids an HTTP GET
-# to /api/show every time max_tokens is accessed during batch embedding.
-_max_tokens_cache: dict[str, int] = {}
 
 # Per-process semaphore controlling concurrent Ollama HTTP calls.
 # Multiple concurrent requests to a single Ollama instance can cause
@@ -502,6 +493,8 @@ def _call_ollama_embed_impl(
         by model — 1024 for mxbai-embed-large, 4096 for qwen3-embedding).
 
     Raises:
+        EmbedderInputTooLong: A document text is longer than the context
+            of the loaded model (HTTP 400 "exceeds the context length").
         OllamaError: On network failure. When ``cfg.auto_pull`` is True,
             auto-pulls the model on HTTP 404 then retries once.
     """
@@ -515,11 +508,18 @@ def _call_ollama_embed_impl(
     prompt = cfg.embed_query_prompt if query else cfg.embed_doc_prompt
     if prompt:
         inputs = [prompt + inp for inp in inputs]
-    payload = {
+    payload: dict[str, object] = {
         "model": cfg.embed_model,
         "input": inputs,
         "keep_alive": cfg.keep_alive,
     }
+    if not query:
+        # A document longer than the context of the loaded model gets an
+        # error, not a vector of its head only: the server cuts an input
+        # without a word when "truncate" is true (its default).  The caller
+        # makes the chunk shorter (EmbedderInputTooLong).  A query stays as
+        # it is: it is short, and a search without an answer helps nobody.
+        payload["truncate"] = False
     t0 = time.monotonic()
     try:
         with ollama_guard():
@@ -541,6 +541,10 @@ def _call_ollama_embed_impl(
             )
         return embeddings
     except httpx.HTTPStatusError as e:
+        if e.response.status_code == 400 and "exceeds the context length" in e.response.text:
+            raise EmbedderInputTooLong(
+                f"an input is longer than the context of {cfg.embed_model}: {e.response.text[:200]}"
+            ) from e
         if e.response.status_code == 404:
             if cfg.auto_pull:
                 log.info("Embedding model '%s' not found, pulling...", cfg.embed_model)
@@ -594,6 +598,47 @@ def call_ollama_embed(inputs: list[str], cfg: LLMConfig, *, query: bool = True) 
     return _call_ollama_embed_impl(inputs, cfg, query=query)
 
 
+def _trained_context(base: str, model: str) -> int | None:
+    """Return the context length that *model* was trained for, from ``/api/show``.
+
+    ``/api/show`` takes a POST with the model in the body; a GET gets 405.
+    ``model_info`` names the value after the architecture of the model
+    (``qwen3.context_length``), and ``general.architecture`` names it.
+    """
+    try:
+        resp = httpx.post(f"{base}/api/show", json={"model": model}, timeout=5.0)
+        if resp.status_code != 200:
+            return None
+        info = resp.json().get("model_info", {})
+    except (ValueError, TypeError, OSError, json.JSONDecodeError, httpx.HTTPError):
+        return None
+    arch = info.get("general.architecture")
+    value = info.get(f"{arch}.context_length") if isinstance(arch, str) else None
+    return value if isinstance(value, int) and value > 0 else None
+
+
+def _loaded_context(base: str, model: str) -> int | None:
+    """Return the context length of the server for *model* when it is loaded (``/api/ps``).
+
+    The list names a model with its tag; a name without a tag means
+    ``:latest``, as for each call of the Ollama API.  The tag follows the
+    last ``/``: in ``host:5000/team/model`` the colon is of the port.
+    """
+    names = {model} if ":" in model.rsplit("/", 1)[-1] else {model, f"{model}:latest"}
+    try:
+        resp = httpx.get(f"{base}/api/ps", timeout=5.0)
+        if resp.status_code != 200:
+            return None
+        loaded = resp.json().get("models", [])
+    except (ValueError, TypeError, OSError, json.JSONDecodeError, httpx.HTTPError):
+        return None
+    for entry in loaded:
+        if entry.get("name") in names or entry.get("model") in names:
+            value = entry.get("context_length")
+            return value if isinstance(value, int) and value > 0 else None
+    return None
+
+
 class OllamaEmbedder(Embedder):
     """Embedding backend that delegates to Ollama's HTTP API.
 
@@ -606,6 +651,44 @@ class OllamaEmbedder(Embedder):
         self._dim: int | None = None
         if cfg.ollama_max_concurrent > 1:
             _reconfigure_ollama_sem(cfg.ollama_max_concurrent)
+
+    def _served_context(self, base: str, model: str) -> int:
+        """Return the context length of the server for *model* for the requests of fw-context.
+
+        One short embedding request goes first, also when the model is
+        loaded: another client can load the model with another
+        ``num_ctx``, and the server loads it again for a request with other
+        options.  The request has the options of the index run, thus
+        ``/api/ps`` after it gives the context of the requests of the run.
+
+        The pair of requests goes a second time when ``/api/ps`` does not
+        name the model: another client can make the server unload it
+        between the two requests, and a ``keep_alive`` of 0 unloads it at
+        once.  The second embedding request thus keeps the model loaded
+        for 30 seconds, whatever ``keep_alive`` is; the requests of the step
+        then have the configured value again.
+
+        Raises:
+            EmbedderContextUnknown: The server did not load the model, or
+                it names no context length for it.  No value is guessed:
+                the value sets the chunks and the content hash of each long
+                body, thus a guessed value stores other vectors, and the
+                next run with the real value embeds them again.
+        """
+        for cfg in (self._cfg, dataclasses.replace(self._cfg, keep_alive="30s")):
+            try:
+                _call_ollama_embed_impl(["x"], cfg, query=False, embedder=self)
+            except OllamaError as exc:
+                raise EmbedderContextUnknown(
+                    f"Ollama did not load {model} to read its context length: {exc}"
+                ) from exc
+            served = _loaded_context(base, model)
+            if served is not None:
+                return served
+        raise EmbedderContextUnknown(
+            f"Ollama names no context length of {model} in /api/ps; "
+            f"an older Ollama does not give it, update Ollama"
+        )
 
     def _update_dim(self, embeddings: list[list[float]]) -> None:
         """Lazily detect embedding dimension from the first batch."""
@@ -634,32 +717,43 @@ class OllamaEmbedder(Embedder):
 
     @property
     def max_tokens(self) -> int:
+        """The number of tokens of one input that the server embeds.
+
+        Two values set it, and the smaller one applies:
+
+        * The context length of the server for the loaded model, from
+          ``/api/ps``.  It comes from ``PARAMETER num_ctx`` of the model, or
+          from the default of the server (``OLLAMA_CONTEXT_LENGTH``), thus
+          each model and each installation can have a different one.
+          Measured with qwen3-embedding:8b: the server used 4096 tokens.
+          A document text that is longer gets an error
+          (``EmbedderInputTooLong``), because the request asks the server
+          not to cut it.  Before, the server cut it without an error, and
+          the tail of the chunk was not in its vector.
+        * The context length that the model was trained for, from
+          ``/api/show`` (40960 for qwen3-embedding:8b).  An older server
+          does not give it; the value of the server then applies alone.
+
+        One short embedding request goes first (see ``_served_context``),
+        thus the first read in a process loads the model, also in an
+        embedding step that then embeds nothing: the step needs the value
+        for the content hash of each symbol.
+
+        Each read asks the server, and no value is kept: a value kept in a
+        long-lived process (the MCP server) differs from the value of the
+        index run after a change of the server setting, and each long body
+        then gets other chunks, thus another content hash, in turn.  The
+        embedding step reads the value one time.
+
+        Raises:
+            EmbedderContextUnknown: The server gave no context length (see
+                ``_served_context``).
+        """
         model = self._cfg.embed_model
-        cached = _max_tokens_cache.get(model)
-        if cached is not None:
-            return cached
-        try:
-            resp = httpx.get(
-                f"{self._cfg.ollama_url.rstrip('/')}/api/show",
-                params={"name": model}, timeout=5.0,
-            )
-            if resp.status_code == 200:
-                info = resp.json().get("model_info", {})
-                ctx_len = info.get("context_length")
-                if isinstance(ctx_len, int) and ctx_len > 0:
-                    _max_tokens_cache[model] = ctx_len
-                    return ctx_len
-        except (ValueError, TypeError, OSError, json.JSONDecodeError, httpx.HTTPError):
-            pass
-        model_lower = model.lower()
-        if "qwen3-embedding" in model_lower:
-            tokens = 32768
-        elif "mxbai" in model_lower:
-            tokens = 512
-        else:
-            tokens = 512
-        _max_tokens_cache[model] = tokens
-        return tokens
+        base = self._cfg.ollama_url.rstrip("/")
+        served = self._served_context(base, model)
+        trained = _trained_context(base, model)
+        return min(served, trained) if trained is not None else served
 
 
 async def call_ollama_async(

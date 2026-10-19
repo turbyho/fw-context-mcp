@@ -6,7 +6,7 @@ VRAM/RAM.  Isolating it from the main runner allows the model to be garbage-
 collected after the embedding phase completes, freeing memory for subsequent
 analysis phases.
 
-Handles embedding model key generation, body chunking/truncation,
+Handles embedding model key generation, body chunking,
 orphaned per-build artifact cleanup, and the main embedding
 build phase.
 """
@@ -24,6 +24,7 @@ from typing import Any
 import httpx
 
 from ..config.settings import DESCRIPTION_VERSION
+from ..llm.embedder import Embedder, EmbedderContextUnknown, EmbedderInputTooLong
 from ..llm.embedder_factory import get_embedder
 from ..utils import SAFE_EXCEPT, is_fatal, remove_stale_tmp
 from . import _run_marker
@@ -266,25 +267,174 @@ def _chunk_body(source: str, max_chars: int) -> list[str]:
             chunk_end = len(lines)  # all remaining lines fit
 
         chunk = "\n".join(lines[chunk_start:chunk_end])
-        # Safety: head+tail truncation for chunks that still exceed max_chars
-        # (happens when a single long line has no split boundary)
-        if len(chunk) > max_chars:
-            chunk = _truncate_body(chunk, max_chars)
-        chunks.append(chunk)
+        # One line longer than max_chars (a table of values on one line) has
+        # no split point.  It goes into pieces of max_chars characters, thus
+        # each character is in a vector.  Before, the middle of the line was
+        # cut out, and nothing told it.
+        chunks.extend(chunk[i:i + max_chars] for i in range(0, len(chunk), max_chars))
         chunk_start = chunk_end
 
     return chunks if chunks else [source]
 
 
-def _truncate_body(body: str, max_chars: int, *, head_frac: float = 0.6) -> str:
-    """Truncate a body string with head+tail split when it exceeds *max_chars*."""
-    if len(body) <= max_chars:
-        return body
-    head = int(max_chars * head_frac)
-    tail = max_chars - head - 8  # 8 for the separator
-    if tail < 0:
-        return body[:max_chars]
-    return body[:head] + "\n// ...\n" + body[-tail:]
+def _descriptions(r: Any, max_body_chars: int) -> list[str]:
+    """Return the texts that the model embeds for symbol *r*, one for each chunk.
+
+    Contextual descriptions — flowing sentences instead of token lists
+    (Anthropic Contextual Retrieval: chunk-specific context as sentences
+    improves embedding recall).  A function body goes into chunks of at most
+    *max_body_chars* characters (:func:`_chunk_body`); each chunk text holds
+    the context of the symbol too.  The inputs are the ones of
+    :func:`_embed_content_hash`.
+    """
+    fp = (r["file_path"] or "").replace("\\", "/")
+    path = ""
+    module = ""
+    if "/" in fp:
+        *dirs, _fname = fp.split("/")
+        path = "/".join(dirs[-2:])
+        module = dirs[-1] if dirs else ""
+    qname = r["qualified_name"] or ""
+    name = r["name"] or ""
+    kind = r["kind"] or ""
+    class_ = "::".join(qname.split("::")[:-1]) if "::" in qname else ""
+    sig = r["signature"] or ""
+    is_vendor = r["is_project"] == 0
+    doc = ""
+    if not is_vendor:
+        doc = (r["docstring"] or "").strip()
+        if doc and len(doc) > 20:
+            doc = doc[:150]
+    llm = (r["summary"] or "").strip()
+    if llm:
+        llm = llm[:200]
+
+    clauses = [f"{kind} {name}"]
+    if class_:
+        clauses.append(f"in class {class_}")
+    if module:
+        clauses.append(f"in module {module}")
+    if path:
+        clauses.append(f"at {path}")
+    if fp:
+        clauses.append(f"file: {fp}")
+    context_prefix = ", ".join(clauses) + "."
+
+    sig_line = f" Signature: {sig}." if sig else ""
+
+    extra = []
+    if doc:
+        extra.append(doc)
+    if llm:
+        extra.append(llm)
+    extra_text = " ".join(extra) if extra else ""
+
+    body_chunks: list[str] = []
+    if kind in _BODY_KINDS:
+        source = (r["source"] or "").strip()
+        if source:
+            body_chunks = _chunk_body(source, max_body_chars)
+
+    if not body_chunks:
+        body_chunks = [""]
+
+    n_chunks = len(body_chunks)
+    texts: list[str] = []
+    for ci, body in enumerate(body_chunks):
+        body_text = ""
+        if body:
+            if n_chunks > 1:
+                body_text = f"\n\nBody [part {ci + 1}/{n_chunks}]:\n{body}"
+            else:
+                body_text = f"\n\nBody:\n{body}"
+        texts.append(f"{context_prefix}{sig_line} {extra_text}{body_text}".rstrip() + "\n")
+    return texts
+
+
+# The smallest chunk of a body that _embed_in_smaller_chunks tries.  A text
+# that does not fit even so is mostly one line without a split point.
+_MIN_CHUNK_CHARS = 256
+
+
+def _embed_in_smaller_chunks(
+    embedder: Embedder, batch: list[tuple[Any, int, str]], max_body_chars: int,
+) -> tuple[list[tuple[Any, int, str]], list[list[float]], int, BaseException | None]:
+    """Embed a batch in which an input is longer than the context of the model.
+
+    The server says only that an input of the batch is too long, not which
+    one.  Thus each symbol of the batch goes on its own, and a symbol whose
+    texts do not fit gets its body in chunks of half the size, again and
+    again, down to ``_MIN_CHUNK_CHARS``.  The texts follow the rule of
+    :func:`_descriptions`, thus each chunk keeps the context of the symbol.
+    A smaller size that gives the same texts (a body that is shorter than
+    the size) gets no request, and the halving goes on.  When no size down
+    to ``_MIN_CHUNK_CHARS`` changes the texts (a symbol without a body in
+    its description), the symbol gets no vector: the same request fails
+    again.
+
+    Measured: real C code has 3.2 to 5.7 characters for each token, and the
+    chunk size assumes 3, but a table of hex values has 1.5 or less.  Before,
+    the server cut such an input, and the tail was not in the vector.
+
+    The same symbol gives the same answer on each run, thus its chunks are
+    the same on each run, and the content hash, which holds the configured
+    chunk size, stays valid.
+
+    A request that fails for another cause (a timeout) goes again, three
+    times in all, as a request of the batch loop does.  A symbol that then
+    has no vector is counted, and the next symbol goes on: before, the
+    error left the step, and the rows of the batches before it were lost.
+
+    Returns the rows ``(r, chunk_index, text)`` that got a vector, their
+    vectors, the number of symbols without a vector, and the last error.
+    """
+
+    by_symbol: dict[int, list[tuple[Any, int, str]]] = {}
+    for item in batch:
+        by_symbol.setdefault(item[0]["id"], []).append(item)
+    rows_out: list[tuple[Any, int, str]] = []
+    vectors_out: list[list[float]] = []
+    not_embedded = 0
+    last_error: BaseException | None = None
+    for items in by_symbol.values():
+        r = items[0][0]
+        texts = [text for _, _, text in items]
+        size = max_body_chars
+        vectors: list[list[float]] | None = None
+        attempt = 0
+        while vectors is None:
+            try:
+                vectors = embedder.embed_documents(texts)
+            except EmbedderInputTooLong as exc:
+                # A size that is still larger than the body gives the same
+                # texts: halve on without a request until the texts change.
+                shorter = texts
+                while shorter == texts and size // 2 >= _MIN_CHUNK_CHARS:
+                    size //= 2
+                    shorter = _descriptions(r, size)
+                if shorter == texts:
+                    log.warning("Embeddings: %s does not fit the context of the model, not embedded",
+                                r["qualified_name"])
+                    last_error = exc
+                    break
+                texts = shorter
+            except SAFE_EXCEPT as exc:
+                if is_fatal(exc):
+                    raise
+                attempt += 1
+                if attempt == 3:
+                    log.warning("Embeddings: %s not embedded: %s", r["qualified_name"], exc)
+                    last_error = exc
+                    break
+                time.sleep(2)
+        if vectors is None:
+            not_embedded += 1
+            continue
+        if size != max_body_chars:
+            log.info("Embeddings: %s embedded in chunks of %d characters", r["qualified_name"], size)
+        rows_out.extend((r, ci, text) for ci, text in enumerate(texts))
+        vectors_out.extend(vectors)
+    return rows_out, vectors_out, not_embedded, last_error
 
 
 def _fmt_dur(seconds: float) -> str:
@@ -478,7 +628,10 @@ def _build_embeddings(
     model = _embed_model_key(embedder.name, True)
     # The two inputs of each description that are not fields of the symbol
     # (see _embed_content_hash).
-    max_body_chars = embedder.max_tokens * 3
+    try:
+        max_body_chars = embedder.max_tokens * 3
+    except EmbedderContextUnknown as e:
+        raise EmbeddingsIncomplete(str(e)) from e
     settings = embedder.document_settings
 
     def content_hash(row) -> str:
@@ -606,69 +759,8 @@ def _build_embeddings(
         """
         desc_rows.clear()
         for r in rows:
-            fp = (r["file_path"] or "").replace("\\", "/")
-            path = ""
-            module = ""
-            if "/" in fp:
-                *dirs, fname = fp.split("/")
-                path = "/".join(dirs[-2:])
-                module = dirs[-1] if dirs else ""
-            qname = r["qualified_name"] or ""
-            name = r["name"] or ""
-            kind = r["kind"] or ""
-            class_ = "::".join(qname.split("::")[:-1]) if "::" in qname else ""
-            sig = r["signature"] or ""
-            is_vendor = r["is_project"] == 0
-            doc = ""
-            if not is_vendor:
-                doc = (r["docstring"] or "").strip()
-                if doc and len(doc) > 20:
-                    doc = doc[:150]
-            llm = (r["summary"] or "").strip()
-            if llm:
-                llm = llm[:200]
-
-            clauses = [f"{kind} {name}"]
-            if class_:
-                clauses.append(f"in class {class_}")
-            if module:
-                clauses.append(f"in module {module}")
-            if path:
-                clauses.append(f"at {path}")
-            if fp:
-                clauses.append(f"file: {fp}")
-            context_prefix = ", ".join(clauses) + "."
-
-            sig_line = f" Signature: {sig}." if sig else ""
-
-            extra = []
-            if doc:
-                extra.append(doc)
-            if llm:
-                extra.append(llm)
-            extra_text = " ".join(extra) if extra else ""
-
-            body_chunks: list[str] = []
-            if kind in _BODY_KINDS:
-                source = (r["source"] or "").strip()
-                if source:
-                    body_chunks = _chunk_body(source, max_body_chars)
-
-            if not body_chunks:
-                body_chunks = [""]
-
-            n_chunks = len(body_chunks)
-            for ci, body in enumerate(body_chunks):
-                body_text = ""
-                if body:
-                    if n_chunks > 1:
-                        body_text = f"\n\nBody [part {ci + 1}/{n_chunks}]:\n{body}"
-                    else:
-                        body_text = f"\n\nBody:\n{body}"
-                desc_rows.append((
-                    r, ci,
-                    f"{context_prefix}{sig_line} {extra_text}{body_text}".rstrip() + "\n",
-                ))
+            for ci, text in enumerate(_descriptions(r, max_body_chars)):
+                desc_rows.append((r, ci, text))
 
     _rebuild_desc_rows()
 
@@ -756,13 +848,21 @@ def _build_embeddings(
             _phase2_idx += 1
         batch_num += 1
         chunk_descs = [d for _, _, d in batch]
-        _batch_chars = sum(len(d) for d in chunk_descs)
         t0 = time.monotonic()
         embs = None
         _last_exc = None
         for _attempt in range(3):
             try:
                 embs = embedder.embed_documents(chunk_descs)
+                break
+            except EmbedderInputTooLong as _e:
+                # The same input fails again: make the chunks shorter instead.
+                # The symbols that do not fit even so count as one failed
+                # batch, thus the build gets the "partial" stamp.
+                batch, embs, not_embedded, _error = _embed_in_smaller_chunks(embedder, batch, max_body_chars)
+                if not_embedded:
+                    failed_batches += 1
+                    last_failure = _error
                 break
             except SAFE_EXCEPT as _e:
                 _last_exc = _e
@@ -836,10 +936,11 @@ def _build_embeddings(
         chunk_vec.extend(vec_rows)
 
         elapsed = time.monotonic() - t0
-        _done_ids.update(seen)
+        embedded_ids = {r["id"] for r, _, _ in batch}
+        _done_ids.update(embedded_ids)
         log.info(
             "Embeddings: [%d/%d] %d symbols (%d chars) embedded %s",
-            len(_done_ids), len(target_ids), len(batch), _batch_chars,
+            len(_done_ids), len(target_ids), len(embedded_ids), sum(len(t) for _, _, t in batch),
             _fmt_dur(elapsed),
         )
 

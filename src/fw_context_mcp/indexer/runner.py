@@ -39,7 +39,6 @@ from ._embedding import (
     _chunk_body,
     _cleanup_orphaned_cc_artifacts,
     _fmt_dur,
-    _truncate_body,
 )
 from ._llm_analysis import _fetch_callees, _fetch_referencers
 from ._postprocess import (
@@ -93,7 +92,6 @@ __all__ = [
     "_fetch_referencers",
     "_fmt_dur",
     "_run_postprocess",
-    "_truncate_body",
     "run",
 ]
 

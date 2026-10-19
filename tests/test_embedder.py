@@ -73,21 +73,38 @@ class TestEmbedderAbstract:
 
 
 class TestGetEmbedder:
+    @pytest.fixture(autouse=True)
+    def _no_ollama_server(self, monkeypatch):
+        """No Ollama server: max_tokens of the Ollama backend then raises.
+
+        Without this, max_tokens asked the Ollama server of the machine
+        (/api/show, /api/ps, a load of the model), and the result depended on
+        that server.  tests/test_ollama_max_tokens.py tests the values from
+        the server.
+        """
+        import httpx
+
+        from fw_context_mcp.llm import ollama
+
+        def refused(url, *_args, **_kwargs):
+            raise httpx.ConnectError("no server in this test", request=httpx.Request("GET", url))
+
+        monkeypatch.setattr(ollama.httpx, "post", refused)
+        monkeypatch.setattr(ollama.httpx, "get", refused)
+
     def test_ollama_default(self) -> None:
         cfg = LLMConfig(embed_model="mxbai-embed-large:latest")
         e = get_embedder(cfg)
         assert e.name == "mxbai-embed-large:latest"
-        assert e.max_tokens == 512
 
-    def test_qwen3_token_limit(self) -> None:
-        cfg = LLMConfig(embed_model="qwen3-embedding:8b")
-        e = get_embedder(cfg)
-        assert e.max_tokens == 32768  # qwen3:8b has 32K context window
+    @pytest.mark.parametrize("model", ["qwen3-embedding:8b", "some-unknown-model"])
+    def test_ollama_without_a_server_guesses_no_context(self, model: str) -> None:
+        """A guessed value sets other chunks than the value of the server."""
+        from fw_context_mcp.llm.embedder import EmbedderContextUnknown
 
-    def test_ollama_default_for_unknown_model(self) -> None:
-        cfg = LLMConfig(embed_model="some-unknown-model")
-        e = get_embedder(cfg)
-        assert e.max_tokens == 512  # conservative default
+        e = get_embedder(LLMConfig(embed_model=model))
+        with pytest.raises(EmbedderContextUnknown):
+            _ = e.max_tokens
 
     @pytest.mark.parametrize("model,max_tokens", [
         ("ibm-granite/granite-embedding-311m-multilingual-r2", 32768),
@@ -225,7 +242,7 @@ class TestMRLTruncation:
         assert e.max_tokens == 32768
 
     def test_max_tokens_bge_default(self) -> None:
-        """BGE models have 512 token limit — head+tail truncation applies."""
+        """BGE models have 512 token limit — a long body goes into more chunks."""
         cfg = LLMConfig(embed_model="BAAI/bge-large-en-v1.5")
         e = get_embedder(cfg)
         assert e.max_tokens == 512
@@ -286,14 +303,12 @@ class TestChunkBody:
     def test_single_long_line_no_boundary(self) -> None:
         from fw_context_mcp.indexer.runner import _chunk_body
 
-        # Line with no semicolons, no braces, no blank lines — falls back
-        # to head+tail truncation since no split boundary exists
+        # Line with no semicolons, no braces, no blank lines: no split
+        # boundary, thus the line goes into pieces of max_chars characters.
         body = "very_long_function_name_with_many_arguments(arg1, arg2, arg3, arg4, arg5, arg6)"
         chunks = _chunk_body(body, max_chars=40)
-        assert len(chunks) >= 1
-        # each chunk stays within reasonable bounds
-        for c in chunks:
-            assert len(c) <= 80  # head+tail truncation bound
+        assert all(len(c) <= 40 for c in chunks)
+        assert "".join(chunks) == body
 
     def test_blank_line_split(self) -> None:
         from fw_context_mcp.indexer.runner import _chunk_body
@@ -337,29 +352,17 @@ class TestChunkBody:
         assert len(chunks) == 1
 
 
-class TestTruncateBody:
-    def test_short_body_unchanged(self) -> None:
-        from fw_context_mcp.indexer.runner import _truncate_body
+class TestLongLine:
+    """A line longer than the chunk size: before, its middle was cut out without a word."""
 
-        body = "short body"
-        result = _truncate_body(body, max_chars=100)
-        assert result == body
+    def test_each_character_of_a_long_line_is_in_a_chunk(self) -> None:
+        from fw_context_mcp.indexer.runner import _chunk_body
 
-    def test_long_body_head_tail_truncation(self) -> None:
-        from fw_context_mcp.indexer.runner import _truncate_body
-
-        body = "A" * 1000
-        result = _truncate_body(body, max_chars=100)
-        assert len(result) <= 100
-        assert "// ..." in result
-
-    def test_truncation_preserves_prefix(self) -> None:
-        from fw_context_mcp.indexer.runner import _truncate_body
-
-        body = "PREFIX_CONTENT_TAIL"
-        result = _truncate_body(body, max_chars=50)
-        assert "PREFIX" in result
-        assert "TAIL" in result
+        table = "static const uint8_t t[] = {" + ", ".join(f"0x{i % 256:02x}" for i in range(400)) + "};"
+        body = "void f(void) {\n" + table + "\n}\n"
+        chunks = _chunk_body(body, max_chars=300)
+        assert all(len(c) <= 300 for c in chunks)
+        assert "\n".join(chunks).replace("\n", "") == body.replace("\n", "")
 
 
 class TestValidateModelDir:
