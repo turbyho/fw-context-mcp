@@ -347,6 +347,47 @@ def test_a_new_order_of_compile_commands_parses_nothing(owned_project: Path):
     _assert_equals_rebuild(proj)
 
 
+def _reindex_file(proj: Path, rel_path: str) -> dict:
+    from fw_context_mcp.mcp.handlers.maintenance import reindex_file
+
+    result = reindex_file(rel_path, str(proj), with_analysis=False)
+    assert "error" not in result, result
+    return result
+
+
+def test_reindex_file_of_a_later_unit_keeps_the_owner(owned_project: Path):
+    proj = owned_project
+    _edit(proj / "src" / "b.c", _unit_source("b", ("shared.h",)) + "int b_more(void) { return 5; }\n")
+    _reindex_file(proj, "src/b.c")
+    names = _names(_db_path_for_project(proj))
+    assert "b_more" in names
+    assert "shared_a" in names
+    assert "shared_other" not in names
+    _assert_equals_rebuild(proj)
+
+
+def test_reindex_file_of_a_header_parses_its_owner(owned_project: Path):
+    proj = owned_project
+    _edit(proj / "src" / "shared.h", _SHARED_H.replace("int a_only;", "int a_only; int a_new;"))
+    result = _reindex_file(proj, "src/shared.h")
+    assert result["translation_units"] == 1
+    names = _names(_db_path_for_project(proj))
+    assert "a_new" in names
+    assert "shared_other" not in names
+    _assert_equals_rebuild(proj)
+
+
+def test_reindex_file_parses_the_owner_of_a_changed_header(owned_project: Path):
+    """``shared.h`` changed; the call names ``b.c``, which includes it and does not own it."""
+    proj = owned_project
+    _edit(proj / "src" / "shared.h", _SHARED_H.replace("int a_only;", "int a_only; int a_new;"))
+    result = _reindex_file(proj, "src/b.c")
+    assert result["translation_units"] == 2, "b.c and a.c, the owner of shared.h"
+    names = _names(_db_path_for_project(proj))
+    assert "a_new" in names
+    assert "shared_other" not in names
+
+
 def test_an_index_run_after_a_change_of_a_source_that_another_unit_includes(owned_project: Path):
     """A unity build: ``a.c`` includes ``b.c``; ``b.c`` changes.
 
@@ -361,6 +402,38 @@ def test_an_index_run_after_a_change_of_a_source_that_another_unit_includes(owne
     result = _index(proj)
     assert result.returncode == 0, result.stderr
     assert "b_more" in _names(_db_path_for_project(proj))
+    _assert_equals_rebuild(proj)
+
+
+def test_reindex_file_of_a_source_that_another_unit_includes(owned_project: Path):
+    """A unity build: ``a.c`` includes ``b.c``, thus ``a.c`` owns ``src/b.c``.
+
+    The call names ``b.c``; its own listing skips the file, thus the owner
+    must be parsed too, or the call writes nothing.
+    """
+    proj = owned_project
+    src = proj / "src"
+    _edit(src / "a.c", _unit_source("a", ("shared.h", "extra.h", "b.c")))
+    assert _index(proj).returncode == 0
+    _edit(src / "b.c", _unit_source("b", ("shared.h",)) + "int b_more(void) { return 5; }\n")
+    result = _reindex_file(proj, "src/b.c")
+    assert result["translation_units"] == 2, "b.c and a.c, the owner of src/b.c"
+    assert "b_more" in _names(_db_path_for_project(proj))
+    _assert_equals_rebuild(proj)
+
+
+def test_reindex_file_leaves_a_dropped_header_to_the_next_index_run(owned_project: Path):
+    """reindex_file parses one unit, thus the next index run gives the header away."""
+    proj = owned_project
+    _edit(proj / "src" / "a.c", _unit_source("a", ("extra.h",)).replace("SHARED_KIND", "0"))
+    _reindex_file(proj, "src/a.c")
+    assert "shared_a" in _names(_db_path_for_project(proj)), "the rows stay until the index run"
+    result = _index(proj)
+    # a.c (needs_reparse) and b.c, which takes shared.h from it.
+    assert "2 updated, 1 unchanged" in _summary(result)
+    names = _names(_db_path_for_project(proj))
+    assert "shared_other" in names
+    assert "shared_a" not in names
     _assert_equals_rebuild(proj)
 
 

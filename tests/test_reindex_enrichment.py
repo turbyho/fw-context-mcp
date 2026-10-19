@@ -137,12 +137,18 @@ def test_the_fixture_embeds_each_definition(one_build):
 
 
 def test_a_header_symbol_of_the_reparsed_unit_keeps_an_embedding(one_build):
-    """Before: ``util_clamp`` of ``util.h`` lost its embedding when ``util.c`` was re-parsed."""
+    """Before: ``util_clamp`` of ``util.h`` lost its embedding when its unit was re-parsed.
+
+    ``util.h`` belongs to ``main.c``: the index run parses the units in the
+    order of their path (``runner._in_claim_order``), and the first unit
+    that walks a header owns its rows.  A re-parse of ``util.c`` does not
+    touch ``util.h``.
+    """
     from fw_context_mcp.mcp.handlers.maintenance import reindex_file
 
     root, db_path = one_build
 
-    result = reindex_file("src/util.c", str(root), with_analysis=True)
+    result = reindex_file("src/main.c", str(root), with_analysis=True)
 
     assert "embedding_warning" not in result, result
     assert _embedded(db_path) == ALL_EMBEDDED
@@ -214,17 +220,22 @@ def _status_message(root: Path) -> str:
 
 
 def test_the_status_names_the_definitions_that_a_fast_reparse_left_without_an_embedding(one_build):
-    """Before: the stamp of the last run said "full", and the status said "fully up to date"."""
+    """Before: the stamp of the last run said "full", and the status said "fully up to date".
+
+    The re-parse of ``main.c`` writes ``step_one``, ``step_two`` and
+    ``util_clamp`` of ``util.h``, which ``main.c`` owns (see the test of the
+    header symbol above).
+    """
     from fw_context_mcp.mcp.handlers.maintenance import reindex_file
 
     root, _ = one_build
     assert "no embedding" not in _status_message(root)
 
-    reindex_file("src/util.c", str(root), with_analysis=False)
+    reindex_file("src/main.c", str(root), with_analysis=False)
 
     message = _status_message(root)
     assert (
-        " | Embeddings: 2 definition(s) have no embedding, and the search by meaning "
+        " | Embeddings: 3 definition(s) have no embedding, and the search by meaning "
         "does not find them: run `fw-context index`" in message
     ), message
 

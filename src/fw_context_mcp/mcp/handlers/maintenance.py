@@ -44,10 +44,12 @@ from ...indexer.autobuild import read_problem as read_build_problem
 from ...indexer.build import checked_compile_commands, user_database
 from ...indexer.compile_commands import command_line_defines
 from ...indexer.compile_commands import parse as parse_cc
+from ...indexer.config_hash import DEFAULT_TRANSIENT_DEFINES, compute_flags_hash
 from ...indexer.db import (
     CURRENT_ROW_FORMAT,
     CURRENT_SCHEMA_VERSION,
     DatabaseCorruptionError,
+    Ownership,
     WriteLockTimeout,
     compute_analysis_coverage,
     count_refs,
@@ -2365,12 +2367,17 @@ def _reindex_parse_and_store(
     vendor_patterns: list[str],
     project_patterns_list: list[str],
     transient_defines: Collection[str],
+    ownership: Ownership | None = None,
 ) -> tuple[int, dict]:
     """Parse one or more translation units with libclang and store their symbols.
 
     Steps:
     1. Call ``extract_all`` for each TU — this invokes libclang to parse
-       the file with the compiler flags from compile_commands.json.
+       the file with the compiler flags from compile_commands.json.  The
+       TUs are parsed in the order of the index run, and each parse skips
+       the files that an earlier listing owns (*ownership*, see
+       ``indexer/db/_owners.py``).  Thus a TU writes only the files that it
+       owns in a full run.
     2. Within a single write-lock transaction, call ``store_symbols_for_unit``
        for each successfully parsed TU to upsert symbols into the database.
     3. Run macro resolution (best-effort — silently skipped on failure).
@@ -2381,8 +2388,9 @@ def _reindex_parse_and_store(
     ``symbols_updated``, ``elapsed_s``, and optionally ``skipped_tus``.
     """
     from ...indexer.compile_commands import CompilationUnit as TU
+    from ...indexer.db import files_claimed_before, number_listings, record_claims, skip_form, unclaimed
     from ...indexer.db import write_lock as db_write_lock
-    from ...indexer.ops import store_symbols_for_unit
+    from ...indexer.ops import _normalize_file_path, store_symbols_for_unit
     from ...indexer.symbols import (
         ExtractionResult,
         extract_all,
@@ -2390,6 +2398,25 @@ def _reindex_parse_and_store(
     from ..background import bg_reindex_pause
 
     config_hash = cfg_data["config_hash"]
+    ownership = ownership or Ownership()
+
+    # The listings in the order of the index run: (normalized path, flags
+    # hash), as runner._in_claim_order sorts them.
+    keyed = sorted(
+        (
+            (
+                (_normalize_file_path(str(unit.file.resolve()), root), _listing_flags_hash(unit, transient_defines)),
+                unit,
+            )
+            for unit in matching
+        ),
+        key=lambda pair: pair[0],
+    )
+    # Two listings of the file with the same flags get two keys, as in the
+    # index run (number_listings).  *matching* holds each listing of the
+    # file, thus the numbers are the ones of the run.
+    keyed = list(zip(number_listings(key for key, _ in keyed), (unit for _, unit in keyed), strict=True))
+    reparsed_keys = {key for key, _ in keyed}
 
     # Phase 1: parse all matching TUs before acquiring the write lock.
     # Parsing is CPU-bound and does not touch the database — doing it
@@ -2400,12 +2427,24 @@ def _reindex_parse_and_store(
     # the stored bodies kept their inactive #if branches, and each row kept
     # the hash of the text before the edit.  The TUs of one call are few:
     # the listings of one source file, or one unit for a header.
+    #
+    # skip_files: the files of the listings before this one, as in the
+    # index run.  A listing that is parsed here gets its claims from this
+    # parse, thus its claims of the last run do not count.
     parsed_units: list[tuple[TU, ExtractionResult]] = []
+    # For each parsed unit: its key and its skip set in the form of
+    # extract_all.
+    unit_claims: list[tuple[tuple[str, str], frozenset[str] | None]] = []
+    seen_this_call: set[str] = set()
     skipped_tus: list[str] = []
-    for unit in matching:
+    for key, unit in keyed:
+        before = files_claimed_before(ownership, key, exclude=reparsed_keys)
+        skip = frozenset(skip_form(before, root) | seen_this_call) or None
         try:
-            parsed = extract_all(unit, with_refs=cfg_refs, return_tu=True)
+            parsed = extract_all(unit, with_refs=cfg_refs, return_tu=True, skip_files=skip)
             parsed_units.append((unit, parsed))
+            unit_claims.append((key, skip))
+            seen_this_call.update(parsed.newly_seen_files or ())
         except sqlite3.Error as exc:
             return 0, {"error": f"DB error during parse of {unit.file.name}: {exc}"}
         except RuntimeError as exc:
@@ -2429,7 +2468,12 @@ def _reindex_parse_and_store(
                 # The header records of each store, for the manifest below:
                 # their hashes are the ones of the text that the parse read.
                 unit_headers: list[list[dict] | None] = []
-                for unit, parsed in parsed_units:
+                # The parsed units that keep a file which they no longer
+                # claim: the next index run must parse them (see below).
+                keeps_lost_files: set[int] = set()
+                for index, ((unit, parsed), (key, skip)) in enumerate(
+                    zip(parsed_units, unit_claims, strict=True)
+                ):
                     with transaction(conn):
                         syms_added, _, headers = store_symbols_for_unit(
                             conn, unit, config_hash, root,
@@ -2437,8 +2481,29 @@ def _reindex_parse_and_store(
                             project_patterns=project_patterns_list,
                             index_refs=cfg_refs,
                             pre_parsed=parsed,
+                            skip_files=skip,
+                            listing=key,
                         )
                         total_symbols += syms_added
+                        # A file that this listing owned and does not claim
+                        # now goes, in the index run, to the next listing
+                        # that includes it.  This call parses no other
+                        # listing, thus the listing keeps the file and its
+                        # rows, and the next index run parses it again and
+                        # gives the file away (runner._settle_claims).
+                        # The same set as owned_paths of the store: the source
+                        # file only when no earlier listing claimed it.
+                        claimed = {
+                            _normalize_file_path(path, root) for path in parsed.newly_seen_files or ()
+                        }
+                        if not skip or str(unit.file.resolve()) not in skip:
+                            claimed.add(key[0])
+                        # A file in the skip set has an earlier owner: a
+                        # listing before this one, or one parsed in this call.
+                        kept = unclaimed(ownership.files_of(key) - claimed, skip or frozenset(), root)
+                        if kept:
+                            record_claims(conn, config_hash, key, claimed | kept)
+                            keeps_lost_files.add(index)
                     unit_headers.append(headers)
 
                 # Phase 3: resolve macro definitions after all TUs are stored.
@@ -2462,7 +2527,7 @@ def _reindex_parse_and_store(
 
                 _update_manifest_after_reindex(
                     parsed_units, unit_headers, root, db_path.parent, config_hash,
-                    transient_defines=transient_defines,
+                    transient_defines=transient_defines, keeps_lost_files=keeps_lost_files,
                 )
 
                 elapsed = round(time.monotonic() - t0, 2)
@@ -2534,6 +2599,7 @@ def _update_manifest_after_reindex(
     config_hash: str,
     *,
     transient_defines: Collection[str],
+    keeps_lost_files: Collection[int] = (),
 ) -> None:
     """Update manifest.json entries for reindexed translation units.
 
@@ -2560,6 +2626,11 @@ def _update_manifest_after_reindex(
     unit a second time and to hash the disk: a file saved between the parse
     and this call gave the entry the hash of the new text beside the symbols
     of the old one, and the next index run found the unit current.
+
+    *keeps_lost_files* holds the indexes in *parsed_units* of the units that keep a
+    file which they no longer claim (see ``_reindex_parse_and_store``).
+    Their entries get ``needs_reparse``: the next index run parses them and
+    gives the file to its next includer.
     """
     try:
         from ...indexer._parsed_text import file_of_parse, parsed_hash
@@ -2610,9 +2681,9 @@ def _update_manifest_after_reindex(
                 )
                 listings.append((rel, flags))
             slots = _entries_for_listings(manifest_data.get("entries", []), listings)
-            for (unit, parsed), records, (tu_rel, flags_hash), slot in zip(
+            for index, ((unit, parsed), records, (tu_rel, flags_hash), slot) in enumerate(zip(
                 parsed_units, unit_headers, listings, slots, strict=True,
-            ):
+            )):
                 # A store without records parsed nothing: the entry keeps
                 # what it says, and its old source hash makes the next run
                 # parse the unit.
@@ -2658,6 +2729,9 @@ def _update_manifest_after_reindex(
                         "flags_hash": flags_hash,
                     })
                     refreshed.add(len(manifest_data["entries"]) - 1)
+                if index in keeps_lost_files:
+                    entry_index = slot if slot is not None else len(manifest_data["entries"]) - 1
+                    manifest_data["entries"][entry_index]["needs_reparse"] = True
             # This function refreshed the SHARED header hashes, so the next
             # full index run sees no difference for the OTHER units that
             # include those headers — their rows still come from the old
@@ -3176,8 +3250,15 @@ def _reindex_one_build(
 
     build_manifest = load_manifest(db_path.parent, config_hash)
 
+    # The files that each listing claimed in the last index run: the parse
+    # below claims only what the listing claims in a full run, and a header
+    # goes to the listing that owns it (indexer/db/_owners.py).
+    from ...indexer.db import load_ownership
+
+    ownership = load_ownership(conn, config_hash)
     matching, via_header, error = _reindex_match_tus(
         target, cfg_data, manifest=build_manifest, project_root=root,
+        ownership=ownership, transient_defines=cfg.index.transient_defines,
     )
     if error:
         return error
@@ -3197,7 +3278,7 @@ def _reindex_one_build(
     total_symbols, result = _reindex_parse_and_store(
         conn, matching, cfg_data, cfg.index.index_refs,
         root, db_path, target, vendor_patterns, project_patterns_list,
-        cfg.index.transient_defines,
+        cfg.index.transient_defines, ownership,
     )
     if "error" in result:
         return result
@@ -3316,6 +3397,13 @@ def _reindex_resolve_target(
     return target, None
 
 
+def _listing_flags_hash(unit, transient_defines: Collection[str]) -> str:
+    """Return the flags hash of *unit*, as the index run computes it (``decide_units``)."""
+    if unit.raw_entry is None:
+        return ""
+    return compute_flags_hash(unit.raw_entry, transient_defines=transient_defines)
+
+
 def _tu_for_header(
     target: Path, manifest: dict | None, project_root: Path
 ) -> Path | None:
@@ -3332,10 +3420,12 @@ def _tu_for_header(
     single tool call into hours, thus the caller warns that the answer
     comes from one compilation context and points at a full index.
 
-    The choice is the lowest path in sort order, not the first entry.
-    Manifest order follows compile_commands.json, which a rebuild can
-    reshuffle, and a tool that picked a different unit on every call
-    would be hard to reason about.
+    The choice is the lowest stored path in sort order, not the first
+    entry.  That is the first includer in the order of the index run,
+    which parses the units sorted by their stored path
+    (``runner._in_claim_order``).  The caller uses this function only for
+    a header that no listing owns: a header with an owner goes to its
+    owner first.
 
     Paths are compared as strings.  The manifest already stores resolved
     forms — relative to the project root when inside it, absolute
@@ -3357,11 +3447,71 @@ def _tu_for_header(
             header_abs = header if Path(header).is_absolute() else str(root / header)
             if header_abs != target_str:
                 continue
-            tu_abs = tu_file if Path(tu_file).is_absolute() else str(root / tu_file)
-            if best is None or tu_abs < best:
-                best = tu_abs
+            if best is None or tu_file < best:
+                best = tu_file
             break
-    return Path(best) if best is not None else None
+    if best is None:
+        return None
+    return Path(best) if Path(best).is_absolute() else root / best
+
+
+def _with_owners_of_changed_headers(
+    found: list,
+    units: list,
+    manifest: dict | None,
+    ownership: Ownership | None,
+    root: Path,
+    transient_defines: Collection[str],
+) -> list:
+    """Add to *found* the listing that owns each changed header of *found*.
+
+    The re-parse skips each file that an earlier listing owns (see
+    ``_reindex_parse_and_store``), as the index run does.  A header that
+    changed on disk must get its new rows, and in a full run its owner
+    writes them: every listing that includes a changed header is parsed
+    again, and the first one claims it.  Thus the owner is parsed here too.
+    Without it, the rows and the stored text of the header stayed old until
+    the next index run.
+
+    A header is changed when the hash on disk differs from the hash in the
+    manifest, the hash of the text that the last parse read.
+
+    The source file of *found* itself can have another owner too: a unity
+    build includes ``b.c`` in ``a.c``, and ``a.c`` comes first, thus ``a.c``
+    owns ``src/b.c``.  The caller re-parses the file because it changed, thus
+    its owner is parsed too, also without a hash check.
+    """
+    if ownership is None or not ownership.owned:
+        return found
+    from ...indexer.manifest import resolve_headers
+    from ...indexer.ops import _normalize_file_path
+    from ...utils import compute_source_hash
+
+    found_files = {_normalize_file_path(str(unit.file), root) for unit in found}
+    owners: set[tuple[str, str]] = {
+        owner for owner in (ownership.owner_of(path) for path in found_files)
+        if owner is not None and owner[0] not in found_files
+    }
+    for entry in (manifest or {}).get("entries") or ():
+        if entry.get("file") not in found_files:
+            continue
+        for record in resolve_headers(entry, (manifest or {}).get("headers")):
+            owner = ownership.owner_of(record["path"])
+            if owner is None or owner[0] in found_files:
+                continue
+            on_disk = Path(record["path"]) if Path(record["path"]).is_absolute() else root / record["path"]
+            if compute_source_hash(on_disk) != record.get("hash", ""):
+                owners.add(owner)
+    if not owners:
+        return found
+    extra = [
+        unit for unit in units
+        if (_normalize_file_path(str(unit.file), root), _listing_flags_hash(unit, transient_defines)) in owners
+    ]
+    log.info(
+        "reindex_file: %d listing(s) that own a changed file of the target are parsed too", len(extra),
+    )
+    return found + extra
 
 
 def _reindex_match_tus(
@@ -3370,6 +3520,8 @@ def _reindex_match_tus(
     *,
     manifest: dict | None = None,
     project_root: Path | None = None,
+    ownership: Ownership | None = None,
+    transient_defines: Collection[str] = DEFAULT_TRANSIENT_DEFINES,
 ) -> tuple[list, bool, dict | None]:
     """Find compilation units in compile_commands.json that build *target*.
 
@@ -3379,9 +3531,11 @@ def _reindex_match_tus(
     returned so symbols from each context are updated.
 
     A header matches nothing this way, because compile_commands.json
-    lists translation units and a header is not one.  For that case
-    *manifest* supplies one unit that includes the header; see
-    _tu_for_header for why one and which one.
+    lists translation units and a header is not one.  For that case the
+    unit is the listing that owns the header in *ownership*: that listing
+    wrote the rows of the header, and the index run gives it the header
+    again.  A header that no listing owns goes to the first includer that
+    *manifest* names; see _tu_for_header for why one and which one.
 
     Returns ``(matching_tus, via_header, None)`` on success, where
     *via_header* says the units came from the manifest fallback and the
@@ -3397,18 +3551,38 @@ def _reindex_match_tus(
     # list(), not the iterator parse_cc returns: the header fallback below
     # walks the units a second time, and a generator is empty by then.
     units = list(parse_cc(cc_path))
+    root = project_root or target.parent
+
+    def with_owners(found: list) -> list:
+        return _with_owners_of_changed_headers(found, units, manifest, ownership, root, transient_defines)
+
     matching = [u for u in units if Path(u.file).resolve() == target]
     if matching:
-        return matching, False, None
+        return with_owners(matching), False, None
 
-    tu_path = _tu_for_header(target, manifest, project_root or target.parent)
+    # Lazy, as the other imports of the indexer here: ops loads libclang.
+    from ...indexer.ops import _normalize_file_path
+
+    owner = ownership.owner_of(_normalize_file_path(str(target), root)) if ownership else None
+    if owner is not None:
+        owned_by = [
+            u for u in units
+            if _normalize_file_path(str(u.file), root) == owner[0]
+            and _listing_flags_hash(u, transient_defines) == owner[1]
+        ]
+        if owned_by:
+            return with_owners(owned_by[:1]), True, None
+
+    tu_path = _tu_for_header(target, manifest, root)
     if tu_path is not None:
         # The manifest can name a unit that a later build dropped from
         # compile_commands.json.  An empty result here falls through to
         # the error below, which is the same answer as before.
         via = [u for u in units if Path(u.file).resolve() == tu_path]
         if via:
-            return via[:1], True, None
+            # The first listing of the file in the order of the index run.
+            first = min(via, key=lambda unit: _listing_flags_hash(unit, transient_defines))
+            return with_owners([first]), True, None
     return [], False, None
 
 
