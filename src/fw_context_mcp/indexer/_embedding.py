@@ -17,7 +17,9 @@ import hashlib
 import logging
 import sqlite3
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -51,16 +53,32 @@ def _embed_model_key(embed_model: str, embed_bodies: bool) -> str:
     return f"{embed_model}:{version}"
 
 
-def _embed_content_hash(r) -> str:
-    """Content-addressable hash of the fields that feed an embedding description.
+# The kinds whose body is in the description, in chunks (_rebuild_desc_rows).
+_BODY_KINDS = frozenset({"function", "method", "constructor", "destructor"})
+
+
+def _embed_content_hash(r, *, max_body_chars: int | None = None, settings: str = "") -> str:
+    """Content-addressable hash of the inputs of an embedding description.
 
     Mirrors the description assembly in :func:`_build_embeddings`: any change
     to name, qualified name, kind, file path, signature, docstring, LLM
     summary, or body must invalidate the embedding so the symbol is
     re-embedded on the next index run.
+
+    Two inputs that are not fields of the symbol are in it too:
+
+    * *max_body_chars* — the chunk size (``embedder.max_tokens * 3``).  It
+      sets the chunks of a body that is longer than it, thus it is in the
+      hash of such a body only.  A short body is one chunk for each size.
+    * *settings* — ``Embedder.document_settings``: the document prompt and
+      the vector size of the backend.
+
+    Both go in only when they act, thus the hash of an embedding that they
+    do not change stays as it was before they were in it.  Before, a change
+    of one of them kept the vectors of the old value.
     """
 
-    raw = "|".join([
+    parts = [
         r["name"] or "",
         r["qualified_name"] or "",
         r["kind"] or "",
@@ -69,11 +87,22 @@ def _embed_content_hash(r) -> str:
         r["docstring"] or "",
         r["summary"] or "",
         r["source"] or "",
-    ])
-    return hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()
+    ]
+    if (
+        max_body_chars is not None
+        and (r["kind"] or "") in _BODY_KINDS
+        and len((r["source"] or "").strip()) > max_body_chars
+    ):
+        parts.append(f"chunks={max_body_chars}")
+    if settings:
+        parts.append(f"settings={settings}")
+    return hashlib.sha256("|".join(parts).encode("utf-8", errors="replace")).hexdigest()
 
 
-def _take_from_stash(conn, rows: list, model: str, config_hash: str, dim: int, db_dir: Path) -> list:
+def _take_from_stash(
+    conn, rows: list, model: str, config_hash: str, dim: int, db_dir: Path,
+    content_hash: Callable[[Any], str] = _embed_content_hash,
+) -> list:
     """Store the stashed vectors of each row whose key the stash holds; return the other rows.
 
     A re-parse inserts each symbol again with a new id, and the store put
@@ -117,7 +146,7 @@ def _take_from_stash(conn, rows: list, model: str, config_hash: str, dim: int, d
     reused_total = 0
     for start in range(0, len(rows), 500):
         batch_rows = rows[start:start + 500]
-        keys = {row["id"]: (model, _embed_content_hash(row), row["is_project"]) for row in batch_rows}
+        keys = {row["id"]: (model, content_hash(row), row["is_project"]) for row in batch_rows}
         found = take_stashed_embeddings(conn, model, set(keys.values()))
         batch: list[tuple[sqlite3.Row, list[tuple[int, bytes]]]] = []
         for row in batch_rows:
@@ -447,6 +476,13 @@ def _build_embeddings(
                 "run 'fw-context doctor --fix'"
             )
     model = _embed_model_key(embedder.name, True)
+    # The two inputs of each description that are not fields of the symbol
+    # (see _embed_content_hash).
+    max_body_chars = embedder.max_tokens * 3
+    settings = embedder.document_settings
+
+    def content_hash(row) -> str:
+        return _embed_content_hash(row, max_body_chars=max_body_chars, settings=settings)
 
     # ── Incremental re-embedding (Phase 0) ──
     # Skip symbols whose embedding description content did not change since
@@ -526,7 +562,7 @@ def _build_embeddings(
     # filter is a no-op — everything is embedded.
     if incremental_ok:
         to_embed = [
-            r for r in rows if existing_hashes.get(r["id"]) != _embed_content_hash(r)
+            r for r in rows if existing_hashes.get(r["id"]) != content_hash(r)
         ]
         skipped = len(rows) - len(to_embed)
         if skipped:
@@ -543,7 +579,7 @@ def _build_embeddings(
         # Only with a known dimension: a stashed vector of another length
         # (embed_dim changed) must not reach vec0.
         if stored_dim is not None:
-            rows = _take_from_stash(conn, rows, model, config_hash, stored_dim, db_dir)
+            rows = _take_from_stash(conn, rows, model, config_hash, stored_dim, db_dir, content_hash)
             if not rows:
                 log.info("All symbols embedded from the stash (model=%s) — nothing to do", model)
                 return
@@ -558,8 +594,6 @@ def _build_embeddings(
     # Build contextual descriptions — flowing sentences instead of token lists.
     # Anthropic Contextual Retrieval: chunk-specific context as sentences improves
     # embedding recall by -35% failures vs token-boundary lists.
-    body_kinds = frozenset({"function", "method", "constructor", "destructor"})
-    max_body_chars = embedder.max_tokens * 3
     MAX_EMBED_BATCH_SYMBOLS = 10
 
     desc_rows: list[tuple[dict, int, str]] = []
@@ -615,7 +649,7 @@ def _build_embeddings(
             extra_text = " ".join(extra) if extra else ""
 
             body_chunks: list[str] = []
-            if kind in body_kinds:
+            if kind in _BODY_KINDS:
                 source = (r["source"] or "").strip()
                 if source:
                     body_chunks = _chunk_body(source, max_body_chars)
@@ -791,7 +825,7 @@ def _build_embeddings(
                     log.warning("vec0 table ensure failed (non-fatal): %s", e)
 
         blob_rows = [
-            (r["id"], ci, _vec_to_blob(emb), model, _embed_content_hash(r))
+            (r["id"], ci, _vec_to_blob(emb), model, content_hash(r))
             for (r, ci, _), emb in zip(batch, embs, strict=True)
         ]
         vec_rows = [

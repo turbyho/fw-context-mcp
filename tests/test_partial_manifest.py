@@ -198,6 +198,7 @@ def test_failed_batches_are_reported_after_the_other_batches(tmp_path, monkeypat
     class _FailsOneBatch:
         name = "fake-embedder"
         max_tokens = 512
+        document_settings = ""
 
         def embed_documents(self, texts):
             if any("fn_11" in text for text in texts):

@@ -97,6 +97,21 @@ class Embedder(ABC):
         """
 
     @property
+    def document_settings(self) -> str:
+        """The settings of the backend that change the vector of a document text.
+
+        The text and ``name`` are not in it.  The index run puts this string
+        into the content hash of each embedding (``_embed_content_hash``),
+        thus a change of a setting computes the embeddings again.  Before,
+        the run compared the text only, and the vectors of the old setting
+        stayed.
+
+        Empty when the backend has no such setting set: the content hash of
+        an index without one then stays as it was.
+        """
+        return ""
+
+    @property
     @abstractmethod
     def max_tokens(self) -> int:
         """Approximate max token count for truncation decisions.

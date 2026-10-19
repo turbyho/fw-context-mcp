@@ -1052,8 +1052,8 @@ def _step_build_embeddings(conn: sqlite3.Connection, ctx: dict) -> None:
     ``force`` also empties the stash of the re-parsed symbols: a forced run
     re-parses each unit, thus the stash holds each vector of the build, and
     the step took all of them back.  ``--force`` promises a new embedding of
-    each symbol, and it is the repair for a model setting that the model
-    key does not hold (``embed_dim``, ``embed_doc_prompt``).
+    each symbol, also when nothing that the content hash holds changed (a
+    new model under the same name, for example).
     """
     config_hash = ctx["config_hash"]
     llm_config = ctx["llm_config"]

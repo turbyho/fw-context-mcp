@@ -415,6 +415,7 @@ class _FakeEmbedder:
 
     name = "test-embed-model"
     max_tokens = 512
+    document_settings = ""
     dim = 8
 
     def __init__(self):

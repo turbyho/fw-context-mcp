@@ -40,6 +40,7 @@ class _FakeEmbedder:
 
     name = "fake-embedder"
     max_tokens = 512
+    document_settings = ""
 
     def embed_documents(self, texts):
         return [[1.0, 0.0, 0.0, 0.0] for _ in texts]

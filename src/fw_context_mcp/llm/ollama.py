@@ -627,6 +627,12 @@ class OllamaEmbedder(Embedder):
         return self._dim
 
     @property
+    def document_settings(self) -> str:
+        # The document prompt goes in front of each text (_call_ollama_embed_impl).
+        prompt = self._cfg.embed_doc_prompt
+        return f"doc_prompt={prompt}" if prompt else ""
+
+    @property
     def max_tokens(self) -> int:
         model = self._cfg.embed_model
         cached = _max_tokens_cache.get(model)

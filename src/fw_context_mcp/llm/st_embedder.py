@@ -151,6 +151,17 @@ class SentenceTransformerEmbedder(Embedder):
             return self._dim
 
     @property
+    def document_settings(self) -> str:
+        # The document prompt goes in front of each text, and embed_dim cuts
+        # each vector (MRL, see _encode).
+        parts = []
+        if self._cfg.embed_doc_prompt:
+            parts.append(f"doc_prompt={self._cfg.embed_doc_prompt}")
+        if self._cfg.embed_dim:
+            parts.append(f"dim={self._cfg.embed_dim}")
+        return ";".join(parts)
+
+    @property
     def model(self):
         """Return the loaded :class:`SentenceTransformer` model, loading it lazily.
 
