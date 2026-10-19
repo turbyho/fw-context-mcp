@@ -6,7 +6,6 @@ exclude_paths = [
     "build",
     "BUILD",
 ]
-compile_commands = "compile_commands.json"
 
 [build]
 
