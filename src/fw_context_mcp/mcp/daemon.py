@@ -1101,23 +1101,35 @@ def _optimize_db(db_dir: Path) -> None:
     error of the open went out of the loop.  The daemon then stopped, and
     no change got an index run.  The maintenance is not necessary, thus a
     warning is sufficient.
+
+    WHY the index lock: within one project each writer holds it, and the
+    optimize can write (ANALYZE).  A manual run that took the lock when
+    the background run ended got ``database is locked`` in the store of a
+    unit.  The daemon takes the lock only when it is free, and skips the
+    optimize when another process holds it: the maintenance can wait for
+    the next run.
     """
     from ..indexer.db import open_db
+    from ..indexer.db._locking import IndexRunLocked, index_run_lock
 
     db_path = db_dir / "index.db"
     if not db_path.exists():
         return
     try:
-        conn = open_db(db_path, skip_integrity_check=True)
-    except (sqlite3.Error, OSError):
-        log.warning("Cannot open the database for PRAGMA optimize", exc_info=True)
-        return
-    try:
-        conn.execute("PRAGMA optimize")
-    except (sqlite3.Error, ValueError, TypeError, RuntimeError, AttributeError):
-        log.debug("PRAGMA optimize failed", exc_info=True)
-    finally:
-        conn.close()
+        with index_run_lock(db_dir):
+            try:
+                conn = open_db(db_path, skip_integrity_check=True)
+            except (sqlite3.Error, OSError):
+                log.warning("Cannot open the database for PRAGMA optimize", exc_info=True)
+                return
+            try:
+                conn.execute("PRAGMA optimize")
+            except (sqlite3.Error, ValueError, TypeError, RuntimeError, AttributeError):
+                log.debug("PRAGMA optimize failed", exc_info=True)
+            finally:
+                conn.close()
+    except IndexRunLocked:
+        log.debug("Another process holds the index: no PRAGMA optimize")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

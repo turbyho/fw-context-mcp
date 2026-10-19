@@ -25,9 +25,9 @@ def cmd_search(args: argparse.Namespace) -> int:
     """
     from ..config import derive_project_id
     from ..config import load as load_config
-    from ..indexer.db import open_db, search_symbols
+    from ..indexer.db import search_symbols
     from ..utils import resolve_project_root
-    from ._builds import selected_build
+    from ._builds import open_for_reading, selected_build
 
     project_root = resolve_project_root(args.project)
     cfg = load_config(project_root=project_root)
@@ -38,7 +38,9 @@ def cmd_search(args: argparse.Namespace) -> int:
         print(f"No index found at {db_path}. Run 'fw-context index' first.", file=sys.stderr)
         return 1
 
-    conn = open_db(db_path)
+    conn = open_for_reading(db_path)
+    if conn is None:
+        return 1
     try:
         build_cfg, error = selected_build(conn, project_id, cfg, args)
         if build_cfg is None:

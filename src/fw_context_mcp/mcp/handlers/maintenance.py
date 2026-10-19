@@ -68,7 +68,7 @@ from ...indexer.db import (
     symbols_without_embedding,
     transaction,
 )
-from ...indexer.db._locking import IndexRunLocked
+from ...indexer.db._locking import IndexRunLocked, index_run_lock
 from ...indexer.git_context import head_moved, stored_head
 from ...llm.ollama import check_setup
 from ...utils import HEADER_EXTENSIONS, resolve_project_root
@@ -429,8 +429,15 @@ def _project_facts(conn, target: _IndexTarget) -> _ProjectFacts:
         if checked_cc is not None and not build_missing_reason(checked_cc):
             # The check ran and found the build (built outside of
             # fw-context): the text is out of date for every answer, not
-            # only here.  Without a check the marker stays.
-            clear_build_problem(db_dir)
+            # only here.  Without a check the marker stays.  Only with the
+            # index lock: an index run that holds it writes the marker,
+            # and the status must not remove a marker that the run wrote
+            # after this read.  The answer omits the text either way.
+            try:
+                with index_run_lock(db_dir):
+                    clear_build_problem(db_dir)
+            except IndexRunLocked:
+                pass
             problem = None
     new_sources = find_unindexed_sources(conn, checked["config_hash"], target.root, cc_path)
     return _ProjectFacts(

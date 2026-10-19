@@ -83,6 +83,7 @@ __all__ = [
     "ensure_schema",
     "get_db_schema_version",
     "open_db",
+    "open_db_readonly",
     "transaction",
 ]
 
@@ -197,7 +198,11 @@ def _configure_connection(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA cache_size = -64000")
     conn.execute("PRAGMA mmap_size = 268435456")
     conn.execute("PRAGMA synchronous = 1")
-    # Load sqlite-vec extension for vector search (graceful when missing)
+    _load_sqlite_vec(conn)
+
+
+def _load_sqlite_vec(conn: sqlite3.Connection) -> None:
+    """Load the sqlite-vec extension for vector search (graceful when missing)."""
     try:
         conn.enable_load_extension(True)
         import sqlite_vec
@@ -210,6 +215,28 @@ def _configure_connection(conn: sqlite3.Connection) -> None:
                   "semantic search KNN unavailable, will use BLOB fallback", e)
     except (sqlite3.Error, RuntimeError, OSError) as e:
         log.warning("sqlite-vec load error: %s", e)
+
+
+def open_db_readonly(path: Path) -> sqlite3.Connection:
+    """Open the index read-only, for a command that only reads it: no schema migration, no write.
+
+    WHY not ``open_db``: it runs the schema migrations, which write the
+    database.  After an upgrade of fw-context, a command that only reads
+    (``fw-context search``, ``db list``, ``export``) migrated the index
+    beside an index run of the project; within one project only a writer
+    that holds the index lock may write.  An index of an older schema thus
+    stays as it is: the caller reads ``missing_columns`` and names the
+    index run that migrates it.
+
+    The connection loads sqlite-vec as ``open_db`` does: a search reads
+    the vectors.  ``as_uri()`` encodes a space, '?' and '#' in the path.
+    """
+    conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only = ON")
+    conn.execute("PRAGMA busy_timeout = 10000")
+    _load_sqlite_vec(conn)
+    return conn
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:

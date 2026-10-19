@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import argparse
 import sqlite3
+import sys
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -90,3 +92,52 @@ def label(build: sqlite3.Row) -> str:
     from ..mcp.shared.stale import build_label
 
     return build_label(build) or "(no name)"
+
+
+# The kinds of an index that a command cannot read as it is (reading_problem).
+OLDER, EMPTY, UNREADABLE = "older", "empty", "unreadable"
+
+
+def reading_problem(conn: sqlite3.Connection) -> tuple[str, str] | None:
+    """Return ``(kind, text)`` when a read-only *conn* cannot read the index as this version writes it, else None.
+
+    *kind* is :data:`OLDER` (an older fw-context wrote it: only an index
+    run migrates it), :data:`EMPTY` (the file holds no tables) or
+    :data:`UNREADABLE` (SQLite cannot read the file).  ``open_db`` made the
+    tables and migrated the schema for each command; a read-only open does
+    neither, because within one project only a writer that holds the index
+    lock writes.
+    """
+    from ..indexer.db import missing_columns
+
+    try:
+        if not conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'build_configs'"
+        ).fetchone():
+            return EMPTY, "the index holds no tables. Run 'fw-context index' to make it."
+        if missing_columns(conn):
+            return OLDER, ("an older fw-context wrote this index. Run 'fw-context index' to migrate it, "
+                           "then run this command again.")
+    except sqlite3.DatabaseError as exc:
+        return UNREADABLE, f"the index cannot be read ({exc}). Run 'fw-context doctor' to check it."
+    return None
+
+
+def open_for_reading(db_path: Path) -> sqlite3.Connection | None:
+    """Open the index read-only for a command that only reads it, or print the error and return None.
+
+    See :func:`reading_problem` for an index that the command cannot read.
+    """
+    from ..indexer.db import open_db_readonly
+
+    try:
+        conn = open_db_readonly(db_path)
+    except sqlite3.DatabaseError as exc:
+        print(f"error: the index cannot be read ({exc}). Run 'fw-context doctor' to check it.", file=sys.stderr)
+        return None
+    problem = reading_problem(conn)
+    if problem is not None:
+        conn.close()
+        print(f"error: {problem[1]}", file=sys.stderr)
+        return None
+    return conn

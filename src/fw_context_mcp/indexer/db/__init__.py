@@ -120,6 +120,7 @@ __all__ = [
     "missing_columns",
     "number_listings",
     "open_db",
+    "open_db_readonly",
     "purge_file_records",
     "purge_missing_files_batch",
     "rebuild_files_fts",
@@ -184,6 +185,7 @@ from ._connection import (
     error_shows_damage,
     get_db_schema_version,
     open_db,
+    open_db_readonly,
     transaction,
 )
 from ._embeddings import (

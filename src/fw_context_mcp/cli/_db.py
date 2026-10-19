@@ -23,6 +23,8 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
+from ._builds import OLDER, open_for_reading, reading_problem
+
 #: The marker of a row that the queries of its build read.
 QUERIED_FOOTER = "* = the row that the queries of its build read"
 
@@ -97,7 +99,7 @@ def cmd_db_list(args: argparse.Namespace) -> int:
     """
     from ..config import derive_project_id
     from ..config import load as load_config
-    from ..indexer.db import get_all_builds_for_project, open_db
+    from ..indexer.db import get_all_builds_for_project
     from ..mcp.shared.stale import latest_builds
     from ..utils import resolve_project_root
 
@@ -110,7 +112,9 @@ def cmd_db_list(args: argparse.Namespace) -> int:
         print("No index found. Run 'fw-context index' first.")
         return 1
 
-    conn = open_db(db_path)
+    conn = open_for_reading(db_path)
+    if conn is None:
+        return 1
     try:
         queried = {build["config_hash"] for build in latest_builds(conn, project_id)}
         builds = get_all_builds_for_project(conn, project_id)
@@ -156,7 +160,7 @@ def cmd_db_stats(args: argparse.Namespace) -> int:
     """Show detailed statistics for a specific build."""
     from ..config import derive_project_id
     from ..config import load as load_config
-    from ..indexer.db import get_build_stats, open_db
+    from ..indexer.db import get_build_stats
     from ..utils import resolve_project_root
 
     project_root = resolve_project_root(args.project)
@@ -168,7 +172,9 @@ def cmd_db_stats(args: argparse.Namespace) -> int:
         print("No index found. Run 'fw-context index' first.")
         return 1
 
-    conn = open_db(db_path)
+    conn = open_for_reading(db_path)
+    if conn is None:
+        return 1
     try:
         config_hash = _resolve_config_hash(conn, args.config_hash)
         if config_hash is None:
@@ -250,10 +256,7 @@ def cmd_db_delete(args: argparse.Namespace) -> int:
     """
     from ..config import derive_project_id
     from ..config import load as load_config
-    from ..indexer.db import (
-        get_all_builds_for_project,
-        open_db,
-    )
+    from ..indexer.db import get_all_builds_for_project, open_db_readonly
     from ..mcp.shared.stale import latest_builds
     from ..utils import resolve_project_root
 
@@ -268,25 +271,33 @@ def cmd_db_delete(args: argparse.Namespace) -> int:
 
     # ── --all: delete entire index ──
     if args.all:
-        conn = open_db(db_path)
+        # Read only, before the lock: an index of an older schema cannot
+        # list its builds, and the command deletes it as a whole.
+        conn = open_db_readonly(db_path)
         try:
-            builds = get_all_builds_for_project(conn, project_id)
-            queried = {build["config_hash"] for build in latest_builds(conn, project_id)}
+            problem = reading_problem(conn)
+            older = problem is not None
+            builds = [] if older else get_all_builds_for_project(conn, project_id)
+            queried = set() if older else {build["config_hash"] for build in latest_builds(conn, project_id)}
         finally:
             conn.close()
 
-        if not builds:
+        if not builds and not older:
             print("No builds to delete.")
             return 0
 
         print(f"Project: {project_root.name}  path={project_root}")
-        print(f"  {len(builds)} build(s) found:")
+        if problem is not None:
+            print(f"  The builds are not listed: {problem[1]}")
+        else:
+            print(f"  {len(builds)} build(s) found:")
         for b in builds:
             desc = b["description"] or "-"
             print(f"  {b['config_hash'][:12]}...  {_row_label(b)}  {_row_state(b, queried)}  {desc}")
 
         if not args.yes:
-            answer = input(f"\nThis will delete the ENTIRE index including all {len(builds)} builds.\n"
+            count = "all its builds" if older else f"all {len(builds)} builds"
+            answer = input(f"\nThis will delete the ENTIRE index including {count}.\n"
                            "Delete all builds? [y/N] ").strip().lower()
             if answer not in ("y", "yes"):
                 print("Aborted.")
@@ -349,7 +360,31 @@ def _delete_one_build(args: argparse.Namespace, cfg, project_id: str, db_path: P
     if not ask and not db_path.exists():
         print("error: the index was deleted meanwhile. Nothing to delete.")
         return 1
-    conn = open_db(db_path)
+    if ask:
+        # Read only, before the lock.  An index of an older schema cannot
+        # show the build: the person confirms the hash, and the checks run
+        # under the lock, where open_db migrates the index.
+        from ..indexer.db import open_db_readonly
+
+        probe = open_db_readonly(db_path)
+        try:
+            problem = reading_problem(probe)
+        finally:
+            probe.close()
+        if problem is not None and problem[0] != OLDER:
+            print(f"error: {problem[1]} Use 'fw-context db delete --all' to delete the whole index.")
+            return 1
+        if problem is not None:
+            print(f"Build {args.config_hash}: {problem[1]}")
+            if not args.yes:
+                answer = input("\nDelete this build after the migration? [y/N] ").strip().lower()
+                if answer not in ("y", "yes"):
+                    print("Aborted.")
+                    return 0
+            return None
+    conn = open_for_reading(db_path) if ask else open_db(db_path)
+    if conn is None:
+        return 1
     try:
         config_hash = _resolve_config_hash(conn, args.config_hash)
         if config_hash is None:

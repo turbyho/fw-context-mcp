@@ -38,9 +38,9 @@ def cmd_export(args: argparse.Namespace) -> int:
     from ..config import derive_project_id
     from ..config import load as load_config
     from ..indexer.build import detect_build_system
-    from ..indexer.db import count_refs, open_db
+    from ..indexer.db import count_refs
     from ..utils import resolve_project_root
-    from ._builds import NO_BUILD, selected_build
+    from ._builds import NO_BUILD, open_for_reading, selected_build
 
     project_root = resolve_project_root(args.project)
     cfg = load_config(project_root=project_root)
@@ -51,7 +51,9 @@ def cmd_export(args: argparse.Namespace) -> int:
         print(f"No index found for {project_root}. Run 'fw-context index' first.", file=sys.stderr)
         return 1
 
-    conn = open_db(db_path)
+    conn = open_for_reading(db_path)
+    if conn is None:
+        return 1
     try:
         build_cfg, error = selected_build(conn, project_id, cfg, args)
         if build_cfg is None:
@@ -147,7 +149,6 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     """
     from ..config import derive_project_id
     from ..config import load as load_config
-    from ..indexer.db import open_db
     from ..utils import resolve_project_root
     from ._builds import selected_builds
 
@@ -181,10 +182,15 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         return 1
 
     # A selector that names no build fails at once, also while the index is
-    # held; _analyze_builds reads the builds again under the lock.
-    conn = open_db(db_path)
+    # held; _analyze_builds reads the builds again under the lock.  Read
+    # only: an index of an older schema skips this check, and the read
+    # under the lock migrates it.
+    from ..indexer.db import open_db_readonly
+    from ._builds import reading_problem
+
+    conn = open_db_readonly(db_path)
     try:
-        _builds_now, error = selected_builds(conn, project_id, cfg, args)
+        error = None if reading_problem(conn) else selected_builds(conn, project_id, cfg, args)[1]
     finally:
         conn.close()
     if error:

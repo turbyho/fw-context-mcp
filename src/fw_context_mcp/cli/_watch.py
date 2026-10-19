@@ -78,24 +78,7 @@ def cmd_watch_status(args: argparse.Namespace) -> int:
     db_path = db_dir / "index.db"
     if db_path.exists():
         try:
-            from ..indexer.db import open_db
-            from ..mcp.shared.stale import _count_modified_files, build_label, latest_builds
-
-            conn = open_db(db_path)
-            try:
-                # Each build: the builds of one project are not always
-                # indexed together, thus one build can be behind while the
-                # newest is current.  The daemon checks each build too.
-                # One hash of each file for all builds: a file that two
-                # builds compile has one text on disk.
-                hash_cache: dict[str, str] = {}
-                for build in sorted(latest_builds(conn, project_id), key=build_label):
-                    mod_count = _count_modified_files(
-                        conn, build["config_hash"], root, use_cache=False, hash_cache=hash_cache,
-                    )
-                    print(f"Modified:   {mod_count} file(s) in build {build_label(build) or '(no name)'}")
-            finally:
-                conn.close()
+            _print_modified_counts(db_path, project_id, root)
         except (sqlite3.Error, OSError):
             pass
 
@@ -163,10 +146,12 @@ def cmd_watch_restart(args: argparse.Namespace) -> int:
         except (ValueError, OSError) as e:
             print(f"Could not read/stop old daemon: {e}")
 
-    # Clean up leftover files
+    # Clean up leftover files.  Not watcher.lock: the daemons exclude each
+    # other with a flock on that file, and a removed file gives the new
+    # daemon a new inode, thus a lock of its own beside an old daemon that
+    # survived its SIGKILL: two daemons.  A lock of a dead process is free.
     pid_file.unlink(missing_ok=True)
     sock_path.unlink(missing_ok=True)
-    (db_dir / "watcher.lock").unlink(missing_ok=True)
 
     # Spawn new daemon
     print("Starting new daemon...")
@@ -180,3 +165,36 @@ def cmd_watch_restart(args: argparse.Namespace) -> int:
         print("Daemon may still be starting — check 'fw-context watch status' in a moment.")
 
     return 0
+
+
+def _print_modified_counts(db_path, project_id: str, root) -> None:
+    """Print the count of the modified files of each build, read-only.
+
+    The status migrates no schema beside an index run.  An index that it
+    cannot read (an older schema after an upgrade) gives one line, and the
+    status goes on: the daemon migrates the index, and the lines after the
+    count show that run.  Before, the status stopped here with exit 1.
+    """
+    from ..indexer.db import open_db_readonly
+    from ..mcp.shared.stale import _count_modified_files, build_label, latest_builds
+    from ._builds import reading_problem
+
+    conn = open_db_readonly(db_path)
+    try:
+        problem = reading_problem(conn)
+        if problem is not None:
+            print(f"Modified:   not known: {problem[1]}")
+            return
+        # Each build: the builds of one project are not always indexed
+        # together, thus one build can be behind while the newest is
+        # current.  The daemon checks each build too.  One hash of each
+        # file for all builds: a file that two builds compile has one text
+        # on disk.
+        hash_cache: dict[str, str] = {}
+        for build in sorted(latest_builds(conn, project_id), key=build_label):
+            mod_count = _count_modified_files(
+                conn, build["config_hash"], root, use_cache=False, hash_cache=hash_cache,
+            )
+            print(f"Modified:   {mod_count} file(s) in build {build_label(build) or '(no name)'}")
+    finally:
+        conn.close()

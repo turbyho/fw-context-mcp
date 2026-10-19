@@ -174,8 +174,9 @@ def resolve_build(
     An index that an older version wrote gets the fact of the old schema
     as its refusal (`stale.outdated_index_fact`): its rows lack the columns
     that the build choice reads.  Each query tool selects a build here,
-    thus one check covers them.  (The CLI opens the index with `open_db`,
-    which adds the columns first.)  The refusal names the status tool and
+    thus one check covers them.  (A CLI command that only reads opens the
+    index read-only and stops with the same fact, `cli._builds.reading_problem`.)
+    The refusal names the status tool and
     no command: this function does not know the state of an index run, and
     a command during the run that adds the columns would take that run
     over.

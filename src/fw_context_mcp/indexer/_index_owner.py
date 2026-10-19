@@ -94,10 +94,11 @@ def index_run_kind(pid: int) -> str | None:
 
 
 def is_fw_context_process(pid: int) -> bool:
-    """Return True when *pid* runs fw-context (any command, or the MCP server), for the message of a refusal."""
+    """Return True when *pid* runs fw-context (any command, the MCP server or its daemon), for the message of a refusal."""
     argv = process_argv(pid)
     return bool(argv) and any(
-        arg.endswith(("fw-context", "fw-context-mcp", "fw_context_mcp.cli", "fw_context_mcp")) for arg in argv or ()
+        arg.endswith(("fw-context", "fw-context-mcp", "fw_context_mcp.cli", "fw_context_mcp", "fw_context_mcp.mcp.daemon"))
+        for arg in argv or ()
     )
 
 

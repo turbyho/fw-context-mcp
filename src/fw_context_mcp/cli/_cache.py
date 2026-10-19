@@ -108,9 +108,10 @@ def cmd_cache_stats(args: argparse.Namespace) -> int:
             project_id = derive_project_id(project_root)
             db_path = cfg.index.db_dir / project_id / "index.db"
             if db_path.exists():
-                from ..indexer.db import open_db
+                from ..indexer.db import open_db_readonly
 
-                conn = open_db(db_path)
+                # Read only: no schema migration beside an index run.
+                conn = open_db_readonly(db_path)
                 hashes: list[str] = []
                 try:
                     hashes = [
@@ -475,9 +476,10 @@ def cmd_cache_clear(args: argparse.Namespace) -> int:
             db_path = cfg.index.db_dir / project_id / "index.db"
             hashes = []
             if db_path.exists():
-                from ..indexer.db import open_db
+                from ..indexer.db import open_db_readonly
 
-                conn = open_db(db_path)
+                # Read only: no schema migration beside an index run.
+                conn = open_db_readonly(db_path)
                 try:
                     hashes = [
                         r[0]
