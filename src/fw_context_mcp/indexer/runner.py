@@ -32,7 +32,7 @@ from ..exit_codes import (  # noqa: F401 — re-exported
     EXIT_TERMINATED,
 )
 from ..mcp.shared.pid_file import PidFile
-from ..utils import TU_EXTENSIONS
+from ..utils import TU_EXTENSIONS, StopRequested
 from . import _run_marker
 from ._embedding import (
     _build_embeddings,
@@ -102,7 +102,7 @@ __all__ = [
 # ═══════════════════════════════════════════════════════════════
 
 
-class IndexStopped(Exception):
+class IndexStopped(StopRequested):
     """This run stopped before its end, and it did not fail.
 
     The base of the two reasons.  A handler that must unwind a stopped run

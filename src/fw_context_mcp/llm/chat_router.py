@@ -33,6 +33,7 @@ from datetime import UTC, datetime
 import httpx
 
 from ..config.settings import LLMConfig
+from ..utils import is_fatal
 from ._debug import _write_debug_log
 from .ollama import ChatApiError, OllamaError
 
@@ -280,6 +281,8 @@ def _stream_openai_chat(
     except OllamaError:
         raise
     except Exception as e:
+        if is_fatal(e):
+            raise
         raise ChatApiError(str(e)) from e
 
     if not chunks:
@@ -415,4 +418,6 @@ def call_openai_chat(
     except OllamaError:
         raise
     except Exception as e:
+        if is_fatal(e):
+            raise
         raise ChatApiError(str(e)) from e

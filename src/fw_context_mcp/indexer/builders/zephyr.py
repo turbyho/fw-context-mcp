@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 import yaml
 
-from fw_context_mcp.utils import resolve_real_binary, run_build_command
+from fw_context_mcp.utils import is_fatal, resolve_real_binary, run_build_command
 
 from ..build_layout import COMPILE_COMMANDS_NAME, BuildLayout
 from . import _linker, registry
@@ -962,8 +962,10 @@ class ZephyrBuildSystem:
                     p = Path(r.stdout.strip()).resolve()
                     if p.name == "zephyr" and p.parent.name.startswith("v"):
                         candidates.append(p.parent.parent)
-            except Exception:  # nosec B110 — best-effort env detection
-                pass
+            except Exception as e:  # nosec B110 — best-effort env detection
+                # A stop of the run (SIGTERM under the index lock) must not vanish here.
+                if is_fatal(e):
+                    raise
 
         home_ncs = Path.home() / "ncs"
         if home_ncs.is_dir():
@@ -1044,8 +1046,10 @@ class ZephyrBuildSystem:
                     zephyr_env = Path(r.stdout.strip()) / "zephyr-env.sh"
                     if zephyr_env.exists():
                         return {"python": None, "activate": str(zephyr_env)}
-            except Exception:  # nosec B110 — best-effort env detection
-                pass
+            except Exception as e:  # nosec B110 — best-effort env detection
+                # A stop of the run (SIGTERM under the index lock) must not vanish here.
+                if is_fatal(e):
+                    raise
 
         # 3. Plain Zephyr SDK — environment-setup-* (sets toolchain env).
         for sdk_dir in sorted(Path.home().glob("zephyr-sdk-*"), reverse=True):

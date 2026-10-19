@@ -173,3 +173,24 @@ def test_doctor_reports_an_old_ollama_of_the_chat_server():
         result = _checks.check_ollama_chat_model(cfg)
     assert result.status == "degraded"
     assert "chat.example.test" in result.message
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_stop_of_the_run_is_not_wrapped(stream):
+    """The SIGTERM handler of the index lock raises IndexTerminated, then ignores SIGTERM.
+
+    Before, the streaming request wrapped it into OllamaError, and the LLM
+    analysis took it as the failure of one symbol: no signal but SIGKILL
+    stopped the process.
+    """
+    from fw_context_mcp.indexer.runner import IndexTerminated
+    from fw_context_mcp.utils import is_fatal
+
+    def stopped(*a, **k):
+        raise IndexTerminated("a SIGTERM stopped this run")
+
+    with mock.patch.object(ollama.httpx, "stream", side_effect=stopped), \
+            mock.patch.object(ollama.httpx, "post", side_effect=stopped), \
+            pytest.raises(IndexTerminated):
+        ollama.call_ollama("p", LLMConfig(stream=stream))
+    assert is_fatal(IndexTerminated("x"))

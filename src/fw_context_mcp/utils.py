@@ -205,9 +205,20 @@ SAFE_EXCEPT = (
 ) + _STDLIB_DB_ERROR
 
 
+class StopRequested(Exception):
+    """A signal asked the process to stop: the handler of the index lock raises it (``IndexStopped``).
+
+    The handler of SIGTERM and SIGHUP raises it inside the code that runs,
+    and then ignores the two signals.  A broad handler that wraps it (into
+    ``OllamaError``, for example) thus leaves a process that no signal but
+    SIGKILL stops: measured on the streaming request of the LLM analysis.
+    :func:`is_fatal` thus names it, as it names ``KeyboardInterrupt``.
+    """
+
+
 def is_fatal(exc: BaseException) -> bool:
     """Return True for exceptions that must never be swallowed."""
-    return isinstance(exc, (KeyboardInterrupt, SystemExit, MemoryError, SystemError))
+    return isinstance(exc, (KeyboardInterrupt, SystemExit, MemoryError, SystemError, StopRequested))
 
 
 def is_db_exception(exc: BaseException) -> bool:

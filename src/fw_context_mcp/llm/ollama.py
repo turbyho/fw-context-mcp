@@ -76,6 +76,7 @@ from datetime import UTC, datetime
 import httpx
 
 from ..config.settings import LLMConfig
+from ..utils import is_fatal
 from ._debug import _write_debug_log
 from .embedder import Embedder, EmbedderContextUnknown, EmbedderInputTooLong
 
@@ -206,6 +207,8 @@ def _pull_model(
     except httpx.HTTPStatusError as e:
         raise OllamaError(f"Failed to pull model '{model}': HTTP {e.response.status_code}") from e
     except Exception as e:
+        if is_fatal(e):
+            raise
         raise OllamaError(f"Failed to pull model '{model}': {e}") from e
 
 
@@ -308,6 +311,8 @@ def _stream_ollama_generate(
     except OllamaError:
         raise
     except Exception as e:
+        if is_fatal(e):
+            raise
         raise OllamaError(str(e)) from e
 
     if not chunks:

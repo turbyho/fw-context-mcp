@@ -958,7 +958,10 @@ def _step_resolve_dispatches(conn: sqlite3.Connection, ctx: dict) -> None:
                     _dispatch_map.update(_user_bridges)
         except (OSError, KeyError, ValueError) as e:
             log.warning("Failed to load dispatch_bridges from %s: %s", _config_path, e)
-        except Exception:
+        except Exception as e:
+            # A stop of the run (SIGTERM under the index lock) must not vanish here.
+            if is_fatal(e):
+                raise
             log.exception("Unexpected error loading dispatch_bridges from %s", _config_path)
 
     resolved = 0
