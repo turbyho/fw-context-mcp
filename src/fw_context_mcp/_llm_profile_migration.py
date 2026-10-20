@@ -21,13 +21,14 @@ doctor --fix --only config`` run this conversion (decision of the user,
   (``# ollama_url = ...``, the text about the chat API, ...) go away, and
   the ``local.toml`` of the project gets the commented ``profile`` line.
 
-A file with ``chat_api_key`` is not converted: a profile has no place for
-the value of an API key (a key in a TOML file is a secret in plain text).
-The report says so; the user moves the key to an environment variable and
-names it with ``api_key_env``.
+* ``chat_api_key`` goes to the key store of the profile (``llm.secrets``:
+  the keyring of the system, else ``secrets.toml``), never into a
+  profile: a key in a TOML file is a secret in plain text.  A project key
+  gets a profile of the project, because it applied to that project only.
 
 Each changed file gets a ``.bak`` copy first (not ``config.toml`` of a
-project: git holds its old text), through ``housekeeping``.
+project: git holds its old text), through ``housekeeping``.  The copy
+holds a mark in the place of the value of ``chat_api_key``.
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ import os
 import re
 import stat
 import tomllib
+from dataclasses import dataclass
 from pathlib import Path
 
 import tomlkit
@@ -43,6 +45,7 @@ import tomlkit
 from .config import settings
 from .config._profiles import project_profile_name, put_profile
 from .housekeeping import CleanupReport, _config_files, _parse_config_file, _write_config_file
+from .llm.secrets import SECRETS_FILE, SecretStoreError, set_api_key, stored_api_key
 
 #: The default chat model of an old config that named none (the default of ``LLMConfig``).
 _OLD_DEFAULT_MODEL = "qwen2.5-coder:14b"
@@ -141,23 +144,24 @@ def migrate_llm_profiles(project_root: Path | None, *, dry_run: bool = False) ->
     changes: dict[Path, list[str]] = {path: [] for path in documents}
     project_files = [(path, documents[path][0]) for path, of_project, _ in files if of_project and path in documents]
 
+    # The API keys to store, (profile, key or the profile to copy the key
+    # from): only after the check that each file can be written.
+    keys: list[tuple[str, str | _KeyOf]] = []
+
     # ── The global config ──
     global_llm = global_doc.get("llm")
     old = _old_keys(global_llm)
-    if old and "chat_api_key" in old:
-        # The project selects a profile of the global config: without the
-        # conversion of the global config, no profile is there to select.
-        report.failures.append((global_path, _KEY_FAILURE))
-        report.failures += [
-            (path, "not converted: the global config is not converted (see its message)")
-            for path, document in project_files if _old_keys(document.get("llm"))
-        ]
-        return report
     global_old: dict[str, object] | None = None
     if old and isinstance(global_llm, dict):
         global_old = old
         values, embed = _profile_from_old(old)
-        name = _place_profile(global_doc, values)
+        key = old.get("chat_api_key")
+        api = values["provider"] == "openai_compatible"
+        name = _place_profile(global_doc, values, new=key is not None and api)
+        if key is not None and api:
+            keys.append((name, str(key)))
+        elif key is not None:
+            changes[global_path].append(_NO_KEY_FOR_OLLAMA)
         for key in old:
             del global_llm[key]
         if "profile" not in global_llm:
@@ -167,10 +171,6 @@ def migrate_llm_profiles(project_root: Path | None, *, dry_run: bool = False) ->
         changes[global_path].append(f"moved [llm] {', '.join(sorted(old))} to [llm.profiles.{name}]{_not_kept(old, values)}")
 
     # ── The project ──
-    with_key = [path for path, document in project_files if "chat_api_key" in _old_keys(document.get("llm"))]
-    if with_key:
-        report.failures += [(path, _KEY_FAILURE) for path in with_key]
-        return report
     project_old: dict[str, object] = {}
     for _path, document in project_files:
         project_old.update(_old_keys(document.get("llm")))
@@ -180,8 +180,19 @@ def migrate_llm_profiles(project_root: Path | None, *, dry_run: bool = False) ->
     )
     if project_old and project_root is not None and local_path is not None:
         _pin_global_selection(global_doc, changes[global_path])
-        _convert_project(global_doc, project_files, project_old, project_root, local_path, documents, changes,
-                         global_old=global_old)
+        keys += _convert_project(global_doc, project_files, project_old, project_root, local_path, documents,
+                                 changes, global_old=global_old)
+    # A copy names the key only when the profile below has a stored one:
+    # a report must not tell about a key that does not go anywhere.
+    to_store: list[tuple[str, str]] = []
+    for name, key in keys:
+        value = stored_api_key(key.profile) if isinstance(key, _KeyOf) else key
+        if not value:
+            continue
+        to_store.append((name, value))
+        source = f"a copy of the stored key of profile {key.profile}" if isinstance(key, _KeyOf) else "the old key"
+        changes[global_path].append(f"the API key of profile {name} ({source}) goes to the keyring of the system, "
+                                    f"else to {SECRETS_FILE}")
 
     # ── The commented lines, and the check of each new text ──
     texts: dict[Path, str] = {}
@@ -220,11 +231,23 @@ def migrate_llm_profiles(project_root: Path | None, *, dry_run: bool = False) ->
             for path in order if path not in dict(blocked)
         ]
         return report
+    # Before the first write: a key that cannot be stored stops the run,
+    # and the key stays in the file that holds it.
+    if not dry_run:
+        for name, value in to_store:
+            try:
+                set_api_key(name, value)
+            except (SecretStoreError, ValueError) as exc:
+                # ValueError: an old key that an HTTP header cannot hold.
+                # Its message holds no key.  A key stored before this one
+                # stays: a second run stores it again.
+                report.failures.append((global_path, f"profile {name}: {exc}; no config file changed"))
+                return report
     for number, path in enumerate(order):
         document, original, backup = documents[path]
         failures = len(report.failures)
-        _write_config_file(path, tomlkit.parse(texts[path]), original, changes[path], report, backup=backup,
-                           dry_run=dry_run)
+        _write_config_file(path, tomlkit.parse(texts[path]), _without_key(original), changes[path], report,
+                           backup=backup, dry_run=dry_run)
         if len(report.failures) > failures:
             report.failures += [
                 (rest, f"not written, because the write of {path} failed: run the conversion again after the repair")
@@ -236,8 +259,13 @@ def migrate_llm_profiles(project_root: Path | None, *, dry_run: bool = False) ->
 
 def _convert_project(global_doc, project_files, project_old: dict[str, object], project_root: Path,
                      local_path: Path, documents: dict, changes: dict[Path, list[str]], *,
-                     global_old: dict[str, object] | None) -> None:
+                     global_old: dict[str, object] | None) -> list[tuple[str, str | _KeyOf]]:
     """Convert the old keys of the project files (*project_old*, merged as ``load`` merged them).
+
+    Returns the API keys to store: ``(profile, key)``, or ``(profile,
+    _KeyOf(<profile below>))`` when a new API profile of the project
+    needs the stored key of the API profile below it, as the old merge
+    gave the key of the global config to the project.
 
     The old keys of the project applied over the values of the layer
     below: thus the profile that the project selects now is converted back
@@ -256,7 +284,7 @@ def _convert_project(global_doc, project_files, project_old: dict[str, object], 
     project.  Else the format comes from the URL of the project, because
     the old format of the layer below is not known.
     """
-    base, base_embed = _selected_profiles(global_doc, project_files)
+    base_name, base, base_embed = _selected_profiles(global_doc, project_files)
     own_selection = any(
         key in (document.get("llm") or {}) for _path, document in project_files for key in ("profile", "embed_profile")
     )
@@ -269,10 +297,14 @@ def _convert_project(global_doc, project_files, project_old: dict[str, object], 
     effective = {**base_old, **project_old}
     values, embed = _profile_from_old(effective)
     base_values, base_embed_values = _profile_from_old(base_old) if base is not None else (None, None)
-    if base is not None and "api_key_env" in base:
-        for converted in (values, base_values):
-            if converted is not None and converted.get("url") == base.get("url"):
-                converted["api_key_env"] = base["api_key_env"]
+    # The old merge gave the key of the layer below to the API of the
+    # project, also at another URL: the variable of the key goes along,
+    # unless the project has a key of its own.
+    if base is not None and "api_key_env" in base and base.get("provider") == "openai_compatible":
+        if base_values is not None and base_values["provider"] == "openai_compatible":
+            base_values["api_key_env"] = base["api_key_env"]
+        if values["provider"] == "openai_compatible" and "chat_api_key" not in project_old:
+            values["api_key_env"] = base["api_key_env"]
 
     for path, document in project_files:
         moved = _old_keys(document.get("llm"))
@@ -280,12 +312,34 @@ def _convert_project(global_doc, project_files, project_old: dict[str, object], 
             del document["llm"][key]
         if moved:
             changes[path].append(f"removed [llm] {', '.join(sorted(moved))} (now in an LLM profile){_not_kept(moved, values)}")
+        if "chat_api_key" in moved and values["provider"] != "openai_compatible":
+            changes[path].append(_NO_KEY_FOR_OLLAMA)
+        elif "chat_api_key" in moved and path.name == settings._PROJECT_CONFIG_NAME:
+            changes[path].append("chat_api_key was in config.toml, a file of git: its history keeps the key, "
+                                 "thus replace the key at the provider")
     profiles_before = set(_profile_names(global_doc))
     selected: dict[str, str] = {}
     chat_name = None
-    if values != base_values:
-        chat_name = _place_profile(global_doc, values, preferred=project_profile_name(project_root))
+    api = values["provider"] == "openai_compatible"
+    own_key = project_old.get("chat_api_key") if api else None
+    selects_own = any("profile" in (document.get("llm") or {}) for _path, document in project_files)
+    keys: list[tuple[str, str | _KeyOf]] = []
+    if own_key is not None and selects_own and values == base_values:
+        # The project selects its profile already (a profile by hand, or
+        # a run that stopped): the key belongs to that profile, and a
+        # second profile of the same values would leave it unused.
+        keys.append((base_name, str(own_key)))
+    elif values != base_values or own_key is not None:
+        chat_name = _place_profile(global_doc, values, preferred=project_profile_name(project_root),
+                                   new=own_key is not None)
         selected["profile"] = chat_name
+    if chat_name is not None and values["provider"] == "openai_compatible":
+        api_key = effective.get("chat_api_key")
+        if api_key is not None:
+            keys.append((chat_name, str(api_key)))
+        elif base_name and base is not None and base.get("provider") == "openai_compatible" \
+                and "api_key_env" not in values:
+            keys.append((chat_name, _KeyOf(base_name)))
     if embed != base_embed_values:
         if embed is not None:
             selected["embed_profile"] = _place_profile(global_doc, embed, preferred="embeddings")
@@ -296,7 +350,7 @@ def _convert_project(global_doc, project_files, project_old: dict[str, object], 
         else:
             selected["embed_profile"] = _place_profile(global_doc, _DEFAULT_EMBED, preferred="embeddings")
     if not selected:
-        return
+        return keys
     if local_path not in documents:
         documents[local_path] = (tomlkit.document(), "", True)
         changes[local_path] = []
@@ -309,6 +363,41 @@ def _convert_project(global_doc, project_files, project_old: dict[str, object], 
     if added:
         global_path = next(iter(documents))
         changes[global_path].append(f"added the LLM profiles of the project ({', '.join(added)})")
+    return keys
+
+
+@dataclass(frozen=True)
+class _KeyOf:
+    """The stored API key of the profile *profile*, to copy to a new profile."""
+
+    profile: str
+
+
+#: The report line for ``chat_api_key`` of an Ollama backend: the old chat
+#: client sent the key only to an OpenAI-compatible API.
+_NO_KEY_FOR_OLLAMA = "removed chat_api_key without a copy: the old releases did not send it to an Ollama server"
+
+#: The value that the ``.bak`` copy holds in the place of ``chat_api_key``.
+_KEY_MARK = "<moved to the key store of fw-context: fw-context llm key status <profile>>"
+
+
+def _without_key(original: str) -> str:
+    """Return *original* with a mark in the place of the value of ``[llm] chat_api_key``.
+
+    The ``.bak`` copy must not keep the key in plain text: the conversion
+    moves it out of the config files for that reason.
+    """
+    if "chat_api_key" not in original:
+        return original
+    try:
+        document = tomlkit.parse(original)
+    except tomlkit.exceptions.TOMLKitError:
+        return original
+    llm = document.get("llm")
+    if not isinstance(llm, dict) or "chat_api_key" not in llm:
+        return original
+    llm["chat_api_key"] = _KEY_MARK
+    return tomlkit.dumps(document)
 
 
 def _pin_global_selection(global_doc, changes: list[str]) -> None:
@@ -368,12 +457,6 @@ def _write_problem(path: Path) -> str | None:
     except (OSError, RuntimeError) as exc:
         return f"{exc}; no file of the conversion changed"
 
-
-_KEY_FAILURE = (
-    "[llm] chat_api_key is not converted: a profile has no place for the value of an API key. Put the key into "
-    "an environment variable, write the profile by hand ([llm.profiles.<name>] with api_key_env = \"<variable>\", "
-    "see docs/configuration.md), and remove the old [llm] keys"
-)
 
 #: The embeddings profile that ``load`` uses when none is selected and the
 #: chat goes to an API.  Its ``model`` is not used (the embeddings use
@@ -458,17 +541,19 @@ def _old_from_profiles(chat: dict, embed: dict | None) -> dict[str, object]:
     return old
 
 
-def _place_profile(document, values: dict, *, preferred: str | None = None) -> str:
+def _place_profile(document, values: dict, *, preferred: str | None = None, new: bool = False) -> str:
     """Put *values* into the profiles of *document* and return the name of the profile.
 
-    A profile with the same values is reused.  A new one gets *preferred*,
+    A profile with the same values is reused, except with *new*: a
+    profile with its own API key is not the same profile, because the
+    key is not in the values.  A new one gets *preferred*,
     or a name from the provider (``local``, ``remote``, ``api``), with
     ``-2``, ``-3``, ... when the name is taken.
     """
     profiles = (document.get("llm") or {}).get("profiles") or {}
     existing = {name: _plain(table) for name, table in profiles.items()}
     for name, table in existing.items():
-        if table == values:
+        if table == values and not new:
             chosen = name
             break
     else:
@@ -486,8 +571,10 @@ def _place_profile(document, values: dict, *, preferred: str | None = None) -> s
     return chosen
 
 
-def _selected_profiles(global_doc, project_files) -> tuple[dict | None, dict | None]:
-    """Return the chat profile and the embeddings profile that the project selects now, as ``load`` selects them.
+def _selected_profiles(global_doc, project_files) -> tuple[str, dict | None, dict | None]:
+    """Return the name of the chat profile, the chat profile and the embeddings profile that the project selects now.
+
+    As ``load`` selects them.
 
     The project files select over the global config.  The embeddings
     profile is None when ``load`` uses no profile for them.
@@ -504,11 +591,11 @@ def _selected_profiles(global_doc, project_files) -> tuple[dict | None, dict | N
         name = next(iter(profiles))
     chat = profiles.get(name)
     if not isinstance(chat, dict):
-        return None, None
+        return "", None, None
     if not embed_name and chat.get("provider") == "ollama":
         embed_name = name
     embed = profiles.get(embed_name) if embed_name else None
-    return chat, embed if isinstance(embed, dict) else None
+    return str(name), chat, embed if isinstance(embed, dict) else None
 
 
 def _clean_comments(text: str, *, profile_line: bool) -> tuple[str, int, bool]:

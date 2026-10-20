@@ -448,7 +448,12 @@ class LLMConfig:
         chat_api_base: Chat API URL for OpenAI-compatible cloud/proxy endpoints
             (DeepSeek, LiteLLM, vLLM, llama.cpp).  ``None`` (default) uses local
             Ollama for chat.  External URLs send source code to that host.
-        chat_api_key: Bearer token for cloud/proxy APIs.  ``None`` for local/no-auth.
+        chat_api_key: Bearer token for cloud/proxy APIs.  ``load`` never sets
+            it: the chat client asks ``llm.secrets`` for the key of
+            ``profile`` when it sends a request (``api_key_env``, the
+            keyring, ``secrets.toml``).  A test or a caller can set it.
+        api_key_env: The environment variable of the API key of the
+            profile (``api_key_env``), or empty.
         chat_api_format: Format override: ``"auto"`` (default), ``"ollama"``, or
             ``"openai"``.  ``"auto"`` detects format from the URL.
         auto_pull: Auto-pull models on 404 (Ollama only).  Default ``False`` —
@@ -480,7 +485,9 @@ class LLMConfig:
     ``None`` (default) skips re-ranking — results are returned in FTS5 order."""
     ollama_max_concurrent: int = 1  # max concurrent Ollama HTTP calls (1=serial, 2–4 for SSE transport)
     chat_api_base: str | None = None
-    chat_api_key: str | None = None
+    # repr=False: a log line or an error that shows the config must not show the key.
+    chat_api_key: str | None = field(default=None, repr=False)
+    api_key_env: str = ""
     chat_api_format: str = "auto"
     auto_pull: bool = False
     stream: bool = False
@@ -1343,12 +1350,9 @@ def _llm_profile_problems(llm: dict, problems: list[ValueProblem], *, global_fil
     ``doctor --fix`` (*removable* False): the value is a setting that the
     user moves, not a value to throw away.
     """
-    # The converters refuse a file with chat_api_key: its message must not
-    # name them (``_llm_profile_migration``).
-    convert = (
-        "Put the API key into an environment variable and name it with api_key_env of the profile"
-        if "chat_api_key" in llm
-        else "'fw-context doctor --fix --only config' or 'fw-context init' converts it"
+    # The converters move chat_api_key to the key store of the profile.
+    convert = "'fw-context doctor --fix --only config' or 'fw-context init' converts it" + (
+        ", and moves the API key to the keyring of the system" if "chat_api_key" in llm else ""
     )
     for key in _MOVED_LLM_KEYS:
         if key in llm:
@@ -1898,27 +1902,6 @@ def _apply_ollama_tuning(llm: LLMConfig, profile: dict) -> None:
     llm.ollama_max_concurrent = _convert(profile.get("max_concurrent", llm.ollama_max_concurrent), "int")
 
 
-_key_env_warned: set[tuple[str, str]] = set()
-
-
-def _warn_missing_key_env(profile: str, env_name: str) -> None:
-    """Tell one time for each process that the API key variable of *profile* is not set.
-
-    WHY a notice and not an error: a server that needs no key (a proxy on
-    the local network) is valid, and only the server can say if a key is
-    necessary.  Without the notice, the first sign was an HTTP 401 in the
-    middle of an index run.  The notice names the variable, never a value.
-    """
-    if (profile, env_name) in _key_env_warned:
-        return
-    _key_env_warned.add((profile, env_name))
-    print(
-        f"⚠ LLM profile {profile!r}: the environment variable {env_name} (api_key_env) is not set: "
-        "the requests go without an API key",
-        file=sys.stderr,
-    )
-
-
 def _resolve_llm_profile(data: dict, llm: LLMConfig, selected_in: dict[str, Path], global_path: Path) -> None:
     """Copy the selected profile into the backend fields of *llm*.
 
@@ -1972,10 +1955,10 @@ def _resolve_llm_profile(data: dict, llm: LLMConfig, selected_in: dict[str, Path
         _apply_ollama_tuning(llm, profile)
     else:
         llm.chat_api_base, llm.chat_api_format = profile["url"], "openai"
-        env_name = profile.get("api_key_env")
-        llm.chat_api_key = os.environ.get(env_name) or None if env_name else None
-        if env_name and llm.chat_api_key is None:
-            _warn_missing_key_env(name, env_name)
+        # Not the key: the chat client gets it at the first request
+        # (``llm.secrets``).  A keyring lookup takes about 0.1 s, and load
+        # runs for each MCP query.
+        llm.api_key_env = str(profile.get("api_key_env") or "")
 
     embed_name = llm.embed_profile or (name if llm.provider == "ollama" else "")
     if embed_name:

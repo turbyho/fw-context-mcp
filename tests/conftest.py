@@ -167,15 +167,27 @@ def _isolate_index_dir():
     as a process must not send a request from the test machine.  The tests
     of the check remove the variable with ``monkeypatch``.
 
+    A sixth: the keyring of the operator.  ``PYTHON_KEYRING_BACKEND``
+    selects the backend that fails each call, for each subprocess, and
+    ``keyring.set_keyring`` does the same in this process.  A test that
+    stores an API key thus writes ``secrets.toml`` of the temp home, never
+    an entry of the keyring of the operator.  A test of the keyring itself
+    sets its own backend in memory.  The fixture does not put the backend
+    of the operator back at the end: to get it, ``keyring`` connects to it,
+    and the process ends with the session.
+
     All variables are inherited by any subprocess a test spawns, thus a
     CLI invocation stays isolated too.  The temp dir is removed at session
     end.
     """
+    import keyring
+    from keyring.backends import fail
+
     import fw_context_mcp.config.settings as settings
 
     names = (
         "FW_CONTEXT_INDEX_DIR", "FW_CONTEXT_PROJECTS_DB", "FW_CONTEXT_CLANG_RESOURCE_DIR", "FW_CONTEXT_HOME",
-        "FW_CONTEXT_NO_UPDATE_CHECK",
+        "FW_CONTEXT_NO_UPDATE_CHECK", "PYTHON_KEYRING_BACKEND",
     )
     prev = {name: os.environ.get(name) for name in names}
     prev_global = settings._GLOBAL_CONFIG_PATH
@@ -189,6 +201,8 @@ def _isolate_index_dir():
         os.environ["FW_CONTEXT_CLANG_RESOURCE_DIR"] = str(Path(d) / "clang-resource")
         os.environ["FW_CONTEXT_HOME"] = str(home)
         os.environ["FW_CONTEXT_NO_UPDATE_CHECK"] = "1"
+        os.environ["PYTHON_KEYRING_BACKEND"] = "keyring.backends.fail.Keyring"
+        keyring.set_keyring(fail.Keyring())
         # The module computed the path at import, before this fixture.
         settings._GLOBAL_CONFIG_PATH = home / "config.toml"
         try:

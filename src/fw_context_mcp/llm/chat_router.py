@@ -289,8 +289,9 @@ class OpenAIChatClient:
         """
         cfg = self.cfg
         headers: dict[str, str] = {"Content-Type": "application/json"}
-        if cfg.chat_api_key:
-            headers["Authorization"] = f"Bearer {cfg.chat_api_key}"
+        key = self._api_key()
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
         payload: dict = {
             "model": cfg.model,
             "messages": [{"role": "user", "content": prompt}],
@@ -382,6 +383,21 @@ class OpenAIChatClient:
             raise ChatApiError("Streaming chat API returned no content chunks")
         return ChatResult("".join(chunks), usage)
 
+    def _api_key(self) -> str | None:
+        """Return the API key: ``chat_api_key`` when a caller set it, else the stored key of the profile.
+
+        ``llm.secrets`` looks in ``api_key_env``, the keyring and
+        ``secrets.toml``.  A config without a profile (a test, an old
+        caller) has no stored key.
+        """
+        if self.cfg.chat_api_key:
+            return self.cfg.chat_api_key
+        if not self.cfg.profile:
+            return None
+        from .secrets import get_api_key
+
+        return get_api_key(self.cfg.profile, self.cfg.api_key_env)
+
     def _error(self, e: Exception) -> ChatApiError:
         """Return the ``ChatApiError`` with a sentence for the operator for the failure *e* of a request.
 
@@ -398,6 +414,21 @@ class OpenAIChatClient:
                 return ChatApiError(
                     f"Model '{self.cfg.model}' not found at {self.endpoint}. "
                     "HTTP 404 — check model name and API endpoint."
+                )
+            if e.response.status_code in (401, 403):
+                # The text of the server stays out: some servers repeat a
+                # part of the key that they refused.
+                status = f"Chat API HTTP {e.response.status_code}: {self.endpoint} refused the API key"
+                if not self.cfg.profile or self.cfg.chat_api_key:
+                    return ChatApiError(f"{status} that the caller gave, or got none")
+                # The cached key goes: another process can have stored a new one.
+                from .secrets import forget
+
+                forget(self.cfg.profile)
+                return ChatApiError(
+                    f"{status} of LLM profile {self.cfg.profile!r}, or got none. Store the key with "
+                    f"'fw-context llm key set {self.cfg.profile}'"
+                    + (f", or set the environment variable {self.cfg.api_key_env}" if self.cfg.api_key_env else "")
                 )
             return ChatApiError(f"Chat API HTTP {e.response.status_code}: {e.response.text[:200]}")
         return ChatApiError(str(e))

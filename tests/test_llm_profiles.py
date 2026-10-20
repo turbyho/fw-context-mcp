@@ -27,10 +27,19 @@ from fw_context_mcp.config.settings import ConfigError, load
 
 @pytest.fixture
 def home(tmp_path: Path, monkeypatch) -> Path:
-    """A global config of its own, and a project directory with a .fw-context folder."""
+    """A global directory of its own (config and secrets.toml), and a project directory with a .fw-context folder.
+
+    The keyring of the session fails each call (conftest), thus a stored
+    key goes to secrets.toml of this directory.
+    """
+    from fw_context_mcp.llm import secrets
+
     global_path = tmp_path / "home" / "config.toml"
     global_path.parent.mkdir()
     monkeypatch.setattr(settings, "_GLOBAL_CONFIG_PATH", global_path)
+    monkeypatch.setenv("FW_CONTEXT_HOME", str(global_path.parent))
+    monkeypatch.setattr(secrets, "_found", {})
+    monkeypatch.setattr(secrets, "_told", set())
     settings._config_cache.clear()
     (tmp_path / "proj" / ".fw-context").mkdir(parents=True)
     return tmp_path
@@ -83,15 +92,16 @@ def test_the_global_profile_fills_the_backend_fields(home):
     assert llm.ollama_url == "http://localhost:11434" and llm.chat_api_base is None
 
 
-def test_a_project_selects_an_api_profile_and_the_key_comes_from_its_variable(home, monkeypatch):
-    monkeypatch.setenv("TEST_DEEPSEEK_KEY", "secret-value")
+def test_a_project_selects_an_api_profile_and_its_key_variable(home):
+    """load names the variable; the chat client reads the key at the first request (llm.secrets)."""
     _write(_global(home), TWO_PROFILES)
     _write(_local(home), '[llm]\nprofile = "deepseek"\n')
 
     llm = load(_project(home)).llm
 
     assert (llm.profile, llm.provider, llm.model) == ("deepseek", "openai_compatible", "deepseek-flash")
-    assert (llm.chat_api_base, llm.chat_api_format, llm.chat_api_key) == ("https://api.deepseek.com", "openai", "secret-value")
+    assert (llm.chat_api_base, llm.chat_api_format) == ("https://api.deepseek.com", "openai")
+    assert (llm.api_key_env, llm.chat_api_key) == ("TEST_DEEPSEEK_KEY", None)
     # The embeddings stay on the local Ollama.
     assert llm.ollama_url == settings._DEFAULT_OLLAMA_URL
 
@@ -128,19 +138,18 @@ def test_with_a_chat_on_an_api_the_ollama_tuning_comes_from_the_embeddings_profi
     assert (llm.provider, llm.keep_alive, llm.ollama_max_concurrent) == ("openai_compatible", "30s", 3)
 
 
-def test_an_api_key_variable_that_is_not_set_gives_one_notice(home, monkeypatch, capsys):
-    """Before, the first sign was an HTTP 401 in the middle of an index run."""
-    monkeypatch.delenv("TEST_DEEPSEEK_KEY", raising=False)
-    monkeypatch.setattr(settings, "_key_env_warned", set())
+def test_load_does_not_look_for_the_api_key(home, monkeypatch):
+    """A keyring lookup takes about 0.1 s, and load runs for each MCP query: the chat client looks."""
+    from fw_context_mcp.llm import secrets
+
+    looked: list[str] = []
+    monkeypatch.setattr(secrets, "get_api_key", lambda *args, **kwargs: looked.append("x"))
     _write(_global(home), TWO_PROFILES)
     _write(_local(home), '[llm]\nprofile = "deepseek"\n')
 
-    assert load(_project(home)).llm.chat_api_key is None
-    settings._config_cache.clear()
     load(_project(home))
 
-    err = capsys.readouterr().err
-    assert err.count("TEST_DEEPSEEK_KEY (api_key_env) is not set") == 1, err
+    assert looked == []
 
 
 @pytest.mark.parametrize(("local", "message"), [
@@ -356,16 +365,22 @@ def test_the_embeddings_server_of_a_project_is_selected_in_the_project_only(home
     assert load(None).llm.ollama_url == "http://localhost:11434", "the global embeddings server must not change"
 
 
-def test_a_file_with_an_api_key_is_not_converted(home):
+def test_an_api_key_of_a_project_goes_to_the_key_store_of_its_own_profile(home):
+    """The key applied to that project only: the project gets a profile of its own, and no TOML file keeps it."""
+    from fw_context_mcp.llm import secrets
+
     _write(_global(home), OLD_GLOBAL)
-    _write(_local(home), '[llm]\nchat_api_base = "https://api.example.test/v1"\nchat_api_key = "sk-plain"\n')
-    before = _local(home).read_text(encoding="utf-8")
+    _write(_local(home), '[llm]\nchat_api_base = "https://api.example.test/v1"\nchat_api_key = "sk-plain-test"\n')
 
     report = migrate_llm_profiles(_project(home))
 
-    assert any("chat_api_key is not converted" in reason for _path, reason in report.failures)
-    assert _local(home).read_text(encoding="utf-8") == before
-    assert all("sk-plain" not in reason for _path, reason in report.failures), "a message must not hold the key"
+    assert report.failures == []
+    llm = _converted(home)
+    assert (llm.profile, llm.chat_api_base) == ("proj", "https://api.example.test/v1")
+    assert secrets.stored_api_key("proj") == "sk-plain-test"
+    for path in (_global(home), _local(home), _local(home).with_name("local.toml.bak")):
+        assert "sk-plain-test" not in path.read_text(encoding="utf-8"), path
+    assert all("sk-plain-test" not in label for _path, label in report.removed_keys), "a message must not hold the key"
 
 
 def test_a_dry_run_changes_no_file(home):
@@ -438,16 +453,44 @@ def test_the_embeddings_of_a_project_stay_on_the_server_of_the_layer_below(home,
     assert _converted(home).ollama_url == embeddings
 
 
-def test_a_project_is_not_converted_when_the_global_config_is_refused(home):
-    """Before, the project selected a profile that the refused global config did not get."""
-    _write(_global(home), '[llm]\nchat_api_base = "https://api.example.test/v1"\nchat_api_key = "sk-plain"\n')
-    _write(_config(home), '[project]\n\n[llm]\nmodel = "gemma4:12b"\n')
+def test_an_api_key_of_the_global_config_applies_to_a_project_profile_of_that_api(home):
+    """The old merge gave the key of the global config to a project that changed only the model."""
+    from fw_context_mcp.llm import secrets
 
-    report = migrate_llm_profiles(_project(home))
+    _write(_global(home), '[llm]\nchat_api_base = "https://api.example.test/v1"\nchat_api_key = "sk-plain-test"\n')
+    _write(_config(home), '[project]\n\n[llm]\nmodel = "m2"\n')
 
-    assert {path for path, _reason in report.failures} == {_global(home), _config(home)}
-    assert _config(home).read_text(encoding="utf-8") == '[project]\n\n[llm]\nmodel = "gemma4:12b"\n'
-    assert not _local(home).exists()
+    assert migrate_llm_profiles(_project(home)).failures == []
+
+    llm = _converted(home)
+    assert (llm.profile, llm.model) == ("proj", "m2")
+    assert secrets.stored_api_key("proj") == "sk-plain-test"
+    assert secrets.stored_api_key(load(None).llm.profile) == "sk-plain-test"
+
+
+def test_a_project_profile_of_an_api_gets_a_copy_of_the_stored_key_of_the_profile_below(home):
+    from fw_context_mcp.llm import secrets
+
+    _write(_global(home), '[llm]\nprofile = "work"\n\n[llm.profiles.work]\nprovider = "openai_compatible"\n'
+                          'url = "https://api.example.test/v1"\nmodel = "m1"\n')
+    secrets.set_api_key("work", "sk-plain-test")
+    _write(_local(home), '[llm]\nmodel = "m2"\n')
+
+    assert migrate_llm_profiles(_project(home)).failures == []
+
+    assert secrets.stored_api_key("proj") == "sk-plain-test"
+
+
+def test_a_dry_run_stores_no_key(home):
+    from fw_context_mcp.llm import secrets
+
+    _write(_global(home), OLD_GLOBAL)
+    _write(_local(home), '[llm]\nchat_api_base = "https://api.example.test/v1"\nchat_api_key = "sk-plain-test"\n')
+
+    report = migrate_llm_profiles(_project(home), dry_run=True)
+
+    assert any("API key of profile proj" in label for _path, label in report.removed_keys), report.removed_keys
+    assert secrets.stored_api_key("proj") is None
 
 
 def test_a_project_without_local_toml_gets_one(home):
@@ -535,14 +578,14 @@ def test_a_valid_local_toml_gets_no_commented_line_alone(home):
     assert report.removed_keys == [] and report.failures == []
 
 
-def test_the_error_of_a_file_with_an_api_key_does_not_name_the_converters(home):
-    _write(_local(home), '[llm]\nchat_api_base = "https://api.example.test/v1"\nchat_api_key = "sk-plain"\n')
+def test_the_error_of_a_file_with_an_api_key_tells_that_the_key_moves_to_the_keyring(home):
+    _write(_local(home), '[llm]\nchat_api_base = "https://api.example.test/v1"\nchat_api_key = "sk-plain-test"\n')
 
     with pytest.raises(ConfigError) as error:
         load(_project(home))
 
-    assert "converts it" not in str(error.value) and "api_key_env" in str(error.value), error.value
-    assert "sk-plain" not in str(error.value)
+    assert "moves the API key to the keyring" in str(error.value), error.value
+    assert "sk-plain-test" not in str(error.value)
 
 
 def test_a_valid_config_toml_gets_no_commented_line(home):
@@ -621,3 +664,49 @@ def test_the_own_profile_of_the_ollama_setup_does_not_replace_a_profile_of_anoth
     profiles = settings.read_config_file(_global(home))["llm"]["profiles"]
     assert profiles["local-proj"]["model"] == "other:1b"
     assert profiles["local-proj-2"]["model"] == "new-chat:1b"
+
+
+# ── The conversion of chat_api_key: the corner cases ──
+
+
+def test_a_project_api_at_another_url_keeps_the_key_variable_of_the_profile_below(home):
+    """The old merge gave the key of the global config to the API of the project, also at another URL."""
+    _write(_global(home), '[llm]\nprofile = "work"\n\n[llm.profiles.work]\nprovider = "openai_compatible"\n'
+                          'url = "https://api.example.test/v1"\nmodel = "m1"\napi_key_env = "WORK_KEY"\n')
+    _write(_local(home), '[llm]\nchat_api_base = "https://other.example.test/v1"\n')
+
+    report = migrate_llm_profiles(_project(home))
+
+    assert report.failures == []
+    assert _converted(home).api_key_env == "WORK_KEY"
+    assert not any("API key of profile" in label for _path, label in report.removed_keys), report.removed_keys
+
+
+def test_a_leftover_key_goes_to_the_profile_that_the_project_selects(home):
+    """Before, a second profile proj-2 got the key, and the selected profile stayed without one."""
+    from fw_context_mcp.llm import secrets
+
+    _write(_global(home), '[llm]\nprofile = "local"\n\n[llm.profiles.local]\nprovider = "ollama"\nmodel = "x"\n\n'
+                          '[llm.profiles.proj]\nprovider = "openai_compatible"\nurl = "https://api.example.test/v1"\n'
+                          'model = "m1"\n')
+    _write(_local(home), '[llm]\nprofile = "proj"\n')
+    _write(_config(home), '[project]\n\n[llm]\nchat_api_key = "sk-left-over"\n')
+
+    assert migrate_llm_profiles(_project(home)).failures == []
+
+    assert "proj-2" not in _global(home).read_text(encoding="utf-8")
+    assert secrets.stored_api_key("proj") == "sk-left-over"
+
+
+def test_a_key_of_an_ollama_config_is_removed_without_a_copy(home):
+    """The old chat client sent the key only to an OpenAI-compatible API."""
+    from fw_context_mcp.llm import secrets
+
+    _write(_global(home), OLD_GLOBAL.replace("enabled = true", 'enabled = true\nchat_api_key = "sk-unused"'))
+
+    report = migrate_llm_profiles(_project(home))
+
+    assert report.failures == []
+    assert any("did not send it to an Ollama server" in label for _path, label in report.removed_keys)
+    assert secrets.stored_api_key("local") is None
+    assert _global(home).read_text(encoding="utf-8").count("[llm.profiles.") == 1

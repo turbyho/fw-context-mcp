@@ -39,6 +39,13 @@ def project(tmp_path: Path, monkeypatch) -> Path:
     global_path.write_text(GLOBAL_LLM, encoding="utf-8")
     monkeypatch.setattr(settings, "_GLOBAL_CONFIG_PATH", global_path)
     settings._config_cache.clear()
+    # A stored API key goes to secrets.toml of this directory: the keyring
+    # of the session fails each call (conftest).
+    from fw_context_mcp.llm import secrets
+
+    monkeypatch.setenv("FW_CONTEXT_HOME", str(global_path.parent))
+    monkeypatch.setattr(secrets, "_found", {})
+    monkeypatch.setattr(secrets, "_told", set())
     root = tmp_path / "proj"
     (root / ".fw-context").mkdir(parents=True)
     (root / ".fw-context" / "config.toml").write_text("[project]\n", encoding="utf-8")
@@ -93,6 +100,7 @@ def _setup(monkeypatch, capsys, root: Path, choice: str, answers: dict[str, str]
     monkeypatch.setattr(client, "call_llm", _call_llm)
     monkeypatch.setattr(_init_interactive, "prompt_text", lambda label, default=None, **kwargs: answers.get(label, default))
     monkeypatch.setattr(_init_interactive, "_confirm", lambda question, **kwargs: shared and "shared" in question)
+    monkeypatch.setattr(_init_interactive, "_read_secret", lambda prompt: answers.get("API key", ""))
     monkeypatch.setattr(auto_model, "_gpu_available", lambda: False)
     monkeypatch.setattr(ollama, "check_setup", lambda cfg: {"status": "ok", "installed_models": []})
     replies = iter([choice])
@@ -331,12 +339,29 @@ def test_option_1_writes_the_chat_model_into_the_selected_ollama_profile(project
     assert tested == ["new-chat:1b"], "the test call must use the model of the new profile"
 
 
+def test_option_2_stores_a_key_for_the_profile_and_never_in_a_config_file(project, monkeypatch, capsys):
+    """Without a variable, the step reads the key without an echo and stores it before the test call."""
+    from fw_context_mcp.config import settings
+    from fw_context_mcp.llm import secrets
+
+    key = "sk-init-" + "test"
+    out, tested = _setup(monkeypatch, capsys, project, "2", {
+        "Profile name": "work", "API URL": "http://127.0.0.1:9/v1", "Model": "work-chat", "API key": key,
+    })
+
+    assert "[ok] LLM configured: profile work" in out and key not in out, out
+    assert secrets.stored_api_key("work") == key
+    assert "api_key_env" not in _global_llm()["profiles"]["work"]
+    for path in (settings._GLOBAL_CONFIG_PATH, project / ".fw-context" / "local.toml"):
+        assert key not in path.read_text(encoding="utf-8"), path
+
+
 def test_option_2_writes_a_cloud_profile_that_names_the_key_variable(project, monkeypatch, capsys):
     """The profile holds the NAME of the variable, never the key: a key in a TOML file is a secret in plain text."""
     out, tested = _setup(monkeypatch, capsys, project, "2", {
         "Profile name": "work",
         "API URL": "http://127.0.0.1:9/v1",
-        "Environment variable with the API key (empty: no key)": "WORK_API_KEY",
+        "Environment variable with the API key (empty: store the key in the keyring)": "WORK_API_KEY",
         "Model": "work-chat",
     })
 

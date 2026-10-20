@@ -565,11 +565,42 @@ def _prompt_ollama_setup(project_root: Path, cfg) -> None:
     print(f"  [ok] Profile saved to {settings._GLOBAL_CONFIG_PATH}; .fw-context/local.toml selects it")
 
 
-def _prompt_cloud_setup(project_root: Path) -> None:
-    """Interactive cloud-API setup: a profile of provider openai_compatible (name, URL, key variable, model).
+def _read_secret(prompt: str) -> str:
+    """Read a secret from the terminal without an echo (a seam for the tests)."""
+    import getpass
 
-    The profile gets the NAME of the environment variable that holds the
-    API key, not the key: a key in a TOML file is a secret in plain text.
+    return getpass.getpass(prompt)
+
+
+def _store_api_key(profile: str) -> bool:
+    """Ask for the API key of *profile* and store it; return False when the setup must stop.
+
+    An empty answer stores nothing: a server without a key (a proxy on the
+    local network) is valid.  The messages never hold the key.
+    """
+    from ..llm.secrets import SecretStoreError, secrets_path, set_api_key
+
+    value = _read_secret("  API key (no echo; empty: no key) > ").strip()
+    if not value:
+        return True
+    try:
+        place = set_api_key(profile, value)
+    except SecretStoreError as exc:
+        print(f"  [warn] {exc}. Cloud API setup stopped")
+        return False
+    where = "the keyring of the system" if place == "keyring" else f"{secrets_path()} (no keyring can be used)"
+    print(f"  [ok] The API key is stored in {where}")
+    return True
+
+
+def _prompt_cloud_setup(project_root: Path) -> None:
+    """Interactive cloud-API setup: a profile of provider openai_compatible (name, URL, key, model).
+
+    The profile never gets the API key: a key in a TOML file is a secret in
+    plain text.  The profile gets the NAME of the environment variable of
+    the key, or, without one, the step reads the key without an echo and
+    stores it for the profile (``llm.secrets``: the keyring, else
+    ``secrets.toml``).
     """
     from ..config import settings
     from ..config._profiles import replaces_other_values
@@ -586,7 +617,7 @@ def _prompt_cloud_setup(project_root: Path) -> None:
     if problem is not None:
         print(f"  [warn] {url} is not a valid URL ({problem}). Cloud API setup skipped")
         return
-    key_env = prompt_text("Environment variable with the API key (empty: no key)") or ""
+    key_env = prompt_text("Environment variable with the API key (empty: store the key in the keyring)") or ""
     model = prompt_text("Model", default="deepseek-chat") or "deepseek-chat"
 
     if not _is_loopback_url(url):
@@ -603,6 +634,9 @@ def _prompt_cloud_setup(project_root: Path) -> None:
         if not name:
             print("  [skip] Cloud API setup skipped")
             return
+    # The key before the test call of _save_profile: the call needs it.
+    if not key_env and not _store_api_key(name):
+        return
     # Before, "[ok] Saved" came after an error too, and named a setting
     # that was not in the file.
     if not _save_profile(project_root, name, values, {"enabled": True, "profile": name}):

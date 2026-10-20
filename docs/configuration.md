@@ -37,7 +37,7 @@ Option 3 "Disable the LLM analysis" writes `[llm] analyze_symbols = false` to `l
 
 Option 1 (local Ollama) writes the chat model to an Ollama profile of the global config. This is the selected profile when it is an Ollama profile, else the profile `local`. The other keys of that profile stay. Then `local.toml` selects the profile with `[llm] profile`, and gets the embedding model in `[llm] embed_model`. The prompts of option 1 give the models that a config file sets as the defaults, thus Enter keeps them. Without such a file, the defaults are the recommended models. The chat model of an `openai_compatible` profile is not a default, because it is not a model of Ollama.
 
-Option 2 (cloud API) asks for four values: a profile name (default `cloud`), the URL of the API, the name of the environment variable that holds the API key, and the model. It writes a profile with `provider = "openai_compatible"` to the global config, and `local.toml` selects it. A profile of the same name gets only the new values. Option 2 never asks for the key itself. Add more profiles, for example a second Ollama server, to the global config with a text editor (see [`[llm]`](#llm--llm-and-embeddings)).
+Option 2 (cloud API) asks for four values: a profile name (default `cloud`), the URL of the API, the name of the environment variable that holds the API key, and the model. It writes a profile with `provider = "openai_compatible"` to the global config, and `local.toml` selects it. A profile of the same name gets only the new values. When you give no variable, option 2 reads the key without an echo and stores it for the profile (see [API keys](#api-keys)). No config file gets the key. Add more profiles, for example a second Ollama server, to the global config with a text editor (see [`[llm]`](#llm--llm-and-embeddings)).
 
 Options 1 and 2 then send a test request to the profile. When the test fails, `local.toml` gets its old text back. The profile stays in the global config.
 
@@ -236,7 +236,7 @@ Each profile is one LLM backend. The name of a profile has only letters, digits,
 | `keep_alive` | `"10m"` | `ollama` | How long Ollama keeps the model loaded in VRAM after a request. Use minutes, seconds, or `-1` for an indefinite time. During indexing, this setting prevents model loading before each request, which takes about 2 to 5 seconds each time. |
 | `auto_pull` | `false` | `ollama` | When `true`, fw-context pulls a model automatically from the Ollama registry when it is not installed. When `false` (default), you must pull each model explicitly. Set this key to `false` for offline or intranet environments. |
 | `max_concurrent` | `1` | `ollama` | The maximum number of parallel Ollama HTTP calls per process. Increase this key to 2–4 for multi-client MCP transports, such as SSE or streamable, where embedding requests (~100 ms) can overlap. Keep this key low for chat requests, which use the GPU more. |
-| `api_key_env` | *(none)* | `openai_compatible` | The **name** of the environment variable that holds the API key, for example `"DEEPSEEK_API_KEY"`. Never write the key itself into a config file. When the variable is not set, fw-context sends no key. |
+| `api_key_env` | *(none)* | `openai_compatible` | The **name** of the environment variable that holds the API key, for example `"DEEPSEEK_API_KEY"`. Never write the key itself into a config file. When the variable is not set, fw-context uses the stored key of the profile (see [API keys](#api-keys)). |
 
 fw-context reads `timeout`, `stream`, `num_ctx`, `keep_alive`, `auto_pull` and `max_concurrent` from the selected profile. Thus these values also apply to the embeddings. When the selected profile is an `openai_compatible` profile, `keep_alive`, `auto_pull` and `max_concurrent` come from the profile of `embed_profile`, because only the embeddings use Ollama. Without `embed_profile`, these keys have their defaults.
 
@@ -269,7 +269,25 @@ profile = "gpu-box"
 
 A profile with `provider = "openai_compatible"` sends the chat requests (analysis generation, `smart_search`, `explain_symbol`) to its `url`, with OpenAI-compatible JSON. The embeddings still use Ollama, see `embed_profile`.
 
-The profile holds the name of the environment variable with the API key, never the key. A key in a TOML file is a secret in plain text. Set the variable in the environment of each process that runs fw-context: your shell for the CLI, and the LLM client that starts the MCP server.
+#### API keys
+
+A config file never holds an API key: a key in a TOML file is a secret in plain text. fw-context gets the key of a profile from the first of these places that holds one:
+
+1. The environment variable that `api_key_env` of the profile names. Set it in the environment of each process that runs fw-context: your shell for the CLI, and the LLM client that starts the MCP server.
+2. The keyring of the system: the macOS Keychain, the Windows Credential Manager, or the Secret Service on Linux (for example GNOME Keyring or KWallet). The service is `fw-context`, and the user is the name of the profile.
+3. `secrets.toml` in the global directory (`$FW_CONTEXT_HOME`, else `~/.fw-context`), with mode 0600 on Linux and macOS. fw-context writes a key there only when no keyring can be used, for example on Linux without a D-Bus session, in WSL or in a container. On Windows the mode does not keep other users out, but the Credential Manager is always there.
+
+These commands store, remove and show a key. No command shows the key itself:
+
+```bash
+fw-context llm key set deepseek      # reads the key without an echo, or one line of stdin
+fw-context llm key status            # the place of the key of each API profile
+fw-context llm key delete deepseek
+```
+
+fw-context gets the key when it sends the first request to the API, not when it reads the config, and keeps a found key in the memory of the process. A key that you store for a profile without a key applies to a running MCP server at the next request. A key that you change applies after the server refuses the old one (HTTP 401 or 403): then fw-context reads the key again. When no place holds a key, fw-context tells it one time, and sends the requests without a key. When the server replies HTTP 401 or 403, the error names the command that stores the key.
+
+A key goes into an HTTP header, thus it can hold only printable ASCII characters without a space. fw-context removes white space at the start and at the end (for example the newline of a variable from a `.env` file). It does not store or use a key with a different character, and the message does not show the key.
 
 **OpenAI:**
 
@@ -438,12 +456,7 @@ The conversion makes these changes:
 
 The conversion selects the provider from `chat_api_format` and `chat_api_base`, with the same rules as the old releases. A `chat_api_format` of the global config applies to a `chat_api_base` of the project, as in the old releases. An `openai_compatible` profile has no `num_ctx`, because the old releases did not send it to such an API: the report says so. When the old keys sent the chat in the Ollama format, the result is an `ollama` profile. Else the result is an `openai_compatible` profile.
 
-The conversion does not change a file that has `chat_api_key`, because a profile has no place for the value of a key. When the global config has it, the conversion changes no file of the project either, because the project selects a profile of the global config. To convert such a file, do these steps:
-
-1. Put the key into an environment variable.
-2. In the global config, write the profile with `api_key_env = "<variable>"` (see [External chat API examples](#external-chat-api-examples)).
-3. Select the profile with `[llm] profile`.
-4. Remove the old `[llm]` keys.
+The conversion moves `chat_api_key` to the key store of the profile (see [API keys](#api-keys)), and removes it from the file. A key of a project gets a profile of the project, because the key applied to that project only. A new API profile of a project gets a copy of the key of the API profile below it, because the old releases gave the key of the global config to the project. When a key cannot be stored, the conversion changes no config file, and a second run stores the keys again. A key of an Ollama backend goes away without a copy, because the old releases did not send it to Ollama. When the project selects a profile with the same values already, its key goes to that profile. The `.bak` copy holds a mark in the place of the key. When `config.toml` of a project held the key, git keeps it in the history of the file: replace the key at the provider.
 
 The conversion first makes and checks each new text, and makes sure that it can write each file. When it cannot write a file, it changes no file. Then it writes the global config, `local.toml` and `config.toml`, in this order, and stops at the first write that fails. Before the conversion changes `local.toml` or the global config, it writes the old text to `<name>.bak` beside the file. `config.toml` of a project gets no copy, because git holds its old text: commit the change.
 

@@ -511,14 +511,15 @@ then shows a menu. The backend keys are `enabled`, `profile`,
 - Option 2 (cloud API) asks for a profile name, the URL, the name of the
   environment variable that holds the API key, and the model. It writes a
   profile with `provider = "openai_compatible"` to the global config, and
-  `.fw-context/local.toml` selects it. It never asks for the key itself.
+  `.fw-context/local.toml` selects it. When you give no variable, it reads
+  the key without an echo and stores it for the profile (see
+  [`fw-context llm key`](#fw-context-llm-key)). No config file gets the key.
 - Option 3 sets `[llm] analyze_symbols = false` in
   `.fw-context/local.toml`: the LLM analysis stops, and the embeddings
   stay.
 
 Options 1 and 2 then send a test request. When the test fails,
-`.fw-context/local.toml` gets its old text back, and the profile stays in
-the global config. See
+`.fw-context/local.toml` and the global config get their old text back. See
 [How config works](configuration.md#how-config-works).
 
 Option 0 depends on the file that sets the backend:
@@ -983,6 +984,35 @@ Old daemon stopped.
 Starting new daemon...
 Daemon restarted successfully.
 ```
+
+### `fw-context llm key`
+
+Store, remove and show the API key of an LLM profile. A config file never
+holds a key. The order of the places that fw-context reads is in
+[configuration.md](configuration.md#api-keys).
+
+```bash
+fw-context llm key set <profile>       # store the key
+fw-context llm key status [<profile>]  # show the place of the key
+fw-context llm key delete <profile>    # remove the stored key
+```
+
+- `set` reads the key without an echo on a terminal, else one line of
+  stdin. Do not give the key as an argument: the process list and the
+  shell history show an argument. The key goes to the keyring of the
+  system. When no keyring can be used, it goes to `secrets.toml` in the
+  global directory (`$FW_CONTEXT_HOME`, else `~/.fw-context`) with mode
+  0600. A profile that the global config does not have yet gives a note,
+  not an error. A key with a space, a control character or a character
+  that is not ASCII is refused.
+- `status` names the place of the key of each profile that uses an API:
+  the environment variable, the keyring, or `secrets.toml`. It never shows
+  the key.
+- `delete` removes the key from the keyring and from `secrets.toml`. An
+  environment variable stays.
+
+Exit codes: 0 when the command did its work; 1 for an empty key, a
+profile name that is not valid, or a key that no place could store.
 
 ### `fw-context version`
 

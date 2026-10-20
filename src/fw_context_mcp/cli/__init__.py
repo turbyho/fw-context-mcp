@@ -520,6 +520,28 @@ def main() -> None:
     p_cleanup.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
     p_cleanup.set_defaults(func=cmd_cleanup)
 
+    from ._llm import cmd_llm, cmd_llm_key_delete, cmd_llm_key_set, cmd_llm_key_status  # noqa: I001
+    p_llm = sub.add_parser("llm", help="Manage the LLM profiles (the API keys)")
+    p_llm_sub = p_llm.add_subparsers(dest="llm_command")
+    p_llm_key = p_llm_sub.add_parser("key", help="Store, remove or show the API key of an LLM profile")
+    p_llm_key_sub = p_llm_key.add_subparsers(dest="llm_key_command")
+    p_llm_key_set = p_llm_key_sub.add_parser(
+        "set", help="Store the API key of a profile (from the terminal without echo, or one line of stdin)",
+    )
+    p_llm_key_set.add_argument("profile", help="The name of the LLM profile")
+    p_llm_key_set.set_defaults(func=cmd_llm_key_set)
+    p_llm_key_delete = p_llm_key_sub.add_parser("delete", help="Remove the stored API key of a profile")
+    p_llm_key_delete.add_argument("profile", help="The name of the LLM profile")
+    p_llm_key_delete.set_defaults(func=cmd_llm_key_delete)
+    p_llm_key_status = p_llm_key_sub.add_parser(
+        "status", help="Show which place gives the API key of each API profile (never the key)",
+    )
+    p_llm_key_status.add_argument("profile", nargs="?", help="Only this profile")
+    p_llm_key_status.set_defaults(func=cmd_llm_key_status)
+    # Without a subcommand, show the usage
+    p_llm.set_defaults(func=cmd_llm)
+    p_llm_key.set_defaults(func=cmd_llm)
+
     args = parser.parse_args()
     if not hasattr(args, "func"):
         parser.print_help()

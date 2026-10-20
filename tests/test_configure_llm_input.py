@@ -94,6 +94,7 @@ def _cloud_setup(monkeypatch, capsys, root: Path, answers: dict[str, str]) -> st
     from fw_context_mcp.cli import _init_interactive
 
     monkeypatch.setattr(_init_interactive, "prompt_text", lambda label, **kwargs: answers.get(label, ""))
+    monkeypatch.setattr(_init_interactive, "_read_secret", lambda prompt: "")
     _init_interactive._prompt_cloud_setup(root)
     return capsys.readouterr().out
 
