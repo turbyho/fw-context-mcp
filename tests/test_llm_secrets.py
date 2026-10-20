@@ -310,3 +310,29 @@ def test_a_refused_key_of_the_caller_gives_no_advice_about_the_key_store(store, 
 
 def test_the_repr_of_the_config_does_not_show_the_key():
     assert KEY not in repr(LLMConfig(chat_api_key=KEY))
+
+
+def test_a_profile_without_a_key_uses_the_key_of_its_provider(store):
+    """Two profiles of OpenRouter use one account: the key is stored one time, as "provider:openrouter"."""
+    secrets.set_api_key(secrets.provider_entry("openrouter"), KEY)
+
+    assert secrets.get_api_key("or-oss", "", "openrouter") == KEY
+    assert secrets.api_key_source("or-oss", "", "openrouter") == "file:openrouter"
+
+
+def test_the_key_of_the_profile_wins_over_the_key_of_the_provider(store):
+    secrets.set_api_key(secrets.provider_entry("openrouter"), "provider-key")
+    secrets.set_api_key("or-oss", KEY)
+
+    assert secrets.get_api_key("or-oss", "", "openrouter") == KEY
+
+
+def test_a_new_key_of_the_provider_applies_after_a_refusal(store):
+    """forget clears each cached key: a profile can hold the key of its provider."""
+    secrets.set_api_key(secrets.provider_entry("openrouter"), "old-key")
+    assert secrets.get_api_key("or-oss", "", "openrouter") == "old-key"
+    secrets._file_save({secrets.provider_entry("openrouter"): KEY})
+
+    secrets.forget("or-oss")
+
+    assert secrets.get_api_key("or-oss", "", "openrouter") == KEY

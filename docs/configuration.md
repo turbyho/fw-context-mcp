@@ -227,20 +227,21 @@ Each profile is one LLM backend. The name of a profile has only letters, digits,
 
 | Key | Default | Provider | Description |
 |-----|---------|----------|-------------|
-| `provider` | *(required)* | each | `"ollama"` for an Ollama server, or `"openai_compatible"` for an API with the OpenAI chat format. |
+| `provider` | *(required)* | each | `"ollama"` for an Ollama server, `"openai_compatible"` for an API with the OpenAI chat format, `"openrouter"` for OpenRouter, or `"deepseek"` for the API of DeepSeek. For `openrouter` and `deepseek`, fw-context knows the URL, the key variable and the request fields that turn the reasoning of the model off. |
 | `model` | *(required)* | each | The chat model. Use a model with 14B parameters or more: a smaller model gives JSON that is not consistent, and poor descriptions of embedded C++ code. |
-| `url` | `"http://localhost:11434"` for Ollama | each | The server. Required for `openai_compatible`. fw-context adds `/chat/completions` to a URL that contains `/v1`, and `/v1/chat/completions` to a URL without `/v1`. A URL that ends with `/chat/completions` stays as it is. |
+| `url` | `"http://localhost:11434"` for Ollama, `"https://openrouter.ai/api/v1"` for OpenRouter, `"https://api.deepseek.com"` for DeepSeek | each | The server. Required for `openai_compatible`. fw-context adds `/chat/completions` to a URL that contains `/v1`, and `/v1/chat/completions` to a URL without `/v1`. A URL that ends with `/chat/completions` stays as it is. |
 | `timeout` | `600.0` | each | The HTTP request timeout, in seconds. Embed requests use `timeout × 2`. |
 | `stream` | `false` | each | When `true`, fw-context sends `stream: true` and reads SSE chunks for chat requests. This setting keeps the HTTP connection open with a continuous data flow, and prevents reverse-proxy idle timeouts (nginx default: 60 s, Cloudflare: 100 s). When `false`, fw-context uses a non-streaming path. |
 | `num_ctx` | `16384` | `ollama` | The context window, in tokens. This size allows full function bodies during analysis generation. |
 | `keep_alive` | `"10m"` | `ollama` | How long Ollama keeps the model loaded in VRAM after a request. Use minutes, seconds, or `-1` for an indefinite time. During indexing, this setting prevents model loading before each request, which takes about 2 to 5 seconds each time. |
 | `auto_pull` | `false` | `ollama` | When `true`, fw-context pulls a model automatically from the Ollama registry when it is not installed. When `false` (default), you must pull each model explicitly. Set this key to `false` for offline or intranet environments. |
 | `max_concurrent` | `1` | `ollama` | The maximum number of parallel Ollama HTTP calls per process. Increase this key to 2–4 for multi-client MCP transports, such as SSE or streamable, where embedding requests (~100 ms) can overlap. Keep this key low for chat requests, which use the GPU more. |
-| `api_key_env` | *(none)* | `openai_compatible` | The **name** of the environment variable that holds the API key, for example `"DEEPSEEK_API_KEY"`. Never write the key itself into a config file. When the variable is not set, fw-context uses the stored key of the profile (see [API keys](#api-keys)). |
+| `api_key_env` | *(none)*; `"OPENROUTER_API_KEY"` for OpenRouter, `"DEEPSEEK_API_KEY"` for DeepSeek, when the profile has no `url` of its own | each API | The **name** of the environment variable that holds the API key, for example `"DEEPSEEK_API_KEY"`. Never write the key itself into a config file. When the variable is not set, fw-context uses the stored key of the profile (see [API keys](#api-keys)). |
+| `routing` | `{ sort = "price", quantizations = ["int8", "fp8", "mxfp8", "fp16", "bf16", "fp32", "unknown"] }` | `openrouter` | The hosts of OpenRouter that get the request (the `provider` object of the OpenRouter API). `sort`: `"price"`, `"throughput"` or `"latency"`. `quantizations`: the precisions that a host can run, from `int4`, `int8`, `fp4`, `mxfp4`, `nvfp4`, `fp6`, `fp8`, `mxfp8`, `fp16`, `bf16`, `fp32` and `unknown`. `zdr`: `true` for hosts with zero data retention only. `data_collection`: `"deny"` for hosts that do not store or train on the data, or `"allow"`. A key of this table replaces the default of that key only. The default filter keeps out the precisions below 8 bits: measured on 2026-10-20, the `fp4` host of a DeepSeek model gave much weaker analyses than an `fp8` host. It keeps `unknown`, the value of the models of OpenAI. A model that only hosts below 8 bits run needs a filter with their precision, for example `quantizations = ["mxfp4"]`. |
 
 fw-context reads `timeout`, `stream`, `num_ctx`, `keep_alive`, `auto_pull` and `max_concurrent` from the selected profile. Thus these values also apply to the embeddings. When the selected profile is an `openai_compatible` profile, `keep_alive`, `auto_pull` and `max_concurrent` come from the profile of `embed_profile`, because only the embeddings use Ollama. Without `embed_profile`, these keys have their defaults.
 
-A key that the provider of the profile does not know is an error, because a typo can select a different backend. A value of the wrong type in `provider`, `model`, `url` or `api_key_env` is an error. In the other keys, it gives a warning, and fw-context uses the default.
+A key that the provider of the profile does not know is an error, because a typo can select a different backend. A value of the wrong type in `provider`, `model`, `url` or `api_key_env`, and each problem of `routing`, is an error. In the other keys, it gives a warning, and fw-context uses the default.
 
 ```toml
 # ~/.fw-context/config.toml
@@ -265,10 +266,6 @@ model = "qwen2.5-coder:32b"
 profile = "gpu-box"
 ```
 
-#### External chat API examples
-
-A profile with `provider = "openai_compatible"` sends the chat requests (analysis generation, `smart_search`, `explain_symbol`) to its `url`, with OpenAI-compatible JSON. The embeddings still use Ollama, see `embed_profile`.
-
 #### API keys
 
 A config file never holds an API key: a key in a TOML file is a secret in plain text. fw-context gets the key of a profile from the first of these places that holds one:
@@ -277,10 +274,15 @@ A config file never holds an API key: a key in a TOML file is a secret in plain 
 2. The keyring of the system: the macOS Keychain, the Windows Credential Manager, or the Secret Service on Linux (for example GNOME Keyring or KWallet). The service is `fw-context`, and the user is the name of the profile.
 3. `secrets.toml` in the global directory (`$FW_CONTEXT_HOME`, else `~/.fw-context`), with mode 0600 on Linux and macOS. fw-context writes a key there only when no keyring can be used, for example on Linux without a D-Bus session, in WSL or in a container. On Windows the mode does not keep other users out, but the Credential Manager is always there.
 
+For a profile of `openrouter` or `deepseek` without a key of its own, fw-context then uses the key of the provider, which `fw-context llm key set provider:openrouter` stores. Thus two profiles of one provider, for example two models of OpenRouter, use one stored key. A profile name cannot have a `:`, thus a profile named `deepseek` never gives its key to the provider DeepSeek.
+
+A profile of `openrouter` or `deepseek` with a `url` of its own (for example a proxy) gets neither the default variable nor the key of the provider: the key of OpenRouter must not go to a different host. `api_key_env = ""` turns the default variable off.
+
 These commands store, remove and show a key. No command shows the key itself:
 
 ```bash
 fw-context llm key set deepseek      # reads the key without an echo, or one line of stdin
+fw-context llm key set provider:openrouter   # the key of each profile of OpenRouter
 fw-context llm key status            # the place of the key of each API profile
 fw-context llm key delete deepseek
 ```
@@ -288,6 +290,10 @@ fw-context llm key delete deepseek
 fw-context gets the key when it sends the first request to the API, not when it reads the config, and keeps a found key in the memory of the process. A key that you store for a profile without a key applies to a running MCP server at the next request. A key that you change applies after the server refuses the old one (HTTP 401 or 403): then fw-context reads the key again. When no place holds a key, fw-context tells it one time, and sends the requests without a key. When the server replies HTTP 401 or 403, the error names the command that stores the key.
 
 A key goes into an HTTP header, thus it can hold only printable ASCII characters without a space. fw-context removes white space at the start and at the end (for example the newline of a variable from a `.env` file). It does not store or use a key with a different character, and the message does not show the key.
+
+#### External chat API examples
+
+A profile with `provider = "openai_compatible"` sends the chat requests (analysis generation, `smart_search`, `explain_symbol`) to its `url`, with OpenAI-compatible JSON. The embeddings still use Ollama, see `embed_profile`.
 
 **OpenAI:**
 
@@ -317,11 +323,22 @@ api_key_env = "LITELLM_API_KEY"
 
 ```toml
 [llm.profiles.deepseek]
-provider = "openai_compatible"
-url = "https://api.deepseek.com/v1"
+provider = "deepseek"            # the URL and the key variable have defaults
 model = "deepseek-v4-flash"
-api_key_env = "DEEPSEEK_API_KEY"
 ```
+
+fw-context turns the thinking of the model off (`thinking: {type: disabled}`): the thinking costs output tokens, and did not make the analysis better.
+
+**OpenRouter:**
+
+```toml
+[llm.profiles.openrouter]
+provider = "openrouter"
+model = "deepseek/deepseek-v4.1-flash"
+routing = { zdr = true }         # only hosts with zero data retention; sort and quantizations keep their defaults
+```
+
+fw-context turns the reasoning of the model off. A model that refuses it (HTTP 400 that names the reasoning) gets the lowest reasoning, without the reasoning text in the answer, and fw-context logs a warning: the reasoning tokens are billed as output. OpenRouter gives the cost of each request: fw-context reads it from the answer.
 
 **LiteLLM proxy (local):**
 

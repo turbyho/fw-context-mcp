@@ -587,7 +587,10 @@ def _all_keys() -> list[tuple[str, str, str]]:
 
 
 #: A TOML value of the wrong type for each converter.
-_WRONG_FOR = {"str": "5", "path": "5", "bool": "5", "list": "5", "dict": "5", "str_table": "5", "int": "[1]", "float": "[1]"}
+_WRONG_FOR = {
+    "str": "5", "path": "5", "bool": "5", "list": "5", "dict": "5", "str_table": "5", "int": "[1]", "float": "[1]",
+    "routing": "5",
+}
 
 
 @pytest.mark.parametrize(("section", "key", "conv"), [k for k in _all_keys() if k[:2] not in settings._TUNING_KEYS])
@@ -610,6 +613,8 @@ def test_each_key_of_the_tuning_list_warns(tmp_path, home, section, key, conv):
 _PROFILE_BASE = {
     "ollama": {"provider": '"ollama"', "model": '"m"'},
     "openai_compatible": {"provider": '"openai_compatible"', "model": '"m"', "url": '"http://localhost:9"'},
+    "openrouter": {"provider": '"openrouter"', "model": '"m"'},
+    "deepseek": {"provider": '"deepseek"', "model": '"m"'},
 }
 
 

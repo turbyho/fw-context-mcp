@@ -44,13 +44,20 @@ def cmd_llm_key_set(args: argparse.Namespace) -> int:
     or no place could store it.
     """
     from ..config._profiles import _NAME
-    from ..llm.secrets import SecretStoreError, secrets_path, set_api_key
+    from ..llm.providers import PROVIDERS
+    from ..llm.secrets import SecretStoreError, provider_entry, secrets_path, set_api_key
 
     profile = args.profile
-    if not _NAME.fullmatch(profile):
+    provider = profile.removeprefix("provider:") if profile.startswith("provider:") else ""
+    if provider and provider not in PROVIDERS:
+        print(f"[error] {provider!r} is not a provider (providers: {', '.join(PROVIDERS)})", file=sys.stderr)
+        return 1
+    if provider:
+        profile = provider_entry(provider)
+    elif not _NAME.fullmatch(profile):
         print(f"[error] profile name {profile!r} must have only letters, digits, '_' and '-'", file=sys.stderr)
         return 1
-    if profile not in _profiles():
+    elif profile not in _profiles():
         # Not an error: the user can store the key first and write the
         # profile after it.
         print(f"[note] The global config has no profile {profile!r} yet", file=sys.stderr)
@@ -93,6 +100,7 @@ def cmd_llm_key_status(args: argparse.Namespace) -> int:
 
     Exit code: 0 always; a missing key is a state, not an error of the command.
     """
+    from ..llm.providers import provider_spec
     from ..llm.secrets import api_key_source
 
     profiles = _profiles()
@@ -104,12 +112,19 @@ def cmd_llm_key_status(args: argparse.Namespace) -> int:
             print("No profile of the global config uses an API")
             return 0
     for name in names:
-        env_name = str(profiles.get(name, {}).get("api_key_env") or "")
-        source = api_key_source(name, env_name)
+        profile = profiles.get(name, {})
+        spec = provider_spec(str(profile.get("provider", "")))
+        own_url = spec is not None and str(profile.get("url", spec.base_url)).rstrip("/") == spec.base_url.rstrip("/")
+        default_env = spec.key_env if spec is not None and own_url else ""
+        env_name = str(profile["api_key_env"]) if "api_key_env" in profile else default_env
+        source = api_key_source(name, env_name, spec.name if spec is not None and own_url else "")
         if source is None:
             print(f"{name}: no API key (store one with 'fw-context llm key set {name}')")
-        elif source.startswith("env:"):
-            print(f"{name}: the environment variable {source[4:]}")
-        else:
-            print(f"{name}: {'the keyring of the system' if source == 'keyring' else 'secrets.toml'}")
+            continue
+        place, _, owner = source.partition(":")
+        if place == "env":
+            print(f"{name}: the environment variable {owner}")
+            continue
+        where = "the keyring of the system" if place == "keyring" else "secrets.toml"
+        print(f"{name}: {where}" + (f" (the key of provider {owner})" if owner else ""))
     return 0

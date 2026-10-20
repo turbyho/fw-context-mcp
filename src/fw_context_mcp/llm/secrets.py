@@ -61,7 +61,7 @@ _FILE_HEADER = (
 #: user stores later must apply without a restart of the MCP server.  A
 #: key that another process changed applies after the next HTTP 401 or
 #: 403: the chat client then calls ``forget``.
-_found: dict[tuple[str, str], str] = {}
+_found: dict[tuple[str, str, str], str] = {}
 
 #: The profiles without a key that this process told about.
 _told: set[str] = set()
@@ -76,20 +76,29 @@ def secrets_path() -> Path:
     return fw_context_home() / SECRETS_FILE
 
 
-def get_api_key(profile: str, env_name: str = "") -> str | None:
+def get_api_key(profile: str, env_name: str = "", shared: str = "") -> str | None:
     """Return the API key of *profile*, or None when no place holds one.
 
     *env_name* is the value of ``api_key_env`` of the profile, or empty.
+    *shared* is the name of the provider of the profile (``openrouter``,
+    ``deepseek``): without a key of the profile, the key stored as
+    ``provider:<name>`` applies.  WHY: two profiles of one provider (two
+    models of OpenRouter) use one account, and the user stores its key one
+    time.  WHY the prefix: a profile name has no ``:``, thus a profile
+    ``deepseek`` of OpenRouter cannot give its key to the provider DeepSeek.
     When no place holds a key, a notice goes to stderr one time for each
     profile: the requests then go without a key, and the server replies
     HTTP 401.
     """
-    cached = _found.get((profile, env_name))
+    entry = (profile, env_name, shared)
+    cached = _found.get(entry)
     if cached is not None:
         return cached
     key = _from_env(env_name, profile) or _from_keyring(profile) or _from_file(profile)
+    if not key and shared:
+        key = _from_keyring(provider_entry(shared)) or _from_file(provider_entry(shared))
     if key:
-        _found[(profile, env_name)] = key
+        _found[entry] = key
         return key
     if profile not in _told:
         _told.add(profile)
@@ -102,10 +111,12 @@ def get_api_key(profile: str, env_name: str = "") -> str | None:
     return None
 
 
-def api_key_source(profile: str, env_name: str = "") -> str | None:
+def api_key_source(profile: str, env_name: str = "", shared: str = "") -> str | None:
     """Return the place that gives the key of *profile* (``env:<name>``, ``keyring``, ``file``), or None.
 
-    For a status line: the value itself is never returned.
+    A key of the provider (*shared*, see ``get_api_key``) gives
+    ``keyring:<provider>`` or ``file:<provider>``.  For a status line: the
+    value itself is never returned.
     """
     if _from_env(env_name, profile):
         return f"env:{env_name}"
@@ -113,7 +124,17 @@ def api_key_source(profile: str, env_name: str = "") -> str | None:
         return "keyring"
     if _from_file(profile):
         return "file"
+    if shared:
+        if _from_keyring(provider_entry(shared)):
+            return f"keyring:{shared}"
+        if _from_file(provider_entry(shared)):
+            return f"file:{shared}"
     return None
+
+
+def provider_entry(provider: str) -> str:
+    """Return the name of the stored key of *provider* (``provider:<name>``), which no profile can have."""
+    return f"provider:{provider}"
 
 
 def stored_api_key(profile: str) -> str | None:
@@ -191,13 +212,14 @@ def delete_api_key(profile: str) -> list[str]:
 
 
 def forget(profile: str) -> None:
-    """Remove the cached key of *profile*, for each variable, and allow a new notice.
+    """Remove each cached key, and allow a new notice for *profile*.
 
     The chat client calls it after HTTP 401 or 403: another process
-    (``fw-context llm key set``) can have changed the key.
+    (``fw-context llm key set``) can have changed the key.  WHY each key
+    and not only the key of *profile*: the key of a provider applies to
+    each profile of that provider, and the cache holds a few keys only.
     """
-    for cached in [entry for entry in _found if entry[0] == profile]:
-        del _found[cached]
+    _found.clear()
     _told.discard(profile)
 
 

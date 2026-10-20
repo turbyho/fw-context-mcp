@@ -993,6 +993,7 @@ holds a key. The order of the places that fw-context reads is in
 
 ```bash
 fw-context llm key set <profile>       # store the key
+fw-context llm key set provider:openrouter  # the key of each profile of a provider
 fw-context llm key status [<profile>]  # show the place of the key
 fw-context llm key delete <profile>    # remove the stored key
 ```

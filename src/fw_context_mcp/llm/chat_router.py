@@ -269,8 +269,14 @@ class OpenAIChatClient:
     counts_tokens = False
 
     def __init__(self, cfg: LLMConfig, endpoint: str) -> None:
+        from .providers import provider_spec
+
         self.cfg = cfg
         self.endpoint = endpoint
+        self.spec = provider_spec(cfg.provider)
+        # True after the model refused to turn the reasoning off: the next
+        # requests ask for the lowest reasoning at once, not for a refusal.
+        self._low_reasoning = False
 
     def generate(
         self,
@@ -301,7 +307,7 @@ class OpenAIChatClient:
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
         t0 = time.monotonic()
-        result = self._stream(headers, payload) if cfg.stream else self._post(headers, payload)
+        result = self._send(headers, payload)
         if cfg.debug_log:
             _write_debug_log(
                 cfg.debug_log,
@@ -316,6 +322,41 @@ class OpenAIChatClient:
                 },
             )
         return result
+
+    def _send(self, headers: dict[str, str], payload: dict) -> ChatResult:
+        """Send *payload* with the fields of the provider; after a refusal of the reasoning field, send it again.
+
+        Some models of OpenRouter cannot turn the reasoning off (gpt-oss):
+        the API replies HTTP 400 and names the reasoning.  Such a model gets
+        the lowest reasoning without its text (``reasoning_low``), for this
+        request and each later one of this client.  The flag is not shared
+        between threads with a lock: a client is made for each call
+        (``call_llm``) and the analysis sends its requests one by one, thus
+        no two threads use one client.
+        """
+        spec = self.spec
+        if spec is not None:
+            payload.update(spec.request_fields(self.cfg.routing, low_reasoning=self._low_reasoning))
+        try:
+            return self._stream(headers, payload) if self.cfg.stream else self._post(headers, payload)
+        except ChatApiError as exc:
+            # The whole body: OpenRouter wraps the error of the host in
+            # metadata.raw, and the word can be after the part that a
+            # message shows.  "reasoning", not "reason": a 400 about
+            # finish_reason turned the reasoning on for the whole run.
+            refused = exc.status_code == 400 and "reasoning" in exc.body.lower()
+            if spec is None or not spec.reasoning_low or self._low_reasoning or not refused:
+                raise
+            # A warning: the reasoning tokens are billed as output.
+            log.warning(
+                "Model %s refused to turn the reasoning off: it gets the lowest reasoning, which is billed as output",
+                self.cfg.model,
+            )
+            self._low_reasoning = True
+            for key in spec.reasoning_off:
+                payload.pop(key, None)
+            payload.update(spec.request_fields(self.cfg.routing, low_reasoning=True))
+            return self._stream(headers, payload) if self.cfg.stream else self._post(headers, payload)
 
     def _post(self, headers: dict[str, str], payload: dict) -> ChatResult:
         """One non-streaming request (Plan A: an SSE answer is parsed as a stream).
@@ -356,6 +397,10 @@ class OpenAIChatClient:
             with httpx.stream(
                 "POST", self.endpoint, json=payload, headers=headers, timeout=self.cfg.timeout
             ) as resp:
+                # The body of an error answer, before the error: _error
+                # reads it, and httpx raised ResponseNotRead for a stream.
+                if resp.status_code >= 400:
+                    resp.read()
                 resp.raise_for_status()
                 for line in resp.iter_lines():
                     line = line.strip() if line else ""
@@ -387,8 +432,9 @@ class OpenAIChatClient:
         """Return the API key: ``chat_api_key`` when a caller set it, else the stored key of the profile.
 
         ``llm.secrets`` looks in ``api_key_env``, the keyring and
-        ``secrets.toml``.  A config without a profile (a test, an old
-        caller) has no stored key.
+        ``secrets.toml``, then at the key of the provider (a profile of
+        OpenRouter uses the key stored as ``openrouter``).  A config
+        without a profile (a test, an old caller) has no stored key.
         """
         if self.cfg.chat_api_key:
             return self.cfg.chat_api_key
@@ -396,7 +442,18 @@ class OpenAIChatClient:
             return None
         from .secrets import get_api_key
 
-        return get_api_key(self.cfg.profile, self.cfg.api_key_env)
+        return get_api_key(self.cfg.profile, self.cfg.api_key_env, self._provider_of_key())
+
+    def _provider_of_key(self) -> str:
+        """Return the provider whose stored key applies to this profile, or empty.
+
+        Only for the URL of the provider: a profile of OpenRouter with the
+        URL of a proxy must not send the key of OpenRouter to the proxy.
+        """
+        spec = self.spec
+        if spec is None or (self.cfg.chat_api_base or "").rstrip("/") != spec.base_url.rstrip("/"):
+            return ""
+        return spec.name
 
     def _error(self, e: Exception) -> ChatApiError:
         """Return the ``ChatApiError`` with a sentence for the operator for the failure *e* of a request.
@@ -410,27 +467,44 @@ class OpenAIChatClient:
         if isinstance(e, httpx.TimeoutException):
             return ChatApiError(f"Chat API request timed out after {self.cfg.timeout:.0f}s")
         if isinstance(e, httpx.HTTPStatusError):
-            if e.response.status_code == 404:
+            status_code = e.response.status_code
+            if status_code == 404 and self.spec is not None and self.spec.options:
+                # OpenRouter: no endpoint of the model matches the routing
+                # (a quantization filter for a model that runs fp4 only).
+                return ChatApiError(
+                    f"{self.spec.label} has no endpoint for model '{self.cfg.model}' that matches the routing "
+                    f"{self.spec.request_fields(self.cfg.routing).get('provider')} (HTTP 404: "
+                    f"{e.response.text[:200]}). Change the model, or [llm.profiles.{self.cfg.profile}.routing] "
+                    "(for example quantizations = [])",
+                    status_code=status_code,
+                )
+            if status_code == 404:
                 return ChatApiError(
                     f"Model '{self.cfg.model}' not found at {self.endpoint}. "
-                    "HTTP 404 — check model name and API endpoint."
+                    "HTTP 404 — check model name and API endpoint.",
+                    status_code=status_code,
                 )
             if e.response.status_code in (401, 403):
                 # The text of the server stays out: some servers repeat a
                 # part of the key that they refused.
                 status = f"Chat API HTTP {e.response.status_code}: {self.endpoint} refused the API key"
                 if not self.cfg.profile or self.cfg.chat_api_key:
-                    return ChatApiError(f"{status} that the caller gave, or got none")
+                    return ChatApiError(f"{status} that the caller gave, or got none", status_code=status_code)
                 # The cached key goes: another process can have stored a new one.
                 from .secrets import forget
 
                 forget(self.cfg.profile)
+                shared = self._provider_of_key()
                 return ChatApiError(
                     f"{status} of LLM profile {self.cfg.profile!r}, or got none. Store the key with "
                     f"'fw-context llm key set {self.cfg.profile}'"
-                    + (f", or set the environment variable {self.cfg.api_key_env}" if self.cfg.api_key_env else "")
+                    + (f" (or 'fw-context llm key set provider:{shared}' for each profile of {shared})" if shared else "")
+                    + (f", or set the environment variable {self.cfg.api_key_env}" if self.cfg.api_key_env else ""),
+                    status_code=status_code,
                 )
-            return ChatApiError(f"Chat API HTTP {e.response.status_code}: {e.response.text[:200]}")
+            return ChatApiError(
+                f"Chat API HTTP {status_code}: {e.response.text[:200]}", status_code=status_code, body=e.response.text,
+            )
         return ChatApiError(str(e))
 
     def count_tokens(self, prompt: str, num_ctx: int) -> int:

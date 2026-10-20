@@ -446,11 +446,15 @@ class OllamaClient:
     def _read_stream(resp: httpx.Response, chunks: list[str], stats: dict) -> None:
         """Read the lines of a streaming answer into *chunks* and *stats*.
 
-        A 400 answer is read first: its body says whether the prompt is too
-        long (:class:`OllamaPromptTooLong`).
+        An error answer is read first.  WHY: the handler of the error reads
+        ``response.text``, and httpx raised ``ResponseNotRead`` for the body
+        of a stream that was not read, in the place of the error.  A 400
+        body also says whether the prompt is too long
+        (:class:`OllamaPromptTooLong`).
         """
-        if resp.status_code == 400:
+        if resp.status_code >= 400:
             resp.read()
+        if resp.status_code == 400:
             too_long = _prompt_too_long(resp)
             if too_long is not None:
                 raise too_long

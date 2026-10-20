@@ -190,10 +190,10 @@ analyze_symbols = true
 # ── LLM profiles ──
 # Each profile is one LLM backend.  The profiles are in this global config
 # only: a project selects one with [llm] profile.  The keys of a profile:
-#   provider     "ollama" or "openai_compatible" (required)
+#   provider     "ollama", "openai_compatible", "openrouter" or "deepseek" (required)
 #   model        the chat model (required)
 #   url          the server.  Ollama: default http://localhost:11434.
-#                openai_compatible: required (for example https://api.deepseek.com)
+#                openai_compatible: required.  openrouter, deepseek: a default
 #   timeout      seconds for one request (default 600)
 #   stream       true: stream the answer, for a server behind a proxy (default false)
 #   Ollama only:
@@ -201,8 +201,13 @@ analyze_symbols = true
 #     keep_alive      how long the model stays loaded after a request (default "10m")
 #     auto_pull       true: pull a model that is not installed (default false)
 #     max_concurrent  Ollama requests at the same time in one process (default 1)
-#   openai_compatible only:
-#     api_key_env     the environment variable that holds the API key
+#   An API (openai_compatible, openrouter, deepseek):
+#     api_key_env     the environment variable that holds the API key; without
+#                     it, 'fw-context llm key set <profile>' stores the key
+#   openrouter only:
+#     routing         the hosts that get the request.  Defaults: sort = "price",
+#                     quantizations = 8 bits or more and "unknown".  Options:
+#                     zdr = true, data_collection = "deny"
 [llm.profiles.local]
 provider = "ollama"
 url = "http://localhost:11434"
@@ -224,12 +229,10 @@ num_ctx = 16384
 # keep_alive = "10m"
 # timeout = 600.0
 
-# An OpenAI-compatible API (the source code goes to its host):
+# An API (the source code goes to its host); the key: 'fw-context llm key set deepseek'
 # [llm.profiles.deepseek]
-# provider = "openai_compatible"
-# url = "https://api.deepseek.com"
-# model = "deepseek-chat"
-# api_key_env = "DEEPSEEK_API_KEY"
+# provider = "deepseek"
+# model = "deepseek-v4-flash"
 """
 
 _PROJECT_DEFAULTS_TEMPLATE = """\
@@ -494,6 +497,8 @@ class LLMConfig:
     profile: str = ""
     provider: str = "ollama"
     embed_profile: str = ""
+    # The table routing of an OpenRouter profile (llm.providers).
+    routing: dict = field(default_factory=dict)
 
     def embed_key(self) -> str:
         """Return ``embed_model`` with description version for cache disambiguation.
@@ -966,7 +971,10 @@ _MOVED_LLM_KEYS: tuple[str, ...] = (
 )
 
 #: The providers of a profile.
-_PROVIDERS: tuple[str, ...] = ("ollama", "openai_compatible")
+#: ``openrouter`` and ``deepseek`` are records of ``llm.providers``: an
+#: OpenAI-compatible API with a default URL, a default key variable and
+#: the parts of a request that the API needs.
+_PROVIDERS: tuple[str, ...] = ("ollama", "openai_compatible", "openrouter", "deepseek")
 
 #: The keys of a profile, with their converter: the keys of each provider,
 #: then the keys of the given provider (``_PROFILE_PROVIDER_FIELDS``).
@@ -974,6 +982,8 @@ _PROFILE_FIELDS: dict[str, str] = {"provider": "str", "model": "str", "timeout":
 _PROFILE_PROVIDER_FIELDS: dict[str, dict[str, str]] = {
     "ollama": {"url": "str", "num_ctx": "int", "keep_alive": "str", "auto_pull": "bool", "max_concurrent": "int"},
     "openai_compatible": {"url": "str", "api_key_env": "str"},
+    "openrouter": {"url": "str", "api_key_env": "str", "routing": "routing"},
+    "deepseek": {"url": "str", "api_key_env": "str"},
 }
 
 #: The profile keys whose default keeps the backend the same: a value of the
@@ -1413,6 +1423,9 @@ def _llm_profile_problems(llm: dict, problems: list[ValueProblem], *, global_fil
                     removable=False,
                 ))
                 continue
+            if conv == "routing":
+                _routing_problems(value, provider, (*keys, key), f"{label} {key}", problems)
+                continue
             expected = _expected_type(value, conv)
             tuning = key in _PROFILE_TUNING_KEYS
             if expected is not None:
@@ -1420,10 +1433,56 @@ def _llm_profile_problems(llm: dict, problems: list[ValueProblem], *, global_fil
                     (*keys, key), f"{label} {key} must be {expected}, not {_toml_type(value, conv)}",
                     removable=tuning, critical=not tuning,
                 ))
+            elif key == "url" and value == "":
+                problems.append(ValueProblem(
+                    (*keys, key), f"{label} url must not be empty: remove the key for the default", removable=False,
+                ))
             elif key == "url" and (problem := url_problem(value)) is not None:
                 problems.append(ValueProblem(
                     (*keys, key), f"{label} url is not a valid URL ({problem})", removable=False,
                 ))
+
+
+def _routing_problems(
+    routing: object, provider: str, keys: tuple[str | int, ...], label: str, problems: list[ValueProblem],
+) -> None:
+    """Add the problems of the table ``routing`` of a profile of *provider* to *problems*.
+
+    Each problem is critical, and the fix keeps it: ``routing`` selects
+    the hosts that get the source code (``zdr``, ``data_collection``), and
+    the API refuses a request with a value that it does not know.
+    """
+    from ..llm.providers import (
+        OPENROUTER_DATA_COLLECTION,
+        OPENROUTER_QUANTIZATIONS,
+        OPENROUTER_SORTS,
+        provider_spec,
+    )
+
+    spec = provider_spec(provider)
+    if spec is None:
+        return
+    if not isinstance(routing, dict):
+        problems.append(ValueProblem(keys, f"{label} must be a table, not {_toml_type(routing)}", removable=False))
+        return
+    allowed = {"sort": OPENROUTER_SORTS, "data_collection": OPENROUTER_DATA_COLLECTION}
+    for key, value in routing.items():
+        conv = spec.options.get(key)
+        if conv is None:
+            problems.append(ValueProblem(
+                (*keys, key), f"{label} {key} is not a key of routing (keys: {', '.join(sorted(spec.options))})",
+                removable=False,
+            ))
+            continue
+        expected = _expected_type(value, conv, strict=True)
+        if expected is None and key in allowed and value not in allowed[key]:
+            expected = f"one of {', '.join(allowed[key])}"
+        if expected is None and key == "quantizations" and any(item not in OPENROUTER_QUANTIZATIONS for item in value):
+            expected = f"an array of {', '.join(OPENROUTER_QUANTIZATIONS)}"
+        if expected is not None:
+            problems.append(ValueProblem(
+                (*keys, key), f"{label} {key} must be {expected}, not {value!r}", removable=False,
+            ))
 
 
 def _variant_problems(variants: object, problems: list[ValueProblem], check: Callable[..., None]) -> None:
@@ -1954,11 +2013,21 @@ def _resolve_llm_profile(data: dict, llm: LLMConfig, selected_in: dict[str, Path
         llm.num_ctx = _convert(profile.get("num_ctx", llm.num_ctx), "int")
         _apply_ollama_tuning(llm, profile)
     else:
-        llm.chat_api_base, llm.chat_api_format = profile["url"], "openai"
+        from ..llm.providers import provider_spec
+
+        spec = provider_spec(llm.provider)
+        llm.chat_api_base = profile["url"] if "url" in profile else spec.base_url if spec else ""
+        llm.chat_api_format = "openai"
+        llm.routing = dict(profile.get("routing") or {})
+        # The key variable of the provider only for its own URL: a proxy
+        # must not get the key of OpenRouter.  An explicit empty
+        # api_key_env turns the variable off.
+        own_url = spec is not None and llm.chat_api_base.rstrip("/") == spec.base_url.rstrip("/")
+        default_env = spec.key_env if spec is not None and own_url else ""
         # Not the key: the chat client gets it at the first request
         # (``llm.secrets``).  A keyring lookup takes about 0.1 s, and load
         # runs for each MCP query.
-        llm.api_key_env = str(profile.get("api_key_env") or "")
+        llm.api_key_env = str(profile["api_key_env"]) if "api_key_env" in profile else default_env
 
     embed_name = llm.embed_profile or (name if llm.provider == "ollama" else "")
     if embed_name:

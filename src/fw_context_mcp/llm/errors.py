@@ -23,4 +23,13 @@ class ChatApiError(LLMError):
 
     Raised for HTTP, network and answer-format failures of the API of a
     provider (OpenAI, OpenRouter, DeepSeek, LiteLLM, vLLM, ...).
+    *status_code* is the HTTP status of a reply that is not a success, else
+    None: the client acts on a 400 that refuses a field of the request.
+    *body* is the whole body of that reply, for that decision only; the
+    message shows a part of it.
     """
+
+    def __init__(self, message: str, *, status_code: int | None = None, body: str = "") -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.body = body

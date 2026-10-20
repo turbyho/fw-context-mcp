@@ -141,6 +141,10 @@ class _MockStreamResponse:
     def iter_lines(self):
         yield from self._lines
 
+    def read(self) -> bytes:
+        """As httpx.Response.read: the clients read the body of an error answer before the error."""
+        return self.text.encode()
+
 
 def _mock_httpx_stream(lines: list[str], status_code: int = 200):
     """Return a mock for httpx.stream that yields the given lines."""
