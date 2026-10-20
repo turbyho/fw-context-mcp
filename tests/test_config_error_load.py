@@ -134,12 +134,22 @@ def test_the_ping_thread_survives_a_config_error(monkeypatch, tmp_path):
     assert len(attempts) == 3
 
 
-def test_a_url_that_cannot_be_parsed_names_its_file(tmp_path):
-    """The ValueError of urlparse named no file, and it stopped the MCP server at its start."""
-    from fw_context_mcp.config import ConfigError, load
+def test_a_url_that_cannot_be_parsed_names_its_file(tmp_path, monkeypatch):
+    """The ValueError of urlparse named no file, and it stopped the MCP server at its start.
 
-    root = _project(tmp_path, VALID + '[llm]\nollama_url = "http://[::1"\n',
-                    local='[llm]\nollama_url = "http://localhost:11434"\n')
+    A URL of the LLM is in a profile of the global config only, thus the
+    error names that file, also for a project whose local.toml selects the
+    profile.
+    """
+    from fw_context_mcp.config import ConfigError, load, settings
 
-    with pytest.raises(ConfigError, match=r"config\.toml: \[llm\] ollama_url is not a valid URL"):
+    global_cfg = tmp_path / "global.toml"
+    global_cfg.write_text(
+        '[llm.profiles.p]\nprovider = "ollama"\nmodel = "m"\nurl = "http://[::1"\n', encoding="utf-8",
+    )
+    monkeypatch.setattr(settings, "_GLOBAL_CONFIG_PATH", global_cfg)
+    root = _project(tmp_path, VALID, local='[llm]\nprofile = "p"\n')
+
+    with pytest.raises(ConfigError, match=r"global\.toml: \[llm\.profiles\.p\] url is not a valid URL") as caught:
         load(project_root=root)
+    assert caught.value.path == global_cfg

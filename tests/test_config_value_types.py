@@ -57,8 +57,11 @@ WRONG = [
     ("[build]\nvariants = 3", "[build] variants must be an array of tables ([[build.variants]]), not an integer"),
     ('[build]\nenv = { X = 1 }', "[build] env must be a table of strings, not a table with a value of a different type"),
     ('[build]\nmake_vars = { X = [1] }', "[build] make_vars must be a table of strings and numbers"),
-    ("[llm]\nollama_url = 5", "[llm] ollama_url must be a string, not an integer"),
-    ('[llm]\nchat_api_base = "http://[::1"', "[llm] chat_api_base is not a valid URL"),
+    ("[llm]\nembed_model = 5", "[llm] embed_model must be a string, not an integer"),
+    # An old backend key of [llm]: the migration moves it, doctor --fix does not remove it.
+    ('[llm]\nollama_url = "http://localhost:11434"', "[llm] ollama_url is a key of an LLM profile now: move it to "),
+    # A profile names the server that gets the source code: a committed file cannot hold one.
+    ('[llm.profiles.p]\nprovider = "ollama"\nmodel = "m"', "[llm.profiles] is in the global config only"),
     ('[call_graph]\ndispatch_bridges = { "a" = 1 }', "[call_graph] dispatch_bridges must be a table of strings"),
     ('llm = "x"', "'llm' must be a table ([llm]), not a string"),
     ('[[build.variants]]\ndescription = "x"', "[[build.variants]] entry 1 must have a name"),
@@ -81,11 +84,35 @@ TUNING = [
     ("[index]\nmax_symbol_body_lines = 1.5", "[index] max_symbol_body_lines must be an integer, not a number"),
     ("[index]\nindex_refs = 1", "[index] index_refs must be true or false, not an integer"),
     ('[llm]\nenabled = "maybe"', "[llm] enabled must be true or false, not a string"),
-    ('[llm]\ntimeout = "x"', "[llm] timeout must be a number, not a string that holds no number"),
+    ('[llm]\nanalyze_vendor = 3', "[llm] analyze_vendor must be true or false, not an integer"),
     ('[cache_server]\nbatch_size = "x"', "[cache_server] batch_size must be an integer"),
     ('[updates]\ncheck = 3', "[updates] check must be true or false, not an integer"),
-    ('[llm]\nmodel = 5', "[llm] model must be a string, not an integer"),
+    ('[llm]\nreranker_model = 5', "[llm] reranker_model must be a string, not an integer"),
     ('[build]\ntimeout = "x"', "[build] timeout must be a number, not a string that holds no number"),
+]
+
+#: The first lines of an Ollama profile of the global config.  A wrong
+#: value of a profile is in the global config, because only that file
+#: can hold a profile.
+PROFILE = '[llm.profiles.p]\nprovider = "ollama"\nmodel = "m"\n'
+
+#: A profile value that stops ``load``: it selects the backend.
+WRONG_PROFILE = [
+    ("url = 5", "[llm.profiles.p] url must be a string, not an integer"),
+    ('url = "http://[::1"', "[llm.profiles.p] url is not a valid URL"),
+    ('api_key_env = "X"', "[llm.profiles.p] api_key_env is not a key of a profile of provider ollama"),
+]
+
+#: A profile value of ``_PROFILE_TUNING_KEYS``, and the ``LLMConfig``
+#: field that gets the default: a warning, and the tools keep working.
+PROFILE_TUNING = [
+    ('timeout = "x"', "[llm.profiles.p] timeout must be a number, not a string that holds no number", "timeout"),
+    ("stream = 3", "[llm.profiles.p] stream must be true or false, not an integer", "stream"),
+    ('num_ctx = "x"', "[llm.profiles.p] num_ctx must be an integer, not a string that holds no integer", "num_ctx"),
+    ("keep_alive = 5", "[llm.profiles.p] keep_alive must be a string, not an integer", "keep_alive"),
+    ("auto_pull = 3", "[llm.profiles.p] auto_pull must be true or false, not an integer", "auto_pull"),
+    ('max_concurrent = "x"', "[llm.profiles.p] max_concurrent must be an integer, not a string that holds no integer",
+     "ollama_max_concurrent"),
 ]
 
 
@@ -97,6 +124,22 @@ def test_a_value_of_the_wrong_type_names_the_file_and_the_key(tmp_path, home, te
         load(root)
 
     assert caught.value.path == root / ".fw-context" / "config.toml"
+    assert caught.value.problem.startswith(message), caught.value.problem
+
+
+@pytest.mark.parametrize(("text", "message"), WRONG_PROFILE)
+def test_a_profile_value_of_the_wrong_type_names_the_global_file_and_the_key(tmp_path, home, text, message):
+    """The profiles are in the global config only, thus the error names that file.
+
+    ``urlparse`` raised ``ValueError`` for ``"http://[::1"``, with no file
+    name, and that stopped the MCP server at its start.
+    """
+    home.write_text(PROFILE + text + "\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError) as caught:
+        load(_project(tmp_path))
+
+    assert caught.value.path == home
     assert caught.value.problem.startswith(message), caught.value.problem
 
 
@@ -116,7 +159,7 @@ def test_the_error_names_the_file_of_the_value(tmp_path, home, layer):
 @pytest.mark.parametrize("text", [
     "",
     '[index]\nmax_symbol_body_lines = "200"',
-    '[llm]\ntimeout = "12.5"\nenabled = "yes"',
+    '[llm]\nenabled = "yes"',
     '[index]\nvendor_paths = "vendor"',
     '[build]\nmake_vars = { JOBS = 4, V = "1" }',
     '[cache_server]\nurl = "http://localhost:9"\nbatch_size = "10"\nforce = "no"',
@@ -128,25 +171,37 @@ def test_a_value_that_load_can_use_loads(tmp_path, home, text):
 
 
 def test_the_string_forms_are_converted(tmp_path, home):
-    cfg = load(_project(tmp_path, '[index]\nmax_symbol_body_lines = "200"\n[llm]\ntimeout = "12.5"\nenabled = "off"\n'
+    """A profile takes the string forms too: ``load`` copies its values with the converters of ``[llm]``."""
+    home.write_text(PROFILE + 'timeout = "12.5"\nnum_ctx = "8192"\nstream = "yes"\n', encoding="utf-8")
+    cfg = load(_project(tmp_path, '[index]\nmax_symbol_body_lines = "200"\n[llm]\nenabled = "off"\n'
                                   '[cache_server]\nurl = "http://localhost:9"\nbatch_size = "10"\nforce = "yes"\n'))
 
     assert cfg.index.max_symbol_body_lines == 200
-    assert (cfg.llm.timeout, cfg.llm.enabled) == (12.5, False)
+    assert (cfg.llm.timeout, cfg.llm.num_ctx, cfg.llm.stream, cfg.llm.enabled) == (12.5, 8192, True, False)
     assert cfg.cache_server is not None
     assert (cfg.cache_server.batch_size, cfg.cache_server.force) == (10, True)
 
 
 def test_the_message_holds_no_value(tmp_path, home):
-    """A key such as chat_api_key holds a secret, and the message goes to logs and to the LLM."""
-    root = _project(tmp_path, local='[llm]\nchat_api_key = 987654321\n[cache_server]\nurl = 123456789\n')
+    """A key such as chat_api_key or token holds a secret, and the message goes to logs and to the LLM.
+
+    Three paths: a critical value, an old ``[llm] chat_api_key`` (the
+    error tells where the key goes, and must not repeat the key), and a
+    value of the warning level (``[cache_server] token``).
+    """
+    root = _project(tmp_path, local='[cache_server]\nurl = 123456789\n')
 
     with pytest.raises(ConfigError) as caught:
         load(root)
 
     assert "123456789" not in str(caught.value)
-    root = _project(tmp_path / "second", local="[llm]\nchat_api_key = 987654321\n")
-    assert not any("987654321" in line for line in load(root).config_warnings)
+    root = _project(tmp_path / "moved", local='[llm]\nchat_api_key = "sk-555666777"\n')
+    with pytest.raises(ConfigError, match=r"\[llm\] chat_api_key is a key of an LLM profile now") as caught:
+        load(root)
+    assert "555666777" not in str(caught.value)
+    root = _project(tmp_path / "second", local="[cache_server]\ntoken = 987654321\n")
+    warnings = load(root).config_warnings
+    assert warnings and not any("987654321" in line for line in warnings), warnings
 
 
 def test_the_message_counts_the_other_values_and_names_the_fix(tmp_path, home):
@@ -178,7 +233,7 @@ class TestRemoval:
 
         text = (
             '# the comment of the team\n[project]\nid = "' + PID + '"\n\n'
-            '[llm]\nmodel = "m"  # stays\ntimeout = "x"\n\n'
+            '[llm]\nembed_model = "m"  # stays\nanalyze_vendor = "x"\n\n'
             '[[build.variants]]\nname = "a"\nenv = { X = 1 }\n\n'
             '[[build.variants]]\ndescription = "no name"\n\n'
             '[[build.variants]]\nname = "c"\ntimeout = "9"\n'
@@ -189,12 +244,12 @@ class TestRemoval:
         report = remove_unusable_values(root)
 
         after = config.read_text(encoding="utf-8")
-        assert "# the comment of the team" in after and 'model = "m"  # stays' in after
+        assert "# the comment of the team" in after and 'embed_model = "m"  # stays' in after
         data = tomllib.loads(after)
         assert [variant["name"] for variant in data["build"]["variants"]] == ["a", "c"]
-        assert "timeout" not in data["llm"]
+        assert "analyze_vendor" not in data["llm"]
         assert [label for _, label in report.removed_keys] == [
-            "[llm] timeout must be a number, not a string that holds no number",
+            "[llm] analyze_vendor must be true or false, not a string",
             "[[build.variants]] 'a' env must be a table of strings, not a table with a value of a different type",
             "[[build.variants]] entry 2 must have a name (a string that is not empty)",
             "[[build.variants]] 'c' timeout must be a number, not a string",
@@ -206,7 +261,7 @@ class TestRemoval:
     def test_local_toml_gets_a_copy_of_its_old_text(self, tmp_path, home):
         from fw_context_mcp.housekeeping import remove_unusable_values
 
-        text = '[llm]\ntimeout = "x"\n'
+        text = '[llm]\nanalyze_vendor = "x"\n'
         root = _project(tmp_path, local=text)
 
         remove_unusable_values(root)
@@ -226,7 +281,7 @@ class TestRemoval:
     def test_a_dry_run_changes_nothing(self, tmp_path, home):
         from fw_context_mcp.housekeeping import remove_unusable_values
 
-        text = '[llm]\ntimeout = "x"\n'
+        text = '[llm]\nanalyze_vendor = "x"\n'
         root = _project(tmp_path, text)
 
         report = remove_unusable_values(root, dry_run=True)
@@ -239,13 +294,13 @@ class TestDoctor:
     def test_the_check_lists_each_value_and_names_the_fix(self, tmp_path, home):
         from fw_context_mcp.deps import run_full_check
 
-        root = _project(tmp_path, '[llm]\ntimeout = "x"\n', local="[index]\ndb_dir = 5\n")
+        root = _project(tmp_path, '[llm]\nanalyze_vendor = "x"\n', local="[index]\ndb_dir = 5\n")
 
         [config] = [r for r in run_full_check(project_root=root) if r.name == "config"]
 
         assert (config.status, config.fix_cmd, config.critical) == ("error", "fw-context doctor --fix --only config", True)
         assert config.message.startswith("config values that fw-context cannot use: "), config.message
-        assert "config.toml: [llm] timeout" in config.message and "local.toml: [index] db_dir" in config.message
+        assert "config.toml: [llm] analyze_vendor" in config.message and "local.toml: [index] db_dir" in config.message
 
     def test_a_file_that_is_not_toml_has_no_fix(self, tmp_path, home):
         from fw_context_mcp.deps import run_full_check
@@ -259,13 +314,13 @@ class TestDoctor:
     def test_doctor_fix_removes_the_values_and_runs_the_skipped_checks(self, tmp_path, home, capsys):
         from fw_context_mcp.cli._doctor import cmd_doctor
 
-        root = _project(tmp_path, f'[project]\nid = "{PID}"\n[llm]\ntimeout = "x"\n')
+        root = _project(tmp_path, f'[project]\nid = "{PID}"\n[llm]\nanalyze_vendor = "x"\n')
 
         cmd_doctor(argparse.Namespace(only="config,db-integrity,disk-space", project=str(root), fix=True, json=False))
 
         out = capsys.readouterr().out
         load(root)
-        assert "timeout" not in (root / ".fw-context" / "config.toml").read_text(encoding="utf-8")
+        assert "analyze_vendor" not in (root / ".fw-context" / "config.toml").read_text(encoding="utf-8")
         assert "check config" not in out, "the checks that skipped the config ran after the fix: " + out
 
 
@@ -318,26 +373,29 @@ class TestRemovalLimits:
         """The fix of `obsolete-files` wrote its copy after the fix of `config`: the removed value was lost."""
         from fw_context_mcp.deps import run_fixes, run_full_check
 
-        text = '[llm]\ntimeout = "x"\nallow_external_llm = true\n'
+        text = '[llm]\nanalyze_vendor = "x"\nallow_external_llm = true\n'
         root = _project(tmp_path, local=text)
 
         run_fixes(run_full_check(project_root=root, subset={"config", "obsolete-files"}), project_root=root)
 
         local = root / ".fw-context" / "local.toml"
-        assert "timeout" not in local.read_text(encoding="utf-8")
+        assert "analyze_vendor" not in local.read_text(encoding="utf-8")
         assert "allow_external_llm" not in local.read_text(encoding="utf-8")
         assert (local.parent / "local.toml.bak").read_text(encoding="utf-8") == text
 
     def test_the_global_config_gets_a_copy(self, tmp_path, home):
+        """A value of a profile is nested (``[llm.profiles.p] timeout``): only that key goes, the profile stays."""
         from fw_context_mcp.housekeeping import remove_unusable_values
 
-        text = '[llm]\ntimeout = "x"\n'
+        text = PROFILE + 'timeout = "x"\n'
         home.write_text(text, encoding="utf-8")
 
         remove_unusable_values(None)
 
         assert home.with_name("config.toml.bak").read_text(encoding="utf-8") == text
-        assert "timeout" not in home.read_text(encoding="utf-8")
+        assert tomllib.loads(home.read_text(encoding="utf-8")) == {
+            "llm": {"profiles": {"p": {"provider": "ollama", "model": "m"}}},
+        }
 
     def test_a_table_that_tomlkit_cannot_remove_is_a_failure(self, tmp_path, home):
         """With a table between the tables of the array, tomlkit removed nothing, and the fix said "removed"."""
@@ -361,7 +419,7 @@ class TestRemovalLimits:
 
         from fw_context_mcp.deps import run_full_check
 
-        root = _project(tmp_path, '[llm]\ntimeout = "x"\n')
+        root = _project(tmp_path, '[llm]\nanalyze_vendor = "x"\n')
         config = root / ".fw-context" / "config.toml"
         config.chmod(stat.S_IRUSR)
         if os.access(config, os.W_OK):
@@ -369,7 +427,7 @@ class TestRemovalLimits:
 
         [row] = [r for r in run_full_check(project_root=root) if r.name == "config"]
 
-        assert "[llm] timeout must be a number" in row.message and "no write permission" in row.message, row.message
+        assert "[llm] analyze_vendor must be true or false" in row.message and "no write permission" in row.message, row.message
         assert row.fix_cmd is None, "the fix cannot remove a value there"
 
 
@@ -377,13 +435,13 @@ def test_the_check_lists_each_value_also_with_a_wrong_project_id(tmp_path, home)
     """The row gave only the first problem of `load` ("and 1 more") when one value was the project ID."""
     from fw_context_mcp.deps import run_full_check
 
-    root = _project(tmp_path, '[project]\nid = 5\n', local='[llm]\ntimeout = "x"\n')
+    root = _project(tmp_path, '[project]\nid = 5\n', local='[llm]\nanalyze_vendor = "x"\n')
 
     [config] = [r for r in run_full_check(project_root=root) if r.name == "config"]
 
-    assert "local.toml: [llm] timeout must be a number" in config.message, config.message
+    assert "local.toml: [llm] analyze_vendor must be true or false" in config.message, config.message
     assert "config.toml: [project] id must be a string" in config.message, config.message
-    assert config.fix_cmd == "fw-context doctor --fix --only config", "the fix can remove the timeout"
+    assert config.fix_cmd == "fw-context doctor --fix --only config", "the fix can remove the analyze_vendor value"
 
 
 def test_a_part_of_the_fix_gives_no_command_that_does_nothing(tmp_path, home):
@@ -393,8 +451,8 @@ def test_a_part_of_the_fix_gives_no_command_that_does_nothing(tmp_path, home):
 
     from fw_context_mcp.deps import run_fixes, run_full_check
 
-    home.write_text('[llm]\ntimeout = "x"\n', encoding="utf-8")
-    root = _project(tmp_path, local='[llm]\nmodel = 5\n')
+    home.write_text(PROFILE + 'timeout = "x"\n', encoding="utf-8")
+    root = _project(tmp_path, local='[llm]\nreranker_model = 5\n')
     local = root / ".fw-context" / "local.toml"
     local.chmod(stat.S_IRUSR)
     if os.access(local, os.W_OK):
@@ -424,24 +482,35 @@ class TestWarningLevel:
         if section in defaults:
             assert getattr(getattr(cfg, section), key) == getattr(defaults[section], key)
 
+    @pytest.mark.parametrize(("text", "message", "field"), PROFILE_TUNING)
+    def test_a_profile_value_gives_a_warning_and_the_default(self, tmp_path, home, text, message, field):
+        """A key of ``_PROFILE_TUNING_KEYS``: the profile still selects the same backend, thus no ConfigError."""
+        home.write_text(PROFILE + text + "\n", encoding="utf-8")
+
+        cfg = load(_project(tmp_path))
+
+        assert cfg.config_warnings == [f"{home}: {message}"]
+        assert (cfg.llm.profile, cfg.llm.model) == ("p", "m"), "the profile is still the backend"
+        assert getattr(cfg.llm, field) == getattr(settings.LLMConfig(), field)
+
     def test_the_value_of_a_lower_file_applies(self, tmp_path, home):
-        root = _project(tmp_path, "[llm]\ntimeout = 300\n", local='[llm]\ntimeout = "x"\n')
+        root = _project(tmp_path, "[llm]\nanalyze_vendor = true\n", local='[llm]\nanalyze_vendor = "x"\n')
 
         cfg = load(root)
 
-        assert cfg.llm.timeout == 300.0
+        assert cfg.llm.analyze_vendor is True, "the value of config.toml, not the default (False)"
         assert [line.split(": ", 1)[0] for line in cfg.config_warnings] == [str(root / ".fw-context" / "local.toml")]
 
     def test_the_default_applies_without_a_lower_value(self, tmp_path, home):
-        root = _project(tmp_path, '[llm]\ntimeout = "x"\nstream = 3\n')
+        home.write_text(PROFILE + 'timeout = "x"\nstream = 3\n', encoding="utf-8")
 
-        cfg = load(root)
+        cfg = load(_project(tmp_path))
 
         assert (cfg.llm.timeout, cfg.llm.stream) == (settings.LLMConfig().timeout, settings.LLMConfig().stream)
         assert len(cfg.config_warnings) == 2
 
     def test_a_critical_value_still_stops(self, tmp_path, home):
-        root = _project(tmp_path, '[llm]\ntimeout = "x"\nembed_model = 5\n')
+        root = _project(tmp_path, '[llm]\nanalyze_vendor = "x"\nembed_model = 5\n')
 
         with pytest.raises(ConfigError, match=r"\[llm\] embed_model must be a string"):
             load(root)
@@ -449,12 +518,14 @@ class TestWarningLevel:
     def test_the_status_gives_the_warnings(self, tmp_path, home):
         from fw_context_mcp.mcp.handlers.maintenance import get_build_info, get_project_status
 
-        root = _project(tmp_path, f'[project]\nid = "{PID}"\n[llm]\ntimeout = "x"\n')
+        home.write_text(PROFILE + 'timeout = "x"\n', encoding="utf-8")
+        root = _project(tmp_path, f'[project]\nid = "{PID}"\n[llm]\nanalyze_vendor = "x"\n')
 
         for state in (get_project_status(project_root=str(root)), get_build_info(project_root=str(root))):
             assert state["status"] == "no_index", state
             assert state["config_warnings"] == [
-                f"{root / '.fw-context' / 'config.toml'}: [llm] timeout must be a number, not a string that holds no number",
+                f"{home}: [llm.profiles.p] timeout must be a number, not a string that holds no number",
+                f"{root / '.fw-context' / 'config.toml'}: [llm] analyze_vendor must be true or false, not a string",
             ]
 
     def test_the_status_of_an_index_gives_the_warnings(self, tmp_path, home):
@@ -463,7 +534,7 @@ class TestWarningLevel:
 
         root, _ = two_builds.__wrapped__(tmp_path)
         local = root / ".fw-context" / "local.toml"
-        local.write_text(local.read_text(encoding="utf-8") + '[llm]\ntimeout = "x"\n', encoding="utf-8")
+        local.write_text(local.read_text(encoding="utf-8") + '[llm]\nanalyze_vendor = "x"\n', encoding="utf-8")
 
         state = get_project_status(project_root=str(root))
 
@@ -472,7 +543,7 @@ class TestWarningLevel:
     def test_doctor_gives_a_row_that_is_not_critical(self, tmp_path, home):
         from fw_context_mcp.deps import exit_code, run_full_check
 
-        root = _project(tmp_path, '[llm]\ntimeout = "x"\n')
+        root = _project(tmp_path, '[llm]\nanalyze_vendor = "x"\n')
 
         results = {r.name: r for r in run_full_check(project_root=root, subset={"config", "disk-space"})}
 
@@ -485,12 +556,15 @@ class TestWarningLevel:
     def test_doctor_fix_removes_the_warning(self, tmp_path, home):
         from fw_context_mcp.deps import run_fixes, run_full_check
 
-        root = _project(tmp_path, '[llm]\ntimeout = "x"\nmodel = "m"\n')
+        home.write_text(PROFILE + 'timeout = "x"\n', encoding="utf-8")
+        root = _project(tmp_path, '[llm]\nanalyze_vendor = "x"\nembed_model = "m"\n')
 
         [config] = run_fixes(run_full_check(project_root=root, subset={"config"}), project_root=root)
 
         assert config.status == "ok", config
-        assert load(root).config_warnings == []
+        cfg = load(root)
+        assert cfg.config_warnings == []
+        assert (cfg.llm.profile, cfg.llm.model, cfg.llm.embed_model) == ("p", "m", "m"), "the rest of each file stays"
 
     def test_each_command_logs_the_warning_one_time(self, tmp_path, home, caplog):
         """A debug line only: `fw-context index` ran for hours with the default of a switch, and said nothing."""
@@ -532,6 +606,78 @@ def test_each_key_of_the_tuning_list_warns(tmp_path, home, section, key, conv):
     assert [line.split(": ", 1)[1].split(" must")[0] for line in load(root).config_warnings] == [f"[{section}] {key}"]
 
 
+#: The values of a valid profile of each provider, as TOML.
+_PROFILE_BASE = {
+    "ollama": {"provider": '"ollama"', "model": '"m"'},
+    "openai_compatible": {"provider": '"openai_compatible"', "model": '"m"', "url": '"http://localhost:9"'},
+}
+
+
+def _all_profile_keys() -> list[tuple[str, str, str]]:
+    return [
+        (provider, key, conv)
+        for provider in settings._PROVIDERS
+        for key, conv in {**settings._PROFILE_FIELDS, **settings._PROFILE_PROVIDER_FIELDS[provider]}.items()
+    ]
+
+
+def _profile_with(provider: str, key: str, value: str) -> str:
+    """Return a global config with one profile ``p`` of *provider*, where *key* has the TOML *value*."""
+    values = {**_PROFILE_BASE[provider], key: value}
+    return "[llm.profiles.p]\n" + "".join(f"{name} = {text}\n" for name, text in values.items())
+
+
+@pytest.mark.parametrize(
+    ("provider", "key", "conv"), [k for k in _all_profile_keys() if k[1] not in settings._PROFILE_TUNING_KEYS],
+)
+def test_each_profile_key_outside_the_tuning_list_stops(tmp_path, home, provider, key, conv):
+    """A profile key that selects the backend (provider, model, url, api_key_env) must not move to the warning level.
+
+    A required key of the wrong type gives "needs <key>" first, and
+    ``provider`` gives the list of the providers: each names the key.
+    """
+    home.write_text(_profile_with(provider, key, _WRONG_FOR[conv]), encoding="utf-8")
+
+    with pytest.raises(ConfigError, match=rf"\[llm\.profiles\.p\] (needs )?{key}\b") as caught:
+        load(_project(tmp_path))
+    assert caught.value.path == home
+
+
+@pytest.mark.parametrize(
+    ("provider", "key", "conv"), [k for k in _all_profile_keys() if k[1] in settings._PROFILE_TUNING_KEYS],
+)
+def test_each_profile_key_of_the_tuning_list_warns(tmp_path, home, provider, key, conv):
+    home.write_text(_profile_with(provider, key, _WRONG_FOR[conv]), encoding="utf-8")
+
+    cfg = load(_project(tmp_path))
+
+    assert [line.split(": ", 1)[1].split(" must")[0] for line in cfg.config_warnings] == [f"[llm.profiles.p] {key}"]
+    assert cfg.llm.provider == provider
+
+
+@pytest.mark.parametrize("layer", ["global", "committed", "local"])
+@pytest.mark.parametrize("key", settings._MOVED_LLM_KEYS)
+def test_each_old_backend_key_stops_and_names_its_new_place(tmp_path, home, key, layer):
+    """An old ``[llm]`` backend key is a ConfigError in each file, and ``doctor --fix`` does not remove it.
+
+    WHY not removable: the value is a setting of the user (the server, the
+    model, the key of an API).  The migration moves it into a profile.
+    """
+    text = f'[llm]\n{key} = "x"\n'
+    if layer == "global":
+        home.write_text(text, encoding="utf-8")
+    root = _project(tmp_path, text if layer == "committed" else "", local=text if layer == "local" else None)
+
+    with pytest.raises(ConfigError) as caught:
+        load(root)
+
+    expected = {"global": home, "committed": root / ".fw-context" / "config.toml",
+                "local": root / ".fw-context" / "local.toml"}[layer]
+    assert caught.value.path == expected
+    assert caught.value.problem.startswith(f"[llm] {key} is a key of an LLM profile now: move it to [llm.profiles.<name>]")
+    assert not caught.value.removable
+
+
 def test_a_section_updates_that_is_not_a_table_warns(home, tmp_path):
     home.write_text("updates = 3\n", encoding="utf-8")
 
@@ -554,7 +700,7 @@ def test_the_state_of_an_old_index_gives_the_warnings(tmp_path, home):
     finally:
         conn.close()
     local = root / ".fw-context" / "local.toml"
-    local.write_text(local.read_text(encoding="utf-8") + '[llm]\ntimeout = "x"\n', encoding="utf-8")
+    local.write_text(local.read_text(encoding="utf-8") + '[llm]\nanalyze_vendor = "x"\n', encoding="utf-8")
 
     state = get_project_status(project_root=str(root))
 
@@ -577,19 +723,21 @@ def test_a_config_row_without_a_fix_command_gets_no_fix(tmp_path, home, monkeypa
 def test_the_tuning_list_is_the_list_of_the_decision():
     """A second copy of the decision of 2026-10-18, on purpose.
 
-    The two tests above read their cases from ``_TUNING_KEYS``: a key that
-    moves between the two levels moves with them.  This copy makes a move
-    a change that a review sees.
+    The tests above read their cases from ``_TUNING_KEYS`` and
+    ``_PROFILE_TUNING_KEYS``: a key that moves between the two levels moves
+    with them.  This copy makes a move a change that a review sees.
+
+    The LLM backend keys left ``[llm]`` for the profiles (2026-10-20).  Their
+    tuning keys (the timeout, the context size, ...) keep the warning
+    level there; ``model`` does not: in a profile it selects the backend.
     """
     assert settings._TUNING_KEYS == {
         ("project", "name"),
         ("index", "index_refs"), ("index", "index_embeddings"), ("index", "rerank_top_k"),
         ("index", "min_dense_count"), ("index", "max_symbol_body_lines"), ("index", "purge_max_missing_percent"),
         ("build", "timeout"), ("build", "clean"),
-        ("llm", "enabled"), ("llm", "model"), ("llm", "num_ctx"), ("llm", "timeout"), ("llm", "keep_alive"),
-        ("llm", "analyze_symbols"), ("llm", "analyze_vendor"), ("llm", "reranker_model"),
-        ("llm", "ollama_max_concurrent"), ("llm", "chat_api_key"), ("llm", "chat_api_format"),
-        ("llm", "auto_pull"), ("llm", "stream"),
+        ("llm", "enabled"), ("llm", "analyze_symbols"), ("llm", "analyze_vendor"), ("llm", "reranker_model"),
         ("cache_server", "token"), ("cache_server", "batch_size"), ("cache_server", "force"),
         ("updates", "check"),
     }
+    assert settings._PROFILE_TUNING_KEYS == {"timeout", "stream", "num_ctx", "keep_alive", "auto_pull", "max_concurrent"}

@@ -43,26 +43,26 @@ def _read_local_toml(root: Path) -> str:
 class TestUpdateLocalTomlCreation:
     def test_creates_file_when_missing(self, tmp_path):
         root = _make_project(tmp_path)
-        _update_local_toml(root, {"model": "new-model"})
+        _update_local_toml(root, {"embed_model": "new-model"})
         assert (root / ".fw-context" / "local.toml").exists()
 
     def test_created_file_has_llm_section(self, tmp_path):
         root = _make_project(tmp_path)
-        _update_local_toml(root, {"model": "new-model"})
+        _update_local_toml(root, {"embed_model": "new-model"})
         content = _read_local_toml(root)
         assert "[llm]" in content
 
     def test_creates_fw_context_dir(self, tmp_path):
         root = tmp_path / "proj"
         root.mkdir()
-        _update_local_toml(root, {"model": "new-model"})
+        _update_local_toml(root, {"embed_model": "new-model"})
         assert (root / ".fw-context" / "local.toml").exists()
 
     def test_does_not_touch_config_toml(self, tmp_path):
         root = _make_project(tmp_path)
         config_path = root / ".fw-context" / "config.toml"
         original = config_path.read_text(encoding="utf-8")
-        _update_local_toml(root, {"model": "new-model"})
+        _update_local_toml(root, {"embed_model": "new-model"})
         assert config_path.read_text(encoding="utf-8") == original
 
 
@@ -71,70 +71,70 @@ class TestUpdateLocalTomlCreation:
 
 class TestUpdateLocalTomlExistingLlmSection:
     def test_updates_existing_key_value(self, tmp_path):
-        root = _make_project(tmp_path, '[llm]\nmodel = "old"\n')
-        _update_local_toml(root, {"model": "new"})
+        root = _make_project(tmp_path, '[llm]\nembed_model = "old"\n')
+        _update_local_toml(root, {"embed_model": "new"})
         content = _read_local_toml(root)
-        assert 'model = "new"' in content
-        assert 'model = "old"' not in content
+        assert 'embed_model = "new"' in content
+        assert 'embed_model = "old"' not in content
 
     def test_adds_new_key_to_section(self, tmp_path):
-        root = _make_project(tmp_path, '[llm]\nmodel = "test"\n')
-        _update_local_toml(root, {"chat_api_base": "https://api.example.com/v1"})
+        root = _make_project(tmp_path, '[llm]\nembed_model = "test"\n')
+        _update_local_toml(root, {"embed_query_prompt": "https://api.example.com/v1"})
         content = _read_local_toml(root)
-        assert 'chat_api_base = "https://api.example.com/v1"' in content
-        assert 'model = "test"' in content
+        assert 'embed_query_prompt = "https://api.example.com/v1"' in content
+        assert 'embed_model = "test"' in content
 
     def test_updates_multiple_keys(self, tmp_path):
-        root = _make_project(tmp_path, '[llm]\nmodel = "old"\n')
+        root = _make_project(tmp_path, '[llm]\nembed_model = "old"\n')
         _update_local_toml(
             root,
             {
-                "model": "new",
-                "chat_api_base": "https://api.example.com/v1",
-                "auto_pull": True,
+                "embed_model": "new",
+                "embed_query_prompt": "https://api.example.com/v1",
+                "analyze_vendor": True,
             },
         )
         content = _read_local_toml(root)
-        assert 'model = "new"' in content
-        assert 'chat_api_base = "https://api.example.com/v1"' in content
-        assert "auto_pull = true" in content
+        assert 'embed_model = "new"' in content
+        assert 'embed_query_prompt = "https://api.example.com/v1"' in content
+        assert "analyze_vendor = true" in content
 
     def test_preserves_comments(self, tmp_path):
-        local = '[llm]\n# my comment\nmodel = "old"\n'
+        local = '[llm]\n# my comment\nembed_model = "old"\n'
         root = _make_project(tmp_path, local)
-        _update_local_toml(root, {"model": "new"})
+        _update_local_toml(root, {"embed_model": "new"})
         content = _read_local_toml(root)
         assert "# my comment" in content
 
     def test_preserves_other_llm_keys(self, tmp_path):
-        local = '[llm]\nmodel = "old"\nnum_ctx = 8192\n'
+        local = '[llm]\nembed_model = "old"\nembed_dim = 8192\n'
         root = _make_project(tmp_path, local)
-        _update_local_toml(root, {"model": "new"})
+        _update_local_toml(root, {"embed_model": "new"})
         content = _read_local_toml(root)
-        assert "num_ctx = 8192" in content
+        assert "embed_dim = 8192" in content
 
     def test_preserves_other_sections(self, tmp_path):
-        local = '[llm]\nmodel = "old"\n\n[index]\ndb_dir = "~/test"\n'
+        local = '[llm]\nembed_model = "old"\n\n[index]\ndb_dir = "~/test"\n'
         root = _make_project(tmp_path, local)
-        _update_local_toml(root, {"model": "new"})
+        _update_local_toml(root, {"embed_model": "new"})
         content = _read_local_toml(root)
         assert "[index]" in content
         assert 'db_dir = "~/test"' in content
 
     def test_uncomments_key_if_commented(self, tmp_path):
-        local = '[llm]\n# model = "old"\n'
+        local = '[llm]\n# embed_model = "old"\n'
         root = _make_project(tmp_path, local)
-        _update_local_toml(root, {"model": "new"})
+        _update_local_toml(root, {"embed_model": "new"})
         content = _read_local_toml(root)
-        assert 'model = "new"' in content
-        assert '# model = "old"' not in content
+        assert 'embed_model = "new"' in content
+        assert '# embed_model = "old"' not in content
 
     def test_idempotent_same_value(self, tmp_path):
-        local = '[llm]\nmodel = "same"\n'
+        local = '[llm]\nembed_model = "same"\n'
         root = _make_project(tmp_path, local)
-        _update_local_toml(root, {"model": "same"})
+        _update_local_toml(root, {"embed_model": "same"})
         content = _read_local_toml(root)
-        assert content.count('model = "same"') == 1
+        assert content.count('embed_model = "same"') == 1
 
 
 # ── No [llm] section ─────────────────────────────────────────────────────────
@@ -143,17 +143,17 @@ class TestUpdateLocalTomlExistingLlmSection:
 class TestUpdateLocalTomlNoLlmSection:
     def test_adds_llm_section_when_absent(self, tmp_path):
         root = _make_project(tmp_path, '[index]\ndb_dir = "~/test"\n')
-        _update_local_toml(root, {"model": "new"})
+        _update_local_toml(root, {"embed_model": "new"})
         content = _read_local_toml(root)
         assert "[llm]" in content
-        assert 'model = "new"' in content
+        assert 'embed_model = "new"' in content
 
     def test_adds_multiple_keys_new_section(self, tmp_path):
         root = _make_project(tmp_path, '[index]\ndb_dir = "~/test"\n')
-        _update_local_toml(root, {"model": "new", "auto_pull": True})
+        _update_local_toml(root, {"embed_model": "new", "analyze_vendor": True})
         content = _read_local_toml(root)
-        assert 'model = "new"' in content
-        assert "auto_pull = true" in content
+        assert 'embed_model = "new"' in content
+        assert "analyze_vendor = true" in content
 
 
 # ── Value type formatting ────────────────────────────────────────────────────
@@ -162,45 +162,45 @@ class TestUpdateLocalTomlNoLlmSection:
 class TestUpdateLocalTomlValueTypes:
     def test_writes_string_value(self, tmp_path):
         root = _make_project(tmp_path, "[llm]\n")
-        _update_local_toml(root, {"chat_api_base": "https://api.example.com"})
+        _update_local_toml(root, {"embed_query_prompt": "https://api.example.com"})
         content = _read_local_toml(root)
-        assert 'chat_api_base = "https://api.example.com"' in content
+        assert 'embed_query_prompt = "https://api.example.com"' in content
 
     def test_writes_bool_true(self, tmp_path):
         root = _make_project(tmp_path, "[llm]\n")
-        _update_local_toml(root, {"auto_pull": True})
+        _update_local_toml(root, {"analyze_vendor": True})
         content = _read_local_toml(root)
-        assert "auto_pull = true" in content
+        assert "analyze_vendor = true" in content
 
     def test_writes_bool_false(self, tmp_path):
         root = _make_project(tmp_path, "[llm]\n")
-        _update_local_toml(root, {"auto_pull": False})
+        _update_local_toml(root, {"analyze_vendor": False})
         content = _read_local_toml(root)
-        assert "auto_pull = false" in content
+        assert "analyze_vendor = false" in content
 
     def test_writes_int_value(self, tmp_path):
         root = _make_project(tmp_path, "[llm]\n")
-        _update_local_toml(root, {"num_ctx": 8192})
+        _update_local_toml(root, {"embed_dim": 8192})
         content = _read_local_toml(root)
-        assert "num_ctx = 8192" in content
+        assert "embed_dim = 8192" in content
 
     def test_writes_float_value(self, tmp_path):
         root = _make_project(tmp_path, "[llm]\n")
-        _update_local_toml(root, {"timeout": 300.0})
+        _update_local_toml(root, {"float_example": 300.0})
         content = _read_local_toml(root)
-        assert "timeout = 300.0" in content
+        assert "float_example = 300.0" in content
 
     def test_none_value_skips_key(self, tmp_path):
-        root = _make_project(tmp_path, '[llm]\nmodel = "existing"\n')
-        _update_local_toml(root, {"model": "existing", "chat_api_base": None})
+        root = _make_project(tmp_path, '[llm]\nembed_model = "existing"\n')
+        _update_local_toml(root, {"embed_model": "existing", "embed_query_prompt": None})
         content = _read_local_toml(root)
-        assert "chat_api_base" not in content
-        assert 'model = "existing"' in content
+        assert "embed_query_prompt" not in content
+        assert 'embed_model = "existing"' in content
 
     def test_all_none_no_write(self, tmp_path):
-        root = _make_project(tmp_path, '[llm]\nmodel = "existing"\n')
+        root = _make_project(tmp_path, '[llm]\nembed_model = "existing"\n')
         original = _read_local_toml(root)
-        _update_local_toml(root, {"chat_api_base": None, "model": None})
+        _update_local_toml(root, {"embed_query_prompt": None, "embed_model": None})
         assert _read_local_toml(root) == original
 
 
@@ -209,48 +209,48 @@ class TestUpdateLocalTomlValueTypes:
 
 class TestUpdateLocalTomlNoSpaces:
     def test_updates_key_value_without_spaces(self, tmp_path):
-        root = _make_project(tmp_path, '[llm]\nmodel="old"\n')
-        _update_local_toml(root, {"model": "new"})
+        root = _make_project(tmp_path, '[llm]\nembed_model="old"\n')
+        _update_local_toml(root, {"embed_model": "new"})
         content = _read_local_toml(root)
-        assert 'model = "new"' in content
-        assert 'model="old"' not in content
+        assert 'embed_model = "new"' in content
+        assert 'embed_model="old"' not in content
 
     def test_updates_key_no_space_before_equals(self, tmp_path):
-        root = _make_project(tmp_path, '[llm]\nmodel ="old"\n')
-        _update_local_toml(root, {"model": "new"})
+        root = _make_project(tmp_path, '[llm]\nembed_model ="old"\n')
+        _update_local_toml(root, {"embed_model": "new"})
         content = _read_local_toml(root)
-        assert 'model = "new"' in content
-        assert 'model ="old"' not in content
+        assert 'embed_model = "new"' in content
+        assert 'embed_model ="old"' not in content
 
     def test_updates_key_no_space_after_equals(self, tmp_path):
-        root = _make_project(tmp_path, '[llm]\nmodel= "old"\n')
-        _update_local_toml(root, {"model": "new"})
+        root = _make_project(tmp_path, '[llm]\nembed_model= "old"\n')
+        _update_local_toml(root, {"embed_model": "new"})
         content = _read_local_toml(root)
-        assert 'model = "new"' in content
-        assert 'model= "old"' not in content
+        assert 'embed_model = "new"' in content
+        assert 'embed_model= "old"' not in content
 
     def test_updates_commented_key_without_spaces(self, tmp_path):
-        root = _make_project(tmp_path, '[llm]\n#model="old"\n')
-        _update_local_toml(root, {"model": "new"})
+        root = _make_project(tmp_path, '[llm]\n#embed_model="old"\n')
+        _update_local_toml(root, {"embed_model": "new"})
         content = _read_local_toml(root)
-        assert 'model = "new"' in content
-        assert '#model="old"' not in content
+        assert 'embed_model = "new"' in content
+        assert '#embed_model="old"' not in content
 
     def test_no_duplicate_line_when_key_without_spaces(self, tmp_path):
-        root = _make_project(tmp_path, '[llm]\nmodel="old"\n')
-        _update_local_toml(root, {"model": "new"})
+        root = _make_project(tmp_path, '[llm]\nembed_model="old"\n')
+        _update_local_toml(root, {"embed_model": "new"})
         content = _read_local_toml(root)
-        assert content.count("model") == 1  # only one line with "model"
+        assert content.count("embed_model") == 1  # only one line with "embed_model"
 
     def test_mixed_space_and_no_space_keys(self, tmp_path):
-        local = '[llm]\nmodel="old"\nchat_api_base = "old_url"\n'
+        local = '[llm]\nembed_model="old"\nchat_api_base = "old_url"\n'
         root = _make_project(tmp_path, local)
-        _update_local_toml(root, {"model": "new", "chat_api_base": "https://new.example.com/v1"})
+        _update_local_toml(root, {"embed_model": "new", "embed_query_prompt": "https://new.example.com/v1"})
         content = _read_local_toml(root)
-        assert 'model = "new"' in content
-        assert 'chat_api_base = "https://new.example.com/v1"' in content
-        assert 'model="old"' not in content
-        assert 'chat_api_base = "old_url"' not in content
+        assert 'embed_model = "new"' in content
+        assert 'embed_query_prompt = "https://new.example.com/v1"' in content
+        assert 'embed_model="old"' not in content
+        assert 'embed_query_prompt = "old_url"' not in content
 
 
 # ── Symlink and unchanged file ───────────────────────────────────────────────
@@ -269,10 +269,10 @@ def test_a_symlinked_local_toml_stays_a_symlink(tmp_path: Path):
     link = root / ".fw-context" / "local.toml"
     link.symlink_to(target)
 
-    _update_local_toml(root, {"model": "x:1b"})
+    _update_local_toml(root, {"embed_model": "x:1b"})
 
     assert link.is_symlink()
-    assert 'model = "x:1b"' in target.read_text(encoding="utf-8")
+    assert 'embed_model = "x:1b"' in target.read_text(encoding="utf-8")
 
 
 def test_an_edit_that_changes_nothing_does_not_write(tmp_path: Path):
@@ -280,7 +280,7 @@ def test_an_edit_that_changes_nothing_does_not_write(tmp_path: Path):
     local = root / ".fw-context" / "local.toml"
     before = local.stat()
 
-    _update_local_toml(root, {}, clear_keys=["chat_api_key"])
+    _update_local_toml(root, {}, clear_keys=["embed_doc_prompt"])
 
     after = local.stat()
     assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)

@@ -409,9 +409,12 @@ def check_config(problem: Exception | None, project_root: str | Path | None = No
         root: Path | None = resolve_project_root(str(project_root) if project_root else None)
     except OSError:
         root = None
+    from .._llm_profile_migration import migrate_llm_profiles
+
+    migration = migrate_llm_profiles(root, dry_run=True)
     report = remove_unusable_values(root, dry_run=True)
-    parts = [f"{path}: {label}" for path, label in report.removed_keys]
-    parts += [f"{path}: {reason}" for path, reason in report.failures]
+    parts = [f"{path}: {label}" for path, label in migration.removed_keys + report.removed_keys]
+    parts += [f"{path}: {reason}" for path, reason in migration.failures + report.failures]
     if problem is None and not parts:
         return DepCheckResult(name="config", status="ok", message="the config files load", critical=False)
     if problem is None:
@@ -424,7 +427,7 @@ def check_config(problem: Exception | None, project_root: str | Path | None = No
         message=lead + "; ".join(parts),
         # --only config: a full `doctor --fix` also pulls the missing models,
         # after the fix of the config lets their checks run.
-        fix_cmd="fw-context doctor --fix --only config" if report.removed_keys else None,
+        fix_cmd="fw-context doctor --fix --only config" if report.removed_keys or migration.removed_keys else None,
         critical=problem is not None,
     )
 
@@ -526,7 +529,7 @@ def check_ollama_chat_model(cfg) -> DepCheckResult:
         return DepCheckResult(
             name="chat-model",
             status="skipped",
-            message=f"chat model '{cfg.model}' runs on an OpenAI-compatible API (chat_api_base), not on Ollama",
+            message=f"chat model '{cfg.model}' runs on an OpenAI-compatible API (profile {cfg.profile!r}), not on Ollama",
             critical=False,
         )
     models = installed_models(server)
@@ -537,7 +540,7 @@ def check_ollama_chat_model(cfg) -> DepCheckResult:
         return DepCheckResult(
             name="chat-model",
             status="degraded",
-            message=f"the Ollama server {server} of chat_api_base gives no model list (/api/tags)",
+            message=f"the Ollama server {server} of the chat profile gives no model list (/api/tags)",
             critical=False,
         )
     if server.rstrip("/") != cfg.ollama_url.rstrip("/"):

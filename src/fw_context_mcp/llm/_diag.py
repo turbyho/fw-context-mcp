@@ -48,7 +48,8 @@ def not_ollama_message(url: str) -> str:
     """The message for a server whose ``/api/tags`` answer is not the answer of Ollama."""
     return (
         f"{url.rstrip('/')}/api/tags did not give the model list of Ollama. "
-        "Make sure that ollama_url names an Ollama server, and not a proxy page."
+        "Make sure that the url of the Ollama profile ([llm.profiles.<name>] of the global config) "
+        "names an Ollama server, and not a proxy page."
     )
 
 

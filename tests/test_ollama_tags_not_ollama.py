@@ -120,7 +120,7 @@ def test_the_doctor_check_does_not_crash(monkeypatch):
 
 @pytest.mark.parametrize(("chat_api_base", "status"), [("", "not_configured"), ("http://127.0.0.1:4000/v1", "embedding_unavailable")])
 def test_a_server_that_runs_gets_the_advice_to_correct_the_url(monkeypatch, chat_api_base, status):
-    """A proxy page got "Start Ollama": the server runs, and ollama_url is wrong."""
+    """A proxy page got "Start Ollama": the server runs, and the url of the Ollama profile is wrong."""
     from fw_context_mcp.llm.ollama import check_setup
 
     _answer(monkeypatch, ANSWERS["html"])
@@ -128,7 +128,7 @@ def test_a_server_that_runs_gets_the_advice_to_correct_the_url(monkeypatch, chat
     result = check_setup(LLMConfig(ollama_url=URL, chat_api_base=chat_api_base, chat_api_format="openai"))
 
     assert result["status"] == status, result
-    assert "correct ollama_url so that it names an ollama server" in result["message"].lower(), result
+    assert "correct the url of the ollama profile so that it names an ollama server" in result["message"].lower(), result
     assert "start Ollama" not in result["message"], result
 
 
@@ -166,7 +166,7 @@ def test_an_http_error_of_a_server_is_the_case_of_a_proxy_page(monkeypatch, embe
     assert (result["status"], result["ollama_running"]) == (status, False), result
     if status != "ok":
         assert result["message"].startswith(f"{URL}/api/tags gave HTTP 502"), result
-        assert "correct ollama_url" in result["message"], result
+        assert "correct the url of the Ollama profile" in result["message"], result
 
 
 def test_init_prints_the_message_of_an_error_with_a_running_server(monkeypatch, capsys):

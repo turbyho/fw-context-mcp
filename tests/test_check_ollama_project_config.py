@@ -2,8 +2,8 @@
 
 The fallback for a project without an index called ``load(None)`` when the
 call named no project: that reads the global config only, thus
-``[llm] enabled``, ``model`` and ``ollama_url`` of ``local.toml`` had no
-effect.  A project name went to ``load`` as a path relative to the
+``[llm] enabled`` and ``profile`` of ``local.toml`` had no effect.  A
+project name went to ``load`` as a path relative to the
 current directory, which holds no config.
 """
 
@@ -24,7 +24,11 @@ def project(tmp_path, monkeypatch) -> Path:
     home = tmp_path / "home" / "config.toml"
     home.parent.mkdir()
     # A port that refuses at once: a check that goes to Ollama fails fast.
-    home.write_text('[llm]\nenabled = true\nollama_url = "http://127.0.0.1:9"\n', encoding="utf-8")
+    home.write_text(
+        '[llm]\nenabled = true\nprofile = "local"\n'
+        '[llm.profiles.local]\nprovider = "ollama"\nurl = "http://127.0.0.1:9"\nmodel = "m"\n',
+        encoding="utf-8",
+    )
     monkeypatch.setattr(settings, "_GLOBAL_CONFIG_PATH", home)
     root = tmp_path / "proj"
     (root / ".git").mkdir(parents=True)

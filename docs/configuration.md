@@ -19,13 +19,15 @@ fw-context merges three levels of TOML files, in this order. A later file overri
 
 **Why two project files?** `config.toml` holds settings that are the same for every developer on the project. Examples are build parameters, source roots, and excludes. Commit `config.toml` to git.
 
-`local.toml` holds settings that are specific to each developer. Examples are which Ollama model you have installed, where your index database is, and whether you want LLM analysis enabled. Keep `local.toml` out of git.
+`local.toml` holds settings that are specific to each developer. Examples are the LLM profile of the project, where your index database is, and whether you want LLM analysis enabled. Keep `local.toml` out of git.
+
+The LLM profiles are in the global config only. A profile names the LLM backend: the server, the model and the API key variable. A project only selects a profile, with `[llm] profile`. See [`[llm]`](#llm--llm-and-embeddings).
 
 The environment variable `FW_CONTEXT_HOME` moves the global `config.toml`, the local LLM cache `llm_cache.db`, the state of the release check `update_check.json` (see [`[updates]`](#updates--release-check)), and the global files that the cleanup removes (see [Obsolete keys and files](#obsolete-keys-and-files)). Without it, they are in `~/.fw-context`. It does not move the index, the project registry or the clang headers: these have their own variables (`FW_CONTEXT_INDEX_DIR`, `FW_CONTEXT_PROJECTS_DB`, `FW_CONTEXT_CLANG_RESOURCE_DIR`). The test suite of fw-context sets all four, thus a test cannot change the files of the operator.
 
 Run `fw-context init` to create the project config files with commented-out default values. This command also adds the necessary entries to `.gitignore`. On first use, fw-context creates only the global `~/.fw-context/config.toml`. The MCP tools and `fw-context index` create no config file in a project that `init` did not set up, and read a missing project file as empty.
 
-The LLM step of `fw-context init` tells which file selects the LLM backend. The backend keys are `enabled`, `model`, `embed_model`, `chat_api_base`, `chat_api_key` and `chat_api_format` of `[llm]`:
+The LLM step of `fw-context init` tells which file selects the LLM backend. The backend keys are `enabled`, `profile`, `embed_profile` and `embed_model` of `[llm]`:
 
 - Only the global config sets them: the step shows the global values, and option 0 "Use the global settings" is the default (Enter). It writes nothing.
 - `local.toml` sets them: the step asks "Change? [y/N]". In the menu, option 0 removes these keys from `local.toml`, and the global settings then apply. Enter keeps the keys.
@@ -33,7 +35,11 @@ The LLM step of `fw-context init` tells which file selects the LLM backend. The 
 
 Option 3 "Disable the LLM analysis" writes `[llm] analyze_symbols = false` to `local.toml`. The embeddings and the chat of `smart_search` stay. To turn off the embeddings too, set `[llm] enabled = false`.
 
-Option 1 (local Ollama) gives the models that a config file sets as the defaults of its prompts, thus Enter keeps them. Without such a file, the defaults are the recommended models. The chat model of a cloud API (`chat_api_base`) is not a default, because it is not a model of Ollama.
+Option 1 (local Ollama) writes the chat model to an Ollama profile of the global config. This is the selected profile when it is an Ollama profile, else the profile `local`. The other keys of that profile stay. Then `local.toml` selects the profile with `[llm] profile`, and gets the embedding model in `[llm] embed_model`. The prompts of option 1 give the models that a config file sets as the defaults, thus Enter keeps them. Without such a file, the defaults are the recommended models. The chat model of an `openai_compatible` profile is not a default, because it is not a model of Ollama.
+
+Option 2 (cloud API) asks for four values: a profile name (default `cloud`), the URL of the API, the name of the environment variable that holds the API key, and the model. It writes a profile with `provider = "openai_compatible"` to the global config, and `local.toml` selects it. A profile of the same name gets only the new values. Option 2 never asks for the key itself. Add more profiles, for example a second Ollama server, to the global config with a text editor (see [`[llm]`](#llm--llm-and-embeddings)).
+
+Options 1 and 2 then send a test request to the profile. When the test fails, `local.toml` gets its old text back. The profile stays in the global config.
 
 When no file sets `embed_model`, fw-context detects the model from the hardware: `qwen3-embedding:8b` with a GPU, `qwen3-embedding:0.6b` without one. `fw-context init` saves the detected name one time to the global config. Thus the model stays the same when a detection fails one time, which would embed the whole index again with a different dimension. The name goes to the global config and not to `local.toml`, because the hardware is a fact of the machine: each project then uses the global settings, and a later change of the global config applies to it. Earlier versions of `init` saved the name to `local.toml` of each project. Option 0 of the LLM step removes it.
 
@@ -47,18 +53,26 @@ fw-context stops with an error when one of the three files has one of these prob
   - `[project] id`
   - `[index]` `db_dir`, `compile_commands`, `config_header`, `vendor_paths`, `project_paths` and `transient_defines`
   - each key of `[build]` except `timeout` and `clean`, and each key of a `[[build.variants]]` table
-  - `[llm]` `ollama_url`, `chat_api_base`, `embed_model`, `embed_dim`, `embed_query_prompt`, `embed_doc_prompt` and `debug_log`
+  - `[llm]` `profile`, `embed_profile`, `embed_model`, `embed_dim`, `embed_query_prompt`, `embed_doc_prompt` and `debug_log`
+  - `provider`, `model`, `url` and `api_key_env` of an LLM profile (`[llm.profiles.<name>]`)
   - `[cache_server] url` and `[call_graph] dispatch_bridges`
 - A `[[build.variants]]` table has no `name`.
-- A URL is not valid, for example `ollama_url = "http://[::1"`.
+- A URL is not valid, for example `url = "http://[::1"` in an LLM profile.
+- A problem of the LLM profiles:
+  - An old `[llm]` backend key, for example `[llm] ollama_url` or `[llm] model`. See [The old `[llm]` backend keys](#the-old-llm-backend-keys).
+  - A table `[llm.profiles]` in `config.toml` or `local.toml` of a project.
+  - A profile without `provider` or `model`, or an `openai_compatible` profile without `url`.
+  - A key in a profile that the provider of the profile does not know. A typo there can select a different backend.
+  - `[llm] profile` or `[llm] embed_profile` names a profile that the global config does not have, or `embed_profile` names a profile that is not an Ollama profile. The error names the file that sets the key.
+  - The global config has two or more profiles, and no file sets `[llm] profile`.
 
-The error names the file and the key, but not the value, because a key such as `chat_api_key` can hold a secret. `fw-context status` gives exit code 1, and the MCP status tools give the status `config_error`. fw-context does not use the default value in place of these values: a default gives answers about other data, or sends the source code to a different place.
+The error names the file and the key, but not the value, because a value can be a secret. `fw-context status` gives exit code 1, and the MCP status tools give the status `config_error`. fw-context does not use the default value in place of these values: a default gives answers about other data, or sends the source code to a different place.
 
-A value of the wrong type in a different key gives a warning: for example a timeout, a limit, the chat model or a switch (`timeout = "x"`, `enabled = "flase"`). A section `[updates]` that is not a table gives a warning too. fw-context then uses the value of a lower file, or the default of the key, and the tools work. Each command writes the warning to the log one time (a CLI command to stderr), `fw-context doctor` shows it, and the MCP status tools give it in the list `config_warnings`.
+A value of the wrong type in a different key gives a warning: for example a timeout, a limit or a switch (`timeout = "x"`, `enabled = "flase"`). In an LLM profile, these keys are `timeout`, `stream`, `num_ctx`, `keep_alive`, `auto_pull` and `max_concurrent`. A section `[updates]` that is not a table gives a warning too. fw-context then uses the value of a lower file, or the default of the key, and the tools work. Each command writes the warning to the log one time (a CLI command to stderr), `fw-context doctor` shows it, and the MCP status tools give it in the list `config_warnings`.
 
 An older form of a value still works: a string that holds a number (`num_ctx = "4096"`), and `"yes"`, `"no"`, `"on"`, `"off"`, `"1"` and `"0"` for a switch. A key of a `[[build.variants]]` table goes to the build as it is, thus it must have the TOML type.
 
-`fw-context doctor` lists each value that fw-context cannot use, in each of the three files. `fw-context doctor --fix --only config` removes each value. Then the value of a lower file applies, for example of `config.toml` for a value of `local.toml`, or else the default of the key. A `fw-context doctor --fix` without `--only` also does the other fixes, and it can pull a missing Ollama model of several GB. `fw-context init` and `doctor --fix --only <checks>` without `config` remove no value. Before the change, `local.toml` and the global config get a copy of the old text in `<name>.bak`. When one `doctor --fix` changes a file two times, the copy holds the text before the first change. `config.toml` of a project gets no copy, because git holds its old text. The fix does not remove a `[project] id` of the wrong type: without an ID, the project is not initialized, and the index of the project is lost. Correct the ID yourself. A file that is not valid TOML also needs you: the fix cannot read its values.
+`fw-context doctor` lists each value that fw-context cannot use, in each of the three files. `fw-context doctor --fix --only config` removes each value. Then the value of a lower file applies, for example of `config.toml` for a value of `local.toml`, or else the default of the key. A `fw-context doctor --fix` without `--only` also does the other fixes, and it can pull a missing Ollama model of several GB. `fw-context init` and `doctor --fix --only <checks>` without `config` remove no value. The old `[llm]` backend keys are not removed: `fw-context doctor --fix --only config` and `fw-context init` convert them to LLM profiles (see [The old `[llm]` backend keys](#the-old-llm-backend-keys)). The fix also does not change a profile in a project file, or a profile without a correct `provider`, `model` or necessary `url`. Correct these yourself. Before the change, `local.toml` and the global config get a copy of the old text in `<name>.bak`. When one `doctor --fix` changes a file two times, the copy holds the text before the first change. `config.toml` of a project gets no copy, because git holds its old text. The fix does not remove a `[project] id` of the wrong type: without an ID, the project is not initialized, and the index of the project is lost. Correct the ID yourself. A file that is not valid TOML also needs you: the fix cannot read its values.
 
 ## Settings reference
 
@@ -178,47 +192,93 @@ The parse also needs the clang compiler headers (`stddef.h`, `arm_acle.h`) of th
 
 WHY the query: a GCC cross compiler adds its system headers and its target macros on its own, and `compile_commands.json` does not hold them. Without the query, a target that libclang has no backend for (xtensa, ESP32) was parsed with the headers of the host, and `#if __XTENSA__` read as false.
 
-### `[llm]` — Ollama
+### `[llm]` — LLM and embeddings
 
-Put these settings in `~/.fw-context/config.toml` for global defaults, or in `<project>/.fw-context/local.toml` for per-project overrides. Do not put these settings in the shared `config.toml` file. LLM configuration is specific to each developer.
+The LLM backend is a named **profile**: a table `[llm.profiles.<name>]`. A profile gives the server, the chat model and the API key variable. The profiles are in the global config `~/.fw-context/config.toml` only. `[llm] profile` selects one profile:
+
+- The global config gives the default profile of each project.
+- `config.toml` or `local.toml` of a project selects a different profile. The last file wins.
+
+WHY the profiles are in the global config only: a profile names the server that gets the source code. A `config.toml` in git thus cannot send the source code to a host that the repository selects. It can only select a profile of the user. A table `[llm.profiles]` in a project file is an error.
+
+When no file sets `[llm] profile` and the global config has one profile, fw-context uses that profile. With two or more profiles, `[llm] profile` is necessary. Without profiles, fw-context uses the defaults: a local Ollama at `http://localhost:11434`, with the model `qwen2.5-coder:14b`. A `profile` that names no profile of the global config is an error, and the error names the file that selects it.
+
+When the selected profile sends the chat or the embeddings to a host that is not this machine, fw-context prints a notice on stderr when it loads the config of a project. The source code then goes to that host.
+
+Put the other `[llm]` keys in `~/.fw-context/config.toml` for global defaults, or in `<project>/.fw-context/local.toml` for per-project overrides. Do not put them in the shared `config.toml` file. LLM configuration is specific to each developer.
 
 | Key | Default | Scope | Description |
 |-----|---------|-------|-------------|
-| `enabled` | `true` | global, local | Enable Ollama. When this key is `false`, `smart_search` falls back to word-split FTS5. Also, `explain_symbol` returns the source code and a prompt for the AI assistant. `fw-context index` then skips the embeddings and the symbol analysis, also for a sentence-transformers `embed_model`. To keep the embeddings and skip only the analysis, set `analyze_symbols = false`. |
-| `ollama_url` | `"http://localhost:11434"` | global, local | The base URL for the Ollama API. Change this key for a remote GPU server. |
-| `model` | `"qwen2.5-coder:14b"` | global, local | The LLM model tag. Override this key for each project, to use a different model for different codebases. |
-| `embed_model` | `""` *(auto-detect)* | global, local | The embedding model for vector search. Empty: fw-context selects `qwen3-embedding:8b` on a machine with a GPU (about 4.7 GB of VRAM, 4096-dimension vectors), and `qwen3-embedding:0.6b` without one. A name with the prefix `BAAI/`, `ibm-granite/`, `lightonai/`, `cross-encoder/` or `sentence-transformers/` uses sentence-transformers (requires the `st` extra); `ft://` selects a fine-tuned local model; any other name is an Ollama model. When `auto_pull` is `true`, fw-context pulls an Ollama model automatically on first use; otherwise pull it manually. A change of model invalidates the stored embeddings. |
+| `enabled` | `true` | global, local | Enable the LLM and the Ollama calls. When this key is `false`, `smart_search` falls back to word-split FTS5. Also, `explain_symbol` returns the source code and a prompt for the AI assistant. `fw-context index` then skips the embeddings and the symbol analysis, also for a sentence-transformers `embed_model`. To keep the embeddings and skip only the analysis, set `analyze_symbols = false`. |
+| `profile` | *(the only profile)* | global, project, local | The name of the LLM profile of the chat (analysis, `smart_search`, `explain_symbol`). It must name a profile of the global config. |
+| `embed_profile` | *(see description)* | global, project, local | The name of the Ollama profile whose `url` is the server of the embeddings. When the selected profile is an `openai_compatible` profile, fw-context also uses `keep_alive`, `auto_pull` and `max_concurrent` of this profile. Without this key, the embeddings use the server of the selected profile when it is an Ollama profile, else `http://localhost:11434`. A profile with a different provider is an error. |
+| `embed_model` | `""` *(auto-detect)* | global, local | The embedding model for vector search. Empty: fw-context selects `qwen3-embedding:8b` on a machine with a GPU (about 4.7 GB of VRAM, 4096-dimension vectors), and `qwen3-embedding:0.6b` without one. A name with the prefix `BAAI/`, `ibm-granite/`, `lightonai/`, `cross-encoder/` or `sentence-transformers/` uses sentence-transformers (requires the `st` extra); `ft://` selects a fine-tuned local model; any other name is an Ollama model. When the selected Ollama profile sets `auto_pull = true`, fw-context pulls an Ollama model automatically on first use; otherwise pull it manually. A change of model invalidates the stored embeddings. |
 | `embed_query_prompt` | *(auto-detect)* | global, local | An instruction that fw-context adds before the query text, before it creates the embedding. fw-context detects this instruction automatically from the model name prefix: for `mxbai-*`, fw-context uses `"Represent this sentence for searching relevant passages: "`; for `qwen3-embedding*`, fw-context uses a code-retrieval instruction. Set this key explicitly to override the default, or set it to `""` to disable it. |
 | `embed_dim` | *(none)* | global, local | The dimension of the stored vectors, for a sentence-transformers or `ft://` model with Matryoshka training. When the value is smaller than the dimension of the model, fw-context cuts each vector to this size and normalizes it again. An Ollama model ignores this key. A negative value means "not set". For a sentence-transformers or `ft://` model, the next `fw-context index` after a change of this key computes each stored embedding again. |
 | `embed_doc_prompt` | *(empty)* | global, local | An instruction that fw-context adds before symbol descriptions during indexing. Most models work best with an empty prompt. Set this key only when the model's training expects a per-document instruction. After a change of this key, the next `fw-context index` computes each stored embedding again. |
-| `auto_pull` | `false` | global, local | When `true`, fw-context pulls a model automatically from the Ollama registry when it is not installed. When `false` (default), you must pull each model explicitly. Set this key to `false` for offline or intranet environments. |
-| `num_ctx` | `16384` | global, local | The context window, in tokens. This size allows full function bodies during analysis generation. |
-| `keep_alive` | `"10m"` | global, local | How long fw-context keeps the model loaded in VRAM after a request. Use minutes, seconds, or `-1` for an indefinite time. During indexing, this setting prevents model loading before each request, which takes about 2 to 5 seconds each time. |
-| `timeout` | `600.0` | global, local | The HTTP request timeout, in seconds, for Ollama API calls. Embed requests use `timeout × 2`. |
-| `reranker_model` | *(none)* | global, local | A cross-encoder model for search result reranking. Example: `"cross-encoder/ms-marco-MiniLM-L6-v2"`. When you set this key, fw-context rescors each result with the cross-encoder for higher precision. This key requires `sentence-transformers`. Default `None` — no reranking. |
+| `reranker_model` | *(none)* | global, local | A cross-encoder model for search result reranking. Example: `"cross-encoder/ms-marco-MiniLM-L6-v2"`. When you set this key, fw-context rescores each result with the cross-encoder for higher precision. This key requires `sentence-transformers`. Default `None` — no reranking. |
 | `analyze_symbols` | `true` | global, local | Generate an LLM analysis for each symbol during indexing. This analysis includes a summary, the inputs, and the outputs. fw-context stores this analysis in the `llm_analysis` table, so you can search for symbols by purpose. |
 | `analyze_vendor` | `false` | global, local | When this key is `true`, the LLM analysis also includes the vendor and SDK code (for example `mbed-os/` or `zephyr/`). This can add hours to an index run. When `false`, the analysis includes only the project code. `fw-context index --analyze-vendor` and `--no-analyze-vendor` override this key. Without `analyze_symbols`, this key has no effect. |
-| `ollama_max_concurrent` | `1` | global, local | The maximum number of parallel Ollama HTTP calls per process. Increase this key to 2–4 for multi-client MCP transports, such as SSE or streamable, where embedding requests (~100 ms) can overlap. Keep this key low for chat requests, which use the GPU more. |
-| `chat_api_base` | *(none)* | global, local | A chat API URL for an OpenAI-compatible cloud or proxy endpoint. Examples: DeepSeek, LiteLLM, vLLM, llama.cpp. When you set this key, fw-context sends chat requests to this URL instead of the local Ollama instance. Default `None` — fw-context uses the local Ollama server. |
-| `chat_api_key` | *(none)* | global, local | A bearer token for the cloud or proxy chat API. Leave this key empty for endpoints that need no authentication. |
-| `chat_api_format` | `"auto"` | global, local | The request format for the chat API. `"auto"` (default) detects the format from the URL. `"ollama"` uses the Ollama-native `/api/chat` format. `"openai"` uses the `/v1/chat/completions` format. |
-| `stream` | `false` | global, local | When `true`, fw-context sends `stream: true` and reads SSE chunks for chat requests. This setting keeps the HTTP connection open with a continuous data flow, and prevents reverse-proxy idle timeouts (nginx default: 60 s, Cloudflare: 100 s). When `false`, fw-context uses a non-streaming path. |
-| `debug_log` | *(none)* | global, local | The path to a JSONL debug log for Ollama prompts and responses. Example: `"~/.fw-context/llm-debug.jsonl"`. |
+| `debug_log` | *(none)* | global, local | The path to a JSONL debug log for LLM prompts and responses. Example: `"~/.fw-context/llm-debug.jsonl"`. |
+
+#### `[llm.profiles.<name>]` — LLM profiles
+
+Each profile is one LLM backend. The name of a profile has only letters, digits, `_` and `-`. The keys of a profile:
+
+| Key | Default | Provider | Description |
+|-----|---------|----------|-------------|
+| `provider` | *(required)* | each | `"ollama"` for an Ollama server, or `"openai_compatible"` for an API with the OpenAI chat format. |
+| `model` | *(required)* | each | The chat model. Use a model with 14B parameters or more: a smaller model gives JSON that is not consistent, and poor descriptions of embedded C++ code. |
+| `url` | `"http://localhost:11434"` for Ollama | each | The server. Required for `openai_compatible`. fw-context adds `/chat/completions` to a URL that contains `/v1`, and `/v1/chat/completions` to a URL without `/v1`. A URL that ends with `/chat/completions` stays as it is. |
+| `timeout` | `600.0` | each | The HTTP request timeout, in seconds. Embed requests use `timeout × 2`. |
+| `stream` | `false` | each | When `true`, fw-context sends `stream: true` and reads SSE chunks for chat requests. This setting keeps the HTTP connection open with a continuous data flow, and prevents reverse-proxy idle timeouts (nginx default: 60 s, Cloudflare: 100 s). When `false`, fw-context uses a non-streaming path. |
+| `num_ctx` | `16384` | `ollama` | The context window, in tokens. This size allows full function bodies during analysis generation. |
+| `keep_alive` | `"10m"` | `ollama` | How long Ollama keeps the model loaded in VRAM after a request. Use minutes, seconds, or `-1` for an indefinite time. During indexing, this setting prevents model loading before each request, which takes about 2 to 5 seconds each time. |
+| `auto_pull` | `false` | `ollama` | When `true`, fw-context pulls a model automatically from the Ollama registry when it is not installed. When `false` (default), you must pull each model explicitly. Set this key to `false` for offline or intranet environments. |
+| `max_concurrent` | `1` | `ollama` | The maximum number of parallel Ollama HTTP calls per process. Increase this key to 2–4 for multi-client MCP transports, such as SSE or streamable, where embedding requests (~100 ms) can overlap. Keep this key low for chat requests, which use the GPU more. |
+| `api_key_env` | *(none)* | `openai_compatible` | The **name** of the environment variable that holds the API key, for example `"DEEPSEEK_API_KEY"`. Never write the key itself into a config file. When the variable is not set, fw-context sends no key. |
+
+fw-context reads `timeout`, `stream`, `num_ctx`, `keep_alive`, `auto_pull` and `max_concurrent` from the selected profile. Thus these values also apply to the embeddings. When the selected profile is an `openai_compatible` profile, `keep_alive`, `auto_pull` and `max_concurrent` come from the profile of `embed_profile`, because only the embeddings use Ollama. Without `embed_profile`, these keys have their defaults.
+
+A key that the provider of the profile does not know is an error, because a typo can select a different backend. A value of the wrong type in `provider`, `model`, `url` or `api_key_env` is an error. In the other keys, it gives a warning, and fw-context uses the default.
+
+```toml
+# ~/.fw-context/config.toml
+[llm]
+profile = "local"                  # the default profile of each project
+
+[llm.profiles.local]
+provider = "ollama"
+url = "http://localhost:11434"
+model = "qwen2.5-coder:14b"
+num_ctx = 16384
+
+[llm.profiles.gpu-box]             # an Ollama server on a different machine
+provider = "ollama"
+url = "http://192.168.1.50:11434"
+model = "qwen2.5-coder:32b"
+```
+
+```toml
+# <project>/.fw-context/local.toml
+[llm]
+profile = "gpu-box"
+```
 
 #### External chat API examples
 
-When you set `chat_api_base`, fw-context sends chat requests (analysis
-generation, `smart_search`, `explain_symbol`) to that URL, with
-OpenAI-compatible JSON. The embedding model still uses Ollama.
+A profile with `provider = "openai_compatible"` sends the chat requests (analysis generation, `smart_search`, `explain_symbol`) to its `url`, with OpenAI-compatible JSON. The embeddings still use Ollama, see `embed_profile`.
+
+The profile holds the name of the environment variable with the API key, never the key. A key in a TOML file is a secret in plain text. Set the variable in the environment of each process that runs fw-context: your shell for the CLI, and the LLM client that starts the MCP server.
 
 **OpenAI:**
 
 ```toml
-[llm]
-chat_api_base = "https://api.openai.com/v1"
-chat_api_key = "sk-..."
-chat_api_format = "openai"
+[llm.profiles.openai]
+provider = "openai_compatible"
+url = "https://api.openai.com/v1"
 model = "gpt-4.1"
+api_key_env = "OPENAI_API_KEY"
 ```
 
 **Anthropic (through a proxy):**
@@ -227,34 +287,34 @@ Anthropic has no OpenAI-compatible endpoint. Use LiteLLM as a proxy —
 it translates OpenAI-format requests to Anthropic-format requests.
 
 ```toml
-[llm]
+[llm.profiles.anthropic]
 # Point at your LiteLLM proxy. Set ANTHROPIC_API_KEY in the proxy env.
-chat_api_base = "http://localhost:4000/v1"
-chat_api_key = "sk-lite"
-chat_api_format = "openai"
+provider = "openai_compatible"
+url = "http://localhost:4000/v1"
 model = "claude-sonnet-4-20250514"
+api_key_env = "LITELLM_API_KEY"
 ```
 
 **DeepSeek:**
 
 ```toml
-[llm]
-chat_api_base = "https://api.deepseek.com/v1"
-chat_api_key = "sk-..."
-chat_api_format = "openai"
+[llm.profiles.deepseek]
+provider = "openai_compatible"
+url = "https://api.deepseek.com/v1"
 model = "deepseek-v4-flash"
+api_key_env = "DEEPSEEK_API_KEY"
 ```
 
 **LiteLLM proxy (local):**
 
 LiteLLM translates between provider-specific formats. You run it locally,
-and fw-context talks to it as if it were OpenAI.
+and fw-context sends requests to it in the OpenAI format.
 
 ```toml
-[llm]
-chat_api_base = "http://localhost:4000/v1"
-chat_api_key = "sk-lite"
-chat_api_format = "openai"
+[llm.profiles.litellm]
+provider = "openai_compatible"
+url = "http://localhost:4000/v1"
+api_key_env = "LITELLM_API_KEY"
 model = "openai/gpt-4o"       # LiteLLM model routing syntax
 # or: model = "deepseek/deepseek-v4-flash"
 # or: model = "anthropic/claude-3-5-sonnet-20241022"
@@ -262,16 +322,16 @@ model = "openai/gpt-4o"       # LiteLLM model routing syntax
 
 **llama.cpp server:**
 
+The server needs no key, thus the profile has no `api_key_env`.
+
 ```toml
-[llm]
-chat_api_base = "http://localhost:8080/v1"
-chat_api_key = "not-needed"
-chat_api_format = "openai"
+[llm.profiles.llamacpp]
+provider = "openai_compatible"
+url = "http://localhost:8080/v1"
 model = "qwen2.5-coder:14b"
 ```
 
-For all external endpoints, set `stream = true` when you use a reverse
-proxy, to prevent idle timeouts.
+To use one of these profiles in a project, set `[llm] profile = "<name>"` in `.fw-context/local.toml`. To use it in each project, set the key in the global config. When you use a reverse proxy, set `stream = true` in the profile, to prevent idle timeouts.
 
 ### `[project]` — Metadata
 
@@ -332,7 +392,7 @@ check = false
 
 ## Obsolete keys and files
 
-fw-context removes the config keys and the files that an older release wrote and that no release reads now. The list is in `src/fw_context_mcp/housekeeping.py`, with the commit that retired each item.
+fw-context removes the config keys and the files that an older release wrote and that no release reads now. The list is in `src/fw_context_mcp/housekeeping.py`, with the commit that retired each item. The old `[llm]` backend keys are not in this list: fw-context converts them to LLM profiles, see [The old `[llm]` backend keys](#the-old-llm-backend-keys).
 
 | Item | Where |
 |------|-------|
@@ -358,6 +418,35 @@ These commands do the cleanup:
 
 The MCP server and the watcher daemon remove nothing. The background runs of the daemon are `fw-context index` runs, thus the cleanup runs in them too. When the cleanup cannot read or write a file, it logs a warning and continues: the index run does not stop for it. When fw-context cannot use the config or read the index (for example a config file that is not valid TOML, or an index of an older schema), the old build output stays. It stays until you correct the config file, or until an index run migrates the index.
 
+### The old `[llm]` backend keys
+
+Before the LLM profiles, `[llm]` named the LLM backend directly, in each of the three files. These keys are an error now:
+
+`ollama_url`, `model`, `num_ctx`, `timeout`, `keep_alive`, `stream`, `auto_pull`, `ollama_max_concurrent`, `chat_api_base`, `chat_api_key` and `chat_api_format`
+
+The error tells where the key goes. These commands convert the keys to LLM profiles:
+
+- `fw-context init`, before it loads the config for the first time. With `--dry-run`, it shows the changes, writes nothing, and stops there, because the next steps read the converted config.
+- `fw-context doctor --fix --only config`. `fw-context doctor` shows the changes in the check `config`.
+
+The conversion makes these changes:
+
+- **The global config.** Its old keys become a profile, and `[llm] profile` selects it when the key is not set. The name of a new profile is `local` for an Ollama server on this machine, `remote` for an Ollama server on a different machine, and `api` for an OpenAI-compatible API. When the name is in use, the conversion adds `-2`, `-3` and so on. When a profile with the same values exists, the conversion uses that profile.
+- **A project.** The old keys of `config.toml` and `local.toml` apply over the profile that the project selects. For example, a project with only `num_ctx` keeps the API and the embeddings server of the global config. When the result is the same profile, the conversion removes the keys. Else it adds a new profile to the global config, with the name of the project directory, and `local.toml` selects it. When `local.toml` is missing, the conversion makes it. Before it adds a profile, the conversion sets `[llm] profile` of the global config when it is not set: else `load` selects the only profile for each project. A global config without a profile gets the profile `local` (Ollama on this machine), the backend of the old defaults. A global config that is missing is made from the template first. The new profile is a copy: a later change of the profile below it does not change the project.
+- **The embeddings.** When the old keys send the embeddings to a server that the chat profile does not give them, the conversion also adds an Ollama profile `embeddings` with the URL of `ollama_url`. With a chat on an API, the profile also gets `keep_alive`, `auto_pull` and `ollama_max_concurrent` (as `max_concurrent`). `[llm] embed_profile` selects it, in the file of the old keys: the global config, or `local.toml` of the project.
+- **The comments.** The conversion removes the commented lines of the old templates from `[llm]`, for example `# ollama_url = ...`. `local.toml` of a project gets a commented `profile` line when the conversion changes the file for a different reason. `config.toml` gets no new line.
+
+The conversion selects the provider from `chat_api_format` and `chat_api_base`, with the same rules as the old releases. A `chat_api_format` of the global config applies to a `chat_api_base` of the project, as in the old releases. An `openai_compatible` profile has no `num_ctx`, because the old releases did not send it to such an API: the report says so. When the old keys sent the chat in the Ollama format, the result is an `ollama` profile. Else the result is an `openai_compatible` profile.
+
+The conversion does not change a file that has `chat_api_key`, because a profile has no place for the value of a key. When the global config has it, the conversion changes no file of the project either, because the project selects a profile of the global config. To convert such a file, do these steps:
+
+1. Put the key into an environment variable.
+2. In the global config, write the profile with `api_key_env = "<variable>"` (see [External chat API examples](#external-chat-api-examples)).
+3. Select the profile with `[llm] profile`.
+4. Remove the old `[llm]` keys.
+
+The conversion first makes and checks each new text, and makes sure that it can write each file. When it cannot write a file, it changes no file. Then it writes the global config, `local.toml` and `config.toml`, in this order, and stops at the first write that fails. Before the conversion changes `local.toml` or the global config, it writes the old text to `<name>.bak` beside the file. `config.toml` of a project gets no copy, because git holds its old text: commit the change.
+
 ## Examples
 
 ### Global config (`~/.fw-context/config.toml`)
@@ -368,11 +457,26 @@ db_dir = "~/.fw-context/index"
 transient_defines = ["MBED_BUILD_TIMESTAMP", "BUILD_TIMESTAMP", "BUILD_TIME", "BUILD_DATE", "BUILD_ID", "BUILD_NUMBER"]
 
 [llm]
-# enabled = true   # set false to disable Ollama entirely
-ollama_url = "http://localhost:11434"
+# enabled = true   # set false to disable the LLM entirely
+profile = "local"  # the default LLM profile of each project
+# embed_profile = "local"   # the Ollama profile of the embeddings
+# debug_log = "~/.fw-context/llm-debug.jsonl"
+analyze_symbols = true
+
+[llm.profiles.local]
+provider = "ollama"
+url = "http://localhost:11434"
 model = "qwen2.5-coder:14b"
 num_ctx = 16384
-# debug_log = "~/.fw-context/llm-debug.jsonl"
+# keep_alive = "10m"
+# timeout = 600.0
+
+# An OpenAI-compatible API (the source code goes to its host):
+# [llm.profiles.deepseek]
+# provider = "openai_compatible"
+# url = "https://api.deepseek.com"
+# model = "deepseek-chat"
+# api_key_env = "DEEPSEEK_API_KEY"
 ```
 
 ### Shared project config (`<project>/.fw-context/config.toml`)
@@ -445,9 +549,9 @@ Keep this file out of git. `fw-context init` already ignores it: its `.gitignore
 # activate = "/home/user/ncs-v3.2.3-env.sh"  # for Zephyr/NCS, ESP-IDF
 
 [llm]
-# enabled = false                        # set false if you don't use Ollama
-# ollama_url = "http://localhost:11434"
-# model = "qwen2.5-coder:14b"           # override if you have a different model
+# profile = "local"                      # the LLM profile of this project: a profile of the global config
+# enabled = false                        # set false if you do not use an LLM
+# embed_profile = "local"                # the Ollama profile of the embeddings
 # analyze_symbols = true
 #
 # ── Embedding model ──

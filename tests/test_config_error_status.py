@@ -65,7 +65,7 @@ def test_configure_llm_gives_its_own_answer_for_a_config_error(broken):
 
     before = (broken / ".fw-context" / "config.toml").read_bytes()
 
-    answer = configure_llm(project_root=str(broken), model="m:1b")
+    answer = configure_llm(project_root=str(broken), profile="local")
 
     path = broken / ".fw-context" / "config.toml"
     assert answer == {"status": "error", "message": answer["message"]}, answer

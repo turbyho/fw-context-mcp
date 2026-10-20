@@ -26,58 +26,43 @@ def configure_llm_core(
     project_root: Path,
     updates: dict[str, object],
     *,
-    chat_api_base: str | None = None,
     clear_keys: list[str] | None = None,
 ) -> dict:
-    """Apply LLM settings to ``local.toml`` and test the connection.
+    """Apply the ``[llm]`` settings of a project to ``local.toml`` and test the connection.
 
     Writes ``updates`` into ``<project>/.fw-context/local.toml`` via
     line-level editing (preserves comments and other sections), reloads
     the config so the result reflects the new settings, then tests the
-    endpoint with a trivial prompt (skipped when LLM is disabled).
+    chat backend with a trivial prompt (skipped when LLM is disabled).
 
     IMPORTANT: only ``local.toml`` is written — never the global config or
-    the shared ``config.toml``.  When ``chat_api_base`` points to an
-    external host, a ``compliance_warning`` is returned because source
-    code snippets in chat prompts will be sent to that endpoint.
+    the shared ``config.toml``.  The backend is a profile of the global
+    config; a project selects it with ``profile``.  When the selected
+    profile sends the chat to a host that is not this machine, a
+    ``compliance_warning`` is returned.
 
     Args:
         project_root: Project root directory (resolved, existing).
-        updates: Dict of ``{key: value}`` pairs to write to ``[llm]``.
-            ``None`` values are skipped.  Supported types: ``str``,
-            ``bool``, ``int``, ``float``.
-        chat_api_base: When set to an external host, adds a compliance
-            warning to the result.
+        updates: Dict of ``{key: value}`` pairs to write to ``[llm]``
+            (``profile``, ``embed_profile``, ``embed_model``, ``enabled``,
+            ``analyze_symbols``, ...).  ``None`` values are skipped.
+            Supported types: ``str``, ``bool``, ``int``, ``float``.
         clear_keys: Keys to REMOVE from the ``[llm]`` section (passed through
-            to ``_update_local_toml``).  Used to clear a previously configured
-            cloud endpoint when switching back to local Ollama.
+            to ``_update_local_toml``).  Used when the project goes back to
+            the settings of the global config.
 
     Returns:
-        dict: {status ("ok"|"error"), chat_api (dict — configured, endpoint,
-        model), model (str), auto_pull (bool), stream (bool),
-        test_latency_s (float, on success), test_response (str, on success),
-        compliance_warning (str, when chat_api_base is external),
-        message (str — present on both success and error)}.  Never raises.
+        dict: {status ("ok"|"error"), profile (str), provider (str),
+        chat_api (dict — configured, endpoint, format, model), model (str),
+        auto_pull (bool), stream (bool), test_latency_s (float, on success),
+        test_response (str, on success), compliance_warning (str, when the
+        chat goes to another host), message (str — present on both success
+        and error)}.  Never raises.
     """
     from ..config import load as load_config
-    from ..config.settings import _URL_KEYS, _is_loopback_url, _update_local_toml, url_problem
-
-    # Before the compliance check and the write: `_is_loopback_url` raised
-    # ValueError for "http://[::1", and the caller got "Internal server
-    # error".  A written value of that kind makes `load` refuse local.toml.
-    for key, value in [*((key, updates.get(key)) for key in _URL_KEYS), ("chat_api_base", chat_api_base)]:
-        if isinstance(value, str) and (problem := url_problem(value)) is not None:
-            return {"status": "error", "message": f"{key} is not a valid URL ({problem}). Nothing was changed."}
+    from ..config.settings import _is_loopback_url, _update_local_toml
 
     result: dict = {}
-    if chat_api_base and not _is_loopback_url(chat_api_base):
-        result["compliance_warning"] = (
-            f"Chat API set to external host ({chat_api_base}). "
-            "Source code snippets in chat prompts WILL be sent to this "
-            "endpoint. Ensure compliance with your organization's data "
-            "security policies. Consider using local Ollama or an internal "
-            "API proxy."
-        )
 
     # WHAT the file held before the write.  A setting that fails its own
     # test must not stay behind: the tool writes AND verifies, thus a
@@ -116,6 +101,22 @@ def configure_llm_core(
         }
 
     try:
+        # The chat and the embeddings: both send the source code (the
+        # embeddings send the symbol descriptions and bodies).
+        hosts = {
+            "chat": new_cfg.llm.chat_api_base or new_cfg.llm.ollama_url,
+            "embeddings": new_cfg.llm.ollama_url,
+        }
+        external = sorted({url for url in hosts.values() if url and not _is_loopback_url(url)})
+        if external:
+            parts = [what for what, url in hosts.items() if url in external]
+            result["compliance_warning"] = (
+                f"The {' and the '.join(parts)} of profile {new_cfg.llm.profile or '(default)'!r} go to an external "
+                f"host ({', '.join(external)}). Source code snippets WILL be sent to this endpoint. "
+                "Ensure compliance with your organization's data security policies."
+            )
+        result["profile"] = new_cfg.llm.profile
+        result["provider"] = new_cfg.llm.provider
         if new_cfg.llm.chat_api_base:
             from .chat_router import detect_chat_endpoint
 
@@ -162,8 +163,8 @@ def configure_llm_core(
     except LLMError as e:
         result["status"] = "error"
         result["message"] = (
-            f"The test call failed: {e}. Check the API URL, key, and model "
-            f"name.{_roll_back()}"
+            f"The test call failed: {e}. Check the URL, the API key and the model "
+            f"of the profile.{_roll_back()}"
         )
     except Exception as e:
         # Never raise — a malformed URL or unexpected backend response must

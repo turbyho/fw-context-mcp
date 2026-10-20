@@ -316,12 +316,12 @@ def fix_chat_model(result, _project_root=None) -> tuple[bool, str]:
     cfg = load_project_config(_project_root).llm
     server = chat_ollama_server(cfg)
     if server is None:
-        return False, "an OpenAI-compatible API (chat_api_base) runs the chat model; Ollama cannot pull it"
+        return False, "an OpenAI-compatible API (the chat profile) runs the chat model; Ollama cannot pull it"
     return _ollama_pull(cfg.model, server)
 
 
 def fix_embed_model(result, _project_root=None) -> tuple[bool, str]:
-    """Pull the configured embedding model onto the server of ``[llm] ollama_url``.
+    """Pull the configured embedding model onto the Ollama server of the embeddings (``ollama_url``).
 
     WHY the model name comes from the config and not from ``fix_cmd``:
     ``fix_cmd`` is a shell command for a person, and it starts with the
@@ -402,12 +402,18 @@ def fix_config(_result, project_root=None) -> tuple[bool, str]:
         root: Path | None = resolve_project_root(str(project_root) if project_root else None)
     except OSError:
         root = None
+    from .._llm_profile_migration import migrate_llm_profiles
+
+    # First the old [llm] backend keys: they become LLM profiles.
+    migration = migrate_llm_profiles(root)
     report = remove_unusable_values(root)
-    removed = "; ".join(f"{path}: {label}" for path, label in report.removed_keys)
-    message = f"removed {len(report.removed_keys)} config value(s) that fw-context cannot use: {removed}"
-    if report.failures:
-        failed = "; ".join(f"{path}: {reason}" for path, reason in report.failures)
-        return False, f"{message}; {failed}" if report.removed_keys else failed
+    changes = migration.removed_keys + report.removed_keys
+    failures = migration.failures + report.failures
+    removed = "; ".join(f"{path}: {label}" for path, label in changes)
+    message = f"changed {len(changes)} config value(s) that fw-context cannot use: {removed}"
+    if failures:
+        failed = "; ".join(f"{path}: {reason}" for path, reason in failures)
+        return False, f"{message}; {failed}" if changes else failed
     return True, message
 
 

@@ -6,9 +6,11 @@ import pytest
 
 from fw_context_mcp.config.settings import (
     Config,
+    ConfigError,
     _deep_merge,
     _ensure_project_local_config,
     _from_dict,
+    _resolve_llm_profile,
     derive_project_id,
     load,
     transient_defines_problems,
@@ -66,13 +68,26 @@ class TestFromDict:
         assert cfg.index.project_paths == ["src/old_hal"]
 
     def test_llm_settings(self):
-        cfg = _from_dict({
+        """The backend values come from the selected profile: ``_from_dict`` reads ``[llm]``, then ``load`` resolves the profile.
+
+        ``_from_dict`` alone keeps the name of the profile only.  WHY the
+        resolution is a separate step: it must know the file that selects
+        the profile, for the error of a name that is not a profile.
+        """
+        data = {
             "llm": {
-                "ollama_url": "http://localhost:9999",
-                "model": "deepseek-coder",
-                "num_ctx": 4096,
-            }
-        })
+                "profile": "p",
+                "profiles": {
+                    "p": {"provider": "ollama", "url": "http://localhost:9999", "model": "deepseek-coder", "num_ctx": 4096},
+                },
+            },
+        }
+        cfg = _from_dict(data)
+        assert (cfg.llm.profile, cfg.llm.model) == ("p", Config().llm.model)
+
+        _resolve_llm_profile(data, cfg.llm, {}, Path("/no-such-dir/config.toml"))
+
+        assert cfg.llm.provider == "ollama"
         assert cfg.llm.ollama_url == "http://localhost:9999"
         assert cfg.llm.model == "deepseek-coder"
         assert cfg.llm.num_ctx == 4096
@@ -173,16 +188,33 @@ class TestLocalConfig:
         assert path.read_text() == "# my custom config\n[llm]\nmodel = \"my-model\"\n"
 
     def test_load_with_local_toml(self, tmpdir, monkeypatch):
-        """load() reads local.toml as the 4th layer."""
+        """load() reads local.toml as the 4th layer.
+
+        The backend values are in the profiles of the global config, thus
+        local.toml selects a different profile than the global config does.
+        """
         import fw_context_mcp.config.settings as settings
 
         fake_home = tmpdir / "fake-home"
         fake_home.mkdir()
         monkeypatch.setattr(Path, "home", lambda: fake_home)
         # The fake home does not move _GLOBAL_CONFIG_PATH, which the module
-        # computes at import.  Point it to a temp file that does not exist
-        # yet, thus load() creates it there and not in the real home.
-        monkeypatch.setattr(settings, "_GLOBAL_CONFIG_PATH", Path(fake_home) / "global.toml")
+        # computes at import.  Point it to a temp file, thus load() reads it
+        # there and not in the real home.
+        global_cfg = Path(fake_home) / "global.toml"
+        global_cfg.write_text("""\
+[llm]
+profile = "shared"
+
+[llm.profiles.shared]
+provider = "ollama"
+model = "global-model"
+
+[llm.profiles.mine]
+provider = "ollama"
+model = "my-local-model"
+""")
+        monkeypatch.setattr(settings, "_GLOBAL_CONFIG_PATH", global_cfg)
 
         # Create project config (shared)
         proj_dir = tmpdir / "project"
@@ -200,13 +232,13 @@ vendor_paths = ["third_party"]
         # Create local config
         (fw_dir / "local.toml").write_text("""\
 [llm]
-model = "my-local-model"
+profile = "mine"
 """)
 
         cfg = load(proj_dir)
         assert cfg.build.board == "nrf52840"
         assert cfg.index.vendor_paths == ["third_party"]
-        assert cfg.llm.model == "my-local-model"
+        assert (cfg.llm.profile, cfg.llm.model) == ("mine", "my-local-model")
 
 
 class TestRetiredQueryDriverKeys:
@@ -293,16 +325,46 @@ class TestRetiredQueryDriverKeys:
         """The build runs the code of the repository in all cases.
 
         Thus a warning on a committed ``pre_build`` or ``command`` protected
-        nothing, and it is gone.  A non-local ``ollama_url`` still warns.
+        nothing, and it is gone.  A committed file cannot name the LLM
+        server at all: see the two tests below.
         """
         committed = '[build]\npre_build = "make gen"\ncommand = "make"\n'
         load(self._project(tmpdir, monkeypatch, committed))
         assert "SECURITY" not in caplog.text
 
-    def test_a_committed_remote_ollama_url_still_warns(self, tmpdir, monkeypatch, caplog):
+    def test_a_committed_profile_is_a_config_error(self, tmpdir, monkeypatch):
+        """A committed config.toml cannot send the source code to a host that the repository selects.
+
+        This replaces the SECURITY warning on a committed non-loopback
+        ``ollama_url``.  A profile names the server, and the profiles are in
+        the global config only: the repository can only select a profile of
+        the user.  The error is not removable: ``doctor --fix`` must not
+        throw a setting away.
+        """
+        committed = (
+            '[llm]\nprofile = "remote"\n'
+            '[llm.profiles.remote]\nprovider = "ollama"\nmodel = "m"\nurl = "http://198.51.100.7:11434"\n'
+        )
+        root = self._project(tmpdir, monkeypatch, committed)
+
+        with pytest.raises(ConfigError) as caught:
+            load(root)
+
+        assert caught.value.path == root / ".fw-context" / "config.toml"
+        assert caught.value.problem.startswith("[llm.profiles] is in the global config only"), caught.value.problem
+        assert not caught.value.removable
+
+    def test_a_committed_ollama_url_is_a_config_error(self, tmpdir, monkeypatch):
+        """The old key named the server in the committed file: it now stops ``load`` and names its new place."""
         committed = '[llm]\nollama_url = "http://198.51.100.7:11434"\n'
-        load(self._project(tmpdir, monkeypatch, committed))
-        assert "SECURITY: ollama_url" in caplog.text
+        root = self._project(tmpdir, monkeypatch, committed)
+
+        with pytest.raises(ConfigError) as caught:
+            load(root)
+
+        assert caught.value.path == root / ".fw-context" / "config.toml"
+        assert caught.value.problem.startswith("[llm] ollama_url is a key of an LLM profile now"), caught.value.problem
+        assert "198.51.100.7" not in str(caught.value)
 
 
 class TestMalformedSection:
@@ -476,11 +538,11 @@ class TestLoadCreatesNoProjectFile:
         (project / ".fw-context").mkdir(parents=True)
         local = project / ".fw-context" / "local.toml"
 
-        assert load(project).llm.num_ctx != 1234
-        local.write_text("[llm]\nnum_ctx = 1234\n", encoding="utf-8")
-        assert load(project).llm.num_ctx == 1234
+        assert load(project).llm.embed_dim != 1234
+        local.write_text("[llm]\nembed_dim = 1234\n", encoding="utf-8")
+        assert load(project).llm.embed_dim == 1234
         local.unlink()
-        assert load(project).llm.num_ctx != 1234
+        assert load(project).llm.embed_dim != 1234
 
     def test_get_project_status_creates_nothing_before_init(self, tmp_path):
         from fw_context_mcp.mcp.handlers.maintenance import get_project_status

@@ -271,9 +271,9 @@ def _llm_summary(cfg) -> str:
     llm = cfg.llm
     if not llm.enabled:
         return "disabled"
-    if llm.chat_api_base:
-        return f"cloud API {llm.model} @ {llm.chat_api_base}"
-    return f"ollama + {llm.model} + {llm.embed_model or 'auto'}"
+    server = llm.chat_api_base or llm.ollama_url
+    return (f"profile {llm.profile or '(default)'}: {llm.provider} {llm.model} @ {server}, "
+            f"embedding {llm.embed_model or 'auto'}")
 
 
 def prompt_llm_config(project_root: Path, cfg, *, non_interactive: bool) -> None:
@@ -430,6 +430,44 @@ def _use_global_llm(project_root: Path, *, remove_local: bool, old_embed_model: 
         )
 
 
+def _save_profile(project_root: Path, name: str, values: dict[str, object], updates: dict[str, object]) -> bool:
+    """Write the profile *name*, select it for the project with *updates*, and do a test call.
+
+    Returns True when the two files changed and the test call passed.
+    When the test call fails, the global config gets its earlier text
+    back.  WHY: ``configure_llm_core`` puts back only ``local.toml``.
+    Before, a profile that failed its test stayed in the global config,
+    and a profile of the same name that worked before was replaced by it.
+    """
+    from ..config import settings
+    from ..config._profiles import set_profile
+    from ..config._toml_editor import _atomic_write
+    from ..llm.configure import configure_llm_core
+
+    try:
+        global_path = settings._ensure_global_config()
+        previous = global_path.read_text(encoding="utf-8")
+        set_profile(name, values)
+    except (ValueError, OSError, settings.ConfigError) as e:
+        print(f"  [warn] The profile {name!r} is not written: {e}")
+        return False
+    res = configure_llm_core(project_root, updates)
+    # An error means that no new setting is saved: the core puts the old
+    # settings of local.toml back, or the write itself failed.  When the
+    # core cannot put the old settings back, its message says so.
+    if res.get("status") == "ok":
+        return True
+    print(f"  [warn] {res.get('message', 'LLM test call failed')}")
+    try:
+        _atomic_write(global_path.resolve(), previous)
+    except OSError as e:
+        print(
+            f"  [warn] init cannot write the earlier text of {global_path} back ({e}): "
+            f"the profile {name!r} stays in it. Read the file before the next command."
+        )
+    return False
+
+
 def _prompt_ollama_setup(project_root: Path, cfg) -> None:
     """Interactive local-Ollama setup: recommend models, pull with consent.
 
@@ -437,13 +475,17 @@ def _prompt_ollama_setup(project_root: Path, cfg) -> None:
     else the recommendation.  WHY: before, the defaults were always the
     recommendation, thus Enter replaced a model of the global config, for
     example a larger chat model, with the recommended one.  Not a model
-    that Ollama does not serve: the chat model of a cloud API
-    (``chat_api_base``), or an embedding model of sentence-transformers or
-    ``ft://``.  The step would offer to pull it from Ollama.
+    that Ollama does not serve: the chat model of an API profile, or an
+    embedding model of sentence-transformers or ``ft://``.  The step would
+    offer to pull it from Ollama.
+
+    The chat model goes to an Ollama profile of the global config: the
+    selected profile when it is an Ollama one, else ``local``.  Its other
+    keys stay; the project then selects it in ``local.toml``.
     """
-    from ..config.settings import llm_key_sources
+    from ..config._profiles import project_profile_name, replaces_other_values
+    from ..config.settings import llm_key_sources, read_config_file
     from ..llm.auto_model import _gpu_available
-    from ..llm.configure import configure_llm_core
     from ..llm.embedder_factory import uses_ollama
     from ..llm.ollama import check_setup
 
@@ -451,7 +493,8 @@ def _prompt_ollama_setup(project_root: Path, cfg) -> None:
     chat_recommended = _DEFAULT_CHAT_MODEL
     embed_recommended = "qwen3-embedding:8b" if gpu else "qwen3-embedding:0.6b"
     sources = llm_key_sources(project_root)
-    chat_from_config = "model" in sources and cfg.llm.model and not cfg.llm.chat_api_base
+    ollama_profile = cfg.llm.provider == "ollama" and bool(cfg.llm.profile)
+    chat_from_config = ollama_profile and bool(cfg.llm.model)
     chat_default = cfg.llm.model if chat_from_config else chat_recommended
     embed_from_config = "embed_model" in sources and cfg.llm.embed_model and uses_ollama(cfg.llm)
     embed_default = cfg.llm.embed_model if embed_from_config else embed_recommended
@@ -494,26 +537,45 @@ def _prompt_ollama_setup(project_root: Path, cfg) -> None:
         ok, msg = _ollama_pull(embed, cfg.llm.ollama_url)
         print(f"  [{'ok' if ok else 'warn'}] {msg}")
 
-    res = configure_llm_core(
-        project_root,
-        {"enabled": True, "model": chat, "embed_model": embed},
-        # Switching from cloud → local Ollama must clear any previously
-        # configured cloud endpoint, otherwise chat keeps routing externally.
-        clear_keys=["chat_api_base", "chat_api_key", "chat_api_format"],
-    )
-    # An error means that no new setting is saved (see the cloud setup).
-    if res.get("status") != "ok":
-        print(f"  [warn] {res.get('message', 'LLM test call failed')}")
+    from ..config import settings
+
+    name = cfg.llm.profile if ollama_profile else "local"
+    profiles = (read_config_file(settings._GLOBAL_CONFIG_PATH).get("llm") or {}).get("profiles") or {}
+    earlier = profiles.get(name)
+    keep: dict = earlier if isinstance(earlier, dict) and earlier.get("provider") == "ollama" else {"url": cfg.llm.ollama_url}
+    values: dict[str, object] = {**keep, "provider": "ollama", "model": chat}
+    # The profile is shared: a new chat model in it is the chat model of
+    # each project that selects it.  Before, the model of a project went to
+    # its own local.toml, thus the question keeps that choice.
+    if replaces_other_values(name, values) and not _confirm(
+        f"The profile {name!r} is shared: each project that selects it gets the chat model {chat}. Change it?",
+        default=False,
+    ):
+        # A profile of that name can be the profile of another project
+        # in a directory of the same name: never replace it.
+        stem, number = f"{name}-{project_profile_name(project_root)}", 1
+        name = stem
+        while replaces_other_values(name, values):
+            number += 1
+            name = f"{stem}-{number}"
+        print(f"  [info] This project gets its own profile {name!r}")
+    if not _save_profile(project_root, name, values, {"enabled": True, "profile": name, "embed_model": embed}):
         return
-    print(f"  [ok] LLM configured: ollama + {chat} + {embed}")
-    print("  [ok] Saved to .fw-context/local.toml")
+    print(f"  [ok] LLM configured: profile {name} (ollama + {chat}), embedding {embed}")
+    print(f"  [ok] Profile saved to {settings._GLOBAL_CONFIG_PATH}; .fw-context/local.toml selects it")
 
 
 def _prompt_cloud_setup(project_root: Path) -> None:
-    """Interactive cloud-API setup: URL, key, model."""
-    from ..config.settings import _is_loopback_url, url_problem
-    from ..llm.configure import configure_llm_core
+    """Interactive cloud-API setup: a profile of provider openai_compatible (name, URL, key variable, model).
 
+    The profile gets the NAME of the environment variable that holds the
+    API key, not the key: a key in a TOML file is a secret in plain text.
+    """
+    from ..config import settings
+    from ..config._profiles import replaces_other_values
+    from ..config.settings import _is_loopback_url, url_problem
+
+    name = prompt_text("Profile name", default="cloud") or "cloud"
     url = prompt_text("API URL") or ""
     if not url:
         print("  [skip] Cloud API setup skipped")
@@ -524,26 +586,29 @@ def _prompt_cloud_setup(project_root: Path) -> None:
     if problem is not None:
         print(f"  [warn] {url} is not a valid URL ({problem}). Cloud API setup skipped")
         return
-    key = prompt_text("API key") or ""
+    key_env = prompt_text("Environment variable with the API key (empty: no key)") or ""
     model = prompt_text("Model", default="deepseek-chat") or "deepseek-chat"
 
     if not _is_loopback_url(url):
         print(f"  ⚠ Source code will be sent to {url}.")
         print("    Ensure this complies with your data security policy.")
 
-    updates: dict[str, object] = {"enabled": True, "chat_api_base": url, "model": model}
-    if key:
-        updates["chat_api_key"] = key
-    res = configure_llm_core(project_root, updates, chat_api_base=url)
-    # An error means that no new setting is saved: the core puts the old
-    # settings back, or the write itself failed.  Before, "[ok] Saved" came
-    # after an error too, and named a setting that was not in the file.
-    # When the core cannot put the old settings back, its message says so.
-    if res.get("status") != "ok":
-        print(f"  [warn] {res.get('message', 'Cloud API setup failed')}")
+    values: dict[str, object] = {"provider": "openai_compatible", "url": url, "model": model, "api_key_env": key_env or None}
+    # Each project that selects the profile uses it: a replaced "local"
+    # profile sent the source code of each project to this API.
+    while replaces_other_values(name, values) and not _confirm(
+        f"The profile {name!r} exists, and each project that selects it uses it. Replace it?", default=False,
+    ):
+        name = prompt_text("Another profile name (empty: skip)") or ""
+        if not name:
+            print("  [skip] Cloud API setup skipped")
+            return
+    # Before, "[ok] Saved" came after an error too, and named a setting
+    # that was not in the file.
+    if not _save_profile(project_root, name, values, {"enabled": True, "profile": name}):
         return
-    print(f"  [ok] LLM configured: cloud API {model} @ {url}")
-    print("  [ok] Saved to .fw-context/local.toml")
+    print(f"  [ok] LLM configured: profile {name} (cloud API {model} @ {url})")
+    print(f"  [ok] Profile saved to {settings._GLOBAL_CONFIG_PATH}; .fw-context/local.toml selects it")
 
 
 # ── Config-first build resolution ───────────────────────────────────────

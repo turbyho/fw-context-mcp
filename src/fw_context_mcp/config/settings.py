@@ -25,11 +25,14 @@ reflection — this avoids fragile naming conventions, gives explicit
 control over type coercion per field, and makes the TOML schema
 self-documenting through the mapping tables themselves.
 
-**Safety — committed config validation:**  ``config.toml`` comes from
-git.  The config loader warns when the committed ``[llm] ollama_url``
-points to a host that is not local, because the LLM prompts send source
-code to that host.  It does not warn on ``pre_build`` or ``command``: the
-build of the project runs the code of the repository in all cases.
+**Safety — the LLM server:**  ``config.toml`` comes from git.  The
+servers of the LLM (they get the source code) are in the profiles of the
+global config only (``[llm.profiles.<name>]``): a project file can only
+select a profile of the user (``[llm] profile``), and a profile in a
+project file is an error.  ``load`` tells on stderr when the selected
+profile sends the source code to a host that is not this machine.  It
+does not warn on ``pre_build`` or ``command``: the build of the project
+runs the code of the repository in all cases.
 """
 
 from __future__ import annotations
@@ -154,27 +157,14 @@ db_dir = "~/.fw-context/index"
 transient_defines = ["MBED_BUILD_TIMESTAMP", "BUILD_TIMESTAMP", "BUILD_TIME", "BUILD_DATE", "BUILD_ID", "BUILD_NUMBER"]
 
 [llm]
-# enabled = false   # uncomment to disable Ollama — LLM-calling tools will return raw prompts
-ollama_url = "http://localhost:11434"
-
-# Chat model for symbolic analysis and search query generation.
-# Minimum recommended: 14B parameters — smaller models produce inconsistent JSON
-# and poor-quality descriptions for C++ embedded code.
-#
-# Recommended models (min. 14B parameters):
-#   Local:
-#     qwen2.5-coder:14b        (4.8 GB VRAM, balanced speed/quality)
-#     deepseek-coder-v2:16b    (10 GB VRAM, strong code comprehension)
-#     qwen2.5-coder:32b        (19 GB VRAM, best local quality)
-#   Cloud (Ollama proxies to cloud APIs — "ollama pull <model>"):
-#     qwen3-coder:480b-cloud         (coding-focused, best quality)
-#     deepseek-v4-flash:cloud        (284B MoE, 13B active — great value)
-#     gemini-3-flash-preview:latest-cloud   (fast, affordable)
-#   See: https://ollama.com/search?c=cloud
-model = "qwen2.5-coder:14b"
-num_ctx = 16384
-# keep_alive = "10m"   # how long to keep model loaded in VRAM after each request
-# timeout = 600.0   # HTTP timeout for Ollama requests in seconds (default 600)
+# enabled = false   # uncomment to disable the LLM — LLM-calling tools will return raw prompts
+# The LLM profile (see [llm.profiles.*] below) of each project.  A project
+# selects a different one in its .fw-context/local.toml: [llm] profile = "<name>".
+profile = "local"
+# The Ollama server of the embeddings: the name of a profile with provider
+# "ollama".  Default: the profile above when it is an Ollama one, else
+# http://localhost:11434.
+# embed_profile = "local"
 # debug_log = "~/.fw-context/llm-debug.jsonl"   # write LLM prompts/responses to JSONL
 
 # Embedding model for semantic_search (auto-detected when not set).
@@ -196,6 +186,50 @@ num_ctx = 16384
 # embed_doc_prompt = ""
 
 analyze_symbols = true
+
+# ── LLM profiles ──
+# Each profile is one LLM backend.  The profiles are in this global config
+# only: a project selects one with [llm] profile.  The keys of a profile:
+#   provider     "ollama" or "openai_compatible" (required)
+#   model        the chat model (required)
+#   url          the server.  Ollama: default http://localhost:11434.
+#                openai_compatible: required (for example https://api.deepseek.com)
+#   timeout      seconds for one request (default 600)
+#   stream       true: stream the answer, for a server behind a proxy (default false)
+#   Ollama only:
+#     num_ctx         the context of a request in tokens (default 16384)
+#     keep_alive      how long the model stays loaded after a request (default "10m")
+#     auto_pull       true: pull a model that is not installed (default false)
+#     max_concurrent  Ollama requests at the same time in one process (default 1)
+#   openai_compatible only:
+#     api_key_env     the environment variable that holds the API key
+[llm.profiles.local]
+provider = "ollama"
+url = "http://localhost:11434"
+# Chat model for symbolic analysis and search query generation.
+# Minimum recommended: 14B parameters — smaller models produce inconsistent JSON
+# and poor-quality descriptions for C++ embedded code.
+#
+# Recommended models (min. 14B parameters):
+#   Local:
+#     qwen2.5-coder:14b        (4.8 GB VRAM, balanced speed/quality)
+#     deepseek-coder-v2:16b    (10 GB VRAM, strong code comprehension)
+#     qwen2.5-coder:32b        (19 GB VRAM, best local quality)
+#   Cloud (Ollama proxies to cloud APIs — "ollama pull <model>"):
+#     qwen3-coder:480b-cloud         (coding-focused, best quality)
+#     deepseek-v4-flash:cloud        (284B MoE, 13B active — great value)
+#   See: https://ollama.com/search?c=cloud
+model = "qwen2.5-coder:14b"
+num_ctx = 16384
+# keep_alive = "10m"
+# timeout = 600.0
+
+# An OpenAI-compatible API (the source code goes to its host):
+# [llm.profiles.deepseek]
+# provider = "openai_compatible"
+# url = "https://api.deepseek.com"
+# model = "deepseek-chat"
+# api_key_env = "DEEPSEEK_API_KEY"
 """
 
 _PROJECT_DEFAULTS_TEMPLATE = """\
@@ -296,8 +330,8 @@ _PROJECT_DEFAULTS_TEMPLATE = """\
 # [call_graph.dispatch_bridges]
 # "events::EventQueue::call_every" = "my_app::event_loop"
 
-# LLM and local-path settings belong in local.toml (gitignored).
-# See local.toml for ollama_url, model, db_dir, etc.
+# The LLM profiles are in the global config (~/.fw-context/config.toml).
+# Select the profile of this project, and local paths, in local.toml (gitignored).
 """
 
 _PROJECT_LOCAL_DEFAULTS_TEMPLATE = """\
@@ -315,13 +349,10 @@ _PROJECT_LOCAL_DEFAULTS_TEMPLATE = """\
 
 [build]
 [llm]
-# enabled = false   # disable Ollama, return raw prompts for the agent to answer
-# ollama_url = "http://localhost:11434"
-# model = "qwen2.5-coder:14b"   # minimum 14B recommended — see global config for options
-# num_ctx = 16384
-# keep_alive = "10m"   # how long to keep model loaded in VRAM after each request
-# timeout = 600.0   # HTTP timeout for Ollama requests in seconds (default 600)
+# profile = "local"   # the LLM profile of this project: a profile of the global config
+# enabled = false   # disable the LLM, return raw prompts for the agent to answer
 # debug_log = "~/.fw-context/llm-debug.jsonl"   # write LLM prompts/responses to JSONL
+# embed_profile = "local"   # the Ollama profile of the embeddings
 # Embedding model for semantic_search (auto-detected when not set).
 # Auto-detect: GPU available → qwen3-embedding:8b, CPU-only → qwen3-embedding:0.6b.
 # Set explicitly below to override.
@@ -342,33 +373,6 @@ _PROJECT_LOCAL_DEFAULTS_TEMPLATE = """\
 # analyze_symbols = true    # generate structured symbol descriptions (summary, inputs, outputs) — enabled by default
 # analyze_vendor = false    # when true, also analyze vendor/SDK code (mbed-os, Zephyr, etc.) — can add hours
 
-# ── Chat API — use OpenAI-compatible API for chat instead of local Ollama ──
-# When set, chat calls are routed to this endpoint. Embedding still uses
-# local Ollama (embed_model above). Format is auto-detected from the URL:
-#   :11434 or /api/generate → Ollama native (keeps keep_alive, num_ctx, auto_pull)
-#   /v1 or bare host       → OpenAI-compatible (DeepSeek, OpenAI, LiteLLM, vLLM, etc.)
-# Examples:
-#   chat_api_base = "https://api.deepseek.com/v1"   # DeepSeek
-#   chat_api_base = "https://api.openai.com/v1"     # OpenAI
-#   chat_api_base = "http://localhost:4000"          # LiteLLM proxy
-#   chat_api_base = "http://localhost:8080/v1"       # llama.cpp
-# chat_api_base = ""
-# chat_api_key = ""   # Bearer token — required by most cloud APIs
-# chat_api_format = "auto"   # "auto" | "ollama" | "openai" (override detection)
-
-# Auto-pull models on 404 (Ollama only). Set true for auto-recovery in
-# online environments. Set false (default) for intranet/offline — model
-# pulls must be done explicitly via `ollama pull` or the agent flow.
-# auto_pull = false
-
-# Stream chat responses (both OpenAI-compatible and Ollama-native).
-# When true, sends stream:true and consumes SSE chunks — keeps the HTTP
-# connection alive with continuous data flow, avoiding reverse-proxy idle
-# timeouts (nginx 60s, Cloudflare 100s). Default false — non-streaming is
-# sufficient for local Ollama. When false, SSE responses are still
-# auto-detected and parsed as a fallback.
-# stream = false
-
 [index]
 # db_dir = "~/.fw-context/index"   # where to store the SQLite index database
 """
@@ -376,9 +380,23 @@ _PROJECT_LOCAL_DEFAULTS_TEMPLATE = """\
 
 @dataclass
 class LLMConfig:
-    """LLM (Ollama) configuration for symbol analysis, search query generation, and embeddings.
+    """LLM configuration for symbol analysis, search query generation, and embeddings.
+
+    The config file names the backend in a profile (``[llm.profiles.<name>]``
+    of the global config); ``load`` copies the profile that ``profile``
+    selects into the backend fields of this object (``ollama_url``,
+    ``model``, ``num_ctx``, ``chat_api_base``, ...).  A reader thus reads
+    the fields as before, and only ``load`` knows the profiles.  Without
+    profiles (an empty config, a test), the defaults are a local Ollama.
 
     Attributes:
+        profile: The name of the selected profile.  Empty: no profile (the
+            defaults), or the only profile of the global config.
+        provider: The kind of the backend of the profile: ``"ollama"`` or
+            ``"openai_compatible"``.
+        embed_profile: The name of the Ollama profile of the embeddings.
+            Empty: the selected profile when it is an Ollama one, else
+            ``http://localhost:11434``.
         enabled: Set False to disable all Ollama calls — tools return raw prompts
             for the agent to answer instead.
         ollama_url: Ollama API endpoint (must be a loopback address unless you
@@ -466,6 +484,9 @@ class LLMConfig:
     chat_api_format: str = "auto"
     auto_pull: bool = False
     stream: bool = False
+    profile: str = ""
+    provider: str = "ollama"
+    embed_profile: str = ""
 
     def embed_key(self) -> str:
         """Return ``embed_model`` with description version for cache disambiguation.
@@ -913,26 +934,52 @@ _INDEX_FIELDS: list[tuple[str, str, str]] = [
 
 _LLM_FIELDS: list[tuple[str, str, str]] = [
     ("enabled", "enabled", "bool"),
-    ("ollama_url", "ollama_url", "str"),
-    ("model", "model", "str"),
+    ("profile", "profile", "str"),
+    ("embed_profile", "embed_profile", "str"),
     ("embed_model", "embed_model", "str"),
     ("embed_query_prompt", "embed_query_prompt", "str"),
     ("embed_doc_prompt", "embed_doc_prompt", "str"),
     ("embed_dim", "embed_dim", "int"),  # -1 = auto-detect (maps to None)
-    ("num_ctx", "num_ctx", "int"),
-    ("timeout", "timeout", "float"),
-    ("keep_alive", "keep_alive", "str"),
     ("debug_log", "debug_log", "path"),
     ("analyze_symbols", "analyze_symbols", "bool"),
     ("analyze_vendor", "analyze_vendor", "bool"),
     ("reranker_model", "reranker_model", "str"),
-    ("ollama_max_concurrent", "ollama_max_concurrent", "int"),
-    ("chat_api_base", "chat_api_base", "str"),
-    ("chat_api_key", "chat_api_key", "str"),
-    ("chat_api_format", "chat_api_format", "str"),
-    ("auto_pull", "auto_pull", "bool"),
-    ("stream", "stream", "bool"),
 ]
+
+#: The ``[llm]`` keys that a profile holds now (``[llm.profiles.<name>]``).
+#: ``load`` gives a ConfigError for a file with one of them, with the place
+#: where it goes: ``load`` itself converts nothing.  ``fw-context init`` and
+#: ``fw-context doctor --fix --only config`` convert them
+#: (``_llm_profile_migration``; decision of the user, 2026-10-20).  WHY not
+#: ``RETIRED_KEYS``: that removes a key without a word, and the backend,
+#: the model and the server would be lost.
+_MOVED_LLM_KEYS: tuple[str, ...] = (
+    "ollama_url", "model", "num_ctx", "timeout", "keep_alive", "stream", "auto_pull",
+    "ollama_max_concurrent", "chat_api_base", "chat_api_key", "chat_api_format",
+)
+
+#: The providers of a profile.
+_PROVIDERS: tuple[str, ...] = ("ollama", "openai_compatible")
+
+#: The keys of a profile, with their converter: the keys of each provider,
+#: then the keys of the given provider (``_PROFILE_PROVIDER_FIELDS``).
+_PROFILE_FIELDS: dict[str, str] = {"provider": "str", "model": "str", "timeout": "float", "stream": "bool"}
+_PROFILE_PROVIDER_FIELDS: dict[str, dict[str, str]] = {
+    "ollama": {"url": "str", "num_ctx": "int", "keep_alive": "str", "auto_pull": "bool", "max_concurrent": "int"},
+    "openai_compatible": {"url": "str", "api_key_env": "str"},
+}
+
+#: The profile keys whose default keeps the backend the same: a value of the
+#: wrong type gives a warning and the default, as ``_TUNING_KEYS``.
+#: ``provider``, ``model``, ``url`` and ``api_key_env`` select the backend,
+#: thus a wrong value there is a ConfigError.
+_PROFILE_TUNING_KEYS: frozenset[str] = frozenset(
+    {"timeout", "stream", "num_ctx", "keep_alive", "auto_pull", "max_concurrent"},
+)
+
+#: The Ollama server of a profile that names no ``url``, and of the
+#: embeddings when no Ollama profile is selected for them.
+_DEFAULT_OLLAMA_URL = "http://localhost:11434"
 
 _UPDATES_FIELDS: list[tuple[str, str, str]] = [
     ("check", "check", "bool"),
@@ -1128,39 +1175,6 @@ def _ensure_project_local_config(project_root: Path) -> Path:
     )
 
 
-def _validate_config_safety(proj_data: dict, proj_path: Path) -> None:
-    """Warn if the committed config sends source code to another host.
-
-    The committed config (``.fw-context/config.toml``) comes from git.  A
-    non-local ``ollama_url`` there sends source code from the machine of
-    each developer to a host that the repository selects.
-
-    **Why the committed layer alone?**  The check reads the committed layer
-    BEFORE the merge with ``local.toml``, because a ``local.toml`` value is
-    the choice of the developer.
-
-    WHY no check of ``[build] pre_build`` and ``command``: the build of the
-    project runs the code of the repository (Makefile, CMake, PlatformIO
-    scripts) in all cases, thus a warning on these two keys protects nothing.
-
-    .. versionadded:: v0.18
-    """
-    ollama_url = (proj_data.get("llm") or {}).get("ollama_url")
-    if ollama_url and not _is_loopback_url(ollama_url):
-        msg = (
-            f"SECURITY: ollama_url ({ollama_url}) in .fw-context/config.toml "
-            f"(committed) points to a non-local host.  Source code snippets in "
-            f"LLM prompts would be sent to that host.  Use localhost or move "
-            f"ollama_url to .fw-context/local.toml (gitignored) instead."
-        )
-        # The log only, as _warn_retired_once: a CLI run logs to stderr, and
-        # a second print showed the warning two times.
-        log.warning(msg)
-
-#: The ``[llm]`` keys that hold a URL.  ``load`` reads the host of each.
-_URL_KEYS = ("ollama_url", "chat_api_base")
-
-
 def url_problem(value: str) -> str | None:
     """Return why ``urlparse`` cannot read the host of *value*, or None.
 
@@ -1232,18 +1246,9 @@ _TUNING_KEYS: frozenset[tuple[str, str]] = frozenset({
     ("build", "timeout"),
     ("build", "clean"),
     ("llm", "enabled"),
-    ("llm", "model"),
-    ("llm", "num_ctx"),
-    ("llm", "timeout"),
-    ("llm", "keep_alive"),
     ("llm", "analyze_symbols"),
     ("llm", "analyze_vendor"),
     ("llm", "reranker_model"),
-    ("llm", "ollama_max_concurrent"),
-    ("llm", "chat_api_key"),
-    ("llm", "chat_api_format"),
-    ("llm", "auto_pull"),
-    ("llm", "stream"),
     ("cache_server", "token"),
     ("cache_server", "batch_size"),
     ("cache_server", "force"),
@@ -1274,12 +1279,21 @@ class ValueProblem:
     critical: bool = True
 
 
-def config_value_problems(layer: dict) -> list[ValueProblem]:
+def config_value_problems(layer: dict, *, global_file: bool = True) -> list[ValueProblem]:
     """Return each value of one config file that ``load`` cannot use, in the order of the file.
 
     *layer* is the parsed TOML of one file.  The types come from the field
     tables, thus a new key needs no change here.  A key that fw-context
-    does not know is not a problem here: ``load`` warns about it.
+    does not know is not a problem here: ``load`` warns about it.  A key
+    of a profile (``[llm.profiles.<name>]``) that fw-context does not know
+    is a problem: a typo there selects a different backend.
+
+    *global_file* is False for ``config.toml`` and ``local.toml`` of a
+    project: a profile there is a problem.  WHY the profiles are in the
+    global config only: a profile names the server that gets the source
+    code.  A committed ``config.toml`` could otherwise send it to a host
+    that the repository selects; now it can only select a profile of the
+    user.
 
     WHY a list and not the first problem: ``fw-context doctor`` shows each
     value, and ``doctor --fix --only config`` removes each one in one run.  The message
@@ -1312,10 +1326,7 @@ def config_value_problems(layer: dict) -> list[ValueProblem]:
                     check((section, key), f"[{section}] {key}", table[key], conv)
     llm = layer.get("llm")
     if isinstance(llm, dict):
-        for key in _URL_KEYS:
-            value = llm.get(key)
-            if isinstance(value, str) and (problem := url_problem(value)) is not None:
-                problems.append(ValueProblem(("llm", key), f"[llm] {key} is not a valid URL ({problem})"))
+        _llm_profile_problems(llm, problems, global_file=global_file)
     build = layer.get("build")
     if isinstance(build, dict) and "variants" in build:
         _variant_problems(build["variants"], problems, check)
@@ -1323,6 +1334,92 @@ def config_value_problems(layer: dict) -> list[ValueProblem]:
     if isinstance(graph, dict) and "dispatch_bridges" in graph:
         check(("call_graph", "dispatch_bridges"), "[call_graph] dispatch_bridges", graph["dispatch_bridges"], "str_table")
     return problems
+
+
+def _llm_profile_problems(llm: dict, problems: list[ValueProblem], *, global_file: bool) -> None:
+    """Add the problems of the profiles, and of the keys that moved into a profile, to *problems*.
+
+    A moved key and a profile in a project file cannot be removed by
+    ``doctor --fix`` (*removable* False): the value is a setting that the
+    user moves, not a value to throw away.
+    """
+    # The converters refuse a file with chat_api_key: its message must not
+    # name them (``_llm_profile_migration``).
+    convert = (
+        "Put the API key into an environment variable and name it with api_key_env of the profile"
+        if "chat_api_key" in llm
+        else "'fw-context doctor --fix --only config' or 'fw-context init' converts it"
+    )
+    for key in _MOVED_LLM_KEYS:
+        if key in llm:
+            problems.append(ValueProblem(
+                ("llm", key),
+                f"[llm] {key} is a key of an LLM profile now: move it to [llm.profiles.<name>] of the global config "
+                f"({_GLOBAL_CONFIG_PATH}), and select the profile with [llm] profile = \"<name>\". "
+                f"{convert} (see docs/configuration.md)",
+                removable=False,
+            ))
+    if "profiles" not in llm:
+        return
+    profiles = llm["profiles"]
+    if not global_file:
+        problems.append(ValueProblem(
+            ("llm", "profiles"),
+            f"[llm.profiles] is in the global config only ({_GLOBAL_CONFIG_PATH}): a project selects one "
+            f"with [llm] profile = \"<name>\"",
+            removable=False,
+        ))
+        return
+    if not isinstance(profiles, dict):
+        problems.append(ValueProblem(("llm", "profiles"), f"[llm] profiles must be a table, not {_toml_type(profiles)}"))
+        return
+    for name, profile in profiles.items():
+        keys: tuple[str | int, ...] = ("llm", "profiles", name)
+        label = f"[llm.profiles.{name}]"
+        if not isinstance(profile, dict):
+            problems.append(ValueProblem(keys, f"{label} must be a table, not {_toml_type(profile)}"))
+            continue
+        provider = profile.get("provider")
+        if provider not in _PROVIDERS:
+            problems.append(ValueProblem(
+                (*keys, "provider") if "provider" in profile else keys,
+                f"{label} provider must be one of {', '.join(_PROVIDERS)}"
+                + ("" if "provider" in profile else " (the key is missing)"),
+                removable=False,
+            ))
+            continue
+        fields = {**_PROFILE_FIELDS, **_PROFILE_PROVIDER_FIELDS[provider]}
+        required = ("model", "url") if provider == "openai_compatible" else ("model",)
+        # Only a value of _PROFILE_TUNING_KEYS can be removed (``doctor
+        # --fix``): its default keeps the backend.  A removed ``url``,
+        # ``model`` or unknown key (a typo of ``url``) would send the
+        # requests to another server or model without a word.
+        for key in required:
+            # A value of the wrong type gets its own problem below, not a second one here.
+            if key not in profile or profile[key] == "":
+                problems.append(ValueProblem(
+                    keys, f"{label} needs {key} (a string that is not empty) for provider {provider}", removable=False,
+                ))
+        for key, value in profile.items():
+            conv = fields.get(key)
+            if conv is None:
+                problems.append(ValueProblem(
+                    (*keys, key), f"{label} {key} is not a key of a profile of provider {provider} "
+                    f"(keys: {', '.join(sorted(fields))})",
+                    removable=False,
+                ))
+                continue
+            expected = _expected_type(value, conv)
+            tuning = key in _PROFILE_TUNING_KEYS
+            if expected is not None:
+                problems.append(ValueProblem(
+                    (*keys, key), f"{label} {key} must be {expected}, not {_toml_type(value, conv)}",
+                    removable=tuning, critical=not tuning,
+                ))
+            elif key == "url" and (problem := url_problem(value)) is not None:
+                problems.append(ValueProblem(
+                    (*keys, key), f"{label} url is not a valid URL ({problem})", removable=False,
+                ))
 
 
 def _variant_problems(variants: object, problems: list[ValueProblem], check: Callable[..., None]) -> None:
@@ -1466,7 +1563,7 @@ def _toml_type(value: object, conv: str = "", *, strict: bool = False) -> str:
 _value_warned: set[tuple[Path, str]] = set()
 
 
-def _check_layer(layer: dict, path: Path, warnings: list[str]) -> None:
+def _check_layer(layer: dict, path: Path, warnings: list[str], *, global_file: bool) -> None:
     """Raise ``ConfigError`` for the first critical value of one config file that ``load`` cannot use.
 
     A value of a key of ``_TUNING_KEYS`` is removed from *layer* instead:
@@ -1482,18 +1579,18 @@ def _check_layer(layer: dict, path: Path, warnings: list[str]) -> None:
     default.  ``urlparse`` raised ``ValueError`` for ``"http://[::1"``, and
     that stopped the MCP server before its tools were there.
     """
-    problems = config_value_problems(layer)
+    problems = config_value_problems(layer, global_file=global_file)
     critical = [problem for problem in problems if problem.critical]
     if critical:
         more = f" (and {len(critical) - 1} more)" if len(critical) > 1 else ""
         raise ConfigError(path, critical[0].message + more, removable=all(p.removable for p in critical), values=True)
     for problem in problems:
         # A key of _TUNING_KEYS, or the section [updates].
-        if len(problem.keys) == 1:
-            layer.pop(problem.keys[0])
-        else:
-            section, key = problem.keys
-            layer[section].pop(key)
+        # The value can be nested, for example ("llm", "profiles", name, key).
+        table = layer
+        for key in problem.keys[:-1]:
+            table = table[key]
+        table.pop(problem.keys[-1])
         warnings.append(f"{path}: {problem.message}")
         if (path, problem.message) not in _value_warned:
             _value_warned.add((path, problem.message))
@@ -1675,13 +1772,11 @@ def read_config_file(path: Path) -> dict:
         raise ConfigError(path, f"not valid TOML: {exc}") from exc
 
 
-#: The ``[llm]`` keys that select the LLM backend: on or off, the chat model
-#: or the chat API, and the embedding model.  ``fw-context init`` reads them
-#: to tell which config file selects the backend, and its option "use the
-#: global settings" removes them from ``local.toml``.
-LLM_BACKEND_KEYS: tuple[str, ...] = (
-    "enabled", "model", "embed_model", "chat_api_base", "chat_api_key", "chat_api_format",
-)
+#: The ``[llm]`` keys that select the LLM backend: on or off, the profile,
+#: and the embeddings.  ``fw-context init`` reads them to tell which config
+#: file selects the backend, and its option "use the global settings"
+#: removes them from ``local.toml``.
+LLM_BACKEND_KEYS: tuple[str, ...] = ("enabled", "profile", "embed_profile", "embed_model")
 
 
 def llm_key_sources(project_root: Path) -> dict[str, str]:
@@ -1791,6 +1886,136 @@ def _mtime_signature(paths: tuple[Path | None, ...]) -> tuple[float | None, ...]
     return tuple(signature)
 
 
+def _apply_ollama_tuning(llm: LLMConfig, profile: dict) -> None:
+    """Copy the Ollama tuning of *profile* into *llm*; a key that the profile does not set keeps its default.
+
+    ``keep_alive``, ``auto_pull`` and ``max_concurrent`` apply to each
+    request to Ollama, the embeddings too.  Thus they come from the chat
+    profile when it is an Ollama one, else from the embeddings profile.
+    """
+    llm.keep_alive = _convert(profile.get("keep_alive", llm.keep_alive), "str")
+    llm.auto_pull = _convert(profile.get("auto_pull", llm.auto_pull), "bool")
+    llm.ollama_max_concurrent = _convert(profile.get("max_concurrent", llm.ollama_max_concurrent), "int")
+
+
+_key_env_warned: set[tuple[str, str]] = set()
+
+
+def _warn_missing_key_env(profile: str, env_name: str) -> None:
+    """Tell one time for each process that the API key variable of *profile* is not set.
+
+    WHY a notice and not an error: a server that needs no key (a proxy on
+    the local network) is valid, and only the server can say if a key is
+    necessary.  Without the notice, the first sign was an HTTP 401 in the
+    middle of an index run.  The notice names the variable, never a value.
+    """
+    if (profile, env_name) in _key_env_warned:
+        return
+    _key_env_warned.add((profile, env_name))
+    print(
+        f"⚠ LLM profile {profile!r}: the environment variable {env_name} (api_key_env) is not set: "
+        "the requests go without an API key",
+        file=sys.stderr,
+    )
+
+
+def _resolve_llm_profile(data: dict, llm: LLMConfig, selected_in: dict[str, Path], global_path: Path) -> None:
+    """Copy the selected profile into the backend fields of *llm*.
+
+    The profile is ``[llm] profile``; without it, the only profile of the
+    global config.  Without profiles, *llm* keeps its defaults (a local
+    Ollama).  The embeddings use the server of ``[llm] embed_profile``, or
+    of the selected profile when it is an Ollama one, or
+    ``_DEFAULT_OLLAMA_URL``.
+
+    An Ollama chat profile on a server that is not the server of the
+    embeddings goes to ``chat_api_base`` with the format ``"ollama"``:
+    ``ollama_url`` is the server of the embeddings, and the chat client
+    (``get_chat_client``) sends the chat to ``chat_api_base`` when it is
+    set.
+
+    Raises:
+        ConfigError: the selected profile, or the profile of the
+            embeddings, is not a profile of the global config, or it is not
+            an Ollama one.  The error names the file that selects it.
+    """
+    profiles = (data.get("llm") or {}).get("profiles") or {}
+    names = ", ".join(sorted(profiles)) or "none"
+    name = llm.profile
+    if not profiles:
+        if name:
+            raise ConfigError(
+                selected_in.get("profile", global_path),
+                f"[llm] profile = {name!r} names no profile: the global config ({global_path}) has no [llm.profiles] table",
+            )
+        return
+    if not name:
+        if len(profiles) > 1:
+            raise ConfigError(
+                global_path, f'[llm] profile is not set, and the config has {len(profiles)} profiles ({names}): '
+                f'set [llm] profile = "<name>"',
+            )
+        name = next(iter(profiles))
+    if name not in profiles:
+        raise ConfigError(
+            selected_in.get("profile", global_path),
+            f"[llm] profile = {name!r} is not a profile of the global config ({global_path}; profiles: {names})",
+        )
+    profile = profiles[name]
+    llm.profile, llm.provider, llm.model = name, profile["provider"], profile["model"]
+    llm.timeout = _convert(profile.get("timeout", llm.timeout), "float")
+    llm.stream = _convert(profile.get("stream", llm.stream), "bool")
+    chat_url = None
+    if llm.provider == "ollama":
+        chat_url = profile.get("url", _DEFAULT_OLLAMA_URL)
+        llm.num_ctx = _convert(profile.get("num_ctx", llm.num_ctx), "int")
+        _apply_ollama_tuning(llm, profile)
+    else:
+        llm.chat_api_base, llm.chat_api_format = profile["url"], "openai"
+        env_name = profile.get("api_key_env")
+        llm.chat_api_key = os.environ.get(env_name) or None if env_name else None
+        if env_name and llm.chat_api_key is None:
+            _warn_missing_key_env(name, env_name)
+
+    embed_name = llm.embed_profile or (name if llm.provider == "ollama" else "")
+    if embed_name:
+        embed = profiles.get(embed_name)
+        if not isinstance(embed, dict) or embed.get("provider") != "ollama":
+            raise ConfigError(
+                selected_in.get("embed_profile", global_path),
+                f"[llm] embed_profile = {embed_name!r} must name a profile with provider \"ollama\" "
+                f"of the global config ({global_path}; profiles: {names})",
+            )
+        llm.ollama_url = embed.get("url", _DEFAULT_OLLAMA_URL)
+        # Only Ollama gets the embeddings: with a chat on an API, the
+        # tuning of the embeddings profile is the tuning that applies.
+        if llm.provider != "ollama":
+            _apply_ollama_tuning(llm, embed)
+    else:
+        llm.ollama_url = _DEFAULT_OLLAMA_URL
+    if chat_url is not None and chat_url.rstrip("/") != llm.ollama_url.rstrip("/"):
+        llm.chat_api_base, llm.chat_api_format = chat_url, "ollama"
+
+
+def _warn_external_llm(llm: LLMConfig) -> None:
+    """Tell on stderr that the source code goes to a host that is not this machine.
+
+    The chat goes to ``chat_api_base`` when it is set, else to
+    ``ollama_url``; the embeddings always go to ``ollama_url``.  WHY a
+    notice and not an error: the user selected the profile, and that is
+    the consent (decision of the user, 2026-10-20).
+    """
+    for label, url in (("chat", llm.chat_api_base or llm.ollama_url), ("embeddings", llm.ollama_url)):
+        if url and not _is_loopback_url(url):
+            print(
+                f"ℹ The {label} of LLM profile {llm.profile or '(default)'!r} go to {url}: "
+                "source code snippets leave this machine.",
+                file=sys.stderr,
+            )
+            if label == "chat" and url == llm.ollama_url:
+                break
+
+
 def load(project_root: Path | None = None) -> Config:
     """Load merged config for the given project root.
 
@@ -1810,7 +2035,7 @@ def load(project_root: Path | None = None) -> Config:
 
     **Why deep merge?**  Shallow merge loses nested keys —
     ``config.toml`` sets ``[llm] embed_model = "foo"``, ``local.toml`` sets
-    ``[llm] num_ctx = 8192`` — shallow merge would overwrite the entire
+    ``[llm] profile = "gpu"`` — shallow merge would overwrite the entire
     ``[llm]`` dict, discarding ``embed_model``.  Deep merge preserves both.
 
     **Why an error and not the defaults?**  A file that ``load`` ignored
@@ -1843,7 +2068,9 @@ def load(project_root: Path | None = None) -> Config:
     # creates it from template if missing).
     data = read_config_file(global_path)
     warnings: list[str] = []
-    _check_layer(data, global_path, warnings)
+    _check_layer(data, global_path, warnings, global_file=True)
+    # The file that sets each of the two selection keys last: an error names it.
+    selected_in = {key: global_path for key in ("profile", "embed_profile") if key in (data.get("llm") or {})}
     _drop_retired_keys(data, global_path)
     _drop_selection_keys(data, global_path)
 
@@ -1854,55 +2081,31 @@ def load(project_root: Path | None = None) -> Config:
         # Uses _deep_merge so nested sections accumulate — [index] keys
         # from global and project config coexist.
         proj_data = read_config_file(proj_path)
-        _check_layer(proj_data, proj_path, warnings)
+        _check_layer(proj_data, proj_path, warnings, global_file=False)
         _drop_retired_keys(proj_data, proj_path)
         _drop_selection_keys(proj_data, proj_path)
         _warn_project_updates_once(proj_data, proj_path)
         data = _deep_merge(data, proj_data)
-        # A non-loopback ollama_url in the committed config.toml sends
-        # source code to a host that the repository selects.
-        _validate_config_safety(proj_data, proj_path)
+        selected_in.update({key: proj_path for key in ("profile", "embed_profile") if key in (proj_data.get("llm") or {})})
 
         assert local_path is not None
 
         # Phase 3: deep-merge local config (gitignored, per-developer).
         # This is the last merge — local.toml values have highest precedence.
         local_data = read_config_file(local_path)
-        _check_layer(local_data, local_path, warnings)
+        _check_layer(local_data, local_path, warnings, global_file=False)
         _drop_retired_keys(local_data, local_path)
         _drop_selection_keys(local_data, local_path)
         _warn_project_updates_once(local_data, local_path)
         data = _deep_merge(data, local_data)
-
-        # Security: a committed or local config can redirect LLM calls (which
-        # include source-code snippets) to an arbitrary host. Warn loudly.
-        final_url = (data.get("llm") or {}).get("ollama_url")
-        if final_url and not _is_loopback_url(final_url):
-            log.warning(
-                "Config sets a non-local ollama_url (%s). "
-                "Source-code snippets in LLM prompts will be sent to that host.",
-                final_url,
-            )
-            print(
-                f"⚠ WARNING: non-local ollama_url ({final_url}) — source code will be sent to an external host.",
-                file=sys.stderr,
-            )
-
-        # Security: chat_api_base may point to an external cloud API.
-        # Unlike ollama_url (which is typically local), chat_api_base is
-        # explicitly chosen by the user for cloud access — so this is an
-        # informational notice, not a loud warning.
-        chat_base = (data.get("llm") or {}).get("chat_api_base")
-        if chat_base and not _is_loopback_url(chat_base):
-            print(
-                f"ℹ Chat API set to external host ({chat_base}). "
-                "Source code snippets in chat prompts will be sent to this endpoint.",
-                file=sys.stderr,
-            )
+        selected_in.update({key: local_path for key in ("profile", "embed_profile") if key in (local_data.get("llm") or {})})
 
         _warn_retired_toolchains_file(project_root)
 
     cfg = _from_dict(data)
+    _resolve_llm_profile(data, cfg.llm, selected_in, global_path)
+    if project_root is not None:
+        _warn_external_llm(cfg.llm)
     cfg.config_warnings = warnings
     from ..llm.auto_model import resolve_embed_model
     resolve_embed_model(cfg.llm)
@@ -2021,10 +2224,21 @@ def _update_local_toml(
             ``str``, ``bool``, ``int``, ``float``.
         clear_keys: Keys to REMOVE from the ``[llm]`` section (both active
             and commented-out forms).  Used when re-configuring away from a
-            value that must not merely be overwritten — e.g. switching from
-            a cloud API back to local Ollama must clear ``chat_api_base``/
-            ``chat_api_key`` so chat stops routing externally.
+            value that must not merely be overwritten — e.g. "use the
+            global settings" of ``fw-context init`` clears ``profile``, so
+            the project selects the profile of the global config again.
+
+    Raises:
+        ConfigError: a key of *updates* is an old backend key
+            (``_MOVED_LLM_KEYS``): it belongs to a profile of the global
+            config, and ``load`` would refuse the written file.
     """
+    moved = sorted(set(updates) & set(_MOVED_LLM_KEYS))
+    if moved:
+        raise ConfigError(
+            project_root / _PROJECT_CONFIG_DIR / _PROJECT_LOCAL_CONFIG_NAME,
+            f"[llm] {', '.join(moved)} is not written: it is a key of an LLM profile of the global config",
+        )
     local_path = project_root / _PROJECT_CONFIG_DIR / _PROJECT_LOCAL_CONFIG_NAME
     if not local_path.exists():
         _ensure_project_local_config(project_root)

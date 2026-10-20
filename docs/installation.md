@@ -85,7 +85,9 @@ Two project-level files exist:
 | File | Purpose | Git |
 |------|---------|-----|
 | `.fw-context/config.toml` | Shared settings (build, index, project name) | Commit |
-| `.fw-context/local.toml` | Private overrides (LLM model, db path, analysis toggles) | Gitignore |
+| `.fw-context/local.toml` | Private overrides (LLM profile, db path, analysis toggles) | Gitignore |
+
+The LLM profiles (server, model, API key variable) are in the global config `~/.fw-context/config.toml`. A project file only selects a profile.
 
 For the full reference, see **[Configuration →](configuration.md)**.
 
@@ -359,9 +361,11 @@ With the default configuration, Ollama does three jobs:
 
 Alternatives:
 
-- **Chat on another server.** Set `[llm] chat_api_base` to an
-  OpenAI-compatible API. Symbol analysis and query generation then use that
-  API. The embeddings still use the local Ollama.
+- **Chat on another server.** Select an LLM profile with
+  `provider = "openai_compatible"` (see
+  [External chat API examples](configuration.md#external-chat-api-examples)).
+  Symbol analysis and query generation then use that API. The embeddings
+  still use Ollama.
 - **Embeddings without Ollama.** Install the `st` extra
   (`pip install "fw-context-mcp[st]"`) and set `embed_model` to a
   sentence-transformers model, for example `"BAAI/bge-small-en-v1.5"`.
@@ -412,8 +416,8 @@ ollama pull qwen3-coder:480b-cloud   # coding-focused, top quality
 
 # Embedding model — required for vector search. With an empty embed_model
 # (default), fw-context selects qwen3-embedding:8b on a machine with a GPU,
-# and qwen3-embedding:0.6b without one. [llm] auto_pull is false by default,
-# so pull the model yourself:
+# and qwen3-embedding:0.6b without one. auto_pull of an LLM profile is false
+# by default, so pull the model yourself:
 ollama pull qwen3-embedding:0.6b     # or qwen3-embedding:8b with a GPU
 
 # Verify
@@ -444,22 +448,30 @@ ollama run qwen2.5-coder:14b "Explain: void uart_init(int baudrate)"
 
 ### Configure
 
-Edit `~/.fw-context/config.toml` (global) or
-`<project>/.fw-context/local.toml` (per-project override):
+The LLM step of `fw-context init` writes an LLM profile for you. To write
+it yourself, edit the global config `~/.fw-context/config.toml`. Each
+profile is one LLM backend, and `[llm] profile` selects one:
 
 ```toml
 [llm]
-enabled      = true
-model        = "qwen2.5-coder:14b"
+enabled = true
+profile = "local"
 # embed_model = ""                 # empty = auto: qwen3-embedding:8b (GPU) / :0.6b (CPU)
-ollama_url   = "http://localhost:11434"
-num_ctx      = 16384
+
+[llm.profiles.local]
+provider = "ollama"
+url      = "http://localhost:11434"
+model    = "qwen2.5-coder:14b"
+num_ctx  = 16384
 ```
 
-> **Remote Ollama:** Set `ollama_url = "http://192.168.1.50:11434"` if
-> Ollama runs on another machine.
-> **Per-project model:** Use `<project>/.fw-context/local.toml` to override
-> the model for a specific project, for example a 32B model for a large codebase.
+> **Remote Ollama:** Add a profile with `url = "http://192.168.1.50:11434"`
+> when Ollama runs on another machine, and select it with `[llm] profile`.
+> **Per-project model:** Add a profile with a different `model`, for example
+> a 32B model for a large codebase. Then select it in
+> `<project>/.fw-context/local.toml`: `[llm] profile = "<name>"`.
+> A profile in a project file is an error. For each key, see
+> [Configuration](configuration.md#llm--llm-and-embeddings).
 
 ## AI assistant setup
 
@@ -483,26 +495,32 @@ runs these steps, in order:
 1. Audit the dependencies, and auto-fix what it can (missing pip packages).
    Model pulls (`ollama pull`) never run here. `--skip-doctor` skips this
    step. This step comes first, because the next steps write config files.
-2. Detect the build system and its parameters (for example the board).
-3. Generate the project ID when the config has none, and register the
+2. Convert the old `[llm]` backend keys (`ollama_url`, `model`,
+   `chat_api_base` and the other keys) to LLM profiles of the global
+   config (see
+   [Configuration](configuration.md#the-old-llm-backend-keys)).
+3. Detect the build system and its parameters (for example the board).
+4. Generate the project ID when the config has none, and register the
    project in the global project registry.
-4. Detect the build environment of this machine (`python`, `activate`,
+5. Detect the build environment of this machine (`python`, `activate`,
    `idf_path`), and write it to `local.toml`.
-5. Create a missing config file from its template, and add the missing
+6. Create a missing config file from its template, and add the missing
    keys to an existing one: the global config, `.fw-context/config.toml`
    and `.fw-context/local.toml`.
-6. Generate `compile_commands.json` when the project is buildable.
+7. Generate `compile_commands.json` when the project is buildable.
    `--skip-build` skips this step, and so does a project of several variants.
-7. Register the AI tools (skipped by `--quick`).
-8. Update `.gitignore`, and install the skills and the agents (the two
+8. Register the AI tools (skipped by `--quick`).
+9. Update `.gitignore`, and install the skills and the agents (the two
    skipped by `--quick`).
-9. Configure the LLM backend (the LLM step, see
-   [Configuration](configuration.md#how-config-works)). In a pipe, or with
-   `--non-interactive`, this step writes nothing.
-10. Save the detected embedding model one time to the global config. This
+10. Configure the LLM backend (the LLM step, see
+    [Configuration](configuration.md#how-config-works)). Options 1 and 2
+    write an LLM profile to the global config, and select it in
+    `local.toml`.
+    In a pipe, or with `--non-interactive`, this step writes nothing.
+11. Save the detected embedding model one time to the global config. This
     step writes nothing when a config file sets `[llm] embed_model`, or
     when the LLM is off.
-11. Print a checklist of the remaining manual steps.
+12. Print a checklist of the remaining manual steps.
 
 When build-system detection fails, `fw-context init` asks for the missing
 value interactively (build system, board, FQBN, and so on). In a pipe, or

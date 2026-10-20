@@ -461,27 +461,33 @@ MCP server.
 
 1. **Dependencies** — audit and auto-fix fixable issues, such as missing
    pip packages. Model pulls (`ollama pull`) never run in this step.
-   `fw-context init` never removes a config value: only
+   `fw-context init` never removes a config value of the wrong type: only
    `fw-context doctor --fix --only config`, or a full
    `fw-context doctor --fix`, does that. `--skip-doctor` skips this step.
-2. **Build system** — detect the build system and its parameters, or ask
+2. **LLM profiles** — convert the old `[llm]` backend keys (`ollama_url`,
+   `model`, `chat_api_base` and the other keys) of the three config files
+   to LLM profiles of the global config. This step runs before the first
+   load of the config, because the old keys are an error. See
+   [The old `[llm]` backend keys](configuration.md#the-old-llm-backend-keys).
+   `--skip-doctor` does not skip this step.
+3. **Build system** — detect the build system and its parameters, or ask
    for a missing value (see the interactive fallback below).
-3. **Project ID** — generate the ID, and register the project in the
+4. **Project ID** — generate the ID, and register the project in the
    global registry.
-4. **Build environment** — detect the environment that the build needs on
+5. **Build environment** — detect the environment that the build needs on
    this machine, and write it to `.fw-context/local.toml`.
-5. **Config files** — create the global config, `.fw-context/config.toml`
+6. **Config files** — create the global config, `.fw-context/config.toml`
    and `.fw-context/local.toml` from their templates, or add the options
    that a file does not have.
-6. **Build** — generate `compile_commands.json` when the project is
+7. **Build** — generate `compile_commands.json` when the project is
    buildable. A project of several variants builds with
    `fw-context index --build`.
-7. **AI tools** — register the MCP server and inject the instructions.
-8. **Project files** — add the `.gitignore` entries, and install the
+8. **AI tools** — register the MCP server and inject the instructions.
+9. **Project files** — add the `.gitignore` entries, and install the
    skills and the agents.
-9. **LLM** — configure the LLM backend (see the LLM step below).
-10. **Embedding model** — detect the embedding model, and save it one time.
-11. **Checklist** — print the remaining manual steps, grouped by category.
+10. **LLM** — configure the LLM backend (see the LLM step below).
+11. **Embedding model** — detect the embedding model, and save it one time.
+12. **Checklist** — print the remaining manual steps, grouped by category.
 
 **Interactive fallback.** When build-system detection fails (no project
 markers, no board, no FQBN), `fw-context init` asks for the missing value.
@@ -495,9 +501,27 @@ parameters), and for an LLM backend that a project file sets. Press Enter
 to keep the current value.
 
 **The LLM step.** The step tells where the LLM backend comes from, and
-then shows a menu. Option 3 sets `[llm] analyze_symbols = false` in
-`.fw-context/local.toml`: the LLM analysis stops, and the embeddings
-stay. The other options depend on the file that sets the backend:
+then shows a menu. The backend keys are `enabled`, `profile`,
+`embed_profile` and `embed_model` of `[llm]`. The menu has these options:
+
+- Option 1 (local Ollama) writes the chat model to an Ollama profile of
+  the global config: the selected profile when it is an Ollama profile,
+  else the profile `local`. `.fw-context/local.toml` then selects the
+  profile, and gets the embedding model.
+- Option 2 (cloud API) asks for a profile name, the URL, the name of the
+  environment variable that holds the API key, and the model. It writes a
+  profile with `provider = "openai_compatible"` to the global config, and
+  `.fw-context/local.toml` selects it. It never asks for the key itself.
+- Option 3 sets `[llm] analyze_symbols = false` in
+  `.fw-context/local.toml`: the LLM analysis stops, and the embeddings
+  stay.
+
+Options 1 and 2 then send a test request. When the test fails,
+`.fw-context/local.toml` gets its old text back, and the profile stays in
+the global config. See
+[How config works](configuration.md#how-config-works).
+
+Option 0 depends on the file that sets the backend:
 
 - Only the global config sets it: option 0 "Use the global settings" is
   the default (Enter), and writes nothing.
@@ -514,11 +538,11 @@ config sets the backend, the step prints the settings. When no file sets
 it, the step prints how to configure it.
 
 **The embedding model.** When no config file sets `[llm] embed_model`,
-fw-context detects the model from the hardware. Step 10 saves that name
+fw-context detects the model from the hardware. Step 11 saves that name
 one time to the global config, thus a later detection cannot select a
 different model. Nothing is saved when the LLM is off.
 
-`--quick` skips step 7, and the skills and the agents of step 8. It still
+`--quick` skips step 8, and the skills and the agents of step 9. It still
 creates the project ID, the config files, the `.gitignore` entries, and
 runs the dependency audit, the build, and the checklist.
 
@@ -634,8 +658,10 @@ names, as supplementary context. fw-context stores the results in the
 `llm_analysis` table, and denormalizes the results into the FTS5 index. So
 symbols become searchable by their purpose, not only by their name.
 
-Configure with `[llm] analyze_symbols`, `[llm] model`, `[llm] analyze_vendor`,
-and `[llm] num_ctx` in `~/.fw-context/config.toml`.
+Configure with `[llm] analyze_symbols` and `[llm] analyze_vendor` in
+`~/.fw-context/config.toml`. The chat model and `num_ctx` are keys of the
+selected LLM profile (`[llm.profiles.<name>]`, see
+[Configuration](configuration.md)).
 
 ### `fw-context cache stats`
 
@@ -836,10 +862,13 @@ without `config` does not repair the config files.
 The check `config` names a config file that cannot be read, or that is
 not UTF-8 or not valid TOML. It also lists each value that fw-context
 cannot use: a value of the wrong type, a section that is not a table, a
-variant without a name, a URL that is not valid. See
+variant without a name, a URL that is not valid, a problem of an LLM
+profile. See
 [A config file that fw-context cannot use](configuration.md#a-config-file-that-fw-context-cannot-use).
 `--fix` removes each such value. Then the value of a lower file, or the
-default, applies. Use `--fix --only config` to do only this fix: a full
+default, applies. `--fix` converts the old `[llm]` backend keys to LLM
+profiles, and does not remove them (see
+[The old `[llm]` backend keys](configuration.md#the-old-llm-backend-keys)). Use `--fix --only config` to do only this fix: a full
 `--fix` can also pull a missing model. The checks that read the config
 (Ollama, the models, the database and the disk) are `skipped` while the
 config does not load. After `--fix` repairs the config, they run. A value
@@ -855,11 +884,13 @@ tells you how to fix them manually.
 `--fix` pulls a missing model onto the Ollama server that the check
 asks, also when that server is on a different machine:
 
-- The embedding model: the server of `[llm] ollama_url`.
-- The chat model: the Ollama server of the chat calls. This is the server
-  of `ollama_url`, or the Ollama server that `chat_api_base` names. When
-  `chat_api_base` names an OpenAI-compatible API, that API runs the chat
-  model, and the check `chat-model` is `skipped`.
+- The embedding model: the Ollama server of the embeddings. This is the
+  `url` of the profile that `[llm] embed_profile` names, else of the
+  selected profile when it is an Ollama profile, else
+  `http://localhost:11434`.
+- The chat model: the `url` of the selected profile, when it is an Ollama
+  profile. When the selected profile is an `openai_compatible` profile,
+  that API runs the chat model, and the check `chat-model` is `skipped`.
 
 The manual command sets `OLLAMA_HOST`, because the `ollama` CLI reads the
 server from it. It sets it also for the default server, because the
@@ -2842,7 +2873,7 @@ fw-context collects during indexing. The two other values:
   installs a missing embedding model, and then `fw-context index`.
   `fw-context doctor --fix` also installs the other missing dependencies,
   for example the chat model. `fw-context index` does not install the
-  model, because `[llm] auto_pull` is `false` by default. `fw-context index` prints the cause in its log. A failed full-text index is not
+  model, because `auto_pull` of an LLM profile is `false` by default. `fw-context index` prints the cause in its log. A failed full-text index is not
   `"partial"`: it stops the run, and the marker of the failed run names
   the error.
 - `"none"`: no manifest exists.
@@ -3256,23 +3287,24 @@ Output: {"status": "ok", "ollama_running": true, "ollama_enabled": true,
 Returns `status: "disabled"` when `[llm] enabled = false`. In that case,
 this tool needs no Ollama.
 
-`chat_api` says whether an external chat API replaces Ollama for chat,
-and which model it names. When it is configured, `chat_api` also holds
-`endpoint` and `format`, and a `compliance_warning` for a host that is not
-local.
+`chat_api` says whether the chat goes to a server that is not the Ollama
+server of the embeddings, and which model it names. This is true for an
+`openai_compatible` profile, and for an Ollama profile on a different
+server. When it is configured, `chat_api` also holds `endpoint` and
+`format`, and a `compliance_warning` for a host that is not local.
 
 `check_ollama` looks for the chat model on the Ollama server of the chat
-calls: the server of `ollama_url`, or the Ollama server that
-`chat_api_base` names. When `chat_api_base` names an OpenAI-compatible
-API, that API runs the chat model, and an Ollama server does not have to
-hold it. When the server of `ollama_url` does not answer, `check_ollama`
-does not look for the chat model; `fw-context doctor` does.
+calls: the `url` of the selected profile, when it is an Ollama profile.
+When the selected profile is an `openai_compatible` profile, that API
+runs the chat model, and an Ollama server does not have to hold it. When
+the Ollama server of the embeddings does not answer, `check_ollama` does
+not look for the chat model; `fw-context doctor` does.
 
 `status: "model_missing"` has a `message` that names the command for each
 missing model. The command sets `OLLAMA_HOST` to the server of the check,
 in the syntax of PowerShell on Windows and of a POSIX shell on other
-systems. `status: "error"` also means that the Ollama server of
-`chat_api_base` gives no model list.
+systems. `status: "error"` also means that the Ollama server of the chat
+profile gives no model list.
 
 `embedding_backend` is `"ollama"` for an Ollama embedding model, and
 `"local"` for a sentence-transformers or `ft://` model. A local model needs
@@ -3280,37 +3312,45 @@ no Ollama: it counts as installed, and with chat on an external API the
 status is `"ok"` even when Ollama does not run. `"embedding_unavailable"`
 thus means an Ollama embedding model and an Ollama that fw-context cannot
 use. `"not_configured"` and `"embedding_unavailable"` come when Ollama does
-not run, and also when `ollama_url` names a server that is not Ollama, for
-example a proxy that gives its own page or an HTTP error. `message` names
-the cause and the repair.
+not run, and also when the `url` of the Ollama profile names a server
+that is not Ollama, for example a proxy that gives its own page or an
+HTTP error. `message` names the cause and the repair.
 
 Note: `explain_symbol`, with pre-computed analysis (the default), returns
-instantly, and does not require Ollama at query time. `num_ctx` is 16384
-by default, to allow full function bodies during analysis generation.
+instantly, and does not require Ollama at query time. `num_ctx` is the
+value of the selected Ollama profile, 16384 by default, to allow full
+function bodies during analysis generation.
 
 #### `configure_llm`
 
-Write per-developer LLM settings to `.fw-context/local.toml` (gitignored).
-This tool writes nothing else. After writing, it tests the configuration
-with a simple API call.
+Select the LLM profile and the embedding model of the project. The tool
+writes `[llm] profile` and `[llm] embed_model` to `.fw-context/local.toml`
+(gitignored). This tool writes nothing else. After writing, it tests the
+configuration with a simple API call.
 
 ```
-Input:  {"chat_api_base?": "https://api.deepseek.com/v1", "chat_api_key?": "sk-…",
-         "model?": "deepseek-chat", "auto_pull?": false, "stream?": false}
-Output: {"status": "ok", "model": "deepseek-chat", "test_latency_s": 1.2, …}
+Input:  {"project_root?": "/path/to/project", "profile?": "deepseek",
+         "embed_model?": "qwen3-embedding:0.6b"}
+Output: {"status": "ok", "profile": "deepseek", "provider": "openai_compatible",
+         "model": "deepseek-v4-flash", "test_latency_s": 1.2, …}
 ```
 
-Pass `chat_api_base` for a cloud or proxy API. When it is empty, this
-tool uses the local Ollama instance. When `chat_api_base` points to an
-external host, source code in chat prompts is sent to that host. Verify
-this complies with your data security policy. Prefer the local Ollama
-instance.
+`profile` must name a profile of the global config
+(`[llm.profiles.<name>]` in `~/.fw-context/config.toml`). An unknown name
+returns `status: "error"`, and the message lists the profiles. The tool
+takes no URL, no API key and no model. An API key must not pass through
+the conversation of the LLM client, and a tool call must not send the
+source code to a host that it selects. The operator adds a profile with
+`fw-context init` (see [`fw-context init`](#fw-context-init)), or with a
+text editor.
 
-Every parameter you omit keeps its current value. `auto_pull` and
-`chat_api_format` are written only when you pass them and they differ from
-the current value; `chat_api_format: "auto"` returns to the detection from
-the URL. A call that changes nothing returns `status: "error"` and writes
-nothing.
+When the selected profile sends the chat to a host that is not this
+machine, the result holds a `compliance_warning`: the source code in chat
+prompts goes to that host. Make sure that this agrees with your data
+security policy.
+
+Every parameter you omit keeps its current value. A call that changes
+nothing returns `status: "error"` and writes nothing.
 
 When the test call fails, this tool restores the previous
 `.fw-context/local.toml` (or removes the file if it did not exist). The

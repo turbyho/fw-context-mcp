@@ -4011,89 +4011,51 @@ def get_project_info(
 
 def configure_llm(
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-    chat_api_base: Annotated[
+    profile: Annotated[
         str | None,
         Field(
             description=(
-                "Chat API URL. None = use local Ollama for chat. "
-                "Auto-detects format: :11434 or /api/generate -> Ollama, "
-                "/v1 or bare host -> OpenAI-compatible. "
-                "Examples: 'https://api.deepseek.com/v1' (DeepSeek), "
-                "'http://localhost:4000' (LiteLLM), "
-                "'http://localhost:8080/v1' (llama.cpp). "
-                "WARNING: external URLs send source code to that host."
+                "The LLM profile of this project: the name of a [llm.profiles.<name>] table of the global "
+                "config (~/.fw-context/config.toml). None = keep the current profile. WARNING: a profile "
+                "whose server is not this machine sends source code to that host."
             )
         ),
-    ] = None,
-    chat_api_key: Annotated[
-        str | None,
-        Field(description="API key for cloud/proxy APIs. None for local/no-auth."),
-    ] = None,
-    chat_api_format: Annotated[
-        str | None,
-        Field(description="Format override: 'ollama' or 'openai'; 'auto' returns to detection from the URL. "
-              "None = keep current."),
-    ] = None,
-    model: Annotated[
-        str | None,
-        Field(description="Chat model name. None = keep current."),
     ] = None,
     embed_model: Annotated[
         str | None,
         Field(description="Embedding model: an Ollama tag, a sentence-transformers name (e.g. 'BAAI/bge-small-en-v1.5'), or 'ft://latest'. None = keep current."),
     ] = None,
-    auto_pull: Annotated[
-        bool | None,
-        Field(description="Auto-pull models on 404 (Ollama only). False for intranet. None = keep current."),
-    ] = None,
-    stream: Annotated[
-        bool | None,
-        Field(
-            description=(
-                "Stream chat responses via SSE (both OpenAI-compatible and Ollama-native). "
-                "True = send stream:true, consume SSE chunks — avoids reverse-proxy idle "
-                "timeouts (nginx 60s, Cloudflare 100s). None = keep current setting."
-            )
-        ),
-    ] = None,
 ) -> dict:
-    """Configure LLM settings for the current project.
+    """Select the LLM profile (and the embedding model) of the current project.
 
     Writes to ``<project>/.fw-context/local.toml`` ONLY (gitignored,
     per-developer). Does NOT modify the global config or the shared
-    project ``config.toml``. After writing, tests the configuration
-    by making a simple API call (skipped when LLM is disabled).  When the
-    test fails, the previous ``local.toml`` is restored and ``status`` is
-    ``"error"``.  A call with no change returns ``"error"`` and writes
-    nothing.
+    project ``config.toml``.  The profiles themselves are in the global
+    config, and only the operator writes them (``fw-context init``): this
+    tool takes no URL and no API key.  After writing, tests the
+    configuration by making a simple API call (skipped when LLM is
+    disabled).  When the test fails, the previous ``local.toml`` is
+    restored and ``status`` is ``"error"``.  A call with no change returns
+    ``"error"`` and writes nothing.
 
-    IMPORTANT: When ``chat_api_base`` points to an external host, source
-    code snippets in chat prompts will be sent to that endpoint. Ensure
-    this complies with your organization's data security policies.
-    Consider using local Ollama or an internal API proxy first.
+    WHY no URL and no key here (since the profiles, 2026-10-20): a key that
+    an MCP call writes passes through the conversation of the LLM client,
+    and a URL that a tool call sets can send the source code to any host.
 
     Args:
         project_root: Project root directory. Auto-detected if omitted.
-        chat_api_base: Chat API URL (see description for format details).
-        chat_api_key: Bearer token for cloud/proxy APIs.
-        chat_api_format: Override auto-detection: "ollama" or "openai";
-            "auto" returns to detection from the URL.  None keeps the
-            current value.
-        model: Chat model name.
+        profile: The name of a profile of the global config.
         embed_model: Embedding model: an Ollama tag, a sentence-transformers
             name (``BAAI/...``, needs the ``st`` extra), or ``ft://``.
-        auto_pull: Whether to auto-pull models on 404.  None keeps the
-            current value.
-        stream: Stream chat responses via SSE. True avoids reverse-proxy idle timeouts.
 
     Returns:
-        dict: {status ("ok"|"error"), chat_api (dict — configured, endpoint,
-        format, model), model (str), auto_pull (bool), stream (bool),
-        test_latency_s (float, on success), test_response (str, on success),
-        compliance_warning (str, when chat_api_base is external),
-        message (str)}
+        dict: {status ("ok"|"error"), profile (str), provider (str),
+        chat_api (dict — configured, endpoint, format, model), model (str),
+        auto_pull (bool), stream (bool), test_latency_s (float, on
+        success), test_response (str, on success), compliance_warning
+        (str, when the chat goes to another host), message (str)}
     """
-    from ...config.settings import ProjectNotInitializedError
+    from ...config.settings import ProjectNotInitializedError, read_config_file
 
     try:
         _, cfg, _, root = _resolve_context(project_root, skip_ready_check=True)
@@ -4116,26 +4078,23 @@ def configure_llm(
     # Collect only the parameters the caller passed: None means "keep
     # current".  A value equal to the current one is not a change, so a
     # call that repeats the config writes nothing.
-    if chat_api_format is not None and chat_api_format not in ("auto", "ollama", "openai"):
-        return {
-            "status": "error",
-            "message": f"Invalid chat_api_format {chat_api_format!r} — use 'auto', 'ollama', or 'openai'.",
-        }
     updates: dict[str, object] = {}
-    if chat_api_base is not None:
-        updates["chat_api_base"] = chat_api_base
-    if chat_api_key is not None:
-        updates["chat_api_key"] = chat_api_key
-    if chat_api_format is not None and chat_api_format != cfg.llm.chat_api_format:
-        updates["chat_api_format"] = chat_api_format
-    if model is not None:
-        updates["model"] = model
-    if embed_model is not None:
+    if profile is not None and profile != cfg.llm.profile:
+        from ...config import settings
+
+        profiles = (read_config_file(settings._GLOBAL_CONFIG_PATH).get("llm") or {}).get("profiles") or {}
+        if profile not in profiles:
+            return {
+                "status": "error",
+                "message": (
+                    f"{profile!r} is not a profile of the global config ({settings._GLOBAL_CONFIG_PATH}; "
+                    f"profiles: {', '.join(sorted(profiles)) or 'none'}). The operator adds a profile with "
+                    "'fw-context init'."
+                ),
+            }
+        updates["profile"] = profile
+    if embed_model is not None and embed_model != cfg.llm.embed_model:
         updates["embed_model"] = embed_model
-    if auto_pull is not None and auto_pull != cfg.llm.auto_pull:
-        updates["auto_pull"] = auto_pull
-    if stream is not None:
-        updates["stream"] = stream
 
     if not updates:
         return {
@@ -4148,4 +4107,4 @@ def configure_llm(
     # reloads the config, and tests the endpoint.
     from ...llm.configure import configure_llm_core
 
-    return configure_llm_core(Path(root), updates, chat_api_base=chat_api_base)
+    return configure_llm_core(Path(root), updates)

@@ -246,18 +246,19 @@ def remove_unusable_values(project_root: Path | None, *, dry_run: bool = False) 
     from .config.settings import config_value_problems
 
     report = CleanupReport()
-    for path, _of_project, backup in _config_files(project_root):
+    for path, of_project, backup in _config_files(project_root):
         document, _unknown = _parse_config_file(path, report)
         if document is None:
             continue
         original = document.as_string()
-        problems = config_value_problems(document.unwrap())
-        removable = [problem for problem in problems if problem.removable]
-        report.failures += [
-            (path, f"{problem.message}. Correct it by hand: without an ID the project is not initialized, "
-                   "and the index of the project is lost")
-            for problem in problems if not problem.removable
+        # An old [llm] backend key is not a value to remove: the LLM profile
+        # migration (``_llm_profile_migration``) moves it, and reports it.
+        problems = [
+            problem for problem in config_value_problems(document.unwrap(), global_file=not of_project)
+            if not (problem.keys[:1] == ("llm",) and problem.keys[1:2] and problem.keys[1] in _moved_llm_keys())
         ]
+        removable = [problem for problem in problems if problem.removable]
+        report.failures += [(path, _by_hand(problem)) for problem in problems if not problem.removable]
         if not removable:
             continue
         # The last place first: a removed table of an array moves the
@@ -272,7 +273,10 @@ def remove_unusable_values(project_root: Path | None, *, dry_run: bool = False) 
         # changes nothing.  The file then stays, and the user must correct
         # it.  Without this check the fix said "removed", and the next
         # check named the same value again.
-        left = {problem.message for problem in config_value_problems(tomlkit.parse(tomlkit.dumps(document)).unwrap())}
+        left = {
+            problem.message
+            for problem in config_value_problems(tomlkit.parse(tomlkit.dumps(document)).unwrap(), global_file=not of_project)
+        }
         if any(problem.message in left for problem in removable):
             report.failures += [
                 (path, f"{problem.message}. Correct it by hand: fw-context cannot remove all of these values "
@@ -288,6 +292,31 @@ def remove_unusable_values(project_root: Path | None, *, dry_run: bool = False) 
             reason = report.failures.pop()[1]
             report.failures += [(path, f"{problem.message} ({reason})") for problem in removable]
     return report
+
+
+def _moved_llm_keys() -> tuple[str, ...]:
+    """Return the old ``[llm]`` backend keys (``settings._MOVED_LLM_KEYS``), with a lazy import."""
+    from .config.settings import _MOVED_LLM_KEYS
+
+    return _MOVED_LLM_KEYS
+
+
+def _by_hand(problem) -> str:
+    """Return the line of a value that ``doctor --fix`` does not remove, and why.
+
+    ``[project] id``: without it the project reads as not initialized.  A
+    profile in a project file: the profiles go to the global config.  A
+    value of a profile that selects the backend (provider, model, url, an
+    unknown key): fw-context cannot know the right value, and a removal
+    sends the requests to another server or model.
+    """
+    if problem.keys == ("project", "id"):
+        return (f"{problem.message}. Correct it by hand: without an ID the project is not initialized, "
+                "and the index of the project is lost")
+    if problem.keys == ("llm", "profiles"):
+        return f"{problem.message}. Correct it by hand: move the profiles to the global config"
+    return (f"{problem.message}. Correct it by hand: the value selects the LLM backend, and a removal would "
+            "send the requests to another server or model")
 
 
 def _remove_at(document: tomlkit.TOMLDocument, keys: tuple[str | int, ...]) -> None:
@@ -424,11 +453,19 @@ def _write_config_file(
     copy of the same run of the fixes (``one_copy_per_file``).  It is the
     only way back for a removed key there; ``config.toml`` of a project has
     git for that.  When the copy cannot be written, the config stays.
+    A file that does not exist is made, without a copy.
     """
     try:
         target = path.resolve()
-        mode = stat.S_IMODE(target.stat().st_mode)
-        if not mode & stat.S_IWUSR:
+        mode: int | None
+        try:
+            mode = stat.S_IMODE(target.stat().st_mode)
+        except FileNotFoundError:
+            # A new file (the LLM profile conversion gives a project of a
+            # fresh clone its local.toml): no old text to copy, and the
+            # default mode of the process, as the other writers of local.toml.
+            mode, backup = None, False
+        if mode is not None and not mode & stat.S_IWUSR:
             report.failures.append((path, "the owner has no write permission, thus the file stays as it is"))
             return
         if not dry_run:

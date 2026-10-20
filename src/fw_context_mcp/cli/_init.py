@@ -780,6 +780,21 @@ def cmd_init(args: argparse.Namespace) -> int:
             print(f"[error] dependency audit/auto-fix failed: {exc}", file=sys.stderr)
             return 1
 
+    # ── 1b. The old [llm] backend keys become LLM profiles (decision of the
+    # user, 2026-10-20).  Before the first load: load refuses an old key.
+    from .._llm_profile_migration import migrate_llm_profiles
+
+    migration = migrate_llm_profiles(project_root, dry_run=args.dry_run)
+    for path, label in migration.removed_keys:
+        print(f"  [{'dry-run' if args.dry_run else 'fix'}] {path}: {label}")
+    for path, reason in migration.failures:
+        print(f"  [warn] {path}: {reason}")
+    if args.dry_run and migration.removed_keys:
+        # The next steps read the config, and load refuses the old keys
+        # that the dry run did not convert: they stopped with a ConfigError.
+        print("  [dry-run] The next steps read the converted config: run 'fw-context init' without --dry-run")
+        return 0
+
     # ── 2. Build system (config-first) + interactive fallback ──
     _proj_cfg = load_project_config(project_root=project_root)
     from ._init_interactive import resolve_build_env, resolve_build_params, resolve_build_system

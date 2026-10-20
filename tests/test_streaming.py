@@ -5,8 +5,8 @@ Covers:
 - Plan A: SSE response auto-detection in call_llm (Ollama-native path)
 - Plan B: Active streaming in OpenAIChatClient.generate (stream=true, httpx.stream)
 - Plan B: Active streaming in call_llm (Ollama-native path, stream=true)
-- Config: stream field parsing from TOML
-- configure_llm: stream parameter writing to local.toml
+- Config: stream key of an LLM profile of the global config
+- configure_llm: the test call uses the stream key of the selected profile
 - Error handling in streaming paths
 - Debug log entries for streaming responses
 - SSE parsing edge cases (empty chunks, malformed lines, [DONE] marker)
@@ -687,7 +687,51 @@ class TestPlanBRoutingOpenaiStream:
 # ── Config: stream field parsing ─────────────────────────────────────────────
 
 
+def _write_global_profiles(tmp_path: Path, monkeypatch, profiles: str) -> Path:
+    """Point the global config to a file with ``[llm] profile = "p"`` and *profiles*.
+
+    WHY each test writes its own global config: ``stream`` is a key of a
+    profile, and the profiles are in the global config only.  The session
+    fixture copies the global config of the operator, and its profiles
+    would decide the result.  ``embed_model`` is set, thus ``load`` does
+    not probe the GPU or Ollama for the automatic model.
+    """
+    from fw_context_mcp.config import settings
+
+    path = tmp_path / "home" / "config.toml"
+    path.parent.mkdir()
+    path.write_text(
+        '[llm]\nprofile = "p"\nenabled = true\nembed_model = "test-embed:1b"\n\n' + profiles, encoding="utf-8",
+    )
+    monkeypatch.setattr(settings, "_GLOBAL_CONFIG_PATH", path)
+    settings._config_cache.clear()
+    return path
+
+
+def _make_stream_project(tmp_path: Path) -> Path:
+    """Create an initialized project with an empty local.toml."""
+    root = tmp_path / "proj"
+    cfg_dir = root / ".fw-context"
+    cfg_dir.mkdir(parents=True)
+    index_dir = tmp_path / "index"
+    index_dir.mkdir()
+    (cfg_dir / "config.toml").write_text(
+        "[project]\n"
+        'id = "abc123"\n\n'
+        "[index]\n"
+        f'db_dir = "{str(index_dir).replace(chr(92), "/")}"\n'
+        'compile_commands = "compile_commands.json"\n',
+        encoding="utf-8",
+    )
+    (cfg_dir / "local.toml").write_text("", encoding="utf-8")
+    return root
+
+
 class TestStreamConfig:
+    """``stream`` is a key of an LLM profile: ``load`` copies it from the selected profile."""
+
+    _OLLAMA = '[llm.profiles.p]\nprovider = "ollama"\nurl = "http://localhost:11434"\nmodel = "m:1b"\n'
+
     def test_stream_defaults_to_false(self):
         cfg = LLMConfig()
         assert cfg.stream is False
@@ -696,103 +740,84 @@ class TestStreamConfig:
         cfg = LLMConfig(stream=True)
         assert cfg.stream is True
 
-    def test_stream_parsed_from_toml_true(self, tmp_path):
+    def test_stream_parsed_from_toml_true(self, tmp_path, monkeypatch):
         from fw_context_mcp.config import load as load_config
 
-        cfg_dir = tmp_path / ".fw-context"
-        cfg_dir.mkdir()
-        (cfg_dir / "config.toml").write_text(
-            '[project]\n'
-            f'id = "test123"\n'
-            f'db_dir = "{str(tmp_path / "idx").replace(chr(92), "/")}"\n'
-            '[llm]\n'
-            'stream = true\n',
-            encoding="utf-8",
-        )
-        cfg = load_config(project_root=tmp_path)
+        _write_global_profiles(tmp_path, monkeypatch, self._OLLAMA + "stream = true\n")
+        cfg = load_config(project_root=_make_stream_project(tmp_path))
         assert cfg.llm.stream is True
 
-    def test_stream_parsed_from_toml_false(self, tmp_path):
+    def test_stream_parsed_from_toml_false(self, tmp_path, monkeypatch):
         from fw_context_mcp.config import load as load_config
 
-        cfg_dir = tmp_path / ".fw-context"
-        cfg_dir.mkdir()
-        (cfg_dir / "config.toml").write_text(
-            '[project]\n'
-            f'id = "test123"\n'
-            f'db_dir = "{str(tmp_path / "idx").replace(chr(92), "/")}"\n'
-            '[llm]\n'
-            'stream = false\n',
-            encoding="utf-8",
-        )
-        cfg = load_config(project_root=tmp_path)
+        _write_global_profiles(tmp_path, monkeypatch, self._OLLAMA + "stream = false\n")
+        cfg = load_config(project_root=_make_stream_project(tmp_path))
         assert cfg.llm.stream is False
 
-    def test_stream_not_in_toml_defaults_false(self, tmp_path):
+    def test_stream_parsed_from_an_openai_compatible_profile(self, tmp_path, monkeypatch):
+        """``stream`` is a key of each provider, not only of Ollama."""
         from fw_context_mcp.config import load as load_config
 
-        cfg_dir = tmp_path / ".fw-context"
-        cfg_dir.mkdir()
-        (cfg_dir / "config.toml").write_text(
-            '[project]\n'
-            f'id = "test123"\n'
-            f'db_dir = "{str(tmp_path / "idx").replace(chr(92), "/")}"\n',
-            encoding="utf-8",
+        _write_global_profiles(
+            tmp_path, monkeypatch,
+            '[llm.profiles.p]\nprovider = "openai_compatible"\nurl = "https://api.example.com/v1"\n'
+            'model = "m"\nstream = true\n',
         )
-        cfg = load_config(project_root=tmp_path)
+        cfg = load_config(project_root=_make_stream_project(tmp_path))
+        assert cfg.llm.stream is True
+
+    def test_stream_not_in_toml_defaults_false(self, tmp_path, monkeypatch):
+        from fw_context_mcp.config import load as load_config
+
+        _write_global_profiles(tmp_path, monkeypatch, self._OLLAMA)
+        cfg = load_config(project_root=_make_stream_project(tmp_path))
         assert cfg.llm.stream is False
 
 
 class TestStreamLocalToml:
-    def test_stream_written_to_local_toml(self, tmp_path):
-        root = tmp_path / "proj"
-        cfg_dir = root / ".fw-context"
-        cfg_dir.mkdir(parents=True)
-        (cfg_dir / "config.toml").write_text('[project]\n# id = ""\n', encoding="utf-8")
-        _update_local_toml(root, {"stream": True})
-        local = (cfg_dir / "local.toml").read_text(encoding="utf-8")
-        assert "stream = true" in local
+    """A project file cannot set ``stream``: it is a key of a profile of the global config."""
 
-    def test_stream_false_written_to_local_toml(self, tmp_path):
-        root = tmp_path / "proj"
-        cfg_dir = root / ".fw-context"
-        cfg_dir.mkdir(parents=True)
-        (cfg_dir / "config.toml").write_text('[project]\n# id = ""\n', encoding="utf-8")
-        _update_local_toml(root, {"stream": False})
-        local = (cfg_dir / "local.toml").read_text(encoding="utf-8")
-        assert "stream = false" in local
+    @pytest.mark.parametrize("value", ["true", "false"])
+    def test_stream_in_local_toml_is_refused(self, tmp_path, value):
+        """A moved key gives an error that tells where it goes, not a silent default."""
+        from fw_context_mcp.config import ConfigError
+        from fw_context_mcp.config import load as load_config
 
-    def test_stream_template_has_comment(self, tmp_path):
+        root = _make_stream_project(tmp_path)
+        (root / ".fw-context" / "local.toml").write_text(f"[llm]\nstream = {value}\n", encoding="utf-8")
+
+        with pytest.raises(ConfigError, match=r"\[llm\] stream is a key of an LLM profile now"):
+            load_config(project_root=root)
+
+    def test_the_template_offers_no_stream_key(self, tmp_path):
+        """The template must not offer a key that the loader refuses: an uncommented line breaks the config."""
         root = tmp_path / "proj"
         cfg_dir = root / ".fw-context"
         cfg_dir.mkdir(parents=True)
         (cfg_dir / "config.toml").write_text('[project]\n# id = ""\n', encoding="utf-8")
         # Create local.toml from template
-        _update_local_toml(root, {"model": "x"})
+        _update_local_toml(root, {"embed_model": "x"})
         local = (cfg_dir / "local.toml").read_text(encoding="utf-8")
-        assert re.search(r"^#?\s*stream\s*=", local, re.MULTILINE), "stream key missing from template"
+        assert not re.search(r"^#?\s*stream\s*=", local, re.MULTILINE), local
 
 
-# ── configure_llm: stream parameter ──────────────────────────────────────────
+# ── configure_llm: the stream key of the selected profile ────────────────────
 
 
 class TestConfigureLlmStream:
-    def _make_project(self, tmp_path: Path) -> Path:
-        root = tmp_path / "proj"
-        cfg_dir = root / ".fw-context"
-        cfg_dir.mkdir(parents=True)
-        index_dir = tmp_path / "index"
-        index_dir.mkdir()
-        config_toml = (
-            "[project]\n"
-            f'id = "abc123"\n\n'
-            "[index]\n"
-            f'db_dir = "{str(index_dir).replace(chr(92), "/")}"\n'
-            'compile_commands = "compile_commands.json"\n'
-        )
-        (cfg_dir / "config.toml").write_text(config_toml, encoding="utf-8")
-        (cfg_dir / "local.toml").write_text("", encoding="utf-8")
-        return root
+    """The test call of ``configure_llm`` uses the ``stream`` key of the profile it selects.
+
+    The tool has no ``stream`` parameter any more: the key is in the
+    profile, and the tool never writes it to local.toml.
+    """
+
+    _PROFILES = (
+        '[llm.profiles.p]\nprovider = "ollama"\nurl = "http://localhost:11434"\nmodel = "m:1b"\n\n'
+        '[llm.profiles.streaming]\nprovider = "openai_compatible"\nurl = "https://api.example.com/v1"\n'
+        'model = "m"\nstream = true\n\n'
+        '[llm.profiles.posting]\nprovider = "openai_compatible"\nurl = "https://api.example.com/v1"\n'
+        'model = "m"\nstream = false\n'
+    )
 
     def _mock_response(self) -> httpx.Response:
         return httpx.Response(
@@ -801,55 +826,44 @@ class TestConfigureLlmStream:
             request=httpx.Request("POST", "https://api.example.com/v1/chat/completions"),
         )
 
+    @patch("fw_context_mcp.llm.chat_router.httpx.post")
     @patch("fw_context_mcp.llm.chat_router.httpx.stream")
-    def test_stream_true_written_by_configure_llm(self, mock_stream, tmp_path):
-        # When stream=True, the test call uses httpx.stream, not httpx.post
+    def test_a_profile_with_stream_true_streams_the_test_call(self, mock_stream, mock_post, tmp_path, monkeypatch):
         lines = [
             'data: {"choices":[{"delta":{"content":"OK"}}]}',
             "data: [DONE]",
         ]
         mock_stream.side_effect = _mock_httpx_stream(lines)
-        root = self._make_project(tmp_path)
+        _write_global_profiles(tmp_path, monkeypatch, self._PROFILES)
+        root = _make_stream_project(tmp_path)
         from fw_context_mcp.mcp.handlers.maintenance import configure_llm
 
-        result = configure_llm(
-            project_root=str(root),
-            chat_api_base="https://api.example.com/v1",
-            stream=True,
-        )
-        assert result["status"] == "ok"
+        result = configure_llm(project_root=str(root), profile="streaming")
+
+        assert result["status"] == "ok", result
         assert result["stream"] is True
+        mock_stream.assert_called_once()
+        mock_post.assert_not_called()
         local = (root / ".fw-context" / "local.toml").read_text(encoding="utf-8")
-        assert "stream = true" in local
+        assert 'profile = "streaming"' in local
+        assert "stream = " not in local  # the key belongs to the profile
 
+    @patch("fw_context_mcp.llm.chat_router.httpx.stream")
     @patch("fw_context_mcp.llm.chat_router.httpx.post")
-    def test_stream_none_does_not_write(self, mock_post, tmp_path):
+    def test_a_profile_with_stream_false_posts_the_test_call(self, mock_post, mock_stream, tmp_path, monkeypatch):
         mock_post.return_value = self._mock_response()
-        root = self._make_project(tmp_path)
+        _write_global_profiles(tmp_path, monkeypatch, self._PROFILES)
+        root = _make_stream_project(tmp_path)
         from fw_context_mcp.mcp.handlers.maintenance import configure_llm
 
-        configure_llm(
-            project_root=str(root),
-            chat_api_base="https://api.example.com/v1",
-            stream=None,
-        )
-        local = (root / ".fw-context" / "local.toml").read_text(encoding="utf-8")
-        assert "stream = " not in local  # stream key should not be written
+        result = configure_llm(project_root=str(root), profile="posting")
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
-    def test_stream_false_written(self, mock_post, tmp_path):
-        mock_post.return_value = self._mock_response()
-        root = self._make_project(tmp_path)
-        from fw_context_mcp.mcp.handlers.maintenance import configure_llm
-
-        result = configure_llm(
-            project_root=str(root),
-            chat_api_base="https://api.example.com/v1",
-            stream=False,
-        )
+        assert result["status"] == "ok", result
         assert result["stream"] is False
+        mock_post.assert_called_once()
+        mock_stream.assert_not_called()
         local = (root / ".fw-context" / "local.toml").read_text(encoding="utf-8")
-        assert "stream = false" in local
+        assert "stream = " not in local  # the key belongs to the profile
 
 
 # ── Regression: existing non-streaming behavior unchanged ────────────────────

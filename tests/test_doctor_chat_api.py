@@ -94,6 +94,36 @@ def _cloud():
     return _cfg(model="deepseek-chat", chat_api_base="https://api.deepseek.com/v1")
 
 
+def _project(tmp_path, monkeypatch, selection: str):
+    """A project whose ``local.toml`` holds *selection*, with a global config of its own.
+
+    The profiles are in the global config only: ``local`` (the Ollama server
+    of the embeddings, and the selection of the global config), ``gpu`` (a
+    remote Ollama server) and ``deepseek`` (an OpenAI-compatible API).
+    WHY the global config selects ``local``: a fix that does not read the
+    selection of the project then asks the local server, and the test sees
+    it.
+    """
+    import fw_context_mcp.config.settings as settings
+
+    home = tmp_path / "home" / "config.toml"
+    home.parent.mkdir()
+    home.write_text(
+        '[llm]\nprofile = "local"\n'
+        f'[llm.profiles.local]\nprovider = "ollama"\nurl = "{LOCAL}"\nmodel = "{CHAT}"\n'
+        f'[llm.profiles.gpu]\nprovider = "ollama"\nurl = "{REMOTE}"\nmodel = "{CHAT}"\n'
+        '[llm.profiles.deepseek]\nprovider = "openai_compatible"\nurl = "https://api.deepseek.com/v1"\n'
+        'model = "deepseek-chat"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(settings, "_GLOBAL_CONFIG_PATH", home)
+    root = tmp_path / "proj"
+    (root / ".fw-context").mkdir(parents=True)
+    (root / ".fw-context" / "local.toml").write_text(f"[llm]\n{selection}", encoding="utf-8")
+    settings._config_cache.clear()
+    return root
+
+
 def _check(cfg):
     from fw_context_mcp.deps._checks import check_ollama_chat_model
 
@@ -131,10 +161,7 @@ def test_the_fix_does_not_pull_the_chat_model_of_an_openai_compatible_api(tmp_pa
     """`run_fixes` skips a skipped check; the fix itself must also refuse the pull."""
     from fw_context_mcp.deps import DepCheckResult, _fixes
 
-    root = tmp_path / "proj"
-    (root / ".fw-context").mkdir(parents=True)
-    (root / ".fw-context" / "local.toml").write_text(
-        '[llm]\nchat_api_base = "https://api.deepseek.com/v1"\nmodel = "deepseek-chat"\n', encoding="utf-8")
+    root = _project(tmp_path, monkeypatch, 'profile = "deepseek"\n')
     calls = []
     monkeypatch.setattr(_fixes, "_ollama_pull", lambda model, url: calls.append(model) or (True, "pulled"))
 
@@ -188,11 +215,10 @@ def test_the_chat_server_is_checked_when_ollama_url_does_not_answer(servers):
 
 
 def test_the_fix_pulls_the_chat_model_onto_the_ollama_server_of_chat_api_base(tmp_path, monkeypatch):
+    """A chat profile on a remote Ollama server and the embeddings on the local one: chat_api_base is the remote server."""
     from fw_context_mcp.deps import DepCheckResult, _fixes
 
-    root = tmp_path / "proj"
-    (root / ".fw-context").mkdir(parents=True)
-    (root / ".fw-context" / "local.toml").write_text(f'[llm]\nchat_api_base = "{REMOTE}"\n', encoding="utf-8")
+    root = _project(tmp_path, monkeypatch, 'profile = "gpu"\nembed_profile = "local"\n')
     calls = []
     monkeypatch.setattr(_fixes, "_ollama_pull", lambda model, url: calls.append((model, url)) or (True, "pulled"))
 

@@ -884,11 +884,14 @@ def _without_ollama(result: dict, cfg: LLMConfig, ollama_embedding: bool, cause:
     does not give the answer of Ollama.  The status depends on what needs
     Ollama: nothing when the chat goes to an API and the embedding model
     runs locally.  *server_runs* selects the advice: a server that runs and
-    is not Ollama (a proxy page) needs a correct ``ollama_url``, not a
-    start of Ollama.
+    is not Ollama (a proxy page) needs a correct url of the Ollama profile,
+    not a start of Ollama.
     """
     result["ollama_running"] = False
-    repair = "Correct ollama_url so that it names an Ollama server" if server_runs else "Install and start Ollama"
+    repair = (
+        "Correct the url of the Ollama profile so that it names an Ollama server"
+        if server_runs else "Install and start Ollama"
+    )
     if cfg.chat_api_base and not ollama_embedding:
         result["status"] = "ok"
     elif cfg.chat_api_base:
@@ -1045,7 +1048,7 @@ def check_setup(cfg: LLMConfig) -> dict:
         result["configured_model"] = cfg.model
         chat_models = installed if same_server else installed_models(chat_server)
     if chat_models is None:
-        messages.append(f"The Ollama server {chat_server} of chat_api_base gives no model list (/api/tags).")
+        messages.append(f"The Ollama server {chat_server} of the chat profile gives no model list (/api/tags).")
     elif chat_server is not None and not _check_model_installed(cfg.model, chat_models):
         messages.append(
             f"Chat model '{cfg.model}' is not installed. Run: {ollama_pull_command(cfg.model, chat_server)}"
