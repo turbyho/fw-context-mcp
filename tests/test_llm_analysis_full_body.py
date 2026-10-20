@@ -27,6 +27,7 @@ from fw_context_mcp.indexer import _llm_analysis as mod
 from fw_context_mcp.indexer._llm_analysis import _build_llm_analysis
 from fw_context_mcp.indexer.db import transaction, upsert_file
 from fw_context_mcp.indexer.db._symbols import insert_symbols_batch
+from fw_context_mcp.llm.client import ChatResult
 from fw_context_mcp.utils import write_text_atomic
 
 CONFIG_HASH = "hash-deadbeef"
@@ -34,25 +35,59 @@ RUN_CTX, LARGEST_CTX = 3000, 16000
 
 
 class _Model:
-    """Stands in for the chat model: one token for each 10 characters of a prompt."""
+    """Stands in for the chat client: one token for each 10 characters of a prompt.
+
+    A test changes ``answer`` (the text of a request) or ``count`` (the
+    token count) to make a request or a count fail.
+    """
+
+    counts_tokens = True
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, int | None, int | None]] = []
+        self.answer = self.reply
+        self.count = lambda prompt, num_ctx: self.tokens(prompt)
 
     @staticmethod
     def tokens(prompt: str) -> int:
         return len(prompt) // 10
 
-    def call(self, prompt, cfg, *, temperature=0.0, num_predict=None, num_ctx=None):
-        self.calls.append((prompt, num_ctx, num_predict))
+    def reply(self, prompt, *, temperature=0.0, max_tokens=None, num_ctx=None):
+        self.calls.append((prompt, num_ctx, max_tokens))
         symbol_id = int(prompt.split("(id: ")[1].split(")")[0])
         return json.dumps([{"id": symbol_id, "summary": f"summary {len(self.calls)}", "inputs": "x", "outputs": "y"}])
 
+    def generate(self, prompt, *, temperature=0.0, max_tokens=None, num_ctx=None) -> ChatResult:
+        return ChatResult(self.answer(prompt, temperature=temperature, max_tokens=max_tokens, num_ctx=num_ctx))
+
+    def count_tokens(self, prompt, num_ctx):
+        return self.count(prompt, num_ctx)
+
+    def trained_context(self):
+        return LARGEST_CTX
+
+    def pull_model(self):
+        raise AssertionError("the run must not pull the model")
+
     def install(self, monkeypatch) -> None:
-        monkeypatch.setattr(mod, "_analysis_contexts", lambda cfg: (RUN_CTX, LARGEST_CTX))
-        monkeypatch.setattr(mod, "generate_endpoint", lambda cfg: "http://ollama.test/api/generate")
-        monkeypatch.setattr(mod, "count_prompt_tokens", lambda prompt, cfg, num_ctx: self.tokens(prompt))
-        monkeypatch.setattr(mod, "call_ollama", self.call)
+        monkeypatch.setattr(mod, "_analysis_contexts", lambda client, cfg: (RUN_CTX, LARGEST_CTX))
+        monkeypatch.setattr(mod, "get_chat_client", lambda cfg: self)
+
+
+class _Server:
+    """Stands in for an Ollama chat client for ``_analysis_contexts``: its trained contexts, in order."""
+
+    counts_tokens = True
+
+    def __init__(self, *trained: int | None) -> None:
+        self.trained = list(trained)
+        self.pulled = 0
+
+    def trained_context(self):
+        return self.trained.pop(0)
+
+    def pull_model(self):
+        self.pulled += 1
 
 
 class _Config:
@@ -118,7 +153,7 @@ def test_a_prompt_that_does_not_fit_waits_for_one_larger_context(populated_db, m
     large_ctx = model.tokens(model.calls[2][0]) + mod._ANSWER_TOKENS
     assert contexts == [RUN_CTX, large_ctx, large_ctx], "one context for the second pass: one load of the model"
     # Before, the largest prompt of the second pass had 300 tokens for its answer.
-    assert [num_predict for _, _, num_predict in model.calls] == [mod._ANSWER_TOKENS] * 3
+    assert [max_tokens for _, _, max_tokens in model.calls] == [mod._ANSWER_TOKENS] * 3
 
 
 def test_a_prompt_larger_than_the_model_gets_the_sentinel(populated_db, monkeypatch, tmp_path: Path):
@@ -187,23 +222,20 @@ def test_local_cache_upsert_keeps_the_first_entry_unless_it_overwrites():
 def test_the_run_has_the_context_of_the_config_and_the_trained_one_as_the_limit(monkeypatch):
     from fw_context_mcp.config.settings import LLMConfig
 
-    monkeypatch.setattr(mod, "trained_context", lambda cfg: 32768)
-    assert mod._analysis_contexts(LLMConfig(num_ctx=16384)) == (16384, 32768)
-    assert mod._analysis_contexts(LLMConfig(num_ctx=65536)) == (32768, 32768)
+    assert mod._analysis_contexts(_Server(32768), LLMConfig(num_ctx=16384)) == (16384, 32768)
+    assert mod._analysis_contexts(_Server(32768), LLMConfig(num_ctx=65536)) == (32768, 32768)
 
 
-def test_a_server_that_does_not_answer_gives_no_analysis(monkeypatch):
+def test_a_server_that_does_not_answer_gives_no_analysis():
     from fw_context_mcp.config.settings import LLMConfig
 
-    monkeypatch.setattr(mod, "trained_context", lambda cfg: None)
-    assert mod._analysis_contexts(LLMConfig()) is None
+    assert mod._analysis_contexts(_Server(None), LLMConfig()) is None
 
 
-def test_an_openai_endpoint_has_the_context_of_the_config(monkeypatch):
+def test_an_openai_endpoint_has_the_context_of_the_config():
     from fw_context_mcp.config.settings import LLMConfig
 
-    monkeypatch.setattr(mod, "generate_endpoint", lambda cfg: None)
-    assert mod._analysis_contexts(LLMConfig(num_ctx=8192)) == (8192, 8192)
+    assert mod._analysis_contexts(SimpleNamespace(counts_tokens=False), LLMConfig(num_ctx=8192)) == (8192, 8192)
 
 
 # ── The CLI ──
@@ -297,7 +329,7 @@ def test_a_symbol_without_an_answer_makes_the_analysis_unfinished(populated_db, 
     def down(*a, **kw):
         raise OllamaError("Ollama stopped")
 
-    monkeypatch.setattr(mod, "call_ollama", down)
+    model.answer = down
     _seed(populated_db, tmp_path, {"no_answer": _body("no_answer", 5)})
 
     assert _build_llm_analysis(populated_db, CONFIG_HASH, _Config(), tmp_path, project_root=tmp_path,
@@ -331,11 +363,11 @@ def test_a_count_that_fails_three_times_leaves_the_symbol_for_the_next_run(popul
     monkeypatch.setattr(mod.time, "sleep", lambda s: None)
     calls = []
 
-    def count(prompt, cfg, num_ctx):
+    def count(prompt, num_ctx):
         calls.append(prompt)
         raise OllamaError("timeout")
 
-    monkeypatch.setattr(mod, "count_prompt_tokens", count)
+    model.count = count
     _seed(populated_db, tmp_path, {"never_counted": _body("never_counted", 5)})
 
     assert _build_llm_analysis(populated_db, CONFIG_HASH, _Config(), tmp_path, project_root=tmp_path,
@@ -365,13 +397,13 @@ def test_the_step_deletes_no_analysis_first(populated_db, monkeypatch, tmp_path:
 def test_an_openai_endpoint_gets_no_count_and_the_answer_budget(populated_db, monkeypatch, tmp_path: Path):
     model = _Model()
     model.install(monkeypatch)
-    monkeypatch.setattr(mod, "generate_endpoint", lambda cfg: None)
-    monkeypatch.setattr(mod, "count_prompt_tokens", lambda *a: pytest.fail("no count for an OpenAI endpoint"))
+    model.counts_tokens = False
+    model.count = lambda *a: pytest.fail("no count for an OpenAI endpoint")
     _seed(populated_db, tmp_path, {"openai_symbol": _body("openai_symbol", 1500)})
 
     _run(populated_db, tmp_path)
 
-    assert [num_predict for _, _, num_predict in model.calls] == [mod._ANSWER_TOKENS]
+    assert [max_tokens for _, _, max_tokens in model.calls] == [mod._ANSWER_TOKENS]
 
 
 def test_a_prompt_that_the_server_refuses_goes_to_the_second_pass(populated_db, monkeypatch, tmp_path: Path):
@@ -379,15 +411,15 @@ def test_a_prompt_that_the_server_refuses_goes_to_the_second_pass(populated_db, 
 
     model = _Model()
     model.install(monkeypatch)
-    monkeypatch.setattr(mod, "count_prompt_tokens", lambda prompt, cfg, num_ctx: 10)  # a wrong count
-    real_call = model.call
+    model.count = lambda prompt, num_ctx: 10  # a wrong count
+    real_call = model.reply
 
-    def call(prompt, cfg, **kwargs):
+    def call(prompt, **kwargs):
         if kwargs["num_ctx"] == RUN_CTX:
             raise OllamaPromptTooLong(5000, RUN_CTX)
-        return real_call(prompt, cfg, **kwargs)
+        return real_call(prompt, **kwargs)
 
-    monkeypatch.setattr(mod, "call_ollama", call)
+    model.answer = call
     _seed(populated_db, tmp_path, {"refused_symbol": _body("refused_symbol", 5)})
 
     _run(populated_db, tmp_path)
@@ -403,12 +435,12 @@ def test_a_failed_count_goes_again(populated_db, monkeypatch, tmp_path: Path):
     monkeypatch.setattr(mod.time, "sleep", lambda s: None)
     failures = [OllamaError("timeout"), OllamaError("timeout")]
 
-    def count(prompt, cfg, num_ctx):
+    def count(prompt, num_ctx):
         if failures:
             raise failures.pop()
         return 10
 
-    monkeypatch.setattr(mod, "count_prompt_tokens", count)
+    model.count = count
     _seed(populated_db, tmp_path, {"recount_symbol": _body("recount_symbol", 5)})
 
     _run(populated_db, tmp_path)
@@ -437,14 +469,10 @@ def test_a_forced_run_does_not_read_the_cache_server(populated_db, monkeypatch, 
     assert len(server.writes) == 1
 
 
-def test_a_missing_model_is_pulled_when_auto_pull_is_on(monkeypatch):
+def test_a_missing_model_is_pulled_when_auto_pull_is_on():
     from fw_context_mcp.config.settings import LLMConfig
 
-    answers = [None, 32768]
-    pulled = []
-    monkeypatch.setattr(mod, "generate_endpoint", lambda cfg: "http://ollama.test/api/generate")
-    monkeypatch.setattr(mod, "trained_context", lambda cfg: answers.pop(0))
-    monkeypatch.setattr(mod, "pull_chat_model", lambda cfg: pulled.append(cfg.model))
+    server = _Server(None, 32768)
 
-    assert mod._analysis_contexts(LLMConfig(num_ctx=16384, auto_pull=True)) == (16384, 32768)
-    assert pulled == [LLMConfig().model]
+    assert mod._analysis_contexts(server, LLMConfig(num_ctx=16384, auto_pull=True)) == (16384, 32768)
+    assert server.pulled == 1

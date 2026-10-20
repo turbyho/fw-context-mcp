@@ -74,7 +74,9 @@ from ...indexer.db._resolve import (
     count_candidates,
     resolve_candidates,
 )
-from ...llm.ollama import OllamaError, OllamaModelNotFoundError, call_ollama_async
+from ...llm.client import call_llm_async
+from ...llm.errors import LLMError
+from ...llm.ollama import OllamaModelNotFoundError
 from ...utils import abs_path, macro_signature, read_file_lines
 from ...utils import escape_like as _escape_like
 from ..shared.context import _normalize_file_path_query
@@ -898,12 +900,12 @@ async def explain_symbol(
         # Three distinct error types form a progressive-degradation strategy:
         # - TimeoutError  → user knows the request completed (just too slow)
         # - ModelNotFound → actionable: install the model or switch to cloud
-        # - OllamaError   → generic failure (server down, OOM, etc.)
+        # - LLMError      → generic failure (server down, OOM, HTTP, etc.)
         # Each produces a warning + raw data so the user's LLM can still
         # interpret the symbol from source + prompt without our server.
         try:
             result["explanation"] = await asyncio.wait_for(
-                call_ollama_async(prompt, cfg.llm),
+                call_llm_async(prompt, cfg.llm),
                 timeout=cfg.llm.timeout,
             )
         except TimeoutError:
@@ -917,7 +919,7 @@ async def explain_symbol(
                 f"{e}. No LLM model available — interpret the 'source' and "
                 f"'explain_prompt' fields below with your own LLM to provide the explanation."
             )
-        except OllamaError as e:
+        except LLMError as e:
             result["warning"] = (
                 f"LLM unavailable: {e}. No local LLM — interpret the 'source' and "
                 f"'explain_prompt' fields below with your own LLM to provide the explanation."

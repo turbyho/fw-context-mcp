@@ -19,6 +19,8 @@ import dataclasses
 import time
 from pathlib import Path
 
+from .errors import LLMError
+
 
 def configure_llm_core(
     project_root: Path,
@@ -140,24 +142,24 @@ def configure_llm_core(
             result["message"] = "Configuration written. LLM is disabled — no test call made."
             return result
 
-        from .ollama import OllamaError, call_ollama
+        from .client import call_llm
 
         t0 = time.monotonic()
         # Short timeout + minimal token budget: the test prompt is trivial
         # so even a slow model responds quickly.
         test_cfg = dataclasses.replace(new_cfg.llm, timeout=30.0)
-        response = call_ollama(
+        response = call_llm(
             "Reply with exactly: OK",
             test_cfg,
             temperature=0.0,
-            num_predict=10,
+            max_tokens=10,
         )
         latency = round(time.monotonic() - t0, 2)
         result["status"] = "ok"
         result["test_latency_s"] = latency
         result["test_response"] = response[:100]
         result["message"] = f"Configuration written and tested successfully ({latency}s)."
-    except OllamaError as e:
+    except LLMError as e:
         result["status"] = "error"
         result["message"] = (
             f"The test call failed: {e}. Check the API URL, key, and model "

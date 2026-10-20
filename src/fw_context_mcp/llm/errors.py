@@ -1,0 +1,26 @@
+"""Errors of the chat backends of fw-context.
+
+``LLMError`` is the base of each failure of a chat backend: a local or a
+remote Ollama, and an API of a provider.  A caller that only reports the
+failure catches ``LLMError``; a caller that acts on one cause (the model is
+not installed, the prompt is too long) catches the subclass.
+
+WHY a base outside ``ollama.py``: before, the base was ``OllamaError``, and
+the error of an external API (``ChatApiError``) derived from it so that the
+handlers caught it.  A handler of "the chat failed" then named one backend,
+and each new backend had to pretend that it is Ollama.
+"""
+
+from __future__ import annotations
+
+
+class LLMError(RuntimeError):
+    """A chat request failed: network, HTTP, the answer, or the backend."""
+
+
+class ChatApiError(LLMError):
+    """A request to an OpenAI-compatible chat API failed.
+
+    Raised for HTTP, network and answer-format failures of the API of a
+    provider (OpenAI, OpenRouter, DeepSeek, LiteLLM, vLLM, ...).
+    """

@@ -60,7 +60,6 @@ Module-level state
 
 from __future__ import annotations
 
-import asyncio
 import dataclasses
 import json
 import logging
@@ -78,7 +77,9 @@ import httpx
 from ..config.settings import LLMConfig
 from ..utils import is_fatal
 from ._debug import _write_debug_log
+from .client import ChatResult, Usage
 from .embedder import Embedder, EmbedderContextUnknown, EmbedderInputTooLong
+from .errors import LLMError
 
 log = logging.getLogger(__name__)
 
@@ -127,7 +128,7 @@ def _reconfigure_ollama_sem(max_concurrent: int) -> None:
 def ollama_guard() -> Generator[None, None, None]:
     """Context manager capping concurrent Ollama requests within this process.
 
-    All ``call_ollama`` and ``call_ollama_embed`` calls should be wrapped
+    All requests of ``OllamaClient`` and ``call_ollama_embed`` should be wrapped
     in this guard.  Cross-process serialization is handled indirectly
     through the write lock (``db.write_lock``) — only the process that
     holds the write lock can perform LLM analysis writes.
@@ -239,104 +240,12 @@ def _accumulate_ollama_sse(resp: httpx.Response) -> str:
     return "".join(chunks)
 
 
-def _stream_ollama_generate(
-    url: str,
-    payload: dict,
-    cfg: LLMConfig,
-    prompt: str,
-    base_url: str,
-    t0: float,
-) -> str:
-    """Send a streaming Ollama /api/generate request and accumulate response.
+def _extract_ollama_chunk(line: str | None, chunks: list[str], stats: dict) -> None:
+    """Add the text of one Ollama streaming JSON line to *chunks*.
 
-    Uses ``httpx.stream()`` to consume newline-delimited JSON chunks as they
-    arrive (Plan B for the Ollama-native path).  This keeps the HTTP connection
-    alive with continuous data flow, avoiding reverse-proxy idle timeouts
-    when using a remote Ollama instance behind a proxy.
-
-    Args:
-        url: Full Ollama /api/generate URL.
-        payload: Request payload (stream will be set to True).
-        cfg: LLM configuration.
-        prompt: Original prompt text (for debug logging).
-        base_url: Ollama base URL (for error messages).
-        t0: Start time (monotonic) for latency logging.
-
-    Returns:
-        The accumulated text response.
-
-    Raises:
-        OllamaError / OllamaModelNotFoundError on failure.
+    The last line (``"done": true``) carries the token counts of the
+    request; *stats* gets that line, for :func:`_ollama_usage`.
     """
-    payload["stream"] = True
-    chunks: list[str] = []
-    try:
-        with ollama_guard():
-            with httpx.stream("POST", url, json=payload, timeout=cfg.timeout) as resp:
-                if resp.status_code == 404:
-                    if cfg.auto_pull:
-                        log.info("LLM model '%s' not found, pulling...", cfg.model)
-                        _pull_model(cfg.model, base_url)
-                        # Retry with streaming
-                        with httpx.stream("POST", url, json=payload, timeout=cfg.timeout) as resp2:
-                            if resp2.status_code == 400:
-                                resp2.read()
-                                too_long = _prompt_too_long(resp2)
-                                if too_long is not None:
-                                    raise too_long
-                            resp2.raise_for_status()
-                            for line in resp2.iter_lines():
-                                _extract_ollama_chunk(line, chunks)
-                    else:
-                        raise OllamaModelNotFoundError(cfg.model, base_url) from None
-                else:
-                    if resp.status_code == 400:
-                        resp.read()
-                        too_long = _prompt_too_long(resp)
-                        if too_long is not None:
-                            raise too_long
-                    resp.raise_for_status()
-                    for line in resp.iter_lines():
-                        _extract_ollama_chunk(line, chunks)
-    except httpx.ConnectError as e:
-        raise OllamaError(
-            f"Cannot connect to Ollama at {base_url}. Make sure Ollama is running: https://ollama.com"
-        ) from e
-    except httpx.TimeoutException:
-        raise OllamaError(f"Ollama request timed out after {cfg.timeout:.0f}s") from None
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 404:
-            raise OllamaModelNotFoundError(cfg.model, base_url) from e
-        raise OllamaError(f"Ollama HTTP {e.response.status_code}: {e.response.text[:200]}") from e
-    except OllamaError:
-        raise
-    except Exception as e:
-        if is_fatal(e):
-            raise
-        raise OllamaError(str(e)) from e
-
-    if not chunks:
-        raise OllamaError("Streaming Ollama request returned no content")
-
-    response_text = "".join(chunks)
-    if cfg.debug_log:
-        _write_debug_log(
-            cfg.debug_log,
-            {
-                "ts": datetime.now(UTC).isoformat(),
-                "model": cfg.model,
-                "num_ctx": payload["options"]["num_ctx"],
-                "latency_s": round(time.monotonic() - t0, 2),
-                "prompt": prompt,
-                "response": response_text,
-                "streamed": True,
-            },
-        )
-    return response_text
-
-
-def _extract_ollama_chunk(line: str | None, chunks: list[str]) -> None:
-    """Extract a content chunk from an Ollama streaming JSON line."""
     if not line:
         return
     line = line.strip()
@@ -344,227 +253,270 @@ def _extract_ollama_chunk(line: str | None, chunks: list[str]) -> None:
         return
     try:
         obj = json.loads(line)
-        chunk = obj.get("response", "")
-        if chunk:
-            chunks.append(chunk)
     except json.JSONDecodeError:
-        pass
+        return
+    # A line that is JSON but not an object raises AttributeError here, and
+    # the request fails (OllamaError), as before the client class.
+    chunk = obj.get("response", "")
+    if chunk:
+        chunks.append(chunk)
+    if obj.get("done"):
+        stats.update(obj)
 
 
-def call_ollama(
-    prompt: str,
-    cfg: LLMConfig,
-    *,
-    temperature: float = 0.0,
-    num_predict: int | None = None,
-    num_ctx: int | None = None,
-) -> str:
-    """Send a prompt to the configured chat backend and return the response text.
+def _ollama_usage(answer: dict) -> Usage:
+    """Return the token counts of an ``/api/generate`` answer.
 
-    When ``cfg.chat_api_base`` is set, the call is routed to an external
-    endpoint (OpenAI-compatible or Ollama-native, auto-detected from the URL).
-    When ``cfg.chat_api_base`` is None, the local Ollama ``/api/generate``
-    endpoint is used (original behaviour).
-
-    Streaming behavior (when ``cfg.stream`` is True):
-
-    * OpenAI-compatible path: delegates to ``call_openai_chat`` which uses
-      ``httpx.stream()`` with SSE chunks (Plan B).
-    * Ollama-native path (local or remote): uses ``httpx.stream()`` with
-      newline-delimited JSON chunks (Plan B).
-
-    When ``cfg.stream`` is False (default): sends ``stream: false``.  If the
-    API returns a streaming response anyway, it is auto-detected and parsed
-    transparently (Plan A fallback).
-
-    WHY two separate paths: The OpenAI-compatible endpoint uses
-    ``/chat/completions`` with a messages array; the Ollama-native endpoint
-    uses ``/api/generate`` with a raw prompt string.  These are different
-    HTTP payload formats — auto-detected from the URL so the operator
-    doesn't need to know which one to use.  Embedding always goes to
-    local Ollama (``/api/embed``) regardless of chat routing.
-
-    Args:
-        prompt: The full prompt text to send.
-        cfg: LLM configuration.
-        temperature: Sampling temperature (0.0 = deterministic, default).
-        num_predict: Maximum tokens to generate (None = model default).
-        num_ctx: The context of this request (None = ``cfg.num_ctx``).  The
-            Ollama-native path only.  A request with another context than
-            the loaded model makes the server load the model again.
-
-    The Ollama-native path asks the server not to cut the prompt
-    (``truncate: false``), see :class:`OllamaPromptTooLong`.
-
-    Raises OllamaError on network or API failure, and OllamaPromptTooLong
-    when the prompt has more tokens than the context.
+    ``prompt_eval_count`` includes the tokens that the server took from its
+    prompt cache (from Ollama 0.30.1, see ``MIN_OLLAMA_VERSION``);
+    ``prompt_eval_cached_count`` is that part.  A field that the answer
+    does not carry is None.
     """
-    if cfg.chat_api_base:
-        from .chat_router import call_openai_chat, detect_chat_endpoint
 
-        fmt, endpoint = detect_chat_endpoint(cfg)
-        if fmt == "openai":
-            return call_openai_chat(
-                prompt,
-                cfg,
-                endpoint,
-                temperature=temperature,
-                num_predict=num_predict,
-            )
-        # fmt == "ollama": use the detected endpoint (may be a remote Ollama).
-        # WHY not the raw chat_api_base as the server: the pull of
-        # `auto_pull` went to ".../api/api/pull" for ".../api", and to
-        # ".../api/generate/api/pull" for ".../api/generate".
-        from .chat_router import chat_ollama_server
+    def count(key: str) -> int | None:
+        value = answer.get(key)
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
 
-        url = endpoint
-        base_url = chat_ollama_server(cfg) or cfg.chat_api_base
-    else:
-        url = cfg.ollama_url.rstrip("/") + "/api/generate"
-        base_url = cfg.ollama_url
+    return Usage(
+        prompt_tokens=count("prompt_eval_count"),
+        cached_tokens=count("prompt_eval_cached_count"),
+        completion_tokens=count("eval_count"),
+    )
 
-    context = num_ctx if num_ctx is not None else cfg.num_ctx
-    options: dict = {"num_ctx": context, "temperature": temperature}
-    if num_predict is not None:
-        options["num_predict"] = num_predict
-    payload: dict = {
-        "model": cfg.model,
-        "prompt": prompt,
-        "stream": False,
-        "truncate": False,
-        "keep_alive": cfg.keep_alive,
-        "options": options,
-    }
 
-    # Plan B: active streaming for the Ollama-native path
-    if cfg.stream:
+class OllamaClient:
+    """The chat client of one Ollama server (``/api/generate``).
+
+    *generate_url* is the ``/api/generate`` URL of the requests;
+    *server_url* is the base URL of the server, for the pull of the model,
+    ``/api/show``, and the error messages.  The two differ only in the
+    path: :func:`~.client.get_chat_client` gives both.
+
+    Each request asks the server not to cut the prompt (``truncate:
+    false``): a prompt longer than the context gets HTTP 400 with the exact
+    count of its tokens (:class:`OllamaPromptTooLong`), thus the caller can
+    select a larger context.
+
+    Streaming (when ``cfg.stream`` is True, Plan B): ``httpx.stream()``
+    with newline-delimited JSON chunks.  Without it, the request sends
+    ``stream: false``; an answer that streams anyway is parsed as a stream
+    (Plan A).  See the module docstring.
+    """
+
+    counts_tokens = True
+
+    def __init__(self, cfg: LLMConfig, generate_url: str, server_url: str) -> None:
+        self.cfg = cfg
+        self.generate_url = generate_url
+        # WHY rstrip: the config keeps a trailing slash of ``ollama_url``,
+        # and "<url>//api/show" got HTTP 307, which httpx does not follow:
+        # the trained context was then unknown, and the run made no analysis.
+        self.server_url = server_url.rstrip("/")
+
+    def generate(
+        self,
+        prompt: str,
+        *,
+        temperature: float = 0.0,
+        max_tokens: int | None = None,
+        num_ctx: int | None = None,
+    ) -> ChatResult:
+        """Send *prompt* to ``/api/generate`` and return the answer and its token counts.
+
+        *num_ctx* is the context of this request (None: ``cfg.num_ctx``).  A
+        request with another context than the loaded model makes the server
+        load the model again.
+
+        Raises:
+            OllamaModelNotFoundError: The model is not installed and
+                ``auto_pull`` is off.
+            OllamaPromptTooLong: The prompt has more tokens than the context.
+            OllamaError: Each other failure of the network or the server.
+        """
+        cfg = self.cfg
+        options: dict = {"num_ctx": num_ctx if num_ctx is not None else cfg.num_ctx, "temperature": temperature}
+        if max_tokens is not None:
+            options["num_predict"] = max_tokens
+        payload: dict = {
+            "model": cfg.model,
+            "prompt": prompt,
+            "stream": False,
+            "truncate": False,
+            "keep_alive": cfg.keep_alive,
+            "options": options,
+        }
         t0 = time.monotonic()
-        return _stream_ollama_generate(url, payload, cfg, prompt, base_url, t0)
-
-    # Non-streaming request (Plan A: SSE auto-detection below)
-    t0 = time.monotonic()
-    try:
-        with ollama_guard():
-            resp = httpx.post(url, json=payload, timeout=cfg.timeout)
-        if resp.status_code == 404:
-            if cfg.auto_pull:
-                log.info("LLM model '%s' not found, pulling...", cfg.model)
-                _pull_model(cfg.model, base_url)
-                with ollama_guard():
-                    resp = httpx.post(url, json=payload, timeout=cfg.timeout)
-            else:
-                raise OllamaModelNotFoundError(cfg.model, base_url) from None
-        too_long = _prompt_too_long(resp)
-        if too_long is not None:
-            raise too_long
-        resp.raise_for_status()
-
-        # Plan A: detect streaming response even when stream:false was requested
-        ct = resp.headers.get("content-type", "").lower()
-        if "text/event-stream" in ct or "application/x-ndjson" in ct:
-            log.debug("Ollama returned streaming response despite stream:false — parsing (Plan A fallback)")
-            response_text = _accumulate_ollama_sse(resp)
-        else:
-            response_text = resp.json()["response"]
-
+        result = self._stream(payload) if cfg.stream else self._post(payload)
         if cfg.debug_log:
-            _write_debug_log(
-                cfg.debug_log,
-                {
-                    "ts": datetime.now(UTC).isoformat(),
-                    "model": cfg.model,
-                    "num_ctx": context,
-                    "latency_s": round(time.monotonic() - t0, 2),
-                    "prompt": prompt,
-                    "response": response_text,
-                },
-            )
-        return response_text
-    except httpx.ConnectError as e:
-        raise OllamaError(
-            f"Cannot connect to Ollama at {base_url}. Make sure Ollama is running: https://ollama.com"
-        ) from e
-    except httpx.TimeoutException:
-        raise OllamaError(f"Ollama request timed out after {cfg.timeout:.0f}s") from None
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 404:
-            raise OllamaModelNotFoundError(cfg.model, base_url) from e
-        raise OllamaError(f"Ollama HTTP {e.response.status_code}: {e.response.text[:200]}") from e
-    except (httpx.HTTPError, OSError, KeyError, json.JSONDecodeError, ValueError) as e:
-        raise OllamaError(str(e)) from e
+            entry = {
+                "ts": datetime.now(UTC).isoformat(),
+                "model": cfg.model,
+                "num_ctx": options["num_ctx"],
+                "latency_s": round(time.monotonic() - t0, 2),
+                "prompt": prompt,
+                "response": result.text,
+            }
+            if cfg.stream:
+                entry["streamed"] = True
+            _write_debug_log(cfg.debug_log, entry)
+        return result
 
+    def _post(self, payload: dict) -> ChatResult:
+        """One non-streaming request (Plan A: an answer that streams anyway is parsed as a stream)."""
+        cfg, url, base_url = self.cfg, self.generate_url, self.server_url
+        try:
+            with ollama_guard():
+                resp = httpx.post(url, json=payload, timeout=cfg.timeout)
+            if resp.status_code == 404:
+                if cfg.auto_pull:
+                    log.info("LLM model '%s' not found, pulling...", cfg.model)
+                    _pull_model(cfg.model, base_url)
+                    with ollama_guard():
+                        resp = httpx.post(url, json=payload, timeout=cfg.timeout)
+                else:
+                    raise OllamaModelNotFoundError(cfg.model, base_url) from None
+            too_long = _prompt_too_long(resp)
+            if too_long is not None:
+                raise too_long
+            resp.raise_for_status()
 
-def generate_endpoint(cfg: LLMConfig) -> str | None:
-    """Return the URL of ``/api/generate`` that :func:`call_ollama` uses, or None.
+            ct = resp.headers.get("content-type", "").lower()
+            if "text/event-stream" in ct or "application/x-ndjson" in ct:
+                log.debug("Ollama returned streaming response despite stream:false — parsing (Plan A fallback)")
+                return ChatResult(_accumulate_ollama_sse(resp))
+            answer = resp.json()
+            return ChatResult(answer["response"], _ollama_usage(answer))
+        except httpx.ConnectError as e:
+            raise OllamaError(
+                f"Cannot connect to Ollama at {base_url}. Make sure Ollama is running: https://ollama.com"
+            ) from e
+        except httpx.TimeoutException:
+            raise OllamaError(f"Ollama request timed out after {cfg.timeout:.0f}s") from None
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                raise OllamaModelNotFoundError(cfg.model, base_url) from e
+            raise OllamaError(f"Ollama HTTP {e.response.status_code}: {e.response.text[:200]}") from e
+        except (httpx.HTTPError, OSError, KeyError, json.JSONDecodeError, ValueError) as e:
+            raise OllamaError(str(e)) from e
 
-    None for an OpenAI-compatible chat endpoint: it has no ``truncate``,
-    and it gives no count of the tokens of a prompt that it refuses.
-    """
-    if cfg.chat_api_base:
-        from .chat_router import detect_chat_endpoint
+    def _stream(self, payload: dict) -> ChatResult:
+        """One streaming request (Plan B).
 
-        fmt, endpoint = detect_chat_endpoint(cfg)
-        return endpoint if fmt == "ollama" else None
-    return cfg.ollama_url.rstrip("/") + "/api/generate"
+        ``httpx.stream()`` keeps the connection busy with continuous data,
+        thus a reverse proxy in front of a remote Ollama does not close it
+        as idle during a long answer.
+        """
+        cfg, url, base_url = self.cfg, self.generate_url, self.server_url
+        payload["stream"] = True
+        chunks: list[str] = []
+        stats: dict = {}
+        try:
+            with ollama_guard():
+                with httpx.stream("POST", url, json=payload, timeout=cfg.timeout) as resp:
+                    if resp.status_code == 404:
+                        if not cfg.auto_pull:
+                            raise OllamaModelNotFoundError(cfg.model, base_url) from None
+                        log.info("LLM model '%s' not found, pulling...", cfg.model)
+                        _pull_model(cfg.model, base_url)
+                        with httpx.stream("POST", url, json=payload, timeout=cfg.timeout) as resp2:
+                            self._read_stream(resp2, chunks, stats)
+                    else:
+                        self._read_stream(resp, chunks, stats)
+        except httpx.ConnectError as e:
+            raise OllamaError(
+                f"Cannot connect to Ollama at {base_url}. Make sure Ollama is running: https://ollama.com"
+            ) from e
+        except httpx.TimeoutException:
+            raise OllamaError(f"Ollama request timed out after {cfg.timeout:.0f}s") from None
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                raise OllamaModelNotFoundError(cfg.model, base_url) from e
+            raise OllamaError(f"Ollama HTTP {e.response.status_code}: {e.response.text[:200]}") from e
+        except OllamaError:
+            raise
+        except Exception as e:
+            if is_fatal(e):
+                raise
+            raise OllamaError(str(e)) from e
+        if not chunks:
+            raise OllamaError("Streaming Ollama request returned no content")
+        return ChatResult("".join(chunks), _ollama_usage(stats))
 
+    @staticmethod
+    def _read_stream(resp: httpx.Response, chunks: list[str], stats: dict) -> None:
+        """Read the lines of a streaming answer into *chunks* and *stats*.
 
-def count_prompt_tokens(prompt: str, cfg: LLMConfig, num_ctx: int) -> int:
-    """Return the number of tokens of *prompt* for the chat model of *cfg*.
-
-    A request with ``num_predict: 1`` and ``truncate: false``.  A prompt that
-    fits the context gives ``prompt_eval_count``; a longer one gives the
-    count in the error of the server (:class:`OllamaPromptTooLong`).  The
-    count comes from the tokenizer of the model, not from a ratio of
-    characters to tokens.
-
-    WHY it costs almost nothing: the server keeps the evaluated prompt, and
-    a request with the same prompt right after it evaluates one token only.
-    Measured with qwen2.5-coder:14b: 8626 tokens took 7.7 s for the count,
-    and 0.08 s in the request that followed.
-
-    *num_ctx* is the context of the request that follows; another value
-    makes the server load the model again.
-
-    Raises:
-        OllamaError: The chat endpoint is not Ollama-native, or the request
-            failed.
-    """
-    url = generate_endpoint(cfg)
-    if url is None:
-        raise OllamaError("an OpenAI-compatible chat endpoint gives no count of the tokens of a prompt")
-    payload = {
-        "model": cfg.model, "prompt": prompt, "stream": False, "truncate": False,
-        "keep_alive": cfg.keep_alive, "options": {"num_ctx": num_ctx, "num_predict": 1},
-    }
-    try:
-        with ollama_guard():
-            resp = httpx.post(url, json=payload, timeout=cfg.timeout)
-        too_long = _prompt_too_long(resp)
-        if too_long is not None:
-            return too_long.prompt_tokens
+        A 400 answer is read first: its body says whether the prompt is too
+        long (:class:`OllamaPromptTooLong`).
+        """
+        if resp.status_code == 400:
+            resp.read()
+            too_long = _prompt_too_long(resp)
+            if too_long is not None:
+                raise too_long
         resp.raise_for_status()
-        return int(resp.json()["prompt_eval_count"])
-    except httpx.TimeoutException:
-        raise OllamaError(f"Ollama request timed out after {cfg.timeout:.0f}s") from None
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 404:
-            raise OllamaModelNotFoundError(cfg.model, url.removesuffix("/api/generate")) from e
-        raise OllamaError(f"Ollama HTTP {e.response.status_code}: {e.response.text[:200]}") from e
-    except (httpx.HTTPError, OSError, KeyError, json.JSONDecodeError, ValueError, TypeError) as e:
-        raise OllamaError(str(e)) from e
+        for line in resp.iter_lines():
+            _extract_ollama_chunk(line, chunks, stats)
 
+    def count_tokens(self, prompt: str, num_ctx: int) -> int:
+        """Return the number of tokens of *prompt* for the chat model.
 
-def pull_chat_model(cfg: LLMConfig) -> None:
-    """Pull the chat model of *cfg* onto its Ollama server (``auto_pull``).
+        A request with ``num_predict: 1`` and ``truncate: false``.  A prompt
+        that fits the context gives ``prompt_eval_count``; a longer one
+        gives the count in the error of the server
+        (:class:`OllamaPromptTooLong`).  The count comes from the tokenizer
+        of the model, not from a ratio of characters to tokens.
 
-    Raises:
-        OllamaError: The chat endpoint is not Ollama-native, or the pull failed.
-    """
-    url = generate_endpoint(cfg)
-    if url is None:
-        raise OllamaError("an OpenAI-compatible chat endpoint has no pull")
-    log.info("LLM model '%s' not found, pulling...", cfg.model)
-    _pull_model(cfg.model, url.removesuffix("/api/generate"))
+        WHY it costs almost nothing: the server keeps the evaluated prompt,
+        and a request with the same prompt right after it evaluates one
+        token only.  Measured with qwen2.5-coder:14b: 8626 tokens took 7.7 s
+        for the count, and 0.08 s in the request that followed.
+
+        *num_ctx* is the context of the request that follows; another value
+        makes the server load the model again.
+
+        Raises:
+            OllamaError: The request failed.
+        """
+        cfg, url = self.cfg, self.generate_url
+        payload = {
+            "model": cfg.model, "prompt": prompt, "stream": False, "truncate": False,
+            "keep_alive": cfg.keep_alive, "options": {"num_ctx": num_ctx, "num_predict": 1},
+        }
+        try:
+            with ollama_guard():
+                resp = httpx.post(url, json=payload, timeout=cfg.timeout)
+            too_long = _prompt_too_long(resp)
+            if too_long is not None:
+                return too_long.prompt_tokens
+            resp.raise_for_status()
+            return int(resp.json()["prompt_eval_count"])
+        except httpx.TimeoutException:
+            raise OllamaError(f"Ollama request timed out after {cfg.timeout:.0f}s") from None
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                raise OllamaModelNotFoundError(cfg.model, self.server_url) from e
+            raise OllamaError(f"Ollama HTTP {e.response.status_code}: {e.response.text[:200]}") from e
+        except (httpx.HTTPError, OSError, KeyError, json.JSONDecodeError, ValueError, TypeError) as e:
+            raise OllamaError(str(e)) from e
+
+    def trained_context(self) -> int | None:
+        """Return the context that the chat model was trained for (``/api/show``), or None.
+
+        The largest context that the server gives the model: a request with
+        a larger ``num_ctx`` gets the trained one.  None when the server
+        does not answer, or does not have the model.
+        """
+        return _trained_context(self.server_url, self.cfg.model)
+
+    def pull_model(self) -> None:
+        """Pull the chat model onto the server (``auto_pull``).
+
+        Raises:
+            OllamaError: The pull failed.
+        """
+        log.info("LLM model '%s' not found, pulling...", self.cfg.model)
+        _pull_model(self.cfg.model, self.server_url)
 
 
 # The oldest Ollama that the LLM analysis and the embeddings can use.  Read
@@ -575,7 +527,7 @@ def pull_chat_model(cfg: LLMConfig) -> None:
 # * v0.30.1 counts the cached tokens of a prompt in ``prompt_eval_count``.
 #   In v0.30.0 the count of a prompt that shares a start with the prompt
 #   before it was too small, thus the answer budget too.
-# The analysis counts each prompt from the two (``count_prompt_tokens``).
+# The analysis counts each prompt from the two (``OllamaClient.count_tokens``).
 # Before them, a ``/api/generate`` request with ``truncate: false`` (v0.12.6)
 # got an error without a count, and a server before v0.12.6 cut the prompt
 # without an error.  ``/api/ps`` names the context of a loaded model from
@@ -616,19 +568,6 @@ def ollama_version_problem(base_url: str) -> str | None:
         f"of a prompt, and the server can cut a long prompt or a long embedding input without an error. "
         f"Update Ollama"
     )
-
-
-def trained_context(cfg: LLMConfig) -> int | None:
-    """Return the context length that the chat model of *cfg* was trained for, or None.
-
-    The largest context that the server gives the model: a request with a
-    larger ``num_ctx`` gets the trained one.  None for an OpenAI-compatible
-    chat endpoint, and when the server does not answer.
-    """
-    url = generate_endpoint(cfg)
-    if url is None:
-        return None
-    return _trained_context(url.removesuffix("/api/generate"), cfg.model)
 
 
 def _call_ollama_embed_impl(
@@ -921,30 +860,6 @@ class OllamaEmbedder(Embedder):
         return min(served, trained) if trained is not None else served
 
 
-async def call_ollama_async(
-    prompt: str,
-    cfg: LLMConfig,
-    *,
-    temperature: float = 0.0,
-    num_predict: int | None = None,
-) -> str:
-    """Async wrapper for ``call_ollama`` — offloads blocking httpx to a thread.
-
-    Use from async MCP tool handlers to avoid blocking the event loop during
-    long-running Ollama requests (10-60 s).
-
-    Args:
-        prompt: The full prompt string to send to the chat model.
-        cfg: LLM configuration (ollama_url, model, num_ctx, debug_log).
-        temperature: Sampling temperature (0.0 = deterministic, default).
-        num_predict: Maximum tokens to generate (None = model default).
-
-    Returns:
-        The model's text response.
-    """
-    return await asyncio.to_thread(call_ollama, prompt, cfg, temperature=temperature, num_predict=num_predict)
-
-
 def _check_model_installed(model: str, installed: list[str]) -> bool:
     """True if *model* is in *installed* (exact or prefix match)."""
     if model in installed:
@@ -1167,8 +1082,8 @@ def check_setup(cfg: LLMConfig) -> dict:
 
 
 
-class OllamaError(RuntimeError):
-    """Base exception for Ollama API and network failures."""
+class OllamaError(LLMError):
+    """A request to an Ollama server failed (network, HTTP, or the answer)."""
 
 
 class OllamaPromptTooLong(OllamaError):
@@ -1208,16 +1123,6 @@ def _prompt_too_long(resp: httpx.Response) -> OllamaPromptTooLong | None:
     if not isinstance(prompt_tokens, int) or not isinstance(context, int):
         return None
     return OllamaPromptTooLong(prompt_tokens, context)
-
-
-class ChatApiError(OllamaError):
-    """Exception for external chat API failures (OpenAI-compatible endpoints).
-
-    Raised by :func:`~fw_context_mcp.llm.chat_router.call_openai_chat`
-    for HTTP, network, and response-format errors from external APIs.
-    Inherits from :class:`OllamaError` so existing ``except OllamaError``
-    handlers catch it without changes.
-    """
 
 
 def ollama_pull_command(model: str, url: str, system: str | None = None) -> str:

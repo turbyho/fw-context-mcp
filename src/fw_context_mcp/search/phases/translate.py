@@ -88,7 +88,8 @@ class TranslatePhase(Phase):
         English" prefixes from the response.  On Ollama errors the original
         query is kept.
         """
-        from fw_context_mcp.llm.ollama import OllamaError, call_ollama_async
+        from fw_context_mcp.llm.client import call_llm_async
+        from fw_context_mcp.llm.errors import LLMError
 
         query = ctx.query
         translate_prompt = (
@@ -100,7 +101,7 @@ class TranslatePhase(Phase):
             f"{query}"
         )
         try:
-            translated = await call_ollama_async(translate_prompt, ctx.config.llm)
+            translated = await call_llm_async(translate_prompt, ctx.config.llm)
             # Strip common "already English" prefixes that some LLMs
             # add despite the prompt instructions
             for prefix in (
@@ -121,6 +122,6 @@ class TranslatePhase(Phase):
             translated = translated[:200]
             if translated and translated != query:
                 return ctx.evolve(query=translated, translated_from=query)
-        except OllamaError:
+        except LLMError:
             pass  # keep original query on failure — better than no search
         return ctx

@@ -170,6 +170,7 @@ class _Answer:
 @pytest.mark.parametrize("chat_api_base", ["http://gpu-box:11434/api", "http://gpu-box:11434/api/generate"])
 def test_auto_pull_of_a_chat_call_pulls_onto_the_ollama_server(monkeypatch, chat_api_base):
     from fw_context_mcp.llm import ollama
+    from fw_context_mcp.llm.client import call_llm
 
     answers = [_Answer(404), _Answer(200)]
     posted = []
@@ -179,6 +180,6 @@ def test_auto_pull_of_a_chat_call_pulls_onto_the_ollama_server(monkeypatch, chat
 
     cfg = _cfg(chat_api_base=chat_api_base, auto_pull=True, stream=False)
 
-    assert ollama.call_ollama("hello", cfg) == "done"
+    assert call_llm("hello", cfg) == "done"
     assert pulled == [(CHAT, REMOTE)]
     assert posted == [f"{REMOTE}/api/generate"] * 2

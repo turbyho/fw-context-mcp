@@ -78,7 +78,8 @@ class LLMQueryPhase(Phase):
 
         Checks the keyword cache first — cache hit avoids a 2-10s LLM call.
         """
-        from fw_context_mcp.llm.ollama import OllamaError, OllamaModelNotFoundError, call_ollama_async
+        from fw_context_mcp.llm.client import call_llm_async
+        from fw_context_mcp.llm.errors import LLMError
 
         cache_key = (ctx.query, ctx.config_hash)
         cached = keyword_cache.get(cache_key)
@@ -158,7 +159,7 @@ class LLMQueryPhase(Phase):
             )
 
         try:
-            raw = await call_ollama_async(prompt, ctx.config.llm)
+            raw = await call_llm_async(prompt, ctx.config.llm)
             understanding, queries = _parse_understanding_response(raw)
             if queries:
                 all_queries = queries[:5]
@@ -168,7 +169,7 @@ class LLMQueryPhase(Phase):
             # Don't cache failures — the same query might succeed next time
             # if the model was temporarily overloaded
             is_fallback = not queries
-        except (OllamaModelNotFoundError, OllamaError) as e:
+        except LLMError as e:
             return ctx.evolve(
                 generated_queries=list(ctx.rough_queries),
                 ollama_warning={"warning": str(e)},

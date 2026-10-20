@@ -2,7 +2,7 @@
 
 Covers:
 - detect_chat_endpoint() URL auto-detection (all priority rules)
-- call_openai_chat() request format, response parsing, error handling
+- OpenAIChatClient.generate() request format, response parsing, error handling
 - Explicit format override
 - Edge cases (trailing slashes, uppercase, ports, IPv6)
 """
@@ -17,8 +17,8 @@ import httpx
 import pytest
 
 from fw_context_mcp.config.settings import LLMConfig
-from fw_context_mcp.llm.chat_router import call_openai_chat, detect_chat_endpoint
-from fw_context_mcp.llm.ollama import OllamaError
+from fw_context_mcp.llm.chat_router import OpenAIChatClient, detect_chat_endpoint
+from fw_context_mcp.llm.errors import LLMError
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -284,7 +284,7 @@ class TestDetectChatEndpointEdgeCases:
         assert url == "http://localhost:11434/v1/chat/completions"
 
 
-# ── call_openai_chat: success cases ──────────────────────────────────────────
+# ── OpenAIChatClient.generate: success cases ──────────────────────────────────────────
 
 
 class TestCallOpenaiChatSuccess:
@@ -292,14 +292,14 @@ class TestCallOpenaiChatSuccess:
     def test_returns_response_content(self, mock_post):
         mock_post.return_value = _mock_response(json_body={"choices": [{"message": {"content": "hello world"}}]})
         cfg = _cfg("https://api.example.com/v1", chat_api_key="sk-test")
-        result = call_openai_chat("test prompt", cfg, "https://api.example.com/v1/chat/completions")
+        result = OpenAIChatClient(cfg, "https://api.example.com/v1/chat/completions").generate("test prompt").text
         assert result == "hello world"
 
     @patch("fw_context_mcp.llm.chat_router.httpx.post")
     def test_sends_content_type_header(self, mock_post):
         mock_post.return_value = _mock_response()
         cfg = _cfg("https://api.example.com/v1")
-        call_openai_chat("p", cfg, "https://api.example.com/v1/chat/completions")
+        OpenAIChatClient(cfg, "https://api.example.com/v1/chat/completions").generate("p")
         _, kwargs = mock_post.call_args
         assert kwargs["headers"]["Content-Type"] == "application/json"
 
@@ -307,7 +307,7 @@ class TestCallOpenaiChatSuccess:
     def test_sends_authorization_when_key_set(self, mock_post):
         mock_post.return_value = _mock_response()
         cfg = _cfg("https://api.example.com/v1", chat_api_key="sk-secret")
-        call_openai_chat("p", cfg, "https://api.example.com/v1/chat/completions")
+        OpenAIChatClient(cfg, "https://api.example.com/v1/chat/completions").generate("p")
         _, kwargs = mock_post.call_args
         assert kwargs["headers"]["Authorization"] == "Bearer sk-secret"
 
@@ -315,7 +315,7 @@ class TestCallOpenaiChatSuccess:
     def test_no_authorization_when_key_none(self, mock_post):
         mock_post.return_value = _mock_response()
         cfg = _cfg("https://api.example.com/v1", chat_api_key=None)
-        call_openai_chat("p", cfg, "https://api.example.com/v1/chat/completions")
+        OpenAIChatClient(cfg, "https://api.example.com/v1/chat/completions").generate("p")
         _, kwargs = mock_post.call_args
         assert "Authorization" not in kwargs["headers"]
 
@@ -323,7 +323,7 @@ class TestCallOpenaiChatSuccess:
     def test_payload_has_model_and_messages(self, mock_post):
         mock_post.return_value = _mock_response()
         cfg = _cfg("https://api.example.com/v1", model="gpt-4o")
-        call_openai_chat("hello", cfg, "https://api.example.com/v1/chat/completions")
+        OpenAIChatClient(cfg, "https://api.example.com/v1/chat/completions").generate("hello")
         _, kwargs = mock_post.call_args
         payload = kwargs["json"]
         assert payload["model"] == "gpt-4o"
@@ -333,7 +333,7 @@ class TestCallOpenaiChatSuccess:
     def test_payload_has_stream_false(self, mock_post):
         mock_post.return_value = _mock_response()
         cfg = _cfg("https://api.example.com/v1")
-        call_openai_chat("p", cfg, "https://api.example.com/v1/chat/completions")
+        OpenAIChatClient(cfg, "https://api.example.com/v1/chat/completions").generate("p")
         _, kwargs = mock_post.call_args
         assert kwargs["json"]["stream"] is False
 
@@ -341,7 +341,7 @@ class TestCallOpenaiChatSuccess:
     def test_payload_has_temperature(self, mock_post):
         mock_post.return_value = _mock_response()
         cfg = _cfg("https://api.example.com/v1")
-        call_openai_chat("p", cfg, "endpoint", temperature=0.7)
+        OpenAIChatClient(cfg, "endpoint").generate("p", temperature=0.7)
         _, kwargs = mock_post.call_args
         assert kwargs["json"]["temperature"] == 0.7
 
@@ -349,7 +349,7 @@ class TestCallOpenaiChatSuccess:
     def test_payload_has_max_tokens_when_num_predict_set(self, mock_post):
         mock_post.return_value = _mock_response()
         cfg = _cfg("https://api.example.com/v1")
-        call_openai_chat("p", cfg, "endpoint", num_predict=500)
+        OpenAIChatClient(cfg, "endpoint").generate("p", max_tokens=500)
         _, kwargs = mock_post.call_args
         assert kwargs["json"]["max_tokens"] == 500
 
@@ -357,7 +357,7 @@ class TestCallOpenaiChatSuccess:
     def test_payload_no_max_tokens_when_num_predict_none(self, mock_post):
         mock_post.return_value = _mock_response()
         cfg = _cfg("https://api.example.com/v1")
-        call_openai_chat("p", cfg, "endpoint", num_predict=None)
+        OpenAIChatClient(cfg, "endpoint").generate("p", max_tokens=None)
         _, kwargs = mock_post.call_args
         assert "max_tokens" not in kwargs["json"]
 
@@ -365,7 +365,7 @@ class TestCallOpenaiChatSuccess:
     def test_payload_excludes_keep_alive(self, mock_post):
         mock_post.return_value = _mock_response()
         cfg = _cfg("https://api.example.com/v1")
-        call_openai_chat("p", cfg, "endpoint")
+        OpenAIChatClient(cfg, "endpoint").generate("p")
         _, kwargs = mock_post.call_args
         assert "keep_alive" not in kwargs["json"]
 
@@ -373,7 +373,7 @@ class TestCallOpenaiChatSuccess:
     def test_payload_excludes_num_ctx_and_options(self, mock_post):
         mock_post.return_value = _mock_response()
         cfg = _cfg("https://api.example.com/v1")
-        call_openai_chat("p", cfg, "endpoint")
+        OpenAIChatClient(cfg, "endpoint").generate("p")
         _, kwargs = mock_post.call_args
         assert "options" not in kwargs["json"]
         assert "num_ctx" not in kwargs["json"]
@@ -382,7 +382,7 @@ class TestCallOpenaiChatSuccess:
     def test_uses_cfg_timeout(self, mock_post):
         mock_post.return_value = _mock_response()
         cfg = _cfg("https://api.example.com/v1", timeout=42.0)
-        call_openai_chat("p", cfg, "endpoint")
+        OpenAIChatClient(cfg, "endpoint").generate("p")
         _, kwargs = mock_post.call_args
         assert kwargs["timeout"] == 42.0
 
@@ -391,7 +391,7 @@ class TestCallOpenaiChatSuccess:
         mock_post.return_value = _mock_response()
         cfg = _cfg("https://api.example.com/v1")
         endpoint = "https://api.example.com/v1/chat/completions"
-        call_openai_chat("p", cfg, endpoint)
+        OpenAIChatClient(cfg, endpoint).generate("p")
         args, _ = mock_post.call_args
         assert args[0] == endpoint
 
@@ -399,12 +399,12 @@ class TestCallOpenaiChatSuccess:
     def test_temperature_default_zero(self, mock_post):
         mock_post.return_value = _mock_response()
         cfg = _cfg("https://api.example.com/v1")
-        call_openai_chat("p", cfg, "endpoint")
+        OpenAIChatClient(cfg, "endpoint").generate("p")
         _, kwargs = mock_post.call_args
         assert kwargs["json"]["temperature"] == 0.0
 
 
-# ── call_openai_chat: error handling ─────────────────────────────────────────
+# ── OpenAIChatClient.generate: error handling ─────────────────────────────────────────
 
 
 class TestCallOpenaiChatErrors:
@@ -412,22 +412,22 @@ class TestCallOpenaiChatErrors:
     def test_connect_error_wrapped_as_ollama_error(self, mock_post):
         mock_post.side_effect = httpx.ConnectError("refused")
         cfg = _cfg("https://api.example.com/v1")
-        with pytest.raises(OllamaError, match="Cannot connect"):
-            call_openai_chat("p", cfg, "endpoint")
+        with pytest.raises(LLMError, match="Cannot connect"):
+            OpenAIChatClient(cfg, "endpoint").generate("p")
 
     @patch("fw_context_mcp.llm.chat_router.httpx.post")
     def test_timeout_wrapped_as_ollama_error(self, mock_post):
         mock_post.side_effect = httpx.TimeoutException("slow")
         cfg = _cfg("https://api.example.com/v1")
-        with pytest.raises(OllamaError, match="timed out"):
-            call_openai_chat("p", cfg, "endpoint")
+        with pytest.raises(LLMError, match="timed out"):
+            OpenAIChatClient(cfg, "endpoint").generate("p")
 
     @patch("fw_context_mcp.llm.chat_router.httpx.post")
     def test_404_raises_ollama_error_no_pull(self, mock_post):
         mock_post.return_value = _mock_response(status_code=404, json_body={"error": "not found"}, text="not found")
         cfg = _cfg("https://api.example.com/v1")
-        with pytest.raises(OllamaError, match="not found"):
-            call_openai_chat("p", cfg, "endpoint")
+        with pytest.raises(LLMError, match="not found"):
+            OpenAIChatClient(cfg, "endpoint").generate("p")
 
     @patch("fw_context_mcp.llm.chat_router.httpx.post")
     def test_500_raises_ollama_error(self, mock_post):
@@ -435,29 +435,29 @@ class TestCallOpenaiChatErrors:
             status_code=500, json_body={"error": "server error"}, text="server error"
         )
         cfg = _cfg("https://api.example.com/v1")
-        with pytest.raises(OllamaError, match="500"):
-            call_openai_chat("p", cfg, "endpoint")
+        with pytest.raises(LLMError, match="500"):
+            OpenAIChatClient(cfg, "endpoint").generate("p")
 
     @patch("fw_context_mcp.llm.chat_router.httpx.post")
     def test_missing_choices_key_raises(self, mock_post):
         mock_post.return_value = _mock_response(json_body={})
         cfg = _cfg("https://api.example.com/v1")
-        with pytest.raises(OllamaError, match="Unexpected chat API response format"):
-            call_openai_chat("p", cfg, "endpoint")
+        with pytest.raises(LLMError, match="Unexpected chat API response format"):
+            OpenAIChatClient(cfg, "endpoint").generate("p")
 
     @patch("fw_context_mcp.llm.chat_router.httpx.post")
     def test_empty_choices_list_raises(self, mock_post):
         mock_post.return_value = _mock_response(json_body={"choices": []})
         cfg = _cfg("https://api.example.com/v1")
-        with pytest.raises(OllamaError, match="Unexpected chat API response format"):
-            call_openai_chat("p", cfg, "endpoint")
+        with pytest.raises(LLMError, match="Unexpected chat API response format"):
+            OpenAIChatClient(cfg, "endpoint").generate("p")
 
     @patch("fw_context_mcp.llm.chat_router.httpx.post")
     def test_missing_message_key_raises(self, mock_post):
         mock_post.return_value = _mock_response(json_body={"choices": [{}]})
         cfg = _cfg("https://api.example.com/v1")
-        with pytest.raises(OllamaError, match="Unexpected chat API response format"):
-            call_openai_chat("p", cfg, "endpoint")
+        with pytest.raises(LLMError, match="Unexpected chat API response format"):
+            OpenAIChatClient(cfg, "endpoint").generate("p")
 
     @patch("fw_context_mcp.llm.chat_router.httpx.post")
     def test_missing_content_key_returns_empty(self, mock_post):
@@ -468,26 +468,26 @@ class TestCallOpenaiChatErrors:
         """
         mock_post.return_value = _mock_response(json_body={"choices": [{"message": {}}]})
         cfg = _cfg("https://api.example.com/v1")
-        result = call_openai_chat("p", cfg, "endpoint")
+        result = OpenAIChatClient(cfg, "endpoint").generate("p").text
         assert result == ""
 
     @patch("fw_context_mcp.llm.chat_router.httpx.post")
     def test_ollama_error_passes_through(self, mock_post):
-        err = OllamaError("pre-existing")
+        err = LLMError("pre-existing")
         mock_post.side_effect = err
         cfg = _cfg("https://api.example.com/v1")
-        with pytest.raises(OllamaError, match="pre-existing"):
-            call_openai_chat("p", cfg, "endpoint")
+        with pytest.raises(LLMError, match="pre-existing"):
+            OpenAIChatClient(cfg, "endpoint").generate("p")
 
     @patch("fw_context_mcp.llm.chat_router.httpx.post")
     def test_generic_exception_wrapped(self, mock_post):
         mock_post.side_effect = RuntimeError("boom")
         cfg = _cfg("https://api.example.com/v1")
-        with pytest.raises(OllamaError, match="boom"):
-            call_openai_chat("p", cfg, "endpoint")
+        with pytest.raises(LLMError, match="boom"):
+            OpenAIChatClient(cfg, "endpoint").generate("p")
 
 
-# ── call_openai_chat: debug log ──────────────────────────────────────────────
+# ── OpenAIChatClient.generate: debug log ──────────────────────────────────────────────
 
 
 class TestCallOpenaiChatDebugLog:
@@ -496,7 +496,7 @@ class TestCallOpenaiChatDebugLog:
         mock_post.return_value = _mock_response()
         log_path = tmp_path / "debug.jsonl"
         cfg = _cfg("https://api.example.com/v1", debug_log=log_path)
-        call_openai_chat("test prompt", cfg, "endpoint")
+        OpenAIChatClient(cfg, "endpoint").generate("test prompt")
         assert log_path.exists()
         lines = log_path.read_text(encoding="utf-8").strip().split("\n")
         entry = json.loads(lines[-1])
@@ -511,6 +511,6 @@ class TestCallOpenaiChatDebugLog:
     def test_no_debug_log_when_none(self, mock_post, tmp_path):
         mock_post.return_value = _mock_response()
         cfg = _cfg("https://api.example.com/v1", debug_log=None)
-        call_openai_chat("p", cfg, "endpoint")
+        OpenAIChatClient(cfg, "endpoint").generate("p")
         # No assertion needed — just ensure no exception. File should not exist.
         assert not (tmp_path / "debug.jsonl").exists()

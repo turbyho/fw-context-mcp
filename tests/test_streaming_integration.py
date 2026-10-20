@@ -4,7 +4,7 @@ These tests verify the full HTTP round-trip with a real LLM backend:
   - Plan A (SSE auto-detection): API returns text/event-stream despite stream=false
   - Plan B (active streaming): client requests stream=true and consumes SSE
   - reasoning_content fallback: GLM models that emit reasoning_content
-  - call_ollama routing: chat_api_base pointing to OpenAI-compatible endpoint
+  - call_llm routing: chat_api_base pointing to OpenAI-compatible endpoint
   - Content-Type charset suffix handling (text/event-stream; charset=utf-8)
 
 Requires a LiteLLM proxy running at http://localhost:4000 with at least
@@ -24,8 +24,8 @@ import httpx
 import pytest
 
 from fw_context_mcp.config.settings import LLMConfig
-from fw_context_mcp.llm.chat_router import call_openai_chat, detect_chat_endpoint
-from fw_context_mcp.llm.ollama import call_ollama
+from fw_context_mcp.llm.chat_router import OpenAIChatClient, detect_chat_endpoint
+from fw_context_mcp.llm.client import call_llm
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -106,9 +106,9 @@ class TestPlanANonStreaming:
 
     @pytest.mark.skipif(not _model_available(MODEL_CONTENT), reason=f"{MODEL_CONTENT} not available")
     def test_non_streaming_returns_content(self):
-        """call_openai_chat(stream=False) returns a non-empty string."""
+        """OpenAIChatClient.generate (stream=False) returns a non-empty string."""
         cfg = _cfg(MODEL_CONTENT, stream=False)
-        result = call_openai_chat(SIMPLE_PROMPT, cfg, _endpoint(), temperature=0.0, num_predict=20)
+        result = OpenAIChatClient(cfg, _endpoint()).generate(SIMPLE_PROMPT, temperature=0.0, max_tokens=20).text
         assert isinstance(result, str)
         assert len(result) > 0
         assert "5" in result
@@ -135,7 +135,7 @@ class TestPlanANonStreaming:
     def test_non_streaming_glm_reasoning_fallback(self):
         """GLM model with reasoning_content: fallback extracts text."""
         cfg = _cfg(MODEL_REASONING, stream=False, timeout=90.0)
-        result = call_openai_chat(SIMPLE_PROMPT, cfg, _endpoint(), temperature=0.0, num_predict=500)
+        result = OpenAIChatClient(cfg, _endpoint()).generate(SIMPLE_PROMPT, temperature=0.0, max_tokens=500).text
         assert isinstance(result, str)
         assert len(result) > 0, "reasoning_content fallback produced empty string"
         # With enough tokens, GLM should mention 5 somewhere in reasoning or content
@@ -150,9 +150,9 @@ class TestPlanBStreaming:
 
     @pytest.mark.skipif(not _model_available(MODEL_CONTENT), reason=f"{MODEL_CONTENT} not available")
     def test_streaming_returns_content(self):
-        """call_openai_chat(stream=True) returns a non-empty string."""
+        """OpenAIChatClient.generate (stream=True) returns a non-empty string."""
         cfg = _cfg(MODEL_CONTENT, stream=True)
-        result = call_openai_chat(SIMPLE_PROMPT, cfg, _endpoint(), temperature=0.0, num_predict=20)
+        result = OpenAIChatClient(cfg, _endpoint()).generate(SIMPLE_PROMPT, temperature=0.0, max_tokens=20).text
         assert isinstance(result, str)
         assert len(result) > 0
         assert "5" in result
@@ -178,7 +178,7 @@ class TestPlanBStreaming:
     def test_streaming_multi_chunk_accumulation(self):
         """Long response: multiple SSE chunks are correctly accumulated."""
         cfg = _cfg(MODEL_CONTENT, stream=True)
-        result = call_openai_chat(LONG_PROMPT, cfg, _endpoint(), temperature=0.0, num_predict=100)
+        result = OpenAIChatClient(cfg, _endpoint()).generate(LONG_PROMPT, temperature=0.0, max_tokens=100).text
         assert isinstance(result, str)
         assert len(result) > 5, f"Expected multi-char response, got: {result!r}"
         # Should contain digits 1-10
@@ -190,8 +190,8 @@ class TestPlanBStreaming:
         """Same prompt + temperature=0: streaming and non-streaming produce similar results."""
         cfg_ns = _cfg(MODEL_CONTENT, stream=False)
         cfg_s = _cfg(MODEL_CONTENT, stream=True)
-        r_ns = call_openai_chat(SIMPLE_PROMPT, cfg_ns, _endpoint(), temperature=0.0, num_predict=10)
-        r_s = call_openai_chat(SIMPLE_PROMPT, cfg_s, _endpoint(), temperature=0.0, num_predict=10)
+        r_ns = OpenAIChatClient(cfg_ns, _endpoint()).generate(SIMPLE_PROMPT, temperature=0.0, max_tokens=10).text
+        r_s = OpenAIChatClient(cfg_s, _endpoint()).generate(SIMPLE_PROMPT, temperature=0.0, max_tokens=10).text
         # Both should contain "5" (the answer)
         assert "5" in r_ns, f"Non-streaming missing answer: {r_ns!r}"
         assert "5" in r_s, f"Streaming missing answer: {r_s!r}"
@@ -200,7 +200,7 @@ class TestPlanBStreaming:
     def test_streaming_glm_reasoning_fallback(self):
         """GLM streaming with reasoning_content: fallback extracts text."""
         cfg = _cfg(MODEL_REASONING, stream=True, timeout=90.0)
-        result = call_openai_chat(SIMPLE_PROMPT, cfg, _endpoint(), temperature=0.0, num_predict=500)
+        result = OpenAIChatClient(cfg, _endpoint()).generate(SIMPLE_PROMPT, temperature=0.0, max_tokens=500).text
         assert isinstance(result, str)
         assert len(result) > 0, "reasoning_content streaming fallback produced empty string"
         assert "5" in result
@@ -234,37 +234,37 @@ class TestContentTypeCharset:
         """Full streaming call succeeds even when content-type has charset suffix."""
         cfg = _cfg(MODEL_CONTENT, stream=True)
         # This should not raise "no content chunks" — charset suffix must not break detection
-        result = call_openai_chat(SIMPLE_PROMPT, cfg, _endpoint(), temperature=0.0, num_predict=10)
+        result = OpenAIChatClient(cfg, _endpoint()).generate(SIMPLE_PROMPT, temperature=0.0, max_tokens=10).text
         assert len(result) > 0
 
 
-# ── call_ollama routing to OpenAI path ─────────────────────────────────────
+# ── call_llm routing to OpenAI path ─────────────────────────────────────
 
 
 class TestCallOllamaRouting:
-    """call_ollama with chat_api_base routes to call_openai_chat."""
+    """call_llm with chat_api_base routes to OpenAIChatClient.generate."""
 
     @pytest.mark.skipif(not _model_available(MODEL_CONTENT), reason=f"{MODEL_CONTENT} not available")
     def test_call_ollama_non_stream_routes_to_openai(self):
-        """call_ollama(stream=False) with /v1 base routes to OpenAI non-streaming."""
+        """call_llm(stream=False) with /v1 base routes to OpenAI non-streaming."""
         cfg = _cfg(MODEL_CONTENT, stream=False)
-        result = call_ollama(SIMPLE_PROMPT, cfg, num_predict=20)
+        result = call_llm(SIMPLE_PROMPT, cfg, max_tokens=20)
         assert isinstance(result, str)
         assert "5" in result
 
     @pytest.mark.skipif(not _model_available(MODEL_CONTENT), reason=f"{MODEL_CONTENT} not available")
     def test_call_ollama_stream_routes_to_openai_streaming(self):
-        """call_ollama(stream=True) with /v1 base routes to OpenAI streaming."""
+        """call_llm(stream=True) with /v1 base routes to OpenAI streaming."""
         cfg = _cfg(MODEL_CONTENT, stream=True)
-        result = call_ollama(SIMPLE_PROMPT, cfg, num_predict=20)
+        result = call_llm(SIMPLE_PROMPT, cfg, max_tokens=20)
         assert isinstance(result, str)
         assert "5" in result
 
     @pytest.mark.skipif(not _model_available(MODEL_REASONING), reason=f"{MODEL_REASONING} not available")
     def test_call_ollama_stream_glm_reasoning(self):
-        """call_ollama(stream=True) with GLM: reasoning_content fallback works through routing."""
+        """call_llm(stream=True) with GLM: reasoning_content fallback works through routing."""
         cfg = _cfg(MODEL_REASONING, stream=True, timeout=90.0)
-        result = call_ollama(SIMPLE_PROMPT, cfg, num_predict=500)
+        result = call_llm(SIMPLE_PROMPT, cfg, max_tokens=500)
         assert isinstance(result, str)
         assert len(result) > 0
         assert "5" in result
@@ -400,7 +400,7 @@ class TestDebugLogStreaming:
             stream=True,
             debug_log=log_path,
         )
-        call_openai_chat(SIMPLE_PROMPT, cfg, _endpoint(), temperature=0.0, num_predict=10)
+        OpenAIChatClient(cfg, _endpoint()).generate(SIMPLE_PROMPT, temperature=0.0, max_tokens=10)
         assert log_path.exists(), "Debug log not created"
         entry = json.loads(log_path.read_text(encoding="utf-8").strip().split("\n")[-1])
         assert entry.get("streamed") is True, f"Expected streamed=True, got: {entry}"
@@ -416,7 +416,7 @@ class TestDebugLogStreaming:
             stream=False,
             debug_log=log_path,
         )
-        call_openai_chat(SIMPLE_PROMPT, cfg, _endpoint(), temperature=0.0, num_predict=10)
+        OpenAIChatClient(cfg, _endpoint()).generate(SIMPLE_PROMPT, temperature=0.0, max_tokens=10)
         assert log_path.exists(), "Debug log not created"
         entry = json.loads(log_path.read_text(encoding="utf-8").strip().split("\n")[-1])
         assert entry.get("streamed") is False, f"Expected streamed=False, got: {entry}"
@@ -485,10 +485,10 @@ class TestNoThinkingMode:
     @pytest.mark.skipif(
         not _model_available(MODEL_NO_THINKING), reason=f"{MODEL_NO_THINKING} not available"
     )
-    def test_no_thinking_call_openai_chat_non_streaming(self):
-        """call_openai_chat(stream=False) with non-thinking model returns content."""
+    def test_no_thinking_openai_client_non_streaming(self):
+        """OpenAIChatClient.generate (stream=False) with non-thinking model returns content."""
         cfg = _cfg(MODEL_NO_THINKING, stream=False)
-        result = call_openai_chat(SIMPLE_PROMPT, cfg, _endpoint(), temperature=0.0, num_predict=50)
+        result = OpenAIChatClient(cfg, _endpoint()).generate(SIMPLE_PROMPT, temperature=0.0, max_tokens=50).text
         assert isinstance(result, str)
         assert len(result) > 0
         assert "5" in result
@@ -496,10 +496,10 @@ class TestNoThinkingMode:
     @pytest.mark.skipif(
         not _model_available(MODEL_NO_THINKING), reason=f"{MODEL_NO_THINKING} not available"
     )
-    def test_no_thinking_call_openai_chat_streaming(self):
-        """call_openai_chat(stream=True) with non-thinking model returns content."""
+    def test_no_thinking_openai_client_streaming(self):
+        """OpenAIChatClient.generate (stream=True) with non-thinking model returns content."""
         cfg = _cfg(MODEL_NO_THINKING, stream=True)
-        result = call_openai_chat(SIMPLE_PROMPT, cfg, _endpoint(), temperature=0.0, num_predict=50)
+        result = OpenAIChatClient(cfg, _endpoint()).generate(SIMPLE_PROMPT, temperature=0.0, max_tokens=50).text
         assert isinstance(result, str)
         assert len(result) > 0
         assert "5" in result
@@ -511,7 +511,7 @@ class TestNoThinkingMode:
         """Non-thinking: streaming and non-streaming produce consistent results."""
         cfg_ns = _cfg(MODEL_NO_THINKING, stream=False)
         cfg_s = _cfg(MODEL_NO_THINKING, stream=True)
-        r_ns = call_openai_chat(SIMPLE_PROMPT, cfg_ns, _endpoint(), temperature=0.0, num_predict=10)
-        r_s = call_openai_chat(SIMPLE_PROMPT, cfg_s, _endpoint(), temperature=0.0, num_predict=10)
+        r_ns = OpenAIChatClient(cfg_ns, _endpoint()).generate(SIMPLE_PROMPT, temperature=0.0, max_tokens=10).text
+        r_s = OpenAIChatClient(cfg_s, _endpoint()).generate(SIMPLE_PROMPT, temperature=0.0, max_tokens=10).text
         assert "5" in r_ns, f"Non-streaming missing answer: {r_ns!r}"
         assert "5" in r_s, f"Streaming missing answer: {r_s!r}"

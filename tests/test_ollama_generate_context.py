@@ -1,4 +1,4 @@
-"""call_ollama asks the server not to cut a prompt, and count_prompt_tokens gives the exact count.
+"""The Ollama client asks the server not to cut a prompt, and its count_tokens gives the exact count.
 
 Measured with Ollama 0.35.1: without "truncate": false, /api/generate cut a
 prompt of 6413 tokens to 1026 tokens for a context of 2048, and the model
@@ -16,6 +16,8 @@ import pytest
 
 from fw_context_mcp.config.settings import LLMConfig
 from fw_context_mcp.llm import ollama
+from fw_context_mcp.llm.client import call_llm, get_chat_client
+from fw_context_mcp.llm.errors import LLMError
 
 # The error of Ollama 0.35.1: the error of its runner as a JSON string.
 _TOO_LONG = {"error": json.dumps({"error": {
@@ -36,7 +38,7 @@ def test_the_request_asks_the_server_not_to_cut_and_takes_the_context_of_the_cal
         return _response(200, {"response": "ok"})
 
     with mock.patch.object(ollama.httpx, "post", side_effect=post):
-        ollama.call_ollama("p", LLMConfig(num_ctx=16384), num_ctx=24576)
+        call_llm("p", LLMConfig(num_ctx=16384), num_ctx=24576)
     assert sent["truncate"] is False
     assert sent["options"]["num_ctx"] == 24576
 
@@ -49,14 +51,14 @@ def test_without_a_context_the_call_has_the_context_of_the_config():
         return _response(200, {"response": "ok"})
 
     with mock.patch.object(ollama.httpx, "post", side_effect=post):
-        ollama.call_ollama("p", LLMConfig(num_ctx=16384))
+        call_llm("p", LLMConfig(num_ctx=16384))
     assert sent["options"]["num_ctx"] == 16384
 
 
 def test_a_prompt_longer_than_the_context_raises_with_the_count():
     with mock.patch.object(ollama.httpx, "post", return_value=_response(400, _TOO_LONG)), \
             pytest.raises(ollama.OllamaPromptTooLong) as raised:
-        ollama.call_ollama("p", LLMConfig())
+        call_llm("p", LLMConfig())
     assert (raised.value.prompt_tokens, raised.value.context) == (6413, 2048)
 
 
@@ -72,7 +74,7 @@ def test_a_streamed_prompt_after_a_pull_raises_with_the_count(monkeypatch):
     monkeypatch.setattr(ollama, "_pull_model", lambda model, base: None)
     with mock.patch.object(ollama.httpx, "stream", side_effect=stream), \
             pytest.raises(ollama.OllamaPromptTooLong):
-        ollama.call_ollama("p", LLMConfig(stream=True, auto_pull=True))
+        call_llm("p", LLMConfig(stream=True, auto_pull=True))
 
 
 def test_a_streamed_prompt_longer_than_the_context_raises_with_the_count():
@@ -82,14 +84,14 @@ def test_a_streamed_prompt_longer_than_the_context_raises_with_the_count():
 
     with mock.patch.object(ollama.httpx, "stream", side_effect=stream), \
             pytest.raises(ollama.OllamaPromptTooLong) as raised:
-        ollama.call_ollama("p", LLMConfig(stream=True))
+        call_llm("p", LLMConfig(stream=True))
     assert raised.value.prompt_tokens == 6413
 
 
 def test_another_error_400_stays_an_ollama_error():
     with mock.patch.object(ollama.httpx, "post", return_value=_response(400, {"error": "invalid options"})), \
             pytest.raises(ollama.OllamaError) as raised:
-        ollama.call_ollama("p", LLMConfig())
+        call_llm("p", LLMConfig())
     assert not isinstance(raised.value, ollama.OllamaPromptTooLong)
 
 
@@ -105,17 +107,17 @@ def test_the_count_comes_from_the_server(answer, count):
         return answer
 
     with mock.patch.object(ollama.httpx, "post", side_effect=post):
-        assert ollama.count_prompt_tokens("p", LLMConfig(), 16384) == count
+        assert get_chat_client(LLMConfig()).count_tokens("p", 16384) == count
     assert sent["options"] == {"num_ctx": 16384, "num_predict": 1}
     assert sent["truncate"] is False
 
 
 def test_an_openai_endpoint_gives_no_count():
-    cfg = LLMConfig(chat_api_base="https://api.example.test/v1")
-    assert ollama.generate_endpoint(cfg) is None
-    assert ollama.trained_context(cfg) is None
-    with pytest.raises(ollama.OllamaError):
-        ollama.count_prompt_tokens("p", cfg, 16384)
+    client = get_chat_client(LLMConfig(chat_api_base="https://api.example.test/v1"))
+    assert client.counts_tokens is False
+    assert client.trained_context() is None
+    with pytest.raises(LLMError):
+        client.count_tokens("p", 16384)
 
 
 # ── The oldest Ollama that fw-context can use ──
@@ -192,5 +194,5 @@ def test_a_stop_of_the_run_is_not_wrapped(stream):
     with mock.patch.object(ollama.httpx, "stream", side_effect=stopped), \
             mock.patch.object(ollama.httpx, "post", side_effect=stopped), \
             pytest.raises(IndexTerminated):
-        ollama.call_ollama("p", LLMConfig(stream=stream))
+        call_llm("p", LLMConfig(stream=stream))
     assert is_fatal(IndexTerminated("x"))

@@ -20,14 +20,8 @@ from pathlib import Path
 from typing import Any
 
 from ..cache_client import get_local_cache_db, local_cache_lookup, local_cache_upsert
-from ..llm.ollama import (
-    OllamaPromptTooLong,
-    call_ollama,
-    count_prompt_tokens,
-    generate_endpoint,
-    pull_chat_model,
-    trained_context,
-)
+from ..llm.client import ChatClient, get_chat_client
+from ..llm.ollama import OllamaPromptTooLong
 from ..utils import SAFE_EXCEPT, is_fatal, read_file_lines
 from ._embedding import _fmt_dur
 from .db import transaction, upsert_llm_analysis_batch, write_lock
@@ -213,7 +207,7 @@ def _enrich_batch(conn, batch_rows, config_hash: str, *, project_root: Path | No
 _ANSWER_TOKENS = 1024
 
 
-def _analysis_contexts(llm_config) -> tuple[int, int] | None:
+def _analysis_contexts(client: ChatClient, llm_config) -> tuple[int, int] | None:
     """Return the context of the run and the largest context of the model, or None.
 
     The context of the run is ``num_ctx`` of the config: the server loads
@@ -226,24 +220,24 @@ def _analysis_contexts(llm_config) -> tuple[int, int] | None:
     each request had ``num_ctx`` (16384).  The answer budget thus counted
     on a context that the server did not use.
 
-    An OpenAI-compatible chat endpoint gives no trained context and no
-    token count: the run then has ``num_ctx`` only.  None when the Ollama
-    server does not answer, or does not have the model: the run then makes
-    no analysis.
+    A backend that cannot count tokens (an OpenAI-compatible API,
+    ``client.counts_tokens`` is False) gives no trained context: the run
+    then has ``num_ctx`` only.  None when the Ollama server does not answer,
+    or does not have the model: the run then makes no analysis.
     """
-    if generate_endpoint(llm_config) is None:
+    if not client.counts_tokens:
         return llm_config.num_ctx, llm_config.num_ctx
-    largest = trained_context(llm_config)
+    largest = client.trained_context()
     if largest is None and llm_config.auto_pull:
         # /api/show gives 404 for a model that is not installed.
         try:
-            pull_chat_model(llm_config)
+            client.pull_model()
         except SAFE_EXCEPT as e:
             if is_fatal(e):
                 raise
             log.warning("The pull of %s failed: %s", llm_config.model, e)
         else:
-            largest = trained_context(llm_config)
+            largest = client.trained_context()
     if largest is None:
         log.warning("Ollama did not give the context of %s (not reachable, or the model is not installed) "
                     "— skipping LLM analysis generation", llm_config.model)
@@ -376,7 +370,7 @@ def _build_llm_analysis(
     answer was JSON, with the full body and with the cut one.
 
     The tokens of each prompt are counted by the tokenizer of the model
-    (``count_prompt_tokens``), not estimated from its characters.  A prompt
+    (``ChatClient.count_tokens``), not estimated from its characters.  A prompt
     that does not fit the context of the run waits for a second pass, after
     each other symbol.  That pass has one context: the smallest one that
     holds each waiting prompt, and at most the trained context.  WHY one
@@ -412,11 +406,12 @@ def _build_llm_analysis(
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
     # Check Ollama reachability and resolve the contexts of the model.
-    contexts = _analysis_contexts(llm_config)
+    client = get_chat_client(llm_config)
+    contexts = _analysis_contexts(client, llm_config)
     if contexts is None:
         return False
     run_ctx, largest_ctx = contexts
-    token_counts = generate_endpoint(llm_config) is not None
+    token_counts = client.counts_tokens
 
     model = llm_config.model
 
@@ -444,7 +439,7 @@ def _build_llm_analysis(
         """Count the tokens of *prompt*; a failed request goes again, three times in all, as a call of the model."""
         for _c_attempt in range(3):
             try:
-                return count_prompt_tokens(prompt, llm_config, run_ctx)
+                return client.count_tokens(prompt, run_ctx)
             except SAFE_EXCEPT as _e:
                 if is_fatal(_e) or _c_attempt == 2:
                     raise
@@ -463,8 +458,8 @@ def _build_llm_analysis(
         _last_exc: BaseException | None = None
         for _a_attempt in range(3):
             try:
-                response = call_ollama(prompt, llm_config, temperature=0.1, num_predict=_ANSWER_TOKENS,
-                                       num_ctx=num_ctx)
+                response = client.generate(prompt, temperature=0.1, max_tokens=_ANSWER_TOKENS,
+                                           num_ctx=num_ctx).text
                 break
             except OllamaPromptTooLong:
                 # The same request fails again: the caller selects a larger context.

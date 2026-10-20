@@ -1,8 +1,8 @@
 """Tests for the Ollama client: routing, auto_pull, check_setup, and backward compat.
 
 Covers:
-- call_ollama() routing to OpenAI when chat_api_base is set
-- call_ollama() backward compat when chat_api_base is None
+- call_llm() routing to OpenAI when chat_api_base is set
+- call_llm() backward compat when chat_api_base is None
 - auto_pull switch (both true and false, for chat and embed)
 - check_setup() all status combinations
 - Regression: existing behavior must not change when chat_api_base is None
@@ -17,11 +17,11 @@ import httpx
 import pytest
 
 from fw_context_mcp.config.settings import LLMConfig
+from fw_context_mcp.llm.client import call_llm
 from fw_context_mcp.llm.ollama import (
     OllamaError,
     OllamaModelNotFoundError,
     _parse_parameter_size,
-    call_ollama,
     call_ollama_embed,
     check_setup,
 )
@@ -92,7 +92,7 @@ def _mock_embed_response(embeddings: list[list[float]] | None = None) -> httpx.R
     )
 
 
-# ── call_ollama: backward compatibility (no chat_api_base) ───────────────────
+# ── call_llm: backward compatibility (no chat_api_base) ───────────────────
 
 
 class TestCallOllamaBackwardCompat:
@@ -100,7 +100,7 @@ class TestCallOllamaBackwardCompat:
     def test_none_chat_api_base_uses_ollama_url(self, mock_post):
         mock_post.return_value = _mock_post_response()
         cfg = _cfg(chat_api_base=None)
-        call_ollama("prompt", cfg)
+        call_llm("prompt", cfg)
         args, _ = mock_post.call_args
         assert args[0] == "http://localhost:11434/api/generate"
 
@@ -108,7 +108,7 @@ class TestCallOllamaBackwardCompat:
     def test_sends_keep_alive_in_payload(self, mock_post):
         mock_post.return_value = _mock_post_response()
         cfg = _cfg(chat_api_base=None, keep_alive="5m")
-        call_ollama("prompt", cfg)
+        call_llm("prompt", cfg)
         _, kwargs = mock_post.call_args
         assert kwargs["json"]["keep_alive"] == "5m"
 
@@ -116,7 +116,7 @@ class TestCallOllamaBackwardCompat:
     def test_sends_num_ctx_in_options(self, mock_post):
         mock_post.return_value = _mock_post_response()
         cfg = _cfg(chat_api_base=None, num_ctx=8192)
-        call_ollama("prompt", cfg)
+        call_llm("prompt", cfg)
         _, kwargs = mock_post.call_args
         assert kwargs["json"]["options"]["num_ctx"] == 8192
 
@@ -124,7 +124,7 @@ class TestCallOllamaBackwardCompat:
     def test_returns_response_field(self, mock_post):
         mock_post.return_value = _mock_post_response(json_body={"response": "generated text"})
         cfg = _cfg(chat_api_base=None)
-        result = call_ollama("prompt", cfg)
+        result = call_llm("prompt", cfg)
         assert result == "generated text"
 
     @patch("fw_context_mcp.llm.ollama.httpx.post")
@@ -132,17 +132,17 @@ class TestCallOllamaBackwardCompat:
         mock_post.side_effect = httpx.ConnectError("refused")
         cfg = _cfg(chat_api_base=None)
         with pytest.raises(OllamaError, match="Ollama"):
-            call_ollama("prompt", cfg)
+            call_llm("prompt", cfg)
 
     @patch("fw_context_mcp.llm.ollama.httpx.post")
     def test_timeout_raises_ollama_error(self, mock_post):
         mock_post.side_effect = httpx.TimeoutException("slow")
         cfg = _cfg(chat_api_base=None)
         with pytest.raises(OllamaError, match="timed out"):
-            call_ollama("prompt", cfg)
+            call_llm("prompt", cfg)
 
 
-# ── call_ollama: routing to OpenAI ───────────────────────────────────────────
+# ── call_llm: routing to OpenAI ───────────────────────────────────────────
 
 
 class TestCallOllamaRouting:
@@ -154,7 +154,7 @@ class TestCallOllamaRouting:
             request=httpx.Request("POST", "https://api.example.com/v1/chat/completions"),
         )
         cfg = _cfg(chat_api_base="https://api.example.com/v1", chat_api_key="sk-test")
-        result = call_ollama("prompt", cfg)
+        result = call_llm("prompt", cfg)
         assert result == "openai result"
         mock_openai_post.assert_called_once()
 
@@ -166,7 +166,7 @@ class TestCallOllamaRouting:
             chat_api_base="http://remote:11434",
             ollama_url="http://localhost:11434",
         )
-        call_ollama("prompt", cfg)
+        call_llm("prompt", cfg)
         args, _ = mock_post.call_args
         assert args[0] == "http://remote:11434/api/generate"
 
@@ -174,7 +174,7 @@ class TestCallOllamaRouting:
     def test_chat_api_base_ollama_preserves_keep_alive(self, mock_post):
         mock_post.return_value = _mock_post_response()
         cfg = _cfg(chat_api_base="http://remote:11434", keep_alive="5m")
-        call_ollama("prompt", cfg)
+        call_llm("prompt", cfg)
         _, kwargs = mock_post.call_args
         assert kwargs["json"]["keep_alive"] == "5m"
 
@@ -190,12 +190,12 @@ class TestCallOllamaRouting:
             chat_api_base="http://localhost:11434",
             chat_api_format="openai",
         )
-        result = call_ollama("prompt", cfg)
+        result = call_llm("prompt", cfg)
         assert result == "ok"
         mock_openai_post.assert_called_once()
 
 
-# ── call_ollama: auto_pull switch ────────────────────────────────────────────
+# ── call_llm: auto_pull switch ────────────────────────────────────────────
 
 
 class TestCallOllamaAutoPull:
@@ -205,7 +205,7 @@ class TestCallOllamaAutoPull:
         mock_post.return_value = _mock_post_response(status_code=404, text="not found")
         cfg = _cfg(chat_api_base=None, auto_pull=False)
         with pytest.raises(OllamaModelNotFoundError):
-            call_ollama("prompt", cfg)
+            call_llm("prompt", cfg)
         mock_pull.assert_not_called()
 
     @patch("fw_context_mcp.llm.ollama.httpx.post")
@@ -216,7 +216,7 @@ class TestCallOllamaAutoPull:
             _mock_post_response(status_code=200, json_body={"response": "ok after pull"}),
         ]
         cfg = _cfg(chat_api_base=None, auto_pull=True)
-        result = call_ollama("prompt", cfg)
+        result = call_llm("prompt", cfg)
         assert result == "ok after pull"
         mock_pull.assert_called_once()
 
@@ -227,7 +227,7 @@ class TestCallOllamaAutoPull:
         mock_pull.side_effect = OllamaError("pull failed")
         cfg = _cfg(chat_api_base=None, auto_pull=True)
         with pytest.raises(OllamaError, match="pull failed"):
-            call_ollama("prompt", cfg)
+            call_llm("prompt", cfg)
 
     @patch("fw_context_mcp.llm.ollama.httpx.post")
     @patch("fw_context_mcp.llm.ollama._pull_model")
@@ -238,7 +238,7 @@ class TestCallOllamaAutoPull:
         ]
         cfg = _cfg(chat_api_base=None, auto_pull=True)
         with pytest.raises(OllamaModelNotFoundError):
-            call_ollama("prompt", cfg)
+            call_llm("prompt", cfg)
 
     @patch("fw_context_mcp.llm.ollama.httpx.post")
     @patch("fw_context_mcp.llm.ollama._pull_model")
@@ -246,7 +246,7 @@ class TestCallOllamaAutoPull:
         mock_post.return_value = _mock_post_response(status_code=500, text="server error")
         cfg = _cfg(chat_api_base=None, auto_pull=True)
         with pytest.raises(OllamaError):
-            call_ollama("prompt", cfg)
+            call_llm("prompt", cfg)
         mock_pull.assert_not_called()
 
     def test_default_llm_config_has_auto_pull_false(self):

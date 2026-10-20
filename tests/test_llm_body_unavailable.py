@@ -226,17 +226,26 @@ class _Recorder:
 
     def install(self, monkeypatch, *, response: str | None = None) -> None:
         from fw_context_mcp.indexer import _llm_analysis as mod
+        from fw_context_mcp.llm.client import ChatResult
 
-        def _call_ollama(prompt, *a, **kw):
-            self.ollama_calls.append(prompt)
-            if response is None:
-                raise AssertionError("the model must not be called for a body-less symbol")
-            return response
+        calls = self.ollama_calls
 
-        monkeypatch.setattr(mod, "_analysis_contexts", lambda cfg: (16384, 32768))
-        monkeypatch.setattr(mod, "generate_endpoint", lambda cfg: "http://ollama.test/api/generate")
-        monkeypatch.setattr(mod, "count_prompt_tokens", lambda prompt, cfg, num_ctx: 100)
-        monkeypatch.setattr(mod, "call_ollama", _call_ollama)
+        class _Client:
+            """Stands in for the chat client: each prompt has 100 tokens."""
+
+            counts_tokens = True
+
+            def generate(self, prompt, **kw):
+                calls.append(prompt)
+                if response is None:
+                    raise AssertionError("the model must not be called for a body-less symbol")
+                return ChatResult(response)
+
+            def count_tokens(self, prompt, num_ctx):
+                return 100
+
+        monkeypatch.setattr(mod, "_analysis_contexts", lambda client, cfg: (16384, 32768))
+        monkeypatch.setattr(mod, "get_chat_client", lambda cfg: _Client())
         # The loop closes the cache handle at the end, thus a bare None fails.
         monkeypatch.setattr(mod, "get_local_cache_db", lambda: SimpleNamespace(close=lambda: None))
         monkeypatch.setattr(mod, "local_cache_lookup", lambda db, hashes: {})

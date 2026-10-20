@@ -35,7 +35,8 @@ import httpx
 from ..config.settings import LLMConfig
 from ..utils import is_fatal
 from ._debug import _write_debug_log
-from .ollama import ChatApiError, OllamaError
+from .client import ChatResult, Usage
+from .errors import ChatApiError, LLMError
 
 log = logging.getLogger(__name__)
 
@@ -216,208 +217,207 @@ def _accumulate_openai_sse(resp: httpx.Response) -> str:
     return "".join(chunks)
 
 
-def _stream_openai_chat(
-    prompt: str,
-    cfg: LLMConfig,
-    endpoint: str,
-    headers: dict[str, str],
-    payload: dict,
-    *,
-    temperature: float,
-    num_predict: int | None,
-) -> str:
-    """Send a streaming chat request and accumulate the response (Plan B).
+def _openai_usage(answer: dict) -> Usage:
+    """Return the token counts of an OpenAI-compatible answer (its ``usage`` object).
 
-    Uses ``httpx.stream()`` to consume SSE chunks as they arrive.  This
-    keeps the HTTP connection alive with continuous data flow, avoiding
-    reverse-proxy idle timeouts (nginx 60s, Cloudflare 100s).
-
-    Args:
-        prompt: The full prompt text (for debug logging).
-        cfg: LLM configuration.
-        endpoint: Full endpoint URL.
-        headers: HTTP headers (Content-Type, Authorization).
-        payload: Base payload dict (will have stream set to True).
-        temperature: Sampling temperature.
-        num_predict: Max tokens (for debug logging only — already in payload).
-
-    Returns:
-        The accumulated text response.
-
-    Raises:
-        ChatApiError: On network, API, or parse failure.
+    The providers name the parts differently: OpenAI and OpenRouter give
+    ``prompt_tokens_details.cached_tokens`` and
+    ``completion_tokens_details.reasoning_tokens``; DeepSeek gives
+    ``prompt_cache_hit_tokens``; OpenRouter gives ``cost`` (US dollars).
+    A field that the answer does not carry is None.
     """
-    payload["stream"] = True
-    t0 = time.monotonic()
-    chunks: list[str] = []
-    try:
-        with httpx.stream("POST", endpoint, json=payload, headers=headers, timeout=cfg.timeout) as resp:
-            resp.raise_for_status()
-            for line in resp.iter_lines():
-                line = line.strip() if line else ""
-                if not line or not line.startswith("data: "):
-                    continue
-                data = line[6:]
-                if data == "[DONE]":
-                    break
-                try:
-                    obj = json.loads(data)
-                    delta = obj.get("choices", [{}])[0].get("delta", {})
-                    content = _extract_openai_text(delta)
-                    if content:
-                        chunks.append(content)
-                except (json.JSONDecodeError, KeyError, IndexError):
-                    continue
-    except httpx.ConnectError as e:
-        raise ChatApiError(f"Cannot connect to chat API at {endpoint}: {e}") from e
-    except httpx.TimeoutException:
-        raise ChatApiError(f"Chat API request timed out after {cfg.timeout:.0f}s") from None
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 404:
-            raise ChatApiError(
-                f"Model '{cfg.model}' not found at {endpoint}. HTTP 404 — check model name and API endpoint."
-            ) from e
-        raise ChatApiError(f"Chat API HTTP {e.response.status_code}: {e.response.text[:200]}") from e
-    except OllamaError:
-        raise
-    except Exception as e:
-        if is_fatal(e):
-            raise
-        raise ChatApiError(str(e)) from e
+    usage = answer.get("usage")
+    if not isinstance(usage, dict):
+        return Usage()
 
-    if not chunks:
-        raise ChatApiError("Streaming chat API returned no content chunks")
+    def number(obj: object, key: str) -> int | None:
+        value = obj.get(key) if isinstance(obj, dict) else None
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
 
-    response_text = "".join(chunks)
-    if cfg.debug_log:
-        _write_debug_log(
-            cfg.debug_log,
-            {
-                "ts": datetime.now(UTC).isoformat(),
-                "model": cfg.model,
-                "endpoint": endpoint,
-                "latency_s": round(time.monotonic() - t0, 2),
-                "prompt": prompt,
-                "response": response_text,
-                "streamed": True,
-            },
-        )
-    return response_text
+    cached = number(usage.get("prompt_tokens_details"), "cached_tokens")
+    if cached is None:
+        cached = number(usage, "prompt_cache_hit_tokens")
+    cost = usage.get("cost")
+    return Usage(
+        prompt_tokens=number(usage, "prompt_tokens"),
+        cached_tokens=cached,
+        completion_tokens=number(usage, "completion_tokens"),
+        reasoning_tokens=number(usage.get("completion_tokens_details"), "reasoning_tokens"),
+        cost=float(cost) if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None,
+    )
 
 
-def call_openai_chat(
-    prompt: str,
-    cfg: LLMConfig,
-    endpoint: str,
-    *,
-    temperature: float = 0.0,
-    num_predict: int | None = None,
-) -> str:
-    """Send a chat request to an OpenAI-compatible endpoint.
+class OpenAIChatClient:
+    """The chat client of an OpenAI-compatible ``/chat/completions`` endpoint.
 
-    Does NOT use ``ollama_guard`` (no local GPU contention with cloud APIs).
-    Does NOT send ``keep_alive`` / ``num_ctx`` (Ollama-specific parameters).
-    Does NOT auto-pull on 404 (cloud APIs don't support model pulling).
+    No ``ollama_guard``, no ``keep_alive`` and ``num_ctx``, no auto-pull:
 
-    WHY no ollama_guard: The semaphore protects a local Ollama process
-    from GPU saturation.  Cloud APIs are multi-tenant and designed for
-    concurrent requests — serializing them would add unnecessary latency.
+    * WHY no ollama_guard: the semaphore protects a local Ollama process
+      from GPU saturation.  A cloud API is multi-tenant and made for
+      concurrent requests; to serialize them only adds latency.
+    * WHY no num_ctx: the API has no context per request.  It also cannot
+      count the tokens of a prompt that it refuses, thus ``counts_tokens``
+      is False.
+    * WHY no auto-pull: a cloud API reports 404 for a wrong model name or a
+      missing deployment, and it has no ``ollama pull``.
 
-    WHY no auto-pull: Cloud APIs report 404 for invalid model names or
-    missing deployments.  Auto-pulling would be meaningless (there is no
-    ``ollama pull`` equivalent for OpenAI/DeepSeek/vLLM).  The operator
-    should fix the model name in config.
-
-    Streaming behavior:
-
-    * When ``cfg.stream`` is True (Plan B): sends ``stream: true`` and
-      consumes SSE chunks via ``httpx.stream()`` — keeps the connection
-      alive, avoiding reverse-proxy idle timeouts.
-    * When ``cfg.stream`` is False (default): sends ``stream: false``. If
-      the API returns SSE anyway (ignoring the flag), the response is
-      auto-detected and parsed transparently (Plan A fallback).
-
-    Args:
-        prompt: The full prompt text to send.
-        cfg: LLM configuration (chat_api_key, model, timeout, debug_log, stream).
-        endpoint: Full endpoint URL (from ``detect_chat_endpoint``).
-        temperature: Sampling temperature (0.0 = deterministic, default).
-        num_predict: Maximum tokens to generate (None = model default).
-
-    Returns:
-        The model's text response.
-
-    Raises:
-        ChatApiError: On any network, API, or response-format failure.
+    Streaming (when ``cfg.stream`` is True, Plan B): ``httpx.stream()`` with
+    SSE chunks.  Without it, the request sends ``stream: false``; an answer
+    that streams anyway is parsed as SSE (Plan A).
     """
-    headers: dict[str, str] = {"Content-Type": "application/json"}
-    if cfg.chat_api_key:
-        headers["Authorization"] = f"Bearer {cfg.chat_api_key}"
 
-    payload: dict = {
-        "model": cfg.model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": temperature,
-        "stream": False,
-    }
-    if num_predict is not None:
-        payload["max_tokens"] = num_predict
+    counts_tokens = False
 
-    # Plan B: active streaming
-    if cfg.stream:
-        return _stream_openai_chat(
-            prompt, cfg, endpoint, headers, payload,
-            temperature=temperature, num_predict=num_predict,
-        )
+    def __init__(self, cfg: LLMConfig, endpoint: str) -> None:
+        self.cfg = cfg
+        self.endpoint = endpoint
 
-    # Non-streaming request (Plan A: SSE auto-detection below)
-    t0 = time.monotonic()
-    try:
-        resp = httpx.post(endpoint, json=payload, headers=headers, timeout=cfg.timeout)
-        resp.raise_for_status()
+    def generate(
+        self,
+        prompt: str,
+        *,
+        temperature: float = 0.0,
+        max_tokens: int | None = None,
+        num_ctx: int | None = None,
+    ) -> ChatResult:
+        """Send *prompt* as one user message and return the answer and its usage.
 
-        # Plan A: detect SSE response even when stream:false was requested.
-        # Some API backends (especially Ollama's /v1 endpoint) ignore the
-        # stream flag and return text/event-stream regardless.  Detecting it
-        # here avoids a JSON decode error — the SSE body is parsed as a
-        # completed stream instead.
-        if _is_sse_response(resp):
-            log.debug("API returned SSE despite stream:false — parsing as SSE (Plan A fallback)")
-            response_text = _accumulate_openai_sse(resp)
-        else:
-            message = resp.json()["choices"][0]["message"]
-            response_text = _extract_openai_text(message)
+        *num_ctx* is ignored: the API has no context per request.
 
+        Raises:
+            ChatApiError: On any network, API, or answer-format failure.
+        """
+        cfg = self.cfg
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if cfg.chat_api_key:
+            headers["Authorization"] = f"Bearer {cfg.chat_api_key}"
+        payload: dict = {
+            "model": cfg.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": temperature,
+            "stream": False,
+        }
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
+        t0 = time.monotonic()
+        result = self._stream(headers, payload) if cfg.stream else self._post(headers, payload)
         if cfg.debug_log:
             _write_debug_log(
                 cfg.debug_log,
                 {
                     "ts": datetime.now(UTC).isoformat(),
                     "model": cfg.model,
-                    "endpoint": endpoint,
+                    "endpoint": self.endpoint,
                     "latency_s": round(time.monotonic() - t0, 2),
                     "prompt": prompt,
-                    "response": response_text,
-                    "streamed": False,
+                    "response": result.text,
+                    "streamed": bool(cfg.stream),
                 },
             )
-        return response_text
+        return result
 
-    except httpx.ConnectError as e:
-        raise ChatApiError(f"Cannot connect to chat API at {endpoint}: {e}") from e
-    except httpx.TimeoutException:
-        raise ChatApiError(f"Chat API request timed out after {cfg.timeout:.0f}s") from None
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 404:
-            raise ChatApiError(
-                f"Model '{cfg.model}' not found at {endpoint}. HTTP 404 — check model name and API endpoint."
-            ) from e
-        raise ChatApiError(f"Chat API HTTP {e.response.status_code}: {e.response.text[:200]}") from e
-    except (KeyError, IndexError) as e:
-        raise ChatApiError(f"Unexpected chat API response format: {e}") from e
-    except OllamaError:
-        raise
-    except Exception as e:
-        if is_fatal(e):
+    def _post(self, headers: dict[str, str], payload: dict) -> ChatResult:
+        """One non-streaming request (Plan A: an SSE answer is parsed as a stream).
+
+        Some backends (Ollama's own ``/v1`` layer in particular) ignore the
+        stream flag and answer ``text/event-stream``; the detection here
+        avoids a JSON decode error.
+        """
+        try:
+            resp = httpx.post(self.endpoint, json=payload, headers=headers, timeout=self.cfg.timeout)
+            resp.raise_for_status()
+            if _is_sse_response(resp):
+                log.debug("API returned SSE despite stream:false — parsing as SSE (Plan A fallback)")
+                return ChatResult(_accumulate_openai_sse(resp))
+            answer = resp.json()
+            return ChatResult(_extract_openai_text(answer["choices"][0]["message"]), _openai_usage(answer))
+        except (KeyError, IndexError) as e:
+            raise ChatApiError(f"Unexpected chat API response format: {e}") from e
+        except LLMError:
             raise
-        raise ChatApiError(str(e)) from e
+        except Exception as e:
+            if is_fatal(e):
+                raise
+            raise self._error(e) from (None if isinstance(e, httpx.TimeoutException) else e)
+
+    def _stream(self, headers: dict[str, str], payload: dict) -> ChatResult:
+        """One streaming request (Plan B).
+
+        ``httpx.stream()`` keeps the connection busy with continuous data,
+        thus a reverse proxy (nginx 60 s, Cloudflare 100 s) does not close
+        it as idle during a long answer.  A chunk with a ``usage`` object
+        gives the usage.
+        """
+        payload["stream"] = True
+        chunks: list[str] = []
+        usage = Usage()
+        try:
+            with httpx.stream(
+                "POST", self.endpoint, json=payload, headers=headers, timeout=self.cfg.timeout
+            ) as resp:
+                resp.raise_for_status()
+                for line in resp.iter_lines():
+                    line = line.strip() if line else ""
+                    if not line or not line.startswith("data: "):
+                        continue
+                    data = line[6:]
+                    if data == "[DONE]":
+                        break
+                    try:
+                        obj = json.loads(data)
+                        if isinstance(obj.get("usage"), dict):
+                            usage = _openai_usage(obj)
+                        content = _extract_openai_text(obj.get("choices", [{}])[0].get("delta", {}))
+                    except (json.JSONDecodeError, KeyError, IndexError):
+                        continue
+                    if content:
+                        chunks.append(content)
+        except LLMError:
+            raise
+        except Exception as e:
+            if is_fatal(e):
+                raise
+            raise self._error(e) from (None if isinstance(e, httpx.TimeoutException) else e)
+        if not chunks:
+            raise ChatApiError("Streaming chat API returned no content chunks")
+        return ChatResult("".join(chunks), usage)
+
+    def _error(self, e: Exception) -> ChatApiError:
+        """Return the ``ChatApiError`` with a sentence for the operator for the failure *e* of a request.
+
+        The caller re-raises a fatal exception (``is_fatal``) and an
+        ``LLMError`` as they are, and suppresses the context of a timeout
+        (``from None``), as the Ollama client does.
+        """
+        if isinstance(e, httpx.ConnectError):
+            return ChatApiError(f"Cannot connect to chat API at {self.endpoint}: {e}")
+        if isinstance(e, httpx.TimeoutException):
+            return ChatApiError(f"Chat API request timed out after {self.cfg.timeout:.0f}s")
+        if isinstance(e, httpx.HTTPStatusError):
+            if e.response.status_code == 404:
+                return ChatApiError(
+                    f"Model '{self.cfg.model}' not found at {self.endpoint}. "
+                    "HTTP 404 — check model name and API endpoint."
+                )
+            return ChatApiError(f"Chat API HTTP {e.response.status_code}: {e.response.text[:200]}")
+        return ChatApiError(str(e))
+
+    def count_tokens(self, prompt: str, num_ctx: int) -> int:
+        """An OpenAI-compatible API gives no count of the tokens of a prompt.
+
+        Raises:
+            ChatApiError: Always.
+        """
+        raise ChatApiError("an OpenAI-compatible chat endpoint gives no count of the tokens of a prompt")
+
+    def trained_context(self) -> int | None:
+        """Not known: the API does not tell the context of its model."""
+        return None
+
+    def pull_model(self) -> None:
+        """An OpenAI-compatible API cannot install a model.
+
+        Raises:
+            ChatApiError: Always.
+        """
+        raise ChatApiError("an OpenAI-compatible chat endpoint has no pull")

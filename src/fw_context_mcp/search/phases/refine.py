@@ -13,7 +13,7 @@ Why refine?
     targeting the correct subsystem.
 
 Why skip when Ollama already failed?
-    If Phase 2 (llm_query) already got an OllamaError, refinement would
+    If Phase 2 (llm_query) already got an LLMError, refinement would
     hit the same error.  Skipping avoids a second failed API call and
     lets the pipeline continue with first-round results.
 
@@ -89,7 +89,8 @@ class RefinePhase(Phase):
         Updates the keyword cache on success so future identical queries
         skip the wrong-subsystem detour.
         """
-        from fw_context_mcp.llm.ollama import OllamaError, call_ollama_async
+        from fw_context_mcp.llm.client import call_llm_async
+        from fw_context_mcp.llm.errors import LLMError
         from fw_context_mcp.search.cache import keyword_cache
 
         if not ctx.fts5_results:
@@ -121,7 +122,7 @@ class RefinePhase(Phase):
         )
 
         try:
-            raw = await call_ollama_async(refine_prompt, ctx.config.llm)
+            raw = await call_llm_async(refine_prompt, ctx.config.llm)
             refined = _parse_search_terms(raw)[:5]
             # Sanitize LLM-generated tokens — same safe pattern as fts5_search.py
             refined = [t for t in refined if _SAFE_FTS5_TOKEN.match(t)]
@@ -132,7 +133,7 @@ class RefinePhase(Phase):
                 # queries skip the wrong-subsystem detour entirely
                 keyword_cache.set(cache_key, all_queries)
                 return ctx.evolve(generated_queries=all_queries)
-        except OllamaError:
+        except LLMError:
             pass  # Refinement is optional; keep first-round results
         return ctx
 
