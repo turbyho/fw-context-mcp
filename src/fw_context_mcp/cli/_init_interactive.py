@@ -28,16 +28,22 @@ _BUILD_SYSTEM_CHOICES: list[tuple[str, str]] = [
     ("ti-ccs", "TI Code Composer Studio — detect-only"),
 ]
 
-# Chat model fixed default — the same default as ``LLMConfig.model``.
-_DEFAULT_CHAT_MODEL = "qwen2.5-coder:14b"
-
 
 def _input(prompt: str) -> str:
-    """Read a trimmed line from stdin, swallowing EOF/Ctrl-C."""
+    """Read a trimmed line from stdin; EOF is an empty answer, Ctrl-C stops the command.
+
+    WHY Ctrl-C stops: before, it was an empty answer, thus the default of
+    the question ran — "Keep the profile?" removed it, and the profile of
+    the project removed the keys of ``local.toml``.  The CLI turns the
+    interrupt into exit code 130 (``cli.main``).
+    """
     try:
         return input(prompt).strip()
-    except (EOFError, KeyboardInterrupt):
+    except EOFError:
         return ""
+    except KeyboardInterrupt:
+        print()
+        raise
 
 
 def prompt_build_system(non_interactive: bool, *, current: str | None = None) -> str | None:
@@ -328,7 +334,8 @@ def prompt_llm_config(project_root: Path, cfg, *, non_interactive: bool) -> None
     elif use_global_offered:
         print("    0. Use the global settings — Enter")
     print("    1. Local Ollama (recommended for offline use)")
-    print("    2. Cloud API (DeepSeek, OpenAI, LiteLLM, ...)")
+    print("    2. LLM services: ChatGPT plan, OpenRouter, DeepSeek, Ollama Cloud, Ollama on another computer,")
+    print("       another OpenAI-compatible API (more profiles; the source code goes to their host)")
     print("    3. Disable the LLM analysis (the embeddings stay)")
     choice = _input("  > ")
 
@@ -339,7 +346,9 @@ def prompt_llm_config(project_root: Path, cfg, *, non_interactive: bool) -> None
     elif choice == "1":
         _prompt_ollama_setup(project_root, cfg)
     elif choice == "2":
-        _prompt_cloud_setup(project_root)
+        from ._llm_wizard import run_wizard
+
+        run_wizard(project_root, cfg)
     elif choice == "3":
         _disable_llm_analysis(project_root, cfg)
     else:
@@ -469,7 +478,27 @@ def _save_profile(project_root: Path, name: str, values: dict[str, object], upda
 
 
 def _prompt_ollama_setup(project_root: Path, cfg) -> None:
-    """Interactive local-Ollama setup: recommend models, pull with consent.
+    """Option 1 of the menu: a local Ollama profile, selected for the project with its embedding model.
+
+    The values come from ``_local_ollama_profile``; ``_save_profile`` writes
+    the profile, selects it in ``local.toml`` and tests it.
+    """
+    from ..config import settings
+
+    found = _local_ollama_profile(project_root, cfg)
+    if found is None:
+        return
+    name, values, embed = found
+    if not _save_profile(project_root, name, values, {"enabled": True, "profile": name, "embed_model": embed}):
+        return
+    print(f"  [ok] LLM configured: profile {name} (ollama + {values['model']}), embedding {embed}")
+    print(f"  [ok] Profile saved to {settings._GLOBAL_CONFIG_PATH}; .fw-context/local.toml selects it")
+
+
+def _local_ollama_profile(
+    project_root: Path | None, cfg, *, cloud: dict[str, str] | None = None, ask_embed: bool = True,
+) -> tuple[str, dict[str, object], str] | None:
+    """Ask for the models of a local Ollama profile, pull them with consent; return (name, values, embedding model).
 
     The default of each prompt is the model that a config file sets now,
     else the recommendation.  WHY: before, the defaults were always the
@@ -480,20 +509,38 @@ def _prompt_ollama_setup(project_root: Path, cfg) -> None:
     offer to pull it from Ollama.
 
     The chat model goes to an Ollama profile of the global config: the
-    selected profile when it is an Ollama one, else ``local``.  Its other
-    keys stay; the project then selects it in ``local.toml``.
+    selected profile when it is a profile of the Ollama of this machine
+    (a loopback server, not a cloud model), else ``local``.  WHY: a
+    selected profile of another computer or of Ollama Cloud got the local
+    model before, and kept its server.  Its other keys stay; the caller
+    writes it.  The recommended chat model comes from the memory of the
+    machine (``llm.hardware``); *cloud* names the cloud models of the
+    local Ollama, which the list leaves out: they do not run on this
+    machine.  Without *ask_embed* the embedding model is not asked (the
+    setup of the LLM services: the embedding belongs to the project), and
+    the third value is "".
+
+    Returns None when the user stops at the question about a shared profile.
     """
     from ..config._profiles import project_profile_name, replaces_other_values
-    from ..config.settings import llm_key_sources, read_config_file
+    from ..config.settings import _DEFAULT_OLLAMA_URL, _is_loopback_url, llm_key_sources, read_config_file
     from ..llm.auto_model import _gpu_available
+    from ..llm.chat_router import chat_ollama_server
     from ..llm.embedder_factory import uses_ollama
+    from ..llm.hardware import machine_memory, recommended_local_model
     from ..llm.ollama import check_setup
 
     gpu = _gpu_available()
-    chat_recommended = _DEFAULT_CHAT_MODEL
+    recommendation = recommended_local_model(machine_memory())
+    chat_recommended = recommendation.model
     embed_recommended = "qwen3-embedding:8b" if gpu else "qwen3-embedding:0.6b"
-    sources = llm_key_sources(project_root)
-    ollama_profile = cfg.llm.provider == "ollama" and bool(cfg.llm.profile)
+    sources = llm_key_sources(project_root) if project_root is not None else {}
+    chat_server = chat_ollama_server(cfg.llm) if cfg.llm.provider == "ollama" else None
+    ollama_profile = (
+        bool(cfg.llm.profile) and chat_server is not None and _is_loopback_url(chat_server)
+        and cfg.llm.model not in (cloud or {})
+    )
+    server = chat_server if ollama_profile and chat_server else _DEFAULT_OLLAMA_URL
     chat_from_config = ollama_profile and bool(cfg.llm.model)
     chat_default = cfg.llm.model if chat_from_config else chat_recommended
     embed_from_config = "embed_model" in sources and cfg.llm.embed_model and uses_ollama(cfg.llm)
@@ -508,7 +555,7 @@ def _prompt_ollama_setup(project_root: Path, cfg) -> None:
         print(f"  [warn] Ollama cannot be used: {result.get('message') or 'no Ollama server at ' + cfg.llm.ollama_url}")
     else:
         print(f"  [ok] Ollama running at {cfg.llm.ollama_url}")
-        installed = result.get("installed_models")
+        installed = [model for model in result.get("installed_models") or [] if model not in (cloud or {})]
         if installed:
             print(f"  Installed models: {', '.join(installed)}")
         # "error" with a running server: the Ollama server of chat_api_base
@@ -517,23 +564,26 @@ def _prompt_ollama_setup(project_root: Path, cfg) -> None:
         if status in ("model_missing", "error") and result.get("message"):
             print(f"  [info] {result['message']}")
 
-    print(f"  Hardware: {'NVIDIA GPU detected' if gpu else 'CPU only (no GPU detected)'}")
+    print(f"  Hardware: {'GPU detected' if gpu else 'CPU only (no GPU detected)'}")
     print("  Recommended:")
-    print(f"    chat:      {chat_recommended} (fixed default)")
-    print(f"    embedding: {embed_recommended}")
-    if (chat_default, embed_default) != (chat_recommended, embed_recommended):
-        print(f"  Current config: chat {chat_default}, embedding {embed_default} — Enter keeps them")
+    print(f"    chat:      {chat_recommended} ({recommendation.reason})")
+    if ask_embed:
+        print(f"    embedding: {embed_recommended}")
+    if (chat_default, embed_default if ask_embed else embed_recommended) != (chat_recommended, embed_recommended):
+        print(f"  Current config: chat {chat_default}" + (f", embedding {embed_default}" if ask_embed else "")
+              + " — Enter keeps them")
 
     chat = prompt_text("Chat model", default=chat_default) or chat_default
-    embed = prompt_text("Embedding model", default=embed_default) or embed_default
+    embed = (prompt_text("Embedding model", default=embed_default) or embed_default) if ask_embed else ""
 
     from ..deps._fixes import _ollama_pull
 
-    # The server of the config: the checks ask it for the two models.
+    # The chat model to the server of the profile, the embedding model to
+    # the server of the embeddings: the checks ask each one for its model.
     if _confirm(f"Pull {chat} now? (multi-GB)"):
-        ok, msg = _ollama_pull(chat, cfg.llm.ollama_url)
+        ok, msg = _ollama_pull(chat, server)
         print(f"  [{'ok' if ok else 'warn'}] {msg}")
-    if _confirm(f"Pull {embed} now? (multi-GB)"):
+    if embed and _confirm(f"Pull {embed} now? (multi-GB)"):
         ok, msg = _ollama_pull(embed, cfg.llm.ollama_url)
         print(f"  [{'ok' if ok else 'warn'}] {msg}")
 
@@ -542,7 +592,11 @@ def _prompt_ollama_setup(project_root: Path, cfg) -> None:
     name = cfg.llm.profile if ollama_profile else "local"
     profiles = (read_config_file(settings._GLOBAL_CONFIG_PATH).get("llm") or {}).get("profiles") or {}
     earlier = profiles.get(name)
-    keep: dict = earlier if isinstance(earlier, dict) and earlier.get("provider") == "ollama" else {"url": cfg.llm.ollama_url}
+    own = (
+        isinstance(earlier, dict) and earlier.get("provider") == "ollama"
+        and _is_loopback_url(str(earlier.get("url") or _DEFAULT_OLLAMA_URL))
+    )
+    keep: dict = earlier if own and isinstance(earlier, dict) else {"url": server}
     values: dict[str, object] = {**keep, "provider": "ollama", "model": chat}
     # The profile is shared: a new chat model in it is the chat model of
     # each project that selects it.  Before, the model of a project went to
@@ -553,16 +607,15 @@ def _prompt_ollama_setup(project_root: Path, cfg) -> None:
     ):
         # A profile of that name can be the profile of another project
         # in a directory of the same name: never replace it.
+        if project_root is None:
+            return None
         stem, number = f"{name}-{project_profile_name(project_root)}", 1
         name = stem
         while replaces_other_values(name, values):
             number += 1
             name = f"{stem}-{number}"
         print(f"  [info] This project gets its own profile {name!r}")
-    if not _save_profile(project_root, name, values, {"enabled": True, "profile": name, "embed_model": embed}):
-        return
-    print(f"  [ok] LLM configured: profile {name} (ollama + {chat}), embedding {embed}")
-    print(f"  [ok] Profile saved to {settings._GLOBAL_CONFIG_PATH}; .fw-context/local.toml selects it")
+    return name, values, embed
 
 
 def _read_secret(prompt: str) -> str:
@@ -580,21 +633,48 @@ def _store_api_key(profile: str) -> bool:
     """
     from ..llm.secrets import SecretStoreError, secrets_path, set_api_key
 
-    value = _read_secret("  API key (no echo; empty: no key) > ").strip()
-    if not value:
-        return True
-    try:
-        place = set_api_key(profile, value)
-    except SecretStoreError as exc:
-        print(f"  [warn] {exc}. Cloud API setup stopped")
-        return False
+    while True:
+        value = _read_secret("  API key (no echo; empty: no key) > ").strip()
+        if not value:
+            return True
+        try:
+            place = set_api_key(profile, value)
+            break
+        except ValueError as exc:
+            # A space, a control character, a character that is not ASCII:
+            # the message holds no key.  Before, the error stopped init.
+            print(f"  [warn] {exc}: give the key again")
+        except SecretStoreError as exc:
+            print(f"  [warn] {exc}. Cloud API setup stopped")
+            return False
     where = "the keyring of the system" if place == "keyring" else f"{secrets_path()} (no keyring can be used)"
     print(f"  [ok] The API key is stored in {where}")
     return True
 
 
-def _prompt_cloud_setup(project_root: Path) -> None:
-    """Interactive cloud-API setup: a profile of provider openai_compatible (name, URL, key, model).
+def _custom_api_profile() -> str | None:
+    """Write a profile of another OpenAI-compatible API to the global config (the setup of the LLM services).
+
+    Returns its name, or None when nothing is written.
+    """
+    from ..config import settings
+    from ..config._profiles import set_profile
+
+    found = _custom_api_values()
+    if found is None:
+        return None
+    name, values = found
+    try:
+        set_profile(name, values)
+    except (ValueError, OSError, settings.ConfigError) as exc:
+        print(f"  [warn] The profile {name!r} is not written: {exc}")
+        return None
+    print(f"  [ok] Profile {name!r} saved to {settings._GLOBAL_CONFIG_PATH}")
+    return name
+
+
+def _custom_api_values() -> tuple[str, dict[str, object]] | None:
+    """Ask for a profile of provider openai_compatible (name, URL, key, model); store its key; return (name, values).
 
     The profile never gets the API key: a key in a TOML file is a secret in
     plain text.  The profile gets the NAME of the environment variable of
@@ -602,7 +682,6 @@ def _prompt_cloud_setup(project_root: Path) -> None:
     stores it for the profile (``llm.secrets``: the keyring, else
     ``secrets.toml``).
     """
-    from ..config import settings
     from ..config._profiles import replaces_other_values
     from ..config.settings import _is_loopback_url, url_problem
 
@@ -610,13 +689,13 @@ def _prompt_cloud_setup(project_root: Path) -> None:
     url = prompt_text("API URL") or ""
     if not url:
         print("  [skip] Cloud API setup skipped")
-        return
+        return None
     # Before `_is_loopback_url`: it raised ValueError for "http://[::1",
     # and init stopped with a traceback.
     problem = url_problem(url)
     if problem is not None:
         print(f"  [warn] {url} is not a valid URL ({problem}). Cloud API setup skipped")
-        return
+        return None
     key_env = prompt_text("Environment variable with the API key (empty: store the key in the keyring)") or ""
     model = prompt_text("Model", default="deepseek-chat") or "deepseek-chat"
 
@@ -633,16 +712,11 @@ def _prompt_cloud_setup(project_root: Path) -> None:
         name = prompt_text("Another profile name (empty: skip)") or ""
         if not name:
             print("  [skip] Cloud API setup skipped")
-            return
-    # The key before the test call of _save_profile: the call needs it.
+            return None
+    # The key before the test call: the call needs it.
     if not key_env and not _store_api_key(name):
-        return
-    # Before, "[ok] Saved" came after an error too, and named a setting
-    # that was not in the file.
-    if not _save_profile(project_root, name, values, {"enabled": True, "profile": name}):
-        return
-    print(f"  [ok] LLM configured: profile {name} (cloud API {model} @ {url})")
-    print(f"  [ok] Profile saved to {settings._GLOBAL_CONFIG_PATH}; .fw-context/local.toml selects it")
+        return None
+    return name, values
 
 
 # ── Config-first build resolution ───────────────────────────────────────

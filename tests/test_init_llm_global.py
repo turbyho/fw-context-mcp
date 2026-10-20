@@ -75,9 +75,18 @@ def _global_llm() -> dict:
     return tomllib.loads(settings._GLOBAL_CONFIG_PATH.read_text(encoding="utf-8")).get("llm", {})
 
 
-def _setup(monkeypatch, capsys, root: Path, choice: str, answers: dict[str, str], *,
+def _no_machine(monkeypatch) -> None:
+    """A machine without a GPU, with 16 GiB of RAM, and without an Ollama server: no request leaves the test."""
+    from fw_context_mcp.llm import _diag, hardware
+
+    monkeypatch.setattr(hardware, "machine_memory", lambda: hardware.Memory(gpu_mib=None, ram_mib=16 * 1024))
+    monkeypatch.setattr(_diag, "installed_models", lambda url: None)
+    monkeypatch.setattr(_diag, "remote_hosts", lambda url: None)
+
+
+def _setup(monkeypatch, capsys, root: Path, choice: str | list[str], answers: dict[str, str], *,
            shared: bool = False) -> tuple[str, list[str]]:
-    """Choose *choice* in the menu and give *answers* to the text prompts (by label; else the default).
+    """Give *choice* (a list: each answer of the menus) and *answers* to the text prompts (by label; else the default).
 
     *shared* is the answer to the question if a shared profile changes;
     each other question (the pull of a model) gets "no".
@@ -103,7 +112,12 @@ def _setup(monkeypatch, capsys, root: Path, choice: str, answers: dict[str, str]
     monkeypatch.setattr(_init_interactive, "_read_secret", lambda prompt: answers.get("API key", ""))
     monkeypatch.setattr(auto_model, "_gpu_available", lambda: False)
     monkeypatch.setattr(ollama, "check_setup", lambda cfg: {"status": "ok", "installed_models": []})
-    replies = iter([choice])
+    _no_machine(monkeypatch)
+    from fw_context_mcp.cli import _llm_wizard
+
+    # The test request of a new profile: the selection of the project tests it again (configure_llm_core).
+    monkeypatch.setattr(_llm_wizard, "test_profile", lambda cfg, name: None)
+    replies = iter([choice] if isinstance(choice, str) else choice)
     monkeypatch.setattr(_init_interactive, "_input", lambda prompt: next(replies))
     _init_interactive.prompt_llm_config(root, load(root), non_interactive=False)
     return capsys.readouterr().out, tested
@@ -259,6 +273,7 @@ def _ollama_defaults(monkeypatch, capsys, root: Path) -> tuple[list[str | None],
     monkeypatch.setattr(_init_interactive, "_confirm", lambda question, **kwargs: False)
     monkeypatch.setattr(auto_model, "_gpu_available", lambda: False)
     monkeypatch.setattr(ollama, "check_setup", lambda cfg: {"status": "ok", "installed_models": []})
+    _no_machine(monkeypatch)
     replies = iter(["1"])
     monkeypatch.setattr(_init_interactive, "_input", lambda prompt: next(replies))
     _init_interactive.prompt_llm_config(root, load(root), non_interactive=False)
@@ -280,7 +295,8 @@ def test_the_ollama_setup_offers_the_recommendation_without_a_config(project, mo
 
     defaults, out = _ollama_defaults(monkeypatch, capsys, project)
 
-    assert defaults == ["qwen2.5-coder:14b", "qwen3-embedding:0.6b"], out
+    # No GPU and 16 GiB of RAM: the recommendation of llm.hardware.
+    assert defaults == ["qwen2.5-coder:7b", "qwen3-embedding:0.6b"], out
     assert "Current config" not in out, out
 
 
@@ -300,10 +316,10 @@ def test_the_chat_model_of_a_cloud_api_is_not_an_ollama_default(project, monkeyp
 
     defaults, _ = _ollama_defaults(monkeypatch, capsys, project)
 
-    assert defaults == ["qwen2.5-coder:14b", "global-embed:1b"]
+    assert defaults == ["qwen2.5-coder:7b", "global-embed:1b"]
     profiles = _global_llm()["profiles"]
     assert profiles["api"] == {"provider": "openai_compatible", "url": "http://127.0.0.1:9/v1", "model": "deepseek-chat"}
-    assert profiles["local"] == {"url": "http://localhost:11434", "provider": "ollama", "model": "qwen2.5-coder:14b"}
+    assert profiles["local"] == {"url": "http://localhost:11434", "provider": "ollama", "model": "qwen2.5-coder:7b"}
 
 
 def test_an_embedding_model_that_ollama_does_not_serve_is_not_an_ollama_default(project, monkeypatch, capsys):
@@ -345,11 +361,12 @@ def test_option_2_stores_a_key_for_the_profile_and_never_in_a_config_file(projec
     from fw_context_mcp.llm import secrets
 
     key = "sk-init-" + "test"
-    out, tested = _setup(monkeypatch, capsys, project, "2", {
+    # Option 2, service 7 (another API), no removal, profile 2 (work) for the project.
+    out, tested = _setup(monkeypatch, capsys, project, ["2", "7", "", "2"], {
         "Profile name": "work", "API URL": "http://127.0.0.1:9/v1", "Model": "work-chat", "API key": key,
     })
 
-    assert "[ok] LLM configured: profile work" in out and key not in out, out
+    assert ".fw-context/local.toml selects profile 'work'" in out and key not in out, out
     assert secrets.stored_api_key("work") == key
     assert "api_key_env" not in _global_llm()["profiles"]["work"]
     for path in (settings._GLOBAL_CONFIG_PATH, project / ".fw-context" / "local.toml"):
@@ -358,14 +375,14 @@ def test_option_2_stores_a_key_for_the_profile_and_never_in_a_config_file(projec
 
 def test_option_2_writes_a_cloud_profile_that_names_the_key_variable(project, monkeypatch, capsys):
     """The profile holds the NAME of the variable, never the key: a key in a TOML file is a secret in plain text."""
-    out, tested = _setup(monkeypatch, capsys, project, "2", {
+    out, tested = _setup(monkeypatch, capsys, project, ["2", "7", "", "2"], {
         "Profile name": "work",
         "API URL": "http://127.0.0.1:9/v1",
         "Environment variable with the API key (empty: store the key in the keyring)": "WORK_API_KEY",
         "Model": "work-chat",
     })
 
-    assert "[ok] LLM configured: profile work (cloud API work-chat @ http://127.0.0.1:9/v1)" in out, out
+    assert "[ok] Profile 'work' saved" in out and ".fw-context/local.toml selects profile 'work'" in out, out
     llm = _global_llm()
     assert llm["profiles"]["work"] == {
         "provider": "openai_compatible", "url": "http://127.0.0.1:9/v1", "model": "work-chat",
@@ -378,7 +395,8 @@ def test_option_2_writes_a_cloud_profile_that_names_the_key_variable(project, mo
 
 
 def test_option_2_without_a_url_writes_nothing(project, monkeypatch, capsys):
-    out, tested = _setup(monkeypatch, capsys, project, "2", {"API URL": ""})
+    # Option 2, service 7 without a URL, no removal, Enter: the global default.
+    out, tested = _setup(monkeypatch, capsys, project, ["2", "7", "", ""], {"API URL": ""})
 
     assert "[skip] Cloud API setup skipped" in out, out
     assert set(_global_llm()["profiles"]) == {"local"}

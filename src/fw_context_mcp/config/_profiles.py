@@ -118,3 +118,54 @@ def set_profile(name: str, values: dict[str, object], *, select: bool = False) -
         raise settings.ConfigError(path, f"the profile {name!r} is not written: {problems[0]}")
     _atomic_write(path.resolve(), text)
     return path
+
+
+def remove_profile(name: str) -> Path:
+    """Remove the profile *name* from the global config, and keep the comments of the file.
+
+    Refused when ``[llm] profile`` or ``[llm] embed_profile`` of the global
+    config selects it: each project without a selection of its own would
+    get an error.  A project that selects it in its own ``local.toml``
+    gets an error that names the profile; ``fw-context llm default`` there
+    selects another one.
+
+    Returns the path of the global config.
+
+    Raises:
+        ConfigError: the global config cannot be read, has no such
+            profile, or selects it.  The file is not changed.
+        OSError: the file cannot be written.
+    """
+    path = settings._ensure_global_config()
+    settings.read_config_file(path)
+    document = tomlkit.parse(path.read_text(encoding="utf-8"))
+    llm = document.get("llm")
+    if llm is None or name not in (llm.get("profiles") or {}):
+        raise settings.ConfigError(path, f"the global config has no LLM profile {name!r}")
+    for key in ("profile", "embed_profile"):
+        if llm.get(key) == name:
+            raise settings.ConfigError(
+                path, f"[llm] {key} of the global config selects {name!r}: select another profile first "
+                f"('fw-context llm default <profile> --global')",
+            )
+    del llm["profiles"][name]
+    _atomic_write(path.resolve(), tomlkit.dumps(document))
+    return path
+
+
+def select_global_profile(name: str) -> Path:
+    """Make *name* the ``[llm] profile`` of the global config: the profile of each project that selects none.
+
+    Raises:
+        ConfigError: the global config cannot be read, or has no such profile.
+        OSError: the file cannot be written.
+    """
+    path = settings._ensure_global_config()
+    settings.read_config_file(path)
+    document = tomlkit.parse(path.read_text(encoding="utf-8"))
+    llm = document.get("llm")
+    if llm is None or name not in (llm.get("profiles") or {}):
+        raise settings.ConfigError(path, f"the global config has no LLM profile {name!r}")
+    llm["profile"] = name
+    _atomic_write(path.resolve(), tomlkit.dumps(document))
+    return path

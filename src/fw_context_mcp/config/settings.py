@@ -1965,6 +1965,83 @@ def _apply_ollama_tuning(llm: LLMConfig, profile: dict) -> None:
     llm.ollama_max_concurrent = _convert(profile.get("max_concurrent", llm.ollama_max_concurrent), "int")
 
 
+def _apply_chat_profile(llm: LLMConfig, name: str, profile: dict) -> str | None:
+    """Copy the chat fields of the profile *name* into *llm*; return the URL of an Ollama chat server, else None.
+
+    The fields of the embeddings (``ollama_url``, ``embed_*``) do not
+    change here: the caller selects their server.  An Ollama profile also
+    sets the Ollama tuning (``_apply_ollama_tuning``).
+    """
+    llm.profile, llm.provider, llm.model = name, profile["provider"], profile["model"]
+    llm.timeout = _convert(profile.get("timeout", llm.timeout), "float")
+    llm.stream = _convert(profile.get("stream", llm.stream), "bool")
+    if llm.provider == "ollama":
+        llm.num_ctx = _convert(profile.get("num_ctx", llm.num_ctx), "int")
+        _apply_ollama_tuning(llm, profile)
+        return str(profile.get("url", _DEFAULT_OLLAMA_URL))
+    if llm.provider == "chatgpt":
+        from ..llm.chatgpt_plan import API_BASE
+
+        # The host of the source code, for the notice and the check; the
+        # client sends to the Responses API, with the tokens of the sign-in.
+        llm.chat_api_base, llm.chat_api_format, llm.api_key_env = API_BASE, "openai", ""
+        return None
+    from ..llm.providers import provider_spec
+
+    spec = provider_spec(llm.provider)
+    llm.chat_api_base = profile["url"] if "url" in profile else spec.base_url if spec else ""
+    llm.chat_api_format = "openai"
+    llm.routing = dict(profile.get("routing") or {})
+    # The key variable of the provider only for its own URL: a proxy
+    # must not get the key of OpenRouter.  An explicit empty
+    # api_key_env turns the variable off.
+    own_url = spec is not None and llm.chat_api_base.rstrip("/") == spec.base_url.rstrip("/")
+    default_env = spec.key_env if spec is not None and own_url else ""
+    # Not the key: the chat client gets it at the first request
+    # (``llm.secrets``).  A keyring lookup takes about 0.1 s, and load
+    # runs for each MCP query.
+    llm.api_key_env = str(profile["api_key_env"]) if "api_key_env" in profile else default_env
+    return None
+
+
+def profile_llm_config(llm: LLMConfig, name: str) -> LLMConfig:
+    """Return a copy of *llm* whose chat is the profile *name* of the global config; the embeddings stay.
+
+    For one run (``--llm``, the question at the start of ``index`` and
+    ``analyze``) and for the test of a profile.  WHY the embeddings stay:
+    a profile is for the LLM analysis only, and a different embeddings
+    server or model gives vectors of a different meaning (decision of the
+    user, 2026-10-20).  The Ollama tuning (``keep_alive``, ``auto_pull``,
+    ``max_concurrent``) applies to the embeddings too, thus it stays too.
+
+    Raises:
+        ConfigError: the global config cannot be read, or has no profile
+            *name*.  The message lists the profiles.
+    """
+    from dataclasses import replace
+
+    profiles = (read_config_file(_GLOBAL_CONFIG_PATH).get("llm") or {}).get("profiles") or {}
+    profile = profiles.get(name)
+    if not isinstance(profile, dict):
+        raise ConfigError(
+            _GLOBAL_CONFIG_PATH,
+            f"{name!r} is not an LLM profile of the global config (profiles: {', '.join(profiles) or 'none'})",
+        )
+    # The fields of the chat start from their defaults, as in load: a
+    # value of the default profile (num_ctx 65536, timeout 900) must not
+    # pass to a profile that does not set it.
+    defaults = LLMConfig()
+    chat = replace(llm, chat_api_base=None, chat_api_key=None, chat_api_format="auto", api_key_env="", routing={},
+                   num_ctx=defaults.num_ctx, timeout=defaults.timeout, stream=defaults.stream)
+    chat_url = _apply_chat_profile(chat, name, profile)
+    chat.keep_alive, chat.auto_pull, chat.ollama_max_concurrent = (
+        llm.keep_alive, llm.auto_pull, llm.ollama_max_concurrent,
+    )
+    if chat_url is not None and chat_url.rstrip("/") != chat.ollama_url.rstrip("/"):
+        chat.chat_api_base, chat.chat_api_format = chat_url, "ollama"
+    return chat
+
+
 def _resolve_llm_profile(data: dict, llm: LLMConfig, selected_in: dict[str, Path], global_path: Path) -> None:
     """Copy the selected profile into the backend fields of *llm*.
 
@@ -2007,37 +2084,7 @@ def _resolve_llm_profile(data: dict, llm: LLMConfig, selected_in: dict[str, Path
             selected_in.get("profile", global_path),
             f"[llm] profile = {name!r} is not a profile of the global config ({global_path}; profiles: {names})",
         )
-    profile = profiles[name]
-    llm.profile, llm.provider, llm.model = name, profile["provider"], profile["model"]
-    llm.timeout = _convert(profile.get("timeout", llm.timeout), "float")
-    llm.stream = _convert(profile.get("stream", llm.stream), "bool")
-    chat_url = None
-    if llm.provider == "ollama":
-        chat_url = profile.get("url", _DEFAULT_OLLAMA_URL)
-        llm.num_ctx = _convert(profile.get("num_ctx", llm.num_ctx), "int")
-        _apply_ollama_tuning(llm, profile)
-    elif llm.provider == "chatgpt":
-        from ..llm.chatgpt_plan import API_BASE
-
-        # The host of the source code, for the notice and the check; the
-        # client sends to the Responses API, with the tokens of the sign-in.
-        llm.chat_api_base, llm.chat_api_format, llm.api_key_env = API_BASE, "openai", ""
-    else:
-        from ..llm.providers import provider_spec
-
-        spec = provider_spec(llm.provider)
-        llm.chat_api_base = profile["url"] if "url" in profile else spec.base_url if spec else ""
-        llm.chat_api_format = "openai"
-        llm.routing = dict(profile.get("routing") or {})
-        # The key variable of the provider only for its own URL: a proxy
-        # must not get the key of OpenRouter.  An explicit empty
-        # api_key_env turns the variable off.
-        own_url = spec is not None and llm.chat_api_base.rstrip("/") == spec.base_url.rstrip("/")
-        default_env = spec.key_env if spec is not None and own_url else ""
-        # Not the key: the chat client gets it at the first request
-        # (``llm.secrets``).  A keyring lookup takes about 0.1 s, and load
-        # runs for each MCP query.
-        llm.api_key_env = str(profile["api_key_env"]) if "api_key_env" in profile else default_env
+    chat_url = _apply_chat_profile(llm, name, profiles[name])
 
     embed_name = llm.embed_profile or (name if llm.provider == "ollama" else "")
     if embed_name:

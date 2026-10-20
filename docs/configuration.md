@@ -37,9 +37,24 @@ Option 3 "Disable the LLM analysis" writes `[llm] analyze_symbols = false` to `l
 
 Option 1 (local Ollama) writes the chat model to an Ollama profile of the global config. This is the selected profile when it is an Ollama profile, else the profile `local`. The other keys of that profile stay. Then `local.toml` selects the profile with `[llm] profile`, and gets the embedding model in `[llm] embed_model`. The prompts of option 1 give the models that a config file sets as the defaults, thus Enter keeps them. Without such a file, the defaults are the recommended models. The chat model of an `openai_compatible` profile is not a default, because it is not a model of Ollama.
 
-Option 2 (cloud API) asks for four values: a profile name (default `cloud`), the URL of the API, the name of the environment variable that holds the API key, and the model. It writes a profile with `provider = "openai_compatible"` to the global config, and `local.toml` selects it. A profile of the same name gets only the new values. When you give no variable, option 2 reads the key without an echo and stores it for the profile (see [API keys](#api-keys)). No config file gets the key. Add more profiles, for example a second Ollama server, to the global config with a text editor (see [`[llm]`](#llm--llm-and-embeddings)).
+Option 1 then sends a test request to the profile. When the test fails, `local.toml` and the global config get their old text back.
 
-Options 1 and 2 then send a test request to the profile. When the test fails, `local.toml` gets its old text back. The profile stays in the global config.
+The setup of the LLM services (option 2, and `fw-context llm setup`) does these steps:
+
+1. It tells what the machine has: the local Ollama, the GPU memory and the RAM.
+2. It lists the services: local Ollama, Ollama on another computer, Ollama Cloud (through the local Ollama), the ChatGPT plan, OpenRouter, DeepSeek, and another OpenAI-compatible API. A ✓ marks a service with a profile, and a ⚠ marks a service that sends the source code to another host. You select services by numbers, separated by commas.
+3. For each selected service, it asks for the values: the model (with a recommendation), the API key (without an echo, into the key store; for OpenRouter and DeepSeek the key of the provider, `provider:<name>`), or the ChatGPT sign-in in the browser. It writes a profile to the global config, and asks before it replaces a profile of the same name.
+4. It sends a request without code through each new profile. When a profile does not answer and you do not keep it, the global config gets its earlier text back: a profile that it replaced comes back with its earlier values. A key or a ChatGPT sign-in that no profile uses then goes.
+5. It asks for profiles to remove, with a question for each. The removal also removes the own key of the profile and the ChatGPT sign-in.
+6. In a project, it asks for the profile of the project: a profile that can run, the global default, or no LLM analysis. A profile without a key or a sign-in is listed with the command that repairs it. When `config.toml` (in git) selects a profile, the global default is not offered, because `local.toml` cannot remove that selection. A selection of a profile or of the global default turns the LLM analysis on again when `local.toml` turned it off.
+
+The local Ollama service writes the profile of the Ollama of this machine: the selected profile only when it is such a profile, else `local`. The setup does not ask for the embedding model: it belongs to the project (option 1 of the LLM step of `init`). Ctrl-C stops the setup; it does not answer the question with its default.
+
+The recommended local model comes from the memory of the machine: `gemma4:26b` with a 12 GB GPU, `gemma4:12b` with an 8 GB GPU, `qwen3-coder:30b` (a MoE model, usable on the CPU) with less GPU memory and 32 GiB of RAM or more, else `qwen2.5-coder:7b`. These values come from a measurement on C and C++ firmware. You select the model.
+
+A cloud model of Ollama (`<model>:cloud`) runs on `ollama.com`, although its server is the local Ollama. fw-context reads the host from the model list of the server (`remote_host`), and tells that the source code leaves the machine.
+
+For another OpenAI-compatible API, the setup asks for four values: a profile name (default `cloud`), the URL of the API, the name of the environment variable that holds the API key, and the model. When you give no variable, it reads the key without an echo and stores it for the profile (see [API keys](#api-keys)). No config file gets the key.
 
 When no file sets `embed_model`, fw-context detects the model from the hardware: `qwen3-embedding:8b` with a GPU, `qwen3-embedding:0.6b` without one. `fw-context init` saves the detected name one time to the global config. Thus the model stays the same when a detection fails one time, which would embed the whole index again with a different dimension. The name goes to the global config and not to `local.toml`, because the hardware is a fact of the machine: each project then uses the global settings, and a later change of the global config applies to it. Earlier versions of `init` saved the name to `local.toml` of each project. Option 0 of the LLM step removes it.
 

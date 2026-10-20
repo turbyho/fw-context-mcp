@@ -284,6 +284,35 @@ def _ollama_usage(answer: dict) -> Usage:
     )
 
 
+#: The (server, model) pairs that this process checked for a cloud model.
+_cloud_checked: set[tuple[str, str]] = set()
+
+
+def _tell_cloud_model(cfg: LLMConfig, server_url: str) -> None:
+    """Tell on stderr one time for each process when the chat model of *server_url* is a cloud model.
+
+    The URL of such a server is a loopback one, thus the notice of ``load``
+    (``settings._warn_external_llm``) does not see that the source code
+    leaves the machine.  The server tells it (``remote_host``).
+    """
+    key = (server_url, cfg.model)
+    if key in _cloud_checked:
+        return
+    from ._diag import remote_hosts
+
+    hosts = remote_hosts(server_url)
+    if hosts is None:
+        return  # no list now: the next request asks again
+    _cloud_checked.add(key)
+    host = hosts.get(cfg.model)
+    if host:
+        print(
+            f"ℹ The chat of LLM profile {cfg.profile or '(default)'!r} uses the cloud model {cfg.model}: "
+            f"source code snippets go to {host}.",
+            file=sys.stderr,
+        )
+
+
 class OllamaClient:
     """The chat client of one Ollama server (``/api/generate``).
 
@@ -334,6 +363,7 @@ class OllamaClient:
             OllamaError: Each other failure of the network or the server.
         """
         cfg = self.cfg
+        _tell_cloud_model(cfg, self.server_url)
         options: dict = {"num_ctx": num_ctx if num_ctx is not None else cfg.num_ctx, "temperature": temperature}
         if max_tokens is not None:
             options["num_predict"] = max_tokens

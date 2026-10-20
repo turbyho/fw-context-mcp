@@ -619,7 +619,7 @@ def test_the_cloud_setup_asks_before_it_replaces_a_profile(home, monkeypatch, ca
     questions: list[str] = []
     monkeypatch.setattr(_init_interactive, "_confirm", lambda question, **kwargs: questions.append(question) or False)
 
-    _init_interactive._prompt_cloud_setup(_project(home))
+    _init_interactive._custom_api_profile()
 
     assert len(questions) == 1 and "'local' exists" in questions[0], questions
     assert "[skip]" in capsys.readouterr().out

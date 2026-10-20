@@ -48,6 +48,9 @@ class ProviderSpec:
             profile does not set them.
         usage_in_request: The part of the request that asks for the usage
             and the cost in the answer.
+        recommended_model: The model that the setup offers first.  It
+            comes from the measurement of 2026-10-20; the setup does not
+            show the grades (decision of the user: an internal rating).
     """
 
     name: str
@@ -59,6 +62,7 @@ class ProviderSpec:
     options: Mapping[str, str] = field(default_factory=dict)
     default_routing: Mapping[str, object] = field(default_factory=dict)
     usage_in_request: Mapping[str, object] = field(default_factory=dict)
+    recommended_model: str = ""
 
     def request_fields(self, routing: Mapping[str, object] | None, *, low_reasoning: bool = False) -> dict[str, object]:
         """Return the fields that a chat request to this provider adds to the OpenAI payload."""
@@ -97,6 +101,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
             options={"sort": "str", "quantizations": "list", "zdr": "bool", "data_collection": "str"},
             default_routing={"sort": "price", "quantizations": list(OPENROUTER_DEFAULT_QUANTIZATIONS)},
             usage_in_request={"usage": {"include": True}},
+            recommended_model="openai/gpt-6-luna",
         ),
         ProviderSpec(
             name="deepseek",
@@ -104,6 +109,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
             base_url="https://api.deepseek.com",
             key_env="DEEPSEEK_API_KEY",
             reasoning_off={"thinking": {"type": "disabled"}},
+            recommended_model="deepseek-v4-flash",
         ),
     )
 }

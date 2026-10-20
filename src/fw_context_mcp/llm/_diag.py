@@ -138,6 +138,28 @@ def check_setup(cfg: LLMConfig) -> dict:
     return result
 
 
+def remote_hosts(url: str) -> dict[str, str] | None:
+    """Return ``{model: host}`` of each cloud model of the Ollama server at *url*; None when it gives no list.
+
+    A cloud model of Ollama (``ollama pull <model>:cloud``) runs on the host
+    of ``remote_host`` of ``/api/tags`` (``https://ollama.com``), not on the
+    server.  WHY the field and not the name: the server says where the
+    model runs; the URL of the server is a loopback one, and the notice
+    that source code leaves the machine missed such a model.
+    """
+    import httpx
+
+    try:
+        resp = httpx.get(url.rstrip("/") + "/api/tags", timeout=5.0)
+        resp.raise_for_status()
+    except (httpx.HTTPError, httpx.InvalidURL, OSError, ValueError):
+        return None
+    models = tag_models(resp)
+    if models is None:
+        return None
+    return {m["name"]: str(m["remote_host"]) for m in models if isinstance(m.get("remote_host"), str) and m["remote_host"]}
+
+
 def installed_models(url: str) -> list[str] | None:
     """Return the model names of the Ollama server at *url*, or ``None`` when it gives no list.
 

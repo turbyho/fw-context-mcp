@@ -108,6 +108,16 @@ def configure_llm_core(
             "embeddings": new_cfg.llm.ollama_url,
         }
         external = sorted({url for url in hosts.values() if url and not _is_loopback_url(url)})
+        if new_cfg.llm.provider == "ollama":
+            # A cloud model runs on another host than its loopback server.
+            from ._diag import remote_hosts
+            from .chat_router import chat_ollama_server
+
+            server = chat_ollama_server(new_cfg.llm) or new_cfg.llm.ollama_url
+            cloud = (remote_hosts(server) or {}).get(new_cfg.llm.model)
+            if cloud:
+                hosts["chat"] = cloud
+                external = sorted({*external, cloud})
         if external:
             parts = [what for what, url in hosts.items() if url in external]
             result["compliance_warning"] = (

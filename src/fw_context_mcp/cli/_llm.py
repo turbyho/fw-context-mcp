@@ -14,13 +14,167 @@ from __future__ import annotations
 import argparse
 import getpass
 import sys
+from pathlib import Path
 
 
 def cmd_llm(args: argparse.Namespace) -> int:
     """Without a subcommand: tell the subcommands."""
-    print("usage: fw-context llm key {set,delete,status} [profile]")
+    print("usage: fw-context llm setup                         (the setup of the LLM services)")
+    print("       fw-context llm list | test <profile> | remove <profile>")
+    print("       fw-context llm default <profile> [--global]")
+    print("       fw-context llm key {set,delete,status} [profile]")
     print("       fw-context llm {login,logout,models} <profile>   (a profile of provider chatgpt)")
     return 0
+
+
+def _project_and_config(args: argparse.Namespace):
+    """Return (project root or None, config); the root is None outside a project of fw-context.
+
+    Raises:
+        ConfigError: a config file cannot be used.
+    """
+    from ..config import load
+    from ..utils import resolve_project_root
+
+    try:
+        root: Path | None = resolve_project_root(getattr(args, "project", None))
+    except OSError:
+        root = None
+    if root is not None and not (root / ".fw-context").is_dir():
+        root = None
+    return root, load(root)
+
+
+def cmd_llm_setup(args: argparse.Namespace) -> int:
+    """Run the setup of the LLM services (the same code as option 2 of the LLM step of ``fw-context init``).
+
+    Exit codes: 0 = done, 1 = no terminal, or a config file cannot be used.
+    """
+    from ..config.settings import ConfigError
+    from ._llm_wizard import run_wizard
+
+    if not sys.stdin.isatty():
+        print("[error] 'fw-context llm setup' asks questions: run it in a terminal", file=sys.stderr)
+        return 1
+    try:
+        root, cfg = _project_and_config(args)
+    except ConfigError as exc:
+        print(f"[error] {exc}", file=sys.stderr)
+        return 1
+    run_wizard(root, cfg)
+    return 0
+
+
+def cmd_llm_list(args: argparse.Namespace) -> int:
+    """List the profiles: provider, model, where the source code goes, and what a profile needs.
+
+    Exit codes: 0 = listed, 1 = a config file cannot be used.
+    """
+    from ..config.settings import ConfigError, llm_key_sources
+    from ..llm.profile_state import profile_state
+    from ._llm_wizard import cloud_hosts
+
+    try:
+        root, cfg = _project_and_config(args)
+    except ConfigError as exc:
+        print(f"[error] {exc}", file=sys.stderr)
+        return 1
+    profiles = _profiles()
+    if not profiles:
+        print("No LLM profile: run 'fw-context llm setup'")
+        return 0
+    from ..config import settings
+
+    global_default = (settings.read_config_file(settings._GLOBAL_CONFIG_PATH).get("llm") or {}).get("profile", "")
+    project_default = cfg.llm.profile if root is not None and llm_key_sources(root).get("profile") in (
+        "local", "project") else ""
+    cloud = cloud_hosts(profiles)
+    for name, profile in profiles.items():
+        state = profile_state(name, profile, cloud=cloud)
+        marks = [label for label, on in (("global default", name == global_default),
+                                         ("this project", name == project_default)) if on]
+        where = f"⚠ {state.host}" if state.external else "this machine"
+        line = f"{name}: {state.provider} {state.model}, {where}"
+        if marks:
+            line += f" [{', '.join(marks)}]"
+        if state.problem:
+            line += f" — {state.problem}"
+        print(line)
+    return 0
+
+
+def cmd_llm_test(args: argparse.Namespace) -> int:
+    """Send a request without code through a profile.
+
+    Exit codes: 0 = it answers, 1 = it does not, or a config file cannot be used.
+    """
+    from ..config.settings import ConfigError
+    from ._llm_wizard import test_profile
+
+    try:
+        _root, cfg = _project_and_config(args)
+    except ConfigError as exc:
+        print(f"[error] {exc}", file=sys.stderr)
+        return 1
+    problem = test_profile(cfg, args.profile)
+    if problem is not None:
+        print(f"[error] Profile {args.profile!r} does not answer: {problem}", file=sys.stderr)
+        return 1
+    print(f"[ok] Profile {args.profile!r} answers")
+    return 0
+
+
+def cmd_llm_default(args: argparse.Namespace) -> int:
+    """Select the profile of the project (``local.toml``, with a test request), or with ``--global`` of each project.
+
+    Exit codes: 0 = selected, 1 = no such profile, no project, the test
+    failed, or a config file cannot be used.
+    """
+    from ..config import settings
+    from ..config._profiles import select_global_profile
+    from ..llm.configure import configure_llm_core
+
+    if args.global_default:
+        try:
+            select_global_profile(args.profile)
+        except (OSError, settings.ConfigError) as exc:
+            print(f"[error] {exc}", file=sys.stderr)
+            return 1
+        print(f"[ok] Profile {args.profile!r} is the profile of each project that selects none")
+        return 0
+    try:
+        root, _cfg = _project_and_config(args)
+    except settings.ConfigError as exc:
+        print(f"[error] {exc}", file=sys.stderr)
+        return 1
+    if root is None:
+        print("[error] No project of fw-context here: run 'fw-context init', or use --global", file=sys.stderr)
+        return 1
+    if args.profile not in _profiles():
+        print(f"[error] The global config has no profile {args.profile!r}", file=sys.stderr)
+        return 1
+    result = configure_llm_core(root, {"enabled": True, "profile": args.profile})
+    if result.get("status") != "ok":
+        print(f"[error] {result.get('message', 'the test of the profile failed')}", file=sys.stderr)
+        return 1
+    print(f"[ok] .fw-context/local.toml selects profile {args.profile!r}")
+    if result.get("compliance_warning"):
+        print(f"⚠ {result['compliance_warning']}")
+    return 0
+
+
+def cmd_llm_remove(args: argparse.Namespace) -> int:
+    """Remove a profile, its own stored key, and the sign-in of a ChatGPT profile.
+
+    Exit codes: 0 = removed, 1 = no such profile, or the global config
+    selects it.
+    """
+    from ._llm_wizard import remove_profile_and_secrets
+
+    if args.profile not in _profiles():
+        print(f"[error] The global config has no profile {args.profile!r}", file=sys.stderr)
+        return 1
+    return 0 if remove_profile_and_secrets(args.profile) else 1
 
 
 def _plan_profile(name: str) -> bool:
@@ -77,9 +231,11 @@ def cmd_llm_logout(args: argparse.Namespace) -> int:
     Exit codes: 0 after the tokens are removed (a revocation that is not
     confirmed gives a note), 1 for a profile that is not a chatgpt profile.
     """
-    from ..llm.chatgpt_plan import logout
+    from ..llm.chatgpt_plan import load_credentials, logout
 
-    if not _plan_profile(args.profile):
+    # Tokens without a profile (a profile that was removed) can still be
+    # revoked: else a valid refresh token stayed on the disk.
+    if load_credentials(args.profile) is None and not _plan_profile(args.profile):
         return 1
     if logout(args.profile):
         print(f"[ok] Profile {args.profile!r} is signed out")

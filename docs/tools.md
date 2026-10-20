@@ -508,17 +508,15 @@ then shows a menu. The backend keys are `enabled`, `profile`,
   the global config: the selected profile when it is an Ollama profile,
   else the profile `local`. `.fw-context/local.toml` then selects the
   profile, and gets the embedding model.
-- Option 2 (cloud API) asks for a profile name, the URL, the name of the
-  environment variable that holds the API key, and the model. It writes a
-  profile with `provider = "openai_compatible"` to the global config, and
-  `.fw-context/local.toml` selects it. When you give no variable, it reads
-  the key without an echo and stores it for the profile (see
-  [`fw-context llm key`](#fw-context-llm-key)). No config file gets the key.
+- Option 2 (LLM services) runs the setup of
+  [`fw-context llm setup`](#fw-context-llm-setup-list-test-default-remove):
+  the list of the services, their profiles, a test of each new profile,
+  and the profile of the project.
 - Option 3 sets `[llm] analyze_symbols = false` in
   `.fw-context/local.toml`: the LLM analysis stops, and the embeddings
   stay.
 
-Options 1 and 2 then send a test request. When the test fails,
+Option 1 then sends a test request. When the test fails,
 `.fw-context/local.toml` and the global config get their old text back. See
 [How config works](configuration.md#how-config-works).
 
@@ -984,6 +982,39 @@ Old daemon stopped.
 Starting new daemon...
 Daemon restarted successfully.
 ```
+
+### `fw-context llm setup`, `list`, `test`, `default`, `remove`
+
+Set up and manage the LLM profiles. The profiles are in the global
+config; a project selects one. See
+[configuration.md](configuration.md#how-config-works) for the setup.
+
+```bash
+fw-context llm setup                     # the setup of the LLM services
+fw-context llm list                      # each profile, its host, what it needs
+fw-context llm test <profile>            # a request without code
+fw-context llm default <profile>         # the profile of this project (local.toml)
+fw-context llm default <profile> --global  # the profile of each project that selects none
+fw-context llm remove <profile>          # the profile, its own key, its ChatGPT sign-in
+```
+
+- `setup` asks questions, thus it needs a terminal. In a project it also
+  asks for the profile of the project.
+- `list` marks the global default and the profile of the project, shows
+  `⚠ <host>` for a profile that sends the source code to another host
+  (also a cloud model of Ollama), and names the command for a profile
+  without a key or a sign-in.
+- `default` without `--global` writes `[llm] profile` to
+  `.fw-context/local.toml` and sends a test request; a failed test puts
+  the old file back.
+- `remove` refuses a profile that `[llm] profile` or `[llm] embed_profile`
+  of the global config selects. The key of a provider
+  (`provider:<name>`) stays, because the other profiles of that provider
+  use it.
+
+Exit codes: 0 when the command did its work; 1 for a profile that does
+not exist or does not answer, no terminal for `setup`, or a config file
+that cannot be used.
 
 ### `fw-context llm key`
 

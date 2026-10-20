@@ -547,6 +547,26 @@ def main() -> None:
         p_llm_plan = p_llm_sub.add_parser(name, help=text)
         p_llm_plan.add_argument("profile", help="The name of the LLM profile (provider chatgpt)")
         p_llm_plan.set_defaults(func=func)
+    from ._llm import cmd_llm_default, cmd_llm_list, cmd_llm_remove, cmd_llm_setup, cmd_llm_test  # noqa: I001
+    p_llm_setup = p_llm_sub.add_parser("setup", help="Set up LLM services: the same setup as fw-context init")
+    p_llm_setup.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
+    p_llm_setup.set_defaults(func=cmd_llm_setup)
+    p_llm_list = p_llm_sub.add_parser("list", help="List the LLM profiles and where each sends the source code")
+    p_llm_list.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
+    p_llm_list.set_defaults(func=cmd_llm_list)
+    p_llm_test = p_llm_sub.add_parser("test", help="Send a request without code through a profile")
+    p_llm_test.add_argument("profile", help="The name of the LLM profile")
+    p_llm_test.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
+    p_llm_test.set_defaults(func=cmd_llm_test)
+    p_llm_default = p_llm_sub.add_parser("default", help="Select the LLM profile of the project, or of each project")
+    p_llm_default.add_argument("profile", help="The name of the LLM profile")
+    p_llm_default.add_argument("--global", dest="global_default", action="store_true",
+                               help="The profile of each project that selects none (the global config)")
+    p_llm_default.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
+    p_llm_default.set_defaults(func=cmd_llm_default)
+    p_llm_remove = p_llm_sub.add_parser("remove", help="Remove a profile, its own key and its ChatGPT sign-in")
+    p_llm_remove.add_argument("profile", help="The name of the LLM profile")
+    p_llm_remove.set_defaults(func=cmd_llm_remove)
     # Without a subcommand, show the usage
     p_llm.set_defaults(func=cmd_llm)
     p_llm_key.set_defaults(func=cmd_llm)
@@ -565,6 +585,10 @@ def main() -> None:
     # (KeyboardInterrupt, MemoryError) propagate unhandled.
     try:
         sys.exit(args.func(args))
+    except KeyboardInterrupt:
+        # Ctrl-C at a question or during a run: the shell convention 128 + SIGINT.
+        print("fw-context: interrupted", file=sys.stderr)
+        sys.exit(130)
     except BaseException as exc:
         from ..utils import is_fatal
         if is_fatal(exc):

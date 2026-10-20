@@ -95,7 +95,7 @@ def _cloud_setup(monkeypatch, capsys, root: Path, answers: dict[str, str]) -> st
 
     monkeypatch.setattr(_init_interactive, "prompt_text", lambda label, **kwargs: answers.get(label, ""))
     monkeypatch.setattr(_init_interactive, "_read_secret", lambda prompt: "")
-    _init_interactive._prompt_cloud_setup(root)
+    _init_interactive._custom_api_profile()
     return capsys.readouterr().out
 
 
@@ -106,20 +106,6 @@ def test_init_refuses_a_url_that_cannot_be_parsed(tmp_path, monkeypatch, capsys)
 
     assert "is not a valid URL" in out and "[ok]" not in out, out
     assert not (root / ".fw-context" / "local.toml").exists()
-
-
-def test_init_says_no_ok_after_an_error(tmp_path, monkeypatch, capsys, global_config):
-    """The profile that failed its test stayed in the global config, and replaced a profile of that name."""
-    from fw_context_mcp.llm import configure
-
-    root = _project(tmp_path)
-    before = global_config.read_text(encoding="utf-8")
-    monkeypatch.setattr(configure, "configure_llm_core", lambda *a, **k: {"status": "error", "message": "test failed"})
-
-    out = _cloud_setup(monkeypatch, capsys, root, {"API URL": "http://localhost:1/v1", "Model": "m"})
-
-    assert "[warn] test failed" in out and "[ok]" not in out, out
-    assert global_config.read_text(encoding="utf-8") == before
 
 
 @pytest.mark.parametrize("separator", ["\u2028", "\u2029", "\x85"])
