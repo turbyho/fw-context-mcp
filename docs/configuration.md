@@ -227,7 +227,7 @@ Each profile is one LLM backend. The name of a profile has only letters, digits,
 
 | Key | Default | Provider | Description |
 |-----|---------|----------|-------------|
-| `provider` | *(required)* | each | `"ollama"` for an Ollama server, `"openai_compatible"` for an API with the OpenAI chat format, `"openrouter"` for OpenRouter, or `"deepseek"` for the API of DeepSeek. For `openrouter` and `deepseek`, fw-context knows the URL, the key variable and the request fields that turn the reasoning of the model off. |
+| `provider` | *(required)* | each | `"ollama"` for an Ollama server, `"openai_compatible"` for an API with the OpenAI chat format, `"openrouter"` for OpenRouter, `"deepseek"` for the API of DeepSeek, or `"chatgpt"` for the ChatGPT plan of the user (see [ChatGPT plan](#chatgpt-plan)). For `openrouter` and `deepseek`, fw-context knows the URL, the key variable and the request fields that turn the reasoning of the model off. A `chatgpt` profile has `provider`, `model` and, as each profile, `timeout`; `stream` has no effect, because each request of the plan streams. |
 | `model` | *(required)* | each | The chat model. Use a model with 14B parameters or more: a smaller model gives JSON that is not consistent, and poor descriptions of embedded C++ code. |
 | `url` | `"http://localhost:11434"` for Ollama, `"https://openrouter.ai/api/v1"` for OpenRouter, `"https://api.deepseek.com"` for DeepSeek | each | The server. Required for `openai_compatible`. fw-context adds `/chat/completions` to a URL that contains `/v1`, and `/v1/chat/completions` to a URL without `/v1`. A URL that ends with `/chat/completions` stays as it is. |
 | `timeout` | `600.0` | each | The HTTP request timeout, in seconds. Embed requests use `timeout × 2`. |
@@ -339,6 +339,27 @@ routing = { zdr = true }         # only hosts with zero data retention; sort and
 ```
 
 fw-context turns the reasoning of the model off. A model that refuses it (HTTP 400 that names the reasoning) gets the lowest reasoning, without the reasoning text in the answer, and fw-context logs a warning: the reasoning tokens are billed as output. OpenRouter gives the cost of each request: fw-context reads it from the answer.
+
+#### ChatGPT plan
+
+A profile with `provider = "chatgpt"` sends the chat requests to OpenAI and bills them to the ChatGPT plan of the user ("Sign in with ChatGPT"), not to an API key. The usage counts against the limits of the plan: see ChatGPT Settings → Usage. For ChatGPT Plus, the five-hour limit is shared with each other app.
+
+```toml
+[llm.profiles.chatgpt]
+provider = "chatgpt"
+model = "gpt-6-luna"             # 'fw-context llm models chatgpt' lists the models of the plan
+```
+
+```bash
+fw-context llm login chatgpt     # sign in in the browser (a loopback callback on 127.0.0.1)
+fw-context llm models chatgpt
+fw-context llm logout chatgpt    # revoke the sign-in and remove the tokens
+```
+
+- The sign-in checks the signature of the ID token against the keys of OpenAI, and the plan permission (`chatgpt.tokens.use.direct`). A profile signs in with one account: for another account, sign out first or make another profile.
+- The tokens are in `auth/chatgpt-<profile>.json` in the global directory, mode 0600, not in the keyring: the record is larger than the Windows Credential Manager takes. fw-context refreshes the access token (1 hour) with the refresh token (30 days, a new one at each refresh) under a file lock, thus an index run and the MCP server do not refresh at the same time.
+- Each request has `store: false`, and the reasoning at `effort: "none"`.
+- When the plan reaches a usage limit, or the sign-in is not valid any more, the LLM analysis stops at once. The stored analyses stay, and a later run continues.
 
 **LiteLLM proxy (local):**
 

@@ -122,6 +122,10 @@ def get_chat_client(cfg: LLMConfig) -> ChatClient:
     from .chat_router import OpenAIChatClient, chat_ollama_server, detect_chat_endpoint
     from .ollama import OllamaClient
 
+    if cfg.provider == "chatgpt":
+        from .chatgpt_plan import ChatGPTPlanClient
+
+        return ChatGPTPlanClient(cfg)
     if not cfg.chat_api_base:
         return OllamaClient(cfg, cfg.ollama_url.rstrip("/") + "/api/generate", cfg.ollama_url)
     fmt, endpoint = detect_chat_endpoint(cfg)

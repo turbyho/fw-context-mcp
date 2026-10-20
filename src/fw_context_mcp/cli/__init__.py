@@ -538,6 +538,15 @@ def main() -> None:
     )
     p_llm_key_status.add_argument("profile", nargs="?", help="Only this profile")
     p_llm_key_status.set_defaults(func=cmd_llm_key_status)
+    from ._llm import cmd_llm_login, cmd_llm_logout, cmd_llm_models  # noqa: I001
+    for name, func, text in (
+        ("login", cmd_llm_login, "Sign a profile of provider chatgpt in with ChatGPT, in the browser"),
+        ("logout", cmd_llm_logout, "Revoke the ChatGPT sign-in of a profile and remove its tokens"),
+        ("models", cmd_llm_models, "List the models of the ChatGPT plan of a profile"),
+    ):
+        p_llm_plan = p_llm_sub.add_parser(name, help=text)
+        p_llm_plan.add_argument("profile", help="The name of the LLM profile (provider chatgpt)")
+        p_llm_plan.set_defaults(func=func)
     # Without a subcommand, show the usage
     p_llm.set_defaults(func=cmd_llm)
     p_llm_key.set_defaults(func=cmd_llm)

@@ -19,6 +19,94 @@ import sys
 def cmd_llm(args: argparse.Namespace) -> int:
     """Without a subcommand: tell the subcommands."""
     print("usage: fw-context llm key {set,delete,status} [profile]")
+    print("       fw-context llm {login,logout,models} <profile>   (a profile of provider chatgpt)")
+    return 0
+
+
+def _plan_profile(name: str) -> bool:
+    """Return True when *name* is a profile of provider ``chatgpt`` of the global config; else tell why."""
+    profile = _profiles().get(name)
+    if profile is None:
+        print(f"[error] The global config has no profile {name!r}. Add it first:\n"
+              f"  [llm.profiles.{name}]\n  provider = \"chatgpt\"\n  model = \"<model>\"", file=sys.stderr)
+        return False
+    if profile.get("provider") != "chatgpt":
+        print(f"[error] Profile {name!r} has provider {profile.get('provider')!r}: only a profile of provider "
+              "chatgpt signs in", file=sys.stderr)
+        return False
+    return True
+
+
+def cmd_llm_login(args: argparse.Namespace) -> int:
+    """Sign a ``chatgpt`` profile in with ChatGPT in the browser.
+
+    Exit codes: 0 = signed in, 1 = not a chatgpt profile, or the sign-in
+    failed.
+    """
+    import webbrowser
+
+    from ..llm.chatgpt_plan import LoginError, login
+
+    if not _plan_profile(args.profile):
+        return 1
+
+    def _open(url: str, shown: str) -> None:
+        print("Sign in with ChatGPT in the browser. When no browser opens, open this URL:")
+        print(f"  {shown}")
+        try:
+            webbrowser.open(url)
+        except webbrowser.Error:
+            pass  # the user has the URL above
+
+    try:
+        credentials = login(args.profile, open_url=_open)
+    except LoginError as exc:
+        print(f"[error] {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"[error] the sign-in cannot be stored: {exc}", file=sys.stderr)
+        return 1
+    print(f"[ok] Profile {args.profile!r} is signed in as {credentials.email or credentials.subject}. "
+          "The requests use the usage of the ChatGPT plan (ChatGPT Settings → Usage)")
+    return 0
+
+
+def cmd_llm_logout(args: argparse.Namespace) -> int:
+    """Revoke the sign-in of a ``chatgpt`` profile and remove its tokens.
+
+    Exit codes: 0 after the tokens are removed (a revocation that is not
+    confirmed gives a note), 1 for a profile that is not a chatgpt profile.
+    """
+    from ..llm.chatgpt_plan import logout
+
+    if not _plan_profile(args.profile):
+        return 1
+    if logout(args.profile):
+        print(f"[ok] Profile {args.profile!r} is signed out")
+    else:
+        print(f"[ok] The tokens of profile {args.profile!r} are removed, but the revocation is not confirmed: "
+              "disconnect fw-context in ChatGPT Settings")
+    return 0
+
+
+def cmd_llm_models(args: argparse.Namespace) -> int:
+    """List the models of the ChatGPT plan of a ``chatgpt`` profile.
+
+    Exit codes: 0 = listed, 1 = not a chatgpt profile, not signed in, or
+    the request failed.
+    """
+    from ..llm.chatgpt_plan import list_models
+    from ..llm.errors import LLMError
+
+    if not _plan_profile(args.profile):
+        return 1
+    try:
+        models = list_models(args.profile)
+    except LLMError as exc:
+        print(f"[error] {exc}", file=sys.stderr)
+        return 1
+    for slug, label in models:
+        print(f"{slug}  ({label})" if label != slug else slug)
     return 0
 
 
@@ -95,6 +183,17 @@ def cmd_llm_key_delete(args: argparse.Namespace) -> int:
     return 0
 
 
+def _plan_status(name: str) -> None:
+    """Print the sign-in of a ``chatgpt`` profile: the account, never a token."""
+    from ..llm.chatgpt_plan import load_credentials
+
+    credentials = load_credentials(name)
+    if credentials is not None and credentials.signed_in():
+        print(f"{name}: signed in with ChatGPT as {credentials.email or credentials.subject}")
+    else:
+        print(f"{name}: not signed in (sign in with 'fw-context llm login {name}')")
+
+
 def cmd_llm_key_status(args: argparse.Namespace) -> int:
     """Tell for each API profile (or for the given one) which place gives its key.
 
@@ -113,6 +212,9 @@ def cmd_llm_key_status(args: argparse.Namespace) -> int:
             return 0
     for name in names:
         profile = profiles.get(name, {})
+        if profile.get("provider") == "chatgpt":
+            _plan_status(name)
+            continue
         spec = provider_spec(str(profile.get("provider", "")))
         own_url = spec is not None and str(profile.get("url", spec.base_url)).rstrip("/") == spec.base_url.rstrip("/")
         default_env = spec.key_env if spec is not None and own_url else ""

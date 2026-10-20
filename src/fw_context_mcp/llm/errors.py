@@ -18,6 +18,14 @@ class LLMError(RuntimeError):
     """A chat request failed: network, HTTP, the answer, or the backend."""
 
 
+class LLMStopRun(LLMError):
+    """The backend refuses each request now: a run of the analysis stops, and a later run continues.
+
+    A usage limit of a plan, or a sign-in that is not valid any more: each
+    of the next thousand symbols would fail the same way, three times.
+    """
+
+
 class ChatApiError(LLMError):
     """A request to an OpenAI-compatible chat API failed.
 

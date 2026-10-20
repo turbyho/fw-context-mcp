@@ -68,6 +68,11 @@ def detect_chat_endpoint(cfg: LLMConfig) -> tuple[str, str]:
     like OpenAI (e.g. a reverse proxy) knows what they are doing.  The
     explicit override is never second-guessed.
     """
+    if cfg.provider == "chatgpt":
+        # The ChatGPT plan: the Responses API of OpenAI, no URL of the profile.
+        from .chatgpt_plan import RESPONSES_URL
+
+        return "chatgpt", RESPONSES_URL
     if not cfg.chat_api_base:
         raise ValueError("chat_api_base is empty — set it or leave as None")
     base = cfg.chat_api_base.rstrip("/")

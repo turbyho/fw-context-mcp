@@ -1015,6 +1015,31 @@ fw-context llm key delete <profile>    # remove the stored key
 Exit codes: 0 when the command did its work; 1 for an empty key, a
 profile name that is not valid, or a key that no place could store.
 
+### `fw-context llm login`, `logout`, `models`
+
+Sign a profile of provider `chatgpt` in with ChatGPT, sign it out, and list
+the models of its plan. See
+[configuration.md](configuration.md#chatgpt-plan).
+
+```bash
+fw-context llm login <profile>    # sign in in the browser
+fw-context llm models <profile>   # the models of the plan
+fw-context llm logout <profile>   # revoke the sign-in, remove the tokens
+```
+
+- `login` opens the browser and waits up to 10 minutes for the callback
+  on `127.0.0.1` (port 1455, or a free port). When no browser opens, open
+  the URL that the command shows. The command refuses a profile that the
+  global config does not have, or that has another provider.
+- `logout` revokes the refresh token at OpenAI and removes the tokens. The
+  registration of the client stays for the next sign-in. When the
+  revocation is not confirmed, disconnect fw-context in ChatGPT Settings.
+- `fw-context llm key status` shows the account of each `chatgpt` profile,
+  never a token.
+
+Exit codes: 0 when the command did its work; 1 for a profile that is not a
+`chatgpt` profile, a sign-in that failed, or a request that failed.
+
 ### `fw-context version`
 
 Show version information.

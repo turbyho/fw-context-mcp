@@ -190,7 +190,8 @@ analyze_symbols = true
 # ── LLM profiles ──
 # Each profile is one LLM backend.  The profiles are in this global config
 # only: a project selects one with [llm] profile.  The keys of a profile:
-#   provider     "ollama", "openai_compatible", "openrouter" or "deepseek" (required)
+#   provider     "ollama", "openai_compatible", "openrouter", "deepseek" or "chatgpt" (required)
+#                chatgpt: the ChatGPT plan; 'fw-context llm login <profile>' signs in
 #   model        the chat model (required)
 #   url          the server.  Ollama: default http://localhost:11434.
 #                openai_compatible: required.  openrouter, deepseek: a default
@@ -974,7 +975,9 @@ _MOVED_LLM_KEYS: tuple[str, ...] = (
 #: ``openrouter`` and ``deepseek`` are records of ``llm.providers``: an
 #: OpenAI-compatible API with a default URL, a default key variable and
 #: the parts of a request that the API needs.
-_PROVIDERS: tuple[str, ...] = ("ollama", "openai_compatible", "openrouter", "deepseek")
+#: ``chatgpt`` is the ChatGPT plan of the user (``llm.chatgpt_plan``): a
+#: model and a sign-in (``fw-context llm login``), no URL and no key.
+_PROVIDERS: tuple[str, ...] = ("ollama", "openai_compatible", "openrouter", "deepseek", "chatgpt")
 
 #: The keys of a profile, with their converter: the keys of each provider,
 #: then the keys of the given provider (``_PROFILE_PROVIDER_FIELDS``).
@@ -984,6 +987,7 @@ _PROFILE_PROVIDER_FIELDS: dict[str, dict[str, str]] = {
     "openai_compatible": {"url": "str", "api_key_env": "str"},
     "openrouter": {"url": "str", "api_key_env": "str", "routing": "routing"},
     "deepseek": {"url": "str", "api_key_env": "str"},
+    "chatgpt": {},
 }
 
 #: The profile keys whose default keeps the backend the same: a value of the
@@ -2012,6 +2016,12 @@ def _resolve_llm_profile(data: dict, llm: LLMConfig, selected_in: dict[str, Path
         chat_url = profile.get("url", _DEFAULT_OLLAMA_URL)
         llm.num_ctx = _convert(profile.get("num_ctx", llm.num_ctx), "int")
         _apply_ollama_tuning(llm, profile)
+    elif llm.provider == "chatgpt":
+        from ..llm.chatgpt_plan import API_BASE
+
+        # The host of the source code, for the notice and the check; the
+        # client sends to the Responses API, with the tokens of the sign-in.
+        llm.chat_api_base, llm.chat_api_format, llm.api_key_env = API_BASE, "openai", ""
     else:
         from ..llm.providers import provider_spec
 

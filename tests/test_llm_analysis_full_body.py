@@ -476,3 +476,24 @@ def test_a_missing_model_is_pulled_when_auto_pull_is_on():
 
     assert mod._analysis_contexts(server, LLMConfig(num_ctx=16384, auto_pull=True)) == (16384, 32768)
     assert server.pulled == 1
+
+
+def test_a_refusal_of_each_request_stops_the_run_after_one_symbol(populated_db, monkeypatch, tmp_path: Path):
+    """A usage limit of a plan: each next symbol failed the same way, three times, with a pause of 2 s each."""
+    from fw_context_mcp.llm.errors import LLMStopRun
+
+    model = _Model()
+
+    def _limit(prompt, **kwargs):
+        model.calls.append((prompt, None, None))
+        raise LLMStopRun("usage limit")
+
+    model.answer = _limit
+    model.install(monkeypatch)
+    _seed(populated_db, tmp_path, {f"fn_{i}": _body(f"fn_{i}", 3) for i in range(5)})
+
+    assert _build_llm_analysis(populated_db, CONFIG_HASH, _Config(), tmp_path, project_root=tmp_path,
+                               write_lock_held=True) is False
+
+    assert len(model.calls) == 1, "the run must stop at the first refusal, without a retry"
+    assert _models(populated_db) == {}, "no symbol gets a sentinel: a later run continues"

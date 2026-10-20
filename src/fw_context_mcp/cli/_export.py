@@ -323,7 +323,11 @@ def _analyze_builds(
             # changed (see set_analyze_vendor).
             set_analyze_vendor(conn, config_hash, analyze_vendor)
             conn.commit()
-            print(f"LLM analysis complete for {project_root}, build {label(build)}")
+            if finished:
+                print(f"LLM analysis complete for {project_root}, build {label(build)}")
+            else:
+                print(f"LLM analysis not complete for {project_root}, build {label(build)}: a symbol failed, "
+                      "or the run stopped (see the log). A later run continues")
     finally:
         if cc:
             cc.close()

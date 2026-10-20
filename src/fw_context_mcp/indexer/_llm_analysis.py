@@ -21,6 +21,7 @@ from typing import Any
 
 from ..cache_client import get_local_cache_db, local_cache_lookup, local_cache_upsert
 from ..llm.client import ChatClient, get_chat_client
+from ..llm.errors import LLMStopRun
 from ..llm.ollama import OllamaPromptTooLong
 from ..utils import SAFE_EXCEPT, is_fatal, read_file_lines
 from ._embedding import _fmt_dur
@@ -440,6 +441,8 @@ def _build_llm_analysis(
         for _c_attempt in range(3):
             try:
                 return client.count_tokens(prompt, run_ctx)
+            except LLMStopRun:
+                raise
             except SAFE_EXCEPT as _e:
                 if is_fatal(_e) or _c_attempt == 2:
                     raise
@@ -461,8 +464,9 @@ def _build_llm_analysis(
                 response = client.generate(prompt, temperature=0.1, max_tokens=_ANSWER_TOKENS,
                                            num_ctx=num_ctx).text
                 break
-            except OllamaPromptTooLong:
-                # The same request fails again: the caller selects a larger context.
+            except (OllamaPromptTooLong, LLMStopRun):
+                # The same request fails again: the caller selects a larger
+                # context, or stops the run (a usage limit of a plan).
                 raise
             except SAFE_EXCEPT as _e:
                 _last_exc = _e
@@ -526,6 +530,7 @@ def _build_llm_analysis(
         log.debug("  outputs: %s", r["outputs"])
         return inserted
 
+    stopped = False
     for idx, row in enumerate(rows):
         t0 = time.monotonic()
         qname = row["qualified_name"] or row["name"]
@@ -678,6 +683,12 @@ def _build_llm_analysis(
             long_prompts.append(_LongPrompt(idx, qname, d, h, prompt, prompt_tokens))
             log.info("[%d/%d] %s: later (prompt %d tokens, context %d)",
                      idx + 1, total_symbols, qname, prompt_tokens, run_ctx)
+        except LLMStopRun as e:
+            # Each next symbol fails the same way: the analysis stops, the
+            # stored analyses stay, and a later run continues.
+            log.error("LLM analysis stopped at %d/%d: %s", idx + 1, total_symbols, e)
+            stopped = True
+            break
         except SAFE_EXCEPT as e:
             failed += 1
             elapsed = time.monotonic() - t0
@@ -685,6 +696,8 @@ def _build_llm_analysis(
             continue
 
     # ── Second pass: the prompts that do not fit the context of the run ──
+    if stopped:
+        long_prompts = []
     too_large: list[_LongPrompt] = []
     fitting: list[_LongPrompt] = []
     for p in long_prompts:
@@ -706,6 +719,10 @@ def _build_llm_analysis(
             t0 = time.monotonic()
             try:
                 total += _ask_model(p.position, p.qname, p.symbol, p.content_hash, p.prompt, long_ctx, t0)
+            except LLMStopRun as e:
+                log.error("LLM analysis stopped: %s", e)
+                stopped = True
+                break
             except SAFE_EXCEPT as e:
                 if is_fatal(e):
                     raise
@@ -722,5 +739,5 @@ def _build_llm_analysis(
         pass  # non-fatal — continue
     finally:
         local_db.close()
-    return failed == 0
+    return failed == 0 and not stopped
 

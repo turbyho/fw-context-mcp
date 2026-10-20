@@ -56,7 +56,7 @@ def _analyze(root: Path, monkeypatch, *, analyze_vendor: bool = False, **selecto
     from fw_context_mcp.cli._export import cmd_analyze
 
     analysed: list[str] = []
-    monkeypatch.setattr(llm_mod, "_build_llm_analysis", lambda conn, config_hash, *a, **k: analysed.append(config_hash))
+    monkeypatch.setattr(llm_mod, "_build_llm_analysis", lambda conn, config_hash, *a, **k: analysed.append(config_hash) or True)
     args = argparse.Namespace(
         project=str(root), verbose=False, analyze_vendor=analyze_vendor, no_analyze_vendor=False, **selector,
     )

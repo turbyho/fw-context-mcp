@@ -615,6 +615,7 @@ _PROFILE_BASE = {
     "openai_compatible": {"provider": '"openai_compatible"', "model": '"m"', "url": '"http://localhost:9"'},
     "openrouter": {"provider": '"openrouter"', "model": '"m"'},
     "deepseek": {"provider": '"deepseek"', "model": '"m"'},
+    "chatgpt": {"provider": '"chatgpt"', "model": '"m"'},
 }
 
 

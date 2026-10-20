@@ -20,6 +20,10 @@ dependencies = [
     # Service on Linux.  MIT; on Linux it adds SecretStorage (BSD-3) and
     # jeepney (MIT).
     "keyring>=24",
+    # The ChatGPT plan (llm/chatgpt_plan.py) checks the signature of the
+    # ID token of the sign-in against the JWKS of OpenAI.  mcp requires it
+    # too; the line names the direct use.  MIT; cryptography: Apache-2.0/BSD.
+    "pyjwt[crypto]>=2.10",
     # <19 is a hard bound: fw-context ships the clang compiler headers of
     # ONE major version (data/clang-resource), and the headers of another
     # version break the parse (clang 22 headers in libclang 18: 312 errors
