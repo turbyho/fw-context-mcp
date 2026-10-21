@@ -52,6 +52,7 @@ from ...indexer.db import (
     DatabaseCorruptionError,
     Ownership,
     WriteLockTimeout,
+    analysis_models,
     compute_analysis_coverage,
     count_refs,
     error_shows_damage,
@@ -456,16 +457,9 @@ def _analysis_of(conn, config_hash: str) -> tuple[dict, bool]:
     vendor symbols apart from project symbols that still need analysis.
     """
     coverage = compute_analysis_coverage(conn, config_hash)
-    # Exclude the skip:* sentinels (skip:toolarge, skip:unparseable) —
-    # they are not model names and must never surface as analysis.model.
-    analysis_model_row = conn.execute(
-        """SELECT a.model FROM llm_analysis a
-           JOIN symbols s ON s.id = a.symbol_id
-           WHERE s.config_hash = ?
-             AND a.model NOT LIKE 'skip:%' LIMIT 1""",
-        (config_hash,),
-    ).fetchone()
-    model = analysis_model_row["model"] if analysis_model_row else None
+    # The skip:* sentinels (skip:toolarge, skip:unparseable) are not models
+    # (analysis_models leaves them out).
+    models = analysis_models(conn, config_hash)
     # The stored analyze_vendor: what was actually indexed.  False for a
     # database from before the column.
     try:
@@ -477,7 +471,7 @@ def _analysis_of(conn, config_hash: str) -> tuple[dict, bool]:
         )
     except sqlite3.OperationalError:
         stored_analyze_vendor = False
-    return make_analysis_summary(coverage, stored_analyze_vendor, model), stored_analyze_vendor
+    return make_analysis_summary(coverage, stored_analyze_vendor, models), stored_analyze_vendor
 
 
 def _build_health(

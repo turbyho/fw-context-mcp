@@ -188,21 +188,35 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     from ..indexer.db import open_db_readonly
     from ._builds import reading_problem
 
-    conn = open_db_readonly(db_path)
-    try:
-        error = None if reading_problem(conn) else selected_builds(conn, project_id, cfg, args)[1]
-    finally:
-        conn.close()
-    if error:
-        print(error, file=sys.stderr)
-        return 1
-
     # Resolve analyze_vendor: CLI flag takes precedence, config falls back.
     analyze_vendor = (
         False
         if getattr(args, "no_analyze_vendor", False)
         else getattr(args, "analyze_vendor", False) or cfg.llm.analyze_vendor
     )
+
+    from ._llm_choice import RunProfileError, analysis_count_line, llm_for_run, may_ask
+
+    conn = open_db_readonly(db_path)
+    count = ""
+    try:
+        error = None
+        if not reading_problem(conn):
+            builds, error = selected_builds(conn, project_id, cfg, args)
+            if error is None and not getattr(args, "llm", None) and may_ask(False):
+                # For the question only: a fact of the index, read before the lock.
+                count = analysis_count_line(conn, builds, project_only=not analyze_vendor,
+                                            force=bool(getattr(args, "force_llm", False)))
+    finally:
+        conn.close()
+    if error:
+        print(error, file=sys.stderr)
+        return 1
+    try:
+        cfg = llm_for_run(args, cfg, background=False, analyses=True, count=count)
+    except RunProfileError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
     from ..indexer.db._locking import IndexRunLocked
     from ..indexer.runner import IndexStopped

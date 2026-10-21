@@ -104,7 +104,7 @@ class TestSkipSentinel:
             )
 
         coverage = compute_analysis_coverage(populated_db, CONFIG_HASH)
-        summary = make_analysis_summary(coverage, False, "m")
+        summary = make_analysis_summary(coverage, False, {"m": 1})
         assert summary["complete"] is True
 
 

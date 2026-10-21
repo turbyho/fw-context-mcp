@@ -1474,6 +1474,16 @@ def _cmd_index(args: argparse.Namespace, outside: _SigtermOutsideTheLock) -> int
     _clean_obsolete(args, project_root, files=False)
     cfg = load_config(project_root=project_root)
     bg = getattr(args, "background", False)
+    # The profile of the run before the parse: the question must come at
+    # the start, not after minutes of work (decision of the user).
+    from ._llm_choice import RunProfileError, index_analyses, llm_for_run, may_ask
+
+    if getattr(args, "llm", None) or may_ask(bg):
+        try:
+            cfg = llm_for_run(args, cfg, background=bg, analyses=index_analyses(args, cfg))
+        except RunProfileError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
     # The config wins over the markers, the same form _run_multi already
     # uses.  The two can disagree: a freestanding NCS application has
     # CMakeLists.txt and no west.yml, so a marker scan calls it a CMake

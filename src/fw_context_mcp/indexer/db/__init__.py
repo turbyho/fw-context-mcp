@@ -40,6 +40,7 @@ __all__ = [
     "_cosine_sim",
     "_ensure_column",
     "_expand_query",
+    "analysis_models",
     "clean_orphan_embeddings",
     "clean_orphan_embeddings_vec",
     "clear_embedding_stash",
@@ -267,6 +268,7 @@ from ._owners import (
     unclaimed,
 )
 from ._projects import (
+    analysis_models,
     compute_analysis_coverage,
     delete_build_data,
     get_active_config,

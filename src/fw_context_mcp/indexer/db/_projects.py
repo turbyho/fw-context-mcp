@@ -26,6 +26,7 @@ from ._schema import _ensure_column
 __all__ = [
     "ANALYZABLE_KINDS",
     "EMBEDDABLE_KINDS",
+    "analysis_models",
     "compute_analysis_coverage",
     "delete_build_data",
     "get_active_config",
@@ -163,12 +164,33 @@ def symbols_without_embedding(conn: sqlite3.Connection, config_hash: str) -> lis
     return [row[0] for row in rows]
 
 
+def analysis_models(conn, config_hash: str) -> dict[str, int]:
+    """Return ``{model: analyses}`` of a build, the most frequent first; the ``skip:*`` sentinels are not models.
+
+    WHY all models: the analyses of one build can come from different
+    profiles (``--llm`` of one run), and one model of a ``LIMIT 1`` query
+    named one of them at random.
+    """
+    rows = conn.execute(
+        """SELECT a.model AS model, COUNT(*) AS n FROM llm_analysis a
+           JOIN symbols s ON s.id = a.symbol_id
+           WHERE s.config_hash = ? AND a.model NOT LIKE 'skip:%'
+           GROUP BY a.model ORDER BY n DESC, a.model""",
+        (config_hash,),
+    ).fetchall()
+    return {row["model"]: row["n"] for row in rows}
+
+
 def make_analysis_summary(
     coverage: dict,
     analyze_vendor: bool,
-    model: str | None,
+    models: dict[str, int] | None,
 ) -> dict:
     """Shape ``compute_analysis_coverage`` output into the ``analysis`` status.
+
+    ``model`` is the model of the most analyses, and ``models`` counts the
+    analyses of each model (``analysis_models``); None is a build without
+    an analysis.
 
     ``complete`` is True when the pipeline has no more work: every project
     symbol is analyzed or skipped and, when vendor analysis is enabled,
@@ -192,8 +214,10 @@ def make_analysis_summary(
         - coverage["vendor"]["analyzed"]
         - coverage["vendor"]["skipped"]
     )
+    models = models or {}
     return {
-        "model": model,
+        "model": next(iter(models), None),
+        "models": models,
         "analyze_vendor": analyze_vendor,
         "project": coverage["project"],
         "vendor": coverage["vendor"],
@@ -612,14 +636,6 @@ def get_build_stats(conn: sqlite3.Connection, config_hash: str) -> dict:
     coverage = compute_analysis_coverage(conn, config_hash)
     # Exclude the skip:* sentinels (skip:toolarge, skip:unparseable) —
     # they are not model names and must never surface as analysis.model.
-    model_row = conn.execute(
-        """SELECT a.model FROM llm_analysis a
-           JOIN symbols s ON s.id = a.symbol_id
-           WHERE s.config_hash = ?
-             AND a.model NOT LIKE 'skip:%' LIMIT 1""",
-        (config_hash,),
-    ).fetchone()
-    model = model_row["model"] if model_row else None
 
     embeddings = conn.execute(
         """SELECT COUNT(DISTINCT e.symbol_id) FROM embeddings e
@@ -642,7 +658,7 @@ def get_build_stats(conn: sqlite3.Connection, config_hash: str) -> dict:
     result["analysis"] = make_analysis_summary(
         coverage,
         bool(result.get("analyze_vendor")),
-        model,
+        analysis_models(conn, config_hash),
     )
     result["file_count"] = files
     result["reference_count"] = refs

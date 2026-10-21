@@ -79,6 +79,7 @@ fw-context index --vendor-paths sdk third_party --project-paths src lib
 | `--no-analyze-vendor` | off | Skip the analysis of the vendor and SDK code. Wins over `--analyze-vendor` and the config. |
 | `--background` | off | The mode of the file-watcher daemon. The run does not rebuild a stale `compile_commands.json`, does not repair it, and prunes no registry rows. It builds only when the backend can build on its own. |
 | `--force` | off | Force re-index of all files, embeddings, overrides, PageRank, and hotspot cache (skips the hash checks). The LLM analysis comes from the cache. |
+| `--llm <profile>` | the profile of the project | The LLM profile of the analysis of this run. Without it, the command asks at its start on a terminal when two profiles or more can run. See [The LLM profile of one run](#the-llm-profile-of-one-run). |
 | `--force-llm` | off | Make the LLM analysis of each symbol again. The analyses of the caches from before the command do not apply, and the new ones replace the entries of the local cache, and of the cache server when the token has `can_overwrite`. It turns on the analysis. With `--no-analyze`, the command stops with an error. A command that stops, or that does not reach each symbol (Ollama did not answer), leaves the old analyses of the symbols that it did not reach. The next `--force-llm` with the same chat model continues from the time of the first command: the file `force_llm.json` of the index keeps it until a command reaches each symbol. Needs Ollama 0.30.1 or later. |
 | `--variant NAME` | all variants | Restrict indexing to one build variant (name from `[[build.variants]]`) |
 | `--variants A,B` | all variants | Comma-separated list of build variants to index |
@@ -635,6 +636,7 @@ fw-context analyze                        # analyze current project
 fw-context analyze --project /path        # specific project
 fw-context analyze --variant nrf52840-dev --image app   # one build
 fw-context analyze --force-llm            # make each analysis again (takes hours on a large project)
+fw-context analyze --force-llm --llm deepseek   # with another LLM profile, without a question
 ```
 
 The command holds the index lock of the project, as `fw-context index`
@@ -661,6 +663,45 @@ Configure with `[llm] analyze_symbols` and `[llm] analyze_vendor` in
 `~/.fw-context/config.toml`. The chat model and `num_ctx` are keys of the
 selected LLM profile (`[llm.profiles.<name>]`, see
 [Configuration](configuration.md)).
+
+### The LLM profile of one run
+
+The project has one LLM profile, which the background reindex uses. A
+manual `fw-context index` or `fw-context analyze` can use another one for
+its LLM analysis, for example an API for a full `--force-llm` run:
+
+- `--llm <profile>` selects the profile without a question. A profile
+  that does not exist, or that has no API key or ChatGPT sign-in, stops
+  the command with an error: fw-context never selects another profile in
+  its place.
+- Without `--llm`, the command asks at its start, before the parse of the
+  sources. It asks only on a terminal in the foreground (not in a job
+  started with `&`), not with `--background`, only when the run makes the
+  LLM analysis (also through `--force-llm` or `--analyze`), and only when
+  two profiles or more can run. Enter keeps the profile of the project,
+  and so does no answer in 60 seconds (on Windows the question waits).
+  `fw-context analyze` also tells how many definitions the analysis
+  reads, and how many of them have no analysis.
+- `--llm` of a run without the LLM analysis (`--no-analyze`) has no
+  effect. A profile with a value that cannot be used stops the command;
+  `fw-context doctor` names the value. The exit code of an error of
+  `--llm` is 2 for `index` and 1 for `analyze`, as their other errors of
+  the arguments.
+- The profile changes the chat of the run only. The embeddings stay on
+  their server and model: a different embedding model gives vectors of a
+  different meaning. The timeout of the embeddings is two times the
+  `timeout` of the profile of the run.
+- At the end of the analysis, also after Ctrl-C or a stop, fw-context
+  logs the usage that the provider reports: the requests, the input
+  tokens (and the part from the cache of the provider), the output
+  tokens, the cost when the provider reports it (OpenRouter), and the
+  time. When a provider reports no usage, the line says so. fw-context
+  does not estimate a price.
+
+The analyses of one build can come from different models. `fw-context db
+stats` shows the count of the analyses of each model, and the
+`analysis` of `get_project_status` has `models` (model: count) beside
+`model` (the model of the most analyses).
 
 ### `fw-context cache stats`
 
@@ -3058,7 +3099,8 @@ Output: {"variant": "nrf52840-dev", "image": "app", "board": "nrf52840dk/nrf5284
          "symbol_count": 12430, "file_count": 1502,
          "reference_count": 8900, "modified_files_count": 0,
          "header_affected_tus": 0, "manifest_verification": "full",
-         "analysis": {"model": "qwen2.5-coder:14b", "analyze_vendor": false,
+         "analysis": {"model": "qwen2.5-coder:14b", "models": {"qwen2.5-coder:14b": 8450},
+                      "analyze_vendor": false,
                       "project": {"analyzed": 8450, "skipped": 6, "total": 8570},
                       "vendor": {"analyzed": 0, "skipped": 0, "total": 42330},
                       "complete": false},

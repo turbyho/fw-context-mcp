@@ -293,6 +293,51 @@ def _clear_skip_sentinels(
         )
 
 
+class _Spent:
+    """The usage of the requests of one analysis run, as the backend reports it.
+
+    WHY: a run on a paid API must tell what it cost; the provider reports
+    the tokens (and OpenRouter the cost) of each answer.  A value that a
+    backend does not report stays out of the line: no estimate.
+    """
+
+    def __init__(self) -> None:
+        self.requests = 0
+        self.reported = 0
+        self.prompt = 0
+        self.cached = 0
+        self.completion = 0
+        self.cost: float | None = None
+
+    def add(self, usage) -> None:
+        self.requests += 1
+        if usage.prompt_tokens is not None or usage.completion_tokens is not None:
+            self.reported += 1
+        self.prompt += usage.prompt_tokens or 0
+        self.cached += usage.cached_tokens or 0
+        self.completion += usage.completion_tokens or 0
+        if usage.cost is not None:
+            self.cost = (self.cost or 0.0) + usage.cost
+
+    def line(self, seconds: float) -> str:
+        parts = [f"{self.requests} requests"]
+        if not self.reported:
+            # A streamed answer can come without a usage object: "0 tokens"
+            # would be a value that the backend did not give.
+            parts.append("usage not reported")
+        else:
+            if self.reported < self.requests:
+                parts.append(f"usage reported for {self.reported} of them")
+            parts.append(f"{self.prompt} input tokens")
+            if self.cached:
+                parts[-1] += f" ({self.cached} from the cache of the provider)"
+            parts.append(f"{self.completion} output tokens")
+        if self.cost is not None:
+            parts.append(f"cost {self.cost:.4f} USD (reported by the provider)")
+        parts.append(f"{seconds:.0f} s")
+        return ", ".join(parts)
+
+
 def _select_unanalyzed_symbols(
     conn,
     config_hash: str,
@@ -306,8 +351,6 @@ def _select_unanalyzed_symbols(
     symbol can be skipped.  Symbols without any analysis have
     ``existing_hash = NULL`` and always proceed to cache lookup.
     """
-    is_project_clause = "AND s.is_project = 1" if project_only else ""
-    kind_placeholders = ", ".join("?" * len(ANALYZABLE_KINDS))
     query = f"""SELECT s.id, s.name, s.qualified_name, s.kind, s.file_path,
                         s.signature, s.is_definition, s.docstring,
                         s.end_line, s.line, s.usr, s.source,
@@ -316,15 +359,37 @@ def _select_unanalyzed_symbols(
                  FROM symbols s
                  JOIN files f ON s.file_id = f.id
                  LEFT JOIN llm_analysis a ON a.symbol_id = s.id
-                 WHERE s.config_hash = ?
-                   AND s.is_definition = 1
-                   AND s.kind IN ({kind_placeholders})
-                   AND s.name NOT LIKE '%(anonymous%'
-                   AND s.name NOT LIKE '%(unnamed%'
-                   {is_project_clause}
+                 WHERE {_CANDIDATES_WHERE.format(project=_project_clause(project_only))}
                  ORDER BY s.kind, s.file_path, s.line"""
     with transaction(conn, checkpoint=False):
         return conn.execute(query, (config_hash, *ANALYZABLE_KINDS)).fetchall()
+
+
+#: The definitions that the analysis reads: one filter for the run and for its count.
+_CANDIDATES_WHERE = (
+    "s.config_hash = ? AND s.is_definition = 1 AND s.kind IN ("
+    + ", ".join("?" * len(ANALYZABLE_KINDS))
+    + ") AND s.name NOT LIKE '%(anonymous%' AND s.name NOT LIKE '%(unnamed%' {project}"
+)
+
+
+def _project_clause(project_only: bool) -> str:
+    return "AND s.is_project = 1" if project_only else ""
+
+
+def count_analysis_candidates(conn, config_hash: str, project_only: bool) -> tuple[int, int]:
+    """Return (definitions that the analysis reads, those without an analysis) of a build.
+
+    ``COUNT`` and not the rows of ``_select_unanalyzed_symbols``: those
+    hold the bodies (measured: 247 MB for 50000 definitions).
+    """
+    query = f"""SELECT COUNT(*) AS total, SUM(a.symbol_id IS NULL) AS without
+                 FROM symbols s
+                 JOIN files f ON s.file_id = f.id
+                 LEFT JOIN llm_analysis a ON a.symbol_id = s.id
+                 WHERE {_CANDIDATES_WHERE.format(project=_project_clause(project_only))}"""
+    row = conn.execute(query, (config_hash, *ANALYZABLE_KINDS)).fetchone()
+    return int(row["total"] or 0), int(row["without"] or 0)
 
 
 def _build_llm_analysis(
@@ -461,8 +526,9 @@ def _build_llm_analysis(
         _last_exc: BaseException | None = None
         for _a_attempt in range(3):
             try:
-                response = client.generate(prompt, temperature=0.1, max_tokens=_ANSWER_TOKENS,
-                                           num_ctx=num_ctx).text
+                result = client.generate(prompt, temperature=0.1, max_tokens=_ANSWER_TOKENS, num_ctx=num_ctx)
+                spent.add(result.usage)
+                response = result.text
                 break
             except (OllamaPromptTooLong, LLMStopRun):
                 # The same request fails again: the caller selects a larger
@@ -531,205 +597,212 @@ def _build_llm_analysis(
         return inserted
 
     stopped = False
-    for idx, row in enumerate(rows):
-        t0 = time.monotonic()
-        qname = row["qualified_name"] or row["name"]
-        try:
-            # ── Step 0: project DB hash check — skip unchanged symbols
-            #    without disk I/O or callee fetch.  Uses the ``source``
-            #    column stored during indexing, which is the same text that
-            #    _enrich_batch gives as the body.  The two MUST agree: the
-            #    hash below decides whether the model runs again, and a
-            #    body from the disk would differ for every symbol that
-            #    holds an inactive #ifdef branch.
-            # A forced run makes each analysis again, thus the stored hash
-            # does not apply.
-            existing_hash = row.get("existing_hash") if force_since is None else None
-            if existing_hash:
-                source_body = row["source"] or ""
-                if not source_body:
-                    # source column is empty (legacy symbol from before
-                    # the 'source' column was added).  Fall back to
-                    # reading the body from disk for the hash comparison.
-                    from ..utils import abs_path as _resolve_abs_path
+    spent = _Spent()
+    run_started = time.monotonic()
+    # The usage line in finally: an interrupted run (Ctrl-C, SIGTERM, a
+    # stop of the plan) is the run whose cost the user must see.
+    try:
+        for idx, row in enumerate(rows):
+            t0 = time.monotonic()
+            qname = row["qualified_name"] or row["name"]
+            try:
+                # ── Step 0: project DB hash check — skip unchanged symbols
+                #    without disk I/O or callee fetch.  Uses the ``source``
+                #    column stored during indexing, which is the same text that
+                #    _enrich_batch gives as the body.  The two MUST agree: the
+                #    hash below decides whether the model runs again, and a
+                #    body from the disk would differ for every symbol that
+                #    holds an inactive #ifdef branch.
+                # A forced run makes each analysis again, thus the stored hash
+                # does not apply.
+                existing_hash = row.get("existing_hash") if force_since is None else None
+                if existing_hash:
+                    source_body = row["source"] or ""
+                    if not source_body:
+                        # source column is empty (legacy symbol from before
+                        # the 'source' column was added).  Fall back to
+                        # reading the body from disk for the hash comparison.
+                        from ..utils import abs_path as _resolve_abs_path
 
-                    file_path = row.get("file_path", "")
-                    abs_file_path = _resolve_abs_path(project_root, file_path) if project_root else file_path
-                    if abs_file_path:
-                        source_body = _read_body(abs_file_path, row["line"], row["end_line"])
-                h = compute_content_hash(
-                    source_body,
-                    row["qualified_name"] or "",
-                    row["signature"] or "",
-                    row["docstring"] or "",
-                )
-                if existing_hash == h:
+                        file_path = row.get("file_path", "")
+                        abs_file_path = _resolve_abs_path(project_root, file_path) if project_root else file_path
+                        if abs_file_path:
+                            source_body = _read_body(abs_file_path, row["line"], row["end_line"])
+                    h = compute_content_hash(
+                        source_body,
+                        row["qualified_name"] or "",
+                        row["signature"] or "",
+                        row["docstring"] or "",
+                    )
+                    if existing_hash == h:
+                        total += 1
+                        elapsed = time.monotonic() - t0
+                        log.debug("[%d/%d] %s: hash-matched %s", idx + 1, total_symbols, qname, _fmt_dur(elapsed))
+                        continue
+
+                batch_dicts = _enrich_batch(conn, [row], config_hash, project_root=project_root)
+                d = batch_dicts[0]
+
+                # ── Cache check — 2 tiers: local global → remote ──
+                h = compute_content_hash(d["body"], d["qualified_name"], d["signature"], d["docstring"])
+
+                # Catch edge cases where source-H ≠ body-H (e.g. varglobal
+                # with multi-line initializer — source column captured the
+                # body but _enrich_batch left it empty).
+                if existing_hash and existing_hash == h:
                     total += 1
                     elapsed = time.monotonic() - t0
                     log.debug("[%d/%d] %s: hash-matched %s", idx + 1, total_symbols, qname, _fmt_dur(elapsed))
                     continue
 
-            batch_dicts = _enrich_batch(conn, [row], config_hash, project_root=project_root)
-            d = batch_dicts[0]
+                # ── Body unavailable: store a sentinel, do not call the model ──
+                # An analysis without the body is worthless, because the model
+                # then sees only the name and the signature.  It is also unsafe
+                # to cache: ``h`` is the hash of an EMPTY body, thus a later
+                # symbol with the same name, signature and docstring could read
+                # the answer back from the content-addressable caches.  The
+                # unparseable-response path below keeps its sentinel out of
+                # those caches for the same reason.
+                #
+                # The sentinel goes into the per-build table only.
+                # ``compute_analysis_coverage`` counts it as skipped, and
+                # ``make_analysis_summary`` counts a skipped symbol as done.
+                # Thus a file that a build step removed cannot keep the
+                # analysis incomplete permanently.  The next run still repairs the
+                # symbol: ``h`` came from an empty body, thus it cannot match
+                # the hash of a body that reads correctly, and the code above
+                # falls through to a real analysis.
+                if d.get("body_unavailable"):
+                    with write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext():
+                        with transaction(conn, checkpoint=False):
+                            upsert_llm_analysis_batch(conn, [(d["id"], "", "", "", "skip:nobody", h)])
+                    total += 1
+                    elapsed = time.monotonic() - t0
+                    log.warning(
+                        "[%d/%d] %s: skip %s (body unavailable — the next run retries)",
+                        idx + 1, total_symbols, qname, _fmt_dur(elapsed),
+                    )
+                    continue
 
-            # ── Cache check — 2 tiers: local global → remote ──
-            h = compute_content_hash(d["body"], d["qualified_name"], d["signature"], d["docstring"])
-
-            # Catch edge cases where source-H ≠ body-H (e.g. varglobal
-            # with multi-line initializer — source column captured the
-            # body but _enrich_batch left it empty).
-            if existing_hash and existing_hash == h:
-                total += 1
-                elapsed = time.monotonic() - t0
-                log.debug("[%d/%d] %s: hash-matched %s", idx + 1, total_symbols, qname, _fmt_dur(elapsed))
-                continue
-
-            # ── Body unavailable: store a sentinel, do not call the model ──
-            # An analysis without the body is worthless, because the model
-            # then sees only the name and the signature.  It is also unsafe
-            # to cache: ``h`` is the hash of an EMPTY body, thus a later
-            # symbol with the same name, signature and docstring could read
-            # the answer back from the content-addressable caches.  The
-            # unparseable-response path below keeps its sentinel out of
-            # those caches for the same reason.
-            #
-            # The sentinel goes into the per-build table only.
-            # ``compute_analysis_coverage`` counts it as skipped, and
-            # ``make_analysis_summary`` counts a skipped symbol as done.
-            # Thus a file that a build step removed cannot keep the
-            # analysis incomplete permanently.  The next run still repairs the
-            # symbol: ``h`` came from an empty body, thus it cannot match
-            # the hash of a body that reads correctly, and the code above
-            # falls through to a real analysis.
-            if d.get("body_unavailable"):
-                with write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext():
-                    with transaction(conn, checkpoint=False):
-                        upsert_llm_analysis_batch(conn, [(d["id"], "", "", "", "skip:nobody", h)])
-                total += 1
-                elapsed = time.monotonic() - t0
-                log.warning(
-                    "[%d/%d] %s: skip %s (body unavailable — the next run retries)",
-                    idx + 1, total_symbols, qname, _fmt_dur(elapsed),
-                )
-                continue
-
-            # Tier 1: local global cache (~/.fw-context/llm_cache.db)
-            cached = None
-            try:
-                local_hits = local_cache_lookup(local_db, [h])
-                cached = local_hits.get(h)
-            except SAFE_EXCEPT as e:
-                if is_fatal(e):
-                    raise
-                log.debug("Local global cache lookup failed: %s", e)
-            if cached and force_since is not None and (
-                cached["analyzed_at"] < force_since or cached["model"] != model
-            ):
+                # Tier 1: local global cache (~/.fw-context/llm_cache.db)
                 cached = None
-
-            # Tier 2: remote cache server.  A forced run does not read it:
-            # its entries have no time of this machine.
-            if not cached and cache_client is not None and force_since is None:
                 try:
-                    remote_hits = cache_client.batch_get([h])
-                    cached = remote_hits.get(h)
-                    if cached:
-                        # Store in local global cache for next time
-                        try:
-                            local_cache_upsert(local_db, [{"hash": h, **cached}])
-                        except SAFE_EXCEPT as e:
-                            if is_fatal(e):
-                                raise
-                            log.debug("Local global cache write failed: %s", e)
-                    else:
-                        log.debug("Remote cache miss for %s (hash=%s…)", qname, h[:12])
+                    local_hits = local_cache_lookup(local_db, [h])
+                    cached = local_hits.get(h)
                 except SAFE_EXCEPT as e:
                     if is_fatal(e):
                         raise
-                    log.debug("Remote cache lookup failed for %s: %s", qname, e)
+                    log.debug("Local global cache lookup failed: %s", e)
+                if cached and force_since is not None and (
+                    cached["analyzed_at"] < force_since or cached["model"] != model
+                ):
+                    cached = None
 
-            if cached:
-                # Cache hit — re-use existing analysis
-                with write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext():
-                    with transaction(conn, checkpoint=False):
-                        upsert_llm_analysis_batch(
-                            conn,
-                            [
-                                (
-                                    d["id"],
-                                    cached["summary"],
-                                    cached["inputs"],
-                                    cached["outputs"],
-                                    cached["model"],
-                                    h,
-                                )
-                            ],
-                        )
-                total += 1
-                elapsed = time.monotonic() - t0
-                log.info("[%d/%d] %s: ok %s", idx + 1, total_symbols, qname, _fmt_dur(elapsed))
-                continue
+                # Tier 2: remote cache server.  A forced run does not read it:
+                # its entries have no time of this machine.
+                if not cached and cache_client is not None and force_since is None:
+                    try:
+                        remote_hits = cache_client.batch_get([h])
+                        cached = remote_hits.get(h)
+                        if cached:
+                            # Store in local global cache for next time
+                            try:
+                                local_cache_upsert(local_db, [{"hash": h, **cached}])
+                            except SAFE_EXCEPT as e:
+                                if is_fatal(e):
+                                    raise
+                                log.debug("Local global cache write failed: %s", e)
+                        else:
+                            log.debug("Remote cache miss for %s (hash=%s…)", qname, h[:12])
+                    except SAFE_EXCEPT as e:
+                        if is_fatal(e):
+                            raise
+                        log.debug("Remote cache lookup failed for %s: %s", qname, e)
 
-            # Cache miss — build the prompt with the full body, count its
-            # tokens, then call the model.
-            prompt = build_analysis_prompt(batch_dicts)
-            prompt_tokens = _count_tokens(prompt) if token_counts else None
-            if prompt_tokens is None or prompt_tokens + _ANSWER_TOKENS <= run_ctx:
-                try:
-                    total += _ask_model(idx, qname, d, h, prompt, run_ctx, t0)
+                if cached:
+                    # Cache hit — re-use existing analysis
+                    with write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext():
+                        with transaction(conn, checkpoint=False):
+                            upsert_llm_analysis_batch(
+                                conn,
+                                [
+                                    (
+                                        d["id"],
+                                        cached["summary"],
+                                        cached["inputs"],
+                                        cached["outputs"],
+                                        cached["model"],
+                                        h,
+                                    )
+                                ],
+                            )
+                    total += 1
+                    elapsed = time.monotonic() - t0
+                    log.info("[%d/%d] %s: ok %s", idx + 1, total_symbols, qname, _fmt_dur(elapsed))
                     continue
-                except OllamaPromptTooLong as e:
-                    prompt_tokens = e.prompt_tokens
-            long_prompts.append(_LongPrompt(idx, qname, d, h, prompt, prompt_tokens))
-            log.info("[%d/%d] %s: later (prompt %d tokens, context %d)",
-                     idx + 1, total_symbols, qname, prompt_tokens, run_ctx)
-        except LLMStopRun as e:
-            # Each next symbol fails the same way: the analysis stops, the
-            # stored analyses stay, and a later run continues.
-            log.error("LLM analysis stopped at %d/%d: %s", idx + 1, total_symbols, e)
-            stopped = True
-            break
-        except SAFE_EXCEPT as e:
-            failed += 1
-            elapsed = time.monotonic() - t0
-            log.warning("[%d/%d] %s: err %s: %s", idx + 1, total_symbols, qname, _fmt_dur(elapsed), e)
-            continue
 
-    # ── Second pass: the prompts that do not fit the context of the run ──
-    if stopped:
-        long_prompts = []
-    too_large: list[_LongPrompt] = []
-    fitting: list[_LongPrompt] = []
-    for p in long_prompts:
-        (too_large if p.prompt_tokens + _ANSWER_TOKENS > largest_ctx else fitting).append(p)
-    for p in too_large:
-        with write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext():
-            with transaction(conn, checkpoint=False):
-                upsert_llm_analysis_batch(
-                    conn, [(p.symbol["id"], "", "", "", f"skip:toolarge:{largest_ctx}", p.content_hash)],
-                )
-        total += 1
-        log.warning("[%d/%d] %s: skip (prompt %d tokens, the model has a context of %d)",
-                    p.position + 1, total_symbols, p.qname, p.prompt_tokens, largest_ctx)
-    fitting.sort(key=lambda p: p.prompt_tokens)
-    if fitting:
-        long_ctx = fitting[-1].prompt_tokens + _ANSWER_TOKENS
-        log.info("LLM analysis: %d symbols with a long prompt, context %d tokens", len(fitting), long_ctx)
-        for p in fitting:
-            t0 = time.monotonic()
-            try:
-                total += _ask_model(p.position, p.qname, p.symbol, p.content_hash, p.prompt, long_ctx, t0)
+                # Cache miss — build the prompt with the full body, count its
+                # tokens, then call the model.
+                prompt = build_analysis_prompt(batch_dicts)
+                prompt_tokens = _count_tokens(prompt) if token_counts else None
+                if prompt_tokens is None or prompt_tokens + _ANSWER_TOKENS <= run_ctx:
+                    try:
+                        total += _ask_model(idx, qname, d, h, prompt, run_ctx, t0)
+                        continue
+                    except OllamaPromptTooLong as e:
+                        prompt_tokens = e.prompt_tokens
+                long_prompts.append(_LongPrompt(idx, qname, d, h, prompt, prompt_tokens))
+                log.info("[%d/%d] %s: later (prompt %d tokens, context %d)",
+                         idx + 1, total_symbols, qname, prompt_tokens, run_ctx)
             except LLMStopRun as e:
-                log.error("LLM analysis stopped: %s", e)
+                # Each next symbol fails the same way: the analysis stops, the
+                # stored analyses stay, and a later run continues.
+                log.error("LLM analysis stopped at %d/%d: %s", idx + 1, total_symbols, e)
                 stopped = True
                 break
             except SAFE_EXCEPT as e:
-                if is_fatal(e):
-                    raise
                 failed += 1
-                log.warning("[%d/%d] %s: err %s: %s", p.position + 1, total_symbols, p.qname,
-                            _fmt_dur(time.monotonic() - t0), e)
+                elapsed = time.monotonic() - t0
+                log.warning("[%d/%d] %s: err %s: %s", idx + 1, total_symbols, qname, _fmt_dur(elapsed), e)
+                continue
 
+        # ── Second pass: the prompts that do not fit the context of the run ──
+        if stopped:
+            long_prompts = []
+        too_large: list[_LongPrompt] = []
+        fitting: list[_LongPrompt] = []
+        for p in long_prompts:
+            (too_large if p.prompt_tokens + _ANSWER_TOKENS > largest_ctx else fitting).append(p)
+        for p in too_large:
+            with write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext():
+                with transaction(conn, checkpoint=False):
+                    upsert_llm_analysis_batch(
+                        conn, [(p.symbol["id"], "", "", "", f"skip:toolarge:{largest_ctx}", p.content_hash)],
+                    )
+            total += 1
+            log.warning("[%d/%d] %s: skip (prompt %d tokens, the model has a context of %d)",
+                        p.position + 1, total_symbols, p.qname, p.prompt_tokens, largest_ctx)
+        fitting.sort(key=lambda p: p.prompt_tokens)
+        if fitting:
+            long_ctx = fitting[-1].prompt_tokens + _ANSWER_TOKENS
+            log.info("LLM analysis: %d symbols with a long prompt, context %d tokens", len(fitting), long_ctx)
+            for p in fitting:
+                t0 = time.monotonic()
+                try:
+                    total += _ask_model(p.position, p.qname, p.symbol, p.content_hash, p.prompt, long_ctx, t0)
+                except LLMStopRun as e:
+                    log.error("LLM analysis stopped: %s", e)
+                    stopped = True
+                    break
+                except SAFE_EXCEPT as e:
+                    if is_fatal(e):
+                        raise
+                    failed += 1
+                    log.warning("[%d/%d] %s: err %s: %s", p.position + 1, total_symbols, p.qname,
+                                _fmt_dur(time.monotonic() - t0), e)
+    finally:
+        if spent.requests:
+            log.info("LLM usage: %s", spent.line(time.monotonic() - run_started))
     try:
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         log.info("LLM analysis stored: %d/%d symbols (model=%s)", total, total_symbols, model)

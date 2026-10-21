@@ -225,8 +225,10 @@ def cmd_db_stats(args: argparse.Namespace) -> int:
     print(f"  Skipped:        {proj.get('skipped', 0)} project, {vend.get('skipped', 0)} vendor")
     print(f"  analyze_vendor: {analysis.get('analyze_vendor', False)}")
     print(f"  Complete:       {analysis.get('complete', False)}")
-    if analysis.get("model"):
-        print(f"  Model:          {analysis['model']}")
+    models = analysis.get("models") or {}
+    if models:
+        # Each model: the analyses of one build can come from more profiles (--llm).
+        print(f"  Models:         {', '.join(f'{name} ({n})' for name, n in models.items())}")
     print(f"Embeddings:     {stats['embedding_count']} symbols with embeddings")
     print(f"Files:          {stats['file_count']}")
     print(f"References:     {stats['reference_count']}")

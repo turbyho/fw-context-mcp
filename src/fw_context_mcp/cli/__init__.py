@@ -206,6 +206,11 @@ def main() -> None:
     )
     p_index.add_argument("--no-analyze", action="store_true", dest="no_analyze", help="Skip LLM analysis generation")
     p_index.add_argument(
+        "--llm", metavar="PROFILE",
+        help="The LLM profile of the analysis of this run (default: the profile of the project; on a terminal "
+             "with two profiles or more, a question at the start)",
+    )
+    p_index.add_argument(
         "--analyze-vendor", action="store_true", dest="analyze_vendor", default=False,
         help="Also analyze vendor/SDK code (mbed-os, Zephyr, etc.)",
     )
@@ -382,6 +387,11 @@ def main() -> None:
     p_export.set_defaults(func=cmd_export)
 
     p_analyze = sub.add_parser("analyze", help="Re-run LLM symbol analysis on existing index (idempotent)")
+    p_analyze.add_argument(
+        "--llm", metavar="PROFILE",
+        help="The LLM profile of the analysis of this run (default: the profile of the project; on a terminal "
+             "with two profiles or more, a question at the start)",
+    )
     p_analyze.add_argument("-v", "--verbose", action="store_true")
     p_analyze.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
     p_analyze.add_argument(
