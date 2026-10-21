@@ -505,10 +505,12 @@ to keep the current value.
 then shows a menu. The backend keys are `enabled`, `profile`,
 `embed_profile` and `embed_model` of `[llm]`. The menu has these options:
 
-- Option 1 (local Ollama) writes the chat model to an Ollama profile of
-  the global config: the selected profile when it is an Ollama profile,
-  else the profile `local`. `.fw-context/local.toml` then selects the
-  profile, and gets the embedding model.
+- Option 1 (local Ollama) writes the chat model to the Ollama profile of
+  this machine (see
+  [One Ollama profile for each machine](configuration.md#one-ollama-profile-for-each-machine)).
+  `.fw-context/local.toml` selects the profile when it is not the global
+  default. The embedding model goes to the global config, or after a
+  "no" to `.fw-context/local.toml` of this project only.
 - Option 2 (LLM services) runs the setup of
   [`fw-context llm setup`](#fw-context-llm-setup-list-test-default-remove-recommend):
   the list of the services, their profiles, a test of each new profile,
@@ -904,6 +906,11 @@ without `config` does not repair the config files.
 - `chat-model` — the chat model is installed on the Ollama server of the
   chat calls. `skipped` when an OpenAI-compatible API runs the chat model.
 - `embed-model` — the embedding model is installed on the Ollama server.
+- `llm-profile` — the project uses the Ollama profile of this machine and
+  the global embedding model (see
+  [One Ollama profile for each machine](configuration.md#one-ollama-profile-for-each-machine)).
+  Not critical. `--fix` makes `.fw-context/local.toml` select the Ollama
+  profile of this machine; the other findings are only reported.
 - `llm-recommend` — no local model of the list is better than the chat
   model and the embedding model of the config (see
   [The recommendation of a model](configuration.md#the-recommendation-of-a-model)).
@@ -1055,6 +1062,7 @@ fw-context llm list                      # each profile, its host, what it needs
 fw-context llm test <profile>            # a request without code
 fw-context llm default <profile>         # the profile of this project (local.toml)
 fw-context llm default <profile> --global  # the profile of each project that selects none
+fw-context llm default <profile> --ollama  # the Ollama profile of this machine
 fw-context llm remove <profile>          # the profile, its own key, its ChatGPT sign-in
 fw-context llm recommend [--again]       # measure the local models, recommend a chat and an embedding model
 ```
@@ -1067,7 +1075,10 @@ fw-context llm recommend [--again]       # measure the local models, recommend a
   without a key or a sign-in.
 - `default` without `--global` writes `[llm] profile` to
   `.fw-context/local.toml` and sends a test request; a failed test puts
-  the old file back.
+  the old file back. It refuses an Ollama profile that is not the Ollama
+  profile of this machine (use `--llm` for one run). `--global` with an
+  Ollama profile also makes it the Ollama profile of this machine;
+  `--ollama` does only that.
 - `recommend` prints a table of the chat models and of the embedding
   models of the list: the quality, the measured speed or the estimate,
   and the recommended model (see
@@ -3491,8 +3502,11 @@ Output: {"status": "ok", "profile": "deepseek", "provider": "openai_compatible",
 
 `profile` must name a profile of the global config
 (`[llm.profiles.<name>]` in `~/.fw-context/config.toml`). An unknown name
-returns `status: "error"`, and the message lists the profiles. The tool
-takes no URL, no API key and no model. An API key must not pass through
+returns `status: "error"`, and the message lists the profiles. An Ollama
+profile that is not the Ollama profile of this machine also returns
+`status: "error"` (see
+[One Ollama profile for each machine](configuration.md#one-ollama-profile-for-each-machine)).
+The tool takes no URL, no API key and no model. An API key must not pass through
 the conversation of the LLM client, and a tool call must not send the
 source code to a host that it selects. The operator adds a profile with
 `fw-context init` (see [`fw-context init`](#fw-context-init)), or with a

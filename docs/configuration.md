@@ -35,7 +35,7 @@ The LLM step of `fw-context init` tells which file selects the LLM backend. The 
 
 Option 3 "Disable the LLM analysis" writes `[llm] analyze_symbols = false` to `local.toml`. The embeddings and the chat of `smart_search` stay. To turn off the embeddings too, set `[llm] enabled = false`.
 
-Option 1 (local Ollama) writes the chat model to an Ollama profile of the global config. This is the selected profile when it is an Ollama profile, else the profile `local`. The other keys of that profile stay. Then `local.toml` selects the profile with `[llm] profile`, and gets the embedding model in `[llm] embed_model`. The prompts of option 1 give the models that a config file sets as the defaults, thus Enter keeps them. Without such a file, the defaults are the recommended models. The chat model of an `openai_compatible` profile is not a default, because it is not a model of Ollama.
+Option 1 (local Ollama) writes the chat model to the Ollama profile of this machine (see [One Ollama profile for each machine](#one-ollama-profile-for-each-machine)): that profile when it is of the local Ollama, else the profile `local`. The other keys of that profile stay. The profile is shared: when it has another model, the step asks before it changes it, and "no" keeps its model. When the Ollama profile of this machine is of another computer, the step asks to make `local` the new one, and "no" stops it. `local.toml` selects the profile with `[llm] profile` only when the file below it (`config.toml`, else the global config) does not select it. A profile `local` of an API or of another computer is never changed: the step writes `local-2`. The embedding model goes to the global config, after a question when it is not the global one; "no" writes it to `local.toml` of this project only. When `config.toml` sets another embedding model, the model goes to `local.toml`. The prompts of option 1 give the models that a config file sets as the defaults, thus Enter keeps them. Without such a file, the defaults are the recommended models. The chat model of an `openai_compatible` profile is not a default, because it is not a model of Ollama.
 
 Option 1 then sends a test request to the profile. When the test fails, `local.toml` and the global config get their old text back.
 
@@ -46,9 +46,9 @@ The setup of the LLM services (option 2, and `fw-context llm setup`) does these 
 3. For each selected service, it asks for the values: the model (with a recommendation), the API key (without an echo, into the key store; for OpenRouter and DeepSeek the key of the provider, `provider:<name>`), or the ChatGPT sign-in in the browser. It writes a profile to the global config, and asks before it replaces a profile of the same name.
 4. It sends a request without code through each new profile. When a profile does not answer and you do not keep it, the global config gets its earlier text back: a profile that it replaced comes back with its earlier values. A key or a ChatGPT sign-in that no profile uses then goes.
 5. It asks for profiles to remove, with a question for each. The removal also removes the own key of the profile and the ChatGPT sign-in.
-6. In a project, it asks for the profile of the project: a profile that can run, the global default, or no LLM analysis. A profile without a key or a sign-in is listed with the command that repairs it. When `config.toml` (in git) selects a profile, the global default is not offered, because `local.toml` cannot remove that selection. A selection of a profile or of the global default turns the LLM analysis on again when `local.toml` turned it off.
+6. In a project, it asks for the profile of the project: a profile that can run, the global default, or no LLM analysis. Of the Ollama profiles, it offers only the Ollama profile of this machine. A profile without a key or a sign-in is listed with the command that repairs it. When `config.toml` (in git) selects a profile, the global default is not offered, because `local.toml` cannot remove that selection. A selection of a profile or of the global default turns the LLM analysis on again when `local.toml` turned it off.
 
-The local Ollama service writes the profile of the Ollama of this machine: the selected profile only when it is such a profile, else `local`. The setup does not ask for the embedding model: it belongs to the project (option 1 of the LLM step of `init`). Ctrl-C stops the setup; it does not answer the question with its default.
+The local Ollama service writes the Ollama profile of this machine, as option 1 of the LLM step of `init` does. The setup does not ask for the embedding model (option 1 of the LLM step of `init` does). Ctrl-C stops the setup; it does not answer the question with its default.
 
 The recommended local models come from the list of the models and the speed of each model on this machine (see [The recommendation of a model](#the-recommendation-of-a-model)). The setup shows a table of the models, and asks before it measures the installed models. You select the model.
 
@@ -213,6 +213,7 @@ The LLM backend is a named **profile**: a table `[llm.profiles.<name>]`. A profi
 
 - The global config gives the default profile of each project.
 - `config.toml` or `local.toml` of a project selects a different profile. The last file wins.
+- A project selects an external profile (an API, the ChatGPT plan, a cloud model of Ollama) or the Ollama profile of this machine. See [One Ollama profile for each machine](#one-ollama-profile-for-each-machine).
 
 WHY the profiles are in the global config only: a profile names the server that gets the source code. A `config.toml` in git thus cannot send the source code to a host that the repository selects. It can only select a profile of the user. A table `[llm.profiles]` in a project file is an error.
 
@@ -226,8 +227,9 @@ Put the other `[llm]` keys in `~/.fw-context/config.toml` for global defaults, o
 |-----|---------|-------|-------------|
 | `enabled` | `true` | global, local | Enable the LLM and the Ollama calls. When this key is `false`, `smart_search` falls back to word-split FTS5. Also, `explain_symbol` returns the source code and a prompt for the AI assistant. `fw-context index` then skips the embeddings and the symbol analysis, also for a sentence-transformers `embed_model`. To keep the embeddings and skip only the analysis, set `analyze_symbols = false`. |
 | `profile` | *(the only profile)* | global, project, local | The name of the LLM profile of the chat (analysis, `smart_search`, `explain_symbol`). It must name a profile of the global config. |
+| `ollama_profile` | *(see description)* | global | The Ollama profile of this machine: the profile of each project that uses Ollama. Without this key: the global `profile` when it is an Ollama profile, else the only Ollama profile. See [One Ollama profile for each machine](#one-ollama-profile-for-each-machine). |
 | `embed_profile` | *(see description)* | global, project, local | The name of the Ollama profile whose `url` is the server of the embeddings. When the selected profile is an `openai_compatible` profile, fw-context also uses `keep_alive`, `auto_pull` and `max_concurrent` of this profile. Without this key, the embeddings use the server of the selected profile when it is an Ollama profile, else `http://localhost:11434`. A profile with a different provider is an error. |
-| `embed_model` | `""` *(auto-detect)* | global, local | The embedding model for vector search. Empty: fw-context selects `qwen3-embedding:8b` on a machine with a GPU (about 5.7 GB of VRAM, 4096-dimension vectors), and `qwen3-embedding:0.6b` without one (about 1.2 GB of VRAM, 1024 dimensions). Measured 2026-10-21 on the search of firmware symbols: `qwen3-embedding:4b` (about 3.4 GB of VRAM, 2560 dimensions) has the same quality as 8b, thus the setup of `fw-context init` recommends it; `mxbai-embed-large` and `nomic-embed-text` are weaker for a query in natural language. A change of the model embeds the index again at the next index run, and until then the search by meaning finds nothing. A name with the prefix `BAAI/`, `ibm-granite/`, `lightonai/`, `cross-encoder/` or `sentence-transformers/` uses sentence-transformers (requires the `st` extra); `ft://` selects a fine-tuned local model; any other name is an Ollama model. When the selected Ollama profile sets `auto_pull = true`, fw-context pulls an Ollama model automatically on first use; otherwise pull it manually. A change of model invalidates the stored embeddings. |
+| `embed_model` | `""` *(auto-detect)* | global, local | The embedding model for vector search. Empty: fw-context selects `qwen3-embedding:8b` on a machine with a GPU (about 5.7 GB of VRAM, 4096-dimension vectors), and `qwen3-embedding:0.6b` without one (about 1.2 GB of VRAM, 1024 dimensions). Measured 2026-10-21 on the search of firmware symbols: `qwen3-embedding:4b` (about 3.4 GB of VRAM, 2560 dimensions) has the same quality as 8b, thus the setup of `fw-context init` recommends it; `mxbai-embed-large` and `nomic-embed-text` are weaker for a query in natural language. A change of the model embeds the index again at the next index run, and until then the search by meaning finds nothing. A name with the prefix `BAAI/`, `ibm-granite/`, `lightonai/`, `cross-encoder/` or `sentence-transformers/` uses sentence-transformers (requires the `st` extra); `ft://` selects a fine-tuned local model; any other name is an Ollama model. When the selected Ollama profile sets `auto_pull = true`, fw-context pulls an Ollama model automatically on first use; otherwise pull it manually. A change of model invalidates the stored embeddings. The setup writes the model to the global config. A project file sets another model for one project, for example to keep an index of that model; `fw-context doctor` reports the difference (the check `llm-profile`). |
 | `embed_query_prompt` | *(auto-detect)* | global, local | An instruction that fw-context adds before the query text, before it creates the embedding. fw-context detects this instruction automatically from the model name prefix: for `mxbai-*`, fw-context uses `"Represent this sentence for searching relevant passages: "`; for `nomic-embed-text*`, `"search_query: "`; for `qwen3-embedding*`, fw-context uses a code-retrieval instruction in the format of the model (`"Instruct: <task>\nQuery:"`). The instruction goes before the query with no separator, thus it must end as the model expects. fw-context replaces the instruction of older releases (`"Retrieve C/C++ functions, …"` without `Instruct:`) for `qwen3-embedding*`: in that form the search found the right symbol much less often. Set this key explicitly to override the default, or set it to `""` to disable it. A query instruction needs no new embeddings. |
 | `embed_dim` | *(none)* | global, local | The dimension of the stored vectors, for a sentence-transformers or `ft://` model with Matryoshka training. When the value is smaller than the dimension of the model, fw-context cuts each vector to this size and normalizes it again. An Ollama model ignores this key. A negative value means "not set". For a sentence-transformers or `ft://` model, the next `fw-context index` after a change of this key computes each stored embedding again. |
 | `embed_doc_prompt` | *(auto-detect)* | global, local | An instruction that fw-context adds before symbol descriptions during indexing. For `nomic-embed-text*`, fw-context uses `"search_document: "`, as its model card asks; for each other model, none. A change of this value embeds the index again at the next index run. Set it to `""` to disable it. |
@@ -262,6 +264,7 @@ A key that the provider of the profile does not know is an error, because a typo
 # ~/.fw-context/config.toml
 [llm]
 profile = "local"                  # the default profile of each project
+ollama_profile = "local"           # the Ollama profile of this machine
 
 [llm.profiles.local]
 provider = "ollama"
@@ -269,21 +272,36 @@ url = "http://localhost:11434"
 model = "qwen2.5-coder:14b"
 num_ctx = 16384
 
-[llm.profiles.gpu-box]             # an Ollama server on a different machine
+[llm.profiles.gpu-box]             # an Ollama server on a different machine: for one run (--llm gpu-box)
 provider = "ollama"
 url = "http://192.168.1.50:11434"
 model = "qwen2.5-coder:32b"
+
+[llm.profiles.deepseek]            # an external API
+provider = "deepseek"
+model = "deepseek-v4-flash"
 ```
 
 ```toml
 # <project>/.fw-context/local.toml
 [llm]
-profile = "gpu-box"
+profile = "deepseek"
 ```
+
+#### One Ollama profile for each machine
+
+The projects of a machine share one Ollama profile: one chat model, one `num_ctx`, and thus one context of the calibration. WHY: the background runs of the projects overlap, a change of the model or of the context loads the model again (3 to 10 seconds), and two models at the same time share the GPU memory. An external profile (an API, the ChatGPT plan, a cloud model of Ollama) shares no memory of this machine, thus each project selects its own. An Ollama server on another computer counts as Ollama: it shares the memory of that server.
+
+- `[llm] ollama_profile` of the global config names the Ollama profile of this machine. Without it, the global `profile` is that profile when it is an Ollama profile, else the only Ollama profile.
+- A project selects the Ollama profile of this machine or an external profile. `fw-context llm default`, the MCP tool `configure_llm` and the setup do not let a project select another Ollama profile. For one run, `--llm <profile>` selects any profile.
+- `fw-context llm default <profile> --ollama` makes a profile the Ollama profile of this machine. `--global` with an Ollama profile makes it the default of each project and the Ollama profile of this machine.
+- A project of an older release can still select another Ollama profile: fw-context loads it. `fw-context doctor` reports it (the check `llm-profile`). When `local.toml` selects it, `fw-context doctor --fix` makes `local.toml` select the Ollama profile of this machine. It removes the key only when the file below `local.toml` selects that profile too: `config.toml` of the project, else the global default. Thus the fix never lets an external profile apply, because the source code would then go out. The fix also never moves a project from the Ollama of this machine to the Ollama of another computer: the check only reports it. A selection of `config.toml` (in git) is only reported.
+- The check also reports several Ollama profiles without `ollama_profile`, a global default that is another Ollama profile, and a project whose `embed_model` is not the global one. It does not change the embedding model: a new model embeds each symbol again at the next index run.
+- A cloud model of Ollama is known from the model list of the local Ollama (`remote_host`). While the local Ollama gives no list (it does not run), a cloud model looks like a model of this machine. Then the check, `fw-context llm default` and `configure_llm` decide nothing about an Ollama profile: start Ollama, and repeat. An external profile of an API or of the ChatGPT plan needs no list.
 
 #### `[llm.models]` and `[llm.embed_models]` — the list of the models of Ollama
 
-The global config holds a list of the models of Ollama that fw-context knows: `[llm.models."<tag>"]` for the LLM analysis, and `[llm.embed_models."<tag>"]` for the embeddings. `fw-context init` and `fw-context doctor --fix` write it, and you can change it. The list gives no setting to a run: a later release uses it to recommend a model.
+The global config holds a list of the models of Ollama that fw-context knows: `[llm.models."<tag>"]` for the LLM analysis, and `[llm.embed_models."<tag>"]` for the embeddings. `fw-context init` and `fw-context doctor --fix` write it, and you can change it. The list gives no setting to a run: fw-context uses it to recommend a model (see [The recommendation of a model](#the-recommendation-of-a-model)).
 
 ```toml
 [llm.models."gemma4:26b"]
@@ -573,7 +591,7 @@ The error tells where the key goes. These commands convert the keys to LLM profi
 The conversion makes these changes:
 
 - **The global config.** Its old keys become a profile, and `[llm] profile` selects it when the key is not set. The name of a new profile is `local` for an Ollama server on this machine, `remote` for an Ollama server on a different machine, and `api` for an OpenAI-compatible API. When the name is in use, the conversion adds `-2`, `-3` and so on. When a profile with the same values exists, the conversion uses that profile.
-- **A project.** The old keys of `config.toml` and `local.toml` apply over the profile that the project selects. For example, a project with only `num_ctx` keeps the API and the embeddings server of the global config. When the result is the same profile, the conversion removes the keys. Else it adds a new profile to the global config, with the name of the project directory, and `local.toml` selects it. When `local.toml` is missing, the conversion makes it. Before it adds a profile, the conversion sets `[llm] profile` of the global config when it is not set: else `load` selects the only profile for each project. A global config without a profile gets the profile `local` (Ollama on this machine), the backend of the old defaults. A global config that is missing is made from the template first. The new profile is a copy: a later change of the profile below it does not change the project.
+- **A project.** The old keys of `config.toml` and `local.toml` apply over the profile that the project selects. For example, a project with only `num_ctx` keeps the API and the embeddings server of the global config. When the result is the same profile, the conversion removes the keys. Else it adds a new profile to the global config, with the name of the project directory, and `local.toml` selects it. For an Ollama profile, `fw-context doctor` then reports that the project does not use the Ollama profile of this machine. When `local.toml` is missing, the conversion makes it. Before it adds a profile, the conversion sets `[llm] profile` of the global config when it is not set: else `load` selects the only profile for each project. A global config without a profile gets the profile `local` (Ollama on this machine), the backend of the old defaults. A global config that is missing is made from the template first. The new profile is a copy: a later change of the profile below it does not change the project.
 - **The embeddings.** When the old keys send the embeddings to a server that the chat profile does not give them, the conversion also adds an Ollama profile `embeddings` with the URL of `ollama_url`. With a chat on an API, the profile also gets `keep_alive`, `auto_pull` and `ollama_max_concurrent` (as `max_concurrent`). `[llm] embed_profile` selects it, in the file of the old keys: the global config, or `local.toml` of the project.
 - **The comments.** The conversion removes the commented lines of the old templates from `[llm]`, for example `# ollama_url = ...`. `local.toml` of a project gets a commented `profile` line when the conversion changes the file for a different reason. `config.toml` gets no new line.
 
