@@ -182,7 +182,7 @@ profile = "local"
 # embed_model = "qwen3-embedding:8b"
 #
 # ── Custom query/doc prompts (auto-detected per model, override if needed) ──
-# embed_query_prompt = "Retrieve C/C++ functions, types, symbols, and implementation code relevant to the query."
+# embed_query_prompt = "Instruct: Retrieve C/C++ functions, types, symbols, and implementation code relevant to the query.\\nQuery:"
 # embed_doc_prompt = ""
 
 analyze_symbols = true
@@ -374,7 +374,7 @@ _PROJECT_LOCAL_DEFAULTS_TEMPLATE = """\
 # embed_model = "qwen3-embedding:8b"
 #
 # ── Custom query/doc prompts (auto-detected per model, override if needed) ──
-# embed_query_prompt = "Retrieve C/C++ functions, types, symbols, and implementation code relevant to the query."
+# embed_query_prompt = "Instruct: Retrieve C/C++ functions, types, symbols, and implementation code relevant to the query.\\nQuery:"
 # embed_doc_prompt = ""
 # analyze_symbols = true    # generate structured symbol descriptions (summary, inputs, outputs) — enabled by default
 # analyze_vendor = false    # when true, also analyze vendor/SDK code (mbed-os, Zephyr, etc.) — can add hours
@@ -414,13 +414,11 @@ class LLMConfig:
             ``qwen3-embedding:8b``, CPU-only → ``qwen3-embedding:0.6b``.
             Set explicitly to override (see config template for options).
         embed_query_prompt: Instruction prepended to query text before embedding.
-            Auto-detected from model prefix when empty.  ``qwen3-embedding*`` uses
-            a code-specific retrieval instruction, ``mxbai-*`` and ``ibm-granite/*``
-            use ``"Represent this sentence for searching relevant passages: "``.
-            Set explicitly in TOML to override or disable (empty string).
+            None (no config sets it): the default of the model
+            (``_apply_embed_prompt_defaults``).  ``""``: no instruction.
         embed_doc_prompt: Instruction prepended to symbol descriptions during
-            indexing.  Most models work best with an empty doc prompt — only
-            set when the model's training expects a per-document instruction.
+            indexing.  None: the default of the model (``"search_document: "``
+            for ``nomic-embed-text*``, else none).  ``""``: no instruction.
         embed_dim: Override output embedding dimension for Matryoshka models.
             When set and smaller than the model's native dimension, vectors
             are truncated to this size and re-normalized.  E.g. set to 128
@@ -476,8 +474,8 @@ class LLMConfig:
     ollama_url: str = "http://localhost:11434"
     model: str = "qwen2.5-coder:14b"
     embed_model: str = ""  # empty = auto-detect (GPU → qwen3:8b, CPU → qwen3:0.6b)
-    embed_query_prompt: str = ""
-    embed_doc_prompt: str = ""
+    embed_query_prompt: str | None = None  # None: the default of the model; "": no instruction
+    embed_doc_prompt: str | None = None
     embed_dim: int | None = None
     num_ctx: int = 16384
     timeout: float = 600.0
@@ -513,36 +511,63 @@ class LLMConfig:
         return f"{model}:{DESCRIPTION_VERSION}"
 
 
-def _apply_embed_prompt_defaults(llm_cfg: LLMConfig) -> None:
-    """Set embed prompt defaults based on model prefix when the field is empty.
+#: The task of a query of qwen3-embedding.
+_QWEN3_TASK = "Retrieve C/C++ functions, types, symbols, and implementation code relevant to the query."
+#: The instruction of a query of qwen3-embedding in the format of the model
+#: card (huggingface.co/Qwen/Qwen3-Embedding-0.6B): "Instruct: {task}\nQuery:{query}".
+#: A document gets no instruction.  WHY the format: older releases sent the
+#: task and the query with no separator ("...the query.write a buffer...").
+#: Measured 2026-10-21 on 748 queries of 6 projects (plans/eval/
+#: embed-models-2026-10-21): MRR@10 of qwen3-embedding:8b 0.432 with the old
+#: form, 0.682 with this one, 0.599 with no instruction.
+_QWEN3_QUERY_PROMPT = f"Instruct: {_QWEN3_TASK}\nQuery:"
+#: The default of older releases (see _QWEN3_QUERY_PROMPT).
+_OLD_QWEN3_QUERY_PROMPT = _QWEN3_TASK
+#: The task prefixes of nomic-embed-text (its model card: a query and a
+#: document each get one).  Measured 2026-10-21 (plans/eval/
+#: embed-models-2026-10-21): MRR@10 0.522 without them, 0.591 with them.  A
+#: document prefix is in the content hash (``Embedder.document_settings``),
+#: thus an index of nomic-embed-text embeds again one time.
+_NOMIC_QUERY_PREFIX = "search_query: "
+_NOMIC_DOCUMENT_PREFIX = "search_document: "
 
-    Called by ``_from_dict`` after loading TOML — only fills defaults when
-    the user hasn't explicitly configured a prompt value.
+
+def _apply_embed_prompt_defaults(llm_cfg: LLMConfig) -> None:
+    """Give each prompt that no config sets (None) the default of the embedding model.
+
+    Called by ``_from_dict`` after loading TOML, and again by ``auto_model``
+    when it selects the model.  ``""`` is a choice of the user (no
+    instruction) and stays.  WHY None and not ``""`` for "not set": with
+    ``""`` as both, a user could not turn a default off, also not the
+    document prefix of nomic-embed-text, whose change embeds the index again.
+    Without a model, the prompts stay None: the model comes later.
 
     **Why per-model prompts?**  Embedding models are trained with specific
-    instruction formats.  ``qwen3-embedding`` models expect a task
-    description prepended to the query (e.g. "Retrieve C/C++ functions…").
-    ``mxbai`` and ``ibm-granite`` models use the standard "Represent this
-    sentence…" format.  Using the wrong format reduces retrieval quality
-    by 10-15% MTEB score — auto-detection prevents silent degradation.
+    instruction formats: ``qwen3-embedding`` a task in the format of
+    ``_QWEN3_QUERY_PROMPT``, ``mxbai`` and ``ibm-granite`` "Represent this
+    sentence…", ``nomic-embed-text`` the task prefixes.  The wrong format
+    costs much retrieval quality (measured 2026-10-21, see the constants).
     """
     model_lower = llm_cfg.embed_model.lower()
-    if llm_cfg.embed_query_prompt == "":
+    if not model_lower:
+        return
+    if model_lower.startswith("qwen3-embedding") and llm_cfg.embed_query_prompt == _OLD_QWEN3_QUERY_PROMPT:
+        # The old default of fw-context, also when a config holds it: the
+        # template of older releases showed it.  It is the task without the
+        # format of the model, thus the new default replaces it.
+        llm_cfg.embed_query_prompt = _QWEN3_QUERY_PROMPT
+    if llm_cfg.embed_query_prompt is None:
         if model_lower.startswith("qwen3-embedding"):
-            llm_cfg.embed_query_prompt = (
-                "Retrieve C/C++ functions, types, symbols, and implementation code relevant to the query."
-            )
-        elif model_lower.startswith("mxbai"):
+            llm_cfg.embed_query_prompt = _QWEN3_QUERY_PROMPT
+        elif model_lower.startswith(("mxbai", "ibm-granite")):
             llm_cfg.embed_query_prompt = "Represent this sentence for searching relevant passages: "
-        elif model_lower.startswith("ibm-granite"):
-            llm_cfg.embed_query_prompt = "Represent this sentence for searching relevant passages: "
-    if llm_cfg.embed_doc_prompt == "":
-        if model_lower.startswith("qwen3-embedding"):
-            llm_cfg.embed_doc_prompt = ""
-        elif model_lower.startswith("mxbai"):
-            llm_cfg.embed_doc_prompt = ""
-        elif model_lower.startswith("ibm-granite"):
-            llm_cfg.embed_doc_prompt = ""
+        elif model_lower.startswith("nomic-embed-text"):
+            # Not nomic-embed-code: its model card gives other prefixes.
+            llm_cfg.embed_query_prompt = _NOMIC_QUERY_PREFIX
+        else:
+            llm_cfg.embed_query_prompt = ""
+    if llm_cfg.embed_doc_prompt is None:
+        llm_cfg.embed_doc_prompt = _NOMIC_DOCUMENT_PREFIX if model_lower.startswith("nomic-embed-text") else ""
 
 
 @dataclass
