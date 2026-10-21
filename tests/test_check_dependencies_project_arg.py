@@ -10,6 +10,8 @@ from __future__ import annotations
 import shlex
 from pathlib import Path
 
+import pytest
+
 import fw_context_mcp.config.settings as settings
 
 
@@ -47,3 +49,11 @@ def test_the_quotes_of_powershell(monkeypatch):
     monkeypatch.setattr(sys, "platform", "win32")
 
     assert _with_project("fw-context doctor --fix", Path("C:/a b/o'k")) == "fw-context doctor --fix --project 'C:/a b/o''k'"
+
+
+@pytest.fixture(autouse=True)
+def _no_cloud_model_list(monkeypatch):
+    """No request to the Ollama of the operator: the rule of the Ollama profiles asks for the cloud models."""
+    from fw_context_mcp.llm import _diag
+
+    monkeypatch.setattr(_diag, "remote_hosts", lambda url: {})

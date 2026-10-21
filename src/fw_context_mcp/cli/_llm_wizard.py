@@ -31,6 +31,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..llm.profile_state import cloud_hosts
 from . import _init_interactive as ui
 
 #: The prompt of a test request: no source code, a short answer.
@@ -129,25 +130,6 @@ def _profiles() -> dict[str, dict]:
     return {name: profile for name, profile in profiles.items() if isinstance(profile, dict)}
 
 
-def cloud_hosts(profiles: dict[str, dict]) -> dict[str, dict[str, str]]:
-    """Return ``{server URL: {model: host}}`` of the cloud models of each loopback Ollama server.
-
-    The local Ollama is always asked; each other loopback server of an
-    Ollama profile too.  WHY each server: a cloud model is a model of the
-    server that the profile names, not of the server of the embeddings.
-    """
-    from ..config.settings import _DEFAULT_OLLAMA_URL, _is_loopback_url
-    from ..llm._diag import remote_hosts
-
-    urls = {local_url().rstrip("/")}
-    for profile in profiles.values():
-        if profile.get("provider") == "ollama":
-            url = str(profile.get("url") or _DEFAULT_OLLAMA_URL).rstrip("/")
-            if _is_loopback_url(url):
-                urls.add(url)
-    return {url: remote_hosts(url) or {} for url in sorted(urls)}
-
-
 def service_of(profile: dict, cloud: dict[str, dict[str, str]]) -> str:
     """Return the key of the service of *profile* (``SERVICES``)."""
     from ..config.settings import _DEFAULT_OLLAMA_URL, _is_loopback_url
@@ -231,7 +213,12 @@ def _setup_local(project_root: Path | None, cfg, cloud: dict[str, str]) -> str |
     if found is None:
         return None
     name, values, _embed = found
-    return _write_profile(name, values)
+    # asked: _local_ollama_profile asked before it changed the shared
+    # profile; a new name would make a second Ollama profile.
+    written = _write_profile(name, values, asked=True)
+    if written is not None:
+        ui.make_machine_profile(written)
+    return written
 
 
 def _setup_remote(project_root: Path | None, cfg, cloud: dict[str, str]) -> str | None:
@@ -515,23 +502,34 @@ def _project_selection(project_root: Path) -> tuple[str, str]:
 def select_project_profile(project_root: Path, cfg) -> None:
     """Ask for the profile of the project: a profile, the global default, or no LLM analysis.
 
-    Only a profile that can run is offered (``profile_state``).  Enter
-    keeps the current selection.  When ``config.toml`` (in git) selects a
-    profile, the global default is not offered: ``local.toml`` can select
-    another profile over it, but cannot remove a selection of
-    ``config.toml``.
+    Only a profile that can run is offered (``profile_state``), and of the
+    Ollama profiles only the Ollama profile of this machine
+    (``project_choice_problem``).  Enter keeps the current selection.
+    When ``config.toml`` (in git) selects a profile, the global default is
+    not offered: ``local.toml`` can select another profile over it, but
+    cannot remove a selection of ``config.toml``.
     """
+    from ..config import settings
     from ..config.settings import ConfigError
-    from ..llm.profile_state import profile_state
+    from ..llm.profile_state import cloud_lists, known, profile_state, project_choice_problem, undecided
 
     try:
         profiles = _profiles()
+        llm = settings.read_config_file(settings._GLOBAL_CONFIG_PATH).get("llm") or {}
     except ConfigError as exc:
         print(f"  [warn] {exc}")
         return
-    cloud = cloud_hosts(profiles)
+    lists = cloud_lists(profiles)
+    cloud = known(lists)
     states = [profile_state(name, profile, cloud=cloud) for name, profile in profiles.items()]
-    ready = [state for state in states if state.problem is None]
+    # Without a model list, a cloud model looks like a local one: no Ollama
+    # profile is offered then (undecided).
+    other_ollama = {state.name: "no model list of Ollama" if undecided(state.name, profiles, lists, machine_too=False)
+                    else "an Ollama profile, not the one of this machine"
+                    for state in states
+                    if undecided(state.name, profiles, lists, machine_too=False) is not None
+                    or project_choice_problem(state.name, llm, cloud) is not None}
+    ready = [state for state in states if state.problem is None and state.name not in other_ollama]
     current, layer = _project_selection(project_root)
     if current and current not in profiles:
         print(f"  [warn] The project selects profile {current!r}, which the global config does not have")
@@ -548,6 +546,8 @@ def select_project_profile(project_root: Path, cfg) -> None:
     for state in states:
         if state.problem is not None:
             print(f"       ({state.name}: {state.problem})")
+        elif state.name in other_ollama:
+            print(f"       ({state.name}: {other_ollama[state.name]}: --llm {state.name} for one run)")
     print("    d. no LLM analysis (the embeddings stay)")
     answer = ui._input("  > ").strip().lower()
     if answer == "d":

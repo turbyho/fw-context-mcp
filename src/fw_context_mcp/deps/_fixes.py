@@ -438,6 +438,29 @@ def fix_llm_models(_result, project_root=None) -> tuple[bool, str]:
     return True, (f"{path}: " + "; ".join(lines)) if lines else "the list of the models was the list of this release"
 
 
+def fix_llm_profile(_result, project_root: str | Path | None = None) -> tuple[bool, str]:
+    """Make ``local.toml`` select the Ollama profile of this machine (``check_llm_profile``).
+
+    The findings are read again: the state can change after the check.
+    """
+    from ..config import settings
+    from ._checks import profile_findings
+
+    findings = profile_findings(project_root)
+    if findings.fix_profile is None or findings.root is None:
+        return False, "nothing to fix: the check gives no profile to write"
+    try:
+        if findings.fix_profile:
+            settings._update_local_toml(findings.root, {"profile": findings.fix_profile})
+        else:
+            settings._update_local_toml(findings.root, {}, clear_keys=["profile"])
+    except (OSError, settings.ConfigError) as exc:
+        return False, f".fw-context/local.toml cannot be changed: {exc}"
+    if findings.fix_profile:
+        return True, f".fw-context/local.toml selects the Ollama profile {findings.fix_profile!r}"
+    return True, ".fw-context/local.toml selects no profile: the global default (the Ollama profile) applies"
+
+
 # ── Registry ────────────────────────────────────────────────────────────
 
 
@@ -454,6 +477,7 @@ FIXABLE: dict[str, Any] = {
     "obsolete-files": fix_obsolete_files,
     "config": fix_config,
     "llm-models": fix_llm_models,
+    "llm-profile": fix_llm_profile,
 }
 
 

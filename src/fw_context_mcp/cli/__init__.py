@@ -570,8 +570,11 @@ def main() -> None:
     p_llm_test.set_defaults(func=cmd_llm_test)
     p_llm_default = p_llm_sub.add_parser("default", help="Select the LLM profile of the project, or of each project")
     p_llm_default.add_argument("profile", help="The name of the LLM profile")
-    p_llm_default.add_argument("--global", dest="global_default", action="store_true",
-                               help="The profile of each project that selects none (the global config)")
+    p_llm_default_scope = p_llm_default.add_mutually_exclusive_group()
+    p_llm_default_scope.add_argument("--ollama", action="store_true",
+                                     help="The Ollama profile of this machine: each project that uses Ollama uses it")
+    p_llm_default_scope.add_argument("--global", dest="global_default", action="store_true",
+                                     help="The profile of each project that selects none (the global config)")
     p_llm_default.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
     p_llm_default.set_defaults(func=cmd_llm_default)
     from ._recommend import cmd_llm_recommend

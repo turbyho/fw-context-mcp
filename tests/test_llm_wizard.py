@@ -266,7 +266,7 @@ def test_default_global_selects_the_profile_of_each_project(home):
     settings._GLOBAL_CONFIG_PATH.write_text(GLOBAL + '\n[llm.profiles.ds]\nprovider = "deepseek"\nmodel = "m"\n',
                                             encoding="utf-8")
 
-    assert _llm.cmd_llm_default(argparse.Namespace(profile="ds", global_default=True, project=None)) == 0
+    assert _llm.cmd_llm_default(argparse.Namespace(profile="ds", global_default=True, ollama=False, project=None)) == 0
 
     assert tomllib.loads(settings._GLOBAL_CONFIG_PATH.read_text(encoding="utf-8"))["llm"]["profile"] == "ds"
 
@@ -295,12 +295,35 @@ def test_the_local_service_does_not_take_a_profile_of_another_computer(home, mon
     monkeypatch.setattr(ollama, "check_setup", lambda cfg: {"status": "ok", "installed_models": []})
     monkeypatch.setattr(wizard, "test_profile", lambda cfg, name: None)
     _answers(monkeypatch, ["1", "", ""])
+    # Yes only to the question that makes "local" the Ollama profile of this machine: no pull.
+    monkeypatch.setattr(ui, "_confirm", lambda question, **kwargs: "Ollama profile of each project" in question)
 
     wizard.run_wizard(home, load(home))
 
-    profiles = _profiles()
-    assert profiles["remote"] == {"provider": "ollama", "url": "http://gpu-box:11434", "model": "big:30b"}
-    assert profiles["local"]["url"] == "http://localhost:11434"
+    llm = tomllib.loads(settings._GLOBAL_CONFIG_PATH.read_text(encoding="utf-8"))["llm"]
+    assert llm["profiles"]["remote"] == {"provider": "ollama", "url": "http://gpu-box:11434", "model": "big:30b"}
+    assert llm["profiles"]["local"]["url"] == "http://localhost:11434"
+    assert llm["ollama_profile"] == "local"
+
+
+def test_the_local_service_stops_when_the_ollama_profile_of_another_computer_stays(home, monkeypatch, capsys):
+    """One Ollama profile for each machine: a "no" writes no second one."""
+    from fw_context_mcp.config import load
+    from fw_context_mcp.llm import auto_model, ollama
+
+    settings._GLOBAL_CONFIG_PATH.write_text(
+        '[llm]\nprofile = "remote"\nembed_model = "e:1b"\n\n'
+        '[llm.profiles.remote]\nprovider = "ollama"\nurl = "http://gpu-box:11434"\nmodel = "big:30b"\n',
+        encoding="utf-8")
+    monkeypatch.setattr(auto_model, "_gpu_available", lambda: False)
+    monkeypatch.setattr(ollama, "check_setup", lambda cfg: {"status": "ok", "installed_models": []})
+    monkeypatch.setattr(wizard, "test_profile", lambda cfg, name: None)
+    _answers(monkeypatch, ["1", "", ""])
+
+    wizard.run_wizard(home, load(home))
+
+    assert set(_profiles()) == {"remote"}
+    assert "llm default <profile> --ollama" in capsys.readouterr().out
 
 
 def test_a_failed_test_puts_back_the_profile_that_it_replaced(home, monkeypatch):

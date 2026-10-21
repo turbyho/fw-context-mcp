@@ -166,7 +166,7 @@ def run_full_check(
                 r = fn(ctx["cfg"].llm)
             elif name == "llm-recommend":
                 r = fn(ctx["cfg"].llm, measure_progress)
-            elif name in ("db-integrity", "disk-space", "obsolete-files"):
+            elif name in ("db-integrity", "disk-space", "obsolete-files", "llm-profile"):
                 r = fn(project_root)
             else:
                 r = fn()
@@ -337,6 +337,7 @@ def _recheck(name: str, project_root: str | Path | None = None) -> DepCheckResul
         check_libclang_python,
         check_libclang_so,
         check_llm_models,
+        check_llm_profile,
         check_llm_recommend,
         check_obsolete_files,
         check_ollama_chat_model,
@@ -376,6 +377,7 @@ def _recheck(name: str, project_root: str | Path | None = None) -> DepCheckResul
         "disk-space": lambda: check_disk_space(project_root),
         "obsolete-files": lambda: check_obsolete_files(project_root),
         "llm-models": check_llm_models,
+        "llm-profile": lambda: check_llm_profile(project_root),
         # No measurement: a re-check after a fix of the config does not
         # load each model again (run_full_check measures).
         "llm-recommend": lambda: check_llm_recommend(cfg.llm) if cfg else DepCheckResult(

@@ -1387,6 +1387,36 @@ def config_value_problems(layer: dict, *, global_file: bool = True) -> list[Valu
     return problems
 
 
+def _ollama_profile_problems(llm: dict, problems: list[ValueProblem], *, global_file: bool) -> None:
+    """Add the problems of ``[llm] ollama_profile``, the Ollama profile of this machine, to *problems*.
+
+    Each one is a warning (*critical* False): ``load`` does not read the
+    key, thus no value of it changes the server of a request.  The rule
+    of the projects (``llm.profile_state``) and ``fw-context doctor`` read
+    it.  A cloud model of Ollama needs the server to tell it, thus it is
+    not a problem here.
+    """
+    if "ollama_profile" not in llm:
+        return
+    value = llm["ollama_profile"]
+    keys: tuple[str | int, ...] = ("llm", "ollama_profile")
+    if not global_file:
+        problems.append(ValueProblem(
+            keys, f"[llm] ollama_profile is in the global config only ({_GLOBAL_CONFIG_PATH}): it names the "
+                  "Ollama profile of this machine for each project", removable=False, critical=False))
+        return
+    if not isinstance(value, str):
+        problems.append(ValueProblem(keys, f"[llm] ollama_profile must be a string, not {_toml_type(value)}",
+                                     critical=False))
+        return
+    profiles = llm.get("profiles")
+    profile = profiles.get(value) if isinstance(profiles, dict) else None
+    if not isinstance(profile, dict) or profile.get("provider") != "ollama":
+        problems.append(ValueProblem(
+            keys, f"[llm] ollama_profile names {value!r}, which is not a profile of provider ollama of the global "
+                  "config", removable=False, critical=False))
+
+
 def _llm_profile_problems(llm: dict, problems: list[ValueProblem], *, global_file: bool) -> None:
     """Add the problems of the profiles, and of the keys that moved into a profile, to *problems*.
 
@@ -1398,6 +1428,7 @@ def _llm_profile_problems(llm: dict, problems: list[ValueProblem], *, global_fil
     convert = "'fw-context doctor --fix --only config' or 'fw-context init' converts it" + (
         ", and moves the API key to the keyring of the system" if "chat_api_key" in llm else ""
     )
+    _ollama_profile_problems(llm, problems, global_file=global_file)
     for key in _MOVED_LLM_KEYS:
         if key in llm:
             problems.append(ValueProblem(

@@ -409,3 +409,11 @@ class TestOmittedParametersKeepTheirValue:
         assert result["status"] == "ok", result
         assert result["profile"] == "api"
         assert _local_llm(root) == {"profile": "api", "embed_model": "other-embed:1b"}
+
+
+@pytest.fixture(autouse=True)
+def _no_cloud_model_list(monkeypatch):
+    """No request to the Ollama of the operator: the rule of the Ollama profiles asks for the cloud models."""
+    from fw_context_mcp.llm import _diag
+
+    monkeypatch.setattr(_diag, "remote_hosts", lambda url: {})

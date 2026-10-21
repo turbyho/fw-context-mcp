@@ -4013,8 +4013,10 @@ def configure_llm(
         Field(
             description=(
                 "The LLM profile of this project: the name of a [llm.profiles.<name>] table of the global "
-                "config (~/.fw-context/config.toml). None = keep the current profile. WARNING: a profile "
-                "whose server is not this machine sends source code to that host."
+                "config (~/.fw-context/config.toml). None = keep the current profile. A project selects an "
+                "external profile (an API, the ChatGPT plan, a cloud model of Ollama) or the Ollama profile of "
+                "this machine; another Ollama profile gives an error. WARNING: a profile whose server is not "
+                "this machine sends source code to that host."
             )
         ),
     ] = None,
@@ -4089,6 +4091,16 @@ def configure_llm(
                     "'fw-context init'."
                 ),
             }
+        # One Ollama profile for each machine (llm.profile_state): another
+        # Ollama profile loads a second model into the memory that the
+        # background runs of each project share.
+        from ...llm.profile_state import cloud_lists, known, project_choice_problem, undecided
+
+        lists = cloud_lists(profiles)
+        problem = undecided(profile, profiles, lists, machine_too=False) or project_choice_problem(
+            profile, read_config_file(settings._GLOBAL_CONFIG_PATH).get("llm") or {}, known(lists))
+        if problem is not None:
+            return {"status": "error", "message": f"A project cannot select it: {problem}"}
         updates["profile"] = profile
     if embed_model is not None and embed_model != cfg.llm.embed_model:
         updates["embed_model"] = embed_model

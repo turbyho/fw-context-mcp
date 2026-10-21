@@ -626,8 +626,8 @@ def test_the_cloud_setup_asks_before_it_replaces_a_profile(home, monkeypatch, ca
     assert _global(home).read_text(encoding="utf-8") == before
 
 
-def test_the_ollama_setup_gives_the_project_its_own_profile_when_the_shared_one_stays(home, monkeypatch):
-    """Before, a new chat model went into the shared profile: each project got it."""
+def test_a_no_to_the_shared_profile_keeps_its_model_and_makes_no_profile_of_the_project(home, monkeypatch):
+    """One Ollama profile for each machine (2026-10-21): before, the project got its own profile local-proj."""
     from fw_context_mcp.cli import _init_interactive
     from fw_context_mcp.llm import auto_model, ollama
 
@@ -643,11 +643,11 @@ def test_the_ollama_setup_gives_the_project_its_own_profile_when_the_shared_one_
 
     profiles = settings.read_config_file(_global(home))["llm"]["profiles"]
     assert profiles["local"]["model"] == "qwen2.5-coder:14b"
-    assert profiles["local-proj"]["model"] == "new-chat:1b"
+    assert "local-proj" not in profiles
 
 
-def test_the_own_profile_of_the_ollama_setup_does_not_replace_a_profile_of_another_project(home, monkeypatch):
-    """Two projects in directories of the same name: the second replaced the profile of the first."""
+def test_the_ollama_setup_leaves_an_old_profile_of_a_project_as_it_is(home, monkeypatch):
+    """An Ollama profile of one project (of an older release) stays: --llm can still use it."""
     from fw_context_mcp.cli import _init_interactive
     from fw_context_mcp.llm import auto_model, ollama
 
@@ -663,7 +663,7 @@ def test_the_own_profile_of_the_ollama_setup_does_not_replace_a_profile_of_anoth
 
     profiles = settings.read_config_file(_global(home))["llm"]["profiles"]
     assert profiles["local-proj"]["model"] == "other:1b"
-    assert profiles["local-proj-2"]["model"] == "new-chat:1b"
+    assert "local-proj-2" not in profiles and profiles["local"]["model"] == "qwen2.5-coder:14b"
 
 
 # ── The conversion of chat_api_key: the corner cases ──
@@ -710,3 +710,16 @@ def test_a_key_of_an_ollama_config_is_removed_without_a_copy(home):
     assert any("did not send it to an Ollama server" in label for _path, label in report.removed_keys)
     assert secrets.stored_api_key("local") is None
     assert _global(home).read_text(encoding="utf-8").count("[llm.profiles.") == 1
+
+
+@pytest.fixture(autouse=True)
+def _no_cloud_model_list(monkeypatch):
+    """No request to the Ollama of the operator: the rule of the Ollama profiles asks for the cloud models.
+
+    The recommendation of the local Ollama setup asks for the installed
+    models too.
+    """
+    from fw_context_mcp.llm import _diag
+
+    monkeypatch.setattr(_diag, "remote_hosts", lambda url: {})
+    monkeypatch.setattr(_diag, "installed_models", lambda url: [])

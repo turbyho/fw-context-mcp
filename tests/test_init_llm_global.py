@@ -339,7 +339,12 @@ def test_an_embedding_model_that_ollama_does_not_serve_is_not_an_ollama_default(
 
 
 def test_option_1_writes_the_chat_model_into_the_selected_ollama_profile(project, monkeypatch, capsys):
-    """The selected profile is an Ollama one: after a "yes", the step changes its model and keeps its other keys."""
+    """The selected profile is an Ollama one: after a "yes", the step changes its model and keeps its other keys.
+
+    It is the global default, thus local.toml does not select it.  The
+    answer "no" to the question about the global embedding model writes
+    the model for this project only.
+    """
     from fw_context_mcp.config import settings
 
     settings._GLOBAL_CONFIG_PATH.write_text(GLOBAL_LLM + "num_ctx = 8192\n", encoding="utf-8")
@@ -353,7 +358,8 @@ def test_option_1_writes_the_chat_model_into_the_selected_ollama_profile(project
     assert _global_llm()["profiles"]["local"] == {
         "provider": "ollama", "url": "http://localhost:11434", "model": "new-chat:1b", "num_ctx": 8192,
     }
-    assert _local_llm(project) == {"enabled": True, "profile": "local", "embed_model": "new-embed:1b"}
+    assert _local_llm(project) == {"enabled": True, "embed_model": "new-embed:1b"}
+    assert "is of this project only" in out, out
     assert tested == ["new-chat:1b"], "the test call must use the model of the new profile"
 
 
@@ -363,8 +369,9 @@ def test_option_2_stores_a_key_for_the_profile_and_never_in_a_config_file(projec
     from fw_context_mcp.llm import secrets
 
     key = "sk-init-" + "test"
-    # Option 2, service 7 (another API), no removal, profile 2 (work) for the project.
-    out, tested = _setup(monkeypatch, capsys, project, ["2", "7", "", "2"], {
+    # Option 2, service 7 (another API), no removal, profile 1 (work) for the project: without a model
+    # list of Ollama (no server), the setup offers no Ollama profile to the project.
+    out, tested = _setup(monkeypatch, capsys, project, ["2", "7", "", "1"], {
         "Profile name": "work", "API URL": "http://127.0.0.1:9/v1", "Model": "work-chat", "API key": key,
     })
 
@@ -377,7 +384,7 @@ def test_option_2_stores_a_key_for_the_profile_and_never_in_a_config_file(projec
 
 def test_option_2_writes_a_cloud_profile_that_names_the_key_variable(project, monkeypatch, capsys):
     """The profile holds the NAME of the variable, never the key: a key in a TOML file is a secret in plain text."""
-    out, tested = _setup(monkeypatch, capsys, project, ["2", "7", "", "2"], {
+    out, tested = _setup(monkeypatch, capsys, project, ["2", "7", "", "1"], {
         "Profile name": "work",
         "API URL": "http://127.0.0.1:9/v1",
         "Environment variable with the API key (empty: store the key in the keyring)": "WORK_API_KEY",

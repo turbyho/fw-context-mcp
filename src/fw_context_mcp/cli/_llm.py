@@ -126,22 +126,77 @@ def cmd_llm_test(args: argparse.Namespace) -> int:
 
 
 def cmd_llm_default(args: argparse.Namespace) -> int:
-    """Select the profile of the project (``local.toml``, with a test request), or with ``--global`` of each project.
+    """Select the profile of the project (``local.toml``, with a test request), of each project, or of Ollama.
 
-    Exit codes: 0 = selected, 1 = no such profile, no project, the test
-    failed, or a config file cannot be used.
+    ``--global``: the profile of each project that selects none.  An Ollama
+    profile then is also the Ollama profile of this machine; with an
+    external profile, the Ollama profile of this machine stays (its key is
+    written, else it followed the old global profile).  ``--ollama``: only
+    the Ollama profile of this machine.  A project selects an external
+    profile or the Ollama profile of this machine (``llm.profile_state``).
+
+    Exit codes: 0 = selected, 1 = no such profile, a profile that the
+    project cannot select, no project, the test failed, or a config file
+    cannot be used.
     """
     from ..config import settings
     from ..config._profiles import select_global_profile
     from ..llm.configure import configure_llm_core
+    from ..llm.profile_state import (
+        cloud_lists,
+        is_ollama,
+        known,
+        ollama_profile_name,
+        project_choice_problem,
+        undecided,
+    )
 
-    if args.global_default:
+    profiles = _profiles()
+    if args.profile not in profiles:
+        print(f"[error] The global config has no profile {args.profile!r}", file=sys.stderr)
+        return 1
+    try:
+        llm = settings.read_config_file(settings._GLOBAL_CONFIG_PATH).get("llm") or {}
+    except settings.ConfigError as exc:
+        print(f"[error] {exc}", file=sys.stderr)
+        return 1
+    lists = cloud_lists(profiles)
+    # --global with an external profile needs the Ollama profile of this
+    # machine only to write it as the key: with the key, nothing is decided.
+    problem = undecided(args.profile, profiles, lists,
+                        machine_too=args.ollama or (args.global_default and "ollama_profile" not in llm))
+    if problem is not None:
+        print(f"[error] {problem}", file=sys.stderr)
+        return 1
+    cloud = known(lists)
+    ollama = is_ollama(profiles[args.profile], cloud)
+    if args.ollama or args.global_default:
+        if args.ollama and not ollama:
+            print(f"[error] The profile {args.profile!r} is not an Ollama profile of this machine or of another "
+                  "computer (an API, the ChatGPT plan or a cloud model)", file=sys.stderr)
+            return 1
+        if ollama:
+            machine: str | None = args.profile
+        else:
+            # Without the key, the Ollama profile followed the global profile.
+            earlier = ollama_profile_name(llm, cloud)
+            machine = earlier if earlier and "ollama_profile" not in llm else None
         try:
-            select_global_profile(args.profile)
+            select_global_profile(args.profile if args.global_default else None, ollama_profile=machine)
         except (OSError, settings.ConfigError) as exc:
             print(f"[error] {exc}", file=sys.stderr)
             return 1
-        print(f"[ok] Profile {args.profile!r} is the profile of each project that selects none")
+        if args.global_default:
+            print(f"[ok] Profile {args.profile!r} is the profile of each project that selects none")
+        if ollama:
+            print(f"[ok] Profile {args.profile!r} is the Ollama profile of this machine: each project that uses "
+                  "Ollama uses it")
+        default = llm.get("profile")
+        if args.ollama and isinstance(default, str) and default != args.profile and default in profiles and is_ollama(
+                profiles[default], cloud):
+            print(f"[warn] The global default profile {default!r} is another Ollama profile: each project without a "
+                  f"selection loads it. 'fw-context llm default {args.profile} --global' makes it the default too",
+                  file=sys.stderr)
         return 0
     try:
         root, _cfg = _project_and_config(args)
@@ -151,8 +206,9 @@ def cmd_llm_default(args: argparse.Namespace) -> int:
     if root is None:
         print("[error] No project of fw-context here: run 'fw-context init', or use --global", file=sys.stderr)
         return 1
-    if args.profile not in _profiles():
-        print(f"[error] The global config has no profile {args.profile!r}", file=sys.stderr)
+    problem = project_choice_problem(args.profile, llm, cloud)
+    if problem is not None:
+        print(f"[error] A project cannot select it: {problem}", file=sys.stderr)
         return 1
     result = configure_llm_core(root, {"enabled": True, "profile": args.profile})
     if result.get("status") != "ok":

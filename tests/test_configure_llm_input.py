@@ -159,3 +159,16 @@ def test_init_says_no_ok_after_an_error_of_the_ollama_setup(tmp_path, monkeypatc
     assert "[warn] test failed" in out, out
     assert "[ok] LLM configured" not in out and "[ok] Saved" not in out, out
     assert global_config.read_text(encoding="utf-8") == before
+
+
+@pytest.fixture(autouse=True)
+def _no_cloud_model_list(monkeypatch):
+    """No request to the Ollama of the operator: the rule of the Ollama profiles asks for the cloud models.
+
+    The recommendation of the local Ollama setup asks for the installed
+    models too.
+    """
+    from fw_context_mcp.llm import _diag
+
+    monkeypatch.setattr(_diag, "remote_hosts", lambda url: {})
+    monkeypatch.setattr(_diag, "installed_models", lambda url: [])

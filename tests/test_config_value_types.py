@@ -425,7 +425,8 @@ class TestRemovalLimits:
         if os.access(config, os.W_OK):
             pytest.skip("root writes a file without write permission")
 
-        [row] = [r for r in run_full_check(project_root=root) if r.name == "config"]
+        # Only the row "config": the checks of Ollama would ask the Ollama of the operator.
+        [row] = [r for r in run_full_check(project_root=root, subset={"config"}) if r.name == "config"]
 
         assert "[llm] analyze_vendor must be true or false" in row.message and "no write permission" in row.message, row.message
         assert row.fix_cmd is None, "the fix cannot remove a value there"
@@ -747,3 +748,11 @@ def test_the_tuning_list_is_the_list_of_the_decision():
         ("updates", "check"),
     }
     assert settings._PROFILE_TUNING_KEYS == {"timeout", "stream", "num_ctx", "keep_alive", "auto_pull", "max_concurrent"}
+
+
+@pytest.fixture(autouse=True)
+def _no_cloud_model_list(monkeypatch):
+    """No request to the Ollama of the operator: the rule of the Ollama profiles asks for the cloud models."""
+    from fw_context_mcp.llm import _diag
+
+    monkeypatch.setattr(_diag, "remote_hosts", lambda url: {})

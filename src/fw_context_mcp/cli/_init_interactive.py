@@ -439,8 +439,13 @@ def _use_global_llm(project_root: Path, *, remove_local: bool, old_embed_model: 
         )
 
 
-def _save_profile(project_root: Path, name: str, values: dict[str, object], updates: dict[str, object]) -> bool:
-    """Write the profile *name*, select it for the project with *updates*, and do a test call.
+def _save_profile(project_root: Path, name: str, values: dict[str, object], updates: dict[str, object], *,
+                  clear_keys: list[str] | None = None, global_embed: str | None = None) -> bool:
+    """Write the profile *name*, select it for the project with *updates* and *clear_keys*, and do a test call.
+
+    *global_embed* is an embedding model for the global config: it is
+    written with the profile, and the restore after a failed test call
+    removes it too.
 
     Returns True when the two files changed and the test call passed.
     When the test call fails, the global config gets its earlier text
@@ -450,23 +455,37 @@ def _save_profile(project_root: Path, name: str, values: dict[str, object], upda
     """
     from ..config import settings
     from ..config._profiles import set_profile
-    from ..config._toml_editor import _atomic_write
     from ..llm.configure import configure_llm_core
 
     try:
         global_path = settings._ensure_global_config()
         previous = global_path.read_text(encoding="utf-8")
-        set_profile(name, values)
     except (ValueError, OSError, settings.ConfigError) as e:
         print(f"  [warn] The profile {name!r} is not written: {e}")
         return False
-    res = configure_llm_core(project_root, updates)
+    try:
+        set_profile(name, values)
+        if global_embed is not None:
+            settings.update_global_llm_key("embed_model", global_embed)
+    except (ValueError, OSError, settings.ConfigError) as e:
+        print(f"  [warn] The global config is not changed: {e}")
+        _put_back(global_path, previous, name)
+        return False
+    res = configure_llm_core(project_root, updates, clear_keys=clear_keys)
     # An error means that no new setting is saved: the core puts the old
     # settings of local.toml back, or the write itself failed.  When the
     # core cannot put the old settings back, its message says so.
     if res.get("status") == "ok":
         return True
     print(f"  [warn] {res.get('message', 'LLM test call failed')}")
+    _put_back(global_path, previous, name)
+    return False
+
+
+def _put_back(global_path: Path, previous: str, name: str) -> None:
+    """Write the earlier text of the global config back; a failure names the profile that stays."""
+    from ..config._toml_editor import _atomic_write
+
     try:
         _atomic_write(global_path.resolve(), previous)
     except OSError as e:
@@ -474,14 +493,16 @@ def _save_profile(project_root: Path, name: str, values: dict[str, object], upda
             f"  [warn] init cannot write the earlier text of {global_path} back ({e}): "
             f"the profile {name!r} stays in it. Read the file before the next command."
         )
-    return False
 
 
 def _prompt_ollama_setup(project_root: Path, cfg) -> None:
     """Option 1 of the menu: a local Ollama profile, selected for the project with its embedding model.
 
     The values come from ``_local_ollama_profile``; ``_save_profile`` writes
-    the profile, selects it in ``local.toml`` and tests it.
+    the profile and tests it.  ``local.toml`` selects the profile only
+    when it is not the global default.  The embedding model is a global
+    default (decision of the user, 2026-10-21): the global config gets it,
+    and ``local.toml`` only when the user wants it for this project only.
     """
     from ..config import settings
 
@@ -489,10 +510,51 @@ def _prompt_ollama_setup(project_root: Path, cfg) -> None:
     if found is None:
         return
     name, values, embed = found
-    if not _save_profile(project_root, name, values, {"enabled": True, "profile": name, "embed_model": embed}):
+    try:
+        global_llm = settings.read_config_file(settings._GLOBAL_CONFIG_PATH).get("llm") or {}
+    except settings.ConfigError as e:
+        print(f"  [warn] {e}")
         return
+    # A key that local.toml does not hold comes from the file below it:
+    # config.toml of the project, else the global config.  WHY: before,
+    # the key went when the global value was the same, and a config.toml
+    # that selects an external profile then sent the code out.
+    try:
+        committed = settings.read_config_file(project_root / ".fw-context" / "config.toml").get("llm") or {}
+    except settings.ConfigError as e:
+        print(f"  [warn] {e}")
+        return
+    updates: dict[str, object] = {"enabled": True}
+    clear = []
+    if (committed.get("profile") or global_llm.get("profile")) == name:
+        clear.append("profile")
+    else:
+        updates["profile"] = name
+    global_embed: str | None = None
+    committed_embed = committed.get("embed_model")
+    if embed == (committed_embed or global_llm.get("embed_model")):
+        clear.append("embed_model")
+    elif committed_embed:
+        # config.toml (in git) sets another model: only local.toml can
+        # select this one over it.
+        updates["embed_model"] = embed
+    elif _confirm(f"Use the embedding model {embed} for each project (the global config)? A project whose index "
+                  "holds another model embeds each symbol again at its next index run", default=True):
+        global_embed = embed
+        clear.append("embed_model")
+    else:
+        updates["embed_model"] = embed
+    if not _save_profile(project_root, name, values, updates, clear_keys=clear, global_embed=global_embed):
+        return
+    make_machine_profile(name)
     print(f"  [ok] LLM configured: profile {name} (ollama + {values['model']}), embedding {embed}")
-    print(f"  [ok] Profile saved to {settings._GLOBAL_CONFIG_PATH}; .fw-context/local.toml selects it")
+    where = ".fw-context/local.toml selects it" if "profile" in updates else (
+        ".fw-context/config.toml selects it" if committed.get("profile") else "it is the global default")
+    print(f"  [ok] Profile saved to {settings._GLOBAL_CONFIG_PATH}; {where}")
+    if "embed_model" in updates:
+        print(f"  [note] The embedding model {embed} is of this project only (.fw-context/local.toml); the "
+              f"global config has {global_llm.get('embed_model') or 'none'}. 'fw-context doctor' reports the "
+              "difference")
 
 
 def _local_ollama_profile(
@@ -508,12 +570,9 @@ def _local_ollama_profile(
     embedding model of sentence-transformers or ``ft://``.  The step would
     offer to pull it from Ollama.
 
-    The chat model goes to an Ollama profile of the global config: the
-    selected profile when it is a profile of the Ollama of this machine
-    (a loopback server, not a cloud model), else ``local``.  WHY: a
-    selected profile of another computer or of Ollama Cloud got the local
-    model before, and kept its server.  Its other keys stay; the caller
-    writes it.  The recommended models come from the rule of two bands
+    The chat model goes to the Ollama profile of this machine
+    (``_machine_profile_for``), never to a profile of one project.  Its
+    other keys stay; the caller writes it.  The recommended models come from the rule of two bands
     (``llm.recommend``): the measured speed of each installed model of the
     list, after a question, else an estimate from the memory of the
     machine; the table shows each model.  *cloud* names the cloud models
@@ -522,10 +581,10 @@ def _local_ollama_profile(
     (the setup of the LLM services: the embedding belongs to the project),
     and the third value is "".
 
-    Returns None when the user stops at the question about a shared profile.
+    Returns None when the user stops at the question about the Ollama
+    profile of this machine (``_machine_profile_for``).
     """
-    from ..config._profiles import project_profile_name, replaces_other_values
-    from ..config.settings import _DEFAULT_OLLAMA_URL, _is_loopback_url, llm_key_sources, read_config_file
+    from ..config.settings import _DEFAULT_OLLAMA_URL, _is_loopback_url, llm_key_sources
     from ..llm.auto_model import _gpu_available
     from ..llm.chat_router import chat_ollama_server
     from ..llm.embedder_factory import uses_ollama
@@ -584,6 +643,11 @@ def _local_ollama_profile(
               + " — Enter keeps them")
 
     chat = prompt_text("Chat model", default=chat_default) or chat_default
+    found_profile = _machine_profile_for(server, chat)
+    if found_profile is None:
+        return None
+    name, values = found_profile
+    chat = str(values["model"])
     embed = (prompt_text("Embedding model", default=embed_default) or embed_default) if ask_embed else ""
 
     from ..deps._fixes import _ollama_pull
@@ -596,36 +660,109 @@ def _local_ollama_profile(
     if embed and _confirm(f"Pull {embed} now? (multi-GB)"):
         ok, msg = _ollama_pull(embed, cfg.llm.ollama_url)
         print(f"  [{'ok' if ok else 'warn'}] {msg}")
+    return name, values, embed
 
+
+def _machine_profile_for(server: str, chat: str) -> tuple[str, dict[str, object]] | None:
+    """Return the Ollama profile of this machine for the local Ollama setup, with the chat model *chat*.
+
+    One Ollama profile for each machine (``llm.profile_state``): the setup
+    writes the chat model into it, and never makes a profile for one
+    project.  The profile is the Ollama profile of this machine when it
+    is of the local Ollama, else ``local``.  When the Ollama profile of
+    this machine is of another computer, the user makes ``local`` the new
+    one, or stops.  The profile is shared: a new chat model in it is the
+    chat model of each project, thus a "no" keeps its model.  A profile
+    ``local`` that is not of the local Ollama (an API, another computer)
+    is never changed: the setup takes a free name.  While a local Ollama
+    gives no model list, only ``[llm] ollama_profile`` names the profile
+    of this machine: a cloud model would look like a local one.
+
+    Returns None when the user stops.
+    """
     from ..config import settings
+    from ..config.settings import _DEFAULT_OLLAMA_URL, _is_loopback_url, read_config_file
+    from ..llm.profile_state import cloud_lists, is_cloud_model, known, ollama_profile_name, unknown_servers
 
-    name = cfg.llm.profile if ollama_profile else "local"
-    profiles = (read_config_file(settings._GLOBAL_CONFIG_PATH).get("llm") or {}).get("profiles") or {}
+    llm = read_config_file(settings._GLOBAL_CONFIG_PATH).get("llm") or {}
+    raw = llm.get("profiles")
+    profiles: dict = raw if isinstance(raw, dict) else {}
+    lists = cloud_lists(profiles)
+    cloud = known(lists)
+    if unknown_servers(profiles, lists):
+        named = llm.get("ollama_profile")
+        machine = named if isinstance(named, str) and isinstance(profiles.get(named), dict) else None
+    else:
+        machine = ollama_profile_name(llm, cloud)
+
+    def own(profile: object) -> bool:
+        # A cloud model is not of the local Ollama: before, a profile
+        # "local" of a cloud model became the Ollama profile of this
+        # machine, and its code went to the cloud.  Without a model list a
+        # cloud model is not known; the test call of the setup then fails
+        # (a cloud model runs through the local Ollama), and the global
+        # config gets its earlier text back.
+        return (isinstance(profile, dict) and profile.get("provider") == "ollama"
+                and _is_loopback_url(str(profile.get("url") or _DEFAULT_OLLAMA_URL))
+                and not is_cloud_model(profile, cloud))
+
+    machine_url = str((profiles.get(machine) or {}).get("url") or _DEFAULT_OLLAMA_URL) if machine else ""
+    if machine and _is_loopback_url(machine_url):
+        name = machine
+    else:
+        name, number = "local", 1
+        while name in profiles and not own(profiles[name]):
+            number += 1
+            name = f"local-{number}"
+        if machine and not _confirm(
+            f"The Ollama profile of this machine is {machine!r} ({machine_url}). Make {name!r} (the local Ollama) "
+            "the Ollama profile of each project?", default=True,
+        ):
+            print("  [skip] The Ollama profile of this machine is not changed: 'fw-context llm default <profile> "
+                  "--ollama' changes it")
+            return None
     earlier = profiles.get(name)
-    own = (
-        isinstance(earlier, dict) and earlier.get("provider") == "ollama"
-        and _is_loopback_url(str(earlier.get("url") or _DEFAULT_OLLAMA_URL))
-    )
-    keep: dict = earlier if own and isinstance(earlier, dict) else {"url": server}
+    keep: dict = earlier if own(earlier) and isinstance(earlier, dict) else {"url": server}
     values: dict[str, object] = {**keep, "provider": "ollama", "model": chat}
-    # The profile is shared: a new chat model in it is the chat model of
-    # each project that selects it.  Before, the model of a project went to
-    # its own local.toml, thus the question keeps that choice.
+    from ..config._profiles import replaces_other_values
+
     if replaces_other_values(name, values) and not _confirm(
-        f"The profile {name!r} is shared: each project that selects it gets the chat model {chat}. Change it?",
+        f"The profile {name!r} is shared: each project that uses Ollama gets the chat model {chat}. Change it?",
         default=False,
     ):
-        # A profile of that name can be the profile of another project
-        # in a directory of the same name: never replace it.
-        if project_root is None:
-            return None
-        stem, number = f"{name}-{project_profile_name(project_root)}", 1
-        name = stem
-        while replaces_other_values(name, values):
-            number += 1
-            name = f"{stem}-{number}"
-        print(f"  [info] This project gets its own profile {name!r}")
-    return name, values, embed
+        values["model"] = keep.get("model") or chat
+        print(f"  [info] The profile {name!r} keeps the chat model {values['model']}")
+    return name, values
+
+
+def make_machine_profile(name: str) -> None:
+    """Make *name* the Ollama profile of this machine after the local Ollama setup wrote it, when it is not yet.
+
+    The key ``[llm] ollama_profile`` is written only when the rule without
+    it gives another profile (``ollama_profile_name``): a global config
+    with one Ollama profile needs no key.
+    """
+    from ..config import settings
+    from ..config._profiles import select_global_profile
+    from ..llm.profile_state import cloud_lists, known, ollama_profile_name, unknown_servers
+
+    try:
+        llm = settings.read_config_file(settings._GLOBAL_CONFIG_PATH).get("llm") or {}
+        raw = llm.get("profiles")
+        profiles: dict = raw if isinstance(raw, dict) else {}
+        lists = cloud_lists(profiles)
+        # Without a list, the rule can give a cloud model: the key then
+        # names the profile without a guess.
+        if not unknown_servers(profiles, lists) and ollama_profile_name(llm, known(lists)) == name:
+            return
+        if llm.get("ollama_profile") == name:
+            return
+        select_global_profile(None, ollama_profile=name)
+    except (OSError, settings.ConfigError) as exc:
+        print(f"  [warn] {name!r} is not the Ollama profile of this machine ({exc}): run "
+              f"'fw-context llm default {name} --ollama'")
+        return
+    print(f"  [ok] Profile {name!r} is the Ollama profile of this machine: each project that uses Ollama uses it")
 
 
 #: The models when the rule has no candidate: the memory of the machine is

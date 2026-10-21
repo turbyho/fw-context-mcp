@@ -153,8 +153,14 @@ def remove_profile(name: str) -> Path:
     return path
 
 
-def select_global_profile(name: str) -> Path:
-    """Make *name* the ``[llm] profile`` of the global config: the profile of each project that selects none.
+def select_global_profile(name: str | None, *, ollama_profile: str | None = None) -> Path:
+    """Write ``[llm] profile`` (*name*) and ``[llm] ollama_profile`` of the global config, in one write.
+
+    *name* is the profile of each project that selects none; None keeps
+    it.  *ollama_profile* is the Ollama profile of this machine
+    (``llm.profile_state.ollama_profile_name``); None keeps the key as it
+    is.  The caller decides which profile is an Ollama one: a cloud model
+    of Ollama needs the server to tell it.
 
     Raises:
         ConfigError: the global config cannot be read, or has no such profile.
@@ -164,8 +170,14 @@ def select_global_profile(name: str) -> Path:
     settings.read_config_file(path)
     document = tomlkit.parse(path.read_text(encoding="utf-8"))
     llm = document.get("llm")
-    if llm is None or name not in (llm.get("profiles") or {}):
-        raise settings.ConfigError(path, f"the global config has no LLM profile {name!r}")
-    llm["profile"] = name
+    for wanted in (name, ollama_profile):
+        if wanted is not None and (llm is None or wanted not in (llm.get("profiles") or {})):
+            raise settings.ConfigError(path, f"the global config has no LLM profile {wanted!r}")
+    if llm is None:
+        return path  # Nothing to write: no profile is named.
+    if name is not None:
+        llm["profile"] = name
+    if ollama_profile is not None:
+        llm["ollama_profile"] = ollama_profile
     _atomic_write(path.resolve(), tomlkit.dumps(document))
     return path

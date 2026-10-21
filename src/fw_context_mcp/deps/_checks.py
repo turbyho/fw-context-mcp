@@ -18,6 +18,7 @@ import importlib
 import importlib.metadata
 import sqlite3
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -431,6 +432,162 @@ def check_config(problem: Exception | None, project_root: str | Path | None = No
         fix_cmd="fw-context doctor --fix --only config" if report.removed_keys or migration.removed_keys else None,
         critical=problem is not None,
     )
+
+
+@dataclass
+class ProfileFindings:
+    """What the check ``llm-profile`` found (``profile_findings``), for the check and for its fix.
+
+    ``fix_profile`` is the value that the fix writes to ``[llm] profile``
+    of ``local.toml``: the Ollama profile of this machine, or "" to remove
+    the key (the global default is that profile).  None: nothing to fix.
+    """
+
+    root: Path | None
+    problems: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+    fix_profile: str | None = None
+
+
+def _project_layers(root: Path) -> list[tuple[str, dict]]:
+    """Return the ``[llm]`` table of ``config.toml`` and of ``local.toml`` of *root*, read from the files."""
+    from ..config import settings
+
+    layers = []
+    for file_name in ("config.toml", "local.toml"):
+        path = root / ".fw-context" / file_name
+        try:
+            llm = settings.read_config_file(path).get("llm") if path.is_file() else None
+        except settings.ConfigError:
+            continue  # The check "config" reports the file.
+        layers.append((file_name, llm if isinstance(llm, dict) else {}))
+    return layers
+
+
+def profile_findings(project_root: str | Path | None) -> ProfileFindings:
+    """Find what the check ``llm-profile`` reports (see ``check_llm_profile``)."""
+    from ..config import settings
+    from ..llm.profile_state import cloud_lists, is_ollama, known, ollama_profile_name, unknown_servers
+    from ..utils import resolve_project_root
+
+    try:
+        found_root: Path | None = resolve_project_root(str(project_root) if project_root else None)
+    except OSError:
+        found_root = None
+    if found_root is not None and not (found_root / ".fw-context").is_dir():
+        found_root = None
+    findings = ProfileFindings(found_root)
+    try:
+        llm = settings.read_config_file(settings._GLOBAL_CONFIG_PATH).get("llm") or {}
+    except settings.ConfigError:
+        return findings  # The check "config" reports the file.
+    raw = llm.get("profiles")
+    profiles = {name: p for name, p in raw.items() if isinstance(p, dict)} if isinstance(raw, dict) else {}
+    layers = dict(_project_layers(found_root)) if found_root is not None else {}
+    _embedding_findings(findings, llm, layers)
+    lists = cloud_lists(profiles)
+    unknown = unknown_servers(profiles, lists)
+    if unknown:
+        # Without the list, a cloud model looks like a model of this
+        # machine: a fix could send the code of the project out.
+        findings.notes.append(f"Ollama at {', '.join(unknown)} gives no model list: the check of the Ollama "
+                              "profiles waits for it")
+        return findings
+    cloud = known(lists)
+    machine = ollama_profile_name(llm, cloud)
+    ollama = [name for name, profile in profiles.items() if is_ollama(profile, cloud)]
+    if machine is None and len(ollama) > 1:
+        findings.problems.append(
+            f"the global config has the Ollama profiles {', '.join(ollama)} and selects none as the Ollama profile "
+            "of this machine: run 'fw-context llm default <profile> --ollama'")
+    default = llm.get("profile")
+    if machine is not None and isinstance(default, str) and default in ollama and default != machine:
+        findings.problems.append(
+            f"the global default profile {default!r} is an Ollama profile, and the Ollama profile of this machine "
+            f"is {machine!r}: run 'fw-context llm default {machine} --global', or 'fw-context llm default "
+            f"{default} --ollama'")
+    selected = [(file_name, layer["profile"]) for file_name, layer in layers.items()
+                if isinstance(layer.get("profile"), str) and layer["profile"]]
+    if not selected:
+        return findings
+    file_name, name = selected[-1]
+    profile = profiles.get(name)
+    if profile is None or not is_ollama(profile, cloud) or name == machine:
+        return findings
+    findings.problems.append(
+        f".fw-context/{file_name} selects the Ollama profile {name!r}, and the Ollama profile of this machine is "
+        f"{machine or '(none)'!r}: one model in the memory for each project (use --llm {name} for one run)")
+    if file_name != "local.toml" or machine is None:
+        return findings
+    if not settings._is_loopback_url(_profile_url(profile)) or settings._is_loopback_url(
+            _profile_url(profiles[machine])):
+        findings.fix_profile = _local_value(llm, layers, machine)
+    else:
+        findings.problems.append(
+            f"the fix does not send the code of this project to {_profile_url(profiles[machine])}: select the "
+            f"profile yourself with 'fw-context llm default {machine}'")
+    return findings
+
+
+def _profile_url(profile: dict) -> str:
+    from ..config import settings
+
+    return str(profile.get("url") or settings._DEFAULT_OLLAMA_URL).rstrip("/")
+
+
+def _local_value(llm: dict, layers: dict[str, dict], machine: str) -> str:
+    """Return what ``local.toml`` must hold as ``profile`` so that *machine* applies: "" to remove the key.
+
+    The key goes only when the file below it selects *machine* too:
+    ``config.toml`` of the project, else the global default.  WHY: before,
+    the fix removed the key when the global default was *machine*, and a
+    ``config.toml`` that selects an external profile then sent the code
+    out.
+    """
+    below = (layers.get("config.toml") or {}).get("profile") or llm.get("profile")
+    return "" if below == machine else machine
+
+
+def _embedding_findings(findings: ProfileFindings, llm: dict, layers: dict[str, dict]) -> None:
+    """Report an embedding model of the project that is not the global one: never fixed (a new one embeds again)."""
+    global_embed = llm.get("embed_model")
+    for file_name in ("local.toml", "config.toml"):
+        embed = (layers.get(file_name) or {}).get("embed_model")
+        if isinstance(embed, str) and embed:
+            if isinstance(global_embed, str) and global_embed and embed != global_embed:
+                findings.problems.append(
+                    f"the embedding model of this project is {embed} (.fw-context/{file_name}), of the global "
+                    f"config {global_embed}: the index of the project holds {embed}. To use {global_embed}, "
+                    f"remove embed_model from .fw-context/{file_name}; the next index run embeds each symbol again")
+            return
+
+
+def check_llm_profile(project_root: str | Path | None = None) -> DepCheckResult:
+    """Say if the project uses the Ollama profile of this machine, and the global embedding model.
+
+    One Ollama profile for each machine (decision of the user,
+    2026-10-21; ``llm.profile_state``).  A project that selects another
+    Ollama profile in ``local.toml`` gets a fix: ``local.toml`` then
+    selects the Ollama profile of this machine, or nothing when the file
+    below it selects that profile too (``_local_value``).  The fix never
+    lets an external profile apply, never moves the code of a project from
+    this machine to another computer, and decides nothing while a local
+    Ollama gives no model list (a cloud model then looks like a local
+    one).  A global default that is another Ollama profile is reported.  ``config.toml`` (in git), several Ollama profiles without
+    ``[llm] ollama_profile``, and an embedding model of the project that
+    is not the global one only get a message: the user decides, and a new
+    embedding model embeds each symbol again.  Not critical.
+    """
+    findings = profile_findings(project_root)
+    if not findings.problems:
+        # A note says that a part was not checked: the sentence then claims nothing.
+        message = "; ".join(findings.notes) if findings.notes else (
+            "the project uses the Ollama profile of this machine and the global embedding model")
+        return DepCheckResult(name="llm-profile", status="ok", message=message, critical=False)
+    return DepCheckResult(
+        name="llm-profile", status="degraded", message="; ".join(findings.problems + findings.notes),
+        fix_cmd="fw-context doctor --fix --only llm-profile" if findings.fix_profile is not None else None,
+        critical=False)
 
 
 def check_llm_models() -> DepCheckResult:
@@ -899,6 +1056,7 @@ CHECK_ORDER: list[tuple[str, Any]] = [
     ("tomli-w", check_tomli_w),
     ("config", check_config),
     ("llm-models", check_llm_models),
+    ("llm-profile", check_llm_profile),
     ("ollama", check_ollama_running),
     ("chat-model", check_ollama_chat_model),
     ("embed-model", check_ollama_embed_model),

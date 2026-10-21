@@ -113,3 +113,11 @@ def test_a_subset_reports_a_load_error_that_is_not_a_config_error(tmp_path, monk
     assert results["db-integrity"].status == "error", results
     assert "The project name matches 2 projects" in results["db-integrity"].message
     assert deps.exit_code(list(results.values())) == 2
+
+
+@pytest.fixture(autouse=True)
+def _no_cloud_model_list(monkeypatch):
+    """No request to the Ollama of the operator: the rule of the Ollama profiles asks for the cloud models."""
+    from fw_context_mcp.llm import _diag
+
+    monkeypatch.setattr(_diag, "remote_hosts", lambda url: {})
