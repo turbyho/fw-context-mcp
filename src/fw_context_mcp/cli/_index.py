@@ -1295,6 +1295,7 @@ def _build_run_kwargs(
     ``force_llm_since`` is None here: ``_cmd_index`` sets it from the marker
     of the index, under the index lock (``indexer._force_llm_marker``).
     """
+    from ..indexer._llm_analysis import ContextChoice
     from ..indexer.build import detect_build_system
 
     force_llm = bool(getattr(args, "force_llm", False))
@@ -1321,6 +1322,9 @@ def _build_run_kwargs(
         config_header=cfg.index.config_header,
         force=args.force,
         force_llm_since=None,
+        # A manual run selects the context of the analysis from the free GPU
+        # memory, one time for its builds; the background reindex uses num_ctx.
+        context_choice=None if getattr(args, "background", False) else ContextChoice(),
         analyze_vendor=(
             False
             if getattr(args, "no_analyze_vendor", False)

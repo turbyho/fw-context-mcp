@@ -74,7 +74,7 @@ from ..utils import SAFE_EXCEPT, is_fatal
 from . import _force_llm_marker as force_llm_marker
 from ._dispatch_bridges import _DISPATCH_ENTRY_POINTS
 from ._embedding import _build_embeddings
-from ._llm_analysis import _build_llm_analysis
+from ._llm_analysis import ContextChoice, _build_llm_analysis
 from ._manifest_updater import _backfill_header_source_hashes, _update_manifest_after_index
 from .db import (
     CURRENT_ROW_FORMAT,
@@ -1125,6 +1125,7 @@ def _step_llm_analysis(conn: sqlite3.Connection, ctx: dict) -> None:
         cache_client=cc,
         retry_unparseable=True,
         force_since=ctx["force_llm_since"],
+        context_choice=ctx.get("context_choice"),
     )
     if ctx["force_llm_since"] is not None and not finished:
         force_llm_marker.mark_unfinished(ctx["db_dir"])
@@ -1818,6 +1819,7 @@ def _run_postprocess(
     cache_server_config=None,
     force: bool = False,
     force_llm_since: str | None = None,
+    context_choice: ContextChoice | None = None,
     purge_max_missing_percent: int = 20,
     variant: str = "",
     image: str = "",
@@ -1874,6 +1876,7 @@ def _run_postprocess(
         "cache_server_config": cache_server_config,
         "force": force,
         "force_llm_since": force_llm_since,
+        "context_choice": context_choice,
         "purge_max_missing_percent": purge_max_missing_percent,
         "variant": variant,
         "image": image,

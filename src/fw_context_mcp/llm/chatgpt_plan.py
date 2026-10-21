@@ -679,6 +679,10 @@ class ChatGPTPlanClient:
         """Not known: the API does not tell the context of its model."""
         return None
 
+    def fit_context(self, lower: int, upper: int) -> None:
+        """None: the plan has no GPU of fw-context, thus its context is not a question of memory."""
+        return None
+
     def pull_model(self) -> None:
         """A ChatGPT plan cannot install a model.
 

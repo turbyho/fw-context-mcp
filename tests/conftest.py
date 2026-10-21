@@ -203,7 +203,9 @@ def _isolate_index_dir():
         os.environ["FW_CONTEXT_NO_UPDATE_CHECK"] = "1"
         os.environ["PYTHON_KEYRING_BACKEND"] = "keyring.backends.fail.Keyring"
         # A seventh: no test unloads a model of the Ollama of the operator
-        # (llm.ollama.release_other_model), also in a process that it starts.
+        # (llm.ollama.release_other_model), and no test loads one to select
+        # the context of an analysis (indexer._llm_analysis.ContextChoice),
+        # also in a process that it starts.
         os.environ["FW_CONTEXT_NO_OLLAMA_RELEASE"] = "1"
         keyring.set_keyring(fail.Keyring())
         # The module computed the path at import, before this fixture.

@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from ..cache_client import get_local_cache_db, local_cache_lookup, local_cache_upsert
-from ..llm.client import ChatClient, get_chat_client
+from ..llm.client import ChatClient, ContextFit, get_chat_client
 from ..llm.errors import LLMStopRun
 from ..llm.ollama import OllamaPromptTooLong
 from ..utils import SAFE_EXCEPT, is_fatal, read_file_lines
@@ -198,6 +198,45 @@ def _enrich_batch(conn, batch_rows, config_hash: str, *, project_root: Path | No
         d["body_unavailable"] = body_unavailable
         enriched.append(d)
     return enriched
+
+#: The lower bound of the context that the free GPU memory selects (decision
+#: of the user, 2026-10-21): a smaller context sends too many prompts to the
+#: second pass.
+_LOWEST_CONTEXT = 4096
+
+
+def _context_choice_on() -> bool:
+    """Return False in the test session: the choice loads models into the Ollama of the operator."""
+    from ..llm.ollama import NO_RELEASE_ENV
+
+    return not os.environ.get(NO_RELEASE_ENV)
+
+
+class ContextChoice:
+    """The context of the LLM analysis of one manual run, selected one time (``ChatClient.fit_context``).
+
+    A manual ``fw-context index`` or ``fw-context analyze`` makes one and
+    gives it to each build of the run.  WHY a manual run only: the
+    search loads the model up to 6 times for a context of 16384 and up to
+    8 times for 65536, each load 3 to 10 s, and the background
+    reindex and ``reindex_file`` usually analyse one or two symbols, for
+    which the speed on the GPU does not matter.  WHY one object for the
+    run: a run of several builds (a Zephyr app, mcuboot and stage0) calls
+    ``_build_llm_analysis`` for each build, and nothing that the search
+    measures changes between the builds.
+    """
+
+    def __init__(self) -> None:
+        self._fits: dict[tuple[str, int], ContextFit | None] = {}
+
+    def select(self, client: ChatClient, model: str, upper: int) -> ContextFit | None:
+        """Return the context of *model* below *upper*: searched at the first call, then the same answer."""
+        key = (model, upper)
+        if key not in self._fits:
+            self._fits[key] = (client.fit_context(min(_LOWEST_CONTEXT, upper), upper)
+                               if _context_choice_on() else None)
+        return self._fits[key]
+
 
 # The tokens of the answer (num_predict), and thus the tokens of the context
 # that a prompt must leave free.  Measured with qwen2.5-coder:14b on 14 long
@@ -404,6 +443,7 @@ def _build_llm_analysis(
     cache_client=None,
     retry_unparseable: bool = False,
     force_since: str | None = None,
+    context_choice: ContextChoice | None = None,
 ) -> bool:
     """Generate structured LLM analysis (summary, inputs, outputs) for each
     project-definition symbol using Ollama, one symbol per request.
@@ -503,20 +543,27 @@ def _build_llm_analysis(
     released = False
 
     def _before_the_first_request() -> None:
-        """Unload the embedding model before the first request of the chat model: the count of tokens or a generate.
+        """Unload the embedding model, then select the context from the free GPU memory: before the first request.
 
         Lazy: a run whose analyses come from the cache keeps the embedding
-        model loaded for the next query.  WHY before the count too: the count
-        loads the chat model, and a model loaded beside the embedding model
-        keeps the split of the GPU that it got.
+        model loaded for the next query, and loads nothing.  WHY before the
+        count too: the count loads the chat model, and a model loaded beside
+        the embedding model keeps the split of the GPU that it got.  With a
+        *context_choice* (a manual run), the context of the run is the
+        upper bound (``num_ctx``); the first pass uses the selected one,
+        the second pass (long prompts) its own larger one.
         """
-        nonlocal released
+        nonlocal released, run_ctx
         if released:
             return
         released = True
         from ..llm.ollama import release_other_model
 
         release_other_model(llm_config, "analysis")
+        fit = context_choice.select(client, llm_config.model, run_ctx) if context_choice is not None else None
+        if fit is not None:
+            run_ctx = fit.num_ctx
+            log.info("LLM analysis: %s", fit.reason)
 
     def _count_tokens(prompt: str) -> int:
         """Count the tokens of *prompt*; a failed request goes again, three times in all, as a call of the model."""

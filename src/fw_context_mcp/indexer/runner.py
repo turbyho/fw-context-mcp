@@ -40,7 +40,7 @@ from ._embedding import (
     _cleanup_orphaned_cc_artifacts,
     _fmt_dur,
 )
-from ._llm_analysis import _fetch_callees, _fetch_referencers
+from ._llm_analysis import ContextChoice, _fetch_callees, _fetch_referencers
 from ._postprocess import (
     _build_hotspot_cache,
     _build_overrides,
@@ -688,6 +688,7 @@ def run(
     cache_server_config=None,
     force: bool = False,
     force_llm_since: str | None = None,
+    context_choice: ContextChoice | None = None,
     index_macros_expanded: bool = True,
     config_header: str = "",
     build_dir_patterns: list[str] | None = None,
@@ -752,6 +753,9 @@ def run(
             command (UTC, ``YYYY-MM-DD HH:MM:SS``).  The LLM analysis of
             each symbol is made again, and an analysis of the caches from
             before it does not apply.  ``force`` alone keeps the analyses.
+        context_choice: The context of the LLM analysis from the free GPU
+            memory, one for the builds of a manual run
+            (``_llm_analysis.ContextChoice``).  None: ``num_ctx``.
         transient_defines: ``[index] transient_defines`` — the ``-D`` macros
             that the config_hash and the flags hash of each unit ignore.  The
             CLI passes the value of the config.  The default is the default
@@ -1419,6 +1423,7 @@ def run(
         cache_server_config=cache_server_config,
         force=force,
         force_llm_since=force_llm_since,
+        context_choice=context_choice,
         purge_max_missing_percent=purge_max_missing_percent,
         variant=variant,
         image=image,

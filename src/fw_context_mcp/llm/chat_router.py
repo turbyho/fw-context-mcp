@@ -524,6 +524,10 @@ class OpenAIChatClient:
         """Not known: the API does not tell the context of its model."""
         return None
 
+    def fit_context(self, lower: int, upper: int) -> None:
+        """None: an API has no GPU of fw-context, thus its context is not a question of memory."""
+        return None
+
     def pull_model(self) -> None:
         """An OpenAI-compatible API cannot install a model.
 

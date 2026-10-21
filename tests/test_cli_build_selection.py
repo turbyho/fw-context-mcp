@@ -544,3 +544,19 @@ def test_db_delete_makes_no_new_index_when_the_index_went_away_meanwhile(two_bui
 
     assert cmd_db_delete(args) == 1
     assert not db_path.exists()
+
+
+def test_analyze_gives_one_choice_of_the_context_to_each_build(two_builds, monkeypatch):  # noqa: F811
+    """Nothing that the search of the context measures changes between the builds of one run."""
+    import fw_context_mcp.indexer._llm_analysis as llm_mod
+    from fw_context_mcp.cli._export import cmd_analyze
+
+    root, _db_path = two_builds
+    _enable_llm(root)
+    choices: list[object] = []
+    monkeypatch.setattr(llm_mod, "_build_llm_analysis",
+                        lambda conn, config_hash, *a, **k: choices.append(k["context_choice"]) or True)
+    args = argparse.Namespace(project=str(root), verbose=False, analyze_vendor=False, no_analyze_vendor=False)
+
+    assert cmd_analyze(args) == 0
+    assert len(choices) == 2 and isinstance(choices[0], llm_mod.ContextChoice) and choices[0] is choices[1]

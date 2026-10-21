@@ -527,3 +527,71 @@ def test_the_embedding_model_is_released_once_before_the_first_request(populated
     calls.clear()
     _run(populated_db, tmp_path)  # each analysis is current: no request
     assert calls == []
+
+
+@pytest.fixture
+def choice_on(monkeypatch):
+    """The session turns the choice off (conftest): these tests turn it on, with a client that selects 6144."""
+    from fw_context_mcp.llm import ollama
+    from fw_context_mcp.llm.client import ContextFit
+
+    monkeypatch.delenv(ollama.NO_RELEASE_ENV, raising=False)
+    monkeypatch.setattr(ollama, "release_other_model", lambda cfg, phase: None)
+    model = _Model()
+    model.asked = []
+    model.fit_context = lambda lower, upper: model.asked.append((lower, upper)) or ContextFit(6144, 1.0, "context 6144")
+    model.counted = []
+    count = model.count
+    model.count = lambda prompt, num_ctx: model.counted.append(num_ctx) or count(prompt, num_ctx)
+    model.install(monkeypatch)
+    # A context of the run above the lower bound of 4096: the search goes from 4096.
+    monkeypatch.setattr(mod, "_analysis_contexts", lambda client, cfg: (8000, LARGEST_CTX))
+    return model
+
+
+def _seed_new(conn, tmp_path: Path, prefix: str) -> None:
+    """Symbols of their own: the LLM cache of the session holds the analyses of the names of other tests."""
+    _seed(conn, tmp_path, {f"{prefix}_{i}": _body(f"{prefix}_{i}", 3) for i in range(3)})
+
+
+def test_the_first_pass_uses_the_context_that_the_free_gpu_memory_selects(populated_db, tmp_path: Path, choice_on):
+    _seed_new(populated_db, tmp_path, "fit_first")
+
+    _run(populated_db, tmp_path, context_choice=mod.ContextChoice())
+
+    assert choice_on.asked == [(4096, 8000)], "one choice for the run, from the lower bound to num_ctx"
+    assert {num_ctx for _prompt, num_ctx, _max in choice_on.calls} == {6144}
+    assert set(choice_on.counted) == {6144}, "the count of the tokens uses the selected context too"
+
+
+def test_the_builds_of_one_run_share_one_choice(populated_db, tmp_path: Path, choice_on):
+    """`analyze` and an index run call the analysis for each build: nothing that the search measures changes."""
+    choice = mod.ContextChoice()
+    _seed_new(populated_db, tmp_path, "fit_app")
+    _run(populated_db, tmp_path, context_choice=choice)
+    _seed_new(populated_db, tmp_path, "fit_boot")
+
+    _run(populated_db, tmp_path, context_choice=choice)
+
+    assert choice_on.asked == [(4096, 8000)]
+    assert {num_ctx for _prompt, num_ctx, _max in choice_on.calls} == {6144}
+
+
+def test_a_run_whose_analyses_come_from_the_cache_selects_nothing(populated_db, tmp_path: Path, choice_on):
+    _seed_new(populated_db, tmp_path, "fit_cached")
+    _run(populated_db, tmp_path, context_choice=mod.ContextChoice())
+    choice_on.asked.clear()
+
+    _run(populated_db, tmp_path, context_choice=mod.ContextChoice())  # each analysis is current: no request
+
+    assert choice_on.asked == []
+
+
+def test_a_run_without_a_choice_uses_num_ctx(populated_db, tmp_path: Path, choice_on):
+    """The background reindex and reindex_file: few symbols, thus no search of 2 to 6 loads."""
+    _seed_new(populated_db, tmp_path, "fit_none")
+
+    _run(populated_db, tmp_path)
+
+    assert choice_on.asked == []
+    assert {num_ctx for _prompt, num_ctx, _max in choice_on.calls} == {8000}

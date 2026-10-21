@@ -250,3 +250,17 @@ def test_the_status_counts_the_analyses_of_each_model(populated_db, tmp_path):
     summary = make_analysis_summary({"project": {"total": 0, "analyzed": 0, "skipped": 0},
                                      "vendor": {"total": 0, "analyzed": 0, "skipped": 0}}, False, models)
     assert (summary["model"], summary["models"]) == ("a:1b", {"a:1b": 2, "b:2b": 1})
+
+
+@pytest.mark.parametrize(("background", "chooses"), [(False, True), (True, False)],
+                         ids=["manual run", "background run"])
+def test_only_a_manual_index_run_selects_the_context_of_the_analysis(cfg, tmp_path: Path, background, chooses):
+    """The search loads the model up to 6 times: the background run usually analyses one or two symbols."""
+    from fw_context_mcp.cli._index import _build_run_kwargs
+    from fw_context_mcp.indexer._llm_analysis import ContextChoice
+
+    args = argparse.Namespace(name=None, no_refs=False, force=False, background=background)
+
+    kwargs = _build_run_kwargs(args, cfg, tmp_path, "id", [], [], None)
+
+    assert isinstance(kwargs["context_choice"], ContextChoice) is chooses

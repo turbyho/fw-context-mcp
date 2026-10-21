@@ -270,7 +270,7 @@ def _analyze_builds(
     waited for can have replaced a build.
     """
     from ..indexer import _force_llm_marker as force_llm_marker
-    from ..indexer._llm_analysis import _build_llm_analysis
+    from ..indexer._llm_analysis import ContextChoice, _build_llm_analysis
     from ..indexer._postprocess import _build_overrides
     from ..indexer.db import open_db, set_analyze_vendor
     from ._builds import label, selected_builds
@@ -313,7 +313,9 @@ def _analyze_builds(
 
         # Each build without options, as a reindex does: the analysis is
         # content-addressed, thus a symbol that one build already
-        # analysed is not sent to the model again.
+        # analysed is not sent to the model again.  One choice of the
+        # context for the builds (``ContextChoice``).
+        choice = ContextChoice()
         for build in builds:
             config_hash = build["config_hash"]
             finished = _build_llm_analysis(
@@ -326,6 +328,7 @@ def _analyze_builds(
                 cache_client=cc,
                 retry_unparseable=True,
                 force_since=force_since,
+                context_choice=choice,
             )
             if force_llm and not finished:
                 force_llm_marker.mark_unfinished(db_path.parent)

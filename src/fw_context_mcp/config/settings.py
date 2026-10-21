@@ -198,7 +198,9 @@ analyze_symbols = true
 #   timeout      seconds for one request (default 600)
 #   stream       true: stream the answer, for a server behind a proxy (default false)
 #   Ollama only:
-#     num_ctx         the context of a request in tokens (default 16384)
+#     num_ctx         the context of a request in tokens (default 16384).  A
+#                     manual index or analyze run uses it as the upper limit,
+#                     and selects a context that fits the free GPU memory
 #     keep_alive      how long the model stays loaded after a request (default "10m")
 #     auto_pull       true: pull a model that is not installed (default false)
 #     max_concurrent  Ollama requests at the same time in one process (default 1)

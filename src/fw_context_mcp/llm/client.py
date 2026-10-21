@@ -107,6 +107,30 @@ class ChatClient(Protocol):
         """
         ...
 
+    def fit_context(self, lower: int, upper: int) -> ContextFit | None:
+        """Select the context of a run from *lower* to *upper* from the free GPU memory; None for an API.
+
+        The largest context at which the model is all on the GPU, *lower*
+        with its GPU share when the model does not fit at *lower*, or
+        *upper* when the server does not tell the share.  A backend
+        without a GPU of its own (an API) returns None: its context is
+        not a question of memory.
+        """
+        ...
+
+
+@dataclass(frozen=True)
+class ContextFit:
+    """The context of a run from the free GPU memory (``OllamaClient.fit_context``).
+
+    ``gpu_share`` is the part of the model on the GPU (1.0: all), None
+    when the server does not tell it; ``reason`` is the sentence for the log.
+    """
+
+    num_ctx: int
+    gpu_share: float | None
+    reason: str
+
 
 def get_chat_client(cfg: LLMConfig) -> ChatClient:
     """Return the chat client for *cfg*.

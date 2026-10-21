@@ -662,7 +662,13 @@ symbols become searchable by their purpose, not only by their name.
 Configure with `[llm] analyze_symbols` and `[llm] analyze_vendor` in
 `~/.fw-context/config.toml`. The chat model and `num_ctx` are keys of the
 selected LLM profile (`[llm.profiles.<name>]`, see
-[Configuration](configuration.md)).
+[Configuration](configuration.md)). With an `ollama` profile, `num_ctx` is
+the upper limit of a manual `fw-context index` or `fw-context analyze`:
+before its first request, the run selects the largest context at which the
+model is fully in the free GPU memory, and writes it to the log. The
+context is at least 4096 tokens, or `num_ctx` when it is smaller. A
+multimodal or a MoE model, and a machine without a GPU, keep `num_ctx`,
+see [Configuration](configuration.md).
 
 ### The LLM profile of one run
 
