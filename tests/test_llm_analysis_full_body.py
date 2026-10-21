@@ -497,3 +497,33 @@ def test_a_refusal_of_each_request_stops_the_run_after_one_symbol(populated_db, 
 
     assert len(model.calls) == 1, "the run must stop at the first refusal, without a retry"
     assert _models(populated_db) == {}, "no symbol gets a sentinel: a later run continues"
+
+
+def test_the_embedding_model_is_released_once_before_the_first_request(populated_db, monkeypatch, tmp_path: Path):
+    """Lazy: a run whose analyses come from the cache keeps the embedding model for the next query."""
+    from fw_context_mcp.llm import ollama
+
+    phases: list[str] = []
+    monkeypatch.setattr(ollama, "release_other_model", lambda cfg, phase: phases.append(phase))
+    model = _Model()
+    model.install(monkeypatch)
+    _seed(populated_db, tmp_path, {f"fn_{i}": _body(f"fn_{i}", 3) for i in range(3)})
+
+    calls: list[str] = []
+    original = model.reply
+
+    def _reply(prompt, **kwargs):
+        calls.append("generate")
+        return original(prompt, **kwargs)
+
+    model.answer = _reply
+    count = model.count
+    model.count = lambda prompt, num_ctx: calls.append("count") or count(prompt, num_ctx)
+    monkeypatch.setattr(ollama, "release_other_model", lambda cfg, phase: calls.append(f"release:{phase}"))
+
+    _run(populated_db, tmp_path)
+    assert calls[0] == "release:analysis" and calls.count("release:analysis") == 1, calls
+
+    calls.clear()
+    _run(populated_db, tmp_path)  # each analysis is current: no request
+    assert calls == []

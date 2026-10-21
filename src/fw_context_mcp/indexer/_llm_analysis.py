@@ -500,9 +500,27 @@ def _build_llm_analysis(
     long_prompts: list[_LongPrompt] = []
     # The symbols that got neither an analysis nor a sentinel.
     failed = 0
+    released = False
+
+    def _before_the_first_request() -> None:
+        """Unload the embedding model before the first request of the chat model: the count of tokens or a generate.
+
+        Lazy: a run whose analyses come from the cache keeps the embedding
+        model loaded for the next query.  WHY before the count too: the count
+        loads the chat model, and a model loaded beside the embedding model
+        keeps the split of the GPU that it got.
+        """
+        nonlocal released
+        if released:
+            return
+        released = True
+        from ..llm.ollama import release_other_model
+
+        release_other_model(llm_config, "analysis")
 
     def _count_tokens(prompt: str) -> int:
         """Count the tokens of *prompt*; a failed request goes again, three times in all, as a call of the model."""
+        _before_the_first_request()
         for _c_attempt in range(3):
             try:
                 return client.count_tokens(prompt, run_ctx)
@@ -522,6 +540,7 @@ def _build_llm_analysis(
                 caller sends it again with a larger context.
         """
         nonlocal failed
+        _before_the_first_request()
         response = None
         _last_exc: BaseException | None = None
         for _a_attempt in range(3):

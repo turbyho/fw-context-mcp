@@ -600,6 +600,14 @@ def _build_embeddings(
     # Suppress httpx INFO logs (one per batch — noisy during embedding)
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
+    # The chat model of the analysis holds the GPU memory for its
+    # keep_alive: the embedding model must get it.  Before get_embedder:
+    # its first property (max_tokens) sends an embedding request, which
+    # loads the model.  Here and not in a step: reindex_file (MCP) calls
+    # this function too.
+    from ..llm.ollama import release_other_model
+
+    release_other_model(llm_config, "embeddings")
     embedder = get_embedder(llm_config)
 
     from ..llm.auto_model import _model_installed

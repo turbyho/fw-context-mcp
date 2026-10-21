@@ -63,6 +63,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import os
 import re
 import shlex
 import sys
@@ -362,6 +363,7 @@ class OllamaClient:
             OllamaPromptTooLong: The prompt has more tokens than the context.
             OllamaError: Each other failure of the network or the server.
         """
+        note_chat_use(self.server_url, self.cfg.model)
         cfg = self.cfg
         _tell_cloud_model(cfg, self.server_url)
         options: dict = {"num_ctx": num_ctx if num_ctx is not None else cfg.num_ctx, "temperature": temperature}
@@ -512,6 +514,7 @@ class OllamaClient:
         Raises:
             OllamaError: The request failed.
         """
+        note_chat_use(self.server_url, self.cfg.model)
         cfg, url = self.cfg, self.generate_url
         payload = {
             "model": cfg.model, "prompt": prompt, "stream": False, "truncate": False,
@@ -734,6 +737,116 @@ def call_ollama_embed(inputs: list[str], cfg: LLMConfig, *, query: bool = True) 
     from .auto_model import resolve_embed_model
     resolve_embed_model(cfg)
     return _call_ollama_embed_impl(inputs, cfg, query=query)
+
+
+#: Set in the test session (conftest), also for each process that a test
+#: starts: a test must not unload a model of the Ollama of the operator.
+NO_RELEASE_ENV = "FW_CONTEXT_NO_OLLAMA_RELEASE"
+
+#: The (server, chat model) pairs that this process sent requests to.  The
+#: release before the embeddings unloads only such a model: a model that
+#: another project or another client uses is not ours to unload.
+_chat_used: set[tuple[str, str]] = set()
+
+#: How long a release waits until ``/api/ps`` no longer lists the model.
+_RELEASE_WAIT_S = 10.0
+
+
+def _with_tag(model: str) -> str:
+    """Return *model* with its tag: ``/api/ps`` names ``nomic-embed-text`` as ``nomic-embed-text:latest``.
+
+    The tag follows the last ``/``: in ``host:5000/team/model`` the colon
+    is of the port.
+    """
+    return model if ":" in model.rsplit("/", 1)[-1] else f"{model}:latest"
+
+
+def loaded_models(server_url: str) -> list[str] | None:
+    """Return the models that the Ollama server holds in memory (``/api/ps``), or None when it gives no list."""
+    try:
+        resp = httpx.get(server_url.rstrip("/") + "/api/ps", timeout=5.0)
+        resp.raise_for_status()
+        body = resp.json()
+    except (httpx.HTTPError, ValueError):
+        return None
+    models = body.get("models") if isinstance(body, dict) else None
+    if not isinstance(models, list):
+        return [] if isinstance(body, dict) and body.get("models") is None else None
+    names = [m.get("name") or m.get("model") for m in models if isinstance(m, dict)]
+    return [name for name in names if isinstance(name, str) and name]
+
+
+def note_chat_use(server_url: str, model: str) -> None:
+    """Record that this process sent a chat request to *model* on *server_url* (see ``_chat_used``)."""
+    _chat_used.add((server_url.rstrip("/"), _with_tag(model)))
+
+
+def release_model(server_url: str, model: str) -> bool | None:
+    """Ask the Ollama server to unload *model*; True when ``/api/ps`` no longer lists it.
+
+    None: the server did not hold the model, or gave no list (nothing to
+    do).  False: the server still holds it after ``_RELEASE_WAIT_S``.
+    ``keep_alive: 0`` of ``/api/generate`` unloads a chat model and an
+    embedding model (measured with Ollama 0.35.1, 2026-10-21).  A release
+    is not certain: a request of another client can load the model again
+    at once.
+    """
+    name = _with_tag(model)
+    held = loaded_models(server_url)
+    if held is None or name not in held:
+        return None
+    try:
+        resp = httpx.post(server_url.rstrip("/") + "/api/generate", json={"model": name, "keep_alive": 0},
+                          timeout=30.0)
+    except httpx.HTTPError as exc:
+        log.info("Ollama at %s: the release of %s failed: %s", server_url, name, type(exc).__name__)
+        return False
+    if resp.status_code >= 400:
+        log.info("Ollama at %s: the release of %s got HTTP %d", server_url, name, resp.status_code)
+        return False
+    deadline = time.monotonic() + _RELEASE_WAIT_S
+    while time.monotonic() < deadline:
+        held = loaded_models(server_url)
+        if held is not None and name not in held:
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def release_other_model(cfg: LLMConfig, phase: str) -> None:
+    """Before *phase* (``"analysis"`` or ``"embeddings"``), unload the model of the other phase from Ollama.
+
+    Only when the chat and the embeddings use one Ollama server: they then
+    share its GPU memory, and a model that ``keep_alive`` holds (10 min by
+    default) leaves the next model only the rest (measured 2026-10-20: a
+    model of 3.5 GB ran 45 % on the GPU after three other models).  A chat
+    on an API, or on another server, shares nothing.  A model that stays
+    gives a warning, not an error: the run goes on, slower.
+    """
+    if os.environ.get(NO_RELEASE_ENV) or cfg.provider != "ollama" or not cfg.embed_model:
+        return
+    from .chat_router import chat_ollama_server
+    from .embedder_factory import uses_ollama
+
+    server = chat_ollama_server(cfg)
+    if not uses_ollama(cfg) or not server or server.rstrip("/") != cfg.ollama_url.rstrip("/"):
+        return
+    if phase == "analysis":
+        model = cfg.embed_model
+    else:
+        # Only a chat model that this process used: else a run without an
+        # analysis unloaded the model of another project or client.
+        key = (server.rstrip("/"), _with_tag(cfg.model))
+        if key not in _chat_used:
+            return
+        _chat_used.discard(key)
+        model = cfg.model
+    result = release_model(server, model)
+    if result is True:
+        log.info("Ollama: released %s before the %s (the GPU memory goes to the next model)", model, phase)
+    elif result is False:
+        log.warning("Ollama at %s still holds %s before the %s: the next model gets less GPU memory",
+                    server, model, phase)
 
 
 def _trained_context(base: str, model: str) -> int | None:

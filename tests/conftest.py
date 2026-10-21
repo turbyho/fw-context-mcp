@@ -187,7 +187,7 @@ def _isolate_index_dir():
 
     names = (
         "FW_CONTEXT_INDEX_DIR", "FW_CONTEXT_PROJECTS_DB", "FW_CONTEXT_CLANG_RESOURCE_DIR", "FW_CONTEXT_HOME",
-        "FW_CONTEXT_NO_UPDATE_CHECK", "PYTHON_KEYRING_BACKEND",
+        "FW_CONTEXT_NO_UPDATE_CHECK", "PYTHON_KEYRING_BACKEND", "FW_CONTEXT_NO_OLLAMA_RELEASE",
     )
     prev = {name: os.environ.get(name) for name in names}
     prev_global = settings._GLOBAL_CONFIG_PATH
@@ -202,6 +202,9 @@ def _isolate_index_dir():
         os.environ["FW_CONTEXT_HOME"] = str(home)
         os.environ["FW_CONTEXT_NO_UPDATE_CHECK"] = "1"
         os.environ["PYTHON_KEYRING_BACKEND"] = "keyring.backends.fail.Keyring"
+        # A seventh: no test unloads a model of the Ollama of the operator
+        # (llm.ollama.release_other_model), also in a process that it starts.
+        os.environ["FW_CONTEXT_NO_OLLAMA_RELEASE"] = "1"
         keyring.set_keyring(fail.Keyring())
         # The module computed the path at import, before this fixture.
         settings._GLOBAL_CONFIG_PATH = home / "config.toml"
