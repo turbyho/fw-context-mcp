@@ -533,7 +533,10 @@ def _local_ollama_profile(
     gpu = _gpu_available()
     recommendation = recommended_local_model(machine_memory())
     chat_recommended = recommendation.model
-    embed_recommended = "qwen3-embedding:8b" if gpu else "qwen3-embedding:0.6b"
+    # 4b and not the automatic 8b: the same quality, less VRAM and smaller
+    # vectors (auto_model, measured 2026-10-21).  The setup is a choice of the
+    # user; the automatic default does not change under an existing index.
+    embed_recommended = "qwen3-embedding:4b" if gpu else "qwen3-embedding:0.6b"
     sources = llm_key_sources(project_root) if project_root is not None else {}
     chat_server = chat_ollama_server(cfg.llm) if cfg.llm.provider == "ollama" else None
     ollama_profile = (

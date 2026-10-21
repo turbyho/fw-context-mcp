@@ -13,8 +13,7 @@ at first embed time by ``OllamaEmbedder``.
 WHY auto-detect: The default config ships with ``embed_model = ""``.
 First-time setup should "just work" without asking the operator to
 choose an embedding model.  Auto-detect picks a reasonable default
-based on GPU availability — larger model (8B, better quality) for
-GPU, smaller model (0.6B, lower RAM) for CPU.
+based on GPU availability — 8B for GPU, 0.6B (lower RAM) for CPU.
 
 WHY best-effort pull: The nvidia-smi check and Ollama API probes are
 fast (<3s combined).  If either fails (no network, Ollama not running),
@@ -43,6 +42,15 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 _DEFAULT_CPU_MODEL = "qwen3-embedding:0.6b"
+# Measured 2026-10-21 on 748 queries of 6 firmware projects (plans/eval/
+# embed-models-2026-10-21): with the query format of the model card,
+# qwen3-embedding:4b has the quality of 8b (MRR@10 0.691 against 0.682) with
+# 3.4 against 5.7 GB of VRAM and 2560 against 4096 dimensions, and was
+# faster on the project that timed each model.  WHY the default stays 8b:
+# a machine on which init saved no model would change the model at its next
+# load, and each search would find no vectors until the next index run.  The
+# setup recommends 4b (cli._init_interactive).  0.6b: 0.619, the model
+# without a GPU.
 _DEFAULT_GPU_MODEL = "qwen3-embedding:8b"
 
 # Cache: once resolved, reuse across all config loads within the same process.

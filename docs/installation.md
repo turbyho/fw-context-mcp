@@ -418,7 +418,7 @@ ollama pull qwen3-coder:480b-cloud   # coding-focused, top quality
 # (default), fw-context selects qwen3-embedding:8b on a machine with a GPU,
 # and qwen3-embedding:0.6b without one. auto_pull of an LLM profile is false
 # by default, so pull the model yourself:
-ollama pull qwen3-embedding:0.6b     # or qwen3-embedding:8b with a GPU
+ollama pull qwen3-embedding:0.6b     # or qwen3-embedding:8b with a GPU (4b: the same quality, less VRAM)
 
 # Verify
 ollama run qwen2.5-coder:14b "Explain: void uart_init(int baudrate)"

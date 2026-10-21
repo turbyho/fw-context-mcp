@@ -172,13 +172,13 @@ profile = "local"
 # Set explicitly below to override.
 # Pull with:  ollama pull <model>
 #
-# ── CPU-only, 32K context (~400 MB), 4096-d vectors ──
+# ── CPU-only, 32K context (~0.6 GB), 1024-d vectors ──
 # embed_model = "qwen3-embedding:0.6b"
 #
-# ── CPU/GPU, 32K context (~2.4 GB), 5120-d vectors ──
+# ── GPU, 40K context (~2.5 GB), 2560-d vectors: the same quality as 8b, faster ──
 # embed_model = "qwen3-embedding:4b"
 #
-# ── GPU, 8K context (~4.7 GB), 4096-d vectors ──
+# ── GPU, 40K context (~4.7 GB), 4096-d vectors: the default with a GPU ──
 # embed_model = "qwen3-embedding:8b"
 #
 # ── Custom query/doc prompts (auto-detected per model, override if needed) ──
@@ -364,13 +364,13 @@ _PROJECT_LOCAL_DEFAULTS_TEMPLATE = """\
 # Set explicitly below to override.
 # Pull with:  ollama pull <model>
 #
-# ── CPU-only, 32K context (~400 MB), 4096-d vectors ──
+# ── CPU-only, 32K context (~0.6 GB), 1024-d vectors ──
 # embed_model = "qwen3-embedding:0.6b"
 #
-# ── CPU/GPU, 32K context (~2.4 GB), 5120-d vectors ──
+# ── GPU, 40K context (~2.5 GB), 2560-d vectors: the same quality as 8b, faster ──
 # embed_model = "qwen3-embedding:4b"
 #
-# ── GPU, 8K context (~4.7 GB), 4096-d vectors ──
+# ── GPU, 40K context (~4.7 GB), 4096-d vectors: the default with a GPU ──
 # embed_model = "qwen3-embedding:8b"
 #
 # ── Custom query/doc prompts (auto-detected per model, override if needed) ──
