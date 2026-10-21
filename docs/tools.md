@@ -510,7 +510,7 @@ then shows a menu. The backend keys are `enabled`, `profile`,
   else the profile `local`. `.fw-context/local.toml` then selects the
   profile, and gets the embedding model.
 - Option 2 (LLM services) runs the setup of
-  [`fw-context llm setup`](#fw-context-llm-setup-list-test-default-remove):
+  [`fw-context llm setup`](#fw-context-llm-setup-list-test-default-remove-recommend):
   the list of the services, their profiles, a test of each new profile,
   and the profile of the project.
 - Option 3 sets `[llm] analyze_symbols = false` in
@@ -904,6 +904,13 @@ without `config` does not repair the config files.
 - `chat-model` — the chat model is installed on the Ollama server of the
   chat calls. `skipped` when an OpenAI-compatible API runs the chat model.
 - `embed-model` — the embedding model is installed on the Ollama server.
+- `llm-recommend` — no local model of the list is better than the chat
+  model and the embedding model of the config (see
+  [The recommendation of a model](configuration.md#the-recommendation-of-a-model)).
+  `fw-context doctor` measures each installed model without a stored
+  speed on the Ollama of this machine; `check_dependencies` only reads the
+  stored speeds. Not critical, no fix: select the model with
+  `fw-context llm setup`.
 - `db-integrity` — `PRAGMA quick_check` of the index database. When it
   finds damage, the check runs `PRAGMA integrity_check`.
 - `obsolete-files` — the files, directories and config keys of an older
@@ -1036,7 +1043,7 @@ Starting new daemon...
 Daemon restarted successfully.
 ```
 
-### `fw-context llm setup`, `list`, `test`, `default`, `remove`
+### `fw-context llm setup`, `list`, `test`, `default`, `remove`, `recommend`
 
 Set up and manage the LLM profiles. The profiles are in the global
 config; a project selects one. See
@@ -1049,6 +1056,7 @@ fw-context llm test <profile>            # a request without code
 fw-context llm default <profile>         # the profile of this project (local.toml)
 fw-context llm default <profile> --global  # the profile of each project that selects none
 fw-context llm remove <profile>          # the profile, its own key, its ChatGPT sign-in
+fw-context llm recommend [--again]       # measure the local models, recommend a chat and an embedding model
 ```
 
 - `setup` asks questions, thus it needs a terminal. In a project it also
@@ -1060,6 +1068,11 @@ fw-context llm remove <profile>          # the profile, its own key, its ChatGPT
 - `default` without `--global` writes `[llm] profile` to
   `.fw-context/local.toml` and sends a test request; a failed test puts
   the old file back.
+- `recommend` prints a table of the chat models and of the embedding
+  models of the list: the quality, the measured speed or the estimate,
+  and the recommended model (see
+  [The recommendation of a model](configuration.md#the-recommendation-of-a-model)).
+  `--again` measures each installed model again.
 - `remove` refuses a profile that `[llm] profile` or `[llm] embed_profile`
   of the global config selects. The key of a provider
   (`provider:<name>`) stays, because the other profiles of that provider

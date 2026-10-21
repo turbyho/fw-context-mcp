@@ -50,7 +50,7 @@ The setup of the LLM services (option 2, and `fw-context llm setup`) does these 
 
 The local Ollama service writes the profile of the Ollama of this machine: the selected profile only when it is such a profile, else `local`. The setup does not ask for the embedding model: it belongs to the project (option 1 of the LLM step of `init`). Ctrl-C stops the setup; it does not answer the question with its default.
 
-The recommended local model comes from the memory of the machine: `gemma4:26b` with a 12 GB GPU, `gemma4:12b` with an 8 GB GPU, `qwen3-coder:30b` (a MoE model, usable on the CPU) with less GPU memory and 32 GiB of RAM or more, else `qwen2.5-coder:7b`. These values come from a measurement on C and C++ firmware. You select the model.
+The recommended local models come from the list of the models and the speed of each model on this machine (see [The recommendation of a model](#the-recommendation-of-a-model)). The setup shows a table of the models, and asks before it measures the installed models. You select the model.
 
 A cloud model of Ollama (`<model>:cloud`) runs on `ollama.com`, although its server is the local Ollama. fw-context reads the host from the model list of the server (`remote_host`), and tells that the source code leaves the machine.
 
@@ -298,7 +298,7 @@ fingerprint = "b82e286eb5d0770b"
 
 | Key | Description |
 |-----|-------------|
-| `quality` | For the LLM analysis: the blind grade 1–5 of the LLM analysis of C/C++ symbols, from the benchmark of fw-context. It is not the result of a public benchmark: a model can be good at other tasks and weak at the analysis of firmware. For the embeddings: the quality of the search, when a benchmark gives it. |
+| `quality` | For the LLM analysis: the blind grade 1–5 of the LLM analysis of C/C++ symbols, from the benchmark of fw-context. It is not the result of a public benchmark: a model can be good at other tasks and weak at the analysis of firmware. For the embeddings: MRR@10 (0–1) of the search of 748 queries with a known target symbol on 6 firmware projects. The two scales are not comparable. |
 | `quality_source` | The benchmark of `quality`: its date, the version of the prompt and the number of symbols. |
 | `weights_gb` | The size of the model file, in GB (10^9 bytes): the memory of the weights. The context needs more (the KV cache). |
 | `moe` | `true` for a mixture-of-experts model: it uses few experts for each token, thus it is usable from the RAM. |
@@ -319,6 +319,22 @@ When a new release of fw-context has a new list, `fw-context doctor` reports it 
 - An entry of fw-context that the new release does not have is removed when you did not change it. When you changed it, it stays, and the report names it.
 
 A removed entry of fw-context comes back with the next `doctor --fix`: fw-context cannot tell a removed entry from one that is not added yet. To take a model out, set `enabled = false`. Thus a removal is also the way back to the values of fw-context for an entry that you changed. Each change counts, also a removed key or a value of the wrong type. A value of the wrong type or an unknown key gives a warning, and fw-context does not use that value. A project file cannot hold the list: the warning asks you to move it to the global config. `fw-context doctor --fix` and `fw-context init` write the list only when the result is valid TOML with each entry in its table. For a shape that they cannot change (an inline `[llm]`, a `[llm.models]` that is not a table of entries), they write nothing there and report it.
+
+#### The recommendation of a model
+
+`fw-context llm recommend`, the setup of a local Ollama, and the check `llm-recommend` of `fw-context doctor` recommend a chat model and an embedding model. The candidates are the entries of `[llm.models]` and `[llm.embed_models]` with a `quality`, without `enabled = false` and without `remote = true`.
+
+The rule has two bands. The quality comes first, and the speed decides between models of the same quality:
+
+1. The band of the quality holds each model whose quality is at most a tolerance below the best quality: 0.2 for the chat models, 0.03 for the embedding models. A smaller difference is in the noise of the benchmark.
+2. The band of the speed holds each model whose time for each symbol is at most 25 % more than the time of the fastest model in the band of the quality. Thus such a model is at most 20 % slower.
+3. The recommendation is the model with the best quality in the band of the speed.
+
+- **Speed.** For an installed model, fw-context measures the time of a typical symbol: for a chat model, the reference request of the calibration at a context of 4096, for an embedding model, a batch of 10 reference documents. It stores the time in `llm_calibration.json`. A calibration of the model at a lower limit of 4096 gives the time without a new measurement. `fw-context llm recommend --again` measures each installed model again, for example after another program used the GPU memory during a measurement.
+- **Estimate.** A model without a time gets an estimate: a model that is not installed, and an installed model that is not measured (the MCP tool, or a measurement that you declined). fw-context estimates from its `weights_gb` where it runs: on the GPU when the weights fit in the GPU memory less 4 GiB (the KV cache, the buffers of llama.cpp, the desktop), else in the RAM when the part that the GPU does not hold fits in the RAM less 8 GiB, else nowhere. A MoE model is faster in the RAM than a dense model. In one place, a model with smaller weights is faster. The table marks each estimate. An estimate is the recommendation only when no installed model has a time, or when the estimate is more than the tolerance better. A model whose measurement failed gets no estimate: it is not recommended.
+- **Without a GPU.** The quality comes first, thus the rule can recommend `qwen3-embedding:4b` on a machine without a GPU, although it is slower there than `qwen3-embedding:0.6b`. The automatic embedding model without a GPU stays `qwen3-embedding:0.6b` (see below).
+- **When.** `fw-context llm recommend` and `fw-context doctor` measure each installed model of the list without a stored time. A model loads for each measurement, 5 to 70 seconds, and is released after it. A model that Ollama held before the measurement stays loaded. The setup of `fw-context init` and `fw-context llm setup` asks first. The MCP tool `check_dependencies` and `fw-context init` before its questions measure nothing: they use the stored times and the estimates. fw-context measures only the Ollama of this machine: on another computer, a measurement can push out the models of other users. With `analyze_symbols = false`, `doctor` does not compare the chat models.
+- **Result.** The check `llm-recommend` is `degraded` when the recommendation is better than the model of the config, and names `fw-context llm setup`. It is not critical and has no fix: a run never changes the model. A new embedding model embeds each index again.
 
 #### The context of the LLM analysis
 
