@@ -15,6 +15,7 @@ Exit codes: 0 = all ok, 1 = warnings, 2 = critical failures.
 from __future__ import annotations
 
 import argparse
+import sys
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
@@ -41,7 +42,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             print(f"fw-context doctor: unknown check(s): {', '.join(sorted(unknown))}. Known: {known}")
             return 2
 
-    results = run_full_check(project_root=args.project, subset=subset)
+    def measure_progress(text: str) -> None:
+        # stderr: the output of --json stays JSON.
+        print(f"  [llm-recommend] {text}", file=sys.stderr, flush=True)
+
+    results = run_full_check(project_root=args.project, subset=subset, measure_progress=measure_progress)
 
     if args.fix:
         # `--only` without `config` changes no config file: the row

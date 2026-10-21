@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from ..cache_client import get_local_cache_db, local_cache_lookup, local_cache_upsert
+from ..llm.calibration import LOWEST_CONTEXT
 from ..llm.client import ChatClient, ContextFit, get_chat_client
 from ..llm.errors import LLMStopRun
 from ..llm.ollama import OllamaPromptTooLong
@@ -201,8 +202,9 @@ def _enrich_batch(conn, batch_rows, config_hash: str, *, project_root: Path | No
 
 #: The lower bound of the context that the measured speed selects (decision
 #: of the user, 2026-10-21): a smaller context sends too many prompts to the
-#: second pass.
-_LOWEST_CONTEXT = 4096
+#: second pass.  The constant is of ``llm.calibration``: the recommendation
+#: of a model measures at the same context.
+_LOWEST_CONTEXT = LOWEST_CONTEXT
 
 
 def _context_choice_on() -> bool:

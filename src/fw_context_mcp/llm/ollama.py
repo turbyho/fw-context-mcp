@@ -79,7 +79,7 @@ import httpx
 from ..config.settings import LLMConfig
 from ..utils import is_fatal
 from ._debug import _write_debug_log
-from .calibration import Key, Measure, Speed, select_context
+from .calibration import EmbedMeasure, Key, Measure, Speed, select_context
 from .client import ChatResult, ContextFit, Usage
 from .embedder import Embedder, EmbedderContextUnknown, EmbedderInputTooLong
 from .errors import LLMError
@@ -950,6 +950,54 @@ def measure_speed(server_url: str, model: str, num_ctx: int, *, keep_alive: str,
         counts.append(value)
     prompt_count, prompt_ns, eval_count, eval_ns = counts
     return Measure(Speed(prompt_count, prompt_count / prompt_ns * 1e9, eval_count / eval_ns * 1e9))
+
+
+#: The documents of ``measure_embed_speed``: one batch of the indexer
+#: (``MAX_EMBED_BATCH_SYMBOLS`` of ``indexer._embedding``), each a
+#: description of a symbol with a part of its body, about 400 tokens.  WHY
+#: not longer: mxbai-embed-large has a context of 512, and a longer input
+#: measures the cut of the server, not the model.
+_EMBED_REFERENCE_SYMBOLS = 10
+_EMBED_REFERENCE_BODY = "\n".join(_REFERENCE_BODY.splitlines()[:8])
+
+
+def _embed_reference_documents() -> list[str]:
+    """Return the reference documents, each with a first line of its own (a model can cache an input)."""
+    stamp = f"{time.monotonic_ns()}-{next(_REQUEST_NUMBERS)}"
+    return [f"Symbol {stamp}-{index}: the function frame_crc_{index} in drivers/crc computes the CRC of a "
+            f"frame from a table. It reads the buffer and returns the CRC.\n{_EMBED_REFERENCE_BODY}"
+            for index in range(_EMBED_REFERENCE_SYMBOLS)]
+
+
+def measure_embed_speed(server_url: str, model: str, *, keep_alive: str, timeout: float) -> EmbedMeasure:
+    """Load the embedding *model* and return the time of one symbol of a batch of the reference documents.
+
+    Two batches: the first loads the model, the second is the measurement.
+    The time comes from the answer of Ollama (``total_duration`` without
+    ``load_duration``), not from the time of the HTTP request.  The
+    documents get no instruction: the instruction of a document is empty
+    or a few words, and the time of the model is the question.
+    """
+    base = server_url.rstrip("/")
+    try:
+        for _ in range(2):
+            with ollama_guard():
+                resp = httpx.post(f"{base}/api/embed", json={
+                    "model": model, "input": _embed_reference_documents(), "keep_alive": keep_alive},
+                    timeout=timeout)
+            if resp.status_code != 200:
+                error = _error_text(resp)
+                return EmbedMeasure(None, error, any(text in error.lower() for text in _OUT_OF_MEMORY))
+        body = resp.json()
+    except httpx.HTTPError as e:
+        return EmbedMeasure(None, f"Ollama does not answer ({type(e).__name__}: {e})")
+    except ValueError:
+        return EmbedMeasure(None, "Ollama gives an answer that is not JSON")
+    total = body.get("total_duration") if isinstance(body, dict) else None
+    load = body.get("load_duration", 0) if isinstance(body, dict) else None
+    if not isinstance(total, int) or not isinstance(load, int) or total - load <= 0:
+        return EmbedMeasure(None, "Ollama gives no times of the request")
+    return EmbedMeasure((total - load) / 1e9 / _EMBED_REFERENCE_SYMBOLS)
 
 
 def calibration_key(server_url: str, model: str, lower: int, upper: int) -> Key | None:

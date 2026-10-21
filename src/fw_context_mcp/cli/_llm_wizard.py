@@ -226,7 +226,7 @@ def _write_profile(name: str, values: dict[str, object], *, asked: bool = False)
 
 
 def _setup_local(project_root: Path | None, cfg, cloud: dict[str, str]) -> str | None:
-    """Local Ollama: the model that the memory recommends, a pull with consent, the profile."""
+    """Local Ollama: the recommended model (``llm.recommend``), a pull with consent, the profile."""
     found = ui._local_ollama_profile(project_root, cfg, cloud=cloud, ask_embed=False)
     if found is None:
         return None

@@ -574,6 +574,14 @@ def main() -> None:
                                help="The profile of each project that selects none (the global config)")
     p_llm_default.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
     p_llm_default.set_defaults(func=cmd_llm_default)
+    from ._recommend import cmd_llm_recommend
+    p_llm_recommend = p_llm_sub.add_parser(
+        "recommend", help="Measure the installed local models and recommend a chat and an embedding model",
+    )
+    p_llm_recommend.add_argument("--again", action="store_true",
+                                 help="Measure each installed model again (another program used the memory)")
+    p_llm_recommend.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
+    p_llm_recommend.set_defaults(func=cmd_llm_recommend)
     p_llm_remove = p_llm_sub.add_parser("remove", help="Remove a profile, its own key and its ChatGPT sign-in")
     p_llm_remove.add_argument("profile", help="The name of the LLM profile")
     p_llm_remove.set_defaults(func=cmd_llm_remove)

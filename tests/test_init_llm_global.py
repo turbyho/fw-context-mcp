@@ -77,10 +77,12 @@ def _global_llm() -> dict:
 
 def _no_machine(monkeypatch) -> None:
     """A machine without a GPU, with 16 GiB of RAM, and without an Ollama server: no request leaves the test."""
-    from fw_context_mcp.llm import _diag, hardware
+    from fw_context_mcp.llm import _diag, hardware, ollama
 
     monkeypatch.setattr(hardware, "machine_memory", lambda: hardware.Memory(gpu_mib=None, ram_mib=16 * 1024))
     monkeypatch.setattr(_diag, "installed_models", lambda url: None)
+    # No key: the recommendation never asks a server and never measures.
+    monkeypatch.setattr(ollama, "calibration_key", lambda *args: None)
     monkeypatch.setattr(_diag, "remote_hosts", lambda url: None)
 
 
@@ -295,8 +297,8 @@ def test_the_ollama_setup_offers_the_recommendation_without_a_config(project, mo
 
     defaults, out = _ollama_defaults(monkeypatch, capsys, project)
 
-    # No GPU and 16 GiB of RAM: the recommendation of llm.hardware.
-    assert defaults == ["qwen2.5-coder:7b", "qwen3-embedding:0.6b"], out
+    # No GPU and 16 GiB of RAM, no Ollama: the estimate of llm.recommend from the weights of the list.
+    assert defaults == ["gemma4:12b", "qwen3-embedding:4b"], out
     assert "Current config" not in out, out
 
 
@@ -316,10 +318,10 @@ def test_the_chat_model_of_a_cloud_api_is_not_an_ollama_default(project, monkeyp
 
     defaults, _ = _ollama_defaults(monkeypatch, capsys, project)
 
-    assert defaults == ["qwen2.5-coder:7b", "global-embed:1b"]
+    assert defaults == ["gemma4:12b", "global-embed:1b"]
     profiles = _global_llm()["profiles"]
     assert profiles["api"] == {"provider": "openai_compatible", "url": "http://127.0.0.1:9/v1", "model": "deepseek-chat"}
-    assert profiles["local"] == {"url": "http://localhost:11434", "provider": "ollama", "model": "qwen2.5-coder:7b"}
+    assert profiles["local"] == {"url": "http://localhost:11434", "provider": "ollama", "model": "gemma4:12b"}
 
 
 def test_an_embedding_model_that_ollama_does_not_serve_is_not_an_ollama_default(project, monkeypatch, capsys):
@@ -333,7 +335,7 @@ def test_an_embedding_model_that_ollama_does_not_serve_is_not_an_ollama_default(
 
     defaults, _ = _ollama_defaults(monkeypatch, capsys, project)
 
-    assert defaults == ["global-chat:1b", "qwen3-embedding:0.6b"]
+    assert defaults == ["global-chat:1b", "qwen3-embedding:4b"]
 
 
 def test_option_1_writes_the_chat_model_into_the_selected_ollama_profile(project, monkeypatch, capsys):

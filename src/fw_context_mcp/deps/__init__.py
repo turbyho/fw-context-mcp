@@ -32,6 +32,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from ..config.settings import Config
 
 # ── Data model ──────────────────────────────────────────────────────────
@@ -89,6 +91,7 @@ def run_preflight() -> list[DepCheckResult]:
 def run_full_check(
     project_root: str | Path | None = None,
     subset: set[str] | None = None,
+    measure_progress: Callable[[str], None] | None = None,
 ) -> list[DepCheckResult]:
     """Complete dependency audit.
 
@@ -110,6 +113,11 @@ def run_full_check(
     WHY: Loading config is slow (it triggers TOML parsing and build
     system detection).  Doing it once and sharing across multiple
     checks avoids redundant I/O.
+
+    *measure_progress*: the check ``llm-recommend`` measures the speed of
+    each installed model that has none, and reports each measurement
+    through it.  None: no model loads (the MCP server, ``fw-context
+    init``, which asks before it measures).
     """
     from ..config import ConfigError
     from ._checks import CHECK_ORDER
@@ -156,6 +164,8 @@ def run_full_check(
                 )
             elif name in ("ollama", "chat-model", "embed-model"):
                 r = fn(ctx["cfg"].llm)
+            elif name == "llm-recommend":
+                r = fn(ctx["cfg"].llm, measure_progress)
             elif name in ("db-integrity", "disk-space", "obsolete-files"):
                 r = fn(project_root)
             else:
@@ -181,7 +191,7 @@ def run_full_check(
 #: ``obsolete-files`` is not one of them: it catches the error of ``load``,
 #: and it reports a config file that it cannot parse.  A skip hides that
 #: result.
-_NEEDS_CONFIG = frozenset({"ollama", "chat-model", "embed-model", "db-integrity", "disk-space"})
+_NEEDS_CONFIG = frozenset({"ollama", "chat-model", "embed-model", "llm-recommend", "db-integrity", "disk-space"})
 
 
 def load_project_config(project_root: str | Path | None = None) -> Config:
@@ -327,6 +337,7 @@ def _recheck(name: str, project_root: str | Path | None = None) -> DepCheckResul
         check_libclang_python,
         check_libclang_so,
         check_llm_models,
+        check_llm_recommend,
         check_obsolete_files,
         check_ollama_chat_model,
         check_ollama_embed_model,
@@ -346,7 +357,7 @@ def _recheck(name: str, project_root: str | Path | None = None) -> DepCheckResul
         return check_config(None, project_root)
 
     cfg = None
-    if name in ("ollama", "chat-model", "embed-model"):
+    if name in ("ollama", "chat-model", "embed-model", "llm-recommend"):
         cfg = load_project_config(project_root)
 
     _map: dict = {
@@ -365,6 +376,10 @@ def _recheck(name: str, project_root: str | Path | None = None) -> DepCheckResul
         "disk-space": lambda: check_disk_space(project_root),
         "obsolete-files": lambda: check_obsolete_files(project_root),
         "llm-models": check_llm_models,
+        # No measurement: a re-check after a fix of the config does not
+        # load each model again (run_full_check measures).
+        "llm-recommend": lambda: check_llm_recommend(cfg.llm) if cfg else DepCheckResult(
+            "llm-recommend", "skipped", "no config"),
     }
     fn = _map.get(name)
     if fn is None:

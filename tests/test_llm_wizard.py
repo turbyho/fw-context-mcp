@@ -17,7 +17,7 @@ import pytest
 from fw_context_mcp.cli import _init_interactive as ui
 from fw_context_mcp.cli import _llm_wizard as wizard
 from fw_context_mcp.config import settings
-from fw_context_mcp.llm import _diag, hardware, secrets
+from fw_context_mcp.llm import _diag, hardware, ollama, secrets
 
 GLOBAL = (
     '[llm]\nprofile = "local"\nenabled = true\nembed_model = "e:1b"\n\n'
@@ -38,6 +38,9 @@ def home(tmp_path: Path, monkeypatch) -> Path:
     monkeypatch.setattr(hardware, "machine_memory", lambda: hardware.Memory(gpu_mib=None, ram_mib=16 * 1024))
     monkeypatch.setattr(_diag, "installed_models", lambda url: ["chat:1b"])
     monkeypatch.setattr(_diag, "remote_hosts", lambda url: {})
+    # No key: gather then never asks a server for a model file, and never
+    # measures (a test that installs a model of the list stays offline).
+    monkeypatch.setattr(ollama, "calibration_key", lambda *args: None)
     root = tmp_path / "proj"
     (root / ".fw-context").mkdir(parents=True)
     (root / ".fw-context" / "config.toml").write_text("[project]\n", encoding="utf-8")
@@ -64,16 +67,6 @@ def _run(home: Path):
 
 
 # ── The memory of the machine ──
-
-
-@pytest.mark.parametrize(("gpu", "ram", "model"), [
-    (12282, 64 * 1024, "gemma4:26b"),  # the driver reports a 12 GB card as 12282 MiB
-    (8188, 32 * 1024, "gemma4:12b"),
-    (4096, 64 * 1024, "qwen3-coder:30b"),
-    (None, 16 * 1024, "qwen2.5-coder:7b"),
-])
-def test_the_recommended_local_model_follows_the_memory(gpu, ram, model):
-    assert hardware.recommended_local_model(hardware.Memory(gpu, ram)).model == model
 
 
 def test_the_largest_nvidia_gpu_counts(monkeypatch):

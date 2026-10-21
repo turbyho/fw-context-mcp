@@ -30,6 +30,11 @@ request at the stored context, and searches again only when that is
 slow.  A background run uses the stored context without a measurement.
 The file belongs to the machine, not to the config: the user does not
 edit it.
+
+The file also keeps the speed of each model at one context
+(``StoredSpeed``): the recommendation of a model (``llm.recommend``)
+compares the models with it, and a model that is not the model of a
+profile has no calibration.
 """
 
 from __future__ import annotations
@@ -60,6 +65,12 @@ SPEED_TOLERANCE = 0.10
 #: 16k), and a check at the same 10 % then starts a new search on 2 % of
 #: noise.  The same margin decides "clearly faster than the calibration".
 CHECK_TOLERANCE = 0.15
+
+#: The smallest context of the LLM analysis, and the lower bound of each
+#: calibration: the best speed of a model is its speed here.  Thus the
+#: recommendation of a model (``llm.recommend``) measures here too, and a
+#: calibration gives it the time without a new measurement.
+LOWEST_CONTEXT = 4096
 
 #: The step of the search: a multiple of it is a context that the KV cache
 #: of llama.cpp allocates without waste.
@@ -145,6 +156,30 @@ class Key:
     def slot(self) -> tuple[str, str, int, int]:
         """The calibration that a new one replaces: of the same server, model and bounds."""
         return self.server, self.model, self.lower, self.upper
+
+
+@dataclass(frozen=True)
+class EmbedMeasure:
+    """The result of one measurement of an embedding model: the time of one symbol, or the error (as ``Measure``)."""
+
+    seconds_per_symbol: float | None
+    error: str = ""
+    out_of_memory: bool = False
+
+
+@dataclass(frozen=True)
+class StoredSpeed:
+    """The measured time of a typical symbol of one model in one role (``"chat"`` or ``"embedding"``).
+
+    ``key.lower`` and ``key.upper`` are the context of the measurement; 0
+    is the default context of the model (the embeddings send no context).
+    """
+
+    role: str
+    key: Key
+    seconds_per_symbol: float
+    created: str
+    fw_context: str
 
 
 @dataclass(frozen=True)
@@ -314,11 +349,62 @@ def load(key: Key) -> Calibration | None:
     context of 0, a context outside the bounds) is not valid: a speed of 0
     divided by zero in the run.
     """
-    for entry in _entries(warn=True):
+    for entry in _entries("calibrations", warn=True):
         calibration = _calibration_of(entry)
         if calibration is not None and key.matches(calibration.key):
             return calibration
     return None
+
+
+def load_speed(role: str, key: Key) -> float | None:
+    """Return the stored time of a typical symbol of *key* in *role*, or None.
+
+    A chat model also has the time in its calibration: the best speed is
+    the speed at the lower bound.  Thus a calibration with the lower bound
+    of *key* gives the time too, and the model is not measured again.
+    """
+    for entry in _entries("speeds", warn=True):
+        speed = _speed_of(entry)
+        if speed is not None and speed.role == role and key.matches(speed.key):
+            return speed.seconds_per_symbol
+    if role != "chat":
+        return None
+    for entry in _entries("calibrations", warn=False):
+        calibration = _calibration_of(entry)
+        if (calibration is not None and calibration.key.lower == key.lower
+                and key.matches(dataclasses.replace(calibration.key, upper=key.upper))):
+            return calibration.best.seconds_per_symbol
+    return None
+
+
+def store_speed(role: str, key: Key, seconds_per_symbol: float) -> None:
+    """Store the time of a typical symbol of *key* in *role*; it replaces the one of the same server and model."""
+    speed = StoredSpeed(role, key, seconds_per_symbol, datetime.now(UTC).isoformat(timespec="seconds"),
+                        __version__)
+    kept = []
+    for entry in _entries("speeds", warn=False):
+        other = _speed_of(entry)
+        if other is not None and (other.role, other.key.slot()) != (role, key.slot()):
+            kept.append(entry)
+    kept.append(dataclasses.asdict(speed))
+    _write("speeds", kept)
+
+
+def _speed_of(entry: dict) -> StoredSpeed | None:
+    """Return the stored speed of one entry of the file, or None when a value is not of a measurement."""
+    try:
+        key = Key(**entry["key"])
+        speed = StoredSpeed(str(entry["role"]), key, entry["seconds_per_symbol"], str(entry["created"]),
+                            str(entry["fw_context"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+    value = speed.seconds_per_symbol
+    if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value <= 0:
+        return None
+    if not all(isinstance(bound, int) and not isinstance(bound, bool) and bound >= 0
+               for bound in (key.lower, key.upper)):
+        return None
+    return speed
 
 
 def _calibration_of(entry: dict) -> Calibration | None:
@@ -355,21 +441,35 @@ def store(calibration: Calibration) -> None:
     time can lose one entry: the next manual run then calibrates again.
     """
     kept = []
-    for entry in _entries(warn=False):
+    for entry in _entries("calibrations", warn=False):
         other = _calibration_of(entry)
         if other is not None and other.key.slot() != calibration.key.slot():
             kept.append(entry)
     kept.append(dataclasses.asdict(calibration))
+    _write("calibrations", kept)
+
+
+#: The sections of the file: a write of one keeps the entries of the other.
+_SECTIONS = ("calibrations", "speeds")
+
+
+def _write(section: str, entries: list[dict]) -> None:
+    """Write *entries* as *section* of the file; the other sections stay.  A failure gives a warning."""
+    data = {"format": _FORMAT, **{name: _entries(name, warn=False) for name in _SECTIONS}, section: entries}
     path = _path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        write_text_atomic(path, json.dumps({"format": _FORMAT, "calibrations": kept}, indent=2) + "\n")
+        write_text_atomic(path, json.dumps(data, indent=2) + "\n")
     except OSError as e:
         log.warning("LLM analysis: cannot store the calibration in %s: %s", path, e)
 
 
-def _entries(*, warn: bool) -> list[dict]:
-    """Return the entries of the file; a file that is missing, of another format or not JSON gives none."""
+def _entries(section: str, *, warn: bool) -> list[dict]:
+    """Return the entries of *section*; a file that is missing, of another format or not JSON gives none.
+
+    A file of an older release has no section ``speeds``: that is not an
+    error, the section is empty.
+    """
     path = _path()
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -380,6 +480,6 @@ def _entries(*, warn: bool) -> list[dict]:
             log.warning("LLM analysis: the calibration file %s is not valid (%s): a new calibration replaces it",
                         path, e)
         return []
-    if not isinstance(data, dict) or data.get("format") != _FORMAT or not isinstance(data.get("calibrations"), list):
+    if not isinstance(data, dict) or data.get("format") != _FORMAT or not isinstance(data.get(section), list):
         return []
-    return [entry for entry in data["calibrations"] if isinstance(entry, dict)]
+    return [entry for entry in data[section] if isinstance(entry, dict)]

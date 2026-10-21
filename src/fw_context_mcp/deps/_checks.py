@@ -17,6 +17,7 @@ from __future__ import annotations
 import importlib
 import importlib.metadata
 import sqlite3
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -469,6 +470,55 @@ def check_llm_models() -> DepCheckResult:
                                   + "; ".join(report.lines()))
 
 
+def check_llm_recommend(cfg, progress: Callable[[str], None] | None = None) -> DepCheckResult:
+    """Say if a local model of Ollama is better than the chat model or the embedding model of the config.
+
+    The rule of two bands (``llm.recommend``).  *progress* None: only the
+    stored speeds count, and no model loads (``check_dependencies`` of
+    the MCP server).  Else each installed model of the list without a
+    stored speed is measured, and *progress* reports each measurement
+    (``fw-context doctor``: the user waits, 5 to 70 s for each model).
+    Not critical, and no fix: the user selects the model
+    (``fw-context llm setup``), and a run never changes it.
+    """
+    if not cfg.enabled:
+        return DepCheckResult(name="llm-recommend", status="skipped", message="LLM disabled in config",
+                              critical=False)
+    from ..config.settings import _is_loopback_url
+    from ..llm.chat_router import chat_ollama_server
+    from ..llm.embedder_factory import uses_ollama
+    from ..llm.hardware import machine_memory
+    from ..llm.recommend import CHAT, EMBEDDING, gather, verdict
+
+    roles = []
+    try:
+        chat_server = chat_ollama_server(cfg)
+    except ValueError:
+        chat_server = None  # The check "chat-model" reports the URL.
+    # Without the LLM analysis, no chat model runs: its measurement only
+    # costs time.
+    if chat_server is not None and cfg.model and cfg.analyze_symbols:
+        roles.append((CHAT, chat_server, cfg.model))
+    if uses_ollama(cfg) and cfg.embed_model:
+        roles.append((EMBEDDING, cfg.ollama_url, cfg.embed_model))
+    if not roles:
+        return DepCheckResult(name="llm-recommend", status="skipped", critical=False,
+                              message="no model of the config runs on Ollama")
+    memory = machine_memory()
+    better, parts = False, []
+    for role, server, model in roles:
+        recommendation = gather(role, server, memory if _is_loopback_url(server) else None,
+                                measure=progress is not None, keep_alive=cfg.keep_alive, timeout=cfg.timeout,
+                                progress=progress)
+        found, text = verdict(recommendation, model)
+        better = better or found
+        parts.append(f"{role.name}: {text}")
+    if better:
+        parts.append("select a model with: fw-context llm setup")
+    return DepCheckResult(name="llm-recommend", status="degraded" if better else "ok", message="; ".join(parts),
+                          critical=False)
+
+
 def check_tomli_w() -> DepCheckResult:
     """Verify tomli-w is installed — required for config writes during init.
 
@@ -852,6 +902,7 @@ CHECK_ORDER: list[tuple[str, Any]] = [
     ("ollama", check_ollama_running),
     ("chat-model", check_ollama_chat_model),
     ("embed-model", check_ollama_embed_model),
+    ("llm-recommend", check_llm_recommend),
     ("db-integrity", check_db_integrity),
     ("obsolete-files", check_obsolete_files),
     ("disk-space", check_disk_space),

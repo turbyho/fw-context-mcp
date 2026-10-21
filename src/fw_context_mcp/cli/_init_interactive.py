@@ -513,12 +513,14 @@ def _local_ollama_profile(
     (a loopback server, not a cloud model), else ``local``.  WHY: a
     selected profile of another computer or of Ollama Cloud got the local
     model before, and kept its server.  Its other keys stay; the caller
-    writes it.  The recommended chat model comes from the memory of the
-    machine (``llm.hardware``); *cloud* names the cloud models of the
-    local Ollama, which the list leaves out: they do not run on this
-    machine.  Without *ask_embed* the embedding model is not asked (the
-    setup of the LLM services: the embedding belongs to the project), and
-    the third value is "".
+    writes it.  The recommended models come from the rule of two bands
+    (``llm.recommend``): the measured speed of each installed model of the
+    list, after a question, else an estimate from the memory of the
+    machine; the table shows each model.  *cloud* names the cloud models
+    of the local Ollama, which the list leaves out: they do not run on
+    this machine.  Without *ask_embed* the embedding model is not asked
+    (the setup of the LLM services: the embedding belongs to the project),
+    and the third value is "".
 
     Returns None when the user stops at the question about a shared profile.
     """
@@ -527,16 +529,9 @@ def _local_ollama_profile(
     from ..llm.auto_model import _gpu_available
     from ..llm.chat_router import chat_ollama_server
     from ..llm.embedder_factory import uses_ollama
-    from ..llm.hardware import machine_memory, recommended_local_model
     from ..llm.ollama import check_setup
 
     gpu = _gpu_available()
-    recommendation = recommended_local_model(machine_memory())
-    chat_recommended = recommendation.model
-    # 4b and not the automatic 8b: the same quality, less VRAM and smaller
-    # vectors (auto_model, measured 2026-10-21).  The setup is a choice of the
-    # user; the automatic default does not change under an existing index.
-    embed_recommended = "qwen3-embedding:4b" if gpu else "qwen3-embedding:0.6b"
     sources = llm_key_sources(project_root) if project_root is not None else {}
     chat_server = chat_ollama_server(cfg.llm) if cfg.llm.provider == "ollama" else None
     ollama_profile = (
@@ -544,10 +539,6 @@ def _local_ollama_profile(
         and cfg.llm.model not in (cloud or {})
     )
     server = chat_server if ollama_profile and chat_server else _DEFAULT_OLLAMA_URL
-    chat_from_config = ollama_profile and bool(cfg.llm.model)
-    chat_default = cfg.llm.model if chat_from_config else chat_recommended
-    embed_from_config = "embed_model" in sources and cfg.llm.embed_model and uses_ollama(cfg.llm)
-    embed_default = cfg.llm.embed_model if embed_from_config else embed_recommended
 
     result = check_setup(cfg.llm)
     status = result.get("status")
@@ -568,10 +559,26 @@ def _local_ollama_profile(
             print(f"  [info] {result['message']}")
 
     print(f"  Hardware: {'GPU detected' if gpu else 'CPU only (no GPU detected)'}")
+    from ._recommend import table_lines
+
+    chat_from_config = ollama_profile and bool(cfg.llm.model)
+    embed_from_config = "embed_model" in sources and cfg.llm.embed_model and uses_ollama(cfg.llm)
+    found = _recommendations(server, cfg.llm.ollama_url, ask_embed=ask_embed, keep_alive=cfg.llm.keep_alive,
+                             timeout=cfg.llm.timeout)
+    chat_recommended = found["chat"].model.tag if found["chat"].model else _FALLBACK_CHAT_MODEL
+    embed_recommended = (found["embedding"].model.tag if "embedding" in found and found["embedding"].model
+                         else _FALLBACK_EMBED_MODEL if gpu else _FALLBACK_CPU_EMBED_MODEL)
+    chat_default = cfg.llm.model if chat_from_config else chat_recommended
+    embed_default = cfg.llm.embed_model if embed_from_config else embed_recommended
+    for name, recommendation in found.items():
+        current = (chat_default if chat_from_config else None) if name == "chat" else (
+            embed_default if embed_from_config else None)
+        print("\n".join(table_lines(recommendation, current)))
+    fallback = " (no recommendation: a small model that runs on each machine)"
     print("  Recommended:")
-    print(f"    chat:      {chat_recommended} ({recommendation.reason})")
+    print(f"    chat:      {chat_recommended}" + ("" if found["chat"].model else fallback))
     if ask_embed:
-        print(f"    embedding: {embed_recommended}")
+        print(f"    embedding: {embed_recommended}" + ("" if found["embedding"].model else fallback))
     if (chat_default, embed_default if ask_embed else embed_recommended) != (chat_recommended, embed_recommended):
         print(f"  Current config: chat {chat_default}" + (f", embedding {embed_default}" if ask_embed else "")
               + " — Enter keeps them")
@@ -619,6 +626,49 @@ def _local_ollama_profile(
             name = f"{stem}-{number}"
         print(f"  [info] This project gets its own profile {name!r}")
     return name, values, embed
+
+
+#: The models when the rule has no candidate: the memory of the machine is
+#: not known (Windows gives no RAM), and no installed model of the list is
+#: measured.  A small model runs on each machine; the user selects another.
+_FALLBACK_CHAT_MODEL = "qwen2.5-coder:7b"
+#: 4b and not the automatic 8b: the same quality, less VRAM and smaller
+#: vectors (measured 2026-10-21).  On the CPU, 0.6b: 4b was 4 times slower
+#: on the GPU of the measurement (22 against 92 symbols/s).  The fallback
+#: only: with a known memory, the rule of two bands decides, and it puts
+#: the quality first (decision of the user, 2026-10-21).
+_FALLBACK_EMBED_MODEL = "qwen3-embedding:4b"
+_FALLBACK_CPU_EMBED_MODEL = "qwen3-embedding:0.6b"
+
+
+def _recommendations(chat_server: str, embed_server: str, *, ask_embed: bool, keep_alive: str,
+                     timeout: float) -> dict:
+    """Return the recommendation of each role (``llm.recommend.gather``); measure the installed models after a question.
+
+    WHY a question: each installed model of the list without a stored
+    speed loads once (5 to 70 s each), and the setup of a machine with
+    many models then takes minutes.  Without the measurement, the
+    estimate from the memory of the machine applies to them too.
+    """
+    from ..config.settings import _is_loopback_url
+    from ..llm.hardware import machine_memory
+    from ..llm.recommend import CHAT, EMBEDDING, gather
+
+    memory = machine_memory()
+    roles = [(CHAT, chat_server)] + ([(EMBEDDING, embed_server)] if ask_embed else [])
+
+    def run(measure: bool) -> dict:
+        return {role.name: gather(role, server, memory if _is_loopback_url(server) else None, measure=measure,
+                                  keep_alive=keep_alive, timeout=timeout,
+                                  progress=lambda text: print(f"  [measure] {text}", flush=True))
+                for role, server in roles}
+
+    found = run(False)
+    waiting = [c.tag for recommendation in found.values() for c in recommendation.candidates if c.can_measure]
+    if waiting and _confirm(f"Measure the speed of {len(waiting)} installed models now? Each one loads one time "
+                            "(5-70 s each); the recommendation then compares the measured speeds", default=True):
+        found = run(True)
+    return found
 
 
 def _read_secret(prompt: str) -> str:
