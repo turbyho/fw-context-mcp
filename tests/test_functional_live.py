@@ -27,7 +27,9 @@ paging is pinned on seeded rows in ``tests/test_search_paging.py``.
 ``conftest.py`` points ``FW_CONTEXT_INDEX_DIR`` at a temp directory for
 the whole session, so that no test writes to the real index.  A live test
 needs the real one, thus the fixture below restores the value that the
-environment had BEFORE the suite started, for the duration of one test.
+environment had BEFORE the suite started, for the duration of one test
+(``conftest.operator_environ``).  The list of the projects reads the real
+registry the same way.
 
 They are marked ``live`` and excluded from ``make test`` and
 ``make test-all``, because they depend on what one machine happens to
@@ -37,16 +39,13 @@ skip, thus a checkout without one is not a failure.
 
 from __future__ import annotations
 
-import os
 import sqlite3
 import tempfile
 from pathlib import Path
 
 import pytest
 
-#: Captured at IMPORT time, which is collection — before the session
-#: fixture of conftest.py redirects the index directory.
-_REAL_INDEX_DIR = os.environ.get("FW_CONTEXT_INDEX_DIR")
+from tests.conftest import operator_environ
 
 NOTICE_KEYS = {"total", "offset", "shown", "more"}
 SIDE_KEYS = {"warning", "info", "error", "_did_you_mean"}
@@ -61,33 +60,23 @@ WALK_CAP = 300
 def _real_index_dir():
     """Undo the index-directory isolation for one live test.
 
-    The session fixture in ``conftest.py`` exists so that no test writes
-    to ``~/.fw-context/index``.  These tests only READ it, and they have
-    nothing to read without it.
+    The isolation of ``conftest.py`` exists so that no test writes to
+    ``~/.fw-context/index``.  These tests only READ it, and they have
+    nothing to read without it.  The global config of the operator comes
+    back too: its ``[index] db_dir`` can name another directory.
     """
-    isolated = os.environ.get("FW_CONTEXT_INDEX_DIR")
-    if _REAL_INDEX_DIR is None:
-        os.environ.pop("FW_CONTEXT_INDEX_DIR", None)
-    else:
-        os.environ["FW_CONTEXT_INDEX_DIR"] = _REAL_INDEX_DIR
-    try:
+    with operator_environ("FW_CONTEXT_INDEX_DIR", global_config=True):
         yield
-    finally:
-        if isolated is None:
-            os.environ.pop("FW_CONTEXT_INDEX_DIR", None)
-        else:
-            os.environ["FW_CONTEXT_INDEX_DIR"] = isolated
 
 
 def _under_temp(path: Path) -> bool:
     """Is *path* inside the system temp directory?
 
-    This suite registers throwaway projects in the REAL global registry —
-    the isolation of ``conftest.py`` covers the index directory and not
-    the registry.  Those rows survive the run that made them, and a live
-    sweep that picks them up reports skips for fixtures rather than
-    answers for the operator's code: measured once, 27 projects where the
-    machine holds 7.
+    Before the registry had its isolation, this suite registered throwaway
+    projects in the REAL global registry.  Those rows survive the run that
+    made them, and a live sweep that picks them up reports skips for
+    fixtures rather than answers for the operator's code: measured once,
+    27 projects where the machine holds 7.
     """
     try:
         return path.resolve().is_relative_to(Path(tempfile.gettempdir()).resolve())
@@ -106,24 +95,26 @@ def _live_projects() -> list[Path]:
         from fw_context_mcp.mcp.shared.context import _db_path
     except ImportError:  # pragma: no cover — the package is always importable
         return []
-    try:
-        conn = open_global_db()
-        rows = conn.execute("SELECT root_path FROM projects").fetchall()
-    except sqlite3.Error:  # pragma: no cover — no registry is not a failure
-        return []
-    out: dict[Path, None] = {}
-    for row in rows:
-        root = Path(row["root_path"] or "")
-        if not root.is_dir() or not (root / ".fw-context").is_dir():
-            continue
-        if _under_temp(root):
-            continue
+    # The real registry, index directory and global config ([index] db_dir).
+    with operator_environ("FW_CONTEXT_PROJECTS_DB", "FW_CONTEXT_INDEX_DIR", global_config=True):
         try:
-            if _db_path(root).exists():
-                out.setdefault(root, None)
-        except Exception:  # noqa: BLE001 — a missing index is not a failure
-            continue
-    return sorted(out)
+            conn = open_global_db()
+            rows = conn.execute("SELECT root_path FROM projects").fetchall()
+        except sqlite3.Error:  # pragma: no cover — no registry is not a failure
+            return []
+        out: dict[Path, None] = {}
+        for row in rows:
+            root = Path(row["root_path"] or "")
+            if not root.is_dir() or not (root / ".fw-context").is_dir():
+                continue
+            if _under_temp(root):
+                continue
+            try:
+                if _db_path(root).exists():
+                    out.setdefault(root, None)
+            except Exception:  # noqa: BLE001 — a missing index is not a failure
+                continue
+        return sorted(out)
 
 
 LIVE_PROJECTS = _live_projects()

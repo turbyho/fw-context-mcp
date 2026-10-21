@@ -14,8 +14,11 @@ import os
 import shutil
 import tempfile
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -71,8 +74,23 @@ _SESSION_START: float | None = None
 
 
 def pytest_configure(config):
-    """Register custom markers and ensure results directory exists."""
+    """Ensure results directory exists, and isolate the session (``_isolate_session``)."""
     _ensure_results_dir()
+    _isolate_session()
+
+
+def pytest_unconfigure(config):
+    """End the isolation of the session (``_end_isolation``)."""
+    _end_isolation()
+
+
+def pytest_terminal_summary(terminalreporter):
+    """Name each process that the session left running (``_stop_leftover_processes``): a test that leaks one."""
+    lines = _isolation.get("leftovers") or []
+    if lines:
+        terminalreporter.section("processes that the test session left running (stopped)")
+        for line in lines:
+            terminalreporter.write_line(line)
 
 
 def pytest_sessionstart(session):
@@ -101,8 +119,12 @@ def pytest_collection_modifyitems(config, items):
 
 
 def pytest_sessionfinish(session, exitstatus):
-    """Write test run summary to tests/results/<timestamp>.json."""
+    """Stop the processes that the session left running, and write test run summary to tests/results/<timestamp>.json."""
     global _SESSION_START
+
+    operator_home = os.environ.get(_OPERATOR_HOME_ENV)
+    if _isolation and operator_home:
+        _isolation["leftovers"] = _stop_leftover_processes(operator_home)
 
     results_dir = _ensure_results_dir()
     timestamp = datetime.now(UTC).strftime("%Y-%m-%d_%H-%M-%S")
@@ -133,9 +155,47 @@ def pytest_sessionfinish(session, exitstatus):
 # ── Standard fixtures ──────────────────────────────────────────────────────
 
 
-@pytest.fixture(scope="session", autouse=True)
-def _isolate_index_dir():
-    """Redirect every fw-context write of this run to a session temp dir.
+#: The temp home with the copy of the global config for the tests of the mark
+#: ``ollama``.  Also the marker of the processes of this session: no test
+#: changes it (``_stop_leftover_processes``).
+_OPERATOR_HOME_ENV = "FW_CONTEXT_TEST_OPERATOR_HOME"
+#: The profile of the embeddings in the isolated config (``_write_isolated_config``).
+_TEST_EMBED_PROFILE = "test-embeddings"
+#: The variables that the isolation sets; each gets its value of before back.
+_ISOLATION_ENV = (
+    "FW_CONTEXT_INDEX_DIR", "FW_CONTEXT_PROJECTS_DB", "FW_CONTEXT_CLANG_RESOURCE_DIR", "FW_CONTEXT_HOME",
+    "FW_CONTEXT_NO_UPDATE_CHECK", "PYTHON_KEYRING_BACKEND", "FW_CONTEXT_NO_OLLAMA_RELEASE", _OPERATOR_HOME_ENV,
+)
+#: The state of the isolation between pytest_configure and pytest_unconfigure:
+#: ``temp`` (the TemporaryDirectory), ``env`` (the values of before),
+#: ``global_path`` (the global config of the operator), ``unreachable_url``,
+#: ``leftovers`` (the lines of ``_stop_leftover_processes``).
+_isolation: dict[str, Any] = {}
+
+
+def _unreachable_url() -> str:
+    """Return the URL of a port of this machine that no server listens on: a request gets "connection refused".
+
+    The kernel gives a free port to a bind on port 0, and the socket closes
+    at once.  WHY not a fixed port: a discard service on port 9 accepts the
+    connection and never answers, and each request of a test then waits
+    for its timeout.
+    """
+    import socket
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    return f"http://127.0.0.1:{port}"
+
+
+def _isolate_session() -> None:
+    """Redirect every fw-context write of this run to a session temp dir, before the first test.
+
+    WHY ``pytest_configure`` and not a session fixture: a session fixture
+    starts in the setup of the first test, thus inside its protocol, and
+    the wrapper of the tests of ``ollama`` (``pytest_runtest_protocol``)
+    then saw no temp home for that test.  ``pytest -m ollama`` failed.
 
     Two stores, and both need the redirect:
 
@@ -158,9 +218,11 @@ def _isolate_index_dir():
     the local LLM cache ``llm_cache.db``, and the files that
     ``housekeeping.clean`` removes there).  A test that
     ran ``fw-context index`` as a process removed a file from
-    ``~/.fw-context`` of the operator.  The global config of the operator
-    is copied in, so that a test that asks Ollama uses the models of the
-    operator, and a write goes to the copy.
+    ``~/.fw-context`` of the operator.  The session gets a copy of the
+    global config of the operator without its servers
+    (``_write_isolated_config``), and a write goes to the copy.  A test of
+    the mark ``ollama`` gets a copy with the servers of the LLM, so that it
+    uses the models of the operator.
 
     A fifth is not a store: ``FW_CONTEXT_NO_UPDATE_CHECK`` stops the
     request to PyPI (``version_check``).  An MCP server that a test starts
@@ -172,53 +234,291 @@ def _isolate_index_dir():
     ``keyring.set_keyring`` does the same in this process.  A test that
     stores an API key thus writes ``secrets.toml`` of the temp home, never
     an entry of the keyring of the operator.  A test of the keyring itself
-    sets its own backend in memory.  The fixture does not put the backend
+    sets its own backend in memory.  The isolation does not put the backend
     of the operator back at the end: to get it, ``keyring`` connects to it,
     and the process ends with the session.
 
+    A seventh: ``FW_CONTEXT_NO_OLLAMA_RELEASE``.  No test unloads a model
+    of the Ollama of the operator (``llm.ollama.release_other_model``), and
+    no test loads one to select the context of an analysis
+    (``indexer._llm_analysis.ContextChoice``).
+
     All variables are inherited by any subprocess a test spawns, thus a
-    CLI invocation stays isolated too.  The temp dir is removed at session
-    end.
+    CLI invocation stays isolated too.  The temp dir is removed at the end
+    of the session (``_end_isolation``).
     """
     import keyring
     from keyring.backends import fail
 
     import fw_context_mcp.config.settings as settings
 
-    names = (
-        "FW_CONTEXT_INDEX_DIR", "FW_CONTEXT_PROJECTS_DB", "FW_CONTEXT_CLANG_RESOURCE_DIR", "FW_CONTEXT_HOME",
-        "FW_CONTEXT_NO_UPDATE_CHECK", "PYTHON_KEYRING_BACKEND", "FW_CONTEXT_NO_OLLAMA_RELEASE",
-    )
-    prev = {name: os.environ.get(name) for name in names}
-    prev_global = settings._GLOBAL_CONFIG_PATH
-    with tempfile.TemporaryDirectory(prefix="fw-context-index-") as d:
-        home = Path(d) / "home"
-        home.mkdir()
-        if prev_global.is_file():
-            shutil.copy2(prev_global, home / "config.toml")
-        os.environ["FW_CONTEXT_INDEX_DIR"] = d
-        os.environ["FW_CONTEXT_PROJECTS_DB"] = str(Path(d) / "projects.db")
-        os.environ["FW_CONTEXT_CLANG_RESOURCE_DIR"] = str(Path(d) / "clang-resource")
-        os.environ["FW_CONTEXT_HOME"] = str(home)
-        os.environ["FW_CONTEXT_NO_UPDATE_CHECK"] = "1"
-        os.environ["PYTHON_KEYRING_BACKEND"] = "keyring.backends.fail.Keyring"
-        # A seventh: no test unloads a model of the Ollama of the operator
-        # (llm.ollama.release_other_model), and no test loads one to select
-        # the context of an analysis (indexer._llm_analysis.ContextChoice),
-        # also in a process that it starts.
-        os.environ["FW_CONTEXT_NO_OLLAMA_RELEASE"] = "1"
-        keyring.set_keyring(fail.Keyring())
-        # The module computed the path at import, before this fixture.
-        settings._GLOBAL_CONFIG_PATH = home / "config.toml"
-        try:
-            yield d
-        finally:
-            settings._GLOBAL_CONFIG_PATH = prev_global
-            for name in names:
-                if prev[name] is None:
-                    os.environ.pop(name, None)
-                else:
-                    os.environ[name] = prev[name]
+    # ignore_cleanup_errors: a process of a test that a SIGKILL stopped can
+    # still hold a file in it at the end of the session.
+    temp = tempfile.TemporaryDirectory(prefix="fw-context-index-", ignore_cleanup_errors=True)
+    d = temp.name
+    home, operator_home = Path(d) / "home", Path(d) / "operator-home"
+    home.mkdir()
+    operator_home.mkdir()
+    source = settings._GLOBAL_CONFIG_PATH
+    url = _unreachable_url()
+    _write_isolated_config(source, home / "config.toml", keep_llm_servers=False, url=url)
+    _write_isolated_config(source, operator_home / "config.toml", keep_llm_servers=True, url=url)
+    _isolation.update(temp=temp, env={name: os.environ.get(name) for name in _ISOLATION_ENV},
+                      global_path=source, unreachable_url=url)
+    os.environ[_OPERATOR_HOME_ENV] = str(operator_home)
+    os.environ["FW_CONTEXT_INDEX_DIR"] = d
+    os.environ["FW_CONTEXT_PROJECTS_DB"] = str(Path(d) / "projects.db")
+    os.environ["FW_CONTEXT_CLANG_RESOURCE_DIR"] = str(Path(d) / "clang-resource")
+    os.environ["FW_CONTEXT_HOME"] = str(home)
+    os.environ["FW_CONTEXT_NO_UPDATE_CHECK"] = "1"
+    os.environ["PYTHON_KEYRING_BACKEND"] = "keyring.backends.fail.Keyring"
+    os.environ["FW_CONTEXT_NO_OLLAMA_RELEASE"] = "1"
+    keyring.set_keyring(fail.Keyring())
+    # The module computed the path at import, before this hook.
+    settings._GLOBAL_CONFIG_PATH = home / "config.toml"
+    settings._config_cache.clear()
+
+
+@contextmanager
+def operator_environ(*names: str, global_config: bool = False) -> Iterator[None]:
+    """Give *names* the values of before the isolation, for the body: the live tests READ the index of the operator.
+
+    *global_config* also gives the global config of the operator back:
+    its ``[index] db_dir`` names the index directory, and the isolated copy
+    has none.  Only when it is there: ``load`` would else make it.
+
+    WHY here: the isolation starts in ``pytest_configure``, before the
+    collection, thus a test module cannot read the values of before at its
+    import any more.
+
+    Raises:
+        KeyError: A name that the isolation does not set (a typo would else
+            remove a variable without a word).
+    """
+    import fw_context_mcp.config.settings as settings
+
+    unknown = [name for name in names if name not in _ISOLATION_ENV]
+    if unknown:
+        raise KeyError(f"not a variable of the isolation: {', '.join(unknown)}")
+    saved = {name: os.environ.get(name) for name in names}
+    saved_path = settings._GLOBAL_CONFIG_PATH
+    before = _isolation.get("env", {})
+    for name in names:
+        if before.get(name) is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = before[name]
+    if global_config and _isolation.get("global_path") is not None and _isolation["global_path"].is_file():
+        settings._GLOBAL_CONFIG_PATH = _isolation["global_path"]
+    settings._config_cache.clear()
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        settings._GLOBAL_CONFIG_PATH = saved_path
+        settings._config_cache.clear()
+
+
+def _end_isolation() -> None:
+    """Give each variable and the global config path their values of before, and remove the temp dir."""
+    import fw_context_mcp.config.settings as settings
+
+    if not _isolation:
+        return
+    settings._GLOBAL_CONFIG_PATH = _isolation["global_path"]
+    settings._config_cache.clear()
+    for name, value in _isolation["env"].items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+    _isolation.pop("temp").cleanup()
+    _isolation.clear()
+
+
+def _write_isolated_config(source: Path, target: Path, *, keep_llm_servers: bool, url: str) -> None:
+    """Write the global config of the test session: the copy of *source* without a server of the operator.
+
+    WHY: the copy keeps the models of the operator, thus a test that
+    indexes gets a valid config.  Measured 2026-10-21: with the unchanged
+    copy, ``analyze_symbols = true`` sent the LLM analysis of each
+    ``fw-context index`` of the system tests to the Ollama of the operator
+    (a load of the model, 43 s), and the embeddings and the cache server
+    went the same way.
+
+    Each copy loses ``[cache_server]`` (a server of the operator, with a
+    token) and ``[index] db_dir`` (a value that is not the default wins
+    over ``FW_CONTEXT_INDEX_DIR``).  *keep_llm_servers* False (each test
+    but the tests of ``ollama``) also changes the LLM:
+
+    - Each profile but ``chatgpt`` gets *url*, which refuses the
+      connection, and ``api_key_env = ""``: the shell of the operator can
+      hold the key of an API.  A ``chatgpt`` profile has no URL, and the
+      temp home has no sign-in.  A selected ``chatgpt`` profile gives the
+      selection to the Ollama profile at *url*: else each ``load`` names an
+      external host, and the tests depend on the selection of the operator.
+    - ``embed_profile`` names an Ollama profile at that address: without
+      it, a selected API profile sends the embeddings to the default
+      ``http://localhost:11434``.
+    - The keys of the old format (``ollama_url``, ``chat_api_base``...) go:
+      a test that runs ``init`` or ``doctor --fix`` would make a profile of
+      them with the real server.
+    - ``analyze_symbols = false``: an analysis cannot reach a server, and
+      each symbol would cost three attempts.  A test that needs one sets it.
+
+    Without a global config, or with one that is not valid TOML, the copy
+    has one Ollama profile at that address: ``load`` would else make the
+    default config, whose Ollama is the one of this machine.
+    """
+    import tomllib
+
+    import tomli_w
+
+    from fw_context_mcp.config.settings import _MOVED_LLM_KEYS
+
+    try:
+        data = tomllib.loads(source.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        data = {}
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+        log.warning("the global config cannot be read (%s): the test session uses a config of its own", e)
+        data = {}
+    data.pop("cache_server", None)
+    index = data.get("index")
+    if isinstance(index, dict):
+        index.pop("db_dir", None)
+    if not keep_llm_servers:
+        llm = data.get("llm")
+        llm = llm if isinstance(llm, dict) else {}
+        data["llm"] = llm
+        for key in _MOVED_LLM_KEYS:
+            llm.pop(key, None)
+        profiles = llm.get("profiles")
+        profiles = profiles if isinstance(profiles, dict) else {}
+        llm["profiles"] = profiles
+        if not profiles:
+            profiles["local"] = {"provider": "ollama", "model": "qwen2.5-coder:7b"}
+        if "profile" not in llm and len(profiles) == 1:
+            # The extra profile of the embeddings below must not make the
+            # selection of the only profile ambiguous.
+            llm["profile"] = next(iter(profiles))
+        for profile in profiles.values():
+            if isinstance(profile, dict) and profile.get("provider") != "chatgpt":
+                profile["url"] = url
+                if profile.get("provider") != "ollama":
+                    profile["api_key_env"] = ""
+        profiles[_TEST_EMBED_PROFILE] = {"provider": "ollama", "model": "qwen2.5-coder:7b", "url": url}
+        llm["embed_profile"] = _TEST_EMBED_PROFILE
+        selected = profiles.get(llm.get("profile"))
+        if isinstance(selected, dict) and selected.get("provider") == "chatgpt":
+            llm["profile"] = _TEST_EMBED_PROFILE
+        llm["analyze_symbols"] = False
+    elif not data:
+        return  # no config of the operator: the tests of ollama get the default config
+    target.write_text(tomli_w.dumps(data), encoding="utf-8")
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_protocol(item, nextitem):
+    """Give a test of the mark ``ollama`` the copy of the global config with the servers of the LLM.
+
+    WHY the whole protocol and not a fixture: a fixture of a larger scope
+    (a class of these tests indexes once) starts in the setup of the first
+    test, before an autouse fixture of the test.
+    """
+    import fw_context_mcp.config.settings as settings
+
+    operator_home = os.environ.get(_OPERATOR_HOME_ENV)
+    if item.get_closest_marker("ollama") is None or not operator_home:
+        return (yield)
+    prev_home, prev_path = os.environ.get("FW_CONTEXT_HOME"), settings._GLOBAL_CONFIG_PATH
+    os.environ["FW_CONTEXT_HOME"] = operator_home
+    settings._GLOBAL_CONFIG_PATH = Path(operator_home) / "config.toml"
+    settings._config_cache.clear()
+    try:
+        return (yield)
+    finally:
+        if prev_home is None:
+            os.environ.pop("FW_CONTEXT_HOME", None)
+        else:
+            os.environ["FW_CONTEXT_HOME"] = prev_home
+        settings._GLOBAL_CONFIG_PATH = prev_path
+        settings._config_cache.clear()
+
+
+def _stop_leftover_processes(marker_value: str) -> list[str]:
+    """Stop each process that this session started and that still runs; return a line for each.
+
+    A test that runs ``fw-context index`` as a process starts the watcher
+    daemon (``cli._index._ensure_watcher_after_index``), and no test stops
+    it.  Measured 2026-10-21: the daemon of a test project lived on after
+    the session, saw the file that the test deleted, and started
+    ``fw-context index --background``.
+
+    WHY the environment and not the PID files: a test can set its own
+    ``db_dir``, and a PID file can hold a PID that a test wrote on purpose.
+    ``FW_CONTEXT_TEST_OPERATOR_HOME`` holds a temp dir of this session
+    only, each process that the session started inherits it, and no test
+    changes it.  SIGTERM first; a process that still runs after 5 s, and
+    still has the marker (its PID can be of a new process now), gets
+    SIGKILL and 1 s more: the temp dir goes next.  A zombie (a child of
+    this process that ended) counts as stopped.  Linux only
+    (``/proc/<pid>/environ``); elsewhere nothing is stopped.
+    """
+    import signal
+
+    marker = f"{_OPERATOR_HOME_ENV}={marker_value}".encode()
+    leftovers: dict[int, str] = {}
+    for proc in Path("/proc").glob("[0-9]*"):
+        pid = int(proc.name)
+        if pid == os.getpid():
+            continue
+        if _has_marker(pid, marker):
+            try:
+                leftovers[pid] = (proc / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+            except OSError:
+                continue  # gone
+    for pid in leftovers:
+        _signal_process(pid, signal.SIGTERM)
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and any(_running(pid) for pid in leftovers):
+        time.sleep(0.05)
+    killed = [pid for pid in leftovers if _running(pid) and _has_marker(pid, marker)]
+    for pid in killed:
+        _signal_process(pid, signal.SIGKILL)
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline and any(_running(pid) for pid in killed):
+        time.sleep(0.05)
+    return [f"PID {pid} ({'SIGKILL' if pid in killed else 'SIGTERM'}): {cmdline.strip()[:200]}"
+            for pid, cmdline in leftovers.items()]
+
+
+def _has_marker(pid: int, marker: bytes) -> bool:
+    """Return True when the environment of *pid* holds *marker* as one variable."""
+    try:
+        return marker in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+    except OSError:
+        return False  # gone, or a process of another user
+
+
+def _signal_process(pid: int, signum: int) -> None:
+    try:
+        os.kill(pid, signum)
+    except OSError:
+        pass  # ended, or no permission: nothing more to do in the teardown of the session
+
+
+def _running(pid: int) -> bool:
+    """Return True when *pid* runs: it exists and is not a zombie."""
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return False
+    return state != "Z"
 
 
 @pytest.fixture
