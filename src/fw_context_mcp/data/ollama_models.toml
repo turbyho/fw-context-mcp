@@ -19,9 +19,10 @@
 # was graded later, beside 5 graded variants; its grade is on the scale of
 # the benchmark from these anchors.
 #
-# [embedding]: the models of the embeddings.  quality comes with the
-# benchmark of the embeddings (MRR on the same symbols); until then the
-# entries have none.
+# [embedding]: the models of the embeddings.  quality is MRR@10 (0-1) of the
+# search of 748 queries with a known target symbol on 6 firmware projects
+# (plans/eval/embed-models-2026-10-21), with the query instruction that
+# fw-context gives each model.  It is not on the scale of the chat models.
 #
 # weights_gb: the size of the model file that Ollama pulled on Linux with
 # an NVIDIA GPU (ollama list), in GB of 10^9 bytes; ollama.com/library for a
@@ -185,24 +186,36 @@ moe = false
 remote = true
 
 [embedding."qwen3-embedding:8b"]
+quality = 0.682
+quality_source = "fw-context benchmark 2026-10-21: MRR@10 of 748 queries on 6 firmware projects, the query instruction of fw-context"
 weights_gb = 4.7
 dimension = 4096
 remote = false
 
 [embedding."qwen3-embedding:4b"]
+quality = 0.691
+quality_source = "fw-context benchmark 2026-10-21: MRR@10 of 748 queries on 6 firmware projects, the query instruction of fw-context"
 weights_gb = 2.5
+dimension = 2560
 remote = false
 
 [embedding."qwen3-embedding:0.6b"]
+quality = 0.619
+quality_source = "fw-context benchmark 2026-10-21: MRR@10 of 748 queries on 6 firmware projects, the query instruction of fw-context"
 weights_gb = 0.639
+dimension = 1024
 remote = false
 
 [embedding."mxbai-embed-large:latest"]
+quality = 0.605
+quality_source = "fw-context benchmark 2026-10-21: MRR@10 of 748 queries on 6 firmware projects, the query instruction of fw-context"
 weights_gb = 0.669
 dimension = 1024
 remote = false
 
 [embedding."nomic-embed-text:latest"]
+quality = 0.591
+quality_source = "fw-context benchmark 2026-10-21: MRR@10 of 748 queries on 6 firmware projects, the query instruction of fw-context"
 weights_gb = 0.274
 dimension = 768
 remote = false
