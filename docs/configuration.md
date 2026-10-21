@@ -281,6 +281,45 @@ model = "qwen2.5-coder:32b"
 profile = "gpu-box"
 ```
 
+#### `[llm.models]` and `[llm.embed_models]` — the list of the models of Ollama
+
+The global config holds a list of the models of Ollama that fw-context knows: `[llm.models."<tag>"]` for the LLM analysis, and `[llm.embed_models."<tag>"]` for the embeddings. `fw-context init` and `fw-context doctor --fix` write it, and you can change it. The list gives no setting to a run: a later release uses it to recommend a model.
+
+```toml
+[llm.models."gemma4:26b"]
+quality = 3.73
+quality_source = "fw-context benchmark 2026-10-20: 30 C/C++ symbols, prompt v1, blind grades 1-5"
+weights_gb = 18.0
+moe = true
+remote = false
+source = "fw-context 0.35.0"
+fingerprint = "b82e286eb5d0770b"
+```
+
+| Key | Description |
+|-----|-------------|
+| `quality` | For the LLM analysis: the blind grade 1–5 of the LLM analysis of C/C++ symbols, from the benchmark of fw-context. It is not the result of a public benchmark: a model can be good at other tasks and weak at the analysis of firmware. For the embeddings: the quality of the search, when a benchmark gives it. |
+| `quality_source` | The benchmark of `quality`: its date, the version of the prompt and the number of symbols. |
+| `weights_gb` | The size of the model file, in GB (10^9 bytes): the memory of the weights. The context needs more (the KV cache). |
+| `moe` | `true` for a mixture-of-experts model: it uses few experts for each token, thus it is usable from the RAM. |
+| `dimension` | Embeddings only: the size of a vector. |
+| `remote` | `true` for a cloud model of Ollama: the source code goes to another computer. |
+| `usd_per_1k_symbols`, `usd_per_1k_symbols_off_peak`, `price_source` | A cloud model only: the price of the LLM analysis of 1000 symbols in USD, from the price list of Ollama and the tokens that the benchmark measured. A thinking model counts its reasoning. The off-peak price applies outside 12:00–18:00 UTC on weekdays, for the models that Ollama gives it. |
+| `enabled` | `false` takes a model out of each recommendation. fw-context does not change this key. |
+| `source`, `fingerprint` | An entry of fw-context: the release that wrote it, and a fingerprint of its values. |
+
+The tag includes the quantization: `qwen2.5-coder:14b` and `qwen2.5-coder:14b-instruct-q8_0` are two entries. The list of each release holds a model of the LLM analysis when no other model of the same or a smaller size is more than 0.2 better. A model below 3.0 stays for a machine with little memory, and its quality is low. A cloud model needs no memory of this machine: the list holds it when no other cloud model of the same or a lower price is more than 0.2 better. The rule compares the lower of the two prices. A cloud model is never recommended without your consent, because the source code goes out.
+
+When a new release of fw-context has a new list, `fw-context doctor` reports it (the check `llm-models`), and `fw-context doctor --fix` or `fw-context init` applies it:
+
+- An entry that is not in the global config is added.
+- An entry of fw-context that you did not change gets the values of the new release. Your `enabled` stays.
+- An entry of fw-context that you changed stays. When the new release has other values for it, the report names them.
+- An entry without `source` is yours. fw-context never changes it.
+- An entry of fw-context that the new release does not have is removed when you did not change it. When you changed it, it stays, and the report names it.
+
+A removed entry of fw-context comes back with the next `doctor --fix`: fw-context cannot tell a removed entry from one that is not added yet. To take a model out, set `enabled = false`. Thus a removal is also the way back to the values of fw-context for an entry that you changed. Each change counts, also a removed key or a value of the wrong type. A value of the wrong type or an unknown key gives a warning, and fw-context does not use that value. A project file cannot hold the list: the warning asks you to move it to the global config. `fw-context doctor --fix` and `fw-context init` write the list only when the result is valid TOML with each entry in its table. For a shape that they cannot change (an inline `[llm]`, a `[llm.models]` that is not a table of entries), they write nothing there and report it.
+
 #### The context of the LLM analysis
 
 With an `ollama` profile, fw-context selects the context of the LLM analysis from the measured speed of the model on this machine. The speed of the analysis follows where the model runs: all in the GPU memory, partly in the RAM, all in the RAM, or in the RAM with swap. The report of Ollama (`/api/ps`) does not tell this for each kind of model, thus fw-context measures it.

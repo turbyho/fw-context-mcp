@@ -315,6 +315,10 @@ def _by_hand(problem) -> str:
                 "and the index of the project is lost")
     if problem.keys == ("llm", "profiles"):
         return f"{problem.message}. Correct it by hand: move the profiles to the global config"
+    if problem.keys[:2] in (("llm", "models"), ("llm", "embed_models")):
+        if len(problem.keys) == 2:
+            return f"{problem.message}. Correct it by hand: move the list to the global config"
+        return f"{problem.message}. Correct it by hand: fw-context does not know which key you meant"
     return (f"{problem.message}. Correct it by hand: the value selects the LLM backend, and a removal would "
             "send the requests to another server or model")
 

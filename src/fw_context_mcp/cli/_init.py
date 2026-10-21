@@ -718,6 +718,40 @@ def _persist_detected_embed_model(project_root: Path, cfg) -> None:
     print(f"  [ok] Embedding model {cfg.llm.embed_model} (detected) saved to {path}")
 
 
+def _sync_model_list(dry_run: bool) -> None:
+    """Copy the list of the models of Ollama of this release into the global config (``config._model_list``).
+
+    One line for the entries that the sync adds, updates and removes, and
+    one line for each entry that the user changed.  A global config that
+    cannot be read is reported, not an error: the list gives a
+    recommendation only, and the other steps of init report the config.
+    """
+    import tomlkit
+
+    from .. import __version__
+    from ..config import settings
+    from ..config._model_list import sync_global_config
+
+    tag = "dry-run" if dry_run else "fix"
+    try:
+        path = settings._GLOBAL_CONFIG_PATH if dry_run else settings._ensure_global_config()
+        if not path.is_file():
+            print(f"  [{tag}] {path}: the list of the models of Ollama goes into a new global config")
+            return
+        report = sync_global_config(path, version=__version__, dry_run=dry_run)
+    except (OSError, UnicodeDecodeError, tomlkit.exceptions.ParseError) as e:
+        print(f"  [warn] the list of the models of Ollama is not changed: {e}")
+        return
+    counts = [f"{len(items)} {verb}" for verb, items in
+              (("added", report.added), ("updated", report.updated), ("removed", report.removed)) if items]
+    if counts:
+        print(f"  [{tag}] {path}: the list of the models of Ollama: {', '.join(counts)}")
+    for label in report.kept:
+        print(f"  [info] {path}: kept {label} (changed by the user)")
+    for label in report.skipped:
+        print(f"  [warn] {path}: the list of the models is not changed: {label}")
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     """Register fw-context with AI assistants and provision the project.
 
@@ -789,6 +823,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         print(f"  [{'dry-run' if args.dry_run else 'fix'}] {path}: {label}")
     for path, reason in migration.failures:
         print(f"  [warn] {path}: {reason}")
+    _sync_model_list(args.dry_run)
     if args.dry_run and migration.removed_keys:
         # The next steps read the config, and load refuses the old keys
         # that the dry run did not convert: they stopped with a ConfigError.

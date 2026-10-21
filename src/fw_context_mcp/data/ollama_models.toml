@@ -1,0 +1,208 @@
+# The models of Ollama that fw-context knows, for the list of the models in
+# the global config ([llm.models] and [llm.embed_models], see
+# config/_model_list.py).  "fw-context init" and "fw-context doctor --fix"
+# copy each entry into the global config.  Change this file only with a new
+# measurement: the next release updates each entry that the user did not
+# change.
+#
+# [chat]: the models of the LLM analysis.  quality is the blind grade 1-5 of
+# the LLM analysis of C/C++ symbols (plans/eval/llm-models-2026-10-20,
+# judge/table.json).  The list holds a model when no other model with the
+# same or smaller weights is more than 0.2 better (decision of the user,
+# 2026-10-21).  A model below 3.0 stays for a machine with little memory.
+# A cloud model (remote = true) needs no memory here: the list holds it when
+# no other cloud model of the same or a lower price is more than 0.2 better.
+# usd_per_1k_symbols is the price of 1000 symbols from the tokens that the
+# benchmark measured (a thinking model counts its reasoning), and
+# usd_per_1k_symbols_off_peak the price outside 12:00-18:00 UTC on weekdays.
+# The rule compares the lower of the two prices.  deepseek-v4.1-flash:cloud
+# was graded later, beside 5 graded variants; its grade is on the scale of
+# the benchmark from these anchors.
+#
+# [embedding]: the models of the embeddings.  quality comes with the
+# benchmark of the embeddings (MRR on the same symbols); until then the
+# entries have none.
+#
+# weights_gb: the size of the model file that Ollama pulled on Linux with
+# an NVIDIA GPU (ollama list), in GB of 10^9 bytes; ollama.com/library for a
+# model that the benchmark did not pull.  One tag can resolve to another
+# file on another platform (mlx, nvfp4): the size is a guide, and the
+# calibration measures the memory of the machine.  dimension: the embedding_length of /api/show.  A
+# value that no source gives is left out.
+
+[chat."gemma4:31b"]
+quality = 3.80
+quality_source = "fw-context benchmark 2026-10-20: 30 C/C++ symbols, prompt v1, blind grades 1-5"
+weights_gb = 19.0
+moe = false
+remote = false
+
+[chat."gemma4:26b"]
+quality = 3.73
+quality_source = "fw-context benchmark 2026-10-20: 30 C/C++ symbols, prompt v1, blind grades 1-5"
+weights_gb = 18.0
+moe = true
+remote = false
+
+[chat."qwen3.5:27b"]
+quality = 3.70
+quality_source = "fw-context benchmark 2026-10-20: 30 C/C++ symbols, prompt v1, blind grades 1-5"
+weights_gb = 17.0
+moe = false
+remote = false
+
+[chat."phi4:14b"]
+quality = 3.67
+quality_source = "fw-context benchmark 2026-10-20: 30 C/C++ symbols, prompt v1, blind grades 1-5"
+weights_gb = 9.1
+moe = false
+remote = false
+
+[chat."qwen3-coder:30b"]
+quality = 3.63
+quality_source = "fw-context benchmark 2026-10-20: 30 C/C++ symbols, prompt v1, blind grades 1-5"
+weights_gb = 18.0
+moe = true
+remote = false
+
+[chat."qwen2.5-coder:14b"]
+quality = 3.53
+quality_source = "fw-context benchmark 2026-10-20: 30 C/C++ symbols, prompt v1, blind grades 1-5"
+weights_gb = 9.0
+moe = false
+remote = false
+
+[chat."gemma4:12b"]
+quality = 3.50
+quality_source = "fw-context benchmark 2026-10-20: 30 C/C++ symbols, prompt v1, blind grades 1-5"
+weights_gb = 8.0
+moe = false
+remote = false
+
+[chat."qwen2.5-coder:14b-instruct-q8_0"]
+quality = 3.47
+quality_source = "fw-context benchmark 2026-10-20: 30 C/C++ symbols, prompt v1, blind grades 1-5"
+weights_gb = 15.0
+moe = false
+remote = false
+
+[chat."qwen3:8b"]
+quality = 3.00
+quality_source = "fw-context benchmark 2026-10-20: 30 C/C++ symbols, prompt v1, blind grades 1-5"
+weights_gb = 5.2
+moe = false
+remote = false
+
+[chat."qwen2.5-coder:7b"]
+quality = 2.80
+quality_source = "fw-context benchmark 2026-10-20: 30 C/C++ symbols, prompt v1, blind grades 1-5"
+weights_gb = 4.7
+moe = false
+remote = false
+
+[chat."qwen3.5:9b"]
+quality = 2.80
+quality_source = "fw-context benchmark 2026-10-20: 30 C/C++ symbols, prompt v1, blind grades 1-5"
+weights_gb = 6.6
+moe = false
+remote = false
+
+[chat."gemma4:e2b"]
+quality = 2.80
+quality_source = "fw-context benchmark 2026-10-20: 30 C/C++ symbols, prompt v1, blind grades 1-5"
+weights_gb = 4.6
+moe = false
+remote = false
+
+[chat."qwen3.5:4b"]
+quality = 2.77
+quality_source = "fw-context benchmark 2026-10-20: 30 C/C++ symbols, prompt v1, blind grades 1-5"
+weights_gb = 3.3
+moe = false
+remote = false
+
+[chat."granite4:tiny-h"]
+quality = 2.57
+quality_source = "fw-context benchmark 2026-10-20: 30 C/C++ symbols, prompt v1, blind grades 1-5"
+weights_gb = 4.2
+moe = true
+remote = false
+
+[chat."qwen2.5-coder:3b"]
+quality = 2.50
+quality_source = "fw-context benchmark 2026-10-20: 30 C/C++ symbols, prompt v1, blind grades 1-5"
+weights_gb = 1.9
+moe = false
+remote = false
+
+[chat."minimax-m3.1-flash:cloud"]
+quality = 4.67
+quality_source = "fw-context benchmark 2026-10-20: 30 C/C++ symbols, prompt v1, blind grades 1-5"
+usd_per_1k_symbols = 1.117
+price_source = "ollama.com/pricing 2026-10-21 and the tokens of the benchmark 2026-10-20"
+moe = false
+remote = true
+
+[chat."deepseek-v4.1-flash:cloud"]
+quality = 4.40
+quality_source = "fw-context review 2026-10-21 with 5 anchors of the benchmark 2026-10-20: 30 C/C++ symbols, prompt v1"
+usd_per_1k_symbols = 1.162
+usd_per_1k_symbols_off_peak = 0.581
+price_source = "ollama.com/pricing 2026-10-21 and the tokens of the run 2026-10-21"
+moe = false
+remote = true
+
+[chat."gpt-oss:120b-cloud"]
+quality = 3.87
+quality_source = "fw-context benchmark 2026-10-20: 30 C/C++ symbols, prompt v1, blind grades 1-5"
+usd_per_1k_symbols = 0.620
+price_source = "ollama.com/pricing 2026-10-21 and the tokens of the benchmark 2026-10-20"
+moe = false
+remote = true
+
+[chat."gemma4:31b-cloud"]
+quality = 3.87
+quality_source = "fw-context benchmark 2026-10-20: 30 C/C++ symbols, prompt v1, blind grades 1-5"
+usd_per_1k_symbols = 0.470
+price_source = "ollama.com/pricing 2026-10-21 and the tokens of the benchmark 2026-10-20"
+moe = false
+remote = true
+
+[chat."gpt-oss:20b-cloud"]
+quality = 3.57
+quality_source = "fw-context benchmark 2026-10-20: 30 C/C++ symbols, prompt v1, blind grades 1-5"
+usd_per_1k_symbols = 0.295
+price_source = "ollama.com/pricing 2026-10-21 and the tokens of the benchmark 2026-10-20"
+moe = false
+remote = true
+
+[chat."nemotron-3-nano:30b-cloud"]
+quality = 3.13
+quality_source = "fw-context benchmark 2026-10-20: 30 C/C++ symbols, prompt v1, blind grades 1-5"
+usd_per_1k_symbols = 0.240
+price_source = "ollama.com/pricing 2026-10-21 and the tokens of the benchmark 2026-10-20"
+moe = false
+remote = true
+
+[embedding."qwen3-embedding:8b"]
+weights_gb = 4.7
+dimension = 4096
+remote = false
+
+[embedding."qwen3-embedding:4b"]
+weights_gb = 2.5
+remote = false
+
+[embedding."qwen3-embedding:0.6b"]
+weights_gb = 0.639
+remote = false
+
+[embedding."mxbai-embed-large:latest"]
+weights_gb = 0.669
+dimension = 1024
+remote = false
+
+[embedding."nomic-embed-text:latest"]
+weights_gb = 0.274
+dimension = 768
+remote = false

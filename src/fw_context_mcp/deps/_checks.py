@@ -432,6 +432,43 @@ def check_config(problem: Exception | None, project_root: str | Path | None = No
     )
 
 
+def check_llm_models() -> DepCheckResult:
+    """Say if the list of the models of Ollama in the global config is the list of this release.
+
+    See ``config._model_list``: the check reads only, ``doctor --fix``
+    adds, updates and removes the entries of fw-context.  Not critical: the
+    list gives a recommendation of a model, and no answer changes.  An
+    entry that the user changed stays; the message names it when this
+    release has a new value for it.
+    """
+    import tomlkit
+
+    from .. import __version__
+    from ..config import settings
+    from ..config._model_list import sync_global_config
+
+    path = settings._GLOBAL_CONFIG_PATH
+    fix = "fw-context doctor --fix --only llm-models"
+    if not path.is_file():
+        return DepCheckResult(name="llm-models", status="degraded", fix_cmd=fix, critical=False,
+                              message=f"no global config ({path}): the list of the models is not there")
+    try:
+        report = sync_global_config(path, version=__version__, dry_run=True)
+    except (OSError, UnicodeDecodeError, tomlkit.exceptions.ParseError) as e:
+        return DepCheckResult(name="llm-models", status="degraded", critical=False,
+                              message=f"cannot read the global config ({path}): {e}")
+    if not report.changes and not report.skipped:
+        message = f"the list of the models is the list of fw-context {__version__}"
+        if report.kept:
+            message += "; " + "; ".join(report.lines())
+        return DepCheckResult(name="llm-models", status="ok", message=message, critical=False)
+    # A skipped table needs the user: the fix can only add what it can write.
+    return DepCheckResult(name="llm-models", status="degraded", fix_cmd=fix if report.changes else None,
+                          critical=False,
+                          message=f"the list of the models is not the list of fw-context {__version__}: "
+                                  + "; ".join(report.lines()))
+
+
 def check_tomli_w() -> DepCheckResult:
     """Verify tomli-w is installed — required for config writes during init.
 
@@ -811,6 +848,7 @@ CHECK_ORDER: list[tuple[str, Any]] = [
     ("watchfiles", check_watchfiles),
     ("tomli-w", check_tomli_w),
     ("config", check_config),
+    ("llm-models", check_llm_models),
     ("ollama", check_ollama_running),
     ("chat-model", check_ollama_chat_model),
     ("embed-model", check_ollama_embed_model),

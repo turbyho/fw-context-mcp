@@ -326,6 +326,7 @@ def _recheck(name: str, project_root: str | Path | None = None) -> DepCheckResul
         check_disk_space,
         check_libclang_python,
         check_libclang_so,
+        check_llm_models,
         check_obsolete_files,
         check_ollama_chat_model,
         check_ollama_embed_model,
@@ -363,6 +364,7 @@ def _recheck(name: str, project_root: str | Path | None = None) -> DepCheckResul
         "db-integrity": lambda: check_db_integrity(project_root),
         "disk-space": lambda: check_disk_space(project_root),
         "obsolete-files": lambda: check_obsolete_files(project_root),
+        "llm-models": check_llm_models,
     }
     fn = _map.get(name)
     if fn is None:

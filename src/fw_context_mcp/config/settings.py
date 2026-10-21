@@ -1350,6 +1350,9 @@ def config_value_problems(layer: dict, *, global_file: bool = True) -> list[Valu
     llm = layer.get("llm")
     if isinstance(llm, dict):
         _llm_profile_problems(llm, problems, global_file=global_file)
+        from ._model_list import problems as model_list_problems
+
+        problems += model_list_problems(llm, global_file=global_file)
     build = layer.get("build")
     if isinstance(build, dict) and "variants" in build:
         _variant_problems(build["variants"], problems, check)
@@ -1667,10 +1670,16 @@ def _check_layer(layer: dict, path: Path, warnings: list[str], *, global_file: b
             # shows it, also `fw-context index`, which can run for hours with
             # the default of a switch.  The MCP status tools give it to the
             # caller in `config_warnings`.
+            # The list of the models has no lower file or default: the value
+            # is only not used (config._model_list).
+            in_list = problem.keys[:2] in (("llm", "models"), ("llm", "embed_models"))
             log.warning(
-                "%s: %s. fw-context uses the value of a lower file or the default. "
-                "Run 'fw-context doctor --fix --only config' to remove the value.",
+                "%s: %s. %s %s",
                 path, problem.message,
+                "fw-context does not use the value." if in_list
+                else "fw-context uses the value of a lower file or the default.",
+                "Run 'fw-context doctor --fix --only config' to remove the value." if problem.removable
+                else "Correct it by hand.",
             )
 
 

@@ -104,6 +104,8 @@ packages = ["src/fw_context_mcp"]
 include = [
     "README.md",
     "src/fw_context_mcp/data/**/*.md",
+    # The list of the models of Ollama (config/_model_list.py).
+    "src/fw_context_mcp/data/ollama_models.toml",
     # The clang compiler headers of the pinned libclang major version, with
     # their license and provenance (scripts/build_clang_headers.py).
     "src/fw_context_mcp/data/clang-resource/*",

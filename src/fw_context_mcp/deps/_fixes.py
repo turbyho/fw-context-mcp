@@ -417,6 +417,27 @@ def fix_config(_result, project_root=None) -> tuple[bool, str]:
     return True, message
 
 
+def fix_llm_models(_result, project_root=None) -> tuple[bool, str]:
+    """Bring the list of the models of the global config to the list of this release (``config._model_list``).
+
+    The global config is made from the template first when it is not
+    there.  Comments stay.  An entry that the user changed stays.
+    """
+    import tomlkit
+
+    from .. import __version__
+    from ..config import settings
+    from ..config._model_list import sync_global_config
+
+    try:
+        path = settings._ensure_global_config()
+        report = sync_global_config(path, version=__version__)
+    except (OSError, UnicodeDecodeError, tomlkit.exceptions.ParseError) as e:
+        return False, f"cannot change the list of the models: {e}"
+    lines = report.lines()
+    return True, (f"{path}: " + "; ".join(lines)) if lines else "the list of the models was the list of this release"
+
+
 # ── Registry ────────────────────────────────────────────────────────────
 
 
@@ -432,6 +453,7 @@ FIXABLE: dict[str, Any] = {
     "clang-resource": fix_clang_resource,
     "obsolete-files": fix_obsolete_files,
     "config": fix_config,
+    "llm-models": fix_llm_models,
 }
 
 

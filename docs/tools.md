@@ -895,6 +895,11 @@ without `config` does not repair the config files.
 - `tomli-w` — the `tomli-w` package is installed. `fw-context init` needs
   it to write the config files.
 - `config` — the config files load (see below).
+- `llm-models` — the list of the models of Ollama in the global config is
+  the list of this release (see
+  [`[llm.models]`](configuration.md#llmmodels-and-llmembed_models--the-list-of-the-models-of-ollama)).
+  Not critical. `--fix` adds, updates and removes the entries of
+  fw-context, and keeps each entry that you changed or added.
 - `ollama` — the Ollama server answers. `skipped` when the LLM is off.
 - `chat-model` — the chat model is installed on the Ollama server of the
   chat calls. `skipped` when an OpenAI-compatible API runs the chat model.
