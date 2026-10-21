@@ -254,8 +254,8 @@ def test_the_status_counts_the_analyses_of_each_model(populated_db, tmp_path):
 
 @pytest.mark.parametrize(("background", "chooses"), [(False, True), (True, False)],
                          ids=["manual run", "background run"])
-def test_only_a_manual_index_run_selects_the_context_of_the_analysis(cfg, tmp_path: Path, background, chooses):
-    """The search loads the model up to 6 times: the background run usually analyses one or two symbols."""
+def test_only_a_manual_index_run_measures_the_context_of_the_analysis(cfg, tmp_path: Path, background, chooses):
+    """A measurement loads the model: the background run takes the stored calibration (``llm.calibration``)."""
     from fw_context_mcp.cli._index import _build_run_kwargs
     from fw_context_mcp.indexer._llm_analysis import ContextChoice
 
@@ -263,4 +263,4 @@ def test_only_a_manual_index_run_selects_the_context_of_the_analysis(cfg, tmp_pa
 
     kwargs = _build_run_kwargs(args, cfg, tmp_path, "id", [], [], None)
 
-    assert isinstance(kwargs["context_choice"], ContextChoice) is chooses
+    assert isinstance(kwargs["context_choice"], ContextChoice) and kwargs["context_choice"].check is chooses

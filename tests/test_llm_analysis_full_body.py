@@ -539,7 +539,8 @@ def choice_on(monkeypatch):
     monkeypatch.setattr(ollama, "release_other_model", lambda cfg, phase: None)
     model = _Model()
     model.asked = []
-    model.fit_context = lambda lower, upper: model.asked.append((lower, upper)) or ContextFit(6144, 1.0, "context 6144")
+    model.fit_context = lambda lower, upper, *, check: (model.asked.append((lower, upper, check))
+                                                        or ContextFit(6144, "context 6144"))
     model.counted = []
     count = model.count
     model.count = lambda prompt, num_ctx: model.counted.append(num_ctx) or count(prompt, num_ctx)
@@ -554,12 +555,12 @@ def _seed_new(conn, tmp_path: Path, prefix: str) -> None:
     _seed(conn, tmp_path, {f"{prefix}_{i}": _body(f"{prefix}_{i}", 3) for i in range(3)})
 
 
-def test_the_first_pass_uses_the_context_that_the_free_gpu_memory_selects(populated_db, tmp_path: Path, choice_on):
+def test_the_first_pass_uses_the_context_that_the_measured_speed_selects(populated_db, tmp_path: Path, choice_on):
     _seed_new(populated_db, tmp_path, "fit_first")
 
     _run(populated_db, tmp_path, context_choice=mod.ContextChoice())
 
-    assert choice_on.asked == [(4096, 8000)], "one choice for the run, from the lower bound to num_ctx"
+    assert choice_on.asked == [(4096, 8000, True)], "one choice for the run, from the lower bound to num_ctx"
     assert {num_ctx for _prompt, num_ctx, _max in choice_on.calls} == {6144}
     assert set(choice_on.counted) == {6144}, "the count of the tokens uses the selected context too"
 
@@ -573,7 +574,7 @@ def test_the_builds_of_one_run_share_one_choice(populated_db, tmp_path: Path, ch
 
     _run(populated_db, tmp_path, context_choice=choice)
 
-    assert choice_on.asked == [(4096, 8000)]
+    assert choice_on.asked == [(4096, 8000, True)]
     assert {num_ctx for _prompt, num_ctx, _max in choice_on.calls} == {6144}
 
 
@@ -595,3 +596,62 @@ def test_a_run_without_a_choice_uses_num_ctx(populated_db, tmp_path: Path, choic
 
     assert choice_on.asked == []
     assert {num_ctx for _prompt, num_ctx, _max in choice_on.calls} == {8000}
+
+
+def test_a_model_that_does_not_fit_the_memory_stops_the_run(populated_db, tmp_path: Path, choice_on):
+    """No request of the run can load the model: the run stops before its first request, and a later run continues."""
+    from fw_context_mcp.llm.errors import ModelDoesNotFit
+
+    def _does_not_fit(lower, upper, *, check):
+        raise ModelDoesNotFit("Ollama cannot load the model")
+
+    choice_on.fit_context = _does_not_fit
+    _seed_new(populated_db, tmp_path, "fit_ram")
+
+    finished = _build_llm_analysis(populated_db, CONFIG_HASH, _Config(), tmp_path, project_root=tmp_path,
+                                   write_lock_held=True, context_choice=mod.ContextChoice())
+
+    assert finished is False and choice_on.calls == [] and choice_on.counted == []
+
+
+def test_the_next_build_tries_the_load_again_after_a_stop(choice_on):
+    """The memory can be free for the next build: one load at the lower bound again, not the stop of the first."""
+    from fw_context_mcp.llm.errors import ModelDoesNotFit
+
+    tries: list[int] = []
+
+    def _does_not_fit(lower, upper, *, check):
+        tries.append(lower)
+        raise ModelDoesNotFit("Ollama cannot load the model")
+
+    choice_on.fit_context = _does_not_fit
+    choice = mod.ContextChoice()
+    for _build in range(2):
+        with pytest.raises(ModelDoesNotFit):
+            choice.select(choice_on, "m:1b", 8000)
+
+    assert tries == [4096, 4096]
+
+
+def test_a_background_choice_takes_the_calibration_without_a_measurement(populated_db, tmp_path: Path, choice_on):
+    """The background reindex and reindex_file: ``check=False`` reaches the client (``llm.calibration``)."""
+    _seed_new(populated_db, tmp_path, "fit_bg")
+
+    _run(populated_db, tmp_path, context_choice=mod.ContextChoice(check=False))
+
+    assert choice_on.asked == [(4096, 8000, False)]
+
+
+def test_reindex_file_takes_the_calibration_without_a_measurement(populated_db, monkeypatch, tmp_path: Path):
+    """One file has few symbols: a measurement of some seconds for each changed file is not worth it."""
+    from fw_context_mcp.cache_client import CacheClient
+    from fw_context_mcp.mcp.handlers import maintenance
+
+    choices: list = []
+    monkeypatch.setattr(mod, "_build_llm_analysis", lambda *a, **k: choices.append(k["context_choice"]) or True)
+    monkeypatch.setattr(CacheClient, "from_config", staticmethod(lambda cfg: None))
+    cfg = SimpleNamespace(llm=SimpleNamespace(enabled=True, analyze_symbols=True))
+
+    maintenance._reindex_llm_analysis(populated_db, CONFIG_HASH, cfg, tmp_path, {}, project_root=tmp_path)
+
+    assert len(choices) == 1 and isinstance(choices[0], mod.ContextChoice) and choices[0].check is False

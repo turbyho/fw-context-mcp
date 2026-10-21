@@ -61,6 +61,7 @@ Module-level state
 from __future__ import annotations
 
 import dataclasses
+import itertools
 import json
 import logging
 import os
@@ -78,6 +79,7 @@ import httpx
 from ..config.settings import LLMConfig
 from ..utils import is_fatal
 from ._debug import _write_debug_log
+from .calibration import Key, Measure, Speed, select_context
 from .client import ChatResult, ContextFit, Usage
 from .embedder import Embedder, EmbedderContextUnknown, EmbedderInputTooLong
 from .errors import LLMError
@@ -555,11 +557,25 @@ class OllamaClient:
         log.info("LLM model '%s' not found, pulling...", self.cfg.model)
         _pull_model(self.cfg.model, self.server_url)
 
-    def fit_context(self, lower: int, upper: int) -> ContextFit:
-        """Select the context of a run from the free GPU memory of the server (module function ``fit_context``)."""
-        note_chat_use(self.server_url, self.cfg.model)
-        return fit_context(self.server_url, self.cfg.model, lower=lower, upper=upper,
-                           keep_alive=self.cfg.keep_alive, timeout=self.cfg.timeout)
+    def fit_context(self, lower: int, upper: int, *, check: bool) -> ContextFit | None:
+        """Select the context of a run from the measured speed of the model (``llm.calibration``).
+
+        No choice when *upper* is not above *lower*: the run uses *upper*,
+        and the key would cost two requests and ``nvidia-smi`` for nothing.
+        """
+        if upper <= lower:
+            return None
+        key = calibration_key(self.server_url, self.cfg.model, lower, upper)
+        if key is None:
+            return None
+        if check:
+            note_chat_use(self.server_url, self.cfg.model)
+
+        def measure(num_ctx: int) -> Measure:
+            return measure_speed(self.server_url, self.cfg.model, num_ctx, keep_alive=self.cfg.keep_alive,
+                                 timeout=self.cfg.timeout, stream=self.cfg.stream)
+
+        return select_context(measure, key, check=check)
 
 
 # The oldest Ollama that the LLM analysis and the embeddings can use.  Read
@@ -747,7 +763,7 @@ def call_ollama_embed(inputs: list[str], cfg: LLMConfig, *, query: bool = True) 
 
 #: Set in the test session (conftest), also for each process that a test
 #: starts: a test must not unload a model of the Ollama of the operator,
-#: and must not load one to select a context (``fit_context``).
+#: and must not load one to measure its speed (``llm.calibration``).
 NO_RELEASE_ENV = "FW_CONTEXT_NO_OLLAMA_RELEASE"
 
 #: The (server, chat model) pairs that this process sent requests to.  The
@@ -856,171 +872,142 @@ def release_other_model(cfg: LLMConfig, phase: str) -> None:
                     server, model, phase)
 
 
-#: The step of the search for the context: a multiple of it is a context
-#: that the KV cache of llama.cpp allocates without waste.
-_CONTEXT_STEP = 1024
+#: The text of a load that failed for memory: the list of Ollama 0.40.7
+#: (``llm/status.go``, ``outOfMemorySubstrings``), which Ollama uses for
+#: its own retry after such an error.  WHY the same list: an error that
+#: Ollama does not take as memory is not a measurement here either.  Plus
+#: the error of the scheduler for a model that is too large for the memory
+#: of the machine (``llm/server.go`` ``ErrLoadRequiredFull``, given at
+#: ``server/sched.go`` "model is too large for system memory").
+_OUT_OF_MEMORY = (
+    "out of memory", "out of device memory", "cudamalloc failed", "hipmalloc failed", "failed to allocate",
+    "allocation failed", "not enough memory", "insufficient memory", "vk_error_out_of_device_memory",
+    "erroroutofmemory", "failed to reserve graph", "unable to load full model on gpu",
+)
+
+#: The reference request of ``measure_speed``: the body of a C function of
+#: about 1700 tokens, the length of a typical prompt of the analysis.
+_REFERENCE_BODY = "\n".join(
+    f"    if (buf[{i}] & 0x{i:02x}) {{ crc = (crc >> 1) ^ table[(crc ^ buf[{i}]) & 0xff]; }}" for i in range(40)
+)
+_REFERENCE_PROMPT = (
+    "Describe this C function. Answer with JSON: summary, inputs, outputs.\n\n"
+    "uint32_t frame_crc(const uint8_t *buf, size_t len, const uint32_t *table)\n{\n"
+    "    uint32_t crc = 0xffffffffu;\n" + _REFERENCE_BODY + "\n    return crc ^ 0xffffffffu;\n}\n"
+)
+#: The answer tokens of the reference request: enough for a stable rate.
+_REFERENCE_ANSWER_TOKENS = 64
+#: A number for each request of ``measure_speed`` in this process.
+_REQUEST_NUMBERS = itertools.count()
 
 
-def fit_context(server_url: str, model: str, *, lower: int, upper: int, keep_alive: str,
-                timeout: float) -> ContextFit:
-    """Select the context of a run of *model* from the free GPU memory of *server_url*.
+def measure_speed(server_url: str, model: str, num_ctx: int, *, keep_alive: str, timeout: float,
+                  stream: bool = False) -> Measure:
+    """Load *model* with *num_ctx* and return the speed of the reference request (``llm.calibration``).
 
-    *upper* is the context of the run: ``num_ctx``, or the trained context
-    of the model when it is smaller.  The result is one of three: the
-    largest context from *lower* to *upper* at which the model is all on
-    the GPU; *lower* with the share on the GPU when the model does not fit
-    at *lower*; *upper* when Ollama does not tell the share, or when no
-    part of the model is on a GPU.
-
-    The speed of the analysis follows the part of the model on the GPU, not
-    the context (measured 2026-10-20: 4k and 6k all on the GPU 3.9
-    s/symbol, 16k with 81 % on the GPU 7.1 s), and the free GPU memory
-    changes during a day.  Thus each run that analyses loads the model
-    with a context (``/api/generate`` without a prompt) and reads
-    ``size`` and ``size_vram`` of ``/api/ps`` — the values of the
-    ``PROCESSOR`` column of ``ollama ps``:
-
-    1. *lower*: the report is used only when ``size`` is at least the
-       weights of the model (``/api/tags``).  A loaded model cannot be
-       smaller than its weights; a smaller report leaves a part out (the
-       projector of a multimodal model, the experts of a MoE model that
-       Ollama keeps in RAM), and its share is not the share of the model.
-       Then the context is *upper*, as without this step.  WHY no list of
-       models: the report decides, thus a model that a later Ollama
-       reports in full gets the choice without a change here.
-    2. No part on a GPU at *lower* (``size_vram`` 0: a machine without a
-       GPU, or an Ollama that does not use it): *upper*.  The model runs
-       from RAM at each context, thus a smaller one makes nothing faster
-       and only sends more prompts to the second pass.
-    3. Not all on the GPU at *lower*: *lower*, with its share (the rest
-       runs from RAM; decision of the user: memory is not a wall).
-    4. All on the GPU at *upper*: *upper*.  Else the largest multiple of
-       ``_CONTEXT_STEP`` between them that is all on the GPU: a bisection,
-       one load of 3 to 10 s for each halving of the candidates (6 loads
-       for 16384, 8 for 65536).  An *upper* that is not a multiple (a
-       trained context of 10000) is a candidate too.
-
-    No weights in ``/api/tags`` or no report at *lower* (a failure of the
-    network, a model that another client unloaded) gives *upper*, as
-    without this step.  A failed load later in the search stops it at
-    the largest context that the search found all on the GPU: a failure
-    is not a measurement, thus it does not count as "does not fit".
-
-    The last load can be at another context than the result.  The first
-    request of the run then loads the model again: one load, the same
-    cost as a load here at the result.
-
-    Each load goes through ``ollama_guard`` with the timeout of the
-    profile, as each request of the analysis.  Works for an Ollama on
-    another computer too: only HTTP.
+    Two requests of the same prompt, each with a first line of its own:
+    the first loads the model and reads each weight that the prompt needs
+    (measured 2026-10-21: the first request after a load can be 8 times
+    slower, while the weights come from the disk; a short prompt does not
+    reach each expert of a MoE model), then the reference request.  The
+    new first line keeps the prompt cache of the runner from making the
+    prompt of the second request free.  The rates come from the times of
+    llama.cpp in the answer, not from the time of the HTTP request.  Each
+    request goes through ``ollama_guard`` with the timeout and the
+    ``stream`` of the profile, as each request of the analysis: a proxy
+    can cut a slow answer that does not stream.
     """
-    if upper <= lower:
-        return ContextFit(upper, None, f"context {upper} (the context of the run is not above {lower})")
-    weights = _weights_size(server_url, model)
-    if weights is None:
-        return ContextFit(upper, None, f"context {upper} (the context of the run): "
-                                       "Ollama gives no size of the model")
-    first = _loaded_with_context(server_url, model, lower, keep_alive, timeout)
-    if first is None:
-        return ContextFit(upper, None, f"context {upper} (the context of the run): "
-                                       "Ollama gives no size of the loaded model")
-    size, vram = first
-    if size < weights:
-        return ContextFit(upper, None, f"context {upper} (the context of the run): Ollama reports a part of "
-                                       f"this model only ({_kind_of(server_url, model)}), "
-                                       "thus its GPU share is not known")
-    if vram == 0:
-        return ContextFit(upper, 0.0, f"context {upper} (the context of the run): no part of the model is on "
-                                      "a GPU, thus a smaller context is not faster")
-    if vram < size:
-        share = vram / size
-        return ContextFit(lower, share, f"context {lower}, {share:.0%} of the model on the GPU: "
-                                        "the rest of the model runs from RAM")
-    # The candidates above *lower*: each multiple of the step below
-    # *upper*, then *upper*.  The search keeps the index of the largest one
-    # that fits (-1: *lower*) and of the smallest one that does not.
-    candidates = [*range((lower // _CONTEXT_STEP + 1) * _CONTEXT_STEP, upper, _CONTEXT_STEP), upper]
-    fits, misses = -1, len(candidates)
-    probe = len(candidates) - 1  # *upper* first: it is the answer when the GPU is free
-    while misses - fits > 1:
-        on_gpu = _all_on_gpu(server_url, model, candidates[probe], keep_alive, timeout)
-        if on_gpu is None:
-            found = lower if fits < 0 else candidates[fits]
-            return ContextFit(found, 1.0, f"context {found}, the model is all on the GPU "
-                                          f"(the load at context {candidates[probe]} failed)")
-        if on_gpu:
-            fits = probe
-        else:
-            misses = probe
-        probe = (fits + misses) // 2
-    found = lower if fits < 0 else candidates[fits]
-    if found == upper:
-        return ContextFit(upper, 1.0, f"context {upper}, the model is all on the GPU")
-    return ContextFit(found, 1.0, f"context {found}, the model is all on the GPU (a larger context is not)")
-
-
-def _loaded_with_context(server_url: str, model: str, num_ctx: int, keep_alive: str,
-                         timeout: float) -> tuple[int, int] | None:
-    """Load *model* with *num_ctx* and return ``(size, size_vram)`` of ``/api/ps``; None when Ollama does not tell."""
     base = server_url.rstrip("/")
+    options = {"num_ctx": num_ctx, "temperature": 0, "seed": 42}
     try:
-        with ollama_guard():
-            resp = httpx.post(f"{base}/api/generate",
-                              json={"model": model, "keep_alive": keep_alive, "options": {"num_ctx": num_ctx}},
-                              timeout=timeout)
-        if resp.status_code != 200:
-            return None
-        body = httpx.get(f"{base}/api/ps", timeout=5.0).json()
-    except (httpx.HTTPError, ValueError):
-        return None
-    name = _with_tag(model)
-    for entry in (body.get("models") or []) if isinstance(body, dict) else []:
-        if isinstance(entry, dict) and (entry.get("name") or entry.get("model")) == name:
-            size, vram = entry.get("size"), entry.get("size_vram")
-            if isinstance(size, int) and isinstance(vram, int) and size > 0:
-                return size, vram
-    return None
+        for tokens in (1, _REFERENCE_ANSWER_TOKENS):
+            # The time keeps the line new for another process, the count
+            # for two requests in one tick of the clock.
+            prompt = f"Request {time.monotonic_ns()}-{next(_REQUEST_NUMBERS)}.\n{_REFERENCE_PROMPT}"
+            with ollama_guard():
+                resp = httpx.post(f"{base}/api/generate", json={
+                    "model": model, "prompt": prompt, "stream": stream, "truncate": False,
+                    "keep_alive": keep_alive, "options": {**options, "num_predict": tokens}}, timeout=timeout)
+            if resp.status_code != 200:
+                error = _error_text(resp)
+                return Measure(None, error, any(text in error.lower() for text in _OUT_OF_MEMORY))
+        body = _final_answer(resp, stream)
+    except httpx.HTTPError as e:
+        return Measure(None, f"Ollama does not answer ({type(e).__name__}: {e})")
+    except ValueError:
+        return Measure(None, "Ollama gives an answer that is not JSON")
+    # A stream that fails after its first part ends with an error line and
+    # HTTP 200: the load is before the stream, thus not this way.
+    stream_error = body.get("error") if isinstance(body, dict) else None
+    if isinstance(stream_error, str) and stream_error:
+        return Measure(None, f"Ollama: {stream_error[:300]}",
+                       any(text in stream_error.lower() for text in _OUT_OF_MEMORY))
+    counts: list[int] = []
+    for key in ("prompt_eval_count", "prompt_eval_duration", "eval_count", "eval_duration"):
+        value = body.get(key) if isinstance(body, dict) else None
+        if not isinstance(value, int) or value <= 0:
+            return Measure(None, "Ollama gives no times of the request")
+        counts.append(value)
+    prompt_count, prompt_ns, eval_count, eval_ns = counts
+    return Measure(Speed(prompt_count, prompt_count / prompt_ns * 1e9, eval_count / eval_ns * 1e9))
 
 
-def _all_on_gpu(server_url: str, model: str, num_ctx: int, keep_alive: str, timeout: float) -> bool | None:
-    """Return True when *model* at *num_ctx* is all on the GPU, False when not, None when Ollama does not tell."""
-    found = _loaded_with_context(server_url, model, num_ctx, keep_alive, timeout)
-    return None if found is None else found[1] >= found[0]
+def calibration_key(server_url: str, model: str, lower: int, upper: int) -> Key | None:
+    """Return what a calibration of *model* on *server_url* is valid for; None: no calibration.
 
+    None for a cloud model of Ollama (``remote_host`` in ``/api/tags``): it
+    runs on another computer, thus its context is not a question of the
+    memory here, and a measurement would send the reference request out.
+    None too when the server does not list the model.  The memory of this
+    machine is part of the key only for a server on this machine.
+    """
+    from urllib.parse import urlparse
 
-def _weights_size(server_url: str, model: str) -> int | None:
-    """Return the size of the weights of *model* on the server (``/api/tags``), or None."""
     from ._diag import tag_models
+    from .hardware import machine_memory
 
     try:
         resp = httpx.get(server_url.rstrip("/") + "/api/tags", timeout=5.0)
         resp.raise_for_status()
-    except httpx.HTTPError:
+        version = httpx.get(server_url.rstrip("/") + "/api/version", timeout=5.0).json().get("version")
+    except (httpx.HTTPError, ValueError, AttributeError):
         return None
     name = _with_tag(model)
-    for entry in tag_models(resp) or []:
-        if entry["name"] == name and isinstance(entry.get("size"), int):
-            return int(entry["size"])
-    return None
+    entry = next((m for m in tag_models(resp) or [] if m["name"] == name), None)
+    if entry is None or entry.get("remote_host"):
+        return None
+    # Only these names count as this machine: another address of it (a LAN
+    # address, 127.0.1.1) gives a key without the memory, thus a new GPU is
+    # not seen there.
+    memory = machine_memory() if urlparse(server_url).hostname in ("localhost", "127.0.0.1", "::1") else None
+    return Key(server=server_url.rstrip("/"), model=name, digest=str(entry.get("digest") or ""),
+               ollama=str(version or ""), gpu_mib=memory.gpu_mib if memory else None,
+               ram_mib=memory.ram_mib if memory else None, lower=lower, upper=upper)
 
 
-def _kind_of(server_url: str, model: str) -> str:
-    """Return a short reason for a partial report: a multimodal model, a MoE model, or a model of another kind."""
+def _final_answer(resp: httpx.Response, stream: bool) -> object:
+    """Return the JSON of the answer; of a streamed answer the last line, which holds the times.
+
+    Raises:
+        ValueError: The answer is not JSON, or a stream has no line.
+    """
+    if not stream:
+        return resp.json()
+    lines = [line for line in resp.text.splitlines() if line.strip()]
+    if not lines:
+        raise ValueError("an empty stream")
+    return json.loads(lines[-1])
+
+
+def _error_text(resp: httpx.Response) -> str:
+    """Return the error of an Ollama answer: ``{"error": ...}``, else the start of the body."""
     try:
-        info = httpx.post(server_url.rstrip("/") + "/api/show", json={"model": model}, timeout=5.0).json()
-    except (httpx.HTTPError, ValueError):
-        return "a model of another kind"
-    # WHY each check: the body is data of the server, and a value of another
-    # type must give the general reason, not an exception in the run.
-    info = info if isinstance(info, dict) else {}
-    capabilities = info.get("capabilities")
-    model_info = info.get("model_info")
-    if isinstance(capabilities, list) and ("vision" in capabilities or "audio" in capabilities):
-        return "a multimodal model"
-    if isinstance(model_info, dict) and any(
-            isinstance(key, str) and key.endswith(".expert_count") and value for key, value in model_info.items()):
-        return "a MoE model, whose experts Ollama keeps in RAM"
-    return "a model of another kind"
+        body = resp.json()
+    except ValueError:
+        body = None
+    error = body.get("error") if isinstance(body, dict) else None
+    text = (error if isinstance(error, str) and error else resp.text)[:300]
+    return f"HTTP {resp.status_code}: {text.strip()}"
 
 
 def _trained_context(base: str, model: str) -> int | None:

@@ -26,6 +26,14 @@ class LLMStopRun(LLMError):
     """
 
 
+class ModelDoesNotFit(LLMStopRun):
+    """The model does not load with the smallest context of the analysis: the memory is not sufficient.
+
+    A run of the analysis stops (``LLMStopRun``): each symbol would load
+    the model three times, and each load would fail the same way.
+    """
+
+
 class ChatApiError(LLMError):
     """A request to an OpenAI-compatible chat API failed.
 

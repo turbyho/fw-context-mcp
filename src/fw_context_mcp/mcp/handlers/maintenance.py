@@ -2793,7 +2793,7 @@ def _reindex_llm_analysis(
         return
     try:
         from ...cache_client import CacheClient
-        from ...indexer._llm_analysis import _build_llm_analysis
+        from ...indexer._llm_analysis import ContextChoice, _build_llm_analysis
         try:
             stored_av = bool(
                 conn.execute(
@@ -2810,6 +2810,9 @@ def _reindex_llm_analysis(
                 write_lock_held=False, retry_unparseable=True,
                 cache_client=cc, project_only=not stored_av,
                 project_root=project_root,
+                # The stored calibration, without a measurement: one file
+                # has few symbols (``llm.calibration``).
+                context_choice=ContextChoice(check=False),
             )
             conn.commit()
         finally:

@@ -1322,9 +1322,9 @@ def _build_run_kwargs(
         config_header=cfg.index.config_header,
         force=args.force,
         force_llm_since=None,
-        # A manual run selects the context of the analysis from the free GPU
-        # memory, one time for its builds; the background reindex uses num_ctx.
-        context_choice=None if getattr(args, "background", False) else ContextChoice(),
+        # A manual run measures the context of the analysis, one time for its
+        # builds; the background reindex takes the stored calibration.
+        context_choice=ContextChoice(check=not getattr(args, "background", False)),
         analyze_vendor=(
             False
             if getattr(args, "no_analyze_vendor", False)

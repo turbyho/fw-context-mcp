@@ -199,41 +199,52 @@ def _enrich_batch(conn, batch_rows, config_hash: str, *, project_root: Path | No
         enriched.append(d)
     return enriched
 
-#: The lower bound of the context that the free GPU memory selects (decision
+#: The lower bound of the context that the measured speed selects (decision
 #: of the user, 2026-10-21): a smaller context sends too many prompts to the
 #: second pass.
 _LOWEST_CONTEXT = 4096
 
 
 def _context_choice_on() -> bool:
-    """Return False in the test session: the choice loads models into the Ollama of the operator."""
+    """Return False in the test session: a measurement loads models into the Ollama of the operator."""
     from ..llm.ollama import NO_RELEASE_ENV
 
     return not os.environ.get(NO_RELEASE_ENV)
 
 
 class ContextChoice:
-    """The context of the LLM analysis of one manual run, selected one time (``ChatClient.fit_context``).
+    """The context of the LLM analysis of one run, selected one time (``ChatClient.fit_context``, ``llm.calibration``).
 
-    A manual ``fw-context index`` or ``fw-context analyze`` makes one and
-    gives it to each build of the run.  WHY a manual run only: the
-    search loads the model up to 6 times for a context of 16384 and up to
-    8 times for 65536, each load 3 to 10 s, and the background
-    reindex and ``reindex_file`` usually analyse one or two symbols, for
-    which the speed on the GPU does not matter.  WHY one object for the
+    An index run or ``fw-context analyze`` makes one and gives it to each
+    build of the run.  WHY a measurement in a manual run only: a full
+    search measures up to 6 contexts for 16384 and up to 8 for 65536, a
+    check one, each a load and a request of some seconds, and the
+    background reindex and ``reindex_file`` usually analyse one or two
+    symbols.  WHY one object for the
     run: a run of several builds (a Zephyr app, mcuboot and stage0) calls
     ``_build_llm_analysis`` for each build, and nothing that the search
     measures changes between the builds.
+
+    *check* False (the background reindex, ``reindex_file``): the context
+    of the stored calibration, without a measurement; without one,
+    ``num_ctx``.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, check: bool = True) -> None:
+        self.check = check
         self._fits: dict[tuple[str, int], ContextFit | None] = {}
 
     def select(self, client: ChatClient, model: str, upper: int) -> ContextFit | None:
-        """Return the context of *model* below *upper*: searched at the first call, then the same answer."""
+        """Return the context of *model* below *upper*: searched at the first call, then the same answer.
+
+        Raises:
+            LLMStopRun: The model does not load at the lower bound for
+                memory (``ModelDoesNotFit``); the run stops.  Not
+                kept: the next build tries one load again.
+        """
         key = (model, upper)
         if key not in self._fits:
-            self._fits[key] = (client.fit_context(min(_LOWEST_CONTEXT, upper), upper)
+            self._fits[key] = (client.fit_context(min(_LOWEST_CONTEXT, upper), upper, check=self.check)
                                if _context_choice_on() else None)
         return self._fits[key]
 
@@ -543,14 +554,14 @@ def _build_llm_analysis(
     released = False
 
     def _before_the_first_request() -> None:
-        """Unload the embedding model, then select the context from the free GPU memory: before the first request.
+        """Unload the embedding model, then select the context from the measured speed: before the first request.
 
         Lazy: a run whose analyses come from the cache keeps the embedding
         model loaded for the next query, and loads nothing.  WHY before the
         count too: the count loads the chat model, and a model loaded beside
         the embedding model keeps the split of the GPU that it got.  With a
-        *context_choice* (a manual run), the context of the run is the
-        upper bound (``num_ctx``); the first pass uses the selected one,
+        *context_choice*, the context of the run is the upper bound
+        (``num_ctx``); the first pass uses the selected one,
         the second pass (long prompts) its own larger one.
         """
         nonlocal released, run_ctx

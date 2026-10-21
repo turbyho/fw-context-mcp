@@ -753,8 +753,8 @@ def run(
             command (UTC, ``YYYY-MM-DD HH:MM:SS``).  The LLM analysis of
             each symbol is made again, and an analysis of the caches from
             before it does not apply.  ``force`` alone keeps the analyses.
-        context_choice: The context of the LLM analysis from the free GPU
-            memory, one for the builds of a manual run
+        context_choice: The context of the LLM analysis from the measured
+            speed, one for the builds of a run
             (``_llm_analysis.ContextChoice``).  None: ``num_ctx``.
         transient_defines: ``[index] transient_defines`` — the ``-D`` macros
             that the config_hash and the flags hash of each unit ignore.  The

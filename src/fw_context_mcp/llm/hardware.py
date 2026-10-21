@@ -3,9 +3,8 @@
 The setup of a local Ollama profile recommends a chat model from the
 memory that the model can use.  WHY total and not free memory: the setup
 runs once, and the free memory changes with each other program.  Each
-manual run (``fw-context index``, ``fw-context analyze``) selects the
-context, not the model, from the free memory before its first request
-(``llm.ollama.fit_context``).
+run selects the context, not the model, from the measured speed of the
+model (``llm.calibration``).
 
 The recommendation comes from the measurement of 2026-10-20 (59 variants,
 30 symbols of C/C++ firmware, blind grades 1-5; speed on a Ryzen 9 9900X

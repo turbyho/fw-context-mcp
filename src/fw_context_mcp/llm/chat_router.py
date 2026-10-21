@@ -524,7 +524,7 @@ class OpenAIChatClient:
         """Not known: the API does not tell the context of its model."""
         return None
 
-    def fit_context(self, lower: int, upper: int) -> None:
+    def fit_context(self, lower: int, upper: int, *, check: bool) -> None:
         """None: an API has no GPU of fw-context, thus its context is not a question of memory."""
         return None
 

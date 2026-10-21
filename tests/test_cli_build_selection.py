@@ -560,3 +560,4 @@ def test_analyze_gives_one_choice_of_the_context_to_each_build(two_builds, monke
 
     assert cmd_analyze(args) == 0
     assert len(choices) == 2 and isinstance(choices[0], llm_mod.ContextChoice) and choices[0] is choices[1]
+    assert choices[0].check is True, "a manual run measures"
