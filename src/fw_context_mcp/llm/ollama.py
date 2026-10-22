@@ -887,6 +887,13 @@ _OUT_OF_MEMORY = (
 
 #: The reference request of ``measure_speed``: the body of a C function of
 #: about 1700 tokens, the length of a typical prompt of the analysis.
+#: Checked 2026-10-22: the reference prompt is 1690 tokens, and the mean
+#: prompt of the 30 symbols of the blind review with the current prompt was
+#: 2012 tokens (DeepSeek API).  The reference is 16 % shorter, and stays:
+#: the length changes only the prompt part of the time of a symbol
+#: (``Speed.seconds_per_symbol``), and that part is small against the
+#: answer (qwen2.5-coder:14b, 2026-10-22: about 2 s of the prompt at 960 tokens/s,
+#: 13 s of an answer of 300 tokens at 23 tokens/s).
 _REFERENCE_BODY = "\n".join(
     f"    if (buf[{i}] & 0x{i:02x}) {{ crc = (crc >> 1) ^ table[(crc ^ buf[{i}]) & 0xff]; }}" for i in range(40)
 )

@@ -94,7 +94,8 @@ def _enrich_batch(conn, batch_rows, config_hash: str, *, project_root: Path | No
     no stored body — a symbol indexed before the column existed.
 
     ``body_unavailable`` is True when the kind of the symbol must have a
-    body, but no text was available.  There are three causes:
+    body (each kind of ``ANALYZABLE_KINDS``, a global variable too: its
+    definition), but no text was available.  There are three causes:
 
     * The stored body holds only blank lines.  Every line of the symbol is
       inside an inactive branch, thus the active build compiles none of it.
@@ -130,13 +131,19 @@ def _enrich_batch(conn, batch_rows, config_hash: str, *, project_root: Path | No
         # Read body for symbols with meaningful extents.  Enums and typedefs
         # benefit from body text during LLM analysis (enum constants, type alias).
         #
+        # A global variable too: its body is its definition, with the
+        # initializer and the comment of the line.  Without it, the model
+        # guessed the meaning of a constant from its name.  Measured
+        # 2026-10-22 (blind review of 3 constants, 5 models): the grade of
+        # those answers went from 2-3 to 4-5 of 5.
+        #
         # `0 < start_line <= end_line` takes the one-line definition too, and
         # it keeps out a row with no extent.  The gate that asked for more
         # than one line let a stored body through to nothing:
         # `ops._read_body` now writes the text of an inline accessor, and
         # this gate would then throw it away.
         if (
-            kind in ("function", "method", "constructor", "destructor", "class", "struct", "union", "enum", "typedef")
+            kind in ANALYZABLE_KINDS
             and abs_file_path
             and 0 < start_line <= end_line
         ):
@@ -725,9 +732,14 @@ def _build_llm_analysis(
                 # ── Cache check — 2 tiers: local global → remote ──
                 h = compute_content_hash(d["body"], d["qualified_name"], d["signature"], d["docstring"])
 
-                # Catch edge cases where source-H ≠ body-H (e.g. varglobal
-                # with multi-line initializer — source column captured the
-                # body but _enrich_batch left it empty).
+                # A guard: no known case reaches it now.  It caught a source-H
+                # that differs from the body-H: a varglobal until 2026-10-22,
+                # when the source column held its definition and _enrich_batch
+                # left the body empty.  Now _enrich_batch reads the same text
+                # for each analysable kind, thus the two hashes are equal.  The
+                # stored hash of an earlier analysis of a varglobal (an empty
+                # body) matches neither, and the symbol is analysed one time
+                # again, with its definition.
                 if existing_hash and existing_hash == h:
                     total += 1
                     elapsed = time.monotonic() - t0

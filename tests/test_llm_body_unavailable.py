@@ -109,16 +109,45 @@ class TestEnrichBatchFlag:
         assert out[0]["body_unavailable"] is False
 
     def test_a_kind_that_needs_no_body(self, tmp_path: Path):
-        """A global variable has no body, thus nothing is unavailable."""
+        """A kind that the analysis does not select has no body, thus nothing is unavailable."""
         f = _source_file(tmp_path, lines=30)
         out = _enrich_batch(
             None,
-            [_row(file_path=str(f), kind="varglobal", line=5, end_line=40)],
+            [_row(file_path=str(f), kind="field", line=5, end_line=40)],
             CONFIG_HASH,
             project_root=tmp_path,
         )
 
+        assert out[0]["body"] == ""
         assert out[0]["body_unavailable"] is False
+
+    def test_a_global_variable_gets_its_definition_as_the_body(self, tmp_path: Path):
+        """The initializer and the comment of the line tell what a constant means.
+
+        Before 2026-10-22 the model got no body for a varglobal and guessed
+        the meaning from the name: "compressor" for COND, a threshold for an
+        alarm register whose comment gives its states.
+        """
+        f = _source_file(tmp_path, lines=30)
+        definition = "constexpr uint16_t LOW_VOLTAGE_ALARM = 4306;  // 0=Ok;1=Warning;2=Alarm\n"
+        row = _row(file_path=str(f), kind="varglobal", line=5, end_line=5)
+        row["source"] = definition
+
+        out = _enrich_batch(None, [row], CONFIG_HASH, project_root=tmp_path)
+
+        assert out[0]["body"] == definition
+        assert out[0]["body_unavailable"] is False
+
+    def test_a_global_variable_in_an_inactive_branch_is_unavailable(self, tmp_path: Path):
+        """The same rule as for a function: a blank stored body never reaches the model."""
+        f = _source_file(tmp_path, lines=30)
+        row = _row(file_path=str(f), kind="varglobal", line=5, end_line=5)
+        row["source"] = "\n"
+
+        out = _enrich_batch(None, [row], CONFIG_HASH, project_root=tmp_path)
+
+        assert out[0]["body"] == ""
+        assert out[0]["body_unavailable"] is True
 
     def test_the_stored_body_wins_over_the_disk(self, tmp_path: Path):
         """The model must read the ifdef-filtered text, not the raw file.
@@ -193,7 +222,7 @@ class TestEnrichBatchFlag:
 
 
 def _add_symbol(
-    conn, file_id: int, file_path: str, *, line: int, end_line: int, source: str = ""
+    conn, file_id: int, file_path: str, *, line: int, end_line: int, source: str = "", kind: str = "function"
 ) -> int:
     """Insert one analyzable definition symbol and return its row id.
 
@@ -209,7 +238,7 @@ def _add_symbol(
         conn,
         [
             (CONFIG_HASH, file_id, file_path, "img_parse_tlvs", "usr-img", "img_parse_tlvs",
-             "the Mbed project::img_parse_tlvs", "function", line, 1, end_line, 1,
+             "the Mbed project::img_parse_tlvs", kind, line, 1, end_line, 1,
              "int img_parse_tlvs(const uint8_t*, size_t)",
              "", None, 0, 0, "", 0, "", 1, 0.0, source, 0),
         ],
@@ -353,6 +382,64 @@ class TestAnalysisLoopSkipsBodylessSymbols:
 
         assert len(rec.ollama_calls) == 1
         assert _analysis_rows(populated_db)[0]["model"] == "skip:unparseable:test-model"
+
+
+class TestGlobalVariableBody:
+    """A global variable gets its definition as the body (2026-10-22), in the loop too."""
+
+    _run = staticmethod(TestAnalysisLoopSkipsBodylessSymbols._run)
+
+    def test_an_earlier_analysis_is_made_again_one_time_then_it_stays(
+        self, populated_db, monkeypatch, tmp_path: Path
+    ):
+        """The stored hash of an analysis without the definition matches no more.
+
+        Before, the model got no body for a global variable, thus the stored
+        hash is the hash of an empty body.  The first run after the change
+        sends the definition one time; the next run matches the new hash.
+        """
+        from fw_context_mcp.indexer.db import upsert_llm_analysis_batch
+        from fw_context_mcp.utils import compute_content_hash
+
+        f = _source_file(tmp_path, lines=30)
+        definition = "constexpr uint16_t LOW_VOLTAGE_ALARM = 4306;  // 0=Ok;1=Warning;2=Alarm\n"
+        with transaction(populated_db):
+            file_id = upsert_file(populated_db, CONFIG_HASH, str(f), "cpp")
+            symbol_id = _add_symbol(populated_db, file_id, str(f), line=5, end_line=5, source=definition,
+                                    kind="varglobal")
+            old_hash = compute_content_hash("", "the Mbed project::img_parse_tlvs",
+                                            "int img_parse_tlvs(const uint8_t*, size_t)", "")
+            upsert_llm_analysis_batch(populated_db, [(symbol_id, "old", "i", "o", "old-model", old_hash)])
+        answer = f'[{{"id": {symbol_id}, "summary": "s", "inputs": "i", "outputs": "o"}}]'
+
+        rec = _Recorder()
+        rec.install(monkeypatch, response=answer)
+        self._run(populated_db, tmp_path)
+        self._run(populated_db, tmp_path)
+
+        assert len(rec.ollama_calls) == 1, "one new analysis, then the hash matches"
+        assert "4306" in rec.ollama_calls[0] and "0=Ok;1=Warning;2=Alarm" in rec.ollama_calls[0]
+        assert _analysis_rows(populated_db)[0]["content_hash"] != old_hash
+
+    def test_a_definition_that_cannot_be_read_gets_the_sentinel(
+        self, populated_db, monkeypatch, tmp_path: Path
+    ):
+        """No stored text and an extent past the end of the file: no model call, no cache write.
+
+        Before 2026-10-22 a global variable went to the model without a body
+        in this case too, because its kind had no body.
+        """
+        f = _source_file(tmp_path, lines=30)
+        with transaction(populated_db):
+            file_id = upsert_file(populated_db, CONFIG_HASH, str(f), "cpp")
+            _add_symbol(populated_db, file_id, str(f), line=40, end_line=40, kind="varglobal")
+
+        rec = _Recorder()
+        rec.install(monkeypatch)  # any model call raises AssertionError
+        self._run(populated_db, tmp_path)
+
+        assert _analysis_rows(populated_db)[0]["model"] == "skip:nobody"
+        assert rec.ollama_calls == [] and rec.cache_writes == []
 
 
 @pytest.mark.parametrize("sentinel", ["skip:nobody", "skip:toolarge:4096", "skip:unparseable:m"])

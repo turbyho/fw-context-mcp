@@ -17,6 +17,18 @@ A format skeleton with placeholders keeps the answer a flat JSON array:
 "think": false (gpt-oss: "low"), which the analysis does not send.  The rules ask for
 the facts of the input only, and name what a firmware developer needs:
 blocking waits, changes of the hardware state, memory ownership.
+
+The second version without examples (2026-10-22) adds a rule for each
+error type of that review: a value that a later line sets again, a
+direction read wrong, an abbreviation of a name decoded without a source,
+an invented caller or user, and local variables or called functions given
+as inputs.  A global variable also gets its definition as its body
+(``_llm_analysis._enrich_batch``).  A blind review of the same 30 symbols
+against the first version: gemma4:26b +0.20, qwen2.5-coder:14b +0.20,
+deepseek-v4.1-flash +0.40 (Ollama Cloud) and +0.47 (DeepSeek API),
+gpt-oss:20b +0.13 of 5; 9 major errors against 11.  Most of the gain is
+of the 3 constants with a definition; the new rules give a small gain of
+the other symbols for 4 of the 5 models.
 """
 
 from __future__ import annotations
@@ -57,19 +69,19 @@ ANSWER: a JSON array with one object for each symbol, in this form, with no othe
 [{"id": <the integer id of the symbol>, "summary": "<what the symbol is, what its body does, and its role>", "inputs": "<the parameters and the state that it reads>", "outputs": "<the return value, the values written through parameters, and the side effects>"}]
 
 The three text fields:
-- "summary": 3 to 6 sentences. The purpose of the symbol, its behavior (the main flow, the branches, the key decisions), and its role in the firmware (the subsystem, who uses it).
+- "summary": 3 to 6 sentences. The purpose of the symbol, its behavior (the main flow, the branches, the key decisions), and its role in the firmware (the subsystem, and who uses it when the input shows it).
 - "inputs": ONE string.
-  - Function or method: each parameter as "name (type): role", separated by semicolons; also the global state, the hardware state, or the member variables that it reads.
-  - Class, struct or union: what fills or configures it.
+  - Function or method: each parameter as "name (type): role", separated by semicolons; also the global state, the hardware state, or the member variables that it reads. Not its local variables, and not the functions that it calls.
+  - Class, struct or union: what fills or configures it, when the input shows it.
   - Typedef: the underlying type.
   - Enum: "-".
-  - Variable: who writes or initializes it, and its subsystem.
+  - Variable: its initial value (the initializer of the body), and who writes it when the input shows it.
 - "outputs": ONE string.
   - Function or method: the return value and its meaning, the values written through pointer or reference parameters, and each side effect (state that changes, hardware that changes, calls that send or store data).
   - Class, struct or union: what it provides and manages.
   - Typedef: what the alias stands for.
   - Enum: what the constants mean, as groups.
-  - Variable: who reads it, and what a change of its value changes.
+  - Variable: what its value means, and who reads it when the input shows it.
 
 RULES FOR THE JSON:
 - Each object has the "id" of the symbol, an integer, as the list gives it.
@@ -82,15 +94,18 @@ RULES FOR THE CONTENT:
   - Write a return value, an error code, a register, a peripheral, an interrupt, or a storage place (RAM, flash, EEPROM, a file) only when the body or the doc shows it. Do not add a usual value, such as 0 for success, that the body does not return.
   - A value is in RAM unless the body writes it to flash, EEPROM or a file. Do not write "persists" or "stored in flash" for a value that the body only keeps in memory.
   - Read each condition, comparison and macro exactly as the code writes it. A macro or a constant stays its name, unless the input gives its value.
+  - Follow each value that you name to the lines that set it. When a later line sets it again on each path, describe the final value. Read a direction, a sign and a unit as the code writes them.
+  - Give the meaning of an abbreviation in a name only when the doc, a comment or the code gives it. Else write the name as it is.
+  - Name a caller, a user, a writer or an overridden function only when the input shows it: the body, the doc, "called functions" or "referenced by". Do not add one from the name.
   - For a called function, use its name and the list of the called functions. Do not describe what it does inside beyond what its name says.
-  - A constant, a macro value, or a declaration without a body: describe its name, its type and its value, and its use from the list of references. Do not invent registers, hardware or behavior for it.
+  - A constant, a macro value, or a declaration: describe its name, its type and its value (the initializer, and the comment of its line), and its use from the list of references. Do not invent registers, hardware or behavior for it.
   - When the body is missing, describe what the signature and the name tell, and write that the body is not available.
 - Name each blocking wait that the body shows (a loop that polls a flag or a register, a delay, a wait for an event, with or without a timeout), each critical section or interrupt context, and each change of the hardware state (a GPIO, a peripheral register, an interrupt enable, a clock).
-- For C++: name the class, the base classes, the virtual functions it overrides, the template parameters, and the ownership of memory (who allocates and frees it).
+- For C++: name the class, the base classes, the virtual functions that it overrides (when the input shows them), the template parameters, and the ownership of memory (who allocates and frees it).
 
 THE INPUT OF EACH SYMBOL:
 - "doc" is the documentation comment of the developer. When it is there, it is the primary source of the intent: @brief is the purpose, @param a parameter, @return the return value. Check it against the body. When it says "(NO DOCSTRING …)", work from the body, the signature, the file path and the names of the called functions.
-- "body" is the source or the declaration. It is the authority for the behavior.
+- "body" is the source or the declaration. It is the authority for the behavior. For a variable, it is its definition.
 - "called functions" and "referenced by" are supplementary context: the dependencies, and for a variable the functions that read or write it.
 
 UNIONS: read the body first, and state the pattern in the summary.
