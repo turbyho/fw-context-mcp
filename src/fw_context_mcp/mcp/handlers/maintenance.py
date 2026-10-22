@@ -2805,7 +2805,7 @@ def _reindex_llm_analysis(
             stored_av = False
         cc = CacheClient.from_config(cfg)
         try:
-            _build_llm_analysis(
+            complete = _build_llm_analysis(
                 conn, config_hash, cfg.llm, db_dir,
                 write_lock_held=False, retry_unparseable=True,
                 cache_client=cc, project_only=not stored_av,
@@ -2823,6 +2823,13 @@ def _reindex_llm_analysis(
             (config_hash,),
         ).fetchone()[0]
         result["analysis_updated"] = analyzed_count
+        if not complete:
+            # Before, the result said nothing: an API model whose context
+            # is not known (an old name) made no analysis at all.
+            result["analysis_warning"] = (
+                "LLM analysis incomplete: the model did not answer for some symbols, or the context of the model "
+                "is not known. Run 'fw-context doctor' (check chat-model) or read the log"
+            )
     except (sqlite3.Error, RuntimeError, OSError) as exc:
         result["analysis_warning"] = f"LLM analysis skipped: {exc}"
 

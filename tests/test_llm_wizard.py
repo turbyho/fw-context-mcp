@@ -48,10 +48,34 @@ def home(tmp_path: Path, monkeypatch) -> Path:
     # A key of the operator would make a profile without a key ready.
     for name in ("OPENROUTER_API_KEY", "DEEPSEEK_API_KEY"):
         monkeypatch.delenv(name, raising=False)
+    from fw_context_mcp.llm.model_list import ModelInfo
+
+    # The lists of DeepSeek and of the ChatGPT plan, each with the context of its models.
+    _fake_model_lists(monkeypatch, {
+        "deepseek": [ModelInfo("deepseek-flash", 1048576), ModelInfo("deepseek-chat", 1048576),
+                     ModelInfo("new-model", 131072)],
+        "chatgpt": [ModelInfo("gpt-6-luna", 272000), ModelInfo("m", 128000)],
+    })
     root = tmp_path / "proj"
     (root / ".fw-context").mkdir(parents=True)
     (root / ".fw-context" / "config.toml").write_text("[project]\n", encoding="utf-8")
     return root
+
+
+def _fake_model_lists(monkeypatch, lists: dict) -> None:
+    """Give *lists* (provider → [ModelInfo]) as the model list of each API provider; another provider has none.
+
+    WHY: the conftest blocks the GET of a real list, and the setup and the
+    selection of an API profile need the list for the names and the context.
+    """
+    from fw_context_mcp.llm import model_list
+
+    def _models(llm):
+        if llm.provider not in lists:
+            raise model_list.ModelListError(f"no model list of {llm.provider} in this test")
+        return lists[llm.provider]
+
+    monkeypatch.setattr(model_list, "provider_models", _models)
 
 
 def _profiles() -> dict:
@@ -173,19 +197,20 @@ def test_the_list_marks_the_services_with_a_profile_and_the_external_ones(home, 
 
 def test_a_service_of_the_registry_stores_the_key_of_its_provider_and_a_tested_profile(home, monkeypatch, capsys):
     tested: list[str] = []
-    monkeypatch.setattr(wizard, "test_profile", lambda cfg, name: tested.append(name))
+    monkeypatch.setattr(wizard, "test_profile", lambda cfg, name, **kwargs: tested.append(name))
     _answers(monkeypatch, ["6", *KEEP], secret="sk-test-" + "key")
 
     _run(home)
 
-    assert _profiles()["deepseek"] == {"provider": "deepseek", "model": "deepseek-v4-flash"}
+    # Enter: the recommended model, which the list of DeepSeek holds; the list gives its context.
+    assert _profiles()["deepseek"] == {"provider": "deepseek", "model": "deepseek-flash"}
     assert secrets.stored_api_key(secrets.provider_entry("deepseek")) == "sk-test-key"
     assert tested == ["deepseek"]
     assert "sk-test-key" not in capsys.readouterr().out
 
 
 def test_a_profile_that_does_not_answer_is_removed_unless_the_user_keeps_it(home, monkeypatch, capsys):
-    monkeypatch.setattr(wizard, "test_profile", lambda cfg, name: "HTTP 401")
+    monkeypatch.setattr(wizard, "test_profile", lambda cfg, name, **kwargs: "HTTP 401")
     _answers(monkeypatch, ["6", *KEEP], secret="sk-x")
 
     _run(home)
@@ -195,7 +220,7 @@ def test_a_profile_that_does_not_answer_is_removed_unless_the_user_keeps_it(home
 
 
 def test_another_computer_offers_its_models(home, monkeypatch):
-    monkeypatch.setattr(wizard, "test_profile", lambda cfg, name: None)
+    monkeypatch.setattr(wizard, "test_profile", lambda cfg, name, **kwargs: None)
     monkeypatch.setattr(_diag, "installed_models", lambda url: ["big:30b"] if "gpu-box" in url else ["chat:1b"])
     _answers(monkeypatch, ["2", *KEEP], {"URL of the Ollama server (for example http://192.168.1.20:11434)":
                                           "http://gpu-box:11434"})
@@ -206,7 +231,7 @@ def test_another_computer_offers_its_models(home, monkeypatch):
 
 
 def test_ollama_cloud_offers_the_cloud_models_of_the_local_server(home, monkeypatch):
-    monkeypatch.setattr(wizard, "test_profile", lambda cfg, name: None)
+    monkeypatch.setattr(wizard, "test_profile", lambda cfg, name, **kwargs: None)
     monkeypatch.setattr(_diag, "remote_hosts", lambda url: {"gpt-oss:20b-cloud": "https://ollama.com"})
     _answers(monkeypatch, ["3", *KEEP])
 
@@ -302,7 +327,7 @@ def test_the_local_service_does_not_take_a_profile_of_another_computer(home, mon
         encoding="utf-8")
     monkeypatch.setattr(auto_model, "_gpu_available", lambda: False)
     monkeypatch.setattr(ollama, "check_setup", lambda cfg: {"status": "ok", "installed_models": []})
-    monkeypatch.setattr(wizard, "test_profile", lambda cfg, name: None)
+    monkeypatch.setattr(wizard, "test_profile", lambda cfg, name, **kwargs: None)
     _answers(monkeypatch, ["1", *KEEP])
     # Yes only to the question that makes "local" the Ollama profile of this machine: no pull.
     monkeypatch.setattr(ui, "_confirm", lambda question, **kwargs: "Ollama profile of each project" in question)
@@ -326,7 +351,7 @@ def test_the_local_service_stops_when_the_ollama_profile_of_another_computer_sta
         encoding="utf-8")
     monkeypatch.setattr(auto_model, "_gpu_available", lambda: False)
     monkeypatch.setattr(ollama, "check_setup", lambda cfg: {"status": "ok", "installed_models": []})
-    monkeypatch.setattr(wizard, "test_profile", lambda cfg, name: None)
+    monkeypatch.setattr(wizard, "test_profile", lambda cfg, name, **kwargs: None)
     _answers(monkeypatch, ["1", *KEEP])
 
     wizard.run_wizard(home, load(home))
@@ -339,7 +364,7 @@ def test_a_failed_test_puts_back_the_profile_that_it_replaced(home, monkeypatch)
     """Before, the profile was removed with its earlier values: each project that selected it stopped."""
     settings._GLOBAL_CONFIG_PATH.write_text(GLOBAL + '\n[llm.profiles.deepseek]\nprovider = "deepseek"\n'
                                             'model = "old-model"\n', encoding="utf-8")
-    monkeypatch.setattr(wizard, "test_profile", lambda cfg, name: "HTTP 500")
+    monkeypatch.setattr(wizard, "test_profile", lambda cfg, name, **kwargs: "HTTP 500")
     _answers(monkeypatch, ["6", *KEEP], {"Model": "new-model"}, secret="sk-x")
     monkeypatch.setattr(ui, "_confirm", lambda question, **kwargs: "Replace" in question)
 
@@ -356,8 +381,7 @@ def test_the_chatgpt_sign_in_belongs_to_the_name_that_the_user_selected(home, mo
                                             encoding="utf-8")
     signed: list[str] = []
     monkeypatch.setattr(chatgpt_plan, "login", lambda name, open_url: signed.append(name))
-    monkeypatch.setattr(chatgpt_plan, "list_models", lambda name: [("gpt-6-luna", "GPT-6-Luna")])
-    monkeypatch.setattr(wizard, "test_profile", lambda cfg, name: None)
+    monkeypatch.setattr(wizard, "test_profile", lambda cfg, name, **kwargs: None)
     _answers(monkeypatch, ["4", *KEEP], {"Another profile name (empty: skip)": "chatgpt2"})
 
     _run(home)
@@ -371,11 +395,10 @@ def test_a_failed_chatgpt_profile_does_not_leave_a_sign_in(home, monkeypatch):
 
     logged_out: list[str] = []
     monkeypatch.setattr(chatgpt_plan, "login", lambda name, open_url: None)
-    monkeypatch.setattr(chatgpt_plan, "list_models", lambda name: [("m", "M")])
     monkeypatch.setattr(chatgpt_plan, "load_credentials", lambda name: chatgpt_plan.PlanCredentials(
         client_id="c", host_id="h", access_token="a", refresh_token="r"))
     monkeypatch.setattr(chatgpt_plan, "logout", lambda name: logged_out.append(name) or True)
-    monkeypatch.setattr(wizard, "test_profile", lambda cfg, name: "HTTP 401")
+    monkeypatch.setattr(wizard, "test_profile", lambda cfg, name, **kwargs: "HTTP 401")
     _answers(monkeypatch, ["4", *KEEP])
 
     _run(home)
@@ -478,3 +501,196 @@ def test_a_cloud_model_of_a_profile_server_shows_its_host(home, monkeypatch, cap
     _llm.cmd_llm_list(argparse.Namespace(project=str(home)))
 
     assert "cloud: ollama m:cloud, ⚠ https://ollama.com" in capsys.readouterr().out
+
+
+# ── The model list of an API (decisions of the user, 2026-10-22) ──
+
+
+def _deepseek(name: str = "ds"):
+    return settings.LLMConfig(provider="deepseek", profile=name, chat_api_base="https://api.deepseek.com")
+
+
+def _prompts(monkeypatch, texts: dict[str, str]) -> list[tuple[str, str | None]]:
+    """Answer the text prompts by label (else the default); return each (label, default)."""
+    asked: list[tuple[str, str | None]] = []
+
+    def _prompt_text(label, default=None, **kwargs):
+        asked.append((label, default))
+        return texts.get(label, default)
+
+    monkeypatch.setattr(ui, "prompt_text", _prompt_text)
+    return asked
+
+
+def test_the_default_model_is_the_recommended_one_of_the_list(home, monkeypatch, capsys):
+    asked = _prompts(monkeypatch, {})
+
+    values = wizard._model_from_list(_deepseek(), "DeepSeek", "deepseek-chat")
+
+    assert values == {"model": "deepseek-chat"}, "the list gives the context: no key context"
+    assert asked == [("Model", "deepseek-chat")], "no question about the context"
+    out = capsys.readouterr().out
+    assert "Models of DeepSeek: deepseek-flash, deepseek-chat, new-model" in out, out
+    assert "Context of deepseek-chat: 1048576 tokens (the model list of the API)" in out, out
+
+
+def test_without_the_recommended_model_the_default_is_the_first_of_the_list(home, monkeypatch):
+    asked = _prompts(monkeypatch, {})
+
+    assert wizard._model_from_list(_deepseek(), "DeepSeek", "deepseek-v4-flash") == {"model": "deepseek-flash"}
+    assert asked[0] == ("Model", "deepseek-flash")
+
+
+def test_a_long_list_shows_its_count_and_not_each_name(home, monkeypatch, capsys):
+    from fw_context_mcp.llm.model_list import ModelInfo
+
+    names = [f"vendor/model-{number:02d}" for number in range(25)]
+    _fake_model_lists(monkeypatch, {"openrouter": [ModelInfo(name, None) for name in names]})
+    _prompts(monkeypatch, {"Model": "", "Context of the model in tokens": "8192"})
+    llm = settings.LLMConfig(provider="openrouter", profile="or", chat_api_base="https://openrouter.ai/api/v1")
+    from fw_context_mcp.llm import model_list
+
+    # The endpoints give no context: the question comes.
+    monkeypatch.setattr(model_list, "_endpoint_context", lambda llm: None)
+
+    values = wizard._model_from_list(llm, "OpenRouter", "vendor/model-07")
+
+    out = capsys.readouterr().out
+    assert "OpenRouter lists 25 models; the recommended one is vendor/model-07" in out, out
+    assert "vendor/model-08" not in out, out
+    assert values == {"model": "vendor/model-07", "context": 8192}
+
+
+def test_a_name_that_the_list_does_not_hold_is_skipped_with_the_similar_names(home, monkeypatch, capsys):
+    _prompts(monkeypatch, {"Model": "deepseek-flsh"})
+
+    assert wizard._model_from_list(_deepseek(), "DeepSeek", "deepseek-flash") is None
+    assert ("[skip] 'deepseek-flsh' is not in the model list of DeepSeek (similar names: deepseek-flash"
+            in capsys.readouterr().out)
+
+
+@pytest.mark.parametrize(("answer", "values"), [("32768", {"model": "m", "context": 32768}), ("big", None),
+                                                ("", None)])
+def test_the_context_is_asked_only_when_the_list_gives_none(home, monkeypatch, capsys, answer, values):
+    from fw_context_mcp.llm.model_list import ModelInfo
+
+    _fake_model_lists(monkeypatch, {"openai_compatible": [ModelInfo("m", None)]})
+    asked = _prompts(monkeypatch, {"Model": "m", "Context of the model in tokens": answer})
+    llm = settings.LLMConfig(provider="openai_compatible", profile="api", chat_api_base="https://api.example.test/v1")
+
+    assert wizard._model_from_list(llm, "the API", "m") == values
+    assert [label for label, _default in asked] == ["Model", "Context of the model in tokens"]
+    if values is None:
+        assert f"[skip] {answer!r} is not a number of tokens: no profile is written" in capsys.readouterr().out
+
+
+def test_an_unreadable_list_writes_no_profile(home, monkeypatch, capsys):
+    _prompts(monkeypatch, {})
+    llm = settings.LLMConfig(provider="openrouter", profile="or", chat_api_base="https://openrouter.ai/api/v1")
+
+    assert wizard._model_from_list(llm, "OpenRouter", "m") is None
+    assert "[warn] The model list of OpenRouter cannot be read" in capsys.readouterr().out
+
+
+def test_unreadable_endpoints_ask_for_no_context(home, monkeypatch, capsys):
+    """The analysis reads the endpoints at its start too: a static context would not let it run.
+
+    Before, the setup asked for a context, wrote it, and the analysis still
+    stopped with "the endpoints of model ... cannot be read".
+    """
+    from fw_context_mcp.llm import model_list
+
+    _fake_model_lists(monkeypatch, {"openrouter": [model_list.ModelInfo("vendor/m", None)]})
+    asked = _prompts(monkeypatch, {"Model": "vendor/m"})
+    llm = settings.LLMConfig(provider="openrouter", profile="or", chat_api_base="https://openrouter.ai/api/v1")
+
+    assert wizard._model_from_list(llm, "OpenRouter", "vendor/m") is None
+    assert [label for label, _default in asked] == ["Model"]
+    assert "[skip] the endpoints of model 'vendor/m' cannot be read" in capsys.readouterr().out
+
+
+def _api_values() -> dict[str, object]:
+    return {"provider": "openai_compatible", "url": "https://api.example.test/v1", "model": "m", "api_key_env": None}
+
+
+def test_another_api_whose_list_gives_the_context_stores_none(home, monkeypatch):
+    from fw_context_mcp.llm.model_list import ModelInfo
+
+    _fake_model_lists(monkeypatch, {"openai_compatible": [ModelInfo("m", 65536)]})
+    asked = _prompts(monkeypatch, {})
+
+    assert ui._custom_api_context("api", _api_values()) == {}
+    assert asked == []
+
+
+@pytest.mark.parametrize(("answer", "values"), [("", {}), ("4096", {"context": 4096}), ("many", None)],
+                         ids=["empty: embeddings only", "a number", "not a number"])
+def test_another_api_without_a_context_asks_for_it(home, monkeypatch, answer, values):
+    """The conftest gives no model list: the API gives no context."""
+    _prompts(monkeypatch, {"Context of the chat model in tokens (empty: the profile serves the embeddings only)":
+                           answer})
+
+    assert ui._custom_api_context("api", _api_values()) == values
+
+
+@pytest.mark.parametrize(("answer", "values"), [("16384", {"context": 16384}), ("", {}), ("many", None)],
+                         ids=["a number", "empty: embeddings only", "not a number"])
+def test_another_api_whose_list_does_not_hold_the_model_asks_for_the_context(home, monkeypatch, capsys, answer,
+                                                                             values):
+    """llama-server lists the name of its model file and runs each name: with a context, the name stays."""
+    from fw_context_mcp.llm import model_list
+    from fw_context_mcp.llm.model_list import ModelInfo
+
+    _fake_model_lists(monkeypatch, {"openai_compatible": [ModelInfo("model-file.gguf", None)]})
+    label = "Context of the chat model in tokens (empty: the profile serves the embeddings only)"
+    asked = _prompts(monkeypatch, {label: answer})
+
+    assert ui._custom_api_context("api", _api_values()) == values
+    assert [entry[0] for entry in asked] == [label]
+    assert ("[note] The model list of the API does not hold 'm': with a context, the name goes to the API as it is"
+            in capsys.readouterr().out)
+    if values:
+        # The profile with that context: the context applies, the list does not stop it.
+        llm = settings.LLMConfig(provider="openai_compatible", profile="api", model="m",
+                                 chat_api_base="https://api.example.test/v1", context=values["context"])
+        assert model_list.model_context(llm) == values["context"]
+
+
+def test_the_test_of_a_profile_names_a_context_problem_without_a_request(home, monkeypatch):
+    """A model that the list no longer holds answered the test, and the analysis stopped later."""
+    from fw_context_mcp.config import load
+    from fw_context_mcp.llm import client
+
+    settings._GLOBAL_CONFIG_PATH.write_text(GLOBAL + '\n[llm.profiles.ds]\nprovider = "deepseek"\n'
+                                            'model = "deepseek-v4-flash"\n', encoding="utf-8")
+    monkeypatch.setattr(client, "get_chat_client", lambda cfg: pytest.fail("no test request"))
+
+    problem = wizard.test_profile(load(home), "ds")
+
+    assert problem is not None and "is not in the model list of its provider" in problem
+
+
+def test_a_new_profile_for_the_embeddings_only_is_kept_without_a_context(home, monkeypatch, capsys):
+    """An openai_compatible profile without a context serves the embeddings: its test must not roll it back."""
+    from fw_context_mcp.config import load
+    from fw_context_mcp.llm import client
+    from fw_context_mcp.llm.client import ChatResult
+
+    before = settings._GLOBAL_CONFIG_PATH.read_text(encoding="utf-8")
+    settings._GLOBAL_CONFIG_PATH.write_text(before + '\n[llm.profiles.emb]\nprovider = "openai_compatible"\n'
+                                            'url = "https://api.example.test/v1"\nmodel = "embed-x"\n',
+                                            encoding="utf-8")
+    sent: list[str] = []
+
+    class _Chat:
+        def generate(self, prompt, **kwargs):
+            sent.append(prompt)
+            return ChatResult("OK")
+
+    monkeypatch.setattr(client, "get_chat_client", lambda cfg: _Chat())
+    cfg = load(home)
+
+    assert wizard.test_profile(cfg, "emb") is not None, "the profile cannot analyse: no context"
+    assert wizard._test_new_profile(cfg, "emb", before) is True
+    assert "emb" in _profiles() and len(sent) == 1
+    assert "[ok] Profile 'emb' answers" in capsys.readouterr().out

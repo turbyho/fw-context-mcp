@@ -442,6 +442,53 @@ class TestGlobalVariableBody:
         assert rec.ollama_calls == [] and rec.cache_writes == []
 
 
+def test_a_prompt_that_the_api_refuses_for_the_context_gets_the_sentinel_at_once(
+    populated_db, monkeypatch, tmp_path: Path
+):
+    """An API counts no tokens for the client, and refuses a prompt that does not fit (HTTP 400).
+
+    Before, the refusal was a plain failure: three requests, a failed
+    count, and the same three requests at each later run.  Now one
+    request, and ``skip:toolarge`` as for Ollama; no cache write.
+    """
+    from fw_context_mcp.indexer import _llm_analysis as mod
+    from fw_context_mcp.llm.errors import ChatPromptTooLong
+
+    f = _source_file(tmp_path, lines=60)
+    with transaction(populated_db):
+        file_id = upsert_file(populated_db, CONFIG_HASH, str(f), "cpp")
+        _add_symbol(populated_db, file_id, str(f), line=5, end_line=40, kind="varglobal")
+    calls: list[str] = []
+
+    class _Api:
+        counts_tokens = False
+
+        def generate(self, prompt, **kw):
+            calls.append(prompt)
+            raise ChatPromptTooLong("Chat API HTTP 400: the prompt and the answer budget do not fit the context",
+                                    status_code=400)
+
+    rec = _Recorder()
+    rec.install(monkeypatch)
+    monkeypatch.setattr(mod, "_analysis_contexts", lambda client, cfg: (16384, 16384))
+    monkeypatch.setattr(mod, "get_chat_client", lambda cfg: _Api())
+
+    def _run() -> bool:
+        return _build_llm_analysis(populated_db, CONFIG_HASH, SimpleNamespace(model="test-model"), tmp_path,
+                                   project_only=True, project_root=tmp_path, write_lock_held=True,
+                                   cache_client=None)
+
+    # The sentinel counts as done: the run is complete.
+    assert _run() is True
+    assert len(calls) == 1, "the same request fails again: no retry"
+    assert _analysis_rows(populated_db)[0]["model"] == "skip:toolarge:16384"
+    assert rec.cache_writes == []
+
+    calls.clear()
+    assert _run() is True
+    assert calls == [], "the next run does not send the prompt again"
+
+
 @pytest.mark.parametrize("sentinel", ["skip:nobody", "skip:toolarge:4096", "skip:unparseable:m"])
 def test_every_sentinel_counts_as_skipped(populated_db, sentinel, tmp_path: Path):
     """``compute_analysis_coverage`` matches ``skip:%``, thus a new sentinel

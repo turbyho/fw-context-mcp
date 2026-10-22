@@ -246,6 +246,7 @@ def choose_chat(project_root: Path | None, cfg, *, offer_global: bool = False) -
     *offer_global*: ``local.toml`` selects a profile, and option 0 removes
     that selection (the global settings then apply).
     """
+    from ..config import settings
     from ..llm.profile_state import cloud_lists, known
 
     profiles = wizard._profiles()
@@ -284,6 +285,16 @@ def choose_chat(project_root: Path | None, cfg, *, offer_global: bool = False) -
     if row.problem:
         print(f"  [skip] The profile {row.profile!r} cannot run: {row.problem}")
         return
+    if row.profile:
+        # The context of an API model must be known before the profile
+        # analyses (decision of the user, 2026-10-22); a GET of the list.
+        try:
+            problem = wizard.context_problem(settings.profile_llm_config(cfg.llm, row.profile))
+        except settings.ConfigError as exc:
+            problem = str(exc)
+        if problem is not None:
+            print(f"  [skip] The profile {row.profile!r} cannot analyse: {problem}")
+            return
     name = row.profile
     if not name:
         # The local Ollama without a profile: set it up now.

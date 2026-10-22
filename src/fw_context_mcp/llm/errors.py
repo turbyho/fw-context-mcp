@@ -49,3 +49,13 @@ class ChatApiError(LLMError):
         super().__init__(message)
         self.status_code = status_code
         self.body = body
+
+
+class ChatPromptTooLong(ChatApiError):
+    """The API refused the request: the prompt and ``max_tokens`` do not fit the context of the model.
+
+    The API checks the rule itself (HTTP 400), because the client cannot
+    count the tokens of a prompt.  The analysis then marks the symbol
+    ``skip:toolarge``, as for Ollama: the same request fails again, thus
+    a retry, and a new failure at each run, only cost time and money.
+    """

@@ -118,10 +118,24 @@ def cmd_llm_test(args: argparse.Namespace) -> int:
         return 1
     problem = test_profile(cfg, args.profile)
     if problem is not None:
-        print(f"[error] Profile {args.profile!r} does not answer: {problem}", file=sys.stderr)
+        # "cannot be used", not "does not answer": the problem can be the
+        # model list or the context of the model, before any request.
+        print(f"[error] Profile {args.profile!r} cannot be used: {problem}", file=sys.stderr)
         return 1
-    print(f"[ok] Profile {args.profile!r} answers")
+    print(f"[ok] Profile {args.profile!r} answers{_context_note(cfg, args.profile)}")
     return 0
+
+
+def _context_note(cfg, name: str) -> str:
+    """Return ", context N tokens" for an API or ChatGPT profile (the model list, read by the test), else ""."""
+    from ..config.settings import ConfigError, profile_llm_config
+    from ..llm.model_list import LIST_PROVIDERS, ModelContextError, model_context
+
+    try:
+        llm = profile_llm_config(cfg.llm, name)
+        return f", context {model_context(llm)} tokens" if llm.provider in LIST_PROVIDERS else ""
+    except (ConfigError, ModelContextError):
+        return ""
 
 
 def cmd_llm_default(args: argparse.Namespace) -> int:

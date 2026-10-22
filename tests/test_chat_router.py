@@ -479,6 +479,38 @@ class TestCallOpenaiChatErrors:
         with pytest.raises(LLMError, match="pre-existing"):
             OpenAIChatClient(cfg, "endpoint").generate("p")
 
+    @pytest.mark.parametrize("body", [
+        # OpenAI (and OpenRouter): the error code.
+        {"error": {"message": "Input too long.", "type": "invalid_request_error", "code": "context_length_exceeded"}},
+        # DeepSeek: no code of its own, the message of the OpenAI API.
+        {"error": {"message": "This model's maximum context length is 131072 tokens. However, you requested "
+                              "132161 tokens (131137 in the messages, 1024 in the completion).",
+                   "type": "invalid_request_error", "code": "invalid_request_error"}},
+        # OpenRouter: the error of the host inside metadata.raw.
+        {"error": {"message": "Provider returned error", "code": 400,
+                   "metadata": {"raw": "This endpoint's maximum context length is 8192 tokens."}}},
+    ], ids=["openai-code", "deepseek-message", "openrouter-raw"])
+    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    def test_a_refusal_for_the_context_is_a_prompt_that_is_too_long(self, mock_post, body):
+        """The analysis marks such a symbol at once: the same request fails again at each run."""
+        from fw_context_mcp.llm.errors import ChatPromptTooLong
+
+        mock_post.return_value = _mock_response(status_code=400, text=json.dumps(body))
+        cfg = _cfg("https://api.example.com/v1")
+        with pytest.raises(ChatPromptTooLong, match="do not fit the context"):
+            OpenAIChatClient(cfg, "endpoint").generate("p", max_tokens=1024)
+
+    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    def test_another_400_is_no_prompt_that_is_too_long(self, mock_post):
+        from fw_context_mcp.llm.errors import ChatApiError, ChatPromptTooLong
+
+        body = {"error": {"message": "temperature must be at most 2", "code": "invalid_request_error"}}
+        mock_post.return_value = _mock_response(status_code=400, text=json.dumps(body))
+        cfg = _cfg("https://api.example.com/v1")
+        with pytest.raises(ChatApiError) as info:
+            OpenAIChatClient(cfg, "endpoint").generate("p")
+        assert not isinstance(info.value, ChatPromptTooLong)
+
     @patch("fw_context_mcp.llm.chat_router.httpx.post")
     def test_generic_exception_wrapped(self, mock_post):
         mock_post.side_effect = RuntimeError("boom")

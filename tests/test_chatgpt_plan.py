@@ -484,3 +484,16 @@ def test_a_sign_in_without_the_plan_scope_keeps_the_old_tokens_and_revokes_the_n
 
     assert plan.load_credentials("gpt").refresh_token == REFRESH
     assert revoked and revoked[0]["token"] == "refresh-new"
+
+
+def test_a_prompt_that_does_not_fit_the_context_is_a_prompt_that_is_too_long(home, monkeypatch):
+    """The analysis marks such a symbol at once: the same request fails again at each run."""
+    from fw_context_mcp.llm.errors import ChatPromptTooLong
+
+    _signed_in()
+    sent = _serve(monkeypatch, (400, b'{"error": {"code": "context_length_exceeded", "param": "input"}}'))
+
+    with pytest.raises(ChatPromptTooLong, match=r"the prompt does not fit the context of 'gpt-6-luna' \(context_length_exceeded\)"):
+        _client().generate("hi")
+
+    assert len(sent) == 1

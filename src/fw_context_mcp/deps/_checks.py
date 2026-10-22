@@ -776,12 +776,7 @@ def check_ollama_chat_model(cfg) -> DepCheckResult:
     except ValueError as exc:
         return DepCheckResult(name="chat-model", status="error", message=str(exc), critical=False)
     if server is None:
-        return DepCheckResult(
-            name="chat-model",
-            status="skipped",
-            message=f"chat model '{cfg.model}' runs on an OpenAI-compatible API (profile {cfg.profile!r}), not on Ollama",
-            critical=False,
-        )
+        return _check_api_chat_model(cfg)
     models = installed_models(server)
     if models is None:
         if server.rstrip("/") == cfg.ollama_url.rstrip("/"):
@@ -816,6 +811,39 @@ def check_ollama_chat_model(cfg) -> DepCheckResult:
         message=cfg.model,
         critical=False,
     )
+
+
+def _check_api_chat_model(cfg) -> DepCheckResult:
+    """Check that the model list of the API holds the chat model, and that its context is known.
+
+    WHY (decision of the user, 2026-10-22): the context must be known, and
+    the names come from the list of the provider.  A name that the list no
+    longer holds still answered a request, and the analysis then stopped
+    without the context.  WHY no fix: the user selects the model
+    (``fw-context llm setup``); doctor does not change a profile.  A static
+    ``context`` of the profile next to a context of the list is only
+    reported: the list applies.
+    """
+    from ..llm.model_list import LIST_PROVIDERS, ModelContextError, model_context
+
+    if cfg.provider not in LIST_PROVIDERS:
+        return DepCheckResult(
+            name="chat-model", status="skipped", critical=False,
+            message=f"chat model '{cfg.model}' runs on an OpenAI-compatible API (profile {cfg.profile!r}), not on Ollama",
+        )
+    try:
+        context = model_context(cfg)
+    except ModelContextError as exc:
+        return DepCheckResult(name="chat-model", status="error", message=str(exc), critical=False,
+                              instructions="fw-context llm setup")
+    if 0 < cfg.context != context:
+        return DepCheckResult(
+            name="chat-model", status="degraded", critical=False,
+            message=f"profile {cfg.profile!r} sets context = {cfg.context}, and the model list of the API gives "
+                    f"{context} for '{cfg.model}': the list applies; remove context from [llm.profiles.{cfg.profile}]",
+        )
+    return DepCheckResult(name="chat-model", status="ok", critical=False,
+                          message=f"{cfg.model} (context {context} tokens)")
 
 
 def check_ollama_embed_model(cfg) -> DepCheckResult:

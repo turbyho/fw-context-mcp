@@ -22,7 +22,7 @@ from typing import Any
 from ..cache_client import get_local_cache_db, local_cache_lookup, local_cache_upsert
 from ..llm.calibration import LOWEST_CONTEXT
 from ..llm.client import ChatClient, ContextFit, get_chat_client
-from ..llm.errors import LLMStopRun
+from ..llm.errors import ChatPromptTooLong, LLMStopRun
 from ..llm.ollama import OllamaPromptTooLong
 from ..utils import SAFE_EXCEPT, is_fatal, read_file_lines
 from ._embedding import _fmt_dur
@@ -280,13 +280,28 @@ def _analysis_contexts(client: ChatClient, llm_config) -> tuple[int, int] | None
     each request had ``num_ctx`` (16384).  The answer budget thus counted
     on a context that the server did not use.
 
-    A backend that cannot count tokens (an OpenAI-compatible API,
-    ``client.counts_tokens`` is False) gives no trained context: the run
-    then has ``num_ctx`` only.  None when the Ollama server does not answer,
-    or does not have the model: the run then makes no analysis.
+    A backend that cannot count tokens (an API, the ChatGPT plan:
+    ``client.counts_tokens`` is False) has the context of its model from
+    the model list of its provider (``llm.model_list``), or from the
+    ``context`` of the profile for a model that the list gives none of.
+    Each request of the run has the whole of it.  Before 2026-10-22 such a
+    run had ``num_ctx`` of the config (16384), an Ollama key, thus the
+    sentinel ``skip:toolarge:16384`` of an API never cleared.  None when the
+    Ollama server does not answer, or does not have the model, or the
+    context of an API model is not known (an error that names the fix):
+    the run then makes no analysis.
     """
     if not client.counts_tokens:
-        return llm_config.num_ctx, llm_config.num_ctx
+        from ..llm.model_list import ModelContextError, model_context
+
+        try:
+            context = model_context(llm_config)
+        except ModelContextError as exc:
+            log.error("LLM analysis: %s — no analysis in this run", exc)
+            return None
+        log.info("LLM analysis: the context of %s is %d tokens (the model list of the provider, or the profile)",
+                 llm_config.model, context)
+        return context, context
     largest = client.trained_context()
     if largest is None and llm_config.auto_pull:
         # /api/show gives 404 for a model that is not installed.
@@ -502,7 +517,10 @@ def _build_llm_analysis(
     holds each waiting prompt, and at most the trained context.  WHY one
     pass, and not a context for each prompt: a request with another context
     makes the server load the model again.  A prompt that does not fit the
-    trained context gets the sentinel ``skip:toolarge:<context>``.
+    trained context gets the sentinel ``skip:toolarge:<context>``.  An
+    OpenAI-compatible API counts no tokens for the client: it checks the
+    prompt and ``max_tokens`` against the context itself, and a refusal
+    (``ChatPromptTooLong``) gives the same sentinel at once.
 
     *force_since* (``--force-llm`` of ``fw-context index`` and ``fw-context analyze``) makes each analysis
     again.  The stored analyses of the build and an entry of a cache from
@@ -517,7 +535,9 @@ def _build_llm_analysis(
 
     Each answer gets ``_ANSWER_TOKENS`` tokens, also from an
     OpenAI-compatible endpoint, which gives no token count.  A prompt that
-    such an endpoint refuses is logged, and the next run tries again.
+    such an endpoint refuses for its context (``ChatPromptTooLong``) gets
+    ``skip:toolarge:<context>`` at once; another refusal is logged, and the
+    next run tries again.
 
     Returns True when each symbol got its analysis or a sentinel, and False
     when the server did not answer, or a symbol got neither: a forced
@@ -599,12 +619,26 @@ def _build_llm_analysis(
                 time.sleep(2)
         raise AssertionError("unreachable: the last attempt returns or raises")
 
+    def _mark_too_large(symbol_id: int, content_hash: str) -> None:
+        """Store the sentinel of a prompt that does not fit the largest context, in the table of the build only.
+
+        WHY the largest context in the sentinel: ``_clear_skip_sentinels``
+        tries the symbol again when a later run has a larger one.
+        """
+        with write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext():
+            with transaction(conn, checkpoint=False):
+                upsert_llm_analysis_batch(
+                    conn, [(symbol_id, "", "", "", f"skip:toolarge:{largest_ctx}", content_hash)],
+                )
+
     def _ask_model(idx: int, qname: str, d: dict[str, Any], h: str, prompt: str, num_ctx: int, t0: float) -> int:
         """Analyse one symbol with the model, store the answer, and return the count to add to the total.
 
         Raises:
             OllamaPromptTooLong: The prompt does not fit *num_ctx*; the
                 caller sends it again with a larger context.
+            ChatPromptTooLong: The API refused the prompt for the context
+                of its model; the caller marks the symbol.
         """
         nonlocal failed
         _before_the_first_request()
@@ -616,9 +650,10 @@ def _build_llm_analysis(
                 spent.add(result.usage)
                 response = result.text
                 break
-            except (OllamaPromptTooLong, LLMStopRun):
+            except (OllamaPromptTooLong, ChatPromptTooLong, LLMStopRun):
                 # The same request fails again: the caller selects a larger
-                # context, or stops the run (a usage limit of a plan).
+                # context, marks the symbol, or stops the run (a usage limit
+                # of a plan).
                 raise
             except SAFE_EXCEPT as _e:
                 _last_exc = _e
@@ -842,6 +877,13 @@ def _build_llm_analysis(
                         continue
                     except OllamaPromptTooLong as e:
                         prompt_tokens = e.prompt_tokens
+                    except ChatPromptTooLong:
+                        # The API has no larger context to try: the sentinel now.
+                        _mark_too_large(d["id"], h)
+                        total += 1
+                        log.warning("[%d/%d] %s: skip (the API refused the prompt: it does not fit the context of "
+                                    "the model)", idx + 1, total_symbols, qname)
+                        continue
                 long_prompts.append(_LongPrompt(idx, qname, d, h, prompt, prompt_tokens))
                 log.info("[%d/%d] %s: later (prompt %d tokens, context %d)",
                          idx + 1, total_symbols, qname, prompt_tokens, run_ctx)
@@ -865,11 +907,7 @@ def _build_llm_analysis(
         for p in long_prompts:
             (too_large if p.prompt_tokens + _ANSWER_TOKENS > largest_ctx else fitting).append(p)
         for p in too_large:
-            with write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext():
-                with transaction(conn, checkpoint=False):
-                    upsert_llm_analysis_batch(
-                        conn, [(p.symbol["id"], "", "", "", f"skip:toolarge:{largest_ctx}", p.content_hash)],
-                    )
+            _mark_too_large(p.symbol["id"], p.content_hash)
             total += 1
             log.warning("[%d/%d] %s: skip (prompt %d tokens, the model has a context of %d)",
                         p.position + 1, total_symbols, p.qname, p.prompt_tokens, largest_ctx)

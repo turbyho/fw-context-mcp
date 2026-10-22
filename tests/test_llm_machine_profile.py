@@ -312,7 +312,7 @@ def _setup(monkeypatch, root: Path, inputs: list[str], answers: dict[str, bool],
     from fw_context_mcp.config import load
     from fw_context_mcp.llm import auto_model, client, hardware, ollama
 
-    monkeypatch.setattr(_llm_wizard, "test_profile", lambda cfg, name: None)
+    monkeypatch.setattr(_llm_wizard, "test_profile", lambda cfg, name, **kwargs: None)
     # The test request of a selection for this project (configure_llm_core).
     monkeypatch.setattr(client, "call_llm", lambda prompt, cfg, **kwargs: "OK")
     monkeypatch.setattr(ollama, "check_setup", lambda cfg: {"status": "ok", "ollama_running": True,

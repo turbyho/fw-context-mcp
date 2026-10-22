@@ -301,7 +301,7 @@ def _ollama_defaults(monkeypatch, capsys, root: Path, answers: list[str]) -> tup
         defaults.append(default)
         return default
 
-    monkeypatch.setattr(_llm_wizard, "test_profile", lambda cfg, name: None)
+    monkeypatch.setattr(_llm_wizard, "test_profile", lambda cfg, name, **kwargs: None)
     monkeypatch.setattr(_init_interactive, "prompt_text", _prompt_text)
     monkeypatch.setattr(_init_interactive, "_confirm", lambda question, **kwargs: False)
     monkeypatch.setattr(auto_model, "_gpu_available", lambda: False)
@@ -415,8 +415,10 @@ def test_option_2_stores_a_key_for_the_profile_and_never_in_a_config_file(projec
     key = "sk-init-" + "test"
     # Service 7 (another API); the LLM analysis: row 2 (work, after local) for this project (1);
     # Enter keeps the embeddings.
+    # The API gives no model list (conftest): the setup asks the context of the chat model.
     out, tested = _setup(monkeypatch, capsys, project, ["7", "2", "1", ""], {
         "Profile name": "work", "API URL": "http://127.0.0.1:9/v1", "Model": "work-chat", "API key": key,
+        "Context of the chat model in tokens (empty: the profile serves the embeddings only)": "8192",
     })
 
     assert ".fw-context/local.toml selects profile 'work'" in out and key not in out, out
@@ -434,13 +436,14 @@ def test_option_2_writes_a_cloud_profile_that_names_the_key_variable(project, mo
         "API URL": "http://127.0.0.1:9/v1",
         "Environment variable with the API key (empty: store the key in the keyring)": "WORK_API_KEY",
         "Model": "work-chat",
+        "Context of the chat model in tokens (empty: the profile serves the embeddings only)": "8192",
     })
 
     assert "[ok] Profile 'work' saved" in out and ".fw-context/local.toml selects profile 'work'" in out, out
     llm = _global_llm()
     assert llm["profiles"]["work"] == {
         "provider": "openai_compatible", "url": "http://127.0.0.1:9/v1", "model": "work-chat",
-        "api_key_env": "WORK_API_KEY",
+        "api_key_env": "WORK_API_KEY", "context": 8192,
     }
     assert llm["profiles"]["local"]["model"] == "global-chat:1b", "the other profiles stay"
     assert llm["profile"] == "local", "the global selection stays: the project selects in local.toml"

@@ -141,7 +141,7 @@ def _no_ok_after_an_error(monkeypatch, capsys, root: Path, answers: list[str]) -
     from fw_context_mcp.llm import auto_model, hardware, ollama
 
     # The test request of the new profile fails.
-    monkeypatch.setattr(_llm_wizard, "test_profile", lambda cfg, name: "test failed")
+    monkeypatch.setattr(_llm_wizard, "test_profile", lambda cfg, name, **kwargs: "test failed")
     monkeypatch.setattr(hardware, "machine_memory", lambda: hardware.Memory(gpu_mib=None, ram_mib=16 * 1024))
     monkeypatch.setattr(ollama, "calibration_key", lambda *args: None)
     replies = iter(answers)

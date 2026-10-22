@@ -267,3 +267,30 @@ def test_a_profile_named_like_a_provider_does_not_give_its_key_to_that_provider(
     secrets.set_api_key("deepseek", "sk-openrouter-" + "key")
 
     assert secrets.get_api_key("ds-direct", "", "deepseek") is None
+
+
+def test_a_context_refusal_that_names_the_reasoning_turns_no_reasoning_on(home, monkeypatch):
+    """The prompt does not fit: a second request with the reasoning on fails the same way, and is billed."""
+    from fw_context_mcp.llm.errors import ChatPromptTooLong
+
+    llm = _profile(home, 'provider = "openrouter"\nmodel = "m"\n')
+    body = '{"error": {"message": "maximum context length is 8192 tokens, reasoning tokens included"}}'
+    sent = _replies(monkeypatch, (400, body), OK)
+    client = _client(llm)
+
+    with pytest.raises(ChatPromptTooLong):
+        client.generate("hi")
+
+    assert len(sent) == 1 and client._low_reasoning is False
+
+
+def test_a_stream_refused_for_the_context_is_a_prompt_that_is_too_long(home, monkeypatch):
+    from fw_context_mcp.llm.errors import ChatPromptTooLong
+
+    llm = _profile(home, 'provider = "openrouter"\nmodel = "m"\nstream = true\n')
+    _stream_replies(monkeypatch, 400, b'{"error": {"code": "context_length_exceeded", "message": "too long"}}')
+
+    with pytest.raises(ChatPromptTooLong) as error:
+        _client(llm).generate("hi")
+
+    assert error.value.status_code == 400

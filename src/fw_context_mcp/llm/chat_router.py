@@ -36,7 +36,7 @@ from ..config.settings import LLMConfig
 from ..utils import is_fatal
 from ._debug import _write_debug_log
 from .client import ChatResult, Usage
-from .errors import ChatApiError, LLMError
+from .errors import ChatApiError, ChatPromptTooLong, LLMError
 
 log = logging.getLogger(__name__)
 
@@ -139,6 +139,53 @@ def chat_ollama_server(cfg: LLMConfig) -> str | None:
         return None
     # Each "ollama" endpoint of detect_chat_endpoint ends with /api/generate.
     return endpoint[: -len("/api/generate")]
+
+
+def chat_api_key(cfg: LLMConfig) -> str | None:
+    """Return the API key of the chat: ``chat_api_key`` when a caller set it, else the stored key of the profile.
+
+    ``llm.secrets`` looks in ``api_key_env``, the keyring and
+    ``secrets.toml``, then at the key of the provider (a profile of
+    OpenRouter uses the key stored as ``openrouter``).  A config without a
+    profile (a test, an old caller) has no stored key.  The model list of
+    the provider (``llm.model_list``) sends the same key.
+    """
+    if cfg.chat_api_key:
+        return cfg.chat_api_key
+    if not cfg.profile:
+        return None
+    from .secrets import get_api_key
+
+    return get_api_key(cfg.profile, cfg.api_key_env, _provider_of_key(cfg))
+
+
+def _provider_of_key(cfg: LLMConfig) -> str:
+    """Return the provider whose stored key applies to the profile of *cfg*, or empty.
+
+    Only for the URL of the provider: a profile of OpenRouter with the URL
+    of a proxy must not send the key of OpenRouter to the proxy.
+    """
+    from .providers import provider_spec
+
+    spec = provider_spec(cfg.provider)
+    if spec is None or (cfg.chat_api_base or "").rstrip("/") != spec.base_url.rstrip("/"):
+        return ""
+    return spec.name
+
+
+#: The marks of a refusal for the context in the body of an HTTP 400: the
+#: error code of the OpenAI API (OpenRouter gives it too), and the message
+#: that OpenAI and DeepSeek give ("This model's maximum context length is
+#: N tokens").  From reports of the error bodies (2026-10-22), not from a
+#: probe: a probe needs a prompt larger than 128k tokens.  The whole body,
+#: lower case: OpenRouter wraps the error of the host in metadata.raw.
+_CONTEXT_REFUSALS = ("context_length_exceeded", "maximum context length")
+
+
+def _is_context_refusal(body: str) -> bool:
+    """Return True when the body of an HTTP 400 says that the prompt does not fit the context of the model."""
+    text = body.lower()
+    return any(mark in text for mark in _CONTEXT_REFUSALS)
 
 
 def _is_sse_response(resp: httpx.Response) -> bool:
@@ -349,7 +396,8 @@ class OpenAIChatClient:
             # metadata.raw, and the word can be after the part that a
             # message shows.  "reasoning", not "reason": a 400 about
             # finish_reason turned the reasoning on for the whole run.
-            refused = exc.status_code == 400 and "reasoning" in exc.body.lower()
+            refused = (exc.status_code == 400 and "reasoning" in exc.body.lower()
+                       and not isinstance(exc, ChatPromptTooLong))
             if spec is None or not spec.reasoning_low or self._low_reasoning or not refused:
                 raise
             # A warning: the reasoning tokens are billed as output.
@@ -441,24 +489,10 @@ class OpenAIChatClient:
         OpenRouter uses the key stored as ``openrouter``).  A config
         without a profile (a test, an old caller) has no stored key.
         """
-        if self.cfg.chat_api_key:
-            return self.cfg.chat_api_key
-        if not self.cfg.profile:
-            return None
-        from .secrets import get_api_key
-
-        return get_api_key(self.cfg.profile, self.cfg.api_key_env, self._provider_of_key())
+        return chat_api_key(self.cfg)
 
     def _provider_of_key(self) -> str:
-        """Return the provider whose stored key applies to this profile, or empty.
-
-        Only for the URL of the provider: a profile of OpenRouter with the
-        URL of a proxy must not send the key of OpenRouter to the proxy.
-        """
-        spec = self.spec
-        if spec is None or (self.cfg.chat_api_base or "").rstrip("/") != spec.base_url.rstrip("/"):
-            return ""
-        return spec.name
+        return _provider_of_key(self.cfg)
 
     def _error(self, e: Exception) -> ChatApiError:
         """Return the ``ChatApiError`` with a sentence for the operator for the failure *e* of a request.
@@ -507,6 +541,12 @@ class OpenAIChatClient:
                     + (f", or set the environment variable {self.cfg.api_key_env}" if self.cfg.api_key_env else ""),
                     status_code=status_code,
                 )
+            if status_code == 400 and _is_context_refusal(e.response.text):
+                return ChatPromptTooLong(
+                    f"Chat API HTTP 400: the prompt and the answer budget do not fit the context of "
+                    f"'{self.cfg.model}': {e.response.text[:200]}",
+                    status_code=status_code, body=e.response.text,
+                )
             return ChatApiError(
                 f"Chat API HTTP {status_code}: {e.response.text[:200]}", status_code=status_code, body=e.response.text,
             )
@@ -521,7 +561,7 @@ class OpenAIChatClient:
         raise ChatApiError("an OpenAI-compatible chat endpoint gives no count of the tokens of a prompt")
 
     def trained_context(self) -> int | None:
-        """Not known: the API does not tell the context of its model."""
+        """None: this client counts no tokens.  The analysis reads the context from ``llm.model_list``."""
         return None
 
     def fit_context(self, lower: int, upper: int, *, check: bool) -> None:

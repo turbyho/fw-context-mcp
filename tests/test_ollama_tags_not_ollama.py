@@ -147,7 +147,7 @@ def test_init_says_ok_only_for_a_server_that_runs(tmp_path, monkeypatch, capsys)
     monkeypatch.setattr(_diag, "remote_hosts", lambda url: None)
     monkeypatch.setattr(hardware, "machine_memory", lambda: hardware.Memory(gpu_mib=None, ram_mib=16 * 1024))
     monkeypatch.setattr(auto_model, "_gpu_available", lambda: False)
-    monkeypatch.setattr(_llm_wizard, "test_profile", lambda cfg, name: None)
+    monkeypatch.setattr(_llm_wizard, "test_profile", lambda cfg, name, **kwargs: None)
     monkeypatch.setattr(_init_interactive, "prompt_text", lambda label, default=None, **kwargs: default)
     monkeypatch.setattr(_init_interactive, "_confirm", lambda question, **kwargs: False)
     # Service 1: the local Ollama.
@@ -196,7 +196,7 @@ def test_init_prints_the_message_of_an_error_with_a_running_server(tmp_path, mon
     monkeypatch.setattr(_diag, "remote_hosts", lambda url: {})
     monkeypatch.setattr(hardware, "machine_memory", lambda: hardware.Memory(gpu_mib=None, ram_mib=16 * 1024))
     monkeypatch.setattr(auto_model, "_gpu_available", lambda: False)
-    monkeypatch.setattr(_llm_wizard, "test_profile", lambda cfg, name: None)
+    monkeypatch.setattr(_llm_wizard, "test_profile", lambda cfg, name, **kwargs: None)
     monkeypatch.setattr(_init_interactive, "prompt_text", lambda label, default=None, **kwargs: default)
     monkeypatch.setattr(_init_interactive, "_confirm", lambda question, **kwargs: False)
     # Service 1: the local Ollama.

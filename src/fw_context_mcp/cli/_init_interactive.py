@@ -647,6 +647,10 @@ def _custom_api_profile() -> str | None:
     if found is None:
         return None
     name, values = found
+    context = _custom_api_context(name, values)
+    if context is None:
+        return None
+    values.update(context)
     try:
         set_profile(name, values)
     except (ValueError, OSError, settings.ConfigError) as exc:
@@ -654,6 +658,40 @@ def _custom_api_profile() -> str | None:
         return None
     print(f"  [ok] Profile {name!r} saved to {settings._GLOBAL_CONFIG_PATH}")
     return name
+
+
+def _custom_api_context(name: str, values: dict[str, object]) -> dict[str, object] | None:
+    """Return ``{"context": n}`` of the chat model of a new openai_compatible profile, ``{}`` without one, or None.
+
+    Such an API gives no context of its models (the OpenAI model list has
+    none), thus the setup asks: the LLM analysis needs the context
+    (decision of the user, 2026-10-22).  With the context, the name of the
+    model need not be in the list of the API (``model_list.model_context``).
+    Empty: the profile serves the embeddings only; the selection of it for
+    the LLM analysis then names the missing context.  None: the answer is
+    not a number.
+    """
+    from ..config.settings import LLMConfig
+    from ..llm.model_list import ModelContextError, model_context
+
+    llm = LLMConfig(provider="openai_compatible", profile=name, chat_api_base=str(values["url"]),
+                    api_key_env=str(values.get("api_key_env") or ""), model=str(values["model"]))
+    try:
+        # The list of this API gives the context: nothing to store.
+        print(f"  Context of {llm.model}: {model_context(llm)} tokens (the model list of the API)")
+        return {}
+    except ModelContextError as exc:
+        if exc.not_listed:
+            print(f"  [note] The model list of the API does not hold {llm.model!r}: with a context, the name goes "
+                  "to the API as it is")
+    answer = (prompt_text("Context of the chat model in tokens (empty: the profile serves the embeddings only)")
+              or "").strip()
+    if not answer:
+        return {}
+    if not answer.isdigit() or int(answer) <= 0:
+        print(f"  [skip] {answer!r} is not a number of tokens: no profile is written")
+        return None
+    return {"context": int(answer)}
 
 
 def _custom_api_values(*, model_prompt: str = "Model", model_default: str = "deepseek-chat",

@@ -606,7 +606,7 @@ def _no_test_call(monkeypatch):
     from fw_context_mcp.llm import configure
 
     monkeypatch.setattr(configure, "configure_llm_core", lambda *a, **k: {"status": "ok"})
-    monkeypatch.setattr(_llm_wizard, "test_profile", lambda cfg, name: None)
+    monkeypatch.setattr(_llm_wizard, "test_profile", lambda cfg, name, **kwargs: None)
 
 
 def _set_up_local_ollama(monkeypatch, root: Path) -> None:

@@ -48,7 +48,7 @@ import httpx
 
 from ..utils import fw_context_home, is_fatal, write_text_atomic
 from .client import ChatResult, Usage
-from .errors import ChatApiError, LLMError, LLMStopRun
+from .errors import ChatApiError, ChatPromptTooLong, LLMError, LLMStopRun
 
 if TYPE_CHECKING:
     from ..config.settings import LLMConfig
@@ -508,18 +508,41 @@ def list_models(profile: str) -> list[tuple[str, str]]:
         PlanAuthError: the profile is not signed in.
         LLMError: the request failed.
     """
+    return [(str(model["slug"]), str(model.get("display_name") or model["slug"])) for model in _listed_models(profile)]
+
+
+def model_contexts(profile: str) -> dict[str, int | None]:
+    """Return the context of each model that the plan of *profile* lists (``context_window``), None when it gives none.
+
+    Measured 2026-10-22: the list gives ``context_window`` for each model
+    (gpt-6-luna 272000), and ``max_context_window`` (872000), the context
+    with an option that fw-context does not send.
+
+    Raises:
+        PlanAuthError: the profile is not signed in.
+        LLMError: the request failed.
+    """
+    from .model_list import tokens
+
+    return {str(model["slug"]): tokens(model.get("context_window")) for model in _listed_models(profile)}
+
+
+def _listed_models(profile: str) -> list[dict]:
+    """Return the entries of the model list of the plan that it lists for a user (``visibility`` "list")."""
     token = access_token(profile)
     try:
         response = httpx.get(MODELS_URL, headers={"Authorization": f"Bearer {token}"}, timeout=30)
         response.raise_for_status()
-    except httpx.HTTPError as exc:
+        body = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
         raise LLMError(f"the model list of the ChatGPT plan failed: {type(exc).__name__}") from None
-    models = response.json().get("models", [])
-    return [
-        (str(model["slug"]), str(model.get("display_name") or model["slug"]))
-        for model in models
-        if isinstance(model, dict) and model.get("visibility") == "list" and model.get("slug")
-    ]
+    # An answer of another form raised AttributeError or TypeError, which
+    # the callers (reindex_file among them) do not catch.
+    models = body.get("models") if isinstance(body, dict) else None
+    if not isinstance(models, list):
+        raise LLMError("the model list of the ChatGPT plan failed: an answer without a list of models")
+    return [model for model in models
+            if isinstance(model, dict) and model.get("visibility") == "list" and model.get("slug")]
 
 
 def _error_code(response: httpx.Response) -> str:
@@ -568,6 +591,13 @@ class ChatGPTPlanClient:
         num_ctx: int | None = None,
     ) -> ChatResult:
         """Send *prompt* and return the answer; *temperature*, *max_tokens* and *num_ctx* are not sent.
+
+        WHY no ``max_output_tokens``: the terms of "Sign in with ChatGPT"
+        for an open-source app name the fields of a request, and that field
+        is not one of them (research 2026-10-20).  A probe of 2026-10-22
+        showed that the plan takes it; the terms decide, not the probe.
+        Thus the API checks only that the prompt fits the context of the
+        model; the context of the analysis comes from the model list.
 
         Raises:
             PlanAuthError: the profile is not signed in.
@@ -642,6 +672,14 @@ class ChatGPTPlanClient:
         code = str(error.get("code") or error.get("detail") or f"HTTP {status_code}")
         param = str(error.get("param") or "")
         profile = self.cfg.profile
+        if code == "context_length_exceeded":
+            # The code of the Responses API for an input that does not fit
+            # the context of the model (reports of the API, 2026-10-22; not
+            # probed: a probe needs a prompt of more than 272k tokens).
+            return _RefusalError(ChatPromptTooLong(
+                f"the ChatGPT plan refused the request: the prompt does not fit the context of '{self.cfg.model}' "
+                f"({code})", status_code=status_code,
+            ))
         if code == "subscription_sharing_usage_limit_exceeded":
             return _RefusalError(PlanLimitError(
                 f"the ChatGPT plan of LLM profile {profile!r} reached a usage limit ({code}): the run stops. "
@@ -676,7 +714,7 @@ class ChatGPTPlanClient:
         raise ChatApiError("the ChatGPT plan gives no count of the tokens of a prompt")
 
     def trained_context(self) -> int | None:
-        """Not known: the API does not tell the context of its model."""
+        """None: this client counts no tokens.  The analysis reads the context from ``llm.model_list``."""
         return None
 
     def fit_context(self, lower: int, upper: int, *, check: bool) -> None:

@@ -232,10 +232,28 @@ def test_a_server_that_does_not_answer_gives_no_analysis():
     assert mod._analysis_contexts(_Server(None), LLMConfig()) is None
 
 
-def test_an_openai_endpoint_has_the_context_of_the_config():
+def test_an_api_has_the_context_of_its_model_list_not_num_ctx(monkeypatch):
+    """Before 2026-10-22 an API run had num_ctx (an Ollama key, 16384), and its skip:toolarge never cleared."""
     from fw_context_mcp.config.settings import LLMConfig
+    from fw_context_mcp.llm import model_list
 
-    assert mod._analysis_contexts(SimpleNamespace(counts_tokens=False), LLMConfig(num_ctx=8192)) == (8192, 8192)
+    monkeypatch.setattr(model_list, "model_context", lambda llm: 1048576)
+
+    assert mod._analysis_contexts(SimpleNamespace(counts_tokens=False), LLMConfig(num_ctx=8192)) == (1048576, 1048576)
+
+
+def test_an_api_model_without_a_known_context_gives_no_analysis(monkeypatch, caplog):
+    """The context must be known (decision of the user, 2026-10-22): no guess, an error that names the fix."""
+    from fw_context_mcp.config.settings import LLMConfig
+    from fw_context_mcp.llm import model_list
+
+    def _unknown(llm):
+        raise model_list.ModelContextError("the API of LLM profile 'work' gives no context of model 'w': set context")
+
+    monkeypatch.setattr(model_list, "model_context", _unknown)
+
+    assert mod._analysis_contexts(SimpleNamespace(counts_tokens=False), LLMConfig()) is None
+    assert "set context" in caplog.text
 
 
 # ── The CLI ──
@@ -655,3 +673,24 @@ def test_reindex_file_takes_the_calibration_without_a_measurement(populated_db, 
     maintenance._reindex_llm_analysis(populated_db, CONFIG_HASH, cfg, tmp_path, {}, project_root=tmp_path)
 
     assert len(choices) == 1 and isinstance(choices[0], mod.ContextChoice) and choices[0].check is False
+
+
+@pytest.mark.parametrize("complete", [True, False])
+def test_reindex_file_says_when_the_analysis_is_not_complete(populated_db, monkeypatch, tmp_path: Path, complete):
+    """Before, the result said nothing: an API model whose context is not known made no analysis at all."""
+    from fw_context_mcp.cache_client import CacheClient
+    from fw_context_mcp.mcp.handlers import maintenance
+
+    monkeypatch.setattr(mod, "_build_llm_analysis", lambda *a, **k: complete)
+    monkeypatch.setattr(CacheClient, "from_config", staticmethod(lambda cfg: None))
+    cfg = SimpleNamespace(llm=SimpleNamespace(enabled=True, analyze_symbols=True))
+    result: dict = {}
+
+    maintenance._reindex_llm_analysis(populated_db, CONFIG_HASH, cfg, tmp_path, result, project_root=tmp_path)
+
+    assert "analysis_updated" in result
+    if complete:
+        assert "analysis_warning" not in result, result
+    else:
+        assert result["analysis_warning"].startswith("LLM analysis incomplete:"), result
+        assert "fw-context doctor" in result["analysis_warning"]

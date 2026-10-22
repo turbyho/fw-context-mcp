@@ -207,6 +207,10 @@ analyze_symbols = true
 #   An API (openai_compatible, openrouter, deepseek):
 #     api_key_env     the environment variable that holds the API key; without
 #                     it, 'fw-context llm key set <profile>' stores the key
+#   An API or chatgpt:
+#     context         the context of the model in tokens, only for a model
+#                     whose model list gives none (an openai_compatible API).
+#                     The model list of the provider has priority
 #   openrouter only:
 #     routing         the hosts that get the request.  Defaults: sort = "price",
 #                     quantizations = 8 bits or more and "unknown".  Options:
@@ -235,7 +239,7 @@ num_ctx = 16384
 # An API (the source code goes to its host); the key: 'fw-context llm key set deepseek'
 # [llm.profiles.deepseek]
 # provider = "deepseek"
-# model = "deepseek-v4-flash"
+# model = "deepseek-flash"
 """
 
 _PROJECT_DEFAULTS_TEMPLATE = """\
@@ -412,6 +416,9 @@ class LLMConfig:
         embed_routing: The provider routing of an OpenRouter embedding request.
         embed_context: The tokens of one input of the embedding API model;
             0: from the model list of the provider.
+        context: The context of the chat model of an API or chatgpt profile,
+            in tokens, for a model whose model list gives none; 0: from the
+            model list (``llm.model_list``).
         enabled: Set False to disable all Ollama calls — tools return raw prompts
             for the agent to answer instead.
         ollama_url: Ollama API endpoint (must be a loopback address unless you
@@ -516,6 +523,10 @@ class LLMConfig:
     embed_api_key_env: str = ""
     embed_routing: dict = field(default_factory=dict)
     embed_context: int = 0
+    # The context of the chat model of an API profile, when its model list
+    # gives none (decision of the user, 2026-10-22: the context must be
+    # known, and the user gives it only where the API does not).
+    context: int = 0
 
     def embed_key(self) -> str:
         """Return ``embed_model`` with description version for cache disambiguation.
@@ -1032,11 +1043,11 @@ _PROVIDERS: tuple[str, ...] = ("ollama", "openai_compatible", "openrouter", "dee
 _PROFILE_FIELDS: dict[str, str] = {"provider": "str", "model": "str", "timeout": "float", "stream": "bool"}
 _PROFILE_PROVIDER_FIELDS: dict[str, dict[str, str]] = {
     "ollama": {"url": "str", "num_ctx": "int", "keep_alive": "str", "auto_pull": "bool", "max_concurrent": "int"},
-    "openai_compatible": {"url": "str", "api_key_env": "str", "embed_context": "int"},
+    "openai_compatible": {"url": "str", "api_key_env": "str", "embed_context": "int", "context": "int"},
     "openrouter": {"url": "str", "api_key_env": "str", "routing": "routing", "embed_routing": "routing",
-                   "embed_context": "int"},
-    "deepseek": {"url": "str", "api_key_env": "str"},
-    "chatgpt": {},
+                   "embed_context": "int", "context": "int"},
+    "deepseek": {"url": "str", "api_key_env": "str", "context": "int"},
+    "chatgpt": {"context": "int"},
 }
 
 #: The profile keys whose default keeps the backend the same: a value of the
@@ -1044,7 +1055,7 @@ _PROFILE_PROVIDER_FIELDS: dict[str, dict[str, str]] = {
 #: ``provider``, ``model``, ``url`` and ``api_key_env`` select the backend,
 #: thus a wrong value there is a ConfigError.
 _PROFILE_TUNING_KEYS: frozenset[str] = frozenset(
-    {"timeout", "stream", "num_ctx", "keep_alive", "auto_pull", "max_concurrent"},
+    {"timeout", "stream", "num_ctx", "keep_alive", "auto_pull", "max_concurrent", "context"},
 )
 
 #: The Ollama server of a profile that names no ``url``, and of the
@@ -2064,6 +2075,7 @@ def _apply_chat_profile(llm: LLMConfig, name: str, profile: dict) -> str | None:
     llm.profile, llm.provider, llm.model = name, profile["provider"], profile["model"]
     llm.timeout = _convert(profile.get("timeout", llm.timeout), "float")
     llm.stream = _convert(profile.get("stream", llm.stream), "bool")
+    llm.context = _convert(profile.get("context", 0), "int")
     if llm.provider == "ollama":
         llm.num_ctx = _convert(profile.get("num_ctx", llm.num_ctx), "int")
         _apply_ollama_tuning(llm, profile)

@@ -521,6 +521,34 @@ def _running(pid: int) -> bool:
     return state != "Z"
 
 
+@pytest.fixture(autouse=True)
+def _no_model_list_requests(monkeypatch):
+    """No test reads the model list of a real provider (``llm.model_list``).
+
+    WHY: the setup, the selection of a profile, ``llm test``, doctor and
+    the analysis read the list of DeepSeek, OpenRouter or the ChatGPT plan
+    with a GET.  Without this guard a test sent that GET to the real host,
+    and its result depended on the network and on the keys of the operator.
+    A test that needs a list replaces ``provider_models`` or
+    ``model_context``.  The caches go too: a list of one test must not
+    answer for the next one.
+    """
+    from fw_context_mcp.llm import model_list
+
+    def _blocked(llm, url):
+        raise model_list.ModelListError(f"no request to {url} in the test session")
+
+    monkeypatch.setattr(model_list, "_get", _blocked)
+    monkeypatch.setattr(model_list, "_LISTS", {})
+    monkeypatch.setattr(model_list, "_ENDPOINT_CONTEXTS", {})
+    from fw_context_mcp.llm import chatgpt_plan
+
+    def _blocked_plan(profile):
+        raise model_list.ModelListError("no request to the model list of the ChatGPT plan in the test session")
+
+    monkeypatch.setattr(chatgpt_plan, "model_contexts", _blocked_plan)
+
+
 @pytest.fixture
 def tmpdir():
     with tempfile.TemporaryDirectory() as d:

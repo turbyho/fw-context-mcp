@@ -36,6 +36,22 @@ GLOBAL = '[llm]\nprofile = "local"\nembed_model = "e:1b"\n\n' + LOCAL
 CLOUD_MODELS = {"m:cloud": "https://ollama.com:443"}
 
 
+def _fake_model_lists(monkeypatch, lists: dict) -> None:
+    """Give *lists* (provider → [ModelInfo]) as the model list of each API provider; another provider has none.
+
+    WHY: the conftest blocks the GET of a real list, and the setup and the
+    selection of an API profile need the list for the names and the context.
+    """
+    from fw_context_mcp.llm import model_list
+
+    def _models(llm):
+        if llm.provider not in lists:
+            raise model_list.ModelListError(f"no model list of {llm.provider} in this test")
+        return lists[llm.provider]
+
+    monkeypatch.setattr(model_list, "provider_models", _models)
+
+
 @pytest.fixture
 def home(tmp_path: Path, monkeypatch) -> dict:
     """A global config of its own, a project, a machine without a GPU, and no local Ollama.
@@ -62,13 +78,17 @@ def home(tmp_path: Path, monkeypatch) -> dict:
     monkeypatch.setattr(auto_model, "_gpu_available", lambda: False)
     monkeypatch.setattr(auto_model, "_model_installed", lambda url, model: True)
     tested: list[str] = []
-    monkeypatch.setattr(_llm_wizard, "test_profile", lambda cfg, name: tested.append(name))
+    monkeypatch.setattr(_llm_wizard, "test_profile", lambda cfg, name, **kwargs: tested.append(name))
     # The test request of a selection for this project (configure_llm_core): the profile of each request.
     selected: list[str] = []
     monkeypatch.setattr(client, "call_llm", lambda prompt, cfg, **kwargs: selected.append(cfg.profile) or "OK")
     # A key of the operator would make a profile without a key ready.
     for name in ("OPENROUTER_API_KEY", "DEEPSEEK_API_KEY"):
         monkeypatch.delenv(name, raising=False)
+    from fw_context_mcp.llm.model_list import ModelInfo
+
+    # DeepSeek lists the model of the profile ds, with its context.
+    _fake_model_lists(monkeypatch, {"deepseek": [ModelInfo("deepseek-chat", 1048576)]})
     root = tmp_path / "proj"
     (root / ".fw-context").mkdir(parents=True)
     (root / ".fw-context" / "config.toml").write_text("[project]\n", encoding="utf-8")
@@ -220,7 +240,7 @@ def test_a_detected_local_ollama_that_does_not_answer_is_not_selected(home, monk
     _global('[llm]\nprofile = "ds"\n\n' + DS)
     before = settings._GLOBAL_CONFIG_PATH.read_text(encoding="utf-8")
     monkeypatch.setattr(_diag, "installed_models", lambda url: ["chat:1b"])
-    monkeypatch.setattr(_llm_wizard, "test_profile", lambda cfg, name: "HTTP 500")
+    monkeypatch.setattr(_llm_wizard, "test_profile", lambda cfg, name, **kwargs: "HTTP 500")
     # No to "Keep the profile anyway?": the global config gets its earlier text back.
     _answers(monkeypatch, ["1"], {"Chat model": "chat:1b"})
 
@@ -796,3 +816,20 @@ def test_option_0_is_offered_when_local_toml_sets_each_key_of_the_global_config(
     _local(root, '[llm]\nprofile = "ds"\nembed_model = "x:1b"\n')
 
     assert _llm_lists.global_offers(root) == (True, True)
+
+
+def test_a_profile_whose_context_is_not_known_is_no_choice(home, monkeypatch, capsys):
+    """The analysis needs the context: a model that the list of DeepSeek does not hold cannot run."""
+    root = home["root"]
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    _global(GLOBAL + '\n[llm.profiles.ds]\nprovider = "deepseek"\nmodel = "deepseek-v4-flash"\n')
+    before = settings._GLOBAL_CONFIG_PATH.read_text(encoding="utf-8")
+    _answers(monkeypatch, ["2", "1"])
+
+    _llm_lists.choose_chat(root, _cfg(root))
+
+    out = capsys.readouterr().out
+    assert "[skip] The profile 'ds' cannot analyse: the model 'deepseek-v4-flash'" in out, out
+    assert home["selected"] == []
+    assert settings._GLOBAL_CONFIG_PATH.read_text(encoding="utf-8") == before
+    assert not (root / ".fw-context" / "local.toml").exists()

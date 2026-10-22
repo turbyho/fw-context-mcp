@@ -815,12 +815,13 @@ class TestConfigureLlmStream:
     profile, and the tool never writes it to local.toml.
     """
 
+    # context: such an API gives none, and configure_llm_core needs the context of the model.
     _PROFILES = (
         '[llm.profiles.p]\nprovider = "ollama"\nurl = "http://localhost:11434"\nmodel = "m:1b"\n\n'
         '[llm.profiles.streaming]\nprovider = "openai_compatible"\nurl = "https://api.example.com/v1"\n'
-        'model = "m"\nstream = true\n\n'
+        'model = "m"\nstream = true\ncontext = 32768\n\n'
         '[llm.profiles.posting]\nprovider = "openai_compatible"\nurl = "https://api.example.com/v1"\n'
-        'model = "m"\nstream = false\n'
+        'model = "m"\nstream = false\ncontext = 32768\n'
     )
 
     def _mock_response(self) -> httpx.Response:

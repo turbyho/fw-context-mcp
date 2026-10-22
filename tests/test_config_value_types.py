@@ -747,7 +747,10 @@ def test_the_tuning_list_is_the_list_of_the_decision():
         ("cache_server", "token"), ("cache_server", "batch_size"), ("cache_server", "force"),
         ("updates", "check"),
     }
-    assert settings._PROFILE_TUNING_KEYS == {"timeout", "stream", "num_ctx", "keep_alive", "auto_pull", "max_concurrent"}
+    # context (2026-10-22): the context of an API model whose list gives
+    # none; a wrong type leaves it 0, and the analysis then names the fix.
+    assert settings._PROFILE_TUNING_KEYS == {"timeout", "stream", "num_ctx", "keep_alive", "auto_pull", "max_concurrent",
+                                             "context"}
 
 
 @pytest.fixture(autouse=True)

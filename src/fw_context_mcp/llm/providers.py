@@ -117,7 +117,10 @@ PROVIDERS: dict[str, ProviderSpec] = {
             base_url="https://api.deepseek.com",
             key_env="DEEPSEEK_API_KEY",
             reasoning_off={"thinking": {"type": "disabled"}},
-            recommended_model="deepseek-v4-flash",
+            # The name of the model list of the API (GET /models,
+            # 2026-10-22); "deepseek-v4-flash" answered too, but the list
+            # does not hold it, thus its context was not known.
+            recommended_model="deepseek-flash",
         ),
     )
 }

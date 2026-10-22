@@ -280,7 +280,7 @@ def _setup_chatgpt(project_root: Path | None, cfg, cloud: dict[str, str]) -> str
     """
     import webbrowser
 
-    from ..llm.chatgpt_plan import LoginError, list_models, login
+    from ..llm.chatgpt_plan import LoginError, login
     from ..llm.errors import LLMError
 
     name = _free_name(ui.prompt_text("Profile name", default="chatgpt") or "chatgpt", lambda n: n in _profiles())
@@ -297,22 +297,18 @@ def _setup_chatgpt(project_root: Path | None, cfg, cloud: dict[str, str]) -> str
         except webbrowser.Error:
             pass  # the user has the URL above
 
+    from ..config.settings import LLMConfig
+    from ..llm.chatgpt_plan import API_BASE
+
     try:
         login(name, open_url=_open)
-        models = list_models(name)
     except (LoginError, LLMError, OSError) as exc:
         print(f"  [warn] ChatGPT plan: {exc}")
         _drop_unused_secrets(name)
         return None
-    slugs = [slug for slug, _label in models]
-    if not slugs:
-        print("  [warn] The plan lists no model")
-        _drop_unused_secrets(name)
-        return None
-    print(f"  Models of the plan: {', '.join(slugs)}")
-    default = "gpt-6-luna" if "gpt-6-luna" in slugs else slugs[0]
-    model = ui.prompt_text("Model", default=default) or default
-    written = _write_profile(name, {"provider": "chatgpt", "model": model}, asked=True)
+    values = _model_from_list(LLMConfig(provider="chatgpt", profile=name, chat_api_base=API_BASE), "the plan",
+                              "gpt-6-luna")
+    written = _write_profile(name, {"provider": "chatgpt", **values}, asked=True) if values else None
     if written is None:
         _drop_unused_secrets(name)
     return written
@@ -333,13 +329,86 @@ def _setup_provider(provider: str) -> Callable[[Path | None, object, dict[str, s
                   f"{spec.label} profile ({provider_entry(spec.name)})")
             if not ui._store_api_key(provider_entry(spec.name)):
                 return None
-        model = ui.prompt_text("Model", default=spec.recommended_model or None) or spec.recommended_model
-        if not model:
-            print(f"  [skip] {spec.label}: no model")
-            return None
-        return _write_profile(name, {"provider": spec.name, "model": model})
+        from ..config.settings import LLMConfig
+
+        llm = LLMConfig(provider=spec.name, profile=name, chat_api_base=spec.base_url, api_key_env=spec.key_env)
+        values = _model_from_list(llm, spec.label, spec.recommended_model)
+        return _write_profile(name, {"provider": spec.name, **values}) if values else None
 
     return _setup
+
+
+#: A model list up to this length is printed whole; a longer one (OpenRouter
+#: lists hundreds of models) gives only the recommended model and the count.
+_LIST_PRINT_LIMIT = 20
+
+
+def _model_from_list(llm, label: str, recommended: str) -> dict[str, object] | None:
+    """Ask for a model of the model list of the provider of *llm*; return the profile values, or None.
+
+    WHY the list (decision of the user, 2026-10-22): the names of the
+    models are the current ones of the API, and the context of the model
+    comes from the same list.  A fixed name went out of date: the
+    recommended "deepseek-v4-flash" answered, but the list of DeepSeek does
+    not hold it, thus its context was not known.  *recommended* is only
+    the default, when the list holds it.  The values get ``context`` only
+    when the list gives no context of the model (``_context_values``).
+    """
+    import difflib
+    from dataclasses import replace
+
+    from ..llm.model_list import ModelListError, provider_models
+
+    try:
+        names = [info.name for info in provider_models(llm)]
+    except ModelListError as exc:
+        print(f"  [warn] The model list of {label} cannot be read ({exc}): no profile is written")
+        return None
+    if not names:
+        print(f"  [warn] The model list of {label} holds no model: no profile is written")
+        return None
+    default = recommended if recommended in names else names[0]
+    if len(names) <= _LIST_PRINT_LIMIT:
+        print(f"  Models of {label}: {', '.join(names)}")
+    else:
+        print(f"  {label} lists {len(names)} models; the recommended one is {default}")
+    model = ui.prompt_text("Model", default=default) or default
+    if model not in names:
+        close = difflib.get_close_matches(model, names, n=5)
+        print(f"  [skip] {model!r} is not in the model list of {label}"
+              + (f" (similar names: {', '.join(close)})" if close else ""))
+        return None
+    context = _context_values(replace(llm, model=model))
+    return None if context is None else {"model": model, **context}
+
+
+def _context_values(llm) -> dict[str, object] | None:
+    """Return ``{}`` when the model list gives the context of the model, else ``{"context": n}`` from a question.
+
+    None: the user gave no context, thus the analysis cannot use the
+    model.  The question comes only for a model whose list gives no
+    context (decision of the user, 2026-10-22: do not ask for a value that
+    the API gives).
+    """
+    from ..llm.model_list import ModelContextError, model_context
+
+    try:
+        context = model_context(llm)
+    except ModelContextError as exc:
+        if exc.not_listed or exc.unreadable:
+            # A static context repairs neither: the analysis reads the list
+            # at its start, and a list that cannot be read stops it too.
+            print(f"  [skip] {exc}")
+            return None
+        print(f"  The API gives no context of {llm.model}: the LLM analysis needs it")
+    else:
+        print(f"  Context of {llm.model}: {context} tokens (the model list of the API)")
+        return {}
+    answer = (ui.prompt_text("Context of the model in tokens") or "").strip()
+    if not answer.isdigit() or int(answer) <= 0:
+        print(f"  [skip] {answer!r} is not a number of tokens: no profile is written")
+        return None
+    return {"context": int(answer)}
 
 
 def _setup_api(project_root: Path | None, cfg, cloud: dict[str, str]) -> str | None:
@@ -361,8 +430,12 @@ _SETUPS: dict[str, Callable[[Path | None, object, dict[str, str]], str | None]] 
 # ── The test, the removal, the profile of the project ──
 
 
-def test_profile(cfg, name: str) -> str | None:
-    """Send a request without code through the profile *name*; return None when it answers, else the problem."""
+def test_profile(cfg, name: str, *, check_context: bool = True) -> str | None:
+    """Send a request without code through the profile *name*; return None when it answers, else the problem.
+
+    *check_context*: first check the model and its context with the model
+    list of an API or ChatGPT profile (``context_problem``).
+    """
     from ..config.settings import ConfigError, profile_llm_config
     from ..llm.client import get_chat_client
     from ..llm.errors import LLMError
@@ -372,8 +445,31 @@ def test_profile(cfg, name: str) -> str | None:
         if name not in profiles:
             return f"the global config has no profile {name!r} (profiles: {', '.join(profiles) or 'none'})"
         llm = profile_llm_config(cfg.llm, name)
+        problem = context_problem(llm) if check_context else None
+        if problem is not None:
+            return problem
         get_chat_client(llm).generate(_TEST_PROMPT, max_tokens=10)
     except (ConfigError, LLMError, ValueError) as exc:
+        return str(exc)
+    return None
+
+
+def context_problem(llm) -> str | None:
+    """Return why the context of the chat model of an API or ChatGPT profile is not known, or None.
+
+    WHY in the test of a profile: a model that the list of the provider no
+    longer holds still answered the test, and the analysis stopped later
+    without the context (decision of the user, 2026-10-22: the context
+    must be known).  An Ollama profile gives its context through the
+    server (``/api/show``), thus None here.
+    """
+    from ..llm.model_list import LIST_PROVIDERS, ModelContextError, model_context
+
+    if llm.provider not in LIST_PROVIDERS:
+        return None
+    try:
+        model_context(llm)
+    except ModelContextError as exc:
         return str(exc)
     return None
 
@@ -400,7 +496,11 @@ def _test_new_profile(cfg, name: str, before: str | None) -> bool:
     from ..config import settings
     from ..config._toml_editor import _atomic_write
 
-    problem = test_profile(cfg, name)
+    # WHY no check of the context: the setup checked it with the model list
+    # (``_model_from_list``), and an openai_compatible profile without a
+    # context serves the embeddings only.  The list of the LLM analysis
+    # checks the context when a profile is selected for the chat.
+    problem = test_profile(cfg, name, check_context=False)
     if problem is None:
         print(f"  [ok] Profile {name!r} answers")
         return True

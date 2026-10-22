@@ -20,6 +20,7 @@ import time
 from pathlib import Path
 
 from .errors import LLMError
+from .model_list import ModelContextError
 
 
 def configure_llm_core(
@@ -155,7 +156,13 @@ def configure_llm_core(
             return result
 
         from .client import call_llm
+        from .model_list import LIST_PROVIDERS, model_context
 
+        if new_cfg.llm.provider in LIST_PROVIDERS:
+            # The context of an API model must be known (decision of the
+            # user, 2026-10-22): an old model name still answered the test
+            # call, and the analysis then stopped without the context.
+            result["context"] = model_context(new_cfg.llm)
         t0 = time.monotonic()
         # Short timeout + minimal token budget: the test prompt is trivial
         # so even a slow model responds quickly.
@@ -171,6 +178,9 @@ def configure_llm_core(
         result["test_latency_s"] = latency
         result["test_response"] = response[:100]
         result["message"] = f"Configuration written and tested successfully ({latency}s)."
+    except ModelContextError as e:
+        result["status"] = "error"
+        result["message"] = f"The profile cannot analyse: {e}.{_roll_back()}"
     except LLMError as e:
         result["status"] = "error"
         result["message"] = (

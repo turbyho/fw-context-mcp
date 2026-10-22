@@ -36,13 +36,16 @@ API_KEY_ENV = "FW_CONTEXT_TEST_API_KEY"
 #: profiles would decide the result.  ``embed_model`` is set, thus ``load``
 #: does not probe the GPU or Ollama for the automatic model.  The ``api``
 #: profile has a long timeout, thus a test can see that the test call uses
-#: its own short one.
+#: its own short one.  Each API profile has a ``context``: such an API gives
+#: none, and ``configure_llm_core`` refuses a profile whose context is not
+#: known (the conftest blocks the model list).
 GLOBAL_PROFILES = (
     '[llm]\nprofile = "local"\nenabled = true\nembed_model = "test-embed:1b"\n\n'
     '[llm.profiles.local]\nprovider = "ollama"\nurl = "http://localhost:11434"\nmodel = "local-chat:1b"\n\n'
     '[llm.profiles.api]\nprovider = "openai_compatible"\nurl = "https://api.example.com/v1"\n'
-    f'model = "api-chat"\napi_key_env = "{API_KEY_ENV}"\ntimeout = 600.0\n\n'
+    f'model = "api-chat"\napi_key_env = "{API_KEY_ENV}"\ntimeout = 600.0\ncontext = 32768\n\n'
     '[llm.profiles.loopback]\nprovider = "openai_compatible"\nurl = "http://localhost:4000"\nmodel = "proxy-chat"\n'
+    'context = 32768\n'
 )
 
 
