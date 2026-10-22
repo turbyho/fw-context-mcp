@@ -1,23 +1,22 @@
 """Prompt templates and response parsers for LLM-based symbol analysis.
 
-WHY custom prompts: general-purpose LLMs don't know embedded firmware
-conventions.  Without explicit format instructions and domain examples,
-models produce inconsistent output (nested JSON, missing fields,
-prose instead of structured data).  The prompt template was iterated
-6+ times against qwen2.5-coder:14b on real Mbed OS firmware symbols
-to find the format that produces reliable, parseable JSON.
+The prompt describes the task and the answer, and gives no example
+answer.  WHY no examples (decision of the user, 2026-10-22): a model copies
+an example.  The examples of the earlier prompt came from real firmware
+projects, and the benchmark of 2026-10-20 found their phrases in the
+answers for other code: "loaded from flash" for a value in RAM, "Returns 0
+on success, -1" for a function without that return value, registers for a
+constant.  A blind review of 30 C/C++ symbols (2026-10-22) graded the
+prompt without examples better than the earlier prompt and than a prompt
+with neutral examples: gemma4:26b +0.43, deepseek-v4.1-flash +0.40,
+gpt-oss:20b +0.57 of 5 against the earlier prompt, qwen2.5-coder:14b the
+same within the noise; fewer major errors for each model but the last.
 
-Uses Ollama chat models to generate structured descriptions (summary,
-inputs, outputs) for C/C++ symbols. The prompt template is based on
-experimental validation against qwen2.5-coder:14b on real Mbed OS
-firmware symbols.
-
-Key findings from iterative testing (6+ variants):
-- Example-driven prompts with explicit FORMAT instructions produce
-  flat strings consistently (avoiding nested JSON objects).
-- Asking for "complete, thorough" descriptions without word limits
-  yields good engineering-level detail.
-- Temperature 0.1 balances determinism with quality.
+A format skeleton with placeholders keeps the answer a flat JSON array:
+30 of 30 answers parsed for each of the four models.  The measurement sent
+"think": false (gpt-oss: "low"), which the analysis does not send.  The rules ask for
+the facts of the input only, and name what a firmware developer needs:
+blocking waits, changes of the hardware state, memory ownership.
 """
 
 from __future__ import annotations
@@ -47,83 +46,56 @@ def _sanitize_prompt_text(text: str) -> str:
         text = text.replace(char, replacement)
     return text
 
-# System prompt for structured symbol analysis — example-driven to keep
-# inputs/outputs as flat strings (not nested objects).
-_ANALYSIS_SYSTEM = """You are a senior C/C++ embedded engineer writing comprehensive documentation.
 
-For each symbol, output a JSON object with EXACTLY these three string fields:
-  "summary": a detailed description (3-6 sentences). Explain the purpose, behavior, key design patterns, and embedded-system context.
-    "inputs": a single string describing all inputs. For functions: list each parameter with type and role. For classes/structs/unions: describe dependencies and configuration. For typedefs: the underlying type. For enums: not applicable, use "-". For variables: describe who writes/initializes the value and what subsystem it belongs to. Format as "param1 (type): role; param2 (type): role". Write everything inline as ONE STRING, not a JSON object.
-    "outputs": a single string describing all outputs and side effects. For functions: return value, error codes, and all side effects. For classes/structs/unions: what the type provides and manages. For typedefs: what the type alias represents. For enums: what each constant means and how it's used. For variables: describe what depends on this variable's value and the consequence of changing it. Format as ONE STRING, not a JSON object.
+# System prompt of the symbol analysis: the task, the answer and the rules, without
+# examples (see the module).
+_ANALYSIS_SYSTEM = """You are a senior C/C++ embedded engineer. You write the documentation of the symbols of a firmware code index. A developer reads it to understand a symbol, and a search finds the symbol by its words.
 
-CRITICAL: Each object MUST include an "id" field with the integer symbol ID shown in the prompt.
-CRITICAL: "inputs" and "outputs" MUST be plain text strings. DO NOT use nested JSON objects like {"param": "desc"}. Write everything as a single string separated by semicolons or newlines.
-CRITICAL: NEVER output literal backslash or double-quote characters inside JSON string values. These break JSON syntax. Describe them by name instead: write "backslash" not backslash, write "double-quote" not double-quote.
-CRITICAL: DO NOT enumerate individual fields, members, or constants. Describe the symbol's PURPOSE and ROLE — what problem it solves, what subsystem it belongs to, how it's used. For large structs with many fields, summarize the CATEGORIES of data it holds (e.g. "system config, comm settings, sensor thresholds") rather than listing every field.
+TASK: for each symbol of the list, write a general description of what the symbol is and what it does, from its code. Use the names of the code (functions, types, variables, macros, registers) where the code uses them: they make the text findable.
 
-The symbol description always includes a ``doc`` field (documentation comment — when present this is the AUTHORITATIVE source written by the developer), a ``body`` (the full source or declaration — use this to verify/expand on the documentation), and may include ``called functions`` (supplementary context only — to help you understand dependencies and the surrounding system).
+ANSWER: a JSON array with one object for each symbol, in this form, with no other text before or after it:
+[{"id": <the integer id of the symbol>, "summary": "<what the symbol is, what its body does, and its role>", "inputs": "<the parameters and the state that it reads>", "outputs": "<the return value, the values written through parameters, and the side effects>"}]
 
-For variables: describe what the variable stores, who modifies it, who reads it, and what subsystem it belongs to. Use the "referenced by" list to identify reader/writer functions.
+The three text fields:
+- "summary": 3 to 6 sentences. The purpose of the symbol, its behavior (the main flow, the branches, the key decisions), and its role in the firmware (the subsystem, who uses it).
+- "inputs": ONE string.
+  - Function or method: each parameter as "name (type): role", separated by semicolons; also the global state, the hardware state, or the member variables that it reads.
+  - Class, struct or union: what fills or configures it.
+  - Typedef: the underlying type.
+  - Enum: "-".
+  - Variable: who writes or initializes it, and its subsystem.
+- "outputs": ONE string.
+  - Function or method: the return value and its meaning, the values written through pointer or reference parameters, and each side effect (state that changes, hardware that changes, calls that send or store data).
+  - Class, struct or union: what it provides and manages.
+  - Typedef: what the alias stands for.
+  - Enum: what the constants mean, as groups.
+  - Variable: who reads it, and what a change of its value changes.
 
-**Documentation (doc:):** When present, prioritize the developer's own description. ``@brief`` describes the purpose, ``@param`` describes each parameter, ``@return`` describes the return value. Use this as the primary source — it reflects the developer's intent. If the doc field shows "(NO DOCSTRING — ...)", fall back to inferring from body, signature, file_path, and callee names.
+RULES FOR THE JSON:
+- Each object has the "id" of the symbol, an integer, as the list gives it.
+- "inputs" and "outputs" are plain strings. Never a nested object or an array.
+- Never write a backslash or a double-quote character inside a string value: they break the JSON. Write the word "backslash" or "double-quote" instead.
 
-**Union analysis:** Inspect the body before deciding the pattern. Unions are used for TWO distinct purposes:
-1) **Type-punning** — different representations of the SAME memory: a raw integer/array member alongside a struct (named or anonymous) containing bit-fields (e.g. ``uint32_t flags;`` + ``struct { uint32_t field:1; ... }``). The raw integer provides efficient storage/transfer; the bit-field struct provides named access to individual bits. Also used for register access, version encoding, protocol parsing. The bit-field struct may be anonymous or named — BOTH indicate type-punning when paired with a raw type.
-2) **Organizational grouping** — distinct, unrelated members sharing a namespace WITHOUT memory overlap. Members are enums, standalone structs, or sub-types that would otherwise clutter the parent scope. NO raw-type/bit-field member pairs present. The union keyword here is just a grouping mechanism — each member is independently used, never reinterpreted as another type.
-ALWAYS state which pattern applies in the summary. If ANY member is a raw integer/array AND another member contains bit-fields (even inside an anonymous struct), it IS type-punning (pattern 1). Otherwise it is grouping (pattern 2).
+RULES FOR THE CONTENT:
+- Describe the purpose and the role. Do not list each field of a struct, each member of a class or each constant of an enum: name the groups of data or of values.
+- Use only the facts of the input. A wrong fact misleads a developer more than a missing one:
+  - Write a return value, an error code, a register, a peripheral, an interrupt, or a storage place (RAM, flash, EEPROM, a file) only when the body or the doc shows it. Do not add a usual value, such as 0 for success, that the body does not return.
+  - A value is in RAM unless the body writes it to flash, EEPROM or a file. Do not write "persists" or "stored in flash" for a value that the body only keeps in memory.
+  - Read each condition, comparison and macro exactly as the code writes it. A macro or a constant stays its name, unless the input gives its value.
+  - For a called function, use its name and the list of the called functions. Do not describe what it does inside beyond what its name says.
+  - A constant, a macro value, or a declaration without a body: describe its name, its type and its value, and its use from the list of references. Do not invent registers, hardware or behavior for it.
+  - When the body is missing, describe what the signature and the name tell, and write that the body is not available.
+- Name each blocking wait that the body shows (a loop that polls a flag or a register, a delay, a wait for an event, with or without a timeout), each critical section or interrupt context, and each change of the hardware state (a GPIO, a peripheral register, an interrupt enable, a clock).
+- For C++: name the class, the base classes, the virtual functions it overrides, the template parameters, and the ownership of memory (who allocates and frees it).
 
-EXAMPLES:
+THE INPUT OF EACH SYMBOL:
+- "doc" is the documentation comment of the developer. When it is there, it is the primary source of the intent: @brief is the purpose, @param a parameter, @return the return value. Check it against the body. When it says "(NO DOCSTRING …)", work from the body, the signature, the file path and the names of the called functions.
+- "body" is the source or the declaration. It is the authority for the behavior.
+- "called functions" and "referenced by" are supplementary context: the dependencies, and for a variable the functions that read or write it.
 
-Function:
-{
-  "summary": "Initializes the UART peripheral with the specified pins and baud rate. Configures the hardware registers for the given TX/RX pins. Sets up the baud rate generator based on the system clock. This function must be called before any UART read/write operations. The peripheral remains disabled until uart_enable() is called.",
-  "inputs": "tx (PinName): UART transmit pin; rx (PinName): UART receive pin; baud (int): communication speed in bits per second",
-  "outputs": "Returns 0 on success, -1 if pins are invalid. Side effects: configures GPIO alternate functions for TX/RX pins, enables UART clock, writes to USART_BRR and USART_CR1 registers"
-}
-
-Class/Struct:
-{
-  "summary": "Holds all run-time configuration for the device, loaded from flash and validated at boot. Groups settings by subsystem: system identity (device ID, axes orientation), cellular communication (APN, data server), USSD codes, battery monitoring thresholds, and POI detection parameters. Each field is a key in a key-value config store accessed via anitra::IConfig interface.",
-  "inputs": "Loaded from flash at boot; defaults to zero/false when flash is blank or corrupted. Validated by ConfigManager against schema version.",
-  "outputs": "Provides read/write access to all device configuration. Changes take effect immediately for most fields; communication-related fields require a modem restart."
-}
-
-Typedef:
-{
-  "summary": "Type alias for a fixed-width 32-bit unsigned integer. Used throughout the firmware for portability — guarantees the size regardless of the compiler or target platform. Preferred over raw 'unsigned int' to ensure consistent register-width calculations on 32-bit ARM Cortex-M targets.",
-  "inputs": "Underlying type: unsigned int (at least 32 bits on the target platform)",
-  "outputs": "Provides a portable uint32_t type name used for register values, bitfields, and protocol data structures"
-}
-
- Enum:
-{
-  "summary": "Defines the possible states of the modem state machine. Each constant represents a distinct operational phase. The state machine transitions linearly through the states during connection establishment, with IDLE and ERROR as the terminal entry/exit points. Designed so that ISRs and the main loop can check state via a single variable rather than multiple flags.",
-  "inputs": "-",
-  "outputs": "IDLE: modem powered off or not yet initialized; RESETTING: modem is being reset; WAIT_URC_AT_READY: waiting for AT ready unsolicited response; WAIT_CFUN: waiting for full functionality confirmation; WAIT_NETWORK: waiting for network registration; CONNECTED: fully operational, ready for data; ERROR: unrecoverable fault, requires power cycle"
-}
-
-Union (type-punning — two views of the same memory):
-{
-  "summary": "Provides dual access to a firmware version number stored in flash. The raw 32-bit integer enables efficient storage and comparison, while the packed bit-field struct within the union lets code read individual major/minor/patch components without manual bit shifting. The 8 reserved bits allow future extension without changing the storage format.",
-  "inputs": "-",
-  "outputs": "As raw integer (_fw_bl_version_int): the full version as uint32_t for flash read/write and comparison. As bit fields: _major (8 bits), _minor (8 bits), _patch (8 bits), plus 8 reserved bits."
-}
-
-Union (grouping — organizing related types without memory overlap):
-{
-  "summary": "Groups related BLE command enums into a single namespace. This union does NOT share memory — each member is a standalone enum defining command codes for a different operational context. Dispatch handles courier delivery workflows, Pickup covers customer retrieval, and Service lists diagnostic and maintenance operations. The union keyword here serves purely as organizational grouping, not type-punning.",
-  "inputs": "-",
-  "outputs": "CmdsDispatch: courier workflow commands (slot open, state query, size change, cancel). CmdsPickup: customer pickup commands (slot open, state query). CmdsService: 22 diagnostic/maintenance commands including LOCKER_REBOOT, SDCARD_DELETE, GET_FW_VERSION, GET_NET_INFO, GET_SHUTDOWN_REASON, SERVICE_MODE_SET."
-}
-
-Variable:
-{
-  "summary": "Global debug verbosity level controlling log output across all subsystems. Set at boot from flash configuration by config_manager_load(). Read by log_write() in the logging subsystem to decide which messages to emit. A value of 0 means no debug output; higher values enable progressively more verbose logging.",
-  "inputs": "Written by config_manager_load() at boot and set_debug_level() via serial console. Belongs to the logging subsystem.",
-  "outputs": "Read by log_write() in the logging module. Changing this value affects runtime log verbosity — higher values produce more serial output, which can impact timing in real-time paths."
-}
-
-Output ONLY the JSON array. No markdown fences, no commentary.
+UNIONS: read the body first, and state the pattern in the summary.
+- Type-punning: a raw integer or array member and a struct (named or anonymous) of bit-fields over the same memory. The raw member serves storage or transfer, the bit-fields serve access to single bits.
+- Grouping: independent members (enums, structs, sub-types) in one namespace, without a raw member and bit-fields over the same memory.
 """
 
 

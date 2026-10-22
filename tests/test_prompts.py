@@ -100,3 +100,23 @@ class TestParseAnalysisResponse:
         batch = [{"id": 1}]
         result = parse_analysis_response(resp, batch)
         assert result is None
+
+
+class TestAnalysisPrompt:
+    """The prompt of the analysis: the task and a form of the answer, no example answer (decision 2026-10-22)."""
+
+    SYMBOL = {"id": 7, "name": "f", "qualified_name": "f", "kind": "function", "file_path": "a.c",
+              "signature": "int f(void)", "docstring": "", "body": "int f(void) { return 1; }"}
+
+    def test_the_prompt_gives_the_form_of_the_answer_and_no_example_answer(self):
+        """A model copies an example answer: each text field of the form is a placeholder only."""
+        import re
+
+        from fw_context_mcp.indexer.prompts import build_analysis_prompt
+
+        prompt = build_analysis_prompt([self.SYMBOL])
+
+        for field in ("summary", "inputs", "outputs"):
+            assert f'"{field}": "<' in prompt
+            assert not re.search(rf'"{field}": "[^<]', prompt), f"an example value of {field}"
+        assert "(id: 7)" in prompt
