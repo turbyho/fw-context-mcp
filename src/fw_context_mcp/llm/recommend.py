@@ -14,9 +14,9 @@ comes first, and the speed decides between models of the same quality.
 
 WHY these tolerances: the quality of a chat model is the blind grade 1-5
 of the benchmark of 2026-10-20, with a noise of about 0.2.  The quality of
-an embedding model is MRR@10 (0-1) of 748 queries, with a noise of about
-0.03 (the bootstrap interval of 4b against 8b: -0.009 to +0.028).  A
-difference in the noise is not a difference.  20 % of the speed: the
+an embedding model is MRR@10 (0-1) of 105 queries on one project, with a
+noise of about 0.05 (the bootstrap interval of 4b against 8b: -0.011 to
++0.064).  A difference in the noise is not a difference.  20 % of the speed: the
 measurements of one model differ by 2 to 3 %, and the user waits 20 %
 more without a loss that matters.
 
@@ -59,7 +59,7 @@ class Role:
 
 
 CHAT = Role("chat", "models", 0.2)
-EMBEDDING = Role("embedding", "embed_models", 0.03)
+EMBEDDING = Role("embedding", "embed_models", 0.05)
 
 #: The GPU memory that a model does not get for its weights: the KV cache
 #: of a context of 4096, the buffers of llama.cpp, and the desktop and the

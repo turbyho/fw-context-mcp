@@ -53,7 +53,8 @@ _FIELDS: dict[str, dict[str, str]] = {
                "price_source": "str", "enabled": "bool",
                "source": "str", "fingerprint": "str"},
     "embed_models": {"quality": "float", "quality_source": "str", "weights_gb": "float", "dimension": "int",
-                     "remote": "bool", "enabled": "bool", "source": "str", "fingerprint": "str"},
+                     "remote": "bool", "provider": "str", "usd_per_mtok": "float", "price_source": "str",
+                     "enabled": "bool", "source": "str", "fingerprint": "str"},
 }
 
 #: The keys that are not values of fw-context: the fingerprint leaves them
