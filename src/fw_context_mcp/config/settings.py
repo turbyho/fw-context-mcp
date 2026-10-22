@@ -400,9 +400,18 @@ class LLMConfig:
             defaults), or the only profile of the global config.
         provider: The kind of the backend of the profile: ``"ollama"`` or
             ``"openai_compatible"``.
-        embed_profile: The name of the Ollama profile of the embeddings.
+        embed_profile: The name of the profile of the embeddings: an Ollama
+            profile, or an API profile (``openrouter``, ``openai_compatible``).
             Empty: the selected profile when it is an Ollama one, else
             ``http://localhost:11434``.
+        embed_provider: The provider of the embeddings: ``"ollama"``, or the
+            provider of an API profile of ``embed_profile``.
+        embed_api_base: The URL of the embedding API (``embed_provider`` not
+            ``"ollama"``); ``POST <url>/embeddings``.
+        embed_api_key_env: The variable of the API key of the embeddings.
+        embed_routing: The provider routing of an OpenRouter embedding request.
+        embed_context: The tokens of one input of the embedding API model;
+            0: from the model list of the provider.
         enabled: Set False to disable all Ollama calls — tools return raw prompts
             for the agent to answer instead.
         ollama_url: Ollama API endpoint (must be a loopback address unless you
@@ -500,6 +509,13 @@ class LLMConfig:
     embed_profile: str = ""
     # The table routing of an OpenRouter profile (llm.providers).
     routing: dict = field(default_factory=dict)
+    # The embeddings through an API (embed_profile of provider openrouter
+    # or openai_compatible); "ollama" keeps them on ollama_url.
+    embed_provider: str = "ollama"
+    embed_api_base: str = ""
+    embed_api_key_env: str = ""
+    embed_routing: dict = field(default_factory=dict)
+    embed_context: int = 0
 
     def embed_key(self) -> str:
         """Return ``embed_model`` with description version for cache disambiguation.
@@ -508,6 +524,10 @@ class LLMConfig:
         yet resolved — ``resolve_embed_model`` fills the field at config load time).
         """
         model = self.embed_model or "auto"
+        if self.embed_provider != "ollama":
+            # The name of ApiEmbedder: the index run keys the vectors with it,
+            # and the search must ask for the same key.
+            model = f"{self.embed_provider}:{model}"
         return f"{model}:{DESCRIPTION_VERSION}"
 
 
@@ -548,7 +568,8 @@ def _apply_embed_prompt_defaults(llm_cfg: LLMConfig) -> None:
     sentence…", ``nomic-embed-text`` the task prefixes.  The wrong format
     costs much retrieval quality (measured 2026-10-21, see the constants).
     """
-    model_lower = llm_cfg.embed_model.lower()
+    # The name after a namespace: an API names a model "qwen/qwen3-embedding-8b".
+    model_lower = llm_cfg.embed_model.lower().rsplit("/", 1)[-1]
     if not model_lower:
         return
     if model_lower.startswith("qwen3-embedding") and llm_cfg.embed_query_prompt == _OLD_QWEN3_QUERY_PROMPT:
@@ -1011,8 +1032,9 @@ _PROVIDERS: tuple[str, ...] = ("ollama", "openai_compatible", "openrouter", "dee
 _PROFILE_FIELDS: dict[str, str] = {"provider": "str", "model": "str", "timeout": "float", "stream": "bool"}
 _PROFILE_PROVIDER_FIELDS: dict[str, dict[str, str]] = {
     "ollama": {"url": "str", "num_ctx": "int", "keep_alive": "str", "auto_pull": "bool", "max_concurrent": "int"},
-    "openai_compatible": {"url": "str", "api_key_env": "str"},
-    "openrouter": {"url": "str", "api_key_env": "str", "routing": "routing"},
+    "openai_compatible": {"url": "str", "api_key_env": "str", "embed_context": "int"},
+    "openrouter": {"url": "str", "api_key_env": "str", "routing": "routing", "embed_routing": "routing",
+                   "embed_context": "int"},
     "deepseek": {"url": "str", "api_key_env": "str"},
     "chatgpt": {},
 }
@@ -2156,39 +2178,81 @@ def _resolve_llm_profile(data: dict, llm: LLMConfig, selected_in: dict[str, Path
     embed_name = llm.embed_profile or (name if llm.provider == "ollama" else "")
     if embed_name:
         embed = profiles.get(embed_name)
-        if not isinstance(embed, dict) or embed.get("provider") != "ollama":
+        if not isinstance(embed, dict) or embed.get("provider") not in _EMBED_PROVIDERS:
             raise ConfigError(
                 selected_in.get("embed_profile", global_path),
-                f"[llm] embed_profile = {embed_name!r} must name a profile with provider \"ollama\" "
-                f"of the global config ({global_path}; profiles: {names})",
+                f"[llm] embed_profile = {embed_name!r} must name a profile with provider "
+                f"{', '.join(repr(p) for p in _EMBED_PROVIDERS)} of the global config ({global_path}; "
+                f"profiles: {names})",
             )
-        llm.ollama_url = embed.get("url", _DEFAULT_OLLAMA_URL)
-        # Only Ollama gets the embeddings: with a chat on an API, the
-        # tuning of the embeddings profile is the tuning that applies.
-        if llm.provider != "ollama":
-            _apply_ollama_tuning(llm, embed)
+        if embed["provider"] == "ollama":
+            llm.ollama_url = embed.get("url", _DEFAULT_OLLAMA_URL)
+            # Only Ollama gets the embeddings: with a chat on an API, the
+            # tuning of the embeddings profile is the tuning that applies.
+            if llm.provider != "ollama":
+                _apply_ollama_tuning(llm, embed)
+        else:
+            _apply_embed_api_profile(llm, embed_name, embed, selected_in.get("embed_profile", global_path))
+            # The chat of an Ollama profile keeps its server.
+            llm.ollama_url = chat_url if chat_url is not None else _DEFAULT_OLLAMA_URL
     else:
         llm.ollama_url = _DEFAULT_OLLAMA_URL
     if chat_url is not None and chat_url.rstrip("/") != llm.ollama_url.rstrip("/"):
         llm.chat_api_base, llm.chat_api_format = chat_url, "ollama"
 
 
+#: The providers whose profile can be the profile of the embeddings: Ollama,
+#: and the APIs with an OpenAI-compatible ``/embeddings`` endpoint.  DeepSeek
+#: and the ChatGPT plan have no such endpoint.
+_EMBED_PROVIDERS: tuple[str, ...] = ("ollama", "openrouter", "openai_compatible")
+
+
+def _apply_embed_api_profile(llm: LLMConfig, name: str, profile: dict, path: Path) -> None:
+    """Make the API profile *name* the server of the embeddings (``embed_profile``).
+
+    The model is ``[llm] embed_model``: the profile names the server and
+    the key, as an Ollama profile of the embeddings names the server.  WHY
+    an error without a model: the automatic model is an Ollama tag, and an
+    API does not serve it; a search would find nothing.
+
+    Raises:
+        ConfigError: ``embed_model`` is empty.
+    """
+    from ..llm.providers import provider_spec
+
+    if not llm.embed_model:
+        raise ConfigError(path, f"[llm] embed_profile = {name!r} is an API profile: [llm] embed_model must name "
+                                "the embedding model of that API (for example \"mistralai/codestral-embed-2505\")")
+    spec = provider_spec(profile["provider"])
+    llm.embed_provider = profile["provider"]
+    llm.embed_api_base = str(profile["url"] if "url" in profile else spec.base_url if spec else "")
+    # The key variable of the provider only for its own URL (as the chat).
+    own_url = spec is not None and llm.embed_api_base.rstrip("/") == spec.base_url.rstrip("/")
+    default_env = spec.key_env if spec is not None and own_url else ""
+    llm.embed_api_key_env = str(profile["api_key_env"]) if "api_key_env" in profile else default_env
+    llm.embed_routing = {**(spec.default_embed_routing if spec else {}), **(profile.get("embed_routing") or {})}
+    llm.embed_context = _convert(profile.get("embed_context", 0), "int")
+
+
 def _warn_external_llm(llm: LLMConfig) -> None:
     """Tell on stderr that the source code goes to a host that is not this machine.
 
     The chat goes to ``chat_api_base`` when it is set, else to
-    ``ollama_url``; the embeddings always go to ``ollama_url``.  WHY a
+    ``ollama_url``; the embeddings go to ``embed_api_base`` for an API
+    profile of the embeddings, else to ``ollama_url``.  One notice for
+    one host of the two.  WHY a
     notice and not an error: the user selected the profile, and that is
     the consent (decision of the user, 2026-10-20).
     """
-    for label, url in (("chat", llm.chat_api_base or llm.ollama_url), ("embeddings", llm.ollama_url)):
+    embeddings = llm.embed_api_base if llm.embed_provider != "ollama" else llm.ollama_url
+    for label, url in (("chat", llm.chat_api_base or llm.ollama_url), ("embeddings", embeddings)):
         if url and not _is_loopback_url(url):
             print(
                 f"ℹ The {label} of LLM profile {llm.profile or '(default)'!r} go to {url}: "
                 "source code snippets leave this machine.",
                 file=sys.stderr,
             )
-            if label == "chat" and url == llm.ollama_url:
+            if label == "chat" and url == embeddings:
                 break
 
 

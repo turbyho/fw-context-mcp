@@ -813,9 +813,18 @@ def check_ollama_chat_model(cfg) -> DepCheckResult:
 
 
 def check_ollama_embed_model(cfg) -> DepCheckResult:
-    """Verify the configured embedding model is installed."""
+    """Verify the configured embedding model is installed.
+
+    An API profile of the embeddings (``embed_provider``) has no model to
+    install: ``skipped``.  A request to the API would send text out and
+    cost money for each doctor run; the index run reports its errors.
+    """
     if not cfg.enabled:
         return DepCheckResult(name="embed-model", status="skipped", message="LLM disabled in config", critical=False)
+    if cfg.embed_provider != "ollama":
+        return DepCheckResult(name="embed-model", status="skipped", critical=False,
+                              message=f"embedding model '{cfg.embed_model}' runs on the API {cfg.embed_api_base} "
+                                      f"(profile {cfg.embed_profile!r}), not on Ollama")
 
     from ..llm._diag import check_setup
     from ..llm.ollama import ollama_pull_command

@@ -48,6 +48,9 @@ class ProviderSpec:
             profile does not set them.
         usage_in_request: The part of the request that asks for the usage
             and the cost in the answer.
+        default_embed_routing: The values of ``embed_routing`` that apply to
+            an embedding request when the profile does not set them.  Empty
+            for a provider without an embedding endpoint.
         recommended_model: The model that the setup offers first.  It
             comes from the measurement of 2026-10-20; the setup does not
             show the grades (decision of the user: an internal rating).
@@ -63,6 +66,7 @@ class ProviderSpec:
     default_routing: Mapping[str, object] = field(default_factory=dict)
     usage_in_request: Mapping[str, object] = field(default_factory=dict)
     recommended_model: str = ""
+    default_embed_routing: Mapping[str, object] = field(default_factory=dict)
 
     def request_fields(self, routing: Mapping[str, object] | None, *, low_reasoning: bool = False) -> dict[str, object]:
         """Return the fields that a chat request to this provider adds to the OpenAI payload."""
@@ -102,6 +106,10 @@ PROVIDERS: dict[str, ProviderSpec] = {
             default_routing={"sort": "price", "quantizations": list(OPENROUTER_DEFAULT_QUANTIZATIONS)},
             usage_in_request={"usage": {"include": True}},
             recommended_model="openai/gpt-6-luna",
+            # The embeddings send the code of each symbol and each search
+            # query: only hosts that keep no data (decision of the user,
+            # 2026-10-22).  A model without such a host gets HTTP 404.
+            default_embed_routing={"zdr": True, "data_collection": "deny"},
         ),
         ProviderSpec(
             name="deepseek",

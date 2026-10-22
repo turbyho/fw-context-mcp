@@ -1302,7 +1302,9 @@ def check_setup(cfg: LLMConfig) -> dict:
 
         Common keys: ``chat_api`` (dict), ``ollama_running`` (bool),
         ``installed_models`` (list, when Ollama is up), ``message`` (str),
-        ``compliance_warning`` (str, when chat_api_base is external).
+        ``compliance_warning`` (str, when chat_api_base is external),
+        ``embedding_compliance_warning`` (str, when the embeddings go to an
+        external API, ``embed_provider``).
     """
     from ..config.settings import _is_loopback_url
     from .embedder_factory import uses_ollama
@@ -1310,8 +1312,14 @@ def check_setup(cfg: LLMConfig) -> dict:
     ollama_embedding = uses_ollama(cfg)
     result: dict = {
         "suggest_cloud": False,
-        "embedding_backend": "ollama" if ollama_embedding else "local",
+        "embedding_backend": ("ollama" if ollama_embedding else "local") if cfg.embed_provider == "ollama"
+        else cfg.embed_provider,
     }
+    if cfg.embed_provider != "ollama" and not _is_loopback_url(cfg.embed_api_base):
+        result["embedding_compliance_warning"] = (
+            f"The embeddings go to an external API ({cfg.embed_api_base}). Source code snippets and each search "
+            "query WILL be sent to this endpoint. Ensure this complies with your organization's data security "
+            "policies.")
 
     # ── Chat API configuration info ──
     if cfg.chat_api_base:

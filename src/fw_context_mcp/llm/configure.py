@@ -105,7 +105,8 @@ def configure_llm_core(
         # embeddings send the symbol descriptions and bodies).
         hosts = {
             "chat": new_cfg.llm.chat_api_base or new_cfg.llm.ollama_url,
-            "embeddings": new_cfg.llm.ollama_url,
+            "embeddings": (new_cfg.llm.embed_api_base if new_cfg.llm.embed_provider != "ollama"
+                           else new_cfg.llm.ollama_url),
         }
         external = sorted({url for url in hosts.values() if url and not _is_loopback_url(url)})
         if new_cfg.llm.provider == "ollama":

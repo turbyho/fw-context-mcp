@@ -154,7 +154,7 @@ def test_load_does_not_look_for_the_api_key(home, monkeypatch):
 
 @pytest.mark.parametrize(("local", "message"), [
     ('[llm]\nprofile = "nope"\n', "'nope' is not a profile"),
-    ('[llm]\nembed_profile = "deepseek"\n', 'must name a profile with provider "ollama"'),
+    ('[llm]\nembed_profile = "deepseek"\n', "is an API profile: \\[llm\\] embed_model must name"),
 ])
 def test_a_selection_of_a_missing_or_wrong_profile_names_the_file(home, local, message):
     _write(_global(home), TWO_PROFILES)

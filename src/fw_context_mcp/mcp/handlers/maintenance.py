@@ -3799,10 +3799,13 @@ def check_ollama(
         configured one adds endpoint, format, and compliance_warning for an
         external host),
         configured_embed_model (str), embedding_installed (bool),
-        embedding_backend (str — "ollama", or "local" for a
+        embedding_backend (str — "ollama", "local" for a
         sentence-transformers or ``ft://`` model, which needs no Ollama:
         it counts as installed, and with chat on an external API a
-        stopped Ollama still gives "ok"),
+        stopped Ollama still gives "ok"; or the provider of an API profile
+        of the embeddings, "openrouter" or "openai_compatible"),
+        embedding_compliance_warning (str, when the embeddings go to an
+        external API: the code and each search query leave the machine),
         message (str, when status is not "ok"), model_details (list[dict]),
         suggest_cloud (bool), vec_available (bool),
         vec_error (str, optional), debug_log (str, optional — only when

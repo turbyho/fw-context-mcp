@@ -40,8 +40,11 @@ def uses_ollama(cfg: LLMConfig) -> bool:
     an empty ``embed_model`` auto-detects an Ollama model, ``ft://`` and the
     sentence-transformers prefixes run locally, and every other name is an
     Ollama tag.  A caller that needs the Ollama server for embedding only
-    asks for it when this is True.
+    asks for it when this is True.  An API profile of the embeddings
+    (``embed_provider``) is not Ollama.
     """
+    if cfg.embed_provider != "ollama":
+        return False
     model = cfg.embed_model.lower()
     return not (model.startswith("ft://") or model.startswith(_ST_PREFIXES))
 
@@ -69,6 +72,12 @@ def get_embedder(cfg: LLMConfig) -> Embedder:
     (e.g. ``mxbai-embed-large``, ``nomic-embed-text``).  This covers the
     common case without extra config.
     """
+    if cfg.embed_provider != "ollama":
+        # An API profile of the embeddings (embed_profile): the model is
+        # embed_model, and load refuses an empty one.
+        from .api_embedder import ApiEmbedder
+
+        return ApiEmbedder(cfg)
     from .auto_model import resolve_embed_model
 
     resolve_embed_model(cfg)  # empty → auto-detect, explicit → no-op
