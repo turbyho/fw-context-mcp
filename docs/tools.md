@@ -501,39 +501,33 @@ value of the build that the project config sets (the build system and its
 parameters), and for an LLM backend that a project file sets. Press Enter
 to keep the current value.
 
-**The LLM step.** The step tells where the LLM backend comes from, and
-then shows a menu. The backend keys are `enabled`, `profile`,
-`embed_profile` and `embed_model` of `[llm]`. The menu has these options:
+**The LLM step.** The step tells where the LLM backend comes from. When a
+project file sets it, the step asks `Change? [y/N]` first. Then it has two
+steps:
 
-- Option 1 (local Ollama) writes the chat model to the Ollama profile of
-  this machine (see
-  [One Ollama profile for each machine](configuration.md#one-ollama-profile-for-each-machine)).
-  `.fw-context/local.toml` selects the profile when it is not the global
-  default. The embedding model goes to the global config, or after a
-  "no" to `.fw-context/local.toml` of this project only.
-- Option 2 (LLM services) runs the setup of
-  [`fw-context llm setup`](#fw-context-llm-setup-list-test-default-remove-recommend):
-  the list of the services, their profiles, a test of each new profile,
-  and the profile of the project.
-- Option 3 sets `[llm] analyze_symbols = false` in
-  `.fw-context/local.toml`: the LLM analysis stops, and the embeddings
-  stay.
+1. **The services that you use.** The local Ollama is detected. An Ollama
+   on another computer and the cloud services (Ollama Cloud, the ChatGPT
+   plan, OpenRouter, DeepSeek, another OpenAI-compatible API) you select by
+   numbers; the step sets up each one (the model, the key or the sign-in)
+   and sends a test request. Enter sets up nothing.
+2. **The service of the LLM analysis, and the service of the
+   embeddings**: two lists of the services that are set up, the local
+   Ollama first. Each row shows the model with its quality, its speed on
+   this machine or its price, and ⚠ where the source code goes. The list
+   of the LLM analysis also has `d`: no LLM analysis (`[llm]
+   analyze_symbols = false`; the embeddings stay).
 
-Option 1 then sends a test request. When the test fails,
-`.fw-context/local.toml` and the global config get their old text back. See
-[How config works](configuration.md#how-config-works).
-
-Option 0 depends on the file that sets the backend:
-
-- Only the global config sets it: option 0 "Use the global settings" is
-  the default (Enter), and writes nothing.
-- `.fw-context/local.toml` sets it: the step asks `Change? [y/N]`. When
-  the global config also sets it, option 0 after `y` removes the `[llm]`
-  backend keys from `.fw-context/local.toml`, and the global settings
-  then apply. Enter keeps the keys.
-- `.fw-context/config.toml` sets it: the step asks `Change? [y/N]`, and
-  the menu has no option 0.
-- No file sets it: Enter skips the step.
+A profile that cannot run (no key, no sign-in) shows the command that
+repairs it, and you cannot select it.
+Enter keeps the current setting of a list. Option 0 (when
+`.fw-context/local.toml` sets the chat or the embeddings, and
+`.fw-context/config.toml` does not select the backend) removes those keys,
+and the global settings then apply. In a project, each choice then asks:
+this project only (`.fw-context/local.toml`), or each project (the global
+default). An Ollama profile of the chat is also the Ollama profile of this
+machine (see
+[One Ollama profile for each machine](configuration.md#one-ollama-profile-for-each-machine)).
+See [How config works](configuration.md#how-config-works).
 
 In non-interactive mode, the LLM step writes nothing. When only the global
 config sets the backend, the step prints the settings. When no file sets
@@ -917,7 +911,9 @@ without `config` does not repair the config files.
   `fw-context doctor` measures each installed model without a stored
   speed on the Ollama of this machine; `check_dependencies` only reads the
   stored speeds. Not critical, no fix: select the model with
-  `fw-context llm setup`.
+  `fw-context llm setup`. For each role that runs on Ollama, the message
+  also names the best cloud model of the list, with its price and the host
+  that gets the code.
 - `db-integrity` — `PRAGMA quick_check` of the index database. When it
   finds damage, the check runs `PRAGMA integrity_check`.
 - `obsolete-files` — the files, directories and config keys of an older
@@ -1067,8 +1063,9 @@ fw-context llm remove <profile>          # the profile, its own key, its ChatGPT
 fw-context llm recommend [--again]       # measure the local models, recommend a chat and an embedding model
 ```
 
-- `setup` asks questions, thus it needs a terminal. In a project it also
-  asks for the profile of the project.
+- `setup` asks questions, thus it needs a terminal. It has the two steps
+  of the LLM step of `fw-context init` (without a project, each choice is
+  the global default), then asks for the profiles to remove.
 - `list` marks the global default and the profile of the project, shows
   `⚠ <host>` for a profile that sends the source code to another host
   (also a cloud model of Ollama), and names the command for a profile
