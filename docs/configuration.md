@@ -29,13 +29,13 @@ Run `fw-context init` to create the project config files with commented-out defa
 
 The LLM step of `fw-context init` tells which file selects the LLM backend. The backend keys are `enabled`, `profile`, `embed_profile` and `embed_model` of `[llm]`. When a project file sets them, the step asks "Change? [y/N]" first. Then it has two steps:
 
-1. **The services that you use.** The step tells what the machine has: the local Ollama (detected), the GPU memory and the RAM. fw-context cannot detect an Ollama on another computer or a cloud service that you pay for, thus you select them: local Ollama, Ollama on another computer, Ollama Cloud (through the local Ollama), the ChatGPT plan, OpenRouter, DeepSeek, and another OpenAI-compatible API, by numbers separated by commas. A ✓ marks a service with a profile, and a ⚠ marks a service that sends the source code to another host. Enter sets up nothing. For each selected service, the step asks for the values: the model (with a recommendation), the API key (without an echo, into the key store; for OpenRouter and DeepSeek the key of the provider, `provider:<name>`), or the ChatGPT sign-in in the browser. It writes a profile to the global config, asks before it replaces a profile of the same name, and sends a request without code through it. When a profile does not answer and you do not keep it, the global config gets its earlier text back.
+1. **The services that you use.** The step tells what the machine has: the local Ollama (detected), the GPU memory and the RAM. fw-context cannot detect an Ollama on another computer or a cloud service that you pay for, thus you select them: local Ollama, Ollama on another computer, Ollama Cloud (through the local Ollama), the ChatGPT plan, OpenRouter, DeepSeek, and another OpenAI-compatible API, by numbers separated by commas. A ✓ marks a service with a profile, and a ⚠ marks a service that sends the source code to another host. Enter sets up nothing. For each selected service, the step asks for the values: the model (with a recommendation; for DeepSeek, OpenRouter and the ChatGPT plan, a model of the model list of the API, see [The context of an API model](#the-context-of-an-api-model)), the API key (without an echo, into the key store; for OpenRouter and DeepSeek the key of the provider, `provider:<name>`), or the ChatGPT sign-in in the browser. It writes a profile to the global config, asks before it replaces a profile of the same name, and sends a request without code through it. When a profile does not answer and you do not keep it, the global config gets its earlier text back.
 2. **The service of the LLM analysis, and the service of the embeddings.** Two independent lists of the services that are set up, the local Ollama first: the chat can run at one provider and the embeddings at another. On a machine without a GPU, or with little memory, a cloud service is the only way. Each row tells the model, its quality, its speed on this machine or its price, and where the source code goes (⚠). The list of the embeddings holds the services that make embeddings: Ollama, OpenRouter and another OpenAI-compatible API.
 
 ```
 Step 2 — the LLM analysis: where it runs (Enter: keep local):
   1. local: ollama gemma4:26b  3.73  6.3 s/symbol
-  2. deepseek: deepseek deepseek-v4-flash  ⚠ https://api.deepseek.com
+  2. deepseek: deepseek deepseek-flash  ⚠ https://api.deepseek.com
   3. openrouter: openrouter openai/gpt-6-luna  ⚠ https://openrouter.ai/api/v1
   d. no LLM analysis (the embeddings stay)
 
@@ -260,6 +260,7 @@ Each profile is one LLM backend. The name of a profile has only letters, digits,
 | `api_key_env` | *(none)*; `"OPENROUTER_API_KEY"` for OpenRouter, `"DEEPSEEK_API_KEY"` for DeepSeek, when the profile has no `url` of its own | each API | The **name** of the environment variable that holds the API key, for example `"DEEPSEEK_API_KEY"`. Never write the key itself into a config file. When the variable is not set, fw-context uses the stored key of the profile (see [API keys](#api-keys)). |
 | `routing` | `{ sort = "price", quantizations = ["int8", "fp8", "mxfp8", "fp16", "bf16", "fp32", "unknown"] }` | `openrouter` | The hosts of OpenRouter that get the request (the `provider` object of the OpenRouter API). `sort`: `"price"`, `"throughput"` or `"latency"`. `quantizations`: the precisions that a host can run, from `int4`, `int8`, `fp4`, `mxfp4`, `nvfp4`, `fp6`, `fp8`, `mxfp8`, `fp16`, `bf16`, `fp32` and `unknown`. `zdr`: `true` for hosts with zero data retention only. `data_collection`: `"deny"` for hosts that do not store or train on the data, or `"allow"`. A key of this table replaces the default of that key only. The default filter keeps out the precisions below 8 bits: measured on 2026-10-20, the `fp4` host of a DeepSeek model gave much weaker analyses than an `fp8` host. It keeps `unknown`, the value of the models of OpenAI. A model that only hosts below 8 bits run needs a filter with their precision, for example `quantizations = ["mxfp4"]`. |
 | `embed_routing` | `{ zdr = true, data_collection = "deny" }` | `openrouter` | The hosts of OpenRouter that get the embedding requests, with the keys of `routing`. The default sends the code and the search queries only to hosts with zero data retention; a model without such a host gets HTTP 404 (`voyageai/voyage-code-4` on 2026-10-22). A key of this table replaces the default of that key only. |
+| `context` | *(the model list of the API)* | `deepseek`, `openrouter`, `chatgpt`, `openai_compatible` | The context of the chat model in tokens, only for a model whose model list gives none: in practice an `openai_compatible` API. The model list of the API has priority, and `fw-context doctor` reports a different value. Without a context, the LLM analysis does not run, see [The context of an API model](#the-context-of-an-api-model). |
 | `embed_context` | *(the model list of OpenRouter)* | `openrouter`, `openai_compatible` | The tokens of one input of the embedding model of this API. OpenRouter names it in its model list; another API needs this key, else the embedding step stops with an error. fw-context guesses no value: it sets the chunks of a long body, thus a change embeds the long bodies again. |
 
 fw-context reads `timeout`, `stream`, `num_ctx`, `keep_alive`, `auto_pull` and `max_concurrent` from the selected profile. Thus these values also apply to the embeddings. When the selected profile is an `openai_compatible` profile, `keep_alive`, `auto_pull` and `max_concurrent` come from the profile of `embed_profile`, because only the embeddings use Ollama. Without `embed_profile`, these keys have their defaults.
@@ -285,7 +286,7 @@ model = "qwen2.5-coder:32b"
 
 [llm.profiles.deepseek]            # an external API
 provider = "deepseek"
-model = "deepseek-v4-flash"
+model = "deepseek-flash"
 ```
 
 ```toml
@@ -395,9 +396,25 @@ With an `ollama` profile, fw-context selects the context of the LLM analysis fro
 - **Manual run.** A manual run with a calibration does one measurement at the stored context. When the model is at most 15 % slower than in the calibration, the run uses that context: the wider margin keeps the noise of one measurement from starting a search. When it is slower, another program uses the memory now: the run searches a smaller context, and the calibration stays. When the lower limit is slower too, the log tells how many times slower the model is. When the model is more than 15 % faster than in the calibration, the run calibrates again.
 - **Background reindex and `reindex_file`.** These use the stored context without a measurement, because they usually analyse few symbols. Without a calibration, they use `num_ctx`.
 - **Memory.** A load that fails for memory (an out-of-memory error of Ollama, or "unable to load full model on GPU" for a model that is too large for the machine) is a context that does not fit. When the model does not load at the lower limit for memory, the run stops with an error, and a later run continues. The exception is a new calibration that a manual run starts because the model is clearly faster: the check just loaded the model at the stored context, thus the run uses that context. Another error is not a measurement, and the log gives it: in the search, the run uses the largest context that the search found; at the first measurement of a calibration, `num_ctx`; at the check of a manual run, the stored context. Ollama maps the weights of a model from its file: a model larger than the free RAM loads and runs slowly from the disk. The measurement shows that as a slow speed.
-- **No selection.** An API profile and a cloud model of Ollama (a model that `/api/tags` lists with `remote_host`) use `num_ctx`: their memory is not on this machine, and a measurement would send the reference request out.
+- **No selection.** A cloud model of Ollama (a model that `/api/tags` lists with `remote_host`) uses `num_ctx`: its memory is not on this machine, and a measurement would send the reference request out. An API profile and the ChatGPT plan use the context of the model, see below.
 
 The log of the run gives the selected context and the time of a typical symbol. A prompt that does not fit the selected context goes to the second pass, which has its own larger context.
+
+#### The context of an API model
+
+A prompt and the answer budget (1024 tokens) must fit the context of the model. Thus fw-context must know the context of each chat model, and guesses none. For an API profile and the ChatGPT plan, it reads the context from the model list of the provider at the start of each run of the LLM analysis. A process keeps a list that it read for 10 minutes:
+
+| Provider | Source |
+|---|---|
+| `deepseek` | `GET <url>/v1/models`, `context_window` |
+| `openrouter` | `GET <url>/models/<model>/endpoints`, the smallest `context_length`: the hosts of one model have different contexts, and the routing selects one. Without an endpoint context, `context_length` of `GET <url>/models` |
+| `chatgpt` | the model list of the plan, `context_window` |
+| `openai_compatible` | `GET <url>/models`, `context_window` or `context_length` when the API gives one; the OpenAI format gives none, thus set `context` in the profile |
+
+- **A model that the list does not hold** (an old name, or a name that the API takes as an alias) gives an error, and the run makes no analysis: select a model of the list with `fw-context llm setup`. For DeepSeek, OpenRouter and the ChatGPT plan, the setup offers only the models of the list. An `openai_compatible` profile with `context` is the exception: its name goes to the API as it is, also when the list does not hold it (llama-server lists the name of its model file).
+- **No context.** When neither the list nor the key `context` gives one, the run makes no analysis, and the log names the key to set. The setup asks for `context` only for a model whose list gives none. For another OpenAI-compatible API, an empty answer makes a profile for the embeddings only.
+- **Checks.** `fw-context llm test <profile>`, `fw-context doctor` (check `chat-model`) and the selection of a profile in the setup check the model and its context before the first analysis.
+- **A refusal.** The API checks the prompt and the answer budget against the context itself, and refuses a prompt that does not fit (HTTP 400). fw-context then marks the symbol `skip:toolarge:<context>`, without a retry. A later run with a model of a larger context analyses it again.
 
 #### API keys
 
@@ -436,6 +453,7 @@ provider = "openai_compatible"
 url = "https://api.openai.com/v1"
 model = "gpt-4.1"
 api_key_env = "OPENAI_API_KEY"
+context = 1047576                # the model list of OpenAI gives no context
 ```
 
 **Anthropic (through a proxy):**
@@ -450,6 +468,7 @@ provider = "openai_compatible"
 url = "http://localhost:4000/v1"
 model = "claude-sonnet-4-20250514"
 api_key_env = "LITELLM_API_KEY"
+context = 200000                 # the proxy gives no context of the model
 ```
 
 **DeepSeek:**
@@ -457,7 +476,7 @@ api_key_env = "LITELLM_API_KEY"
 ```toml
 [llm.profiles.deepseek]
 provider = "deepseek"            # the URL and the key variable have defaults
-model = "deepseek-v4-flash"
+model = "deepseek-flash"
 ```
 
 fw-context turns the thinking of the model off (`thinking: {type: disabled}`): the thinking costs output tokens, and did not make the analysis better.
@@ -505,8 +524,9 @@ provider = "openai_compatible"
 url = "http://localhost:4000/v1"
 api_key_env = "LITELLM_API_KEY"
 model = "openai/gpt-4o"       # LiteLLM model routing syntax
-# or: model = "deepseek/deepseek-v4-flash"
+# or: model = "deepseek/deepseek-flash"
 # or: model = "anthropic/claude-3-5-sonnet-20241022"
+context = 128000              # required: LiteLLM gives no context of the model
 ```
 
 **llama.cpp server:**
@@ -518,6 +538,7 @@ The server needs no key, thus the profile has no `api_key_env`.
 provider = "openai_compatible"
 url = "http://localhost:8080/v1"
 model = "qwen2.5-coder:14b"
+context = 32768                  # the context of the server (llama-server -c)
 ```
 
 To use one of these profiles in a project, set `[llm] profile = "<name>"` in `.fw-context/local.toml`. To use it in each project, set the key in the global config. When you use a reverse proxy, set `stream = true` in the profile, to prevent idle timeouts.
@@ -655,12 +676,10 @@ num_ctx = 16384
 # keep_alive = "10m"
 # timeout = 600.0
 
-# An OpenAI-compatible API (the source code goes to its host):
+# An API (the source code goes to its host):
 # [llm.profiles.deepseek]
-# provider = "openai_compatible"
-# url = "https://api.deepseek.com"
-# model = "deepseek-chat"
-# api_key_env = "DEEPSEEK_API_KEY"
+# provider = "deepseek"            # the URL and the key variable have defaults
+# model = "deepseek-flash"         # a name of the model list of DeepSeek
 ```
 
 ### Shared project config (`<project>/.fw-context/config.toml`)

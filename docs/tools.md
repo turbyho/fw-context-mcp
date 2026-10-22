@@ -909,7 +909,11 @@ without `config` does not repair the config files.
   fw-context, and keeps each entry that you changed or added.
 - `ollama` — the Ollama server answers. `skipped` when the LLM is off.
 - `chat-model` — the chat model is installed on the Ollama server of the
-  chat calls. `skipped` when an OpenAI-compatible API runs the chat model.
+  chat calls. For an API profile and the ChatGPT plan: the model list of
+  the provider holds the model, and the context of the model is known
+  (see [The context of an API model](configuration.md#the-context-of-an-api-model)).
+  `error` when not, with `fw-context llm setup`; `degraded` when the key
+  `context` of the profile differs from the list.
 - `embed-model` — the embedding model is installed on the Ollama server.
 - `llm-profile` — the project uses the Ollama profile of this machine and
   the global embedding model (see
@@ -962,8 +966,9 @@ asks, also when that server is on a different machine:
   selected profile when it is an Ollama profile, else
   `http://localhost:11434`.
 - The chat model: the `url` of the selected profile, when it is an Ollama
-  profile. When the selected profile is an `openai_compatible` profile,
-  that API runs the chat model, and the check `chat-model` is `skipped`.
+  profile. When the selected profile is an API profile, that API runs the
+  chat model, and the check `chat-model` checks the model list of the API
+  instead.
 
 The manual command sets `OLLAMA_HOST`, because the `ollama` CLI reads the
 server from it. It sets it also for the default server, because the
@@ -1066,7 +1071,7 @@ config; a project selects one. See
 ```bash
 fw-context llm setup                     # the setup of the LLM services
 fw-context llm list                      # each profile, its host, what it needs
-fw-context llm test <profile>            # a request without code
+fw-context llm test <profile>            # the model and its context, then a request without code
 fw-context llm default <profile>         # the profile of this project (local.toml)
 fw-context llm default <profile> --global  # the profile of each project that selects none
 fw-context llm default <profile> --ollama  # the Ollama profile of this machine
@@ -1081,6 +1086,10 @@ fw-context llm recommend [--again]       # measure the local models, recommend a
   `⚠ <host>` for a profile that sends the source code to another host
   (also a cloud model of Ollama), and names the command for a profile
   without a key or a sign-in.
+- `test` checks that the model list of the API holds the model of an API
+  or ChatGPT profile and gives its context (or that the profile sets
+  `context`), then sends a request without code. See
+  [The context of an API model](configuration.md#the-context-of-an-api-model).
 - `default` without `--global` writes `[llm] profile` to
   `.fw-context/local.toml` and sends a test request; a failed test puts
   the old file back. It refuses an Ollama profile that is not the Ollama
@@ -3303,7 +3312,10 @@ absent otherwise, never `null`:
 - `analysis_updated` and `embeddings_updated` — counts for the whole
   build, not only for this file.
 - `analysis_warning`, `overrides_warning`, `pagerank_warning`,
-  `embedding_warning` — a phase failed.
+  `embedding_warning` — a phase failed. `analysis_warning` also tells an
+  LLM analysis that is not complete: a symbol that the model did not
+  answer for, or an API model whose context is not known (see
+  [The context of an API model](configuration.md#the-context-of-an-api-model)).
 
 A file that is gone from disk but is still in the index has its records
 removed in each build that holds it. The result is then `{"file": …,
@@ -3505,7 +3517,7 @@ configuration with a simple API call.
 Input:  {"project_root?": "/path/to/project", "profile?": "deepseek",
          "embed_model?": "qwen3-embedding:0.6b"}
 Output: {"status": "ok", "profile": "deepseek", "provider": "openai_compatible",
-         "model": "deepseek-v4-flash", "test_latency_s": 1.2, …}
+         "model": "deepseek-flash", "test_latency_s": 1.2, …}
 ```
 
 `profile` must name a profile of the global config
