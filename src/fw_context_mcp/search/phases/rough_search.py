@@ -10,9 +10,9 @@ Why rough search before LLM query?
 Why embedding-first?
     When embeddings are available, semantic similarity finds conceptually
     relevant samples even when query words don't appear literally in symbol
-    names.  For "parcel locker", FTS5 would find zero samples (no symbol
-    contains "parcel" or "locker"), but embeddings find ``get_door_state``
-    and ``set_shipment`` — semantically related.  These samples teach the
+    names.  For "motor overcurrent protection", FTS5 would find zero samples
+    (no symbol contains "overcurrent"), but embeddings find
+    ``check_current_limit`` and ``pwm_emergency_stop`` — semantically related.  These samples teach the
     LLM the naming style of the correct subsystem.
 
 Why extract terms from sample names?
@@ -70,7 +70,7 @@ class RoughSearchPhase(Phase):
 
     Prefers embedding search when available — semantic similarity finds
     conceptually related symbols even when query words don't literally
-    appear in their names (e.g. "parcel locker" → get_door_state).
+    appear in their names (e.g. "motor overcurrent" → check_current_limit).
 
     Falls back to FTS5 word-pair + single-word search when embeddings
     or Ollama are unavailable.

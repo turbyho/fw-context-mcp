@@ -708,7 +708,7 @@ def _try_macro_fallback(
     return result
 # ── moved from server.py ──
 async def explain_symbol(
-    name: Annotated[str, Field(description="Symbol name to explain. E.g. 'uart_init', 'ModemMsg::send'.", min_length=1)],
+    name: Annotated[str, Field(description="Symbol name to explain. E.g. 'uart_init', 'Modem::send'.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     context_lines: Annotated[int, Field(description="Lines of source context around the symbol definition (1-200).", ge=0)] = 40,
     variant: Annotated[str | None, Field(description=VARIANT_DESCRIPTION)] = None,
@@ -729,7 +729,7 @@ async def explain_symbol(
     ``get_symbol_context``.
 
     Args:
-        name: Symbol name to explain. E.g. ``uart_init``, ``ModemMsg::send``.
+        name: Symbol name to explain. E.g. ``uart_init``, ``Modem::send``.
         project_root: Project root directory. Auto-detected if omitted.
         context_lines: Lines of source context around the symbol definition
             (default 40, max 200). Only used when no pre-computed analysis exists.

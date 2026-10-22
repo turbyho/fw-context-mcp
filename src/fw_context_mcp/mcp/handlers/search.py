@@ -631,7 +631,7 @@ _SEMANTIC_DEFAULT_THRESHOLD = 0.60
 
 
 async def semantic_search(
-    query: Annotated[str, Field(description="Natural language description, 5-15 words. E.g. 'parcel locker state machine' or 'how does the modem connect?'.", min_length=1)],
+    query: Annotated[str, Field(description="Natural language description, 5-15 words. E.g. 'motor overcurrent protection' or 'how does the modem connect?'.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     threshold: Annotated[float, Field(description="Minimum cosine similarity (0.0-1.0). Default 0.60. Use 0.55 for exploratory, 0.50 for broad search.", ge=0.0, le=1.0)] = _SEMANTIC_DEFAULT_THRESHOLD,
     limit: Annotated[int, Field(description="Maximum results on one page (default 20). Held between 1 and 100.", ge=1)] = 20,
@@ -648,10 +648,11 @@ async def semantic_search(
 
     **When to prefer over search_code:** When you're describing a *concept*
     rather than searching for a known keyword.  Examples:
-    - ``"parcel locker state"`` finds door-state and shipment methods even
-      though "parcel" and "locker" don't appear in their names.
-    - ``"cell modem"`` finds ``_socket_t`` and ``ModemMsg*`` classes.
-    - ``"delivery box"`` finds ``set_shipment`` and ``get_zrtdata``.
+    - ``"motor overcurrent protection"`` finds the current-limit and the
+      PWM-shutdown functions even though "overcurrent" doesn't appear in
+      their names.
+    - ``"cell modem"`` finds the AT command parser and the ``Modem*`` classes.
+    - ``"data logging"`` finds ``log_write`` and the flash append functions.
     - ``"power consumption"`` finds ``get_load_power`` and INA260 class.
 
     **When to prefer search_code instead:** When you know the exact keyword

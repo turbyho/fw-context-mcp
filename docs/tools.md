@@ -1657,11 +1657,11 @@ are conceptually related to a natural-language query, even when the
 query words do not appear literally in the code.
 
 ```
-Input:  {"query": "parcel locker state machine", "project_root?": "/path/to/project", "threshold?": 0.60, "limit?": 20, "offset?": 0}
+Input:  {"query": "motor overcurrent protection", "project_root?": "/path/to/project", "threshold?": 0.60, "limit?": 20, "offset?": 0}
 Output: [{"total": 175, "offset": 0, "shown": 20, "more": true, "hint": "…offset=20…"},
-         {"name": "set_shipment", "qualified_name": "Locker::set_shipment",
-          "kind": "method", "file": "/path/src/locker.cpp", "line": 118,
-          "is_definition": true, "signature": "void set_shipment(int id)",
+         {"name": "check_current_limit", "qualified_name": "MotorDriver::check_current_limit",
+          "kind": "method", "file": "/path/src/motor.cpp", "line": 118,
+          "is_definition": true, "signature": "bool check_current_limit(int milliamps)",
           "docstring": "", "_method": "embedding", "_similarity": 0.8123}, …]
 ```
 
@@ -1801,13 +1801,13 @@ Input:  {"file_path": "src/net_msg.cpp", "project_root?": "/path/to/project", "s
 Output: {"file": "src/net_msg.cpp", "total_symbols": 426,
          "symbols": {
            "method": {"count": 45, "items": [
-             {"name": "_is_socket_ok", "qualified_name": "ModemMsg::_is_socket_ok",
+             {"name": "_is_socket_ok", "qualified_name": "Modem::_is_socket_ok",
               "line": 140, "end_line": 152}, …],
              "hint": "get_file_map('src/net_msg.cpp', kind='method', offset=30) reads the next page."},
            "varglobal": {"count": 3, "items": [
              {"name": "_buffer_msg", "qualified_name": "_buffer_msg", "line": 105}, …]},
            "constructor": {"count": 1, "items": [
-             {"name": "ModemMsg", "qualified_name": "ModemMsg::ModemMsg",
+             {"name": "Modem", "qualified_name": "Modem::Modem",
               "line": 130, "end_line": 138}]},
            "struct": {"count": 2, "items": [
              {"name": "buffer", "qualified_name": "buffer", "line": 3561, "end_line": 3570}, …]},
@@ -1839,7 +1839,7 @@ that kind, enum constants too:
 ```
 Input:  {"file_path": "src/net_msg.cpp", "kind": "method", "max_per_kind": 30, "offset": 30}
 Output: {"file": "src/net_msg.cpp", "kind": "method", "count": 45,
-         "items": [{"name": "send", "qualified_name": "ModemMsg::send",
+         "items": [{"name": "send", "qualified_name": "Modem::send",
                     "line": 410, "end_line": 432}, …],
          "page": {"total": 45, "offset": 30, "shown": 15, "more": false}}
 ```

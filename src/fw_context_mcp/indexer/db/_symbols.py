@@ -51,7 +51,7 @@ Token decomposition
 into lowercase tokens stored in the ``symbols.name_tokens`` column
 and the ``symbols_fts`` FTS5 index.  This is the mechanism that lets
 ``connect*`` match ``onConnectionComplete`` and ``modem*`` match
-``ModemMsgManager``.  Anonymous struct/enum/union markers and single-
+``ModemManager``.  Anonymous struct/enum/union markers and single-
 character noise tokens are stripped because they match thousands of
 irrelevant symbols.
 """
@@ -141,7 +141,7 @@ def split_tokens(name: str, qualified_name: str = "") -> str:
 
     Builds a searchable token graph in FTS5 where each camelCase component
     becomes an independent node, so ``connect*`` finds ``onConnectionComplete``,
-    ``modem*`` finds ``ModemMsgManager``, etc.
+    ``modem*`` finds ``ModemManager``, etc.
 
     Examples:
         onConnectionComplete       → "on connection complete"
