@@ -627,6 +627,17 @@ no current analysis. To make the analysis of each symbol again, without
 an index run, use `--force-llm`. It does what `fw-context index
 --force-llm` does to the analysis, and the two continue each other.
 
+The cache key of an analysis holds the code of the symbol, not the
+prompt. Thus after a release with a new prompt, the earlier analyses stay
+until `--force-llm`. Since 2026-10, the model also gets the definition of
+a global variable (the initializer and the comment of its line). Thus the
+next run analyses each global variable with a definition again one time,
+without `--force-llm`, and embeds it again, because its summary changes.
+A large firmware project can have 2000 or more global variables: on a paid
+LLM profile, that run costs more than a usual run. A global variable in a
+table that does not fit the context of the model gets no analysis
+(`skip:toolarge`), as a function of that size.
+
 ```bash
 fw-context analyze                        # analyze current project
 fw-context analyze --project /path        # specific project
