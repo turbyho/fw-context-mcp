@@ -41,6 +41,13 @@ def home(tmp_path: Path, monkeypatch) -> Path:
     # No key: gather then never asks a server for a model file, and never
     # measures (a test that installs a model of the list stays offline).
     monkeypatch.setattr(ollama, "calibration_key", lambda *args: None)
+    # The test request of a selection (configure_llm_core): no request leaves the test.
+    from fw_context_mcp.llm import client
+
+    monkeypatch.setattr(client, "call_llm", lambda prompt, cfg, **kwargs: "OK")
+    # A key of the operator would make a profile without a key ready.
+    for name in ("OPENROUTER_API_KEY", "DEEPSEEK_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
     root = tmp_path / "proj"
     (root / ".fw-context").mkdir(parents=True)
     (root / ".fw-context" / "config.toml").write_text("[project]\n", encoding="utf-8")
@@ -64,6 +71,11 @@ def _run(home: Path):
     from fw_context_mcp.config import load
 
     wizard.run_wizard(home, load(home))
+
+
+#: The answers of run_wizard after the services when the user keeps each
+#: setting: the list of the LLM analysis, the list of the embeddings, the removal.
+KEEP = ["", "", ""]
 
 
 # ── The memory of the machine ──
@@ -150,7 +162,7 @@ def test_the_chat_of_a_cloud_model_is_told_one_time(monkeypatch, capsys):
 
 
 def test_the_list_marks_the_services_with_a_profile_and_the_external_ones(home, monkeypatch, capsys):
-    _answers(monkeypatch, ["", "", ""])
+    _answers(monkeypatch, ["", *KEEP])
 
     _run(home)
 
@@ -162,7 +174,7 @@ def test_the_list_marks_the_services_with_a_profile_and_the_external_ones(home, 
 def test_a_service_of_the_registry_stores_the_key_of_its_provider_and_a_tested_profile(home, monkeypatch, capsys):
     tested: list[str] = []
     monkeypatch.setattr(wizard, "test_profile", lambda cfg, name: tested.append(name))
-    _answers(monkeypatch, ["6", "", ""], secret="sk-test-" + "key")
+    _answers(monkeypatch, ["6", *KEEP], secret="sk-test-" + "key")
 
     _run(home)
 
@@ -174,7 +186,7 @@ def test_a_service_of_the_registry_stores_the_key_of_its_provider_and_a_tested_p
 
 def test_a_profile_that_does_not_answer_is_removed_unless_the_user_keeps_it(home, monkeypatch, capsys):
     monkeypatch.setattr(wizard, "test_profile", lambda cfg, name: "HTTP 401")
-    _answers(monkeypatch, ["6", "", ""], secret="sk-x")
+    _answers(monkeypatch, ["6", *KEEP], secret="sk-x")
 
     _run(home)
 
@@ -185,7 +197,7 @@ def test_a_profile_that_does_not_answer_is_removed_unless_the_user_keeps_it(home
 def test_another_computer_offers_its_models(home, monkeypatch):
     monkeypatch.setattr(wizard, "test_profile", lambda cfg, name: None)
     monkeypatch.setattr(_diag, "installed_models", lambda url: ["big:30b"] if "gpu-box" in url else ["chat:1b"])
-    _answers(monkeypatch, ["2", "", ""], {"URL of the Ollama server (for example http://192.168.1.20:11434)":
+    _answers(monkeypatch, ["2", *KEEP], {"URL of the Ollama server (for example http://192.168.1.20:11434)":
                                           "http://gpu-box:11434"})
 
     _run(home)
@@ -196,7 +208,7 @@ def test_another_computer_offers_its_models(home, monkeypatch):
 def test_ollama_cloud_offers_the_cloud_models_of_the_local_server(home, monkeypatch):
     monkeypatch.setattr(wizard, "test_profile", lambda cfg, name: None)
     monkeypatch.setattr(_diag, "remote_hosts", lambda url: {"gpt-oss:20b-cloud": "https://ollama.com"})
-    _answers(monkeypatch, ["3", "", ""])
+    _answers(monkeypatch, ["3", *KEEP])
 
     _run(home)
 
@@ -207,7 +219,7 @@ def test_a_removal_asks_and_removes_the_own_key(home, monkeypatch):
     settings._GLOBAL_CONFIG_PATH.write_text(GLOBAL + '\n[llm.profiles.work]\nprovider = "openrouter"\nmodel = "m"\n',
                                             encoding="utf-8")
     secrets.set_api_key("work", "sk-work")
-    _answers(monkeypatch, ["", "work", ""], confirm=True)
+    _answers(monkeypatch, ["", "", "", "work"], confirm=True)
 
     _run(home)
 
@@ -216,7 +228,7 @@ def test_a_removal_asks_and_removes_the_own_key(home, monkeypatch):
 
 
 def test_the_global_default_cannot_be_removed(home, monkeypatch, capsys):
-    _answers(monkeypatch, ["", "local", ""], confirm=True)
+    _answers(monkeypatch, ["", "", "", "local"], confirm=True)
 
     _run(home)
 
@@ -224,24 +236,21 @@ def test_the_global_default_cannot_be_removed(home, monkeypatch, capsys):
     assert "select another profile first" in capsys.readouterr().out
 
 
-def test_the_project_offers_only_a_profile_that_can_run(home, monkeypatch, capsys):
-    """A profile of an API without a key is listed with the command that repairs it, not as a choice."""
+def test_the_list_names_the_command_that_repairs_a_profile(home, monkeypatch, capsys):
+    """A profile of an API without a key is listed with the command that repairs it."""
     settings._GLOBAL_CONFIG_PATH.write_text(GLOBAL + '\n[llm.profiles.or]\nprovider = "openrouter"\nmodel = "m"\n',
                                             encoding="utf-8")
-    _answers(monkeypatch, ["", "", "2"])
+    _answers(monkeypatch, ["", *KEEP])
 
     _run(home)
 
     out = capsys.readouterr().out
-    assert "(or: no API key: run 'fw-context llm key set or')" in out, out
-    assert "[skip] The profile of the project is not changed" in out, out
+    assert "or: openrouter m  ⚠ https://openrouter.ai/api/v1  (no API key: run 'fw-context llm key set or')" in out, out
 
 
 def test_the_project_selects_a_profile(home, monkeypatch, capsys):
-    from fw_context_mcp.llm import client
-
-    monkeypatch.setattr(client, "call_llm", lambda prompt, cfg, **kwargs: "OK")
-    _answers(monkeypatch, ["", "", "1"])
+    # The LLM analysis: profile 1 (local) for this project (1); keep the embeddings, no removal.
+    _answers(monkeypatch, ["", "1", "1", "", ""])
 
     _run(home)
 
@@ -294,7 +303,7 @@ def test_the_local_service_does_not_take_a_profile_of_another_computer(home, mon
     monkeypatch.setattr(auto_model, "_gpu_available", lambda: False)
     monkeypatch.setattr(ollama, "check_setup", lambda cfg: {"status": "ok", "installed_models": []})
     monkeypatch.setattr(wizard, "test_profile", lambda cfg, name: None)
-    _answers(monkeypatch, ["1", "", ""])
+    _answers(monkeypatch, ["1", *KEEP])
     # Yes only to the question that makes "local" the Ollama profile of this machine: no pull.
     monkeypatch.setattr(ui, "_confirm", lambda question, **kwargs: "Ollama profile of each project" in question)
 
@@ -318,7 +327,7 @@ def test_the_local_service_stops_when_the_ollama_profile_of_another_computer_sta
     monkeypatch.setattr(auto_model, "_gpu_available", lambda: False)
     monkeypatch.setattr(ollama, "check_setup", lambda cfg: {"status": "ok", "installed_models": []})
     monkeypatch.setattr(wizard, "test_profile", lambda cfg, name: None)
-    _answers(monkeypatch, ["1", "", ""])
+    _answers(monkeypatch, ["1", *KEEP])
 
     wizard.run_wizard(home, load(home))
 
@@ -331,7 +340,7 @@ def test_a_failed_test_puts_back_the_profile_that_it_replaced(home, monkeypatch)
     settings._GLOBAL_CONFIG_PATH.write_text(GLOBAL + '\n[llm.profiles.deepseek]\nprovider = "deepseek"\n'
                                             'model = "old-model"\n', encoding="utf-8")
     monkeypatch.setattr(wizard, "test_profile", lambda cfg, name: "HTTP 500")
-    _answers(monkeypatch, ["6", "", ""], {"Model": "new-model"}, secret="sk-x")
+    _answers(monkeypatch, ["6", *KEEP], {"Model": "new-model"}, secret="sk-x")
     monkeypatch.setattr(ui, "_confirm", lambda question, **kwargs: "Replace" in question)
 
     _run(home)
@@ -349,7 +358,7 @@ def test_the_chatgpt_sign_in_belongs_to_the_name_that_the_user_selected(home, mo
     monkeypatch.setattr(chatgpt_plan, "login", lambda name, open_url: signed.append(name))
     monkeypatch.setattr(chatgpt_plan, "list_models", lambda name: [("gpt-6-luna", "GPT-6-Luna")])
     monkeypatch.setattr(wizard, "test_profile", lambda cfg, name: None)
-    _answers(monkeypatch, ["4", "", ""], {"Another profile name (empty: skip)": "chatgpt2"})
+    _answers(monkeypatch, ["4", *KEEP], {"Another profile name (empty: skip)": "chatgpt2"})
 
     _run(home)
 
@@ -367,7 +376,7 @@ def test_a_failed_chatgpt_profile_does_not_leave_a_sign_in(home, monkeypatch):
         client_id="c", host_id="h", access_token="a", refresh_token="r"))
     monkeypatch.setattr(chatgpt_plan, "logout", lambda name: logged_out.append(name) or True)
     monkeypatch.setattr(wizard, "test_profile", lambda cfg, name: "HTTP 401")
-    _answers(monkeypatch, ["4", "", ""])
+    _answers(monkeypatch, ["4", *KEEP])
 
     _run(home)
 
@@ -375,28 +384,36 @@ def test_a_failed_chatgpt_profile_does_not_leave_a_sign_in(home, monkeypatch):
 
 
 def test_a_removed_profile_of_the_project_is_not_kept(home, monkeypatch, capsys):
-    """Before, Enter said that the project keeps a profile that was gone: the next load stopped."""
-    (home / ".fw-context" / "local.toml").write_text('[llm]\nprofile = "gone"\n', encoding="utf-8")
-    _answers(monkeypatch, [""])
+    """Before, the project kept a profile that was gone: the next load stopped."""
+    from fw_context_mcp.config import load
 
-    wizard.select_project_profile(home, settings.Config())
+    settings._GLOBAL_CONFIG_PATH.write_text(GLOBAL + '\n[llm.profiles.work]\nprovider = "deepseek"\nmodel = "m"\n',
+                                            encoding="utf-8")
+    (home / ".fw-context" / "local.toml").write_text('[llm]\nprofile = "work"\n', encoding="utf-8")
+    # Keep each setting, then remove the profile that local.toml selects.
+    _answers(monkeypatch, ["", "", "", "work"], confirm=True)
 
-    out = capsys.readouterr().out
-    assert "selects profile 'gone', which the global config does not have" in out, out
-    assert "keeps profile" not in out
+    _run(home)
+
+    assert "work" not in _profiles()
     assert "profile" not in tomllib.loads((home / ".fw-context" / "local.toml").read_text(encoding="utf-8")).get(
-        "llm", {})
+        "llm", {}), capsys.readouterr().out
+    settings._config_cache.clear()
+    load(home)
 
 
 def test_the_global_default_is_not_offered_when_config_toml_selects_a_profile(home, monkeypatch, capsys):
+    """``local.toml`` can select another profile over config.toml, but cannot remove its selection."""
     (home / ".fw-context" / "config.toml").write_text('[project]\n\n[llm]\nprofile = "local"\n', encoding="utf-8")
-    _answers(monkeypatch, ["0"])
+    # Option 0 of the LLM analysis; then keep the embeddings, no removal.
+    _answers(monkeypatch, ["", "0", "", ""])
 
-    wizard.select_project_profile(home, settings.Config())
+    _run(home)
 
     out = capsys.readouterr().out
-    assert "not offered, .fw-context/config.toml selects 'local'" in out, out
-    assert "the global settings apply" not in out
+    assert "0. the global settings" not in out, out
+    assert "[skip] The LLM analysis is not changed" in out, out
+    assert not (home / ".fw-context" / "local.toml").exists()
 
 
 def test_a_key_that_a_header_cannot_hold_is_asked_again(home, monkeypatch):
@@ -437,13 +454,13 @@ def test_ctrl_c_stops_and_does_not_answer_the_default():
 
 
 def test_a_selected_profile_turns_the_analysis_on_again(home, monkeypatch, capsys):
-    from fw_context_mcp.llm import client
+    from fw_context_mcp.cli import _llm_lists
 
     (home / ".fw-context" / "local.toml").write_text("[llm]\nanalyze_symbols = false\n", encoding="utf-8")
-    monkeypatch.setattr(client, "call_llm", lambda prompt, cfg, **kwargs: "OK")
-    _answers(monkeypatch, ["1"])
+    # Profile 1 (local) for this project (1).
+    _answers(monkeypatch, ["1", "1"])
 
-    wizard.select_project_profile(home, settings.Config())
+    _llm_lists.choose_chat(home, settings.Config())
 
     local = tomllib.loads((home / ".fw-context" / "local.toml").read_text(encoding="utf-8"))["llm"]
     assert local.get("profile") == "local" and "analyze_symbols" not in local, local

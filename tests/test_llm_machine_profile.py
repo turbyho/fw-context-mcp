@@ -299,38 +299,65 @@ def test_the_recheck_after_the_fix_knows_the_check(home):
 # ── The local Ollama setup ──
 
 
-def _setup(monkeypatch, root: Path, answers: dict[str, bool], chat: str = "chat:14b", embed: str = "e:4b"):
-    """Run option 1 of init; *answers* maps a part of a question to the answer (else no)."""
-    from fw_context_mcp.cli import _init_interactive as ui
-    from fw_context_mcp.config import load
-    from fw_context_mcp.llm import auto_model, client, ollama
+def _setup(monkeypatch, root: Path, inputs: list[str], answers: dict[str, bool], chat: str = "chat:14b",
+           embed: str = "e:4b"):
+    """Run the LLM step of init with *inputs* for the lists; *answers* maps a part of a question to the answer (else no).
 
+    *inputs*: "Change?" (only when the project selects the backend), the
+    services (1: the local Ollama), the list of the LLM analysis and the
+    list of the embeddings, each with its question of the scope.
+    """
+    from fw_context_mcp.cli import _init_interactive as ui
+    from fw_context_mcp.cli import _llm_wizard
+    from fw_context_mcp.config import load
+    from fw_context_mcp.llm import auto_model, client, hardware, ollama
+
+    monkeypatch.setattr(_llm_wizard, "test_profile", lambda cfg, name: None)
+    # The test request of a selection for this project (configure_llm_core).
     monkeypatch.setattr(client, "call_llm", lambda prompt, cfg, **kwargs: "OK")
     monkeypatch.setattr(ollama, "check_setup", lambda cfg: {"status": "ok", "ollama_running": True,
                                                             "installed_models": []})
     monkeypatch.setattr(ollama, "calibration_key", lambda *args: None)
     monkeypatch.setattr(_diag, "installed_models", lambda url: [])
+    monkeypatch.setattr(hardware, "machine_memory", lambda: hardware.Memory(gpu_mib=None, ram_mib=16 * 1024))
     monkeypatch.setattr(auto_model, "_gpu_available", lambda: False)
     monkeypatch.setattr(ui, "prompt_text", lambda label, default=None, **kwargs: {
         "Chat model": chat, "Embedding model": embed}.get(label, default))
     monkeypatch.setattr(ui, "_confirm", lambda question, **kwargs: next(
         (value for part, value in answers.items() if part in question), False))
-    ui._prompt_ollama_setup(root, load(root))
+    replies = iter(inputs)
+    monkeypatch.setattr(ui, "_input", lambda prompt: next(replies))
+    ui.prompt_llm_config(root, load(root), non_interactive=False)
 
 
-def test_the_setup_writes_the_embedding_model_to_the_global_config_on_a_yes(home, monkeypatch):
+@pytest.mark.parametrize("remove", [True, False], ids=["yes removes the own model", "no keeps it"])
+def test_the_setup_writes_the_embedding_model_to_the_global_config_for_each_project(home, monkeypatch, capsys,
+                                                                                   remove):
+    """Scope 2 writes the global default; the own model of local.toml goes only after a "yes".
+
+    WHY a question: the own model of local.toml wins over the new global
+    one, and a removal embeds each symbol again at the next index run.
+    """
     _global('[llm]\nprofile = "local"\nembed_model = "e:8b"\n' + LOCAL)
     _local(home, '[llm]\nembed_model = "e:8b"\n')
 
-    _setup(monkeypatch, home, {"for each project": True})
+    # Change, service 1, keep the LLM analysis, the embeddings of "local" (1) for each project (2).
+    _setup(monkeypatch, home, ["y", "1", "", "1", "2"], {"sets its own embedding model": remove})
 
-    assert _global_llm()["embed_model"] == "e:4b" and "embed_model" not in _local_llm(home)
+    assert (_global_llm()["embed_model"], _global_llm()["embed_profile"]) == ("e:4b", "local")
+    out = capsys.readouterr().out
+    if remove:
+        assert "embed_model" not in _local_llm(home), out
+    else:
+        assert _local_llm(home) == {"embed_model": "e:8b"}
+        assert "[note] .fw-context/local.toml of this project keeps its own embeddings" in out, out
 
 
 def test_the_setup_selects_the_ollama_profile_in_local_toml_when_the_global_default_is_external(home, monkeypatch):
     _global('[llm]\nprofile = "ds"\nembed_model = "e:4b"\n' + LOCAL + API)
 
-    _setup(monkeypatch, home, {})
+    # Service 1; the LLM analysis: "local" (row 1, before the external ds) for this project (1); keep the embeddings.
+    _setup(monkeypatch, home, ["1", "1", "1", ""], {})
 
     assert _local_llm(home)["profile"] == "local" and "embed_model" not in _local_llm(home)
 
@@ -429,7 +456,9 @@ def test_the_setup_selects_the_profile_when_config_toml_selects_another_one(home
     (home / ".fw-context" / "config.toml").write_text(
         '[project]\nid = "abc123"\n\n[llm]\nprofile = "ds"\nembed_model = "e:8b"\n', encoding="utf-8")
 
-    _setup(monkeypatch, home, {"for each project": True})
+    # Change; service 1; the LLM analysis "local" (row 1) for this project (1); the embeddings of
+    # "local" (row 1) for this project (1).
+    _setup(monkeypatch, home, ["y", "1", "1", "1", "1", "1"], {})
 
     assert _local_llm(home)["profile"] == "local"
     # config.toml sets another embedding model: only local.toml selects this one over it.
@@ -441,7 +470,8 @@ def test_the_setup_never_changes_a_profile_local_of_an_api(home, monkeypatch):
     _global('[llm]\nprofile = "local"\n\n[llm.profiles.local]\nprovider = "openai_compatible"\n'
             'url = "https://api.example.test/v1"\nmodel = "m"\napi_key_env = "K"\n')
 
-    _setup(monkeypatch, home, {})
+    # Service 1; the LLM analysis: "local-2" (row 1: the external "local" comes last) for this project (1).
+    _setup(monkeypatch, home, ["1", "1", "1", ""], {})
 
     profiles = _global_llm()["profiles"]
     assert profiles["local"]["api_key_env"] == "K" and profiles["local-2"]["provider"] == "ollama"
@@ -459,7 +489,8 @@ def test_a_failed_write_of_the_global_embedding_model_puts_the_global_config_bac
 
     monkeypatch.setattr(settings, "update_global_llm_key", _fail)
 
-    _setup(monkeypatch, home, {"for each project": True, "Change it": True}, chat="new:1b")
+    # No service; keep the LLM analysis; the embeddings of "local" (row 1) for each project (2).
+    _setup(monkeypatch, home, ["", "", "1", "2"], {})
 
     assert settings._GLOBAL_CONFIG_PATH.read_text(encoding="utf-8") == before
     assert "The global config is not changed: disk full" in capsys.readouterr().out
@@ -470,7 +501,8 @@ def test_the_setup_never_takes_a_profile_local_of_a_cloud_model(home, monkeypatc
     _global('[llm]\nprofile = "ds"\n\n[llm.profiles.local]\nprovider = "ollama"\nurl = "http://localhost:11434"\n'
             'model = "m:cloud"\n\n' + API)
 
-    _setup(monkeypatch, home, {})
+    # Service 1; the LLM analysis: "local-2" (row 1: the cloud model and ds go out) for this project (1).
+    _setup(monkeypatch, home, ["1", "1", "1", ""], {})
 
     profiles = _global_llm()["profiles"]
     assert profiles["local"]["model"] == "m:cloud" and profiles["local-2"]["model"] == "chat:14b"

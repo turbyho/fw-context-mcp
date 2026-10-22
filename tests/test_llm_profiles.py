@@ -602,9 +602,23 @@ def test_a_valid_config_toml_gets_no_commented_line(home):
 
 
 def _no_test_call(monkeypatch):
+    from fw_context_mcp.cli import _llm_wizard
     from fw_context_mcp.llm import configure
 
     monkeypatch.setattr(configure, "configure_llm_core", lambda *a, **k: {"status": "ok"})
+    monkeypatch.setattr(_llm_wizard, "test_profile", lambda cfg, name: None)
+
+
+def _set_up_local_ollama(monkeypatch, root: Path) -> None:
+    """Run step 1 of the LLM setup with service 1 (the local Ollama); no request leaves the test."""
+    from fw_context_mcp.cli import _init_interactive, _llm_lists
+    from fw_context_mcp.llm import _diag, hardware
+
+    monkeypatch.setattr(_diag, "installed_models", lambda url: [])
+    monkeypatch.setattr(_diag, "remote_hosts", lambda url: {})
+    monkeypatch.setattr(hardware, "machine_memory", lambda: hardware.Memory(gpu_mib=None, ram_mib=16 * 1024))
+    monkeypatch.setattr(_init_interactive, "_input", lambda prompt: "1")
+    _llm_lists.setup_services(root, load(root))
 
 
 def test_the_cloud_setup_asks_before_it_replaces_a_profile(home, monkeypatch, capsys):
@@ -638,8 +652,9 @@ def test_a_no_to_the_shared_profile_keeps_its_model_and_makes_no_profile_of_the_
     monkeypatch.setattr(_init_interactive, "prompt_text",
                         lambda label, default=None, **kwargs: "new-chat:1b" if label == "Chat model" else default)
     monkeypatch.setattr(_init_interactive, "_confirm", lambda question, **kwargs: False)
+    monkeypatch.setattr(ollama, "calibration_key", lambda *args: None)
 
-    _init_interactive._prompt_ollama_setup(_project(home), load(_project(home)))
+    _set_up_local_ollama(monkeypatch, _project(home))
 
     profiles = settings.read_config_file(_global(home))["llm"]["profiles"]
     assert profiles["local"]["model"] == "qwen2.5-coder:14b"
@@ -658,8 +673,9 @@ def test_the_ollama_setup_leaves_an_old_profile_of_a_project_as_it_is(home, monk
     monkeypatch.setattr(_init_interactive, "prompt_text",
                         lambda label, default=None, **kwargs: "new-chat:1b" if label == "Chat model" else default)
     monkeypatch.setattr(_init_interactive, "_confirm", lambda question, **kwargs: False)
+    monkeypatch.setattr(ollama, "calibration_key", lambda *args: None)
 
-    _init_interactive._prompt_ollama_setup(_project(home), load(_project(home)))
+    _set_up_local_ollama(monkeypatch, _project(home))
 
     profiles = settings.read_config_file(_global(home))["llm"]["profiles"]
     assert profiles["local-proj"]["model"] == "other:1b"

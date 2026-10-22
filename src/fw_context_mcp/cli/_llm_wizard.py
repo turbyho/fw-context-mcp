@@ -1,4 +1,4 @@
-"""The setup of the LLM services: one code for ``fw-context init`` (option 2 of the LLM step) and ``fw-context llm setup``.
+"""The setup of the LLM services: one code for the LLM step of ``fw-context init`` and ``fw-context llm setup``.
 
 The profiles belong to the user (the global config); a project selects
 one.  Thus the setup:
@@ -15,23 +15,23 @@ one.  Thus the setup:
    now, not after an hour of indexing.  When the test fails and the user
    does not keep the profile, the global config gets its earlier text
    back, and a key or a sign-in that no profile uses any more goes.
-5. Removes the profiles that the user names, after a question each.
-6. In a project: selects the profile of the project (the background
-   reindex uses it), the global default, or no LLM analysis.
+5. Selects the service of the LLM analysis and the service and model of
+   the embeddings, from two independent lists (``cli._llm_lists``), for
+   this project or for each project.
+6. ``llm setup`` only: removes the profiles that the user names, after a
+   question each, and a selection of ``local.toml`` of a removed profile.
 
-No price and no grade is shown (decisions of the user, 2026-10-20): a
-price is not known without data, and the grades are an internal rating.
-The embedding model belongs to the project (option 1 of the LLM step of
-``init``), thus the setup does not ask for it.
+The lists show the grade and the price of each model of the model list
+(``[llm.models]``): a cloud service is a first-class choice (decision of
+the user, 2026-10-22), and the user compares it with the local models.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..llm.profile_state import cloud_hosts
 from . import _init_interactive as ui
 
 #: The prompt of a test request: no source code, a short answer.
@@ -76,21 +76,24 @@ def run_wizard(project_root: Path | None, cfg) -> None:
 
     _machine_report()
     try:
-        profiles = _profiles()
+        _profiles()
     except ConfigError as exc:
         print(f"  [warn] {exc}")
         return
-    cloud = cloud_hosts(profiles)
-    _print_services(profiles, cloud)
-    answer = ui._input("  Set up services: numbers, separated by commas (Enter: none) > ")
-    for service in _selected(answer):
-        before = _global_text()
-        name = _SETUPS[service.key](project_root, cfg, cloud.get(local_url().rstrip("/"), {}))
-        if name:
-            _test_new_profile(cfg, name, before)
+    from ._llm_lists import choose_chat, choose_embeddings, global_offers, setup_services
+
+    # Two steps (decision of the user, 2026-10-22): the services that the
+    # user uses, then the service of the analysis and of the embeddings;
+    # then the removal of profiles.
+    setup_services(project_root, cfg)
+    cfg = ui._reload(project_root, cfg)
+    chat_offer, embed_offer = global_offers(project_root)
+    choose_chat(project_root, cfg, offer_global=chat_offer)
+    cfg = ui._reload(project_root, cfg)
+    choose_embeddings(project_root, cfg, offer_global=embed_offer)
     _remove_profiles()
-    if project_root is not None and (project_root / ".fw-context").is_dir():
-        select_project_profile(project_root, cfg)
+    if project_root is not None:
+        _forget_removed_profiles(project_root)
 
 
 # ── The report and the list ──
@@ -130,7 +133,7 @@ def _profiles() -> dict[str, dict]:
     return {name: profile for name, profile in profiles.items() if isinstance(profile, dict)}
 
 
-def service_of(profile: dict, cloud: dict[str, dict[str, str]]) -> str:
+def service_of(profile: dict, cloud: Mapping[str, Mapping[str, str]]) -> str:
     """Return the key of the service of *profile* (``SERVICES``)."""
     from ..config.settings import _DEFAULT_OLLAMA_URL, _is_loopback_url
 
@@ -209,10 +212,10 @@ def _write_profile(name: str, values: dict[str, object], *, asked: bool = False)
 
 def _setup_local(project_root: Path | None, cfg, cloud: dict[str, str]) -> str | None:
     """Local Ollama: the recommended model (``llm.recommend``), a pull with consent, the profile."""
-    found = ui._local_ollama_profile(project_root, cfg, cloud=cloud, ask_embed=False)
+    found = ui._local_ollama_profile(project_root, cfg, cloud=cloud)
     if found is None:
         return None
-    name, values, _embed = found
+    name, values = found
     # asked: _local_ollama_profile asked before it changed the shared
     # profile; a new name would make a second Ollama profile.
     written = _write_profile(name, values, asked=True)
@@ -385,8 +388,10 @@ def _global_text() -> str | None:
         return None
 
 
-def _test_new_profile(cfg, name: str, before: str | None) -> None:
+def _test_new_profile(cfg, name: str, before: str | None) -> bool:
     """Test the new profile *name*; when it fails, put the global config of *before* back, unless the user keeps it.
+
+    Returns True when the profile stays: it answers, or the user keeps it.
 
     WHY the earlier text and not a removal: a profile that replaced
     another one would be gone with the earlier values, and each project
@@ -398,22 +403,23 @@ def _test_new_profile(cfg, name: str, before: str | None) -> None:
     problem = test_profile(cfg, name)
     if problem is None:
         print(f"  [ok] Profile {name!r} answers")
-        return
+        return True
     print(f"  [warn] Profile {name!r} does not answer: {problem}")
     if ui._confirm(f"Keep the profile {name!r} anyway?", default=False):
-        return
+        return True
     if before is None:
         print(f"  [warn] The earlier global config cannot be put back: remove the profile with "
               f"'fw-context llm remove {name}'")
-        return
+        return False
     try:
         _atomic_write(settings._GLOBAL_CONFIG_PATH.resolve(), before)
     except OSError as exc:
         print(f"  [warn] The earlier global config cannot be written back ({exc}): remove the profile with "
               f"'fw-context llm remove {name}'")
-        return
+        return False
     print(f"  [ok] The global config has its earlier text: profile {name!r} is not changed")
     _drop_unused_secrets(name)
+    return False
 
 
 def _drop_unused_secrets(name: str) -> None:
@@ -460,6 +466,39 @@ def _remove_profiles() -> None:
             remove_profile_and_secrets(name)
 
 
+def _forget_removed_profiles(project_root: Path) -> None:
+    """Remove a selection of ``local.toml`` that names a profile that is gone: else the next load stops.
+
+    The global default then applies.  A selection of ``config.toml`` (in
+    git) is only named: init writes only ``local.toml``.
+    """
+    from ..config import settings
+
+    profiles = _profiles()
+    for file_name in ("local.toml", "config.toml"):
+        path = project_root / ".fw-context" / file_name
+        try:
+            llm = (settings.read_config_file(path).get("llm") or {}) if path.is_file() else {}
+        except settings.ConfigError:
+            continue
+        gone = [key for key in ("profile", "embed_profile") if isinstance(llm.get(key), str) and llm[key]
+                and llm[key] not in profiles]
+        if not gone:
+            continue
+        if file_name == "config.toml":
+            print(f"  [warn] .fw-context/config.toml selects {', '.join(repr(llm[k]) for k in gone)}, which the "
+                  "global config does not have: change the file")
+            continue
+        from ._llm_lists import _write_local
+
+        # The model goes with its profile: else the model of the removed
+        # API goes to the Ollama of the global settings.
+        clear = gone + (["embed_model"] if "embed_profile" in gone and "embed_model" in llm else [])
+        if _write_local(project_root, {}, clear):
+            print(f"  [ok] .fw-context/local.toml selected {', '.join(repr(llm[k]) for k in gone)}, which is "
+                  "removed: the global settings apply")
+
+
 def remove_profile_and_secrets(name: str) -> bool:
     """Remove the profile *name*, its own stored key, and the sign-in of a ChatGPT profile; return True when removed.
 
@@ -479,106 +518,12 @@ def remove_profile_and_secrets(name: str) -> bool:
     return True
 
 
-def _project_selection(project_root: Path) -> tuple[str, str]:
-    """Return the profile that the project files select, and the file (``project`` or ``local``); ("", "") for none.
-
-    Read from the files, not from the loaded config: a profile that the
-    setup removed is still in the config that was loaded before.
-    """
-    from ..config import settings
-
-    name, layer = "", ""
-    for label, file_name in (("project", "config.toml"), ("local", "local.toml")):
-        path = project_root / ".fw-context" / file_name
-        try:
-            llm = settings.read_config_file(path).get("llm") if path.is_file() else None
-        except settings.ConfigError:
-            continue
-        if isinstance(llm, dict) and isinstance(llm.get("profile"), str) and llm["profile"]:
-            name, layer = llm["profile"], label
-    return name, layer
-
-
-def select_project_profile(project_root: Path, cfg) -> None:
-    """Ask for the profile of the project: a profile, the global default, or no LLM analysis.
-
-    Only a profile that can run is offered (``profile_state``), and of the
-    Ollama profiles only the Ollama profile of this machine
-    (``project_choice_problem``).  Enter keeps the current selection.
-    When ``config.toml`` (in git) selects a profile, the global default is
-    not offered: ``local.toml`` can select another profile over it, but
-    cannot remove a selection of ``config.toml``.
-    """
-    from ..config import settings
-    from ..config.settings import ConfigError
-    from ..llm.profile_state import cloud_lists, known, profile_state, project_choice_problem, undecided
-
-    try:
-        profiles = _profiles()
-        llm = settings.read_config_file(settings._GLOBAL_CONFIG_PATH).get("llm") or {}
-    except ConfigError as exc:
-        print(f"  [warn] {exc}")
-        return
-    lists = cloud_lists(profiles)
-    cloud = known(lists)
-    states = [profile_state(name, profile, cloud=cloud) for name, profile in profiles.items()]
-    # Without a model list, a cloud model looks like a local one: no Ollama
-    # profile is offered then (undecided).
-    other_ollama = {state.name: "no model list of Ollama" if undecided(state.name, profiles, lists, machine_too=False)
-                    else "an Ollama profile, not the one of this machine"
-                    for state in states
-                    if undecided(state.name, profiles, lists, machine_too=False) is not None
-                    or project_choice_problem(state.name, llm, cloud) is not None}
-    ready = [state for state in states if state.problem is None and state.name not in other_ollama]
-    current, layer = _project_selection(project_root)
-    if current and current not in profiles:
-        print(f"  [warn] The project selects profile {current!r}, which the global config does not have")
-        current = "" if layer == "local" else current
-    print("  The LLM profile of this project (the background reindex uses it):")
-    if layer == "project":
-        print(f"    (0. the global default: not offered, .fw-context/config.toml selects {current!r})")
-    else:
-        print(f"    0. the global default{' — Enter' if not current else ''}")
-    for number, state in enumerate(ready, 1):
-        warning = f"  ⚠ {state.host}" if state.external else ""
-        mark = " — Enter" if state.name == current else ""
-        print(f"    {number}. {state.name}: {state.provider} {state.model}{warning}{mark}")
-    for state in states:
-        if state.problem is not None:
-            print(f"       ({state.name}: {state.problem})")
-        elif state.name in other_ollama:
-            print(f"       ({state.name}: {other_ollama[state.name]}: --llm {state.name} for one run)")
-    print("    d. no LLM analysis (the embeddings stay)")
-    answer = ui._input("  > ").strip().lower()
-    if answer == "d":
-        ui._disable_llm_analysis(project_root, cfg)
-        return
-    if layer != "project" and (answer == "0" or (answer == "" and not current)):
-        ui._use_global_llm(project_root, remove_local=layer == "local" or _has_local_llm(project_root),
-                           old_embed_model=cfg.llm.embed_model)
-        _analysis_on_again(project_root)
-        return
-    if answer == "":
-        print(f"  [ok] LLM: the project keeps profile {current!r}")
-        return
-    if not answer.isdigit() or not 1 <= int(answer) <= len(ready):
-        print("  [skip] The profile of the project is not changed")
-        return
-    _select(project_root, ready[int(answer) - 1].name)
-
-
-def _has_local_llm(project_root: Path) -> bool:
-    """Return True when ``local.toml`` sets a key of ``LLM_BACKEND_KEYS``."""
-    from ..config.settings import llm_key_sources
-
-    return "local" in llm_key_sources(project_root).values()
-
-
 def _analysis_on_again(project_root: Path) -> None:
-    """Remove ``analyze_symbols = false`` of ``local.toml``: a selected backend is a backend that analyses.
+    """Remove ``analyze_symbols = false`` and ``enabled = false`` of ``local.toml``: a selected backend analyses.
 
-    WHY: option "d" wrote it, and a later selection of a profile said
-    "[ok]" while the analysis stayed off.
+    WHY: option "d" writes ``analyze_symbols = false``, and an older
+    release wrote ``enabled = false``.  A later selection of a profile
+    said "[ok]" while the analysis stayed off.
     """
     from ..config import settings
 
@@ -587,24 +532,14 @@ def _analysis_on_again(project_root: Path) -> None:
         llm = settings.read_config_file(path).get("llm") if path.is_file() else None
     except settings.ConfigError:
         return
-    if not isinstance(llm, dict) or llm.get("analyze_symbols") is not False:
+    if not isinstance(llm, dict):
         return
-    try:
-        settings._update_local_toml(project_root, {}, clear_keys=["analyze_symbols"])
-    except (OSError, settings.ConfigError) as exc:
-        print(f"  [warn] analyze_symbols = false stays in .fw-context/local.toml ({exc})")
+    off = [key for key in ("analyze_symbols", "enabled") if llm.get(key) is False]
+    if not off:
         return
-    print("  [ok] LLM analysis on again (removed analyze_symbols = false from .fw-context/local.toml)")
+    from ._llm_lists import _write_local
 
+    if _write_local(project_root, {}, off):
+        print(f"  [ok] LLM analysis on again (removed {' and '.join(f'{key} = false' for key in off)} from "
+              ".fw-context/local.toml)")
 
-def _select(project_root: Path, name: str) -> None:
-    from ..llm.configure import configure_llm_core
-
-    result = configure_llm_core(project_root, {"enabled": True, "profile": name})
-    if result.get("status") != "ok":
-        print(f"  [warn] {result.get('message', 'the test of the profile failed')}")
-        return
-    print(f"  [ok] .fw-context/local.toml selects profile {name!r}")
-    if result.get("compliance_warning"):
-        print(f"  ⚠ {result['compliance_warning']}")
-    _analysis_on_again(project_root)

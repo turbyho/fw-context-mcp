@@ -72,8 +72,7 @@ def cmd_llm_list(args: argparse.Namespace) -> int:
     Exit codes: 0 = listed, 1 = a config file cannot be used.
     """
     from ..config.settings import ConfigError, llm_key_sources
-    from ..llm.profile_state import profile_state
-    from ._llm_wizard import cloud_hosts
+    from ..llm.profile_state import cloud_hosts, profile_state
 
     try:
         root, cfg = _project_and_config(args)

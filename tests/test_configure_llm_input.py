@@ -8,6 +8,8 @@
   config, and the profile writer refuses one that cannot be parsed.
 - ``fw-context init`` printed "[ok] Saved to .fw-context/local.toml" after
   an error, when ``configure_llm_core`` had put the old settings back.
+  Now the test of a new profile does it: after an error, the global config
+  gets its earlier text back, and no "[ok]" names the profile.
 """
 
 from __future__ import annotations
@@ -133,13 +135,17 @@ def test_a_key_after_a_last_line_without_a_newline_gets_its_own_line(tmp_path, t
     assert tomllib.loads(written)["llm"]["embed_model"] == "e", written
 
 
-def _no_ok_after_an_error(monkeypatch, capsys, root: Path, choice: str) -> str:
-    from fw_context_mcp.cli import _init_interactive
+def _no_ok_after_an_error(monkeypatch, capsys, root: Path, answers: list[str]) -> str:
+    from fw_context_mcp.cli import _init_interactive, _llm_wizard
     from fw_context_mcp.config import load
-    from fw_context_mcp.llm import auto_model, configure, ollama
+    from fw_context_mcp.llm import auto_model, hardware, ollama
 
-    monkeypatch.setattr(configure, "configure_llm_core", lambda *a, **k: {"status": "error", "message": "test failed"})
-    monkeypatch.setattr(_init_interactive, "_input", lambda prompt: choice)
+    # The test request of the new profile fails.
+    monkeypatch.setattr(_llm_wizard, "test_profile", lambda cfg, name: "test failed")
+    monkeypatch.setattr(hardware, "machine_memory", lambda: hardware.Memory(gpu_mib=None, ram_mib=16 * 1024))
+    monkeypatch.setattr(ollama, "calibration_key", lambda *args: None)
+    replies = iter(answers)
+    monkeypatch.setattr(_init_interactive, "_input", lambda prompt: next(replies))
     monkeypatch.setattr(_init_interactive, "prompt_text", lambda label, default=None, **kwargs: default or "m")
     monkeypatch.setattr(_init_interactive, "_confirm", lambda question, **kwargs: False)
     monkeypatch.setattr(auto_model, "_gpu_available", lambda: False)
@@ -154,10 +160,11 @@ def test_init_says_no_ok_after_an_error_of_the_ollama_setup(tmp_path, monkeypatc
     (root / ".git").mkdir()
     before = global_config.read_text(encoding="utf-8")
 
-    out = _no_ok_after_an_error(monkeypatch, capsys, root, "1")
+    # Service 1 (the local Ollama); then Enter keeps the LLM analysis and the embeddings.
+    out = _no_ok_after_an_error(monkeypatch, capsys, root, ["1", "", ""])
 
-    assert "[warn] test failed" in out, out
-    assert "[ok] LLM configured" not in out and "[ok] Saved" not in out, out
+    assert "[warn] Profile 'local' does not answer: test failed" in out, out
+    assert "[ok] Profile 'local' answers" not in out and "selects profile" not in out, out
     assert global_config.read_text(encoding="utf-8") == before
 
 

@@ -9,8 +9,6 @@ init`` and the Ollama checks of doctor ("check crashed").
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import httpx
 import pytest
 
@@ -132,19 +130,30 @@ def test_a_server_that_runs_gets_the_advice_to_correct_the_url(monkeypatch, chat
     assert "start Ollama" not in result["message"], result
 
 
-def test_init_says_ok_only_for_a_server_that_runs(monkeypatch, capsys):
+def test_init_says_ok_only_for_a_server_that_runs(tmp_path, monkeypatch, capsys):
     """`init` read only the status, and "ok" also comes for a setup that needs no Ollama."""
-    from fw_context_mcp.cli import _init_interactive
+    from fw_context_mcp.cli import _init_interactive, _llm_lists, _llm_wizard
+    from fw_context_mcp.config import settings
     from fw_context_mcp.config.settings import Config
-    from fw_context_mcp.llm import auto_model, ollama
+    from fw_context_mcp.llm import _diag, auto_model, hardware, ollama
 
+    # The setup writes a profile: into a global config of this test, not into the copy of the session.
+    monkeypatch.setattr(settings, "_GLOBAL_CONFIG_PATH", tmp_path / "config.toml")
+    monkeypatch.setenv("FW_CONTEXT_HOME", str(tmp_path))
+    settings._config_cache.clear()
     monkeypatch.setattr(ollama, "check_setup", lambda cfg: {"status": "ok", "ollama_running": False})
+    monkeypatch.setattr(ollama, "calibration_key", lambda *args: None)
+    monkeypatch.setattr(_diag, "installed_models", lambda url: None)
+    monkeypatch.setattr(_diag, "remote_hosts", lambda url: None)
+    monkeypatch.setattr(hardware, "machine_memory", lambda: hardware.Memory(gpu_mib=None, ram_mib=16 * 1024))
     monkeypatch.setattr(auto_model, "_gpu_available", lambda: False)
+    monkeypatch.setattr(_llm_wizard, "test_profile", lambda cfg, name: None)
     monkeypatch.setattr(_init_interactive, "prompt_text", lambda label, default=None, **kwargs: default)
     monkeypatch.setattr(_init_interactive, "_confirm", lambda question, **kwargs: False)
-    monkeypatch.setattr("fw_context_mcp.llm.configure.configure_llm_core", lambda *a, **k: {"status": "error", "message": "x"})
+    # Service 1: the local Ollama.
+    monkeypatch.setattr(_init_interactive, "_input", lambda prompt: "1")
 
-    _init_interactive._prompt_ollama_setup(Path("."), Config())
+    _llm_lists.setup_services(None, Config())
 
     out = capsys.readouterr().out
     assert "[ok] Ollama running" not in out and "[warn] Ollama cannot be used" in out, out
@@ -169,20 +178,30 @@ def test_an_http_error_of_a_server_is_the_case_of_a_proxy_page(monkeypatch, embe
         assert "correct the url of the Ollama profile" in result["message"], result
 
 
-def test_init_prints_the_message_of_an_error_with_a_running_server(monkeypatch, capsys):
+def test_init_prints_the_message_of_an_error_with_a_running_server(tmp_path, monkeypatch, capsys):
     """The Ollama server of chat_api_base gives no model list: `init` said only "[ok] Ollama running"."""
-    from fw_context_mcp.cli import _init_interactive
+    from fw_context_mcp.cli import _init_interactive, _llm_lists, _llm_wizard
+    from fw_context_mcp.config import settings
     from fw_context_mcp.config.settings import Config
-    from fw_context_mcp.llm import auto_model, ollama
+    from fw_context_mcp.llm import _diag, auto_model, hardware, ollama
 
+    monkeypatch.setattr(settings, "_GLOBAL_CONFIG_PATH", tmp_path / "config.toml")
+    monkeypatch.setenv("FW_CONTEXT_HOME", str(tmp_path))
+    settings._config_cache.clear()
     monkeypatch.setattr(ollama, "check_setup", lambda cfg: {
         "status": "error", "ollama_running": True, "installed_models": [], "message": "chat server gives no model list",
     })
+    monkeypatch.setattr(ollama, "calibration_key", lambda *args: None)
+    monkeypatch.setattr(_diag, "installed_models", lambda url: [])
+    monkeypatch.setattr(_diag, "remote_hosts", lambda url: {})
+    monkeypatch.setattr(hardware, "machine_memory", lambda: hardware.Memory(gpu_mib=None, ram_mib=16 * 1024))
     monkeypatch.setattr(auto_model, "_gpu_available", lambda: False)
+    monkeypatch.setattr(_llm_wizard, "test_profile", lambda cfg, name: None)
     monkeypatch.setattr(_init_interactive, "prompt_text", lambda label, default=None, **kwargs: default)
     monkeypatch.setattr(_init_interactive, "_confirm", lambda question, **kwargs: False)
-    monkeypatch.setattr("fw_context_mcp.llm.configure.configure_llm_core", lambda *a, **k: {"status": "error", "message": "x"})
+    # Service 1: the local Ollama.
+    monkeypatch.setattr(_init_interactive, "_input", lambda prompt: "1")
 
-    _init_interactive._prompt_ollama_setup(Path("."), Config())
+    _llm_lists.setup_services(None, Config())
 
     assert "[info] chat server gives no model list" in capsys.readouterr().out

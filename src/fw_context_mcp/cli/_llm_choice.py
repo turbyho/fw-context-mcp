@@ -95,8 +95,8 @@ def llm_for_run(args, cfg, *, background: bool, analyses: bool, count: str = "")
             cannot run.  The message names the profiles or the command.
     """
     from ..config.settings import ConfigError
-    from ..llm.profile_state import profile_state
-    from ._llm_wizard import _profiles, cloud_hosts
+    from ..llm.profile_state import cloud_hosts, profile_state
+    from ._llm_wizard import _profiles
 
     name = getattr(args, "llm", None) or ""
     if name and not analyses:

@@ -289,16 +289,15 @@ def prompt_llm_config(project_root: Path, cfg, *, non_interactive: bool) -> None
     (``config.toml`` or ``local.toml``), the global config, or nowhere.
 
     * The project selects the backend: a "Change? [y/N]" prompt, with the
-      file named.  On "y", the menu.
-    * Only the global config selects it: the menu, with option 0 "Use the
-      global settings" as the default (Enter), which writes nothing.
-    * Nothing selects it: the menu, and Enter skips the step.
+      file named.  On "y", the two lists.
+    * Else: the two lists (``cli._llm_lists``): where the LLM analysis runs,
+      and where the embeddings run (decision of the user, 2026-10-22).
+      Enter keeps the current setting of each.
 
-    In a project that selects the backend in ``local.toml`` and not in
-    ``config.toml``, option 0 removes the keys of ``LLM_BACKEND_KEYS``
-    from ``local.toml``, and the global settings then apply.  Enter keeps
-    the settings there: a removal must be a choice.  Option 0 is not given
-    when ``config.toml`` selects the backend: init writes only
+    In a project that selects the chat or the embeddings in ``local.toml``
+    and not in ``config.toml``, option 0 of a list removes those keys from
+    ``local.toml``, and the global settings then apply.  Option 0 is not
+    given when ``config.toml`` selects the backend: init writes only
     ``local.toml``, and a committed setting applies to each user.
 
     Non-interactive mode writes nothing.  It prints where the settings come
@@ -307,7 +306,6 @@ def prompt_llm_config(project_root: Path, cfg, *, non_interactive: bool) -> None
     layers = _llm_layers(project_root)
     project_layers = [layer for layer in layers if layer != "global"]
     from_global = "global" in layers
-    use_global_offered = from_global and "project" not in project_layers
 
     if non_interactive:
         if not project_layers and from_global:
@@ -327,36 +325,34 @@ def prompt_llm_config(project_root: Path, cfg, *, non_interactive: bool) -> None
         print(f"  LLM: {_llm_summary(cfg)} (from the global config)")
     else:
         print("  LLM: not configured")
-    print("  fw-context can use an LLM for symbol analysis and smart search.")
-    print("  How would you like to configure it?\n")
-    if use_global_offered and "local" in project_layers:
-        print("    0. Use the global settings (removes the [llm] backend keys of .fw-context/local.toml)")
-    elif use_global_offered:
-        print("    0. Use the global settings — Enter")
-    print("    1. Local Ollama (recommended for offline use)")
-    print("    2. LLM services: ChatGPT plan, OpenRouter, DeepSeek, Ollama Cloud, Ollama on another computer,")
-    print("       another OpenAI-compatible API (more profiles; the source code goes to their host)")
-    print("    3. Disable the LLM analysis (the embeddings stay)")
-    choice = _input("  > ")
+    print("  fw-context uses an LLM for the symbol analysis and smart search, and embeddings for the search")
+    print("  by meaning. Each runs on this machine, on another computer, or at a cloud service.")
+    from ._llm_lists import choose_chat, choose_embeddings, global_offers, setup_services
+    from ._llm_wizard import _machine_report
 
-    if use_global_offered and (choice == "0" or (choice == "" and not project_layers)):
-        _use_global_llm(
-            project_root, remove_local="local" in project_layers, old_embed_model=cfg.llm.embed_model,
-        )
-    elif choice == "1":
-        _prompt_ollama_setup(project_root, cfg)
-    elif choice == "2":
-        from ._llm_wizard import run_wizard
+    chat_offer, embed_offer = global_offers(project_root)
+    _machine_report()
+    setup_services(project_root, cfg)
+    cfg = _reload(project_root, cfg)
+    choose_chat(project_root, cfg, offer_global=chat_offer)
+    cfg = _reload(project_root, cfg)
+    choose_embeddings(project_root, cfg, offer_global=embed_offer)
 
-        run_wizard(project_root, cfg)
-    elif choice == "3":
-        _disable_llm_analysis(project_root, cfg)
-    else:
-        print("  [skip] LLM configuration skipped")
+
+def _reload(project_root: Path | None, cfg):
+    """Return the config of *project_root* after a change of the LLM setup; *cfg* when it cannot be loaded."""
+    from ..config import load, settings
+
+    settings._config_cache.clear()
+    try:
+        return load(project_root)
+    except settings.ConfigError as exc:
+        print(f"  [warn] {exc}")
+        return cfg
 
 
 def _disable_llm_analysis(project_root: Path, cfg) -> None:
-    """Turn off the LLM analysis of the project, and keep the embeddings (option 3 of the menu).
+    """Turn off the LLM analysis of the project, and keep the embeddings (option "d" of the chat list).
 
     Writes ``[llm] analyze_symbols = false`` to ``local.toml``.  WHY not
     ``enabled = false``, as before: that also turns off the embeddings and
@@ -377,221 +373,36 @@ def _disable_llm_analysis(project_root: Path, cfg) -> None:
         print("  [note] The LLM is off ([llm] enabled = false): the embeddings need enabled = true")
 
 
-def _use_global_llm(project_root: Path, *, remove_local: bool, old_embed_model: str) -> None:
-    """Let the global LLM settings apply to the project (option 0 of the menu).
-
-    *remove_local*: remove the keys of ``LLM_BACKEND_KEYS`` from
-    ``local.toml``.  Else nothing is written: no project file selects the
-    backend.  No test call: the global settings are the ones that the
-    other projects use, and ``fw-context doctor`` does the check.
-    *old_embed_model* is the model that applied before: a note tells the
-    user when the removal changes it.
-    """
-    from ..config.settings import LLM_BACKEND_KEYS, ConfigError, _update_local_toml, llm_key_sources
-
-    if not remove_local:
-        print("  [ok] LLM: the global settings apply")
-        return
-    from ..config import load
-
-    local = project_root / ".fw-context" / "local.toml"
-    try:
-        previous = local.read_bytes()
-        _update_local_toml(project_root, {}, clear_keys=list(LLM_BACKEND_KEYS))
-        # The editor finds only the line "[llm]".  For another form of the
-        # table (`[llm]  # note`, an inline table) it removed nothing, and
-        # the step said "[ok]".  Thus read the file again.
-        left = sorted(key for key, layer in llm_key_sources(project_root).items() if layer == "local")
-    except (ConfigError, OSError) as exc:
-        print(f"  [warn] .fw-context/local.toml cannot be changed ({exc}). Nothing was changed.")
-        return
-    if left:
-        try:
-            # Only when the editor removed a part: an unchanged file is
-            # not written again.  Atomic, as the edit itself.
-            if local.read_bytes() != previous:
-                from ..config._toml_editor import _atomic_write
-
-                _atomic_write(local.resolve(), previous.decode("utf-8"))
-        except OSError as exc:
-            print(
-                f"  [warn] init cannot remove {', '.join(left)} from .fw-context/local.toml, and cannot "
-                f"write its old text back ({exc}). Read the file before the next command."
-            )
-            return
-        print(
-            f"  [warn] init cannot remove {', '.join(left)} from .fw-context/local.toml: its [llm] table "
-            "has a form that init does not edit. Nothing was changed. Remove the keys yourself."
-        )
-        return
-    print("  [ok] LLM: removed the [llm] backend keys of .fw-context/local.toml — the global settings apply")
-    # A different model gives vectors of a different meaning, and often of
-    # a different dimension: the next index run embeds each definition
-    # again.  The user must know that before the run, not after it.
-    try:
-        new_embed_model = load(project_root).llm.embed_model
-    except ConfigError:
-        return
-    if old_embed_model and new_embed_model and new_embed_model != old_embed_model:
-        print(
-            f"  [note] The embedding model changes from {old_embed_model} to {new_embed_model}: "
-            "the next index run embeds each definition again"
-        )
-
-
-def _save_profile(project_root: Path, name: str, values: dict[str, object], updates: dict[str, object], *,
-                  clear_keys: list[str] | None = None, global_embed: str | None = None) -> bool:
-    """Write the profile *name*, select it for the project with *updates* and *clear_keys*, and do a test call.
-
-    *global_embed* is an embedding model for the global config: it is
-    written with the profile, and the restore after a failed test call
-    removes it too.
-
-    Returns True when the two files changed and the test call passed.
-    When the test call fails, the global config gets its earlier text
-    back.  WHY: ``configure_llm_core`` puts back only ``local.toml``.
-    Before, a profile that failed its test stayed in the global config,
-    and a profile of the same name that worked before was replaced by it.
-    """
-    from ..config import settings
-    from ..config._profiles import set_profile
-    from ..llm.configure import configure_llm_core
-
-    try:
-        global_path = settings._ensure_global_config()
-        previous = global_path.read_text(encoding="utf-8")
-    except (ValueError, OSError, settings.ConfigError) as e:
-        print(f"  [warn] The profile {name!r} is not written: {e}")
-        return False
-    try:
-        set_profile(name, values)
-        if global_embed is not None:
-            settings.update_global_llm_key("embed_model", global_embed)
-    except (ValueError, OSError, settings.ConfigError) as e:
-        print(f"  [warn] The global config is not changed: {e}")
-        _put_back(global_path, previous, name)
-        return False
-    res = configure_llm_core(project_root, updates, clear_keys=clear_keys)
-    # An error means that no new setting is saved: the core puts the old
-    # settings of local.toml back, or the write itself failed.  When the
-    # core cannot put the old settings back, its message says so.
-    if res.get("status") == "ok":
-        return True
-    print(f"  [warn] {res.get('message', 'LLM test call failed')}")
-    _put_back(global_path, previous, name)
-    return False
-
-
-def _put_back(global_path: Path, previous: str, name: str) -> None:
-    """Write the earlier text of the global config back; a failure names the profile that stays."""
-    from ..config._toml_editor import _atomic_write
-
-    try:
-        _atomic_write(global_path.resolve(), previous)
-    except OSError as e:
-        print(
-            f"  [warn] init cannot write the earlier text of {global_path} back ({e}): "
-            f"the profile {name!r} stays in it. Read the file before the next command."
-        )
-
-
-def _prompt_ollama_setup(project_root: Path, cfg) -> None:
-    """Option 1 of the menu: a local Ollama profile, selected for the project with its embedding model.
-
-    The values come from ``_local_ollama_profile``; ``_save_profile`` writes
-    the profile and tests it.  ``local.toml`` selects the profile only
-    when it is not the global default.  The embedding model is a global
-    default (decision of the user, 2026-10-21): the global config gets it,
-    and ``local.toml`` only when the user wants it for this project only.
-    """
-    from ..config import settings
-
-    found = _local_ollama_profile(project_root, cfg)
-    if found is None:
-        return
-    name, values, embed = found
-    try:
-        global_llm = settings.read_config_file(settings._GLOBAL_CONFIG_PATH).get("llm") or {}
-    except settings.ConfigError as e:
-        print(f"  [warn] {e}")
-        return
-    # A key that local.toml does not hold comes from the file below it:
-    # config.toml of the project, else the global config.  WHY: before,
-    # the key went when the global value was the same, and a config.toml
-    # that selects an external profile then sent the code out.
-    try:
-        committed = settings.read_config_file(project_root / ".fw-context" / "config.toml").get("llm") or {}
-    except settings.ConfigError as e:
-        print(f"  [warn] {e}")
-        return
-    updates: dict[str, object] = {"enabled": True}
-    clear = []
-    if (committed.get("profile") or global_llm.get("profile")) == name:
-        clear.append("profile")
-    else:
-        updates["profile"] = name
-    global_embed: str | None = None
-    committed_embed = committed.get("embed_model")
-    if embed == (committed_embed or global_llm.get("embed_model")):
-        clear.append("embed_model")
-    elif committed_embed:
-        # config.toml (in git) sets another model: only local.toml can
-        # select this one over it.
-        updates["embed_model"] = embed
-    elif _confirm(f"Use the embedding model {embed} for each project (the global config)? A project whose index "
-                  "holds another model embeds each symbol again at its next index run", default=True):
-        global_embed = embed
-        clear.append("embed_model")
-    else:
-        updates["embed_model"] = embed
-    if not _save_profile(project_root, name, values, updates, clear_keys=clear, global_embed=global_embed):
-        return
-    make_machine_profile(name)
-    print(f"  [ok] LLM configured: profile {name} (ollama + {values['model']}), embedding {embed}")
-    where = ".fw-context/local.toml selects it" if "profile" in updates else (
-        ".fw-context/config.toml selects it" if committed.get("profile") else "it is the global default")
-    print(f"  [ok] Profile saved to {settings._GLOBAL_CONFIG_PATH}; {where}")
-    if "embed_model" in updates:
-        print(f"  [note] The embedding model {embed} is of this project only (.fw-context/local.toml); the "
-              f"global config has {global_llm.get('embed_model') or 'none'}. 'fw-context doctor' reports the "
-              "difference")
-
-
 def _local_ollama_profile(
-    project_root: Path | None, cfg, *, cloud: dict[str, str] | None = None, ask_embed: bool = True,
-) -> tuple[str, dict[str, object], str] | None:
-    """Ask for the models of a local Ollama profile, pull them with consent; return (name, values, embedding model).
+    project_root: Path | None, cfg, *, cloud: dict[str, str] | None = None,
+) -> tuple[str, dict[str, object]] | None:
+    """Ask for the chat model of the local Ollama, pull it with consent; return (profile name, values).
 
-    The default of each prompt is the model that a config file sets now,
-    else the recommendation.  WHY: before, the defaults were always the
-    recommendation, thus Enter replaced a model of the global config, for
-    example a larger chat model, with the recommended one.  Not a model
-    that Ollama does not serve: the chat model of an API profile, or an
-    embedding model of sentence-transformers or ``ft://``.  The step would
-    offer to pull it from Ollama.
+    The default of the prompt is the model of the Ollama profile of this
+    machine, else the recommendation.  WHY: before, the default was always
+    the recommendation, thus Enter replaced a model of the global config,
+    for example a larger chat model, with the recommended one.  Not the
+    chat model of an API profile: Ollama does not serve it.
 
     The chat model goes to the Ollama profile of this machine
     (``_machine_profile_for``), never to a profile of one project.  Its
-    other keys stay; the caller writes it.  The recommended models come from the rule of two bands
-    (``llm.recommend``): the measured speed of each installed model of the
-    list, after a question, else an estimate from the memory of the
-    machine; the table shows each model.  *cloud* names the cloud models
-    of the local Ollama, which the list leaves out: they do not run on
-    this machine.  Without *ask_embed* the embedding model is not asked
-    (the setup of the LLM services: the embedding belongs to the project),
-    and the third value is "".
+    other keys stay; the caller writes it.  The recommended model comes
+    from the rule of two bands (``llm.recommend``): the measured speed of
+    each installed model of the list, after a question, else an estimate
+    from the memory of the machine; the table shows each model.  *cloud*
+    names the cloud models of the local Ollama, which the list leaves
+    out: they do not run on this machine.  The embedding model has its
+    own list (``cli._llm_lists.choose_embeddings``).
 
     Returns None when the user stops at the question about the Ollama
     profile of this machine (``_machine_profile_for``).
     """
-    from ..config.settings import _DEFAULT_OLLAMA_URL, _is_loopback_url, llm_key_sources
+    from ..config.settings import _DEFAULT_OLLAMA_URL, _is_loopback_url
     from ..llm.auto_model import _gpu_available
     from ..llm.chat_router import chat_ollama_server
-    from ..llm.embedder_factory import uses_ollama
     from ..llm.ollama import check_setup
 
     gpu = _gpu_available()
-    sources = llm_key_sources(project_root) if project_root is not None else {}
     chat_server = chat_ollama_server(cfg.llm) if cfg.llm.provider == "ollama" else None
     ollama_profile = (
         bool(cfg.llm.profile) and chat_server is not None and _is_loopback_url(chat_server)
@@ -600,47 +411,34 @@ def _local_ollama_profile(
     server = chat_server if ollama_profile and chat_server else _DEFAULT_OLLAMA_URL
 
     result = check_setup(cfg.llm)
-    status = result.get("status")
     # `ollama_running`, not the status: "ok" also comes for a setup that
     # needs no Ollama (chat on an API, local embeddings), and it then said
     # "Ollama running" for a server that does not run.
     if not result.get("ollama_running"):
-        print(f"  [warn] Ollama cannot be used: {result.get('message') or 'no Ollama server at ' + cfg.llm.ollama_url}")
+        print(f"  [warn] Ollama cannot be used: {result.get('message') or 'no Ollama server at ' + server}")
     else:
-        print(f"  [ok] Ollama running at {cfg.llm.ollama_url}")
+        print(f"  [ok] Ollama running at {server}")
         installed = [model for model in result.get("installed_models") or [] if model not in (cloud or {})]
         if installed:
             print(f"  Installed models: {', '.join(installed)}")
         # "error" with a running server: the Ollama server of chat_api_base
-        # gives no model list.  Its message also names a missing embedding
-        # model.
-        if status in ("model_missing", "error") and result.get("message"):
+        # gives no model list.  Its message also names a missing model.
+        if result.get("status") in ("model_missing", "error") and result.get("message"):
             print(f"  [info] {result['message']}")
 
     print(f"  Hardware: {'GPU detected' if gpu else 'CPU only (no GPU detected)'}")
     from ._recommend import table_lines
 
     chat_from_config = ollama_profile and bool(cfg.llm.model)
-    embed_from_config = "embed_model" in sources and cfg.llm.embed_model and uses_ollama(cfg.llm)
-    found = _recommendations(server, cfg.llm.ollama_url, ask_embed=ask_embed, keep_alive=cfg.llm.keep_alive,
+    found = _recommendations(server, server, ask_embed=False, keep_alive=cfg.llm.keep_alive,
                              timeout=cfg.llm.timeout)
     chat_recommended = found["chat"].model.tag if found["chat"].model else _FALLBACK_CHAT_MODEL
-    embed_recommended = (found["embedding"].model.tag if "embedding" in found and found["embedding"].model
-                         else _FALLBACK_EMBED_MODEL if gpu else _FALLBACK_CPU_EMBED_MODEL)
     chat_default = cfg.llm.model if chat_from_config else chat_recommended
-    embed_default = cfg.llm.embed_model if embed_from_config else embed_recommended
-    for name, recommendation in found.items():
-        current = (chat_default if chat_from_config else None) if name == "chat" else (
-            embed_default if embed_from_config else None)
-        print("\n".join(table_lines(recommendation, current)))
-    fallback = " (no recommendation: a small model that runs on each machine)"
-    print("  Recommended:")
-    print(f"    chat:      {chat_recommended}" + ("" if found["chat"].model else fallback))
-    if ask_embed:
-        print(f"    embedding: {embed_recommended}" + ("" if found["embedding"].model else fallback))
-    if (chat_default, embed_default if ask_embed else embed_recommended) != (chat_recommended, embed_recommended):
-        print(f"  Current config: chat {chat_default}" + (f", embedding {embed_default}" if ask_embed else "")
-              + " — Enter keeps them")
+    print("\n".join(table_lines(found["chat"], chat_default if chat_from_config else None)))
+    fallback = "" if found["chat"].model else " (no recommendation: a small model that runs on each machine)"
+    print(f"  Recommended: {chat_recommended}{fallback}")
+    if chat_default != chat_recommended:
+        print(f"  Current config: {chat_default} — Enter keeps it")
 
     chat = prompt_text("Chat model", default=chat_default) or chat_default
     found_profile = _machine_profile_for(server, chat)
@@ -648,19 +446,13 @@ def _local_ollama_profile(
         return None
     name, values = found_profile
     chat = str(values["model"])
-    embed = (prompt_text("Embedding model", default=embed_default) or embed_default) if ask_embed else ""
 
     from ..deps._fixes import _ollama_pull
 
-    # The chat model to the server of the profile, the embedding model to
-    # the server of the embeddings: the checks ask each one for its model.
     if _confirm(f"Pull {chat} now? (multi-GB)"):
         ok, msg = _ollama_pull(chat, server)
         print(f"  [{'ok' if ok else 'warn'}] {msg}")
-    if embed and _confirm(f"Pull {embed} now? (multi-GB)"):
-        ok, msg = _ollama_pull(embed, cfg.llm.ollama_url)
-        print(f"  [{'ok' if ok else 'warn'}] {msg}")
-    return name, values, embed
+    return name, values
 
 
 def _machine_profile_for(server: str, chat: str) -> tuple[str, dict[str, object]] | None:
@@ -779,20 +571,21 @@ _FALLBACK_CPU_EMBED_MODEL = "qwen3-embedding:0.6b"
 
 
 def _recommendations(chat_server: str, embed_server: str, *, ask_embed: bool, keep_alive: str,
-                     timeout: float) -> dict:
+                     timeout: float, ask_chat: bool = True) -> dict:
     """Return the recommendation of each role (``llm.recommend.gather``); measure the installed models after a question.
 
     WHY a question: each installed model of the list without a stored
     speed loads once (5 to 70 s each), and the setup of a machine with
     many models then takes minutes.  Without the measurement, the
     estimate from the memory of the machine applies to them too.
+    *ask_chat* False: the embeddings only (the list of the embeddings).
     """
     from ..config.settings import _is_loopback_url
     from ..llm.hardware import machine_memory
     from ..llm.recommend import CHAT, EMBEDDING, gather
 
     memory = machine_memory()
-    roles = [(CHAT, chat_server)] + ([(EMBEDDING, embed_server)] if ask_embed else [])
+    roles = ([(CHAT, chat_server)] if ask_chat else []) + ([(EMBEDDING, embed_server)] if ask_embed else [])
 
     def run(measure: bool) -> dict:
         return {role.name: gather(role, server, memory if _is_loopback_url(server) else None, measure=measure,
@@ -863,8 +656,12 @@ def _custom_api_profile() -> str | None:
     return name
 
 
-def _custom_api_values() -> tuple[str, dict[str, object]] | None:
+def _custom_api_values(*, model_prompt: str = "Model", model_default: str = "deepseek-chat",
+                       ) -> tuple[str, dict[str, object]] | None:
     """Ask for a profile of provider openai_compatible (name, URL, key, model); store its key; return (name, values).
+
+    *model_prompt* and *model_default*: the question of the model, for a
+    chat model or for an embedding model (the list of the embeddings).
 
     The profile never gets the API key: a key in a TOML file is a secret in
     plain text.  The profile gets the NAME of the environment variable of
@@ -887,7 +684,7 @@ def _custom_api_values() -> tuple[str, dict[str, object]] | None:
         print(f"  [warn] {url} is not a valid URL ({problem}). Cloud API setup skipped")
         return None
     key_env = prompt_text("Environment variable with the API key (empty: store the key in the keyring)") or ""
-    model = prompt_text("Model", default="deepseek-chat") or "deepseek-chat"
+    model = prompt_text(model_prompt, default=model_default) or model_default
 
     if not _is_loopback_url(url):
         print(f"  ⚠ Source code will be sent to {url}.")

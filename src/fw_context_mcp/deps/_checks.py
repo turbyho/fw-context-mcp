@@ -645,7 +645,7 @@ def check_llm_recommend(cfg, progress: Callable[[str], None] | None = None) -> D
     from ..llm.chat_router import chat_ollama_server
     from ..llm.embedder_factory import uses_ollama
     from ..llm.hardware import machine_memory
-    from ..llm.recommend import CHAT, EMBEDDING, gather, verdict
+    from ..llm.recommend import CHAT, EMBEDDING, cloud_alternative, gather, verdict
 
     roles = []
     try:
@@ -670,6 +670,12 @@ def check_llm_recommend(cfg, progress: Callable[[str], None] | None = None) -> D
         found, text = verdict(recommendation, model)
         better = better or found
         parts.append(f"{role.name}: {text}")
+    # A cloud service is always a choice too (decision of the user,
+    # 2026-10-22): the message names the best one; the status is of the
+    # local models only.
+    cloud = [f"{role.name} {text}" for role, _server, _model in roles if (text := cloud_alternative(role))]
+    if cloud:
+        parts.append("a cloud service is a choice too: " + ", ".join(cloud))
     if better:
         parts.append("select a model with: fw-context llm setup")
     return DepCheckResult(name="llm-recommend", status="degraded" if better else "ok", message="; ".join(parts),

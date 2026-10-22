@@ -445,3 +445,58 @@ def _verdict(recommendation: Recommendation, tag: str) -> tuple[bool, str]:
     if recommendation.measured_bands is not None and recommendation.measured_bands.holds(current):
         return False, f"{mine} is as good as the recommendation {pick}"
     return True, f"{pick} is better than {mine}"
+
+
+def remote_models(role: Role, provider: str | None = None) -> list[tuple[str, dict]]:
+    """Return the external models of *role* of the list (``remote = true``), the best quality first.
+
+    *provider*: only the embedding models of that API provider.  A cloud
+    service is a choice next to the local models (decision of the user,
+    2026-10-22): on a machine without a GPU it is the only way.  The rule
+    of two bands does not rank them with the local models: the code goes
+    out, and the user selects it.
+    """
+    entries, _note = list_entries(role)
+    found = [(tag, entry) for tag, entry in entries.items()
+             if entry.get("remote") is True and entry.get("enabled") is not False
+             and _number(entry.get("quality")) is not None
+             and (provider is None or entry.get("provider") == provider)]
+    return sorted(found, key=lambda item: -float(item[1]["quality"]))
+
+
+def price(entry: dict, role: Role) -> str:
+    """Return the price of an external model for a person: of a chat model with an off-peak price, the range.
+
+    WHY the range and not the lower price only: the off-peak price is
+    the price outside 12:00-18:00 UTC on weekdays, and a run in that
+    window pays the higher one.
+    """
+    if role is CHAT:
+        prices = sorted({float(entry[key]) for key in ("usd_per_1k_symbols", "usd_per_1k_symbols_off_peak")
+                         if _number(entry.get(key)) is not None})
+        if not prices:
+            return ""
+        shown = f"${prices[0]:.2f}" if len(prices) == 1 else f"${prices[0]:.2f}-{prices[-1]:.2f}"
+        return f"{shown}/1000 symbols"
+    value = _number(entry.get("usd_per_mtok"))
+    return f"${value:.2f}/Mtok" if value is not None else ""
+
+
+def cloud_alternative(role: Role) -> str:
+    """Return one sentence that names the best external model of *role*, its quality, price and host; "" for none."""
+    models = remote_models(role)
+    if not models:
+        return ""
+    from urllib.parse import urlparse
+
+    from .providers import provider_spec
+
+    tag, entry = models[0]
+    # The host that gets the code: a cloud chat model runs at ollama.com
+    # (through the local Ollama), an embedding model at its API provider.
+    spec = provider_spec(str(entry.get("provider") or ""))
+    api_host = urlparse(spec.base_url).hostname if spec is not None else None
+    host = "ollama.com" if role is CHAT else api_host or "an API"
+    cost = price(entry, role)
+    grade = f"{float(entry['quality']):.2f}" if role is CHAT else f"{float(entry['quality']):.3f}"
+    return f"{tag} ({grade}{', ' + cost if cost else ''}; the code goes to {host})"
