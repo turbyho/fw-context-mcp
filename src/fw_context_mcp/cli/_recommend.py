@@ -21,13 +21,17 @@ LOW_CHAT_QUALITY = 3.0
 NUMBER_OR_NAME = "  Give the number of a row, or the name of a model"
 
 
-def table_lines(recommendation: Recommendation, current: str | None = None, *, numbered: bool = False) -> list[str]:
+def table_lines(recommendation: Recommendation, current: str | None = None, *, numbered: bool = False,
+                notes: bool = True) -> list[str]:
     """Return the lines of the table of *recommendation*: the best quality first, the marks at the right.
 
     The marks: ``← recommended``; ``(estimate)`` when the speed is not
     measured on this machine; ``(current)`` for the model of the config.
     *numbered*: each row gets its number of ``table_tags``, for a question
     of the setup that takes a number (``_init_interactive.prompt_model``).
+    The caller prints ``NUMBER_OR_NAME`` after the rows it adds.  *notes*
+    False leaves out the ``[info]`` notes: a caller that adds rows prints
+    them after the whole numbered list, which they split before.
     """
     role = recommendation.role
     if role is CHAT:
@@ -42,9 +46,8 @@ def table_lines(recommendation: Recommendation, current: str | None = None, *, n
     for number, candidate in enumerate(_ordered(recommendation), 1):
         prefix = f"{number:>{width}}. " if numbered else ""
         lines.append("    " + prefix + _row(candidate, recommendation, candidate is current_candidate))
-    if numbered and recommendation.candidates:
-        lines.append(NUMBER_OR_NAME)
-    lines += [f"  [info] {note}" for note in recommendation.notes]
+    if notes:
+        lines += [f"  [info] {note}" for note in recommendation.notes]
     return lines
 
 

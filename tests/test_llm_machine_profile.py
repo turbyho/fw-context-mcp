@@ -300,7 +300,7 @@ def test_the_recheck_after_the_fix_knows_the_check(home):
 
 
 def _setup(monkeypatch, root: Path, inputs: list[str], answers: dict[str, bool], chat: str = "chat:14b",
-           embed: str = "e:4b"):
+           embed: str = "e:4b", installed: list[str] | dict[str, list[str]] | None = None):
     """Run the LLM step of init with *inputs* for the lists; *answers* maps a part of a question to the answer (else no).
 
     *inputs*: "Change?" (only when the project selects the backend), the
@@ -318,7 +318,10 @@ def _setup(monkeypatch, root: Path, inputs: list[str], answers: dict[str, bool],
     monkeypatch.setattr(ollama, "check_setup", lambda cfg: {"status": "ok", "ollama_running": True,
                                                             "installed_models": []})
     monkeypatch.setattr(ollama, "calibration_key", lambda *args: None)
-    monkeypatch.setattr(_diag, "installed_models", lambda url: [])
+    # *installed*: a dict of the models of each server, or the models of each server.
+    models = installed if isinstance(installed, dict) else None
+    monkeypatch.setattr(_diag, "installed_models",
+                        lambda url: list(models.get(url.rstrip("/"), [])) if models is not None else list(installed or []))
     monkeypatch.setattr(hardware, "machine_memory", lambda: hardware.Memory(gpu_mib=None, ram_mib=16 * 1024))
     monkeypatch.setattr(auto_model, "_gpu_available", lambda: False)
     monkeypatch.setattr(ui, "prompt_text", lambda label, default=None, **kwargs: {
@@ -525,3 +528,95 @@ def test_without_the_model_list_the_check_claims_nothing(home, monkeypatch):
     message = _check(home).message
 
     assert "gives no model list" in message and "uses the Ollama profile" not in message
+
+
+def test_the_installed_models_outside_the_list_are_rows_of_the_chat_list(home, monkeypatch, capsys):
+    """Request of the user, 2026-10-23: one line held each installed model; now each has a numbered row.
+
+    An embedding model of the list is no chat model: it is not a row.
+    """
+    _global('[llm]\nprofile = "local"\nembed_model = "e:8b"\n' + LOCAL)
+
+    # Service 1 (the local Ollama: the table), keep the lists.
+    _setup(monkeypatch, home, ["1", "", ""], {}, chat="zz-custom:7b",
+           installed=["zz-custom:7b", "qwen3-embedding:8b"])
+
+    out = capsys.readouterr().out
+    assert "Other installed models (not in the list of fw-context: no grade):" in out, out
+    assert ". zz-custom:7b\n" in out and ". qwen3-embedding:8b" not in out.split("Other installed models")[1], out
+    assert "Installed models:" not in out
+
+
+def _rows(out: str) -> dict[str, int]:
+    """Return the number of each numbered row of the chat list in *out*: model → number."""
+    import re
+
+    part = out.split("Chat models")[1].split("Give the number")[0]
+    return {match.group(2): int(match.group(1)) for match in re.finditer(r"^ +(\d+)\. (\S+)", part, re.M)}
+
+
+def test_a_number_selects_an_other_installed_model(home, monkeypatch, capsys):
+    """The rows below the table continue the numbers of the table."""
+    from fw_context_mcp.cli import _init_interactive as ui
+
+    _global('[llm]\nprofile = "local"\nembed_model = "e:8b"\n' + LOCAL)
+    asked: list[str] = []
+    numbers: dict[str, int] = {}
+
+    def _prompt_model(label, names, default=None):
+        numbers.update({name: number for number, name in enumerate(names, 1)})
+        asked.append(label)
+        return names[numbers["zz-custom:7b"] - 1] if label == "Chat model" else default
+
+    monkeypatch.setattr(ui, "prompt_model", _prompt_model)
+    _setup(monkeypatch, home, ["1", "", ""], {"is shared": True}, installed=["zz-custom:7b"])
+
+    out = capsys.readouterr().out
+    assert _rows(out)["zz-custom:7b"] == numbers["zz-custom:7b"], out
+    assert 'model = "zz-custom:7b"' in settings._GLOBAL_CONFIG_PATH.read_text(encoding="utf-8")
+
+
+def test_the_models_of_another_server_are_no_rows_of_the_local_ollama(home, monkeypatch, capsys):
+    """The review of 2026-10-23: check_setup read ollama_url (another computer), and its models were rows here."""
+    _global('[llm]\nprofile = "box"\nembed_model = "e:8b"\n'
+            '[llm.profiles.box]\nprovider = "ollama"\nurl = "http://gpu-box:11434"\nmodel = "big:30b"\n')
+
+    _setup(monkeypatch, home, ["1", "", ""], {}, chat="zz-local:7b",
+           installed={"http://localhost:11434": ["zz-local:7b"], "http://gpu-box:11434": ["zz-remote:70b"]})
+
+    out = capsys.readouterr().out
+    assert "zz-local:7b" in _rows(out) and "zz-remote:70b" not in out, out
+
+
+def test_a_model_of_the_list_is_no_other_row(home, monkeypatch, capsys):
+    """A list model that the table leaves out (enabled = false), and a tag without ":latest", are no other rows."""
+    from fw_context_mcp.llm import recommend
+
+    _global('[llm]\nprofile = "local"\nembed_model = "e:8b"\n' + LOCAL)
+    real = recommend.list_entries
+
+    def _entries(role):
+        entries, note = real(role)
+        extra = {"hidden:7b": {"quality": 3.5, "weights_gb": 4.0, "enabled": False},
+                 "plain": {"quality": 3.4, "weights_gb": 4.0, "enabled": False}}
+        return ({**entries, **extra} if role is recommend.CHAT else entries), note
+
+    monkeypatch.setattr(recommend, "list_entries", _entries)
+    _setup(monkeypatch, home, ["1", "", ""], {}, installed=["hidden:7b", "plain:latest", "zz-custom:7b"])
+
+    rows = _rows(capsys.readouterr().out)
+    assert "zz-custom:7b" in rows and "hidden:7b" not in rows and "plain:latest" not in rows, rows
+
+
+def test_an_empty_list_gives_no_hint_of_a_number(home, monkeypatch, capsys):
+    from fw_context_mcp.llm import recommend
+
+    _global('[llm]\nprofile = "local"\nembed_model = "e:8b"\n' + LOCAL)
+    real = recommend.list_entries
+    monkeypatch.setattr(recommend, "list_entries", lambda role: ({}, "") if role is recommend.CHAT else real(role))
+
+    _setup(monkeypatch, home, ["1", "", ""], {})
+
+    out = capsys.readouterr().out
+    chat_part = out.split("Chat models")[1].split("Chat model")[0]
+    assert "no model of the list" in chat_part and "Give the number" not in chat_part, out

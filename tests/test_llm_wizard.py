@@ -234,6 +234,18 @@ def test_a_removal_asks_and_removes_the_own_key(home, monkeypatch):
     assert secrets.stored_api_key("work") is None
 
 
+def test_the_profiles_to_remove_are_one_on_each_line_and_a_number_removes_one(home, monkeypatch, capsys):
+    """Request of the user, 2026-10-23: one choice on each line, and a number for each."""
+    settings._GLOBAL_CONFIG_PATH.write_text(GLOBAL + '\n[llm.profiles.work]\nprovider = "openrouter"\nmodel = "m"\n',
+                                            encoding="utf-8")
+    _answers(monkeypatch, ["", "", "", "2"], confirm=True)
+
+    _run(home)
+
+    assert "work" not in _profiles()
+    assert "  Profiles:\n    1. local\n    2. work\n" in capsys.readouterr().out
+
+
 def test_the_global_default_cannot_be_removed(home, monkeypatch, capsys):
     _answers(monkeypatch, ["", "", "", "local"], confirm=True)
 
@@ -713,3 +725,18 @@ def test_a_new_profile_for_the_embeddings_only_is_kept_without_a_context(home, m
     assert wizard._test_new_profile(cfg, "emb", before) is True
     assert "emb" in _profiles() and len(sent) == 1
     assert "[ok] Profile 'emb' answers" in capsys.readouterr().out
+
+
+def test_a_profile_named_twice_is_removed_one_time(home, monkeypatch, capsys):
+    """The review of 2026-10-23: "2, work" asked two times, and the second removal named a fault of the config."""
+    settings._GLOBAL_CONFIG_PATH.write_text(GLOBAL + '\n[llm.profiles.work]\nprovider = "openrouter"\nmodel = "m"\n',
+                                            encoding="utf-8")
+    questions: list[str] = []
+    _answers(monkeypatch, ["", "", "", "2, work"])
+    monkeypatch.setattr(ui, "_confirm", lambda question, **kwargs: questions.append(question) or True)
+
+    _run(home)
+
+    assert "work" not in _profiles()
+    assert sum("Remove the profile 'work'" in question for question in questions) == 1
+    assert "Correct the file" not in capsys.readouterr().out

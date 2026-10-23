@@ -443,7 +443,13 @@ def _local_ollama_profile(
     )
     server = chat_server if ollama_profile and chat_server else _DEFAULT_OLLAMA_URL
 
+    from ..llm._diag import installed_models
+
     result = check_setup(cfg.llm)
+    # The models of *server*, the server of this setup: check_setup reads
+    # ollama_url, which can be another computer (an Ollama profile of
+    # gpu-box), and a model of that list would be offered for a pull here.
+    installed = [model for model in installed_models(server) or [] if model not in (cloud or {})]
     # `ollama_running`, not the status: "ok" also comes for a setup that
     # needs no Ollama (chat on an API, local embeddings), and it then said
     # "Ollama running" for a server that does not run.
@@ -451,29 +457,47 @@ def _local_ollama_profile(
         print(f"  [warn] Ollama cannot be used: {result.get('message') or 'no Ollama server at ' + server}")
     else:
         print(f"  [ok] Ollama running at {server}")
-        installed = [model for model in result.get("installed_models") or [] if model not in (cloud or {})]
-        if installed:
-            print(f"  Installed models: {', '.join(installed)}")
         # "error" with a running server: the Ollama server of chat_api_base
         # gives no model list.  Its message also names a missing model.
         if result.get("status") in ("model_missing", "error") and result.get("message"):
             print(f"  [info] {result['message']}")
 
     print(f"  Hardware: {'GPU detected' if gpu else 'CPU only (no GPU detected)'}")
-    from ._recommend import table_lines, table_tags
+    from ..llm.ollama import _with_tag
+    from ..llm.recommend import CHAT, EMBEDDING, list_entries
+    from ._recommend import NUMBER_OR_NAME, table_lines, table_tags
 
     chat_from_config = ollama_profile and bool(cfg.llm.model)
     found = _recommendations(server, server, ask_embed=False, keep_alive=cfg.llm.keep_alive,
                              timeout=cfg.llm.timeout)
     chat_recommended = found["chat"].model.tag if found["chat"].model else _FALLBACK_CHAT_MODEL
     chat_default = cfg.llm.model if chat_from_config else chat_recommended
-    print("\n".join(table_lines(found["chat"], chat_default if chat_from_config else None, numbered=True)))
+    print("\n".join(table_lines(found["chat"], chat_default if chat_from_config else None, numbered=True,
+                                notes=False)))
+    names = table_tags(found["chat"])
+    # The installed models outside the list, one on each line and with the
+    # next numbers (request of the user, 2026-10-23: before, one line held
+    # each installed model).  Each model of the list stays out: a model that
+    # the table leaves out (enabled = false, a cloud model) is not offered,
+    # and an embedding model is no chat model.  The tags with ":latest", as
+    # the list compares them (``recommend.gather``).
+    listed = {_with_tag(tag) for role in (CHAT, EMBEDDING) for tag in list_entries(role)[0]}
+    others = sorted(model for model in installed if _with_tag(model) not in listed)
+    if others:
+        print("  Other installed models (not in the list of fw-context: no grade):")
+        for number, model in enumerate(others, len(names) + 1):
+            print(f"    {number}. {model}")
+        names += others
+    if names:
+        print(NUMBER_OR_NAME)
+    for note in found["chat"].notes:
+        print(f"  [info] {note}")
     fallback = "" if found["chat"].model else " (no recommendation: a small model that runs on each machine)"
     print(f"  Recommended: {chat_recommended}{fallback}")
     if chat_default != chat_recommended:
         print(f"  Current config: {chat_default} — Enter keeps it")
 
-    chat = prompt_model("Chat model", table_tags(found["chat"]), default=chat_default) or chat_default
+    chat = prompt_model("Chat model", names, default=chat_default) or chat_default
     found_profile = _machine_profile_for(server, chat)
     if found_profile is None:
         return None

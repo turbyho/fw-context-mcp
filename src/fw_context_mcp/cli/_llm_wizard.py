@@ -571,11 +571,24 @@ def _remove_profiles() -> None:
         return
     if not names:
         return
-    answer = ui._input(f"  Remove profiles ({', '.join(names)}): names, separated by commas (Enter: none) > ")
-    for name in [part.strip() for part in answer.split(",") if part.strip()]:
+    # One profile on each line, and a number for each (request of the
+    # user, 2026-10-23); a name works too, and an exact name wins over a
+    # number (a profile name can be only digits).
+    print("  Profiles:")
+    for number, name in enumerate(names, 1):
+        print(f"    {number}. {name}")
+    answer = ui._input("  Remove profiles: numbers or names, separated by commas (Enter: none) > ")
+    selected: list[str] = []
+    for part in [part.strip() for part in answer.split(",") if part.strip()]:
+        name = (names[int(part) - 1] if part not in names and part.isdigit() and 1 <= int(part) <= len(names)
+                else part)
         if name not in names:
-            print(f"  [warn] No profile {name!r}")
-            continue
+            print(f"  [warn] No profile {part!r}")
+        elif name not in selected:
+            # One question for each profile: "2, work" names one profile
+            # twice, and a second removal said that the config has a fault.
+            selected.append(name)
+    for name in selected:
         if ui._confirm(f"Remove the profile {name!r} (and its own key or sign-in)?", default=False):
             remove_profile_and_secrets(name)
 

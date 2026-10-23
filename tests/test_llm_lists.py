@@ -833,3 +833,14 @@ def test_a_profile_whose_context_is_not_known_is_no_choice(home, monkeypatch, ca
     assert home["selected"] == []
     assert settings._GLOBAL_CONFIG_PATH.read_text(encoding="utf-8") == before
     assert not (root / ".fw-context" / "local.toml").exists()
+
+
+@pytest.mark.parametrize(("answer", "scope"), [("", "project"), ("1", "project"), ("2", "global")])
+def test_the_scope_has_one_choice_on_each_line(home, monkeypatch, capsys, answer, scope):
+    """Request of the user, 2026-10-23: the two choices were on one line."""
+    _answers(monkeypatch, [answer])
+
+    assert _llm_lists._ask_scope(home["root"], "the profile 'ds'") == scope
+    out = capsys.readouterr().out
+    assert ("  Where does the profile 'ds' apply?\n    1. this project only (.fw-context/local.toml)\n"
+            "    2. each project (the global default)\n") in out

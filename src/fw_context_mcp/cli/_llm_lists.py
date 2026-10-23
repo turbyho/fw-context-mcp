@@ -111,8 +111,11 @@ def _ask_scope(project_root: Path | None, what: str) -> str:
     """Return ``"project"`` or ``"global"``: where the choice of *what* goes; without a project, global."""
     if not _in_project(project_root):
         return "global"
-    answer = ui._input(f"  Use it for this project only (1, .fw-context/local.toml) or for each project "
-                       f"(2, the global default) — {what}? [1] > ").strip()
+    # One choice on each line (request of the user, 2026-10-23).
+    print(f"  Where does {what} apply?")
+    print("    1. this project only (.fw-context/local.toml)")
+    print("    2. each project (the global default)")
+    answer = ui._input("  [1] > ").strip()
     return "global" if answer == "2" else "project"
 
 
@@ -498,7 +501,7 @@ def _ollama_embed_model(cfg, name: str, profile: Mapping[str, object],
     from ..deps._fixes import _ollama_pull
     from ..llm._diag import installed_models
     from ..llm.embedder_factory import uses_ollama
-    from ._recommend import table_lines, table_tags
+    from ._recommend import NUMBER_OR_NAME, table_lines, table_tags
 
     url = str(profile.get("url") or _DEFAULT_OLLAMA_URL)
     if not name or _is_local_ollama(profile, cloud):
@@ -514,8 +517,12 @@ def _ollama_embed_model(cfg, name: str, profile: Mapping[str, object],
             _global_llm(), _project_llm(project_root, "config.toml"), _project_llm(project_root, "local.toml")))
         configured = (cfg.llm.embed_model if set_in_file and uses_ollama(cfg.llm)
                       and cfg.llm.ollama_url.rstrip("/") == url.rstrip("/") else "")
-        print("\n".join(table_lines(recommendation, configured or None, numbered=True)))
+        print("\n".join(table_lines(recommendation, configured or None, numbered=True, notes=False)))
         names = table_tags(recommendation)
+        if names:
+            print(NUMBER_OR_NAME)
+        for note in recommendation.notes:
+            print(f"  [info] {note}")
         default = configured or (recommendation.model.tag if recommendation.model else ui._FALLBACK_EMBED_MODEL)
     else:
         names = installed_models(url) or []
