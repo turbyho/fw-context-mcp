@@ -498,7 +498,7 @@ def _ollama_embed_model(cfg, name: str, profile: Mapping[str, object],
     from ..deps._fixes import _ollama_pull
     from ..llm._diag import installed_models
     from ..llm.embedder_factory import uses_ollama
-    from ._recommend import table_lines
+    from ._recommend import table_lines, table_tags
 
     url = str(profile.get("url") or _DEFAULT_OLLAMA_URL)
     if not name or _is_local_ollama(profile, cloud):
@@ -514,14 +514,17 @@ def _ollama_embed_model(cfg, name: str, profile: Mapping[str, object],
             _global_llm(), _project_llm(project_root, "config.toml"), _project_llm(project_root, "local.toml")))
         configured = (cfg.llm.embed_model if set_in_file and uses_ollama(cfg.llm)
                       and cfg.llm.ollama_url.rstrip("/") == url.rstrip("/") else "")
-        print("\n".join(table_lines(recommendation, configured or None)))
+        print("\n".join(table_lines(recommendation, configured or None, numbered=True)))
+        names = table_tags(recommendation)
         default = configured or (recommendation.model.tag if recommendation.model else ui._FALLBACK_EMBED_MODEL)
     else:
-        models = installed_models(url) or []
-        print(f"  Models of {url}: {', '.join(models) or 'none (pull an embedding model there)'}")
+        names = installed_models(url) or []
+        print(f"  Models of {url}:" if names else f"  Models of {url}: none (pull an embedding model there)")
+        if names:
+            print("\n".join(ui.numbered(names)))
         print(f"  ⚠ The source code and each search query go to {url}")
-        default = models[0] if models else ""
-    model = ui.prompt_text("Embedding model", default=default or None) or default
+        default = names[0] if names else ""
+    model = ui.prompt_model("Embedding model", names, default=default or None) or default
     if not model:
         print("  [skip] Embeddings: no model")
         return None
@@ -537,11 +540,15 @@ def _openrouter_embed_model() -> str | None:
 
     models = remote_models(EMBEDDING, "openrouter")
     print("  Embedding models of OpenRouter (quality MRR@10 of the search, price for one million tokens):")
-    for tag, entry in models:
-        print(f"    {tag:<40} {float(entry['quality']):.3f}  {price(entry, EMBEDDING)}".rstrip())
+    from ._recommend import NUMBER_OR_NAME
+
+    for number, (tag, entry) in enumerate(models, 1):
+        print(f"    {number}. {tag:<40} {float(entry['quality']):.3f}  {price(entry, EMBEDDING)}".rstrip())
+    if models:
+        print(NUMBER_OR_NAME)
     print("  ⚠ The source code and each search query go to openrouter.ai (hosts with zero data retention)")
     default = models[0][0] if models else "mistralai/codestral-embed-2505"
-    return ui.prompt_text("Embedding model", default=default) or default
+    return ui.prompt_model("Embedding model", [tag for tag, _entry in models], default=default) or default
 
 
 def _api_embed_model(name: str, profile: Mapping[str, object]) -> str | None:

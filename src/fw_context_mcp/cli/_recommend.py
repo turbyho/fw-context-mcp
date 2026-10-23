@@ -16,12 +16,18 @@ from ..llm.recommend import CHAT, Candidate, Recommendation, quality, rate
 #: machine with little memory, with a warning).
 LOW_CHAT_QUALITY = 3.0
 
+#: The line under a numbered list of models of the setup
+#: (``_init_interactive.prompt_model`` takes a number or a name).
+NUMBER_OR_NAME = "  Give the number of a row, or the name of a model"
 
-def table_lines(recommendation: Recommendation, current: str | None = None) -> list[str]:
+
+def table_lines(recommendation: Recommendation, current: str | None = None, *, numbered: bool = False) -> list[str]:
     """Return the lines of the table of *recommendation*: the best quality first, the marks at the right.
 
     The marks: ``← recommended``; ``(estimate)`` when the speed is not
     measured on this machine; ``(current)`` for the model of the config.
+    *numbered*: each row gets its number of ``table_tags``, for a question
+    of the setup that takes a number (``_init_interactive.prompt_model``).
     """
     role = recommendation.role
     if role is CHAT:
@@ -32,10 +38,24 @@ def table_lines(recommendation: Recommendation, current: str | None = None) -> l
     if not recommendation.candidates:
         lines.append("    no model of the list")
     current_candidate = recommendation.candidate(current) if current else None
-    for candidate in sorted(recommendation.candidates, key=lambda c: (-c.quality, c.tag)):
-        lines.append("    " + _row(candidate, recommendation, candidate is current_candidate))
+    width = len(str(len(recommendation.candidates)))
+    for number, candidate in enumerate(_ordered(recommendation), 1):
+        prefix = f"{number:>{width}}. " if numbered else ""
+        lines.append("    " + prefix + _row(candidate, recommendation, candidate is current_candidate))
+    if numbered and recommendation.candidates:
+        lines.append(NUMBER_OR_NAME)
     lines += [f"  [info] {note}" for note in recommendation.notes]
     return lines
+
+
+def table_tags(recommendation: Recommendation) -> list[str]:
+    """Return the tags of the rows of ``table_lines``, in its order: row 1 is the first tag."""
+    return [candidate.tag for candidate in _ordered(recommendation)]
+
+
+def _ordered(recommendation: Recommendation) -> list[Candidate]:
+    """The candidates in the order of the table: the best quality first, then the tag."""
+    return sorted(recommendation.candidates, key=lambda c: (-c.quality, c.tag))
 
 
 def _row(candidate: Candidate, recommendation: Recommendation, is_current: bool) -> str:

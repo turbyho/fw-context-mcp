@@ -253,9 +253,10 @@ def _setup_remote(project_root: Path | None, cfg, cloud: dict[str, str]) -> str 
     if not models:
         print(f"  [warn] {url} has no model: pull one there ('ollama pull <model>')")
         return None
-    print(f"  Models of {url}: {', '.join(models)}")
+    print(f"  Models of {url}:")
+    print("\n".join(ui.numbered(models)))
     print(f"  ⚠ The source code goes to {url}")
-    model = ui.prompt_text("Model", default=models[0]) or models[0]
+    model = ui.prompt_model("Model", models, default=models[0]) or models[0]
     name = ui.prompt_text("Profile name", default="remote") or "remote"
     return _write_profile(name, {"provider": "ollama", "url": url, "model": model})
 
@@ -266,12 +267,14 @@ def _setup_ollama_cloud(project_root: Path | None, cfg, cloud: dict[str, str]) -
     print("  Ollama Cloud runs a model on ollama.com through the local Ollama. It needs 'ollama signin' and a")
     print("  cloud model on the local server ('ollama pull <model>:cloud').")
     print("  ⚠ The source code goes to ollama.com")
-    if cloud:
-        print(f"  Cloud models of the local Ollama: {', '.join(cloud)}")
+    names = list(cloud)
+    if names:
+        print("  Cloud models of the local Ollama:")
+        print("\n".join(ui.numbered(names)))
     else:
         print(f"  The Ollama at {url} has no cloud model yet")
-    default = next(iter(cloud), "")
-    model = ui.prompt_text("Cloud model", default=default or None) or default
+    default = names[0] if names else ""
+    model = ui.prompt_model("Cloud model", names, default=default or None) or default
     if not model:
         print("  [skip] Ollama Cloud: no model")
         return None
@@ -376,11 +379,14 @@ def _model_from_list(llm, label: str, recommended: str) -> dict[str, object] | N
         print(f"  [warn] The model list of {label} holds no model: no profile is written")
         return None
     default = recommended if recommended in names else names[0]
-    if len(names) <= _LIST_PRINT_LIMIT:
-        print(f"  Models of {label}: {', '.join(names)}")
+    # A number names a printed row only: a long list is not printed.
+    shown = names if len(names) <= _LIST_PRINT_LIMIT else []
+    if shown:
+        print(f"  Models of {label}:")
+        print("\n".join(ui.numbered(shown)))
     else:
         print(f"  {label} lists {len(names)} models; the recommended one is {default}")
-    model = ui.prompt_text("Model", default=default) or default
+    model = ui.prompt_model("Model", shown, default=default) or default
     if model not in names:
         close = difflib.get_close_matches(model, names, n=5)
         print(f"  [skip] {model!r} is not in the model list of {label}"

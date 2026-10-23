@@ -229,6 +229,39 @@ def prompt_text(
     return answer or default
 
 
+def prompt_model(label: str, names: list[str], default: str | None = None) -> str | None:
+    """Ask for a model: the number of a row of *names* (as the list printed them), or a name; Enter gives *default*.
+
+    WHY a number (request of the user, 2026-10-23): a model name such as
+    ``qwen2.5-coder:14b-instruct-q8_0`` is long to type, and the setup
+    printed a numbered list of the services, but not of the models.  WHY a
+    name too: a model that the list does not show (an Ollama model outside
+    the list of fw-context, a model of a long list of an API).  A number
+    outside the list asks again.  The default is never read as a number:
+    Enter (and the end of the input) gives it, also for a model whose name
+    is only digits, and a number outside the list cannot then ask again
+    for ever.  The question is the one of ``prompt_text``, with the same
+    *label*: the list above it says that a number works (``NUMBER_OR_NAME``).
+    """
+    while True:
+        answer = (prompt_text(label, default=default) or "").strip()
+        if not answer or answer == default or not answer.isdigit():
+            return answer or default
+        if 1 <= int(answer) <= len(names):
+            return names[int(answer) - 1]
+        if not names:
+            print("  [warn] The list of the models is not printed: give the name of a model")
+        else:
+            print(f"  [warn] No row {answer}: the list has {len(names)} rows")
+
+
+def numbered(names: list[str]) -> list[str]:
+    """Return the lines of a numbered list of *names*, for ``prompt_model``, with ``NUMBER_OR_NAME``."""
+    from ._recommend import NUMBER_OR_NAME
+
+    return [f"    {number}. {name}" for number, name in enumerate(names, 1)] + [NUMBER_OR_NAME]
+
+
 def confirm_change(label: str, current: str, *, non_interactive: bool = False) -> bool:
     """Ask whether to change an already-configured value. Default N (keep)."""
     print(f"  {label}: {current} (already configured)")
@@ -427,20 +460,20 @@ def _local_ollama_profile(
             print(f"  [info] {result['message']}")
 
     print(f"  Hardware: {'GPU detected' if gpu else 'CPU only (no GPU detected)'}")
-    from ._recommend import table_lines
+    from ._recommend import table_lines, table_tags
 
     chat_from_config = ollama_profile and bool(cfg.llm.model)
     found = _recommendations(server, server, ask_embed=False, keep_alive=cfg.llm.keep_alive,
                              timeout=cfg.llm.timeout)
     chat_recommended = found["chat"].model.tag if found["chat"].model else _FALLBACK_CHAT_MODEL
     chat_default = cfg.llm.model if chat_from_config else chat_recommended
-    print("\n".join(table_lines(found["chat"], chat_default if chat_from_config else None)))
+    print("\n".join(table_lines(found["chat"], chat_default if chat_from_config else None, numbered=True)))
     fallback = "" if found["chat"].model else " (no recommendation: a small model that runs on each machine)"
     print(f"  Recommended: {chat_recommended}{fallback}")
     if chat_default != chat_recommended:
         print(f"  Current config: {chat_default} — Enter keeps it")
 
-    chat = prompt_text("Chat model", default=chat_default) or chat_default
+    chat = prompt_model("Chat model", table_tags(found["chat"]), default=chat_default) or chat_default
     found_profile = _machine_profile_for(server, chat)
     if found_profile is None:
         return None

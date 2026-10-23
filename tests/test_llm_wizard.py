@@ -512,8 +512,45 @@ def test_the_default_model_is_the_recommended_one_of_the_list(home, monkeypatch,
     assert values == {"model": "deepseek-chat"}, "the list gives the context: no key context"
     assert asked == [("Model", "deepseek-chat")], "no question about the context"
     out = capsys.readouterr().out
-    assert "Models of DeepSeek: deepseek-flash, deepseek-chat, new-model" in out, out
+    assert "Models of DeepSeek:\n    1. deepseek-flash\n    2. deepseek-chat\n    3. new-model\n" in out, out
+    assert "Give the number of a row, or the name of a model" in out, out
     assert "Context of deepseek-chat: 1048576 tokens (the model list of the API)" in out, out
+
+
+@pytest.mark.parametrize(("answer", "model"), [("2", "deepseek-chat"), ("deepseek-chat", "deepseek-chat"),
+                                               ("", "deepseek-flash")], ids=["a number", "a name", "Enter"])
+def test_a_model_of_the_list_is_selected_by_its_number_or_its_name(home, monkeypatch, answer, model):
+    """Request of the user, 2026-10-23: the setup asked for the name of a model, a long text to type."""
+    _prompts(monkeypatch, {"Model": answer})
+
+    assert wizard._model_from_list(_deepseek(), "DeepSeek", "deepseek-flash") == {"model": model}
+
+
+def test_a_number_outside_the_list_asks_again(monkeypatch, capsys):
+    answers = iter(["7", "3"])
+    monkeypatch.setattr(ui, "prompt_text", lambda label, default=None, **kwargs: next(answers))
+
+    assert ui.prompt_model("Model", ["a:1b", "b:2b", "c:3b"], default="a:1b") == "c:3b"
+    assert "[warn] No row 7: the list has 3 rows" in capsys.readouterr().out
+
+
+def test_a_long_list_takes_a_name_and_no_number(monkeypatch, capsys):
+    """A list longer than 20 is not printed: a number names no printed row."""
+    answers = iter(["5", "vendor/model-05"])
+    monkeypatch.setattr(ui, "prompt_text", lambda label, default=None, **kwargs: next(answers))
+    names = [f"vendor/model-{n:02d}" for n in range(30)]
+
+    assert ui.prompt_model("Model", [], default=names[0]) == "vendor/model-05"
+    assert "[warn] The list of the models is not printed: give the name of a model" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("names", [["a:1b", "b:2b"], []], ids=["a short list", "a list that is not printed"])
+def test_a_default_of_digits_is_the_default_and_no_row(monkeypatch, names):
+    """The review of 2026-10-23: a default "2" selected row 2, and outside the list it asked again for ever."""
+    monkeypatch.setattr(ui, "prompt_text", lambda label, default=None, **kwargs: default)
+
+    assert ui.prompt_model("Model", names, default="2") == "2"
+    assert ui.prompt_model("Model", names, default="123") == "123"
 
 
 def test_without_the_recommended_model_the_default_is_the_first_of_the_list(home, monkeypatch):
