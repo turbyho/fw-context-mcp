@@ -1055,11 +1055,20 @@ def _build_variants(project_root: Path, build_cfg, builder, variants: list) -> l
         v for v in variants
         if build_multi is not None and build_variant_config(build_cfg, v).sysbuild
     ]
-    if build_multi is not None and multi:
-        for variant, image, path in build_multi(project_root, build_cfg, multi):
-            v = _find_variant(variants, variant)
-            board = _effective_board(build_cfg, v, image) if v else ""
-            found.append((variant, image, path, board))
+    # One call of build_multi for each variant: a failed build raises out of
+    # build_multi, and one call for all of them stopped the variants that
+    # come after the failed one, and the index run with them.
+    if build_multi is not None:
+        for multi_variant in multi:
+            try:
+                built = build_multi(project_root, build_cfg, [multi_variant])
+            except RuntimeError as exc:
+                print(f"error: variant '{multi_variant.name}': {exc}", file=sys.stderr)
+                continue
+            for variant, image, path in built:
+                v = _find_variant(variants, variant)
+                board = _effective_board(build_cfg, v, image) if v else ""
+                found.append((variant, image, path, board))
     multi_names = {v.name for v in multi}
     for variant in variants:
         if variant.name in multi_names:

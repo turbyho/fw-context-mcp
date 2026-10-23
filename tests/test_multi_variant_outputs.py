@@ -136,6 +136,43 @@ def test_sysbuild_is_chosen_for_each_variant(monkeypatch, tmp_path: Path, board_
     assert sorted(seen) == [("multi", "app"), ("single", "")]
 
 
+def test_a_failed_sysbuild_variant_does_not_stop_the_others(monkeypatch, tmp_path: Path, capsys):
+    """A failed sysbuild build of one variant must not stop the next variant.
+
+    ``build_multi`` raised out of ``_build_variants`` at the first failed
+    variant, thus the variants after it got no build and no index.
+    """
+    import fw_context_mcp.indexer.build as build_mod
+    import fw_context_mcp.indexer.builders as builders_pkg
+    import fw_context_mcp.indexer.runner as runner_mod
+    from fw_context_mcp.cli import _index as index_mod
+
+    class _FailingFirstBuilder(_BoardBuilder):
+        def build_multi(self, project_root, cfg, variants):
+            if any(v.name == "broken" for v in variants):
+                raise RuntimeError("Build command failed (exit 1): west build")
+            return [(v.name, "app", tmp_path / f"{v.name}.json") for v in variants]
+
+    registry = SimpleNamespace(get=lambda name: _FailingFirstBuilder if name == "fake" else None, keys=lambda: ["fake"])
+    monkeypatch.setattr(build_mod, "_builder_registry", registry)
+    monkeypatch.setattr(builders_pkg, "registry", registry)
+    seen: list[tuple[str, str]] = []
+    monkeypatch.setattr(runner_mod, "run", lambda **kw: seen.append((kw["variant"], kw["image"])) or "0" * 64)
+
+    build = BuildConfig(
+        system="fake",
+        sysbuild=True,
+        variants=[BuildVariant(name="broken", board="a"), BuildVariant(name="good", board="b")],
+    )
+    index_mod._run_multi(
+        SimpleNamespace(build=True), SimpleNamespace(build=build), tmp_path, "pid",
+        tmp_path / "index.db", "fake", {"vendor_paths": [], "project_paths": []},
+    )
+
+    assert seen == [("good", "app")]
+    assert "error: variant 'broken':" in capsys.readouterr().err
+
+
 def test_a_variant_without_a_build_gets_no_entry(tmp_path: Path, board_backend):
     from fw_context_mcp.cli import _index as index_mod
 
