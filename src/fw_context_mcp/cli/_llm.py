@@ -236,15 +236,38 @@ def cmd_llm_default(args: argparse.Namespace) -> int:
 def cmd_llm_remove(args: argparse.Namespace) -> int:
     """Remove a profile, its own stored key, and the sign-in of a ChatGPT profile.
 
-    Exit codes: 0 = removed, 1 = no such profile, or the global config
-    selects it.
+    Exit codes: 0 = removed, 1 = no such profile, or it is in use
+    (``profile_uses``): the global config selects it, it is the local
+    Ollama profile of this machine and the local Ollama answers, or it is a
+    profile of a local Ollama that answers while fw-context cannot tell the
+    Ollama profile of this machine.  The rules are the ones of step 3 of
+    ``fw-context llm setup`` (decision of the user, 2026-10-23), thus the
+    two commands do not tell different things.
     """
-    from ._llm_wizard import remove_profile_and_secrets
+    from ..config import settings
+    from ..llm.profile_state import cloud_lists
+    from ._llm_wizard import in_use_message, machine_profile_change, profile_uses, remove_profile_and_secrets
 
-    if args.profile not in _profiles():
+    profiles = _profiles()
+    if args.profile not in profiles:
         print(f"[error] The global config has no profile {args.profile!r}", file=sys.stderr)
         return 1
-    return 0 if remove_profile_and_secrets(args.profile) else 1
+    try:
+        llm = settings.read_config_file(settings._GLOBAL_CONFIG_PATH).get("llm") or {}
+    except settings.ConfigError as exc:
+        print(f"[error] {exc}", file=sys.stderr)
+        return 1
+    lists = cloud_lists(profiles)
+    in_use = profile_uses(args.profile, llm, profiles, lists)
+    if in_use:
+        print(f"[error] {in_use_message(args.profile, in_use)}", file=sys.stderr)
+        return 1
+    change = machine_profile_change(args.profile, llm, lists)
+    if not remove_profile_and_secrets(args.profile):
+        return 1
+    if change:
+        print(f"  [note] {change}")
+    return 0
 
 
 def _plan_profile(name: str) -> bool:

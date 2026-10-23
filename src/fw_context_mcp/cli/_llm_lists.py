@@ -190,7 +190,9 @@ def setup_services(project_root: Path | None, cfg) -> None:
 
     profiles = wizard._profiles()
     cloud = cloud_hosts(profiles)
-    print("\n  Step 1 — the services that you use (the local Ollama is detected; the others you select):")
+    # Each step and each choice tells what it does (request of the user, 2026-10-23).
+    print("\n  Step 1 — the services that you use. The setup of a service saves a profile (its model and its")
+    print("  key or sign-in) in the global config and tests it. The local Ollama is detected; select the others:")
     wizard._print_services(profiles, cloud)
     if _local_ollama_runs() and not any(_is_local_ollama(p, cloud) for p in profiles.values()):
         print("    (the local Ollama runs: step 2 offers it, also without a profile)")
@@ -233,12 +235,14 @@ def _chat_rows(profiles: dict[str, dict], cloud: Mapping[str, Mapping[str, str]]
         if problem:
             # It cannot run yet: the row says what repairs it.
             info += f"  ({problem})"
-        rows.append(Row(name, f"{name}: {profile.get('provider')} {model}{f'  ⚠ {host}' if host else ''}",
-                        info, problem))
+        # The service and the model: what the row is (request of the user,
+        # 2026-10-23: each choice tells what it does).
+        service = wizard.SERVICE_LABELS.get(wizard.service_of(profile, cloud), str(profile.get("provider")))
+        rows.append(Row(name, f"{name}: {service}, {model}{f'  ⚠ {host}' if host else ''}", info, problem))
     if local is not None and not any(_is_local_ollama(p, cloud) for p in profiles.values()):
         hint = f"  recommended {local.model.tag}  {quality(local.model, CHAT)}  {rate(local.model, CHAT)}" if (
             local.model is not None) else ""
-        rows.insert(0, Row("", "Local Ollama (detected, no profile yet: set it up now)", hint))
+        rows.insert(0, Row("", "Local Ollama: detected, no profile yet (this choice sets one up)", hint))
     rows.sort(key=lambda row: row.profile != "" and "⚠" in row.label)
     return rows
 
@@ -256,14 +260,15 @@ def choose_chat(project_root: Path | None, cfg, *, offer_global: bool = False) -
     cloud = known(cloud_lists(profiles))
     rows = _chat_rows(profiles, cloud)
     current = cfg.llm.profile or cfg.llm.model
-    print(f"\n  Step 2 — the LLM analysis: where it runs (Enter: keep {current or 'the current setting'}):")
+    print("\n  Step 2 — the LLM analysis: the service whose model writes a description of each symbol, for the")
+    print(f"  search and the MCP tools. Enter keeps {current or 'the current setting'}:")
     if offer_global:
-        print("    0. the global settings (removes the profile of .fw-context/local.toml)")
+        print("    0. the global settings: remove the selection of this project (.fw-context/local.toml)")
     for number, row in enumerate(rows, 1):
         print(f"    {number}. {row.label}{row.hint}")
     if not rows:
         print("    (no service: set one up in step 1)")
-    print("    d. no LLM analysis (the embeddings stay)")
+    print("    d. no LLM analysis: the symbols get no description; the embeddings stay")
     answer = ui._input("  > ").strip().lower()
     if answer == "":
         print("  [ok] LLM analysis: the current setting stays")
@@ -419,10 +424,11 @@ def _embed_rows(profiles: dict[str, dict], cloud: Mapping[str, Mapping[str, str]
         problem = profile_state(name, profile, cloud=cloud).problem or ""
         if problem:
             hint += f"  ({problem})"
-        rows.append(Row(name, f"{name}: {provider}{f'  ⚠ {host}' if host else ''}", hint, problem))
+        service = wizard.SERVICE_LABELS.get(wizard.service_of(profile, cloud), str(provider))
+        rows.append(Row(name, f"{name}: {service}{f'  ⚠ {host}' if host else ''}", hint, problem))
     if local is not None and not any(_is_local_ollama(p, cloud) for p in profiles.values()):
         hint = f"  recommended {local.model.tag}  {quality(local.model, EMBEDDING)}" if local.model else ""
-        rows.insert(0, Row("", "Local Ollama (detected)", hint))
+        rows.insert(0, Row("", "Local Ollama: detected, no profile yet", hint))
     rows.sort(key=lambda row: row.profile != "" and "⚠" in row.label)
     return rows
 
@@ -439,9 +445,10 @@ def choose_embeddings(project_root: Path | None, cfg, *, offer_global: bool = Fa
     cloud = known(cloud_lists(profiles))
     rows = _embed_rows(profiles, cloud)
     current = cfg.llm.embed_model + (f" ({cfg.llm.embed_profile})" if cfg.llm.embed_profile else "")
-    print(f"\n  Step 2 — the embeddings: where they run (Enter: keep {current or 'the current setting'}):")
+    print("\n  Step 2 — the embeddings: the service whose model makes the vectors of the search by meaning")
+    print(f"  (semantic_search, smart_search). Enter keeps {current or 'the current setting'}:")
     if offer_global:
-        print("    0. the global settings (removes embed_profile and embed_model of .fw-context/local.toml)")
+        print("    0. the global settings: remove the embeddings of this project (.fw-context/local.toml)")
     for number, row in enumerate(rows, 1):
         print(f"    {number}. {row.label}{row.hint}")
     if not rows:

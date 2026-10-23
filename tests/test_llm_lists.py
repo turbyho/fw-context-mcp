@@ -157,7 +157,7 @@ def test_enter_in_step_1_sets_up_no_service(home, monkeypatch, capsys):
     _llm_lists.setup_services(root, _cfg(root))
 
     out = capsys.readouterr().out
-    assert "1. ✓ Local Ollama  profiles: local" in out, out
+    assert "1. ✓ Local Ollama — models on the GPU or CPU of this machine; no cost  profiles: local" in out, out
     assert settings._GLOBAL_CONFIG_PATH.read_text(encoding="utf-8") == before
     assert home["tested"] == []
     assert not (root / ".fw-context" / "local.toml").exists()
@@ -187,9 +187,9 @@ def test_the_chat_list_shows_only_the_profiles_and_the_detected_local_ollama(hom
 
     rows = _rows(capsys.readouterr().out)
     assert len(rows) == 3, rows
-    assert rows[0].startswith("1. Local Ollama (detected, no profile yet: set it up now)"), rows
-    assert rows[1].startswith("2. ds: deepseek deepseek-chat  ⚠ https://api.deepseek.com"), rows
-    assert rows[2].startswith("3. or: openrouter m  ⚠ https://openrouter.ai"), rows
+    assert rows[0].startswith("1. Local Ollama: detected, no profile yet (this choice sets one up)"), rows
+    assert rows[1].startswith("2. ds: DeepSeek, deepseek-chat  ⚠ https://api.deepseek.com"), rows
+    assert rows[2].startswith("3. or: OpenRouter, m  ⚠ https://openrouter.ai"), rows
 
 
 def test_the_chat_list_puts_the_profiles_of_this_machine_first(home, monkeypatch, capsys):
@@ -280,7 +280,7 @@ def test_0_removes_the_profile_of_local_toml(home, monkeypatch, capsys):
     _llm_lists.choose_chat(root, _cfg(root), offer_global=True)
 
     out = capsys.readouterr().out
-    assert "0. the global settings (removes the profile of .fw-context/local.toml)" in out, out
+    assert "0. the global settings: remove the selection of this project (.fw-context/local.toml)" in out, out
     assert "[ok] LLM analysis: the global settings apply" in out, out
     assert _local_llm(root) == {"embed_model": "x:1b"}, "the embeddings have their own list"
 
@@ -482,7 +482,7 @@ def test_the_embeddings_list_offers_the_local_ollama_without_a_profile(home, mon
     _llm_lists.choose_embeddings(root, _cfg(root))
 
     rows = _rows(capsys.readouterr().out)
-    assert rows[0].startswith("1. Local Ollama (detected)") and len(rows) == 2, rows
+    assert rows[0].startswith("1. Local Ollama: detected, no profile yet") and len(rows) == 2, rows
 
 
 @pytest.mark.parametrize("scope", ["1", "2"], ids=["this project", "each project"])
@@ -557,7 +557,7 @@ def test_embeddings_0_removes_the_embeddings_of_local_toml(home, monkeypatch, ca
     _llm_lists.choose_embeddings(root, _cfg(root), offer_global=True)
 
     out = capsys.readouterr().out
-    assert "0. the global settings (removes embed_profile and embed_model of .fw-context/local.toml)" in out, out
+    assert "0. the global settings: remove the embeddings of this project (.fw-context/local.toml)" in out, out
     assert "[ok] Embeddings: the global settings apply" in out, out
     assert _local_llm(root) == {"profile": "local"}, "the LLM analysis has its own list"
 
@@ -684,7 +684,7 @@ def test_option_0_is_offered_for_an_old_enabled_false_alone(home, monkeypatch, c
     ui.prompt_llm_config(root, _cfg(root), non_interactive=False)
 
     out = capsys.readouterr().out
-    assert "0. the global settings (removes the profile of .fw-context/local.toml)" in out, out
+    assert "0. the global settings: remove the selection of this project (.fw-context/local.toml)" in out, out
     assert _local_llm(root) == {}
     assert _cfg(root).llm.enabled is True
 
@@ -732,8 +732,8 @@ def test_llm_setup_in_a_project_offers_and_applies_option_0(home, monkeypatch, c
     _llm_wizard.run_wizard(root, _cfg(root))
 
     out = capsys.readouterr().out
-    assert "0. the global settings (removes the profile of .fw-context/local.toml)" in out, out
-    assert "0. the global settings (removes embed_profile and embed_model of .fw-context/local.toml)" in out, out
+    assert "0. the global settings: remove the selection of this project (.fw-context/local.toml)" in out, out
+    assert "0. the global settings: remove the embeddings of this project (.fw-context/local.toml)" in out, out
     assert _local_llm(root) == {}
     assert (_cfg(root).llm.profile, _cfg(root).llm.embed_model) == ("local", "e:1b")
 
@@ -783,7 +783,7 @@ def test_a_quality_that_is_not_a_number_shows_a_dash(home, monkeypatch, capsys):
     _llm_lists.choose_chat(root, _cfg(root))
 
     rows = _rows(capsys.readouterr().out)
-    assert rows[1] == "2. cloudy: ollama m:cloud  ⚠ https://ollama.com:443  -", rows
+    assert rows[1] == "2. cloudy: Ollama Cloud (through the local Ollama), m:cloud  ⚠ https://ollama.com:443  -", rows
 
 
 def test_a_failed_restore_of_local_toml_says_so(home, monkeypatch, capsys):

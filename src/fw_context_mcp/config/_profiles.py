@@ -125,7 +125,16 @@ def remove_profile(name: str) -> Path:
 
     Refused when ``[llm] profile`` or ``[llm] embed_profile`` of the global
     config selects it: each project without a selection of its own would
-    get an error.  A project that selects it in its own ``local.toml``
+    get an error.  When ``[llm] ollama_profile`` names it, the same write
+    removes that key (decision of the user, 2026-10-23): this machine then
+    has no Ollama profile of its own choice.  WHY not a refusal: the setup
+    writes the key when an API becomes the default, and no command removes
+    it, thus the last Ollama profile could not be removed.  WHY not the key
+    alone: a key that names no profile is a fault of the config
+    (``settings._ollama_profile_problems``).  The commands keep the local
+    Ollama profile of this machine while the local Ollama answers
+    (``cli._llm_wizard.profile_uses``): that check asks the
+    server, and this module asks no server.  A project that selects it in its own ``local.toml``
     gets an error that names the profile; ``fw-context llm default`` there
     selects another one.
 
@@ -142,13 +151,16 @@ def remove_profile(name: str) -> Path:
     llm = document.get("llm")
     if llm is None or name not in (llm.get("profiles") or {}):
         raise settings.ConfigError(path, f"the global config has no LLM profile {name!r}")
-    for key in ("profile", "embed_profile"):
+    for key, how in (("profile", "'fw-context llm default <profile> --global', or step 2 of 'fw-context llm setup' "
+                                 "outside a project"),
+                     ("embed_profile", "step 2 of 'fw-context llm setup' outside a project")):
         if llm.get(key) == name:
             raise settings.ConfigError(
-                path, f"[llm] {key} of the global config selects {name!r}: select another profile first "
-                f"('fw-context llm default <profile> --global')",
+                path, f"[llm] {key} of the global config selects {name!r}: select another profile first ({how})",
             )
     del llm["profiles"][name]
+    if llm.get("ollama_profile") == name:
+        del llm["ollama_profile"]
     _atomic_write(path.resolve(), tomlkit.dumps(document))
     return path
 

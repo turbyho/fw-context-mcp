@@ -40,22 +40,32 @@ _TEST_PROMPT = "Reply with exactly: OK"
 
 @dataclass(frozen=True)
 class Service:
-    """One entry of the service list; *host* is where the source code goes ("" for this machine)."""
+    """One entry of the service list; *host* is where the source code goes ("" for this machine).
+
+    *description* tells in a few words what the service is (request of
+    the user, 2026-10-23: each choice of the setup has a short description).
+    """
 
     key: str
     label: str
     host: str
+    description: str
 
 
 SERVICES: tuple[Service, ...] = (
-    Service("local", "Local Ollama", ""),
-    Service("remote", "Ollama on another computer", "that computer"),
-    Service("ollama_cloud", "Ollama Cloud (through the local Ollama)", "ollama.com"),
-    Service("chatgpt", "ChatGPT plan (Sign in with ChatGPT)", "api.openai.com"),
-    Service("openrouter", "OpenRouter", "openrouter.ai"),
-    Service("deepseek", "DeepSeek", "api.deepseek.com"),
-    Service("api", "Another OpenAI-compatible API", "the host of the API"),
+    Service("local", "Local Ollama", "", "models on the GPU or CPU of this machine; no cost"),
+    Service("remote", "Ollama on another computer", "that computer", "an Ollama server of your network"),
+    Service("ollama_cloud", "Ollama Cloud (through the local Ollama)", "ollama.com",
+            "large models at ollama.com; needs 'ollama signin'"),
+    Service("chatgpt", "ChatGPT plan (Sign in with ChatGPT)", "api.openai.com",
+            "the models of your ChatGPT subscription"),
+    Service("openrouter", "OpenRouter", "openrouter.ai", "models of many providers with one API key; a price per token"),
+    Service("deepseek", "DeepSeek", "api.deepseek.com", "the API of DeepSeek; a price per token"),
+    Service("api", "Another OpenAI-compatible API", "the host of the API", "a server or a proxy at a URL that you give"),
 )
+
+#: The label of each service, by its key (``service_of``).
+SERVICE_LABELS = {service.key: service.label for service in SERVICES}
 
 
 def local_url() -> str:
@@ -166,7 +176,7 @@ def _print_services(profiles: dict[str, dict], cloud: dict[str, dict[str, str]])
         mark = "✓" if names else " "
         warning = f"  ⚠ to {service.host}" if service.host else ""
         have = f"  profiles: {', '.join(names)}" if names else ""
-        print(f"    {number}. {mark} {service.label}{warning}{have}")
+        print(f"    {number}. {mark} {service.label} — {service.description}{warning}{have}")
 
 
 def _selected(answer: str) -> list[Service]:
@@ -561,23 +571,222 @@ def _drop_unused_secrets(name: str) -> None:
               "ChatGPT Settings")
 
 
+def profile_uses(name: str, llm: Mapping[str, object], profiles: Mapping[str, Mapping[str, object]],
+                 lists: Mapping[str, Mapping[str, str] | None]) -> list[tuple[str, str]]:
+    """Return what keeps the profile *name* in use, each with how to free it: ``(what, how)``.
+
+    ``[llm] profile`` is the default of the projects that select none; an
+    Ollama profile there also makes their embeddings when ``embed_profile``
+    is not set (``settings._resolve_llm_profile``).  These two keys are the
+    ones that ``remove_profile`` refuses for.  The third use is the local
+    Ollama profile of this machine (``_machine_use``).  *lists*:
+    ``cloud_lists``.  Step 3 of the setup and ``fw-context llm remove``
+    both use this list, thus they tell the same uses.
+    """
+    uses = []
+    if llm.get("profile") == name:
+        embeddings = (profiles.get(name) or {}).get("provider") == "ollama" and not llm.get("embed_profile")
+        uses.append(("the default of the projects without their own selection"
+                     + (", their embeddings too" if embeddings else ""),
+                     "select another default in step 2 of 'fw-context llm setup' outside a project, or with "
+                     "'fw-context llm default <profile> --global'"))
+    if llm.get("embed_profile") == name:
+        uses.append(("the embeddings of the projects without their own selection",
+                     "select other embeddings in step 2 of 'fw-context llm setup' outside a project"))
+    machine = _machine_use(name, llm, profiles, lists)
+    if machine is not None:
+        uses.append(machine)
+    return uses
+
+
+def in_use_message(name: str, uses: list[tuple[str, str]]) -> str:
+    """Return the sentences that tell why the profile *name* is not removed (*uses*: ``profile_uses``)."""
+    hows = list(dict.fromkeys(how for _what, how in uses))
+    return (f"The profile {name!r} is in use ({'; '.join(what for what, _how in uses)}). "
+            f"Before you remove it, {'; and '.join(hows)}")
+
+
+#: How to free the local Ollama profile of this machine while its Ollama answers.
+_MACHINE_PROFILE_HOW = "select another Ollama profile of this machine with 'fw-context llm default <profile> --ollama'"
+
+
+def _server_url(profile: Mapping[str, object]) -> str:
+    from ..config.settings import _DEFAULT_OLLAMA_URL
+
+    return str(profile.get("url") or _DEFAULT_OLLAMA_URL).rstrip("/")
+
+
+def machine_profile(llm: Mapping[str, object], profiles: Mapping[str, Mapping[str, object]],
+                    lists: Mapping[str, Mapping[str, str] | None]) -> tuple[bool, str | None]:
+    """Return ``(decided, name)``: the Ollama profile of this machine, or None for no Ollama profile.
+
+    *decided* is False when fw-context cannot tell it now.  The rules are
+    the ones of ``profile_state.ollama_profile_name``, in this order:
+
+    1. ``[llm] ollama_profile`` decides.
+    2. Else the global ``profile`` decides when it is an Ollama profile of
+       a server that gives a model list, or of an Ollama on another
+       computer.
+    3. Else, while a loopback Ollama of a profile gives no list (*lists*:
+       ``cloud_lists``), fw-context cannot tell: a cloud model of that
+       server looks like a model of this machine.
+    4. Else the only Ollama profile, or None.
+
+    WHY one function (review, 2026-10-23): the refusal, the question, the
+    note of ``fw-context llm remove`` and the list of step 3 each decided
+    the profile in their own way, and two of them refused or said "cannot
+    tell" when a key decided it.
+    """
+    from ..config.settings import _is_loopback_url
+    from ..llm.profile_state import is_cloud_model, is_ollama, known, unknown_servers
+
+    cloud = known(lists)
+    named = llm.get("ollama_profile")
+    if isinstance(named, str) and named:
+        profile = profiles.get(named)
+        return True, named if profile is not None and is_ollama(profile, cloud) else None
+    default = llm.get("profile")
+    profile = profiles.get(default) if isinstance(default, str) else None
+    if profile is not None and profile.get("provider") == "ollama":
+        url = _server_url(profile)
+        if not _is_loopback_url(url) or (lists.get(url) is not None and not is_cloud_model(profile, cloud)):
+            return True, str(default)
+    if unknown_servers(profiles, lists):
+        return False, None
+    ollama = [key for key, value in profiles.items() if is_ollama(value, cloud)]
+    return True, ollama[0] if len(ollama) == 1 else None
+
+
+def _machine_use(name: str, llm: Mapping[str, object], profiles: Mapping[str, Mapping[str, object]],
+                 lists: Mapping[str, Mapping[str, str] | None]) -> tuple[str, str] | None:
+    """Return why the local Ollama profile *name* stays, with how to free it; None when it can go.
+
+    WHY (decision of the user, 2026-10-23): the only reason to remove the
+    local Ollama profile of this machine is that this machine has no local
+    Ollama any more.  A server that gives no list (*lists*:
+    ``cloud_lists``) counts as gone: an Ollama in a container has no
+    program ``ollama`` to look for.  A stopped Ollama counts as gone too,
+    thus the question of the removal says that it does not answer.  The
+    profile of an Ollama on another computer can always go.
+
+    WHY the second reason (review, 2026-10-23): when ``machine_profile``
+    cannot tell the profile of this machine, the profile of a local
+    Ollama that answers stays, as for the other writers
+    (``profile_state.undecided``).
+    """
+    from ..config.settings import _is_loopback_url
+    from ..llm.profile_state import is_cloud_model, known, unknown_servers
+
+    profile = profiles.get(name) or {}
+    url = _server_url(profile)
+    if (profile.get("provider") != "ollama" or not _is_loopback_url(url) or lists.get(url) is None
+            or is_cloud_model(profile, known(lists))):
+        return None
+    decided, machine = machine_profile(llm, profiles, lists)
+    if not decided:
+        servers = ", ".join(unknown_servers(profiles, lists))
+        return (f"an Ollama profile of this machine, and the Ollama at {servers} gives no model list, thus "
+                "fw-context cannot tell the Ollama profile of this machine",
+                f"start the Ollama at {servers} and repeat, or remove the profiles of that Ollama first")
+    if machine == name:
+        return "the Ollama profile of this machine, and the local Ollama answers", _MACHINE_PROFILE_HOW
+    return None
+
+
+def machine_profile_change(name: str, llm: Mapping[str, object],
+                           lists: Mapping[str, Mapping[str, str] | None]) -> str:
+    """Return a sentence on how a removal of *name* changes the Ollama profile of this machine; "" for no change.
+
+    WHY (review, 2026-10-23): without ``[llm] ollama_profile``, the global
+    ``profile`` or the only Ollama profile is the profile of this machine
+    (``machine_profile``).  Thus a removal can make another profile the
+    profile of this machine, also a profile of an Ollama on another
+    computer, and "no Ollama profile" was then not true.  When
+    ``machine_profile`` cannot tell the profile after the removal, the
+    sentence says so.  A profile that is not of Ollama never changes it.
+    """
+    from ..config.settings import _is_loopback_url
+    from ..llm.profile_state import unknown_servers
+
+    profiles = llm.get("profiles")
+    if not isinstance(profiles, Mapping) or not isinstance(profiles.get(name), Mapping) \
+            or profiles[name].get("provider") != "ollama":
+        return ""
+    profiles = {key: profile for key, profile in profiles.items() if isinstance(profile, Mapping)}
+    rest = {key: profile for key, profile in profiles.items() if key != name}
+    after_llm = {key: value for key, value in llm.items()
+                 if key != "profiles" and not (key == "ollama_profile" and value == name)}
+    after_decided, after = machine_profile(after_llm, rest, lists)
+    if not after_decided:
+        return (f"fw-context cannot tell the Ollama profile of this machine then: the Ollama at "
+                f"{', '.join(unknown_servers(rest, lists))} gives no model list")
+    if machine_profile(llm, profiles, lists) == (True, after):
+        return ""
+    if after is None:
+        return ("This machine then has no Ollama profile: 'fw-context llm setup' or "
+                "'fw-context llm default <profile> --ollama' selects one")
+    url = str(rest[after].get("url") or "")
+    where = f" (the Ollama at {url})" if url and not _is_loopback_url(url) else ""
+    return f"The Ollama profile of this machine then is {after!r}{where}"
+
+
+def removal_question(name: str, llm: Mapping[str, object], profiles: Mapping[str, Mapping[str, object]],
+                     lists: Mapping[str, Mapping[str, str] | None]) -> str:
+    """Return the question before the removal of *name*: what goes with it, and what this machine then uses."""
+    from ..config.settings import _is_loopback_url
+
+    profile = profiles[name]
+    question = f"Remove the profile {name!r}{_also_removed(name, profile)}?"
+    url = _server_url(profile)
+    if profile.get("provider") == "ollama" and _is_loopback_url(url) and lists.get(url) is None:
+        # ``_machine_use`` keeps a profile of this machine while its Ollama answers.
+        question += f" The Ollama at {url} does not answer."
+    change = machine_profile_change(name, llm, lists)
+    return f"{question} {change}" if change else question
+
+
 def _remove_profiles() -> None:
-    """Ask for profiles to remove; remove each one after a question, with its key or sign-in."""
-    from ..config.settings import ConfigError
+    """Offer to remove profiles that the user no longer uses; remove each one after a question.
+
+    WHY the text (request of the user, 2026-10-23): the step listed the
+    names only, and the user did not know what it does.  Thus it tells what
+    a profile is, what a removal changes, and for each profile what it is
+    and what uses it.  A profile in use is listed, but a removal of it is
+    refused at once (``profile_uses``).  The Ollama profile of this machine
+    can go when it is not local, or when the local Ollama does not answer,
+    after a question that tells what this machine then uses (decisions of
+    the user, 2026-10-23).
+    """
+    from ..config import settings
+    from ..llm.profile_state import cloud_lists, known
 
     try:
-        names = list(_profiles())
-    except ConfigError:
+        profiles = _profiles()
+        llm = settings.read_config_file(settings._GLOBAL_CONFIG_PATH).get("llm") or {}
+    except settings.ConfigError:
         return
-    if not names:
+    if not profiles:
         return
-    # One profile on each line, and a number for each (request of the
-    # user, 2026-10-23); a name works too, and an exact name wins over a
-    # number (a profile name can be only digits).
-    print("  Profiles:")
+    lists = cloud_lists(profiles)
+    cloud = known(lists)
+    names = list(profiles)
+    uses = {name: profile_uses(name, llm, profiles, lists) for name in names}
+    decided, machine = machine_profile(llm, profiles, lists)
+    print("\n  Step 3 — remove the profiles that you do not use (Enter: remove nothing):")
+    print("  A profile is an LLM service that the setup saved in the global config: its provider, model and")
+    print("  server. A removed profile is gone for each project, with its own API key or ChatGPT sign-in")
+    print("  (the key of a provider stays: the other profiles of that provider use it).")
+    # One profile on each line, with a number and what it is (request of
+    # the user, 2026-10-23); a name works too, and an exact name wins over
+    # a number (a profile name can be only digits).
     for number, name in enumerate(names, 1):
-        print(f"    {number}. {name}")
-    answer = ui._input("  Remove profiles: numbers or names, separated by commas (Enter: none) > ")
+        profile = profiles[name]
+        what = f"{SERVICE_LABELS.get(service_of(profile, cloud), str(profile.get('provider')))}, {profile.get('model')}"
+        used = f"  — in use: {'; '.join(what for what, _how in uses[name])}" if uses[name] else ""
+        if decided and name == machine and all(how != _MACHINE_PROFILE_HOW for _what, how in uses[name]):
+            used += "  — the Ollama profile of this machine"
+        print(f"    {number}. {name}: {what}{used}")
+    answer = ui._input("  Profiles to remove: numbers or names, separated by commas (Enter: none) > ")
     selected: list[str] = []
     for part in [part.strip() for part in answer.split(",") if part.strip()]:
         name = (names[int(part) - 1] if part not in names and part.isdigit() and 1 <= int(part) <= len(names)
@@ -588,9 +797,32 @@ def _remove_profiles() -> None:
             # One question for each profile: "2, work" names one profile
             # twice, and a second removal said that the config has a fault.
             selected.append(name)
-    for name in selected:
-        if ui._confirm(f"Remove the profile {name!r} (and its own key or sign-in)?", default=False):
+    for index, name in enumerate(selected):
+        if index:
+            # An earlier removal can change the Ollama profile of this
+            # machine (``machine_profile_change``), thus what is in use.
+            try:
+                profiles = _profiles()
+                llm = settings.read_config_file(settings._GLOBAL_CONFIG_PATH).get("llm") or {}
+            except settings.ConfigError:
+                return
+        in_use = profile_uses(name, llm, profiles, lists)
+        if in_use:
+            print(f"  [skip] {in_use_message(name, in_use)}")
+            continue
+        if ui._confirm(removal_question(name, llm, profiles, lists), default=False):
             remove_profile_and_secrets(name)
+
+
+def _also_removed(name: str, profile: Mapping[str, object]) -> str:
+    """Return the words for what a removal of *name* removes too: its sign-in, its own API key, or nothing."""
+    from ..llm import chatgpt_plan
+    from ..llm.secrets import stored_api_key
+
+    if profile.get("provider") == "chatgpt":
+        credentials = chatgpt_plan.load_credentials(name)
+        return " and its ChatGPT sign-in" if credentials is not None and credentials.signed_in() else ""
+    return " and its own API key" if stored_api_key(name) is not None else ""
 
 
 def _forget_removed_profiles(project_root: Path) -> None:

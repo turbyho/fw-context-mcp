@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import tomllib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -173,8 +174,8 @@ def test_the_list_marks_the_services_with_a_profile_and_the_external_ones(home, 
     _run(home)
 
     out = capsys.readouterr().out
-    assert "1. ✓ Local Ollama  profiles: local" in out, out
-    assert "5.   OpenRouter  ⚠ to openrouter.ai" in out, out
+    assert "1. ✓ Local Ollama — models on the GPU or CPU of this machine; no cost  profiles: local" in out, out
+    assert "5.   OpenRouter — models of many providers with one API key; a price per token  ⚠ to openrouter.ai" in out, out
 
 
 def test_a_service_of_the_registry_stores_the_key_of_its_provider_and_a_tested_profile(home, monkeypatch, capsys):
@@ -243,7 +244,9 @@ def test_the_profiles_to_remove_are_one_on_each_line_and_a_number_removes_one(ho
     _run(home)
 
     assert "work" not in _profiles()
-    assert "  Profiles:\n    1. local\n    2. work\n" in capsys.readouterr().out
+    assert ("    1. local: Local Ollama, chat:1b  — in use: the default of the projects without their own selection, "
+            "their embeddings too; the Ollama profile of this machine, and the local Ollama answers\n"
+            "    2. work: OpenRouter, m\n") in capsys.readouterr().out
 
 
 def test_the_global_default_cannot_be_removed(home, monkeypatch, capsys):
@@ -252,7 +255,7 @@ def test_the_global_default_cannot_be_removed(home, monkeypatch, capsys):
     _run(home)
 
     assert "local" in _profiles()
-    assert "select another profile first" in capsys.readouterr().out
+    assert "is in use (the default of the projects without their own selection" in capsys.readouterr().out
 
 
 def test_the_list_names_the_command_that_repairs_a_profile(home, monkeypatch, capsys):
@@ -264,7 +267,7 @@ def test_the_list_names_the_command_that_repairs_a_profile(home, monkeypatch, ca
     _run(home)
 
     out = capsys.readouterr().out
-    assert "or: openrouter m  ⚠ https://openrouter.ai/api/v1  (no API key: run 'fw-context llm key set or')" in out, out
+    assert "or: OpenRouter, m  ⚠ https://openrouter.ai/api/v1  (no API key: run 'fw-context llm key set or')" in out, out
 
 
 def test_the_project_selects_a_profile(home, monkeypatch, capsys):
@@ -740,3 +743,321 @@ def test_a_profile_named_twice_is_removed_one_time(home, monkeypatch, capsys):
     assert "work" not in _profiles()
     assert sum("Remove the profile 'work'" in question for question in questions) == 1
     assert "Correct the file" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(("key", "how"), [("profile", "--global"), ("embed_profile", "fw-context llm setup")])
+def test_a_profile_that_the_global_config_selects_is_not_removed(home, monkeypatch, key, how):
+    """Each project without its own selection would get an error."""
+    from fw_context_mcp.config._profiles import remove_profile
+
+    selection = {"profile": "box"} if key == "profile" else {"profile": "other", key: "box"}
+    settings._GLOBAL_CONFIG_PATH.write_text(
+        "[llm]\n" + "".join(f'{name} = "{value}"\n' for name, value in selection.items())
+        + '\n[llm.profiles.other]\nprovider = "ollama"\nmodel = "chat:1b"\n'
+        '\n[llm.profiles.box]\nprovider = "ollama"\nurl = "http://localhost:11434"\nmodel = "chat:7b"\n',
+        encoding="utf-8")
+
+    with pytest.raises(settings.ConfigError, match=f"{key} of the global config selects 'box'.*{how}"):
+        remove_profile("box")
+
+    assert "box" in _profiles()
+
+
+def test_a_profile_that_nothing_selects_is_removed(home):
+    from fw_context_mcp.config._profiles import remove_profile
+
+    settings._GLOBAL_CONFIG_PATH.write_text(GLOBAL + '\n[llm.profiles.work]\nprovider = "openrouter"\nmodel = "m"\n',
+                                            encoding="utf-8")
+
+    remove_profile("work")
+
+    assert "work" not in _profiles()
+
+
+def test_the_ollama_profile_of_the_machine_goes_with_its_key(home):
+    """Decision of the user, 2026-10-23: before, the last Ollama profile could not be removed after an API default."""
+    from fw_context_mcp.config._profiles import remove_profile
+
+    settings._GLOBAL_CONFIG_PATH.write_text(
+        '[llm]\nprofile = "ds"\nollama_profile = "local"\n\n'
+        '[llm.profiles.ds]\nprovider = "deepseek"\nmodel = "deepseek-flash"\n\n'
+        '[llm.profiles.local]\nprovider = "ollama"\nurl = "http://localhost:11434"\nmodel = "chat:1b"\n',
+        encoding="utf-8")
+
+    remove_profile("local")
+
+    llm = tomllib.loads(settings._GLOBAL_CONFIG_PATH.read_text(encoding="utf-8"))["llm"]
+    assert "local" not in llm["profiles"] and "ollama_profile" not in llm
+
+
+#: An API is the default, and the local Ollama profile is the Ollama profile of this machine.
+MACHINE = (
+    '[llm]\nprofile = "ds"\nollama_profile = "local"\n\n'
+    '[llm.profiles.ds]\nprovider = "deepseek"\nmodel = "deepseek-flash"\n\n'
+    '[llm.profiles.local]\nprovider = "ollama"\nurl = "http://localhost:11434"\nmodel = "chat:1b"\n'
+)
+#: The profile of an Ollama on another computer.
+BOX = '\n[llm.profiles.box]\nprovider = "ollama"\nurl = "http://box.lan:11434"\nmodel = "chat:7b"\n'
+
+
+def _no_local_ollama(monkeypatch) -> None:
+    """The local Ollama gives no model list: it is gone, or it does not run."""
+    monkeypatch.setattr(_diag, "remote_hosts", lambda url: None)
+
+
+def _removal_step(monkeypatch, answer: str, *, confirm: bool = True) -> list[str]:
+    """Run the removal step with *answer*, *confirm* to each question; return the questions."""
+    questions: list[str] = []
+    monkeypatch.setattr(ui, "_input", lambda prompt: answer)
+    monkeypatch.setattr(ui, "_confirm", lambda question, **kwargs: questions.append(question) or confirm)
+    wizard._remove_profiles()
+    return questions
+
+
+def test_the_local_ollama_profile_of_the_machine_stays_while_the_local_ollama_answers(home, monkeypatch, capsys):
+    """Decision of the user, 2026-10-23: the only reason to remove it is that the local Ollama is gone."""
+    settings._GLOBAL_CONFIG_PATH.write_text(MACHINE, encoding="utf-8")
+
+    questions = _removal_step(monkeypatch, "local")
+
+    out = capsys.readouterr().out
+    assert questions == [], questions
+    assert "local: Local Ollama, chat:1b  — in use: the Ollama profile of this machine, and the local Ollama " \
+           "answers" in out, out
+    assert "Before you remove it, select another Ollama profile of this machine with " \
+           "'fw-context llm default <profile> --ollama'" in out, out
+    assert "local" in _profiles()
+
+
+def test_the_step_removes_the_ollama_profile_of_the_machine_when_the_local_ollama_is_gone(home, monkeypatch, capsys):
+    settings._GLOBAL_CONFIG_PATH.write_text(MACHINE, encoding="utf-8")
+    _no_local_ollama(monkeypatch)
+
+    questions = _removal_step(monkeypatch, "local")
+
+    out = capsys.readouterr().out
+    assert "local: Local Ollama, chat:1b  — the Ollama profile of this machine" in out, out
+    assert questions == ["Remove the profile 'local'? The Ollama at http://localhost:11434 does not answer. This machine then has no "
+                         "Ollama profile: 'fw-context llm setup' or 'fw-context llm default <profile> --ollama' "
+                         "selects one"], questions
+    llm = tomllib.loads(settings._GLOBAL_CONFIG_PATH.read_text(encoding="utf-8"))["llm"]
+    assert "local" not in llm["profiles"] and "ollama_profile" not in llm
+
+
+def test_the_question_names_the_profile_that_becomes_the_profile_of_the_machine(home, monkeypatch):
+    """Review, 2026-10-23: without the key, the only Ollama profile left is the profile of the machine."""
+    settings._GLOBAL_CONFIG_PATH.write_text(MACHINE + BOX, encoding="utf-8")
+    _no_local_ollama(monkeypatch)
+
+    questions = _removal_step(monkeypatch, "local", confirm=False)
+
+    assert questions == ["Remove the profile 'local'? The Ollama at http://localhost:11434 does not answer. The Ollama profile of this "
+                         "machine then is 'box' (the Ollama at http://box.lan:11434)"], questions
+
+
+def test_the_profile_of_a_remote_ollama_can_always_go(home, monkeypatch):
+    """Decision of the user, 2026-10-23: also when it is the Ollama profile of this machine."""
+    settings._GLOBAL_CONFIG_PATH.write_text(MACHINE.replace('ollama_profile = "local"', 'ollama_profile = "box"')
+                                            + BOX, encoding="utf-8")
+
+    questions = _removal_step(monkeypatch, "box")
+
+    assert questions == ["Remove the profile 'box'? The Ollama profile of this machine then is 'local'"], questions
+    llm = tomllib.loads(settings._GLOBAL_CONFIG_PATH.read_text(encoding="utf-8"))["llm"]
+    assert "box" not in llm["profiles"] and "ollama_profile" not in llm
+
+
+def test_a_profile_in_use_gets_no_question(home, monkeypatch, capsys):
+    settings._GLOBAL_CONFIG_PATH.write_text(
+        GLOBAL.replace('embed_model = "e:1b"', 'embed_profile = "emb"\nembed_model = "e:1b"')
+        + '\n[llm.profiles.emb]\nprovider = "ollama"\nurl = "http://localhost:11434"\nmodel = "chat:1b"\n',
+        encoding="utf-8")
+    _no_local_ollama(monkeypatch)
+
+    questions = _removal_step(monkeypatch, "local, emb")
+
+    out = capsys.readouterr().out
+    assert questions == [], questions
+    assert "'local' is in use (the default of the projects without their own selection). Before you remove it, " \
+           "select another default in step 2 of 'fw-context llm setup' outside a project, or with " \
+           "'fw-context llm default <profile> --global'\n" in out, out
+    assert "'emb' is in use (the embeddings of the projects without their own selection). Before you remove it, " \
+           "select other embeddings in step 2 of 'fw-context llm setup' outside a project\n" in out, out
+    assert {"local", "emb"} <= set(_profiles())
+
+
+def test_a_profile_with_two_uses_names_each_one(home, monkeypatch, capsys):
+    """The global default is the only Ollama profile, thus the profile of the machine too."""
+    questions = _removal_step(monkeypatch, "local")
+
+    out = capsys.readouterr().out
+    assert questions == [], questions
+    assert "(the default of the projects without their own selection, their embeddings too; the Ollama profile " \
+           "of this machine, and the local Ollama answers)" in out, out
+    assert "'fw-context llm default <profile> --global'; and select another Ollama profile" in out, out
+
+
+def test_a_machine_profile_without_the_key_counts_too(home, monkeypatch):
+    """Without [llm] ollama_profile, the only Ollama profile is the profile of the machine."""
+    settings._GLOBAL_CONFIG_PATH.write_text(MACHINE.replace('ollama_profile = "local"\n', ""), encoding="utf-8")
+
+    assert _removal_step(monkeypatch, "local") == []
+    _no_local_ollama(monkeypatch)
+    assert _removal_step(monkeypatch, "local") == [
+        "Remove the profile 'local'? The Ollama at http://localhost:11434 does not answer. This machine then has no Ollama profile: "
+        "'fw-context llm setup' or 'fw-context llm default <profile> --ollama' selects one"]
+    assert "local" not in _profiles()
+
+
+def test_a_chatgpt_profile_without_a_sign_in_names_no_sign_in(home, monkeypatch):
+    settings._GLOBAL_CONFIG_PATH.write_text(GLOBAL + '\n[llm.profiles.gpt]\nprovider = "chatgpt"\nmodel = "gpt-6-luna"\n',
+                                            encoding="utf-8")
+
+    questions = _removal_step(monkeypatch, "gpt")
+
+    assert questions == ["Remove the profile 'gpt'?"], questions
+
+
+def test_a_signed_in_chatgpt_profile_names_the_sign_in(home, monkeypatch):
+    from fw_context_mcp.llm import chatgpt_plan
+
+    settings._GLOBAL_CONFIG_PATH.write_text(GLOBAL + '\n[llm.profiles.gpt]\nprovider = "chatgpt"\nmodel = "gpt-6-luna"\n',
+                                            encoding="utf-8")
+    monkeypatch.setattr(chatgpt_plan, "load_credentials",
+                        lambda name: SimpleNamespace(signed_in=lambda: True))
+
+    # No to the question: a removal would revoke the sign-in at the server.
+    questions = _removal_step(monkeypatch, "gpt", confirm=False)
+
+    assert questions == ["Remove the profile 'gpt' and its ChatGPT sign-in?"], questions
+    assert "gpt" in _profiles()
+
+
+def test_a_profile_with_an_own_key_names_the_key(home, monkeypatch):
+    settings._GLOBAL_CONFIG_PATH.write_text(GLOBAL + '\n[llm.profiles.work]\nprovider = "openrouter"\nmodel = "m"\n',
+                                            encoding="utf-8")
+    secrets.set_api_key("work", "sk-work")
+
+    questions = _removal_step(monkeypatch, "work")
+
+    assert questions == ["Remove the profile 'work' and its own API key?"], questions
+
+
+def test_llm_remove_has_the_rules_of_the_setup(home, monkeypatch, capsys):
+    """Review, 2026-10-23: the command removed the profile of the machine and told nothing."""
+    from fw_context_mcp.cli._llm import cmd_llm_remove
+
+    settings._GLOBAL_CONFIG_PATH.write_text(MACHINE + BOX, encoding="utf-8")
+
+    assert cmd_llm_remove(argparse.Namespace(profile="local")) == 1
+    assert "Before you remove it, select another Ollama profile of this machine" in capsys.readouterr().err
+    assert "local" in _profiles()
+
+    _no_local_ollama(monkeypatch)
+    assert cmd_llm_remove(argparse.Namespace(profile="local")) == 0
+    out = capsys.readouterr().out
+    assert "[ok] Profile 'local' removed\n  [note] The Ollama profile of this machine then is 'box' " \
+           "(the Ollama at http://box.lan:11434)" in out, out
+    assert "local" not in _profiles()
+
+
+#: A cloud model of the local Ollama.
+CLOUD = '\n[llm.profiles.c]\nprovider = "ollama"\nurl = "http://localhost:11434"\nmodel = "gpt-oss:120b-cloud"\n'
+
+
+def test_the_question_says_that_it_cannot_tell_while_a_cloud_model_has_no_list(home, monkeypatch):
+    """Review, 2026-10-23: a cloud model of an Ollama that does not answer looks like a model of this machine."""
+    settings._GLOBAL_CONFIG_PATH.write_text(MACHINE + CLOUD, encoding="utf-8")
+    _no_local_ollama(monkeypatch)
+
+    questions = _removal_step(monkeypatch, "local", confirm=False)
+
+    assert questions == ["Remove the profile 'local'? The Ollama at http://localhost:11434 does not answer. "
+                         "fw-context cannot tell the Ollama profile of this machine then: the Ollama at "
+                         "http://localhost:11434 gives no model list"], questions
+
+
+def test_another_local_ollama_without_a_list_keeps_a_profile_of_an_ollama_that_answers(home, monkeypatch, capsys):
+    """Review, 2026-10-23: the profile of the other server counted as a second Ollama profile."""
+    settings._GLOBAL_CONFIG_PATH.write_text(
+        MACHINE.replace('ollama_profile = "local"\n', "")
+        + '\n[llm.profiles.c2]\nprovider = "ollama"\nurl = "http://127.0.0.1:11500"\nmodel = "m:cloud"\n',
+        encoding="utf-8")
+    monkeypatch.setattr(_diag, "remote_hosts", lambda url: {} if url.endswith(":11434") else None)
+
+    questions = _removal_step(monkeypatch, "local")
+
+    assert questions == []
+    assert "the Ollama at http://127.0.0.1:11500 gives no model list, thus fw-context cannot tell the Ollama " \
+           "profile of this machine). Before you remove it, start the Ollama at http://127.0.0.1:11500 and " \
+           "repeat, or remove the profiles of that Ollama first" in capsys.readouterr().out
+    assert "local" in _profiles()
+
+
+def test_the_url_of_the_profile_decides_and_not_the_default_port(home, monkeypatch, capsys):
+    settings._GLOBAL_CONFIG_PATH.write_text(MACHINE.replace("localhost:11434", "localhost:11500"), encoding="utf-8")
+    monkeypatch.setattr(_diag, "remote_hosts", lambda url: {} if url.endswith(":11500") else None)
+
+    assert _removal_step(monkeypatch, "local") == []
+    assert "the Ollama profile of this machine, and the local Ollama answers" in capsys.readouterr().out
+
+
+def test_a_removal_that_makes_another_profile_the_profile_of_the_machine_keeps_that_one(home, monkeypatch, capsys):
+    """Two local Ollama profiles and no key: no profile of the machine, until one of them goes."""
+    settings._GLOBAL_CONFIG_PATH.write_text(
+        MACHINE.replace('ollama_profile = "local"\n', "")
+        + '\n[llm.profiles.b]\nprovider = "ollama"\nurl = "http://localhost:11434"\nmodel = "chat:7b"\n',
+        encoding="utf-8")
+
+    questions = _removal_step(monkeypatch, "local, b")
+
+    assert questions == ["Remove the profile 'local'? The Ollama profile of this machine then is 'b'"], questions
+    assert "[skip] The profile 'b' is in use (the Ollama profile of this machine, and the local Ollama answers)" \
+        in capsys.readouterr().out
+    assert set(_profiles()) == {"ds", "b"}
+
+
+def test_llm_remove_names_each_use(home, capsys):
+    """Review, 2026-10-23: the command told one use, and the setup two."""
+    from fw_context_mcp.cli._llm import cmd_llm_remove
+
+    assert cmd_llm_remove(argparse.Namespace(profile="local")) == 1
+    err = capsys.readouterr().err
+    assert "(the default of the projects without their own selection, their embeddings too; the Ollama profile " \
+           "of this machine, and the local Ollama answers)" in err, err
+
+
+#: A cloud model of a second local Ollama, which gives no list in these tests.
+C2 = '\n[llm.profiles.c2]\nprovider = "ollama"\nurl = "http://127.0.0.1:11500"\nmodel = "m:cloud"\n'
+
+
+def test_the_key_decides_the_profile_of_the_machine_while_another_ollama_has_no_list(home, monkeypatch):
+    """Second review, 2026-10-23: the removal was refused with "cannot tell", but the key names 'box'."""
+    settings._GLOBAL_CONFIG_PATH.write_text(
+        MACHINE.replace('ollama_profile = "local"', 'ollama_profile = "box"') + BOX + C2, encoding="utf-8")
+    monkeypatch.setattr(_diag, "remote_hosts", lambda url: {} if url.endswith(":11434") else None)
+
+    assert _removal_step(monkeypatch, "local") == ["Remove the profile 'local'?"]
+    assert "local" not in _profiles()
+
+
+def test_the_global_ollama_default_decides_while_another_ollama_has_no_list(home, monkeypatch, capsys):
+    settings._GLOBAL_CONFIG_PATH.write_text(
+        GLOBAL + '\n[llm.profiles.b]\nprovider = "ollama"\nurl = "http://localhost:11434"\nmodel = "chat:7b"\n'
+        + C2, encoding="utf-8")
+    monkeypatch.setattr(_diag, "remote_hosts", lambda url: {} if url.endswith(":11434") else None)
+
+    assert _removal_step(monkeypatch, "b") == ["Remove the profile 'b'?"]
+    assert "1. local: Local Ollama, chat:1b  — in use: the default of the projects without their own selection, " \
+           "their embeddings too; the Ollama profile of this machine, and the local Ollama answers" \
+        in capsys.readouterr().out
+
+
+def test_no_cannot_tell_when_the_key_stays(home, monkeypatch):
+    """Second review, 2026-10-23: the question said "cannot tell", but the profile of the machine stays 'box'."""
+    settings._GLOBAL_CONFIG_PATH.write_text(
+        MACHINE.replace('ollama_profile = "local"', 'ollama_profile = "box"') + BOX + CLOUD, encoding="utf-8")
+    _no_local_ollama(monkeypatch)
+
+    assert _removal_step(monkeypatch, "local", confirm=False) == [
+        "Remove the profile 'local'? The Ollama at http://localhost:11434 does not answer."]

@@ -153,7 +153,7 @@ def test_the_global_settings_are_shown_and_enter_keeps_them(project, monkeypatch
 
     assert f"LLM: {GLOBAL_SUMMARY} (from the global config)" in out, out
     assert "not configured" not in out, out
-    assert "the LLM analysis: where it runs (Enter: keep local)" in out, out
+    assert "Enter keeps local:" in out, out
     assert "[ok] LLM analysis: the current setting stays" in out, out
     assert "[ok] Embeddings: the current setting stays" in out, out
     assert _local_llm(project) == {}
@@ -177,8 +177,8 @@ def test_option_0_removes_the_backend_keys_of_local_toml(project, monkeypatch, c
     out = _run(monkeypatch, capsys, project, ["y", "", "0", "0"])
 
     assert "(set in .fw-context/local.toml) (already configured)" in out, out
-    assert "0. the global settings (removes the profile of .fw-context/local.toml)" in out, out
-    assert "0. the global settings (removes embed_profile and embed_model of .fw-context/local.toml)" in out, out
+    assert "0. the global settings: remove the selection of this project (.fw-context/local.toml)" in out, out
+    assert "0. the global settings: remove the embeddings of this project (.fw-context/local.toml)" in out, out
     assert "removed the profile of .fw-context/local.toml" in out, out
     assert "[ok] Embeddings: the global settings apply" in out, out
     assert _local_llm(project) == {"analyze_symbols": False}, "a key that does not select the backend stays"
@@ -492,4 +492,4 @@ def test_option_d_gives_no_ok_when_local_toml_cannot_be_written(project, monkeyp
 
     assert "[warn] .fw-context/local.toml cannot be changed (read-only). Nothing was changed." in out, out
     # The list of the embeddings comes after "d": its Enter says "[ok] ... stays".
-    assert "[ok]" not in out.split("the embeddings: where they run")[0], out
+    assert "[ok]" not in out.split("the embeddings: the service")[0], out
