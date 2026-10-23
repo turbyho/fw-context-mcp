@@ -367,10 +367,11 @@ def detect_build_system(project_root: Path) -> str | None:
 
     Delegates to the ``BuildSystemRegistry`` — each registered builder's
     ``markers`` list is scored by how many markers exist in *project_root*.
-    The builder with the highest score wins.
+    The builder with the highest score wins.  On a tie, the builder that
+    was registered first wins, because ``max`` keeps the first maximum.
 
-    Returns one of ``"mbed-os"``, ``"zephyr"``, ``"platformio"``, or
-    ``None`` when nothing is recognised.
+    Returns the ``config_key`` of the builder that wins, or ``None`` when
+    no marker is in *project_root*.
     """
     root = project_root.resolve()
     scores: dict[str, int] = {}
@@ -381,7 +382,7 @@ def detect_build_system(project_root: Path) -> str | None:
             continue
         markers: list[str] = getattr(builder_cls, "markers", [])
         for marker in markers:
-            if (root / marker).exists():
+            if _marker_present(root, marker):
                 scores[config_key] = scores.get(config_key, 0) + 1
 
     if not scores:
@@ -389,6 +390,20 @@ def detect_build_system(project_root: Path) -> str | None:
 
     # Return the system with the most markers matched
     return max(scores, key=lambda k: scores[k])
+
+
+def _marker_present(root: Path, marker: str) -> bool:
+    """Return True when *marker* names a file or directory in *root*.
+
+    A marker with a glob character is a pattern: a Keil or IAR project
+    file has the name of the project (``Blinky.uvprojx``), so no literal
+    name can find it.  These markers were literal names before, and
+    detection never found a Keil or an IAR project.  A plain name stays
+    a direct test, because a glob of ``root`` costs a directory listing.
+    """
+    if any(char in marker for char in "*?["):
+        return next(root.glob(marker), None) is not None
+    return (root / marker).exists()
 
 
 # ---------------------------------------------------------------------------

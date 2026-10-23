@@ -40,7 +40,7 @@ class IARBuildSystem:
 
     name: str = "IAR EWARM"
     config_key: str = "iar-ewarm"
-    markers: list[str] = [".ewp", ".eww"]
+    markers: list[str] = ["*.ewp", "*.eww"]
 
     @classmethod
     def detect(cls, project_root: Path) -> bool:

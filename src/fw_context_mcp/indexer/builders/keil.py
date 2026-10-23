@@ -38,7 +38,7 @@ class KeilBuildSystem:
 
     name: str = "Keil MDK"
     config_key: str = "keil-mdk"
-    markers: list[str] = [".uvprojx"]
+    markers: list[str] = ["*.uvprojx"]
 
     @classmethod
     def detect(cls, project_root: Path) -> bool:

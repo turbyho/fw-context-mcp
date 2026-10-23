@@ -49,6 +49,24 @@ class TestDetectBuildSystem:
         (tmpdir / "west.yml").write_text("manifest:\n")
         assert detect_build_system(tmpdir) == "mbed-os"
 
+    def test_keil_detected_by_the_name_of_its_project_file(self, tmp_path):
+        """A Keil project file has the name of the project, not a fixed name.
+
+        The marker was the literal name ``.uvprojx``, which no real project
+        has, thus detection never found a Keil project.
+        """
+        (tmp_path / "Blinky.uvprojx").write_text("<Project/>\n")
+        assert detect_build_system(tmp_path) == "keil-mdk"
+
+    def test_iar_detected_by_the_name_of_its_project_file(self, tmp_path):
+        (tmp_path / "Blinky.ewp").write_text("<project/>\n")
+        (tmp_path / "Blinky.eww").write_text("<workspace/>\n")
+        assert detect_build_system(tmp_path) == "iar-ewarm"
+
+    def test_glob_marker_does_not_match_a_file_of_another_type(self, tmp_path):
+        (tmp_path / "notes.uvprojx.txt").write_text("")
+        assert detect_build_system(tmp_path) is None
+
 
 class TestParseMbedDotfile:
     def test_parses_valid_file(self, tmpdir):
