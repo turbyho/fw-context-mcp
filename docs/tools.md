@@ -907,6 +907,14 @@ without `config` does not repair the config files.
   [`[llm.models]`](configuration.md#llmmodels-and-llmembed_models--the-list-of-the-models-of-ollama)).
   Not critical. `--fix` adds, updates and removes the entries of
   fw-context, and keeps each entry that you changed or added.
+- `gpu-tools` — on Linux, `nvidia-smi` gives the GPU memory on a machine
+  with an NVIDIA GPU. Without it, the recommendation of a model counts no
+  GPU. `degraded` with the package to install when `nvidia-smi` is not
+  installed (`nvidia-utils` on Arch and Manjaro, `nvidia-smi` on Debian),
+  or with its error and the usual causes when it fails (a driver update
+  without a restart, the kernel driver nouveau). No fix, because the
+  install needs root. `skipped` without an NVIDIA GPU, when no model of
+  the config runs on the Ollama of this machine, and on Windows and macOS.
 - `ollama` — the Ollama server answers. `skipped` when the LLM is off.
 - `chat-model` — the chat model is installed on the Ollama server of the
   chat calls. For an API profile and the ChatGPT plan: the model list of
