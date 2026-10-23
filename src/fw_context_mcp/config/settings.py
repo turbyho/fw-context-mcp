@@ -1850,7 +1850,9 @@ def _drop_selection_keys(layer: dict, path: Path) -> None:
     WHY a warning and not an error: an older ``config.toml`` keeps working.
     WHY not silence: the operator who wrote the key expects that it selects
     a build, and a query without a selector now gets a refusal that lists
-    the builds.  The file of the user is not changed.
+    the builds.  The loader does not change the file: the cleanup does
+    (``housekeeping.RETIRED_KEYS``), at the next ``fw-context index``,
+    ``fw-context cleanup`` or ``fw-context doctor --fix``.
 
     WHY a ``[[build.variants]]`` table too: such a table copies each key
     that is not an ``[index]`` field into its ``[build]`` overrides, and
@@ -1870,7 +1872,8 @@ def _drop_selection_keys(layer: dict, path: Path) -> None:
         _selection_keys_warned.add(path)
         log.warning(
             "%s: [build] %s %s no effect. A query names its build with variant and image, "
-            "and fw-context selects none. You can remove %s.",
+            "and fw-context selects none. The next 'fw-context index', 'fw-context cleanup' or "
+            "'fw-context doctor --fix' removes %s.",
             path, ", ".join(found), "has" if len(found) == 1 else "have", "it" if len(found) == 1 else "them",
         )
 

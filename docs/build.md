@@ -422,8 +422,9 @@ Shared `[build]` keys for multi-variant projects:
 The keys `[build] default_variant` and `[build] default_image` are
 retired. They have no effect: a query names its build, and fw-context
 selects none. The config loader ignores the two keys and logs a warning
-that they have no effect. It does not change your config file, thus you
-can remove the keys yourself.
+that they have no effect. The cleanup of `fw-context index`,
+`fw-context cleanup` and `fw-context doctor --fix` removes them from the
+file, see [Obsolete keys and files](configuration.md#obsolete-keys-and-files).
 
 Variant overrides merge with the shared `[build]` section by type. A
 scalar value (such as `board`) replaces the shared value. A list value

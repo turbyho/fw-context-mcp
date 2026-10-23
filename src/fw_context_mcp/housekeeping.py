@@ -68,6 +68,11 @@ RETIRED_KEYS: tuple[RetiredKey, ...] = (
     # Each build goes to .fw-context/build/<variant>/out; the key had no
     # effect, and an index run refused a config that held it.
     RetiredKey("build", "build_dir", "build layout .fw-context/build/<variant>/out", in_variants=True),
+    # The build of a query that names none (2026-10): a query names its
+    # build, and fw-context selects none; the loader ignored the keys and
+    # gave a warning at each start of a process.
+    RetiredKey("build", "default_variant", "one query, one build", in_variants=True),
+    RetiredKey("build", "default_image", "one query, one build", in_variants=True),
 )
 
 #: The config files that got a ``.bak`` copy in the current run of the

@@ -162,8 +162,8 @@ variant name needs only `image`. See
 [A project of several builds](tools.md#mcp-tools). The keys
 `[build] default_variant` and `[build] default_image` are retired, and
 they have no effect. The config loader ignores them and logs a warning
-that they have no effect. It does not change your config file, thus you
-can remove the keys yourself.
+that they have no effect. The cleanup removes them from the file, see
+[Obsolete keys and files](#obsolete-keys-and-files).
 
 ```toml
 [build]
@@ -609,6 +609,7 @@ fw-context removes the config keys and the files that an older release wrote and
 | `[index] query_driver`, `query_driver_extra`, `query_driver_auto` | each config file, also in `[[build.variants]]` |
 | `[llm] allow_external_llm` | each config file |
 | `[build] build_dir` | each config file, also in `[[build.variants]]` |
+| `[build] default_variant`, `default_image` | each config file, also in `[[build.variants]]` |
 | `[index] compile_commands` with the value `compile_commands.json` or `.fw-context/build/compile_commands.json` | `config.toml` and `local.toml` of the project, when two conditions are true. fw-context runs the build of the project: for a stub build (for example STM32CubeIDE), the value names the database of the project. And the files below it give such a value too, or none: else the removal brings up the value of a lower file. The global config keeps the key, because it applies to each project, a stub project too. |
 | `.fw-context/toolchains.toml` | the project |
 | The build output of the older layout (`.fw-context/autobuild/`, the files directly in `.fw-context/build/`), see [build.md](build.md) | the project. A database that a build of the index reads stays. |
