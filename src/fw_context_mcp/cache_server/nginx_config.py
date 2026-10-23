@@ -32,6 +32,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from ..cache_limits import MAX_BODY_BYTES
+
 log = logging.getLogger(__name__)
 
 NGINX_SITES_AVAILABLE = Path("/etc/nginx/sites-available")
@@ -184,6 +186,15 @@ def generate_nginx_config(domain: str, proxy_port: int = 8000) -> str:
     chain.  ``X-Forwarded-Proto`` tells the backend whether the
     original request was HTTPS — needed if the backend ever generates
     absolute URLs.
+
+    Why client_max_body_size?
+    -------------------------
+    Without it, nginx uses its default of 1 MB and answers 413 before
+    the request gets to the server.  The server takes a body of up to
+    ``MAX_BODY_BYTES`` (10 MB), and the client fills a batch to 80 % of
+    that value.  Thus a large batch failed behind the proxy, and the
+    direct connection accepted it.  The value is in bytes, so that nginx
+    and the server use the same limit with no rounding.
     """
     _validate_domain(domain)
     return f"""# fw-context Cache Server — nginx reverse proxy
@@ -210,6 +221,7 @@ server {{
     ssl_ciphers         HIGH:!aNULL:!MD5;
 
     limit_req zone=fw_context_cache burst=20 nodelay;
+    client_max_body_size {MAX_BODY_BYTES};
 
     location / {{
         proxy_pass http://fw_cache_backend;

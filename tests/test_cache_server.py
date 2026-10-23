@@ -184,6 +184,18 @@ class TestNginxConfig:
         assert "listen 443 ssl" in config
         assert "limit_req" in config
 
+    def test_nginx_body_limit_is_the_limit_of_the_server(self) -> None:
+        """nginx must not refuse a body that the server takes.
+
+        Without ``client_max_body_size`` nginx keeps its default of 1 MB,
+        and a batch of the client (up to 80 % of 10 MB) got 413 from the
+        proxy.
+        """
+        from fw_context_mcp.cache_limits import MAX_BODY_BYTES
+        from fw_context_mcp.cache_server.nginx_config import generate_nginx_config
+        config = generate_nginx_config("fw-cache.example.com")
+        assert f"client_max_body_size {MAX_BODY_BYTES};" in config
+
 
 class TestInstall:
     def test_generate_systemd_unit(self) -> None:
