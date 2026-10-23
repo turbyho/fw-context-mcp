@@ -1089,7 +1089,9 @@ fw-context llm recommend [--again]       # measure the local models, recommend a
 
 - `setup` asks questions, thus it needs a terminal. It has the two steps
   of the LLM step of `fw-context init` (without a project, each choice is
-  the global default), then asks for the profiles to remove.
+  the global default), then a step 3 that removes the profiles that you
+  do not use. It does not remove a profile in use, with the rules of
+  `remove`.
 - `list` marks the global default and the profile of the project, shows
   `⚠ <host>` for a profile that sends the source code to another host
   (also a cloud model of Ollama), and names the command for a profile
@@ -1110,13 +1112,20 @@ fw-context llm recommend [--again]       # measure the local models, recommend a
   [The recommendation of a model](configuration.md#the-recommendation-of-a-model)).
   `--again` measures each installed model again.
 - `remove` refuses a profile that `[llm] profile` or `[llm] embed_profile`
-  of the global config selects. The key of a provider
-  (`provider:<name>`) stays, because the other profiles of that provider
-  use it.
+  of the global config selects. It also refuses the local Ollama profile
+  of this machine while the local Ollama answers: select another one with
+  `default <profile> --ollama` first. While another Ollama on this
+  machine gives no model list, it refuses each profile of a local Ollama
+  that answers: fw-context then cannot tell the Ollama profile of this
+  machine. The profile of an Ollama on another computer can always go.
+  When `[llm] ollama_profile` names the profile, the removal removes that
+  key too. When the removal changes the Ollama profile of this machine, a
+  note tells what it is then. The key of a provider (`provider:<name>`)
+  stays, because the other profiles of that provider use it.
 
 Exit codes: 0 when the command did its work; 1 for a profile that does
-not exist or does not answer, no terminal for `setup`, or a config file
-that cannot be used.
+not exist, is in use (`remove`) or does not answer (`test`), no terminal
+for `setup`, or a config file that cannot be used.
 
 ### `fw-context llm key`
 
