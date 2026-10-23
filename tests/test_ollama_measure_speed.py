@@ -66,8 +66,8 @@ def test_a_request_of_the_same_prompt_loads_the_model_before_the_reference_reque
     assert [request["options"]["num_predict"] for request in sent] == [1, ollama._REFERENCE_ANSWER_TOKENS]
     assert all(request["prompt"].endswith(ollama._REFERENCE_PROMPT) for request in sent)
     assert {request["options"]["num_ctx"] for request in sent} == {8192}
-    assert {(request["keep_alive"], request["timeout"], request["truncate"]) for request in sent} == {
-        ("5m", 77.0, False)}
+    assert {(request["keep_alive"], request["timeout"], request["truncate"], request["think"])
+            for request in sent} == {("5m", 77.0, False, False)}
 
 
 def test_each_reference_request_has_a_new_first_line(monkeypatch):

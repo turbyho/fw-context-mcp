@@ -110,6 +110,9 @@ def test_the_count_comes_from_the_server(answer, count):
         assert get_chat_client(LLMConfig()).count_tokens("p", 16384) == count
     assert sent["options"] == {"num_ctx": 16384, "num_predict": 1}
     assert sent["truncate"] is False
+    # Measured 2026-10-23: gemma4:26b counted 3 tokens more without "think": false, the prompt of
+    # the analysis is the one with it.
+    assert sent["think"] is False
 
 
 def test_an_openai_endpoint_gives_no_count():
@@ -196,3 +199,31 @@ def test_a_stop_of_the_run_is_not_wrapped(stream):
             pytest.raises(IndexTerminated):
         call_llm("p", LLMConfig(stream=stream))
     assert is_fatal(IndexTerminated("x"))
+
+
+def test_the_request_turns_off_the_thinking_of_the_model():
+    """Measured 2026-10-23 with gemma4:26b, which thinks by default: without "think": false it wrote its
+    reasoning first, used each of the 1024 answer tokens, and gave an empty response for each symbol.
+    """
+    sent: dict = {}
+
+    def post(url, json=None, **_):
+        sent.update(json)
+        return _response(200, {"response": "ok"})
+
+    with mock.patch.object(ollama.httpx, "post", side_effect=post):
+        call_llm("p", LLMConfig(num_ctx=16384))
+    assert sent["think"] is False
+
+
+def test_a_streamed_request_turns_off_the_thinking_too():
+    sent: dict = {}
+
+    @contextmanager
+    def stream(method, url, json=None, **_):
+        sent.update(json)
+        yield httpx.Response(200, content=b'{"response": "ok", "done": true}\n', request=httpx.Request(method, url))
+
+    with mock.patch.object(ollama.httpx, "stream", side_effect=stream):
+        call_llm("p", LLMConfig(stream=True))
+    assert sent["think"] is False

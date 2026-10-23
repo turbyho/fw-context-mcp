@@ -14,7 +14,8 @@ same within the noise; fewer major errors for each model but the last.
 
 A format skeleton with placeholders keeps the answer a flat JSON array:
 30 of 30 answers parsed for each of the four models.  The measurement sent
-"think": false (gpt-oss: "low"), which the analysis does not send.  The rules ask for
+"think": false (gpt-oss: "low").  Since 2026-10-23 the analysis sends
+"think": false too (``llm.ollama.OllamaClient``); gpt-oss ignores it.  The rules ask for
 the facts of the input only, and name what a firmware developer needs:
 blocking waits, changes of the hardware state, memory ownership.
 

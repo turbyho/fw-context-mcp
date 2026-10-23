@@ -329,6 +329,14 @@ class OllamaClient:
     count of its tokens (:class:`OllamaPromptTooLong`), thus the caller can
     select a larger context.
 
+    Each request also turns off the thinking of the model (``think:
+    false``).  Measured 2026-10-23 with gemma4:26b, which thinks by default:
+    the model wrote its reasoning first, used each answer token, and the
+    response was empty for each symbol.  The answer has no use for the
+    reasoning.  A model without thinking accepts the key (measured with
+    qwen2.5-coder:14b).  gpt-oss ignores it: it knows only the levels of
+    thinking.
+
     Streaming (when ``cfg.stream`` is True, Plan B): ``httpx.stream()``
     with newline-delimited JSON chunks.  Without it, the request sends
     ``stream: false``; an answer that streams anyway is parsed as a stream
@@ -376,6 +384,7 @@ class OllamaClient:
             "prompt": prompt,
             "stream": False,
             "truncate": False,
+            "think": False,
             "keep_alive": cfg.keep_alive,
             "options": options,
         }
@@ -519,7 +528,9 @@ class OllamaClient:
         note_chat_use(self.server_url, self.cfg.model)
         cfg, url = self.cfg, self.generate_url
         payload = {
-            "model": cfg.model, "prompt": prompt, "stream": False, "truncate": False,
+            # "think": false as in ``generate``: the template of a thinking
+            # model depends on it (gemma4:26b: 3 tokens more without it).
+            "model": cfg.model, "prompt": prompt, "stream": False, "truncate": False, "think": False,
             "keep_alive": cfg.keep_alive, "options": {"num_ctx": num_ctx, "num_predict": 1},
         }
         try:
@@ -922,7 +933,9 @@ def measure_speed(server_url: str, model: str, num_ctx: int, *, keep_alive: str,
     llama.cpp in the answer, not from the time of the HTTP request.  Each
     request goes through ``ollama_guard`` with the timeout and the
     ``stream`` of the profile, as each request of the analysis: a proxy
-    can cut a slow answer that does not stream.
+    can cut a slow answer that does not stream.  It also sends
+    ``think: false``, as the analysis (``OllamaClient``): the measure is
+    the speed of the answer that the analysis gets.
     """
     base = server_url.rstrip("/")
     options = {"num_ctx": num_ctx, "temperature": 0, "seed": 42}
@@ -933,7 +946,7 @@ def measure_speed(server_url: str, model: str, num_ctx: int, *, keep_alive: str,
             prompt = f"Request {time.monotonic_ns()}-{next(_REQUEST_NUMBERS)}.\n{_REFERENCE_PROMPT}"
             with ollama_guard():
                 resp = httpx.post(f"{base}/api/generate", json={
-                    "model": model, "prompt": prompt, "stream": stream, "truncate": False,
+                    "model": model, "prompt": prompt, "stream": stream, "truncate": False, "think": False,
                     "keep_alive": keep_alive, "options": {**options, "num_predict": tokens}}, timeout=timeout)
             if resp.status_code != 200:
                 error = _error_text(resp)
