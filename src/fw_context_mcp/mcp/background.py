@@ -166,8 +166,8 @@ _REINDEX_RECORD_START = re.compile(
 )
 
 # How much of the tail to read.  A record start must be inside it, and a
-# failed build can quote up to 500 characters of another tool's stderr
-# ahead of one — see the docstring below.  64 KiB holds hundreds of lines
+# failed build can quote up to 2000 characters of each stream of another
+# tool ahead of one (``utils._BUILD_OUTPUT_TAIL``) — see the docstring below.  64 KiB holds hundreds of lines
 # and keeps a multi-megabyte log off the query path.
 _REINDEX_TAIL_BYTES = 65536
 
@@ -184,9 +184,10 @@ def read_reindex_progress(db_dir: Path) -> str | None:
     and ``fw-context watch status`` — reported that text as the progress.
 
     The error text of fw-context is not safe to take either.  When a build
-    command fails, ``utils.run_build`` puts 500 characters of the tool's
-    stderr into the message, so the record ends on a line that fw-context
-    printed but did not write.
+    command fails, ``utils.run_build_command`` puts up to 2000 characters
+    of the stdout and of the stderr of the tool into the message
+    (``utils._BUILD_OUTPUT_TAIL``), so the record ends on a line that
+    fw-context printed but did not write.
 
     So this reads backwards for the newest line that STARTS a fw-context
     record and gives that line.  After a failed build it is the
