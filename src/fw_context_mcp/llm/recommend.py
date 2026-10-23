@@ -61,17 +61,27 @@ class Role:
 CHAT = Role("chat", "models", 0.2)
 EMBEDDING = Role("embedding", "embed_models", 0.05)
 
-#: The GPU memory that a model does not get for its weights: the KV cache
-#: of a context of 4096, the buffers of llama.cpp, and the desktop and the
-#: other programs.  An estimate from the measurement of 2026-10-21 at 4096
-#: on a GPU of 12282 MiB with 2.7 GiB used by the desktop: gemma4:12b (7629
-#: MiB of weights) ran at 3.7 s/symbol, qwen2.5-coder:14b (8583 MiB) and
-#: phi4:14b (8678 MiB) at 12 to 13 s/symbol, thus partly from RAM.
-GPU_RESERVE_MIB = 4096
+#: The GPU memory that a model does not get for its weights, apart from the
+#: other programs: the KV cache of a context of 4096 and the buffers of
+#: llama.cpp.  From the measurement of 2026-10-21 at 4096 on a GPU of 12282
+#: MiB with 2.7 GiB (2765 MiB) used by the desktop: gemma4:12b (7629 MiB of
+#: weights) ran at 3.7 s/symbol, qwen2.5-coder:14b (8583 MiB) and phi4:14b
+#: (8678 MiB) at 12 to 13 s/symbol, thus partly from RAM.  The reserve of
+#: that machine was 4096 MiB in all: 4096 - 2765 = 1331 MiB for the model.
+RUNTIME_RESERVE_MIB = 4096 - 2765
 
-#: The RAM that the system and the other programs keep.  An estimate:
-#: a model is "GPU + RAM" when its part outside the GPU fits in the RAM
-#: without it.
+#: The GPU memory of the other programs when ``nvidia-smi`` does not tell
+#: it (``Memory.gpu_others_mib`` None: Apple Silicon, Windows WDDM): the
+#: desktop of the measurement above.  WHY not 0: an estimate that gives a
+#: model that does not fit costs a slow run; one that is too small costs
+#: only a smaller model.
+OTHERS_ESTIMATE_MIB = 2765
+
+#: The RAM that the system and the other programs keep, when the RAM that
+#: is available now is not known (``Memory.ram_available_mib`` None, macOS).
+#: An estimate: a model is "GPU + RAM" when its part outside the GPU fits
+#: in the RAM without it.  It holds the KV cache and the buffers of
+#: llama.cpp too.  With the RAM of now, ``RUNTIME_RESERVE_MIB`` holds them.
 RAM_RESERVE_MIB = 8 * 1024
 
 _MIB_PER_GB = 1e9 / (1024 * 1024)
@@ -188,20 +198,31 @@ def choose(candidates: list[Candidate], role: Role, speed_tolerance: float = SPE
 def estimate(weights_gb: float | None, moe: bool, memory: Memory | None) -> Fit | None:
     """Return where a model of *weights_gb* runs on a machine of *memory*, or None (not known, does not fit).
 
-    See ``GPU_RESERVE_MIB`` and ``RAM_RESERVE_MIB``.  A machine with
-    unified memory (Apple Silicon) runs the model in its GPU part.
+    The GPU gives its memory without ``RUNTIME_RESERVE_MIB`` and without
+    the memory that other programs hold now (``Memory.gpu_others_mib``,
+    else ``OTHERS_ESTIMATE_MIB``).  The RAM gives the memory that is
+    available now (``Memory.ram_available_mib``) without
+    ``RUNTIME_RESERVE_MIB``, else its size without ``RAM_RESERVE_MIB``.
+    WHY the runtime reserve on the RAM side too: the KV cache and the
+    buffers of the part outside the GPU are in the RAM, and a model that
+    takes all of the available RAM swaps.  WHY the memory of now (decision of the user,
+    2026-10-23): the other programs hold another amount on each machine
+    and at each time.  The estimate thus describes the moment of the
+    call.  A machine with unified memory (Apple Silicon) runs the model in
+    its GPU part.
     """
     if weights_gb is None or memory is None:
         return None
     weights = weights_gb * _MIB_PER_GB
-    # The reserve is of the GPU only: without a GPU, the RAM reserve holds
-    # the KV cache and the other programs.
-    gpu = max(0, (memory.gpu_mib or 0) - GPU_RESERVE_MIB)
+    others = memory.gpu_others_mib if memory.gpu_others_mib is not None else OTHERS_ESTIMATE_MIB
+    gpu = max(0, (memory.gpu_mib or 0) - RUNTIME_RESERVE_MIB - others)
     if weights <= gpu:
         return Fit.GPU
     if memory.unified or memory.ram_mib is None:
         return None
-    if weights - gpu <= memory.ram_mib - RAM_RESERVE_MIB:
+    ram = (memory.ram_available_mib - RUNTIME_RESERVE_MIB if memory.ram_available_mib is not None
+           else memory.ram_mib - RAM_RESERVE_MIB)
+    if weights - gpu <= ram:
         return Fit.MOE_IN_RAM if moe else Fit.DENSE_IN_RAM
     return None
 

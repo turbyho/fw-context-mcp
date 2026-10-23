@@ -162,7 +162,7 @@ def run_full_check(
                     message=f"the config file {problem.path} cannot be used (check config)",
                     critical=False,
                 )
-            elif name in ("ollama", "chat-model", "embed-model"):
+            elif name in ("ollama", "chat-model", "embed-model", "gpu-tools"):
                 r = fn(ctx["cfg"].llm)
             elif name == "llm-recommend":
                 r = fn(ctx["cfg"].llm, measure_progress)
@@ -191,7 +191,8 @@ def run_full_check(
 #: ``obsolete-files`` is not one of them: it catches the error of ``load``,
 #: and it reports a config file that it cannot parse.  A skip hides that
 #: result.
-_NEEDS_CONFIG = frozenset({"ollama", "chat-model", "embed-model", "llm-recommend", "db-integrity", "disk-space"})
+_NEEDS_CONFIG = frozenset({"ollama", "chat-model", "embed-model", "llm-recommend", "db-integrity", "disk-space",
+                           "gpu-tools"})
 
 
 def load_project_config(project_root: str | Path | None = None) -> Config:
@@ -334,6 +335,7 @@ def _recheck(name: str, project_root: str | Path | None = None) -> DepCheckResul
         check_config,
         check_db_integrity,
         check_disk_space,
+        check_gpu_tools,
         check_libclang_python,
         check_libclang_so,
         check_llm_models,
@@ -358,7 +360,7 @@ def _recheck(name: str, project_root: str | Path | None = None) -> DepCheckResul
         return check_config(None, project_root)
 
     cfg = None
-    if name in ("ollama", "chat-model", "embed-model", "llm-recommend"):
+    if name in ("ollama", "chat-model", "embed-model", "llm-recommend", "gpu-tools"):
         cfg = load_project_config(project_root)
 
     _map: dict = {
@@ -370,6 +372,7 @@ def _recheck(name: str, project_root: str | Path | None = None) -> DepCheckResul
         "clang-resource": check_clang_resource,
         "watchfiles": check_watchfiles,
         "tomli-w": check_tomli_w,
+        "gpu-tools": lambda: check_gpu_tools(cfg.llm) if cfg else DepCheckResult("gpu-tools", "skipped", "no config"),
         "ollama": lambda: check_ollama_running(cfg.llm) if cfg else DepCheckResult("ollama", "skipped", "no config"),
         "chat-model": lambda: check_ollama_chat_model(cfg.llm) if cfg else DepCheckResult("chat-model", "skipped", "no config"),
         "embed-model": lambda: check_ollama_embed_model(cfg.llm) if cfg else DepCheckResult("embed-model", "skipped", "no config"),

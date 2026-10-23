@@ -1,14 +1,14 @@
-"""The setup of the LLM services (``cli/_llm_wizard.py``), the memory of the machine, and ``fw-context llm``.
+"""The setup of the LLM services (``cli/_llm_wizard.py``) and ``fw-context llm``.
 
 No test sends a request out: the Ollama lists, the test request, the
 GPU query and the keyring are replaced (the keyring of the session fails
-each call, thus a key goes to secrets.toml of the test directory).
+each call, thus a key goes to secrets.toml of the test directory).  The
+memory of the machine: ``test_hardware.py``.
 """
 
 from __future__ import annotations
 
 import argparse
-import subprocess
 import tomllib
 from pathlib import Path
 
@@ -100,24 +100,6 @@ def _run(home: Path):
 #: The answers of run_wizard after the services when the user keeps each
 #: setting: the list of the LLM analysis, the list of the embeddings, the removal.
 KEEP = ["", "", ""]
-
-
-# ── The memory of the machine ──
-
-
-def test_the_largest_nvidia_gpu_counts(monkeypatch):
-    monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout="8192\n12282\n"))
-
-    assert hardware._nvidia_mib() == 12282
-
-
-def test_no_nvidia_smi_is_no_gpu(monkeypatch):
-    def _missing(*args, **kwargs):
-        raise FileNotFoundError("nvidia-smi")
-
-    monkeypatch.setattr(subprocess, "run", _missing)
-
-    assert hardware._nvidia_mib() is None
 
 
 # ── The chat of one run: the embeddings stay ──

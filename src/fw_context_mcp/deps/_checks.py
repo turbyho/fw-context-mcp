@@ -17,6 +17,7 @@ from __future__ import annotations
 import importlib
 import importlib.metadata
 import sqlite3
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -711,6 +712,101 @@ def check_tomli_w() -> DepCheckResult:
     )
 
 
+#: The PCI vendor id of NVIDIA, and the PCI class of a display controller
+#: (``0x03`` and a subclass), as ``/sys/bus/pci/devices/*/`` gives them.
+_NVIDIA_VENDOR = "0x10de"
+_DISPLAY_CLASS_PREFIX = "0x03"
+_PCI_DEVICES = Path("/sys/bus/pci/devices")
+
+
+def check_gpu_tools(cfg) -> DepCheckResult:
+    """Check that ``nvidia-smi`` gives the GPU memory on a Linux machine with an NVIDIA GPU.
+
+    WHY: the recommendation of a model reads the GPU memory with it
+    (``llm.hardware``); without it, the machine counts as a machine without
+    a GPU, and the setup recommends a small model.  WHY no fix: the tool is
+    a part of the NVIDIA driver, not a Python package; its install needs
+    the package manager of the system and root, and fw-context runs no
+    command as root.  Thus the check names the package, or, for a tool
+    that is installed and fails, the usual cause (the proprietary driver of
+    Arch and Manjaro always brings it, thus a failure there is a driver
+    update without a restart, or the kernel driver nouveau).  WHY only when
+    a model of *cfg* (``LLMConfig``) runs on the Ollama of this machine:
+    else the recommendation does not read the GPU.  WHY Linux only: on
+    Windows the driver installs ``nvidia-smi``, and macOS has no NVIDIA
+    driver for Ollama.
+    """
+    if sys.platform != "linux":
+        return DepCheckResult(name="gpu-tools", status="skipped", critical=False,
+                              message="only on Linux: the NVIDIA driver of Windows has nvidia-smi, and macOS has "
+                                      "no NVIDIA driver")
+    if not _local_ollama_used(cfg):
+        return DepCheckResult(name="gpu-tools", status="skipped", critical=False,
+                              message="no model of the config runs on the Ollama of this machine")
+    if not _nvidia_gpu_present():
+        return DepCheckResult(name="gpu-tools", status="skipped", critical=False, message="no NVIDIA GPU")
+    from ..llm.hardware import nvidia_gpu, nvidia_smi_problem
+
+    problem = nvidia_smi_problem()
+    if problem is None:
+        gpu = nvidia_gpu()
+        return DepCheckResult(name="gpu-tools", status="ok", critical=False,
+                              message=f"nvidia-smi: {gpu.total_mib} MiB" if gpu else "nvidia-smi")
+    if problem.missing:
+        instructions = (
+            "nvidia-smi is a part of the NVIDIA driver. Install the driver utilities of your system:\n"
+            "  Arch, Manjaro: sudo pacman -S nvidia-utils\n"
+            "  Debian: sudo apt install nvidia-smi\n"
+            "  another system: find the package that has nvidia-smi (apt-file search nvidia-smi, "
+            "dnf provides '*/nvidia-smi')"
+        )
+        message = ("this machine has an NVIDIA GPU, but nvidia-smi is not installed: the recommendation of a "
+                   "model counts no GPU")
+    else:
+        instructions = (
+            "nvidia-smi is installed and fails. Usual causes:\n"
+            "  a driver update without a restart (\"Driver/library version mismatch\"): restart the machine\n"
+            "  the kernel driver nouveau and not the NVIDIA driver: install the NVIDIA driver of your system"
+        )
+        message = (f"this machine has an NVIDIA GPU, but nvidia-smi fails ({problem}): the recommendation of a "
+                   "model counts no GPU")
+    return DepCheckResult(name="gpu-tools", status="degraded", critical=False, instructions=instructions,
+                          message=message)
+
+
+def _local_ollama_used(cfg) -> bool:
+    """Return True when the chat or the embeddings of *cfg* (``LLMConfig``) run on an Ollama of this machine."""
+    from ..config.settings import _is_loopback_url
+    from ..llm.chat_router import chat_ollama_server
+    from ..llm.embedder_factory import uses_ollama
+
+    if not cfg.enabled:
+        return False
+    try:
+        chat_server = chat_ollama_server(cfg)
+    except ValueError:
+        chat_server = None
+    chat = chat_server is not None and _is_loopback_url(chat_server)
+    return chat or (uses_ollama(cfg) and _is_loopback_url(cfg.ollama_url))
+
+
+def _nvidia_gpu_present() -> bool:
+    """Return True when a PCI display controller of NVIDIA is in ``/sys/bus/pci/devices``."""
+    try:
+        devices = list(_PCI_DEVICES.iterdir())
+    except OSError:
+        return False
+    for device in devices:
+        try:
+            vendor = (device / "vendor").read_text(encoding="ascii").strip()
+            device_class = (device / "class").read_text(encoding="ascii").strip()
+        except (OSError, UnicodeDecodeError):
+            continue
+        if vendor == _NVIDIA_VENDOR and device_class.startswith(_DISPLAY_CLASS_PREFIX):
+            return True
+    return False
+
+
 def check_ollama_running(cfg) -> DepCheckResult:
     """Verify Ollama is reachable."""
     if not cfg.enabled:
@@ -1100,6 +1196,7 @@ CHECK_ORDER: list[tuple[str, Any]] = [
     ("config", check_config),
     ("llm-models", check_llm_models),
     ("llm-profile", check_llm_profile),
+    ("gpu-tools", check_gpu_tools),
     ("ollama", check_ollama_running),
     ("chat-model", check_ollama_chat_model),
     ("embed-model", check_ollama_embed_model),

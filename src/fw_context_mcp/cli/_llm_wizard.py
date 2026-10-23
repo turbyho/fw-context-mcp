@@ -106,12 +106,20 @@ def _machine_report() -> None:
 
     memory = machine_memory()
     parts = []
+    # The free part too: the recommendation estimates from the memory of
+    # now (``recommend.estimate``), thus the user sees why it changes.
+    # The GPU part for models counts the models that Ollama holds as free:
+    # Ollama unloads them for the next model.
     if memory.gpu_mib:
-        parts.append(f"{'unified memory for the GPU' if memory.unified else 'GPU'} {memory.gpu_mib / 1024:.0f} GiB")
+        free = (f" ({(memory.gpu_mib - memory.gpu_others_mib) / 1024:.1f} GiB free for models now)"
+                if memory.gpu_others_mib is not None else "")
+        parts.append(f"{'unified memory for the GPU' if memory.unified else 'GPU'} {memory.gpu_mib / 1024:.1f} GiB{free}")
     else:
         parts.append("no GPU found")
     if memory.ram_mib:
-        parts.append(f"RAM {memory.ram_mib / 1024:.0f} GiB")
+        free = (f" ({memory.ram_available_mib / 1024:.1f} GiB available now)"
+                if memory.ram_available_mib is not None else "")
+        parts.append(f"RAM {memory.ram_mib / 1024:.1f} GiB{free}")
     models = installed_models(local_url())
     parts.append(f"local Ollama at {local_url()} ({len(models)} models)" if models is not None
                  else f"no Ollama at {local_url()}")
