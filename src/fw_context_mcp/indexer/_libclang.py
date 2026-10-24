@@ -14,8 +14,7 @@ thus the setting applies to each parse after this import.
 ``Config.resource_dir``: ``parse`` adds ``-resource-dir`` of the wheel to a
 parse that has none.  The wheel lacks the generated ARM and RISC-V
 intrinsic headers (see ``_clang_resource``), thus ``symbols._get_index``
-points it to the headers that ``_clang_resource`` finds, before the first
-parse.
+points it to the headers that ``_clang_resource`` finds, at each call.
 """
 
 from __future__ import annotations
