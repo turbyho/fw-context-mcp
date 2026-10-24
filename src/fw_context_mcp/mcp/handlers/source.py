@@ -74,6 +74,7 @@ from ...indexer.db._resolve import (
     count_candidates,
     resolve_candidates,
 )
+from ...indexer.models import origin_names
 from ...llm.client import call_llm_async
 from ...llm.errors import LLMError
 from ...llm.ollama import OllamaModelNotFoundError
@@ -1281,8 +1282,8 @@ def _collect_callers(
     return [
         {"name": c["caller_name"] or "?", "qualified_name": c["caller_qname"] or "",
          "file": abs_path(root, c["caller_file"] or c["from_file"]),
-         "line": c["from_line"], "kind": c["caller_kind"] or "",
-         "ref_kind": c["ref_kind"]}
+         "line": c["from_line"], "col": c["from_col"], "kind": c["caller_kind"] or "",
+         "ref_kind": c["ref_kind"], "origins": origin_names(c["origins"])}
         for c in callers
     ]
 
@@ -1649,7 +1650,8 @@ def get_symbol_context(
     Returns:
         dict with: name, qualified_name, kind, file, line, signature,
         docstring (raw Doxygen comment text), is_definition, callers (list,
-        max 50 — ``call`` and ``indirect`` references, each with its line),
+        max 50 — ``call`` and ``indirect`` references, each with its line,
+        its column and its ``origins`` as in ``find_callers``),
         callees (list, max 100 — one row for each callee and kind of
         reference), source (body text),
         indirect_call_sites (list, max 200 — for a field/variable symbol,

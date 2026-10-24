@@ -39,14 +39,14 @@ def _fill(conn, file_ids: list[int]) -> None:
     for i in range(MIDDLES):
         usr = f"c:@F@mid{i}"
         rows.append(symbol_row(fid, path, f"mid{i}", f"mid{i}", usr, 10 + i))
-        refs.append((CH, usr, path, 100 + i, "c:@F@main", "call", None))
-        refs.append((CH, "c:@F@sink", path, 200 + i, usr, "call", None))
+        refs.append((CH, usr, path, 100 + i, "c:@F@main", "call", None, 0, 1))
+        refs.append((CH, "c:@F@sink", path, 200 + i, usr, "call", None, 0, 1))
     # lonely has callers of its own, none of which main reaches: both fronts
     # of the walk keep nodes, thus a small budget is what stops it.
     for i in range(MIDDLES):
         usr = f"c:@F@island{i}"
         rows.append(symbol_row(fid, path, f"island{i}", f"island{i}", usr, 50 + i))
-        refs.append((CH, "c:@F@lonely", path, 300 + i, usr, "call", None))
+        refs.append((CH, "c:@F@lonely", path, 300 + i, usr, "call", None, 0, 1))
     insert_symbols_batch(conn, rows)
     insert_refs_batch(conn, refs)
 

@@ -112,13 +112,13 @@ def _ref_row(
     from_usr: str | None,
     ref_kind: str = "call",
 ) -> tuple:
-    """Build one reference row for insert_refs_batch.  The tail is slot_index.
+    """Build one reference row for insert_refs_batch.  The tail is slot_index, from_col, origins.
 
     *ref_kind* is a parameter because a function-pointer table writes
     ``indirect`` rows, and that is the shape the repair below has to get
     right — see ``TestRepairFromUsr``.
     """
-    return (CH, to_usr, from_file, from_line, from_usr, ref_kind, None)
+    return (CH, to_usr, from_file, from_line, from_usr, ref_kind, None, 0, 1)
 
 
 @pytest.fixture
@@ -432,10 +432,10 @@ class TestRepairFromUsr:
     def test_the_repair_runs_twice_without_failing(self, db_with_gaps):
         """A second index run meets the rows that the first one repaired.
 
-        ``idx_refs_unique`` covers ``from_usr`` and SQLite reads two NULLs
-        as distinct, thus a NULL row and its repaired twin can both exist.
-        Writing the same USR into the NULL one would then collide, and the
-        UPDATE would abort the whole index run.
+        ``idx_refs_site`` covers ``from_usr``, thus a NULL row and its
+        repaired twin can both exist.  Writing the same USR into the NULL
+        one would then collide, and the UPDATE would abort the whole index
+        run.
         """
         insert_refs_batch(db_with_gaps, [
             _ref_row("u_callee", "src/gap.cpp", 20, "u_outer"),

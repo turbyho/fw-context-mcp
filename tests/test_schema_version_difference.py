@@ -13,7 +13,7 @@ from fw_context_mcp.indexer.db import CURRENT_SCHEMA_VERSION, open_db
 
 # Only the migration of a version difference makes this index again
 # (`_run_data_migrations`): no step of each open does.
-_GATED_INDEX = "idx_refs_unique"
+_GATED_INDEX = "idx_refs_site"
 
 
 def _index(tmp_path):

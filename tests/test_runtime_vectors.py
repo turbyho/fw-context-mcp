@@ -130,6 +130,23 @@ void second(void) {
         finally:
             conn.close()
 
+    def test_two_irqs_on_one_line_are_two_references(self, tmp_path):
+        """One handler for two IRQs on one line: two slots, thus two rows.
+
+        The key of a row once had no slot, thus the second IRQ was lost.
+        """
+        conn = _index(tmp_path, """
+void init(void) {
+    NVIC_SetVector(TIMER1_IRQn, (unsigned int) us_ticker_irq_handler); NVIC_SetVector(RTC1_IRQn, (unsigned int) us_ticker_irq_handler);
+}
+""")
+        try:
+            assert _refs(conn) == [
+                (9, "us_ticker_irq_handler"), (17, "us_ticker_irq_handler"),
+            ]
+        finally:
+            conn.close()
+
     def test_a_computed_irq_records_nothing(self, tmp_path):
         """A loop over interrupts names no slot, and a guess would lie."""
         conn = _index(tmp_path, """

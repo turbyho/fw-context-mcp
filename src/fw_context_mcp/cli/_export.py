@@ -93,18 +93,22 @@ def cmd_export(args: argparse.Namespace) -> int:
         if not args.no_refs:
             ref_count = count_refs(conn, config_hash)
             if ref_count > 0:
+                from ..indexer.models import origin_names
+
                 refs = conn.execute(
-                    """SELECT r.to_usr, r.from_file, r.from_line, r.ref_kind,
+                    """SELECT r.to_usr, r.from_file, r.from_line, r.from_col, r.origins, r.ref_kind,
                               caller.name AS caller_name,
                               callee.name AS callee_name
                        FROM refs r
                        LEFT JOIN symbols caller ON caller.usr = r.from_usr AND caller.config_hash = r.config_hash
                        LEFT JOIN symbols callee ON callee.usr = r.to_usr AND callee.config_hash = r.config_hash
                        WHERE r.config_hash = ?
-                       ORDER BY r.from_file, r.from_line""",
+                       ORDER BY r.from_file, r.from_line, r.from_col, r.rowid""",
                     (config_hash,),
                 ).fetchall()
-                output["references"] = [dict(r) for r in refs]
+                output["references"] = [
+                    {**dict(r), "origins": origin_names(r["origins"])} for r in refs
+                ]
                 output["reference_count"] = ref_count
             else:
                 output["reference_count"] = 0

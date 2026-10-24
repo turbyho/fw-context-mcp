@@ -40,7 +40,7 @@ def _function(fid: int, path: str, name: str) -> tuple:
 
 
 def _call(caller: str, callee: str, path: str, line: int) -> tuple:
-    return (CH, f"u_{callee}", path, line, f"u_{caller}", "call", None)
+    return (CH, f"u_{callee}", path, line, f"u_{caller}", "call", None, 0, 1)
 
 
 @pytest.fixture

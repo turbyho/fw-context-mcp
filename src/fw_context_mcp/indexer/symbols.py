@@ -75,6 +75,7 @@ from .models import (
     Macro,
     PendingDispatch,
     Reference,
+    RefOrigin,
     Symbol,
 )
 from .nvic import runtime_vector_reference
@@ -448,8 +449,15 @@ def _find_fn_refs_in_expr(
     _skip_usr: str | None = None,
     _depth: int = 0,
     expected: cx.Type | None = None,
-) -> list[cx.Cursor]:
+) -> list[tuple[cx.Cursor, cx.SourceLocation]]:
     """Recursively extract function/method declarations referenced inside an expression.
+
+    Returns ``(target, site)`` pairs: *site* is the location of the
+    expression that names the target (the DECL_REF_EXPR or MEMBER_REF_EXPR).
+    WHY the site and not the location of the enclosing expression: the walk
+    reaches one reference from each enclosing call — ``reg(wrap(f))`` claims
+    ``f`` for ``reg`` and again for ``wrap`` — and the row of a reference is
+    keyed on its column.  The site gives the two claims one key.
 
     Depth-limited to prevent stack overflow on deeply nested C++ expressions.
 
@@ -463,7 +471,7 @@ def _find_fn_refs_in_expr(
         _log.warning("_find_fn_refs_in_expr: max depth %d exceeded", _FN_REF_MAX_DEPTH)
         return []
 
-    results: list[cx.Cursor] = []
+    results: list[tuple[cx.Cursor, cx.SourceLocation]] = []
 
     # Direct reference to a callable (bare function name, method ref, etc.)
     if cursor.kind in (cx.CursorKind.DECL_REF_EXPR, cx.CursorKind.MEMBER_REF_EXPR):
@@ -476,15 +484,14 @@ def _find_fn_refs_in_expr(
                 return results
             for target in _resolve_overload_set(ref, expected):
                 if not (_skip_usr and target.get_usr() == _skip_usr) and target.location.file:
-                    results.append(target)
+                    results.append((target, cursor.location))
             return results
         if ref is not None and ref.kind in _INDIRECT_TARGET_KINDS:
             # Skip if this is the callee of the enclosing function call
             if _skip_usr and ref.get_usr() == _skip_usr:
                 return results
-            loc = ref.location
-            if loc.file:
-                results.append(ref)
+            if ref.location.file:
+                results.append((ref, cursor.location))
         return results
 
     # Address-of operator (&) — peel and recurse into the operand
@@ -930,10 +937,19 @@ def _resolve_method_usr(
     return None
 
 
-def _record_indirect(seen_ref: set, key: tuple, slot_index: int | None) -> bool:
-    """Claim one indirect reference, and report whether it is new.
+#: The references of one unit, by the key of their site (see ``_claim_ref``).
+_SeenRefs = dict[tuple, Reference]
 
-    *key* is the reference without its slot.  Two rules meet here:
+
+def _claim_ref(refs: list[Reference], seen_ref: _SeenRefs, ref: Reference) -> bool:
+    """Add *ref* to *refs*, or join its origins to the reference of the same site.
+
+    The key of a site is the key of a row of ``refs``: the target, the
+    file, the line, the column, the caller, the kind and the slot.  Two
+    analyses that find one site give one reference with both origins, and
+    not two references — ``find_callers`` would count the call twice.
+
+    Two rules of the slots meet here:
 
     * Two slots of one table can hold the same function on the same line, as
       in ``{ reset, reset }``.  Those are two facts, so the slot joins the
@@ -943,27 +959,63 @@ def _record_indirect(seen_ref: set, key: tuple, slot_index: int | None) -> bool:
       which does not.  Those are one fact, and the slotted view is the
       better one.
 
-    A slotted claim therefore marks the slotless key as well, which is what
-    makes the later slotless claim for the same reference stand down.  The
-    AST walk is preorder, so the enclosing list always claims first.
+    A slotted claim therefore also takes a key of its line without the
+    column, and a later slotless claim of the same target, line, caller and
+    kind joins the slotted reference.  WHY without the column: the two claims
+    name different cursors of one element.  The enclosing list gives the
+    location of the element (``{ 0, isr_a }`` at its ``{``), and the nested
+    list the location of the function inside it.  The AST walk is
+    preorder, so the enclosing list always claims first.
+
+    The line key (the key without the column) lets ``_claim_text_ref``
+    find an earlier site of its line: the scan of the source text has no
+    column.
+
+    Returns True when *ref* is a new reference.
     """
-    if slot_index is None:
-        if key in seen_ref:
-            return False
-        seen_ref.add(key)
-        return True
-    slotted = (*key, slot_index)
-    if slotted in seen_ref:
+    key = (ref.to_usr, ref.from_file, ref.from_line, ref.from_col, ref.from_usr, ref.ref_kind)
+    line_key = (ref.to_usr, ref.from_file, ref.from_line, ref.from_usr, ref.ref_kind)
+    if ref.slot_index is None:
+        claim: tuple = key
+        known = seen_ref.get(key) or seen_ref.get(("slotted", *line_key))
+    else:
+        claim = (*key, ref.slot_index)
+        known = seen_ref.get(claim)
+    if known is not None:
+        known.origins |= ref.origins
         return False
-    seen_ref.add(slotted)
-    seen_ref.add(key)
+    seen_ref[claim] = ref
+    if ref.slot_index is not None:
+        seen_ref.setdefault(("slotted", *line_key), ref)
+    seen_ref.setdefault(("line", *line_key), ref)
+    refs.append(ref)
     return True
+
+
+def _claim_text_ref(refs: list[Reference], seen_ref: _SeenRefs, ref: Reference) -> bool:
+    """Add a reference that the scan of the source text found, which has no column.
+
+    A site of the same target, line, caller and kind that an earlier claim
+    found gets the origin of the text, and no second row with column 0.
+    In the index run that earlier claim is one of the scan itself: two of
+    its phases can name one target on one line.  The scan skips each line
+    where the walk found a call or an indirect reference
+    (``_run_source_line_fallback``), thus it does not meet a site of the
+    walk there.
+
+    Returns True when *ref* is a new reference.
+    """
+    known = seen_ref.get(("line", ref.to_usr, ref.from_file, ref.from_line, ref.from_usr, ref.ref_kind))
+    if known is not None:
+        known.origins |= ref.origins
+        return False
+    return _claim_ref(refs, seen_ref, ref)
 
 
 def _emit_fn_ptr_targets(
     expr_cursor: cx.Cursor,
     caller_usr: str | None,
-    seen_ref: set,
+    seen_ref: _SeenRefs,
     refs: list[Reference],
     fp_assignments: list[FnPointerAssignment],
     skip_usr: str | None = None,
@@ -1038,22 +1090,22 @@ def _emit_fn_ptr_targets(
         targets = _find_fn_refs_in_expr(child, skip_usr, expected=expected_type)
         if not targets:
             continue
-        for target in targets:
+        for target, site in targets:
             target_usr = target.get_usr()
             if target_usr == skip_usr:
                 continue
             target_loc = target.location
-            if target_loc.file:
-                key = (target_usr, loc.file.name, loc.line, caller_usr, "indirect")
-                if _record_indirect(seen_ref, key, slot_index):
-                    refs.append(Reference(
-                        to_usr=target_usr,
-                        from_file=loc.file.name,
-                        from_line=loc.line,
-                        from_usr=caller_usr,
-                        ref_kind="indirect",
-                        slot_index=slot_index,
-                    ))
+            if target_loc.file and site.file:
+                _claim_ref(refs, seen_ref, Reference(
+                    to_usr=target_usr,
+                    from_file=site.file.name,
+                    from_line=site.line,
+                    from_usr=caller_usr,
+                    ref_kind="indirect",
+                    slot_index=slot_index,
+                    from_col=site.column,
+                    origins=RefOrigin.DIRECT,
+                ))
                 if ((lhs_usr and lhs_usr != target_usr) or lhs_name) and (
                     stored is None or target_usr in stored
                 ):
@@ -1092,19 +1144,20 @@ def _emit_fn_ptr_targets(
                 break
         if not any_found:
             pairs = _extract_fn_refs_from_unexposed(expr_cursor, qn_to_usr)
-            for target_usr, rhs_name in pairs:
-                if target_usr == skip_usr:
+            for target_usr, rhs_name, site in pairs:
+                if target_usr == skip_usr or not site.file:
                     continue
-                key = (target_usr, loc.file.name, loc.line, caller_usr, "indirect")
-                if _record_indirect(seen_ref, key, slot_index):
-                    refs.append(Reference(
-                        to_usr=target_usr,
-                        from_file=loc.file.name,
-                        from_line=loc.line,
-                        from_usr=caller_usr,
-                        ref_kind="indirect",
-                        slot_index=slot_index,
-                    ))
+                # The target came from a name in the tokens: TEXT.
+                _claim_ref(refs, seen_ref, Reference(
+                    to_usr=target_usr,
+                    from_file=site.file.name,
+                    from_line=site.line,
+                    from_usr=caller_usr,
+                    ref_kind="indirect",
+                    slot_index=slot_index,
+                    from_col=site.column,
+                    origins=RefOrigin.TEXT,
+                ))
                 if (lhs_usr and lhs_usr != target_usr) or lhs_name:
                     fp_assignments.append(FnPointerAssignment(
                         from_file=loc.file.name,
@@ -1166,7 +1219,7 @@ def _build_refs_and_fp_assignments(
     indirect_call_sites: list[IndirectCallSite] = []
     fp_assignments: list[FnPointerAssignment] = []
     pending_dispatches: list[PendingDispatch] = []
-    seen_ref: set[tuple] = set()
+    seen_ref: _SeenRefs = {}
     _fn_spans: list[tuple[str, int, int]] = []
 
     fn_stack: list[tuple[str, int, str]] = []
@@ -1489,7 +1542,7 @@ def _process_ref_cursor(
     indirect_call_sites: list[IndirectCallSite],
     fp_assignments: list[FnPointerAssignment],
     pending_dispatches: list[PendingDispatch],
-    seen_ref: set[tuple],
+    seen_ref: _SeenRefs,
     qn_to_usr: dict[str, str],
     tu_path_str: str,
     resolve_fn: Callable[..., object],
@@ -1509,21 +1562,18 @@ def _process_ref_cursor(
     _handle_token_fallbacks(cursor, cur_fn, refs, fp_assignments, seen_ref, qn_to_usr, tu_path_str, _log)
 
 
-def _add_ref(refs: list[Reference], seen_ref: set[tuple], to_usr: str,
-             from_file: str, from_line: int, from_usr: str | None,
-             ref_kind: str) -> bool:
-    """Deduplicated append to refs list."""
-    key = (to_usr, from_file, from_line, from_usr, ref_kind)
-    if key not in seen_ref:
-        seen_ref.add(key)
-        refs.append(Reference(to_usr=to_usr, from_file=from_file, from_line=from_line,
-                              from_usr=from_usr, ref_kind=ref_kind))
-        return True
-    return False
+def _add_ref(refs: list[Reference], seen_ref: _SeenRefs, to_usr: str,
+             loc: cx.SourceLocation, from_usr: str | None,
+             ref_kind: str, origins: RefOrigin) -> bool:
+    """Claim the reference at the location *loc* of a cursor (see ``_claim_ref``)."""
+    return _claim_ref(refs, seen_ref, Reference(
+        to_usr=to_usr, from_file=loc.file.name, from_line=loc.line,
+        from_usr=from_usr, ref_kind=ref_kind, from_col=loc.column, origins=origins,
+    ))
 
 
 def _handle_direct_refs(cursor: cx.Cursor, cur_fn: str | None, refs: list[Reference],
-                       seen_ref: set[tuple], static_init_calls: set[int]) -> None:
+                       seen_ref: _SeenRefs, static_init_calls: set[int]) -> None:
     """Direct call/ref/member references from ``cursor.referenced``, and run-time vectors.
 
     WHY no fallback for a CALL_EXPR without a target: two fallbacks once
@@ -1560,7 +1610,7 @@ def _handle_direct_refs(cursor: cx.Cursor, cur_fn: str | None, refs: list[Refere
                         and referenced.kind == cx.CursorKind.CONSTRUCTOR
                         and cursor.hash in static_init_calls):
                     ref_kind = "implicit_construct"
-                _add_ref(refs, seen_ref, to_usr, loc.file.name, loc.line, cur_fn, ref_kind)
+                _add_ref(refs, seen_ref, to_usr, loc, cur_fn, ref_kind, RefOrigin.DIRECT)
 
         if cursor.kind == cx.CursorKind.CALL_EXPR:
             _handle_runtime_vector(cursor, referenced, cur_fn, refs, seen_ref)
@@ -1568,7 +1618,7 @@ def _handle_direct_refs(cursor: cx.Cursor, cur_fn: str | None, refs: list[Refere
 
 def _handle_runtime_vector(cursor: cx.Cursor, referenced: cx.Cursor | None,
                            cur_fn: str | None, refs: list[Reference],
-                           seen_ref: set[tuple]) -> None:
+                           seen_ref: _SeenRefs) -> None:
     """Record a vector table entry this call installs at run time.
 
     A CMSIS target that moves its table into RAM fills it with
@@ -1576,18 +1626,14 @@ def _handle_runtime_vector(cursor: cx.Cursor, referenced: cx.Cursor | None,
     which handler services the interrupt.  See ``nvic`` for what makes a
     call qualify and why the IRQ number is stored unshifted.
 
-    Deduplicated on the same key as every other reference, so one call
-    site emitted twice by the preprocessor stays one edge.
+    Deduplicated on the key of its site, the IRQ number (``slot_index``)
+    included, so one call site emitted twice by the preprocessor stays one
+    edge, and two IRQs that one line gives the same handler stay two.
     """
     found = runtime_vector_reference(cursor, referenced, cur_fn)
     if found is None:
         return
-    key = (found.to_usr, found.from_file, found.from_line, found.from_usr,
-           found.ref_kind)
-    if key in seen_ref:
-        return
-    seen_ref.add(key)
-    refs.append(found)
+    _claim_ref(refs, seen_ref, found)
 
 
 def _handle_indirect_invocations(cursor: cx.Cursor, cur_fn: str | None,
@@ -1595,7 +1641,7 @@ def _handle_indirect_invocations(cursor: cx.Cursor, cur_fn: str | None,
                                  indirect_call_sites: list[IndirectCallSite],
                                  fp_assignments: list[FnPointerAssignment],
                                  pending_dispatches: list[PendingDispatch],
-                                 seen_ref: set[tuple], tu_path_str: str,
+                                 seen_ref: _SeenRefs, tu_path_str: str,
                                  resolve_fn: Callable[..., object],
                                  qn_to_usr: dict[str, str],
                                  _log: logging.Logger) -> None:
@@ -1658,14 +1704,16 @@ def _handle_indirect_invocations(cursor: cx.Cursor, cur_fn: str | None,
 def _extract_fn_refs_from_unexposed(
     cursor: cx.Cursor,
     qn_to_usr: dict[str, str],
-) -> list[tuple[str, str]]:
-    """Extract ``(USR, rhs_name)`` pairs from UNEXPOSED_EXPR tokens.
+) -> list[tuple[str, str, cx.SourceLocation]]:
+    """Extract ``(USR, rhs_name, site)`` triples from UNEXPOSED_EXPR tokens.
 
     Parses token stream for ``&Class::method`` patterns and resolves
-    them against *qn_to_usr*.  Returns ``[(usr, name), ...]`` tuples
-    suitable for direct ``FnPointerAssignment`` creation.
+    them against *qn_to_usr*.  *site* is the location of the token of the
+    method name: the location that a DECL_REF_EXPR of ``&Class::method``
+    has, thus a claim from the tokens and one from the AST of the same
+    reference get one key.
     """
-    results: list[tuple[str, str]] = []
+    results: list[tuple[str, str, cx.SourceLocation]] = []
     try:
         tokens = list(cursor.get_tokens())
     except (ValueError, TypeError, RuntimeError, AttributeError):
@@ -1685,7 +1733,7 @@ def _extract_fn_refs_from_unexposed(
                             target_usr = usr
                             break
                 if target_usr:
-                    results.append((target_usr, t3.spelling))
+                    results.append((target_usr, t3.spelling, t3.location))
     return results
 
 
@@ -1693,7 +1741,7 @@ def _handle_fn_ptr_as_argument(cursor: cx.Cursor, cur_fn: str | None,
                                refs: list[Reference],
                                fp_assignments: list[FnPointerAssignment],
                                pending_dispatches: list[PendingDispatch],
-                               seen_ref: set[tuple], tu_path_str: str,
+                               seen_ref: _SeenRefs, tu_path_str: str,
                                qn_to_usr: dict[str, str],
                                _log: logging.Logger) -> None:
     """Function pointers passed as call arguments.
@@ -1791,9 +1839,10 @@ def _handle_fn_ptr_as_argument(cursor: cx.Cursor, cur_fn: str | None,
             unexposed_pairs = _extract_fn_refs_from_unexposed(arg, qn_to_usr)
             if unexposed_pairs:
                 param_usr, _fp_type = _param_info(i, arg)
-                for target_usr, rhs_name in unexposed_pairs:
-                    if target_usr != direct_callee_usr:
-                        _add_ref(refs, seen_ref, target_usr, loc.file.name, loc.line, cur_fn, "indirect")
+                for target_usr, rhs_name, site in unexposed_pairs:
+                    if target_usr != direct_callee_usr and site.file:
+                        # The target came from a name in the tokens: TEXT.
+                        _add_ref(refs, seen_ref, target_usr, site, cur_fn, "indirect", RefOrigin.TEXT)
                         fp_assignments.append(FnPointerAssignment(
                             from_file=loc.file.name, from_line=loc.line,
                             lhs_usr=param_usr or "",
@@ -1814,10 +1863,10 @@ def _handle_fn_ptr_as_argument(cursor: cx.Cursor, cur_fn: str | None,
                             ))
         if targets:
             param_usr, _fp_type = _param_info(i, arg)
-            for target in targets:
+            for target, site in targets:
                 target_usr = target.get_usr()
-                if target_usr and target_usr != direct_callee_usr:
-                    _add_ref(refs, seen_ref, target_usr, loc.file.name, loc.line, cur_fn, "indirect")
+                if target_usr and target_usr != direct_callee_usr and site.file:
+                    _add_ref(refs, seen_ref, target_usr, site, cur_fn, "indirect", RefOrigin.DIRECT)
                     _lhs_name = callee_expr_text or target.spelling
                     fp_assignments.append(FnPointerAssignment(
                         from_file=loc.file.name, from_line=loc.line,
@@ -2118,7 +2167,7 @@ def _init_list_element_field(
       row of the nested list.  Such an element now gives no row.  The
       nested list is an INIT_LIST_EXPR of its own, and the walk gives its
       fields.  The element still gives its indirect references, with the
-      slot of an array (see ``_record_indirect``).
+      slot of an array (see ``_claim_ref``).
     * A chain of designators wrote its FIRST field: ``.ops.init = f`` gave
       ``ops = f``.  The chain now gives its LAST field, and the type of
       that field, because a name can repeat along the chain
@@ -2594,7 +2643,7 @@ def _field_entry(field_decl: cx.Cursor) -> tuple[str | None, str, str, cx.Type |
 def _handle_fn_ptr_cases(cursor: cx.Cursor, cur_fn: str | None,
                         refs: list[Reference],
                         fp_assignments: list[FnPointerAssignment],
-                        seen_ref: set[tuple], tu_path_str: str,
+                        seen_ref: _SeenRefs, tu_path_str: str,
                         _log: logging.Logger) -> None:
     """Function pointers in assignments, variable initializers, and init lists.
 
@@ -2722,7 +2771,7 @@ def _static_init_constructor_calls(var: cx.Cursor) -> set[int]:
 def _handle_token_fallbacks(cursor: cx.Cursor, cur_fn: str | None,
                             refs: list[Reference],
                             fp_assignments: list[FnPointerAssignment],
-                            seen_ref: set[tuple], qn_to_usr: dict[str, str],
+                            seen_ref: _SeenRefs, qn_to_usr: dict[str, str],
                             tu_path_str: str,
                             _log: logging.Logger) -> None:
     """Token-based detection of ``&Class::method`` that the AST leaves opaque.
@@ -2762,8 +2811,9 @@ def _handle_token_fallbacks(cursor: cx.Cursor, cur_fn: str | None,
 
     if cursor.kind == cx.CursorKind.UNEXPOSED_EXPR:
         pairs = _extract_fn_refs_from_unexposed(cursor, qn_to_usr)
-        for _target_usr, _rhs_name in pairs:
-            _add_ref(refs, seen_ref, _target_usr, loc.file.name, loc.line, cur_fn, "indirect")
+        for _target_usr, _rhs_name, site in pairs:
+            if site.file:
+                _add_ref(refs, seen_ref, _target_usr, site, cur_fn, "indirect", RefOrigin.TEXT)
 
     if cursor.kind == cx.CursorKind.CALL_EXPR:
         try:
@@ -2783,8 +2833,11 @@ def _handle_token_fallbacks(cursor: cx.Cursor, cur_fn: str | None,
                     and tokens[i + 3].kind.name == "IDENTIFIER"):
                 partial = f"{tokens[i + 1].spelling}::{tokens[i + 3].spelling}"
                 target_usr = _resolve_partial_qn(partial, qn_to_usr)
-                if target_usr:
-                    _add_ref(refs, seen_ref, target_usr, loc.file.name, loc.line, cur_fn, "indirect")
+                site = tokens[i + 3].location
+                if target_usr and site.file:
+                    # The site is the name of the method, as in
+                    # _extract_fn_refs_from_unexposed: one key for one reference.
+                    _add_ref(refs, seen_ref, target_usr, site, cur_fn, "indirect", RefOrigin.TEXT)
                     fp_assignments.append(FnPointerAssignment(
                         from_file=loc.file.name, from_line=loc.line,
                         lhs_usr="", lhs_name=tokens[i + 3].spelling,
@@ -2798,7 +2851,7 @@ def _run_source_line_fallback(
     refs: list[Reference],
     fp_assignments: list[FnPointerAssignment],
     pending_dispatches: list[PendingDispatch],
-    seen_ref: set,
+    seen_ref: _SeenRefs,
     _fn_spans: list[tuple[str, int, int]],
     qn_to_usr: dict[str, str],
     usr_to_qn: dict[str, str],
@@ -2940,14 +2993,11 @@ def _run_source_line_fallback(
                     )
                 if not _handler_usr:
                     continue
-                _key = (_handler_usr, _tu_file, _lineno, _line_fn, "indirect")
-                if _key not in seen_ref:
-                    seen_ref.add(_key)
-                    refs.append(Reference(
-                        to_usr=_handler_usr, from_file=_tu_file,
-                        from_line=_lineno, from_usr=_line_fn,
-                        ref_kind="indirect",
-                    ))
+                if _claim_text_ref(refs, seen_ref, Reference(
+                    to_usr=_handler_usr, from_file=_tu_file,
+                    from_line=_lineno, from_usr=_line_fn,
+                    ref_kind="indirect", from_col=0, origins=RefOrigin.TEXT,
+                )):
                     fp_assignments.append(FnPointerAssignment(
                         from_file=_tu_file, from_line=_lineno,
                         lhs_usr="", lhs_name=_isr_fn,
@@ -2967,13 +3017,11 @@ def _run_source_line_fallback(
             _target_usr = _resolve_partial_qn(_partial, qn_to_usr)
             if not _target_usr:
                 continue
-            _key = (_target_usr, _tu_file, _lineno, _line_fn, "indirect")
-            if _key not in seen_ref:
-                seen_ref.add(_key)
-                refs.append(Reference(
-                    to_usr=_target_usr, from_file=_tu_file,
-                    from_line=_lineno, from_usr=_line_fn, ref_kind="indirect",
-                ))
+            if _claim_text_ref(refs, seen_ref, Reference(
+                to_usr=_target_usr, from_file=_tu_file,
+                from_line=_lineno, from_usr=_line_fn, ref_kind="indirect",
+                from_col=0, origins=RefOrigin.TEXT,
+            )):
                 fp_assignments.append(FnPointerAssignment(
                     from_file=_tu_file, from_line=_lineno,
                     lhs_usr="", lhs_name=_m.group(2),

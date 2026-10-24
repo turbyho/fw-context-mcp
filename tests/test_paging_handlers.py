@@ -131,9 +131,9 @@ def project(tmp_path: Path) -> Path:
             )
             insert_refs_batch(
                 conn,
-                [(CH, "u_sd_stop", "src/dl.cpp", 100 + i, "u_app", "call", None)
+                [(CH, "u_sd_stop", "src/dl.cpp", 100 + i, "u_app", "call", None, 0, 1)
                  for i in range(2)]
-                + [(CH, "u_flash_stop", "src/dl.cpp", 200 + i, "u_app", "call", None)
+                + [(CH, "u_flash_stop", "src/dl.cpp", 200 + i, "u_app", "call", None, 0, 1)
                    for i in range(6)],
             )
     finally:
@@ -190,7 +190,7 @@ def two_devs(project: Path) -> Path:
                 ],
             )
             insert_refs_batch(conn, [
-                (CH, "u_mid_reset", "src/dl.cpp", 300 + i, "u_app", "call", None)
+                (CH, "u_mid_reset", "src/dl.cpp", 300 + i, "u_app", "call", None, 0, 1)
                 for i in range(3)
             ])
     finally:
@@ -349,7 +349,7 @@ class TestOneAnswerOwnsTheWalk:
         try:
             with transaction(conn):
                 insert_refs_batch(conn, [
-                    (CH, "u_base_stop", "src/dl.cpp", 90, "u_app", "call", None),
+                    (CH, "u_base_stop", "src/dl.cpp", 90, "u_app", "call", None, 0, 1),
                 ])
         finally:
             conn.close()

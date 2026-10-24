@@ -31,7 +31,7 @@ def _fill(conn, file_ids: list[int]) -> None:
     rows.append(symbol_row(fid, "src/f0.c", "main", "main", "c:@F@main", 200))
     insert_symbols_batch(conn, rows)
     # The tool needs the reference index; this call reaches no source.
-    insert_refs_batch(conn, [(CH, "c:@F@uart_send", "src/f0.c", 201, "c:@F@main", "call", None)])
+    insert_refs_batch(conn, [(CH, "c:@F@uart_send", "src/f0.c", 201, "c:@F@main", "call", None, 0, 1)])
 
 
 @pytest.fixture

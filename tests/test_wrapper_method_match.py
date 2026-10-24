@@ -50,7 +50,7 @@ def _fill(conn, file_ids: list[int]) -> None:
                            kind="method", parent_usr=_usr(wrapper)),
             ]
             refs.append((CH, _usr(owner) + "@F@op", path, line + 4, _usr(wrapper) + "@F@go",
-                         "call", None))
+                         "call", None, 0, 1))
             line += 10
     insert_symbols_batch(conn, symbols)
     insert_refs_batch(conn, refs)

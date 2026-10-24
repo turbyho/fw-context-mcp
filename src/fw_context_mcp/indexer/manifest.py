@@ -1089,6 +1089,10 @@ def compute_config_hash(
         # the binding of libclang 18 raised ValueError for the C++20 cursor
         # kinds that it did not know, and libclang 18 gave an error for each
         # ``__malloc__(dealloc)`` attribute of a Zephyr header.
+        # /10 marks the key of a row of ``refs``: one reference site of one
+        # caller, with its column and the analyses that found it (origins).
+        # Before it, two calls on one line were one row, and two slots of
+        # one function inside a body were one row.
         #
         # WHY the format version belongs in THIS hash: a new config_hash
         # leaves no row for the build, thus a plain `fw-context index` writes
@@ -1099,7 +1103,7 @@ def compute_config_hash(
         #
         # Every existing index therefore gets one final reindex, which is
         # intended.
-        "_format": "fw-context-cc/9",
+        "_format": "fw-context-cc/10",
         "project_root": str(project_root),
         # WHY only these two: config_hash answers "could the same source text
         # compile to something different now?"  Macros flip #ifdef, and the

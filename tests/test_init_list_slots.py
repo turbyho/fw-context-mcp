@@ -250,18 +250,18 @@ def test_the_slot_reaches_the_database(tmp_path):
     ``ops`` builds the row tuple for every C reference; this pins that the
     last column carries the slot instead of a constant None.
     """
-    from fw_context_mcp.indexer.models import Reference
+    from fw_context_mcp.indexer.models import Reference, RefOrigin
 
     db_path = tmp_path / "index.db"
     conn = open_db(db_path)
     try:
         insert_refs_batch(conn, [
             ("hash", r.to_usr, r.from_file, r.from_line, r.from_usr,
-             r.ref_kind, r.slot_index)
+             r.ref_kind, r.slot_index, r.from_col, int(r.origins))
             for r in (
-                Reference("c:@F@reset", "v.c", 3, None, "indirect", 0),
-                Reference("c:@F@nmi", "v.c", 3, None, "indirect", 1),
-                Reference("c:@F@other", "v.c", 9, None, "indirect", None),
+                Reference("c:@F@reset", "v.c", 3, None, "indirect", 0, from_col=0, origins=RefOrigin.DIRECT),
+                Reference("c:@F@nmi", "v.c", 3, None, "indirect", 1, from_col=0, origins=RefOrigin.DIRECT),
+                Reference("c:@F@other", "v.c", 9, None, "indirect", None, from_col=0, origins=RefOrigin.DIRECT),
             )
         ])
         conn.commit()

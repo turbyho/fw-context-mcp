@@ -54,7 +54,7 @@ def _table(conn, name, signature, filled, table_file="isr_tables.c"):
         ])
         insert_refs_batch(conn, [
             (CONFIG, f"c:@F@h{slot}", table_file, 11 + slot, None,
-             "indirect", slot)
+             "indirect", slot, 0, 1)
             for slot in filled
         ])
 

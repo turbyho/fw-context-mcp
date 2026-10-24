@@ -962,7 +962,10 @@ def _step_resolve_dispatches(conn: sqlite3.Connection, ctx: dict) -> None:
                 raise
             log.exception("Unexpected error loading dispatch_bridges from %s", _config_path)
 
-    resolved = 0
+    from .db import insert_refs_batch
+    from .models import RefOrigin
+
+    edges: list[tuple] = []
     for r in rows:
         callee_qn = r["callee_qn"]
         entry_qn = _dispatch_map.get(callee_qn)
@@ -981,20 +984,15 @@ def _step_resolve_dispatches(conn: sqlite3.Connection, ctx: dict) -> None:
         if not target_usr:
             continue
 
-        conn.execute(
-            """INSERT OR IGNORE INTO refs
-               (config_hash, to_usr, from_file, from_line, from_usr, ref_kind)
-               VALUES (?, ?, ?, ?, ?, 'dispatch')""",
-            (
-                config_hash,
-                target_usr,
-                r["file"],
-                r["line"],
-                entry_usr,
-            ),
-        )
-        resolved += 1
+        # Column 0: a pending dispatch records the line of its call only.
+        edges.append((
+            config_hash, target_usr, r["file"], r["line"], entry_usr,
+            "dispatch", None, 0, int(RefOrigin.DISPATCH),
+        ))
 
+    if edges:
+        insert_refs_batch(conn, edges)
+    resolved = len(edges)
     if resolved:
         log.info("Dispatch edges resolved: %d synthetic edges created", resolved)
 
@@ -1232,11 +1230,14 @@ def _step_repair_from_usr(conn: sqlite3.Connection, ctx: dict) -> None:
     """
     config_hash = ctx["config_hash"]
 
-    # ``idx_refs_unique`` covers ``from_usr``, and SQLite reads two NULLs
-    # as distinct values.  A gap row and its already-resolved twin can
-    # therefore both exist, and writing the caller into the gap row would
-    # collide and abort the whole index run.  The gap row is the redundant
-    # one, thus it goes.
+    # ``idx_refs_site`` covers ``from_usr`` (a macro that defines several
+    # functions on one line gives each a call at one place).  A gap row and
+    # its already-resolved twin can therefore both exist, and writing the
+    # caller into the gap row would collide and abort the whole index run.
+    # The gap row is the redundant one, thus it goes.  The twin is the row
+    # of the same site: the column and the slot match too, thus a gap row
+    # of another slot or of another call on the line stays (an earlier key
+    # had no slot, and this DELETE then removed a slot of a table).
     conn.execute(
         f"""DELETE FROM refs
             WHERE config_hash = ? AND from_usr IS NULL
@@ -1246,21 +1247,23 @@ def _step_repair_from_usr(conn: sqlite3.Connection, ctx: dict) -> None:
                     AND other.to_usr     = refs.to_usr
                     AND other.from_file  = refs.from_file
                     AND other.from_line  = refs.from_line
+                    AND other.from_col   = refs.from_col
                     AND other.ref_kind   = refs.ref_kind
+                    AND ifnull(other.slot_index, -1) = ifnull(refs.slot_index, -1)
                     AND other.from_usr   = ({_ENCLOSING_CALLABLE_SQL}))""",
         (config_hash,),
     )
 
-    # ``OR IGNORE`` covers what the DELETE cannot reach: two gap rows that
-    # are alike in every other column resolve to one caller, and the
-    # second write would then collide with the first.  Skipping it leaves
-    # the row as it was, which is what it already was.
+    # No ``OR IGNORE``: the DELETE above removed each row that this write
+    # could collide with.  Two gap rows of one site cannot exist, because
+    # the index reads two NULL callers as one value.  An earlier key read
+    # them as two, and the clause then skipped the second write.
     #
     # The WHERE repeats the subquery so that a row with no enclosing
     # callable is not "updated" to the NULL it already holds.  Without it
     # ``rowcount`` would report every gap as repaired.
     cur = conn.execute(
-        f"""UPDATE OR IGNORE refs SET from_usr = ({_ENCLOSING_CALLABLE_SQL})
+        f"""UPDATE refs SET from_usr = ({_ENCLOSING_CALLABLE_SQL})
             WHERE config_hash = ? AND from_usr IS NULL
               AND ({_ENCLOSING_CALLABLE_SQL}) IS NOT NULL""",
         (config_hash,),

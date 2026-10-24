@@ -653,7 +653,7 @@ class TestRefs:
         self._setup_symbols(populated_db)
         # app_run (U_caller) calls modem_init (U_callee) at app.cpp:55
         insert_refs_batch(populated_db, [
-            ("hash-deadbeef", "U_callee", "src/app.cpp", 55, "U_caller", "call", None),
+            ("hash-deadbeef", "U_callee", "src/app.cpp", 55, "U_caller", "call", None, 0, 1),
         ])
         assert count_refs(populated_db, "hash-deadbeef") == 1
 
@@ -670,8 +670,8 @@ class TestRefs:
     def test_find_refs_kind_filter(self, populated_db):
         self._setup_symbols(populated_db)
         insert_refs_batch(populated_db, [
-            ("hash-deadbeef", "U_callee", "src/app.cpp", 55, "U_caller", "call", None),
-            ("hash-deadbeef", "U_callee", "src/app.cpp", 60, "U_caller", "ref", None),
+            ("hash-deadbeef", "U_callee", "src/app.cpp", 55, "U_caller", "call", None, 0, 1),
+            ("hash-deadbeef", "U_callee", "src/app.cpp", 60, "U_caller", "ref", None, 0, 1),
         ])
         calls = find_refs(populated_db, "hash-deadbeef", "modem_init", ref_kind="call")
         assert len(calls) == 1
@@ -682,7 +682,7 @@ class TestRefs:
         self._setup_symbols(populated_db)
         # reference from file scope (from_usr NULL) — LEFT JOIN keeps it
         insert_refs_batch(populated_db, [
-            ("hash-deadbeef", "U_callee", "src/app.cpp", 5, None, "call", None),
+            ("hash-deadbeef", "U_callee", "src/app.cpp", 5, None, "call", None, 0, 1),
         ])
         rows = find_refs(populated_db, "hash-deadbeef", "modem_init")
         assert len(rows) == 1
@@ -692,9 +692,9 @@ class TestRefs:
         """The plural form clears several origin files in one call."""
         self._setup_symbols(populated_db)
         insert_refs_batch(populated_db, [
-            ("hash-deadbeef", "U_callee", "src/app.cpp", 55, "U_caller", "call", None),
-            ("hash-deadbeef", "U_callee", "src/inline.h", 7, "U_caller", "call", None),
-            ("hash-deadbeef", "U_callee", "src/other.cpp", 5, None, "call", None),
+            ("hash-deadbeef", "U_callee", "src/app.cpp", 55, "U_caller", "call", None, 0, 1),
+            ("hash-deadbeef", "U_callee", "src/inline.h", 7, "U_caller", "call", None, 0, 1),
+            ("hash-deadbeef", "U_callee", "src/other.cpp", 5, None, "call", None, 0, 1),
         ])
         assert count_refs(populated_db, "hash-deadbeef") == 3
         delete_refs_for_files(
@@ -707,7 +707,7 @@ class TestRefs:
         """An empty path list must not turn into an unfiltered DELETE."""
         self._setup_symbols(populated_db)
         insert_refs_batch(populated_db, [
-            ("hash-deadbeef", "U_callee", "src/app.cpp", 55, "U_caller", "call", None),
+            ("hash-deadbeef", "U_callee", "src/app.cpp", 55, "U_caller", "call", None, 0, 1),
         ])
         delete_refs_for_files(populated_db, "hash-deadbeef", [])
         assert count_refs(populated_db, "hash-deadbeef") == 1
@@ -716,8 +716,8 @@ class TestRefs:
         """Rows of another config must survive a delete for the same path."""
         self._setup_symbols(populated_db)
         insert_refs_batch(populated_db, [
-            ("hash-deadbeef", "U_callee", "src/app.cpp", 55, "U_caller", "call", None),
-            ("hash-other", "U_callee", "src/app.cpp", 55, "U_caller", "call", None),
+            ("hash-deadbeef", "U_callee", "src/app.cpp", 55, "U_caller", "call", None, 0, 1),
+            ("hash-other", "U_callee", "src/app.cpp", 55, "U_caller", "call", None, 0, 1),
         ])
         delete_refs_for_files(populated_db, "hash-deadbeef", ["src/app.cpp"])
         assert count_refs(populated_db, "hash-deadbeef") == 0
@@ -732,10 +732,10 @@ class TestRefs:
         self._setup_symbols(populated_db)
         paths = [f"src/gen/hdr_{i:04d}.h" for i in range(1200)]
         insert_refs_batch(populated_db, [
-            ("hash-deadbeef", "U_callee", p, 1, "U_caller", "call", None) for p in paths
+            ("hash-deadbeef", "U_callee", p, 1, "U_caller", "call", None, 0, 1) for p in paths
         ])
         insert_refs_batch(populated_db, [
-            ("hash-deadbeef", "U_callee", "src/keep.cpp", 1, "U_caller", "call", None),
+            ("hash-deadbeef", "U_callee", "src/keep.cpp", 1, "U_caller", "call", None, 0, 1),
         ])
         assert count_refs(populated_db, "hash-deadbeef") == 1201
         delete_refs_for_files(populated_db, "hash-deadbeef", paths)
@@ -762,7 +762,7 @@ class TestRefs:
         ])
         # Reference: WRAPPER::transmit calls DRIVER::send
         insert_refs_batch(populated_db, [
-            ("hash-deadbeef", "U_drv_send", "src/wrapper.cpp", 55, "U_wrp_xmit", "call", None),
+            ("hash-deadbeef", "U_drv_send", "src/wrapper.cpp", 55, "U_wrp_xmit", "call", None, 0, 1),
         ])
 
         # Partially-qualified name should resolve via suffix LIKE
@@ -793,7 +793,7 @@ class TestRefs:
              1, 1, 0, 1, "int main()", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
         ])
         insert_refs_batch(populated_db, [
-            ("hash-deadbeef", "c:@N@ns@S@DRIVER@F@send#1", "src/main.cpp", 5, "U_main", "call", None),
+            ("hash-deadbeef", "c:@N@ns@S@DRIVER@F@send#1", "src/main.cpp", 5, "U_main", "call", None, 0, 1),
         ])
 
         # Partially-qualified class name → aggregate prefix match
@@ -821,7 +821,7 @@ class TestRefs:
              50, 1, 0, 1, "void app_run()", "", None, 0, 0, "", 0, "", 1, 0.0, "", 0),
         ])
         insert_refs_batch(populated_db, [
-            ("hash-deadbeef", "U_callee_i2c", "src/app.cpp", 55, "U_caller_app", "call", None),
+            ("hash-deadbeef", "U_callee_i2c", "src/app.cpp", 55, "U_caller_app", "call", None, 0, 1),
         ])
 
         rows = find_refs(populated_db, "hash-deadbeef", "i2c_write", ref_kind="call")

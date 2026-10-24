@@ -87,20 +87,31 @@ def insert_refs_batch(conn: sqlite3.Connection, rows: list[tuple]) -> int:
     """Insert reference rows for the cross-reference / call graph.
 
     Each row: (config_hash, to_usr, from_file, from_line, from_usr,
-               ref_kind, slot_index).  slot_index is an index counted from
-    zero — a slot of a vector table from the assembly reader, or an element
-    of a positional array initializer from the C indexer — and None for a
-    reference that has no position.
+               ref_kind, slot_index, from_col, origins).  The last two came
+    later, thus the first seven keep the order of an older row.  slot_index is an
+    index counted from zero — a slot of a vector table from the assembly
+    reader, or an element of a positional array initializer from the C
+    indexer — the IRQ number of a runtime vector, or None for a reference
+    that has no position.  origins is a set of ``models.RefOrigin`` bits.
 
-    Why INSERT OR IGNORE: the same TU can be indexed multiple times
-    (reindex after header change).  OR IGNORE skips duplicates silently
-    instead of raising IntegrityError.  Duplicate detection relies on
-    the ``idx_refs_unique`` UNIQUE index, which is created during data
-    migration AFTER deduplication for performance.
+    One row is one reference site of one caller: ``idx_refs_site`` is
+    unique on the target, the file, the line, the column, the kind, the
+    slot and the caller (``ifnull`` of the two nullable columns, because a
+    unique index reads two NULLs as different values).  A row for a site
+    that is already there does not add a second row: its origins join the
+    origins of the row.  WHY: one site can be found by more than one
+    analysis (the AST walk, a scan of the tokens, the assembly reader), and
+    each of them is a fact about the edge, while a second row would count
+    one call twice.  WHY the caller is in the key: a macro that defines
+    several functions on one line gives each of them a call at one place.
     """
     cur = conn.executemany(
-        """INSERT OR IGNORE INTO refs (config_hash, to_usr, from_file, from_line, from_usr, ref_kind, slot_index)
-           VALUES (?,?,?,?,?,?,?)""",
+        """INSERT INTO refs
+               (config_hash, to_usr, from_file, from_line, from_usr, ref_kind, slot_index, from_col, origins)
+           VALUES (?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(config_hash, to_usr, from_file, from_line, from_col, ref_kind,
+                       ifnull(slot_index, -1), ifnull(from_usr, ''))
+           DO UPDATE SET origins = refs.origins | excluded.origins""",
         rows,
     )
     return cur.rowcount
@@ -146,9 +157,8 @@ def delete_refs_for_files(
     HEADER's path in ``from_file``, so a delete keyed on the TU path alone
     leaves those rows behind.  A call removed from a header then keeps its
     refs row — ``find_callers`` reports a caller that no longer exists — and
-    a call that only moved gains a SECOND row, because ``idx_refs_unique``
-    includes ``from_line`` and ``insert_refs_batch`` uses ``INSERT OR
-    IGNORE``.
+    a call that only moved gains a SECOND row, because ``idx_refs_site``
+    includes ``from_line`` and ``from_col``.
 
     *from_files* must be normalised exactly the way ``insert_refs_batch``
     normalises the paths it writes.  A path built by a different normaliser
@@ -734,19 +744,23 @@ def refs_for_symbol(
     lines did, one of them from 8 callers.  Those groups tie on the file
     and the line alone, thus the caller ends that order.
 
-    A plain symbol ends at ``r.rowid``.  The file and the line alone do NOT
-    separate its references: ``idx_refs_unique`` covers ``from_usr`` and
-    ``ref_kind`` as well, thus one line may hold a ``call`` row and a
-    ``ref`` row for one symbol.  Measured over six firmware indexes, 4792
+    A plain symbol orders by the column after the line, thus two calls on
+    one line come in the order of the source, and ends at ``r.rowid``.  The
+    file, the line and the column alone do NOT
+    separate its references: ``idx_refs_site`` covers the column, the slot,
+    ``from_usr`` and ``ref_kind`` as well, thus one line may hold a ``call``
+    row and a ``ref`` row for one symbol.  Measured over six firmware indexes, 4792
     to 80635 lines carry such a pair — ``ARM_MPU_ClrRegion`` at
     ``cortex_m/scb.c:64`` is one.  The rowid is unique whatever the columns
     hold, which the unique index is not: SQLite reads two NULL
     ``from_usr`` values as distinct, so even that index leaves ties.
     """
+    from ..models import origins_or_sql
+
     kind_filter, kind_params = _build_kind_filter(ref_kind)
 
     _SELECT = """SELECT r.from_file, r.from_line, r.ref_kind,
-                        r.from_usr,
+                        r.from_usr, {col} AS from_col, {origins} AS origins,
                         caller.name           AS caller_name,
                         caller.qualified_name AS caller_qname,
                         caller.kind           AS caller_kind,
@@ -760,8 +774,11 @@ def refs_for_symbol(
     if kind in _MEMBER_GRANULAR_KINDS:
         lo, hi = _member_usr_range(usr)
         params: list = [config_hash, lo, hi] + kind_params + [limit, offset]
+        # One row for each caller and line: the first column of the group,
+        # and the origins of each row of it.
+        select = _SELECT.format(col="MIN(r.from_col)", origins=origins_or_sql("r.origins"))
         return conn.execute(
-            f"""{_SELECT}
+            f"""{select}
                   AND r.to_usr >= ? AND r.to_usr < ? {kind_filter}
                 GROUP BY caller.qualified_name, r.from_file, r.from_line
                 ORDER BY r.from_file, r.from_line, caller.qualified_name
@@ -770,10 +787,11 @@ def refs_for_symbol(
         ).fetchall()
 
     params = [config_hash, usr] + kind_params + [limit, offset]
+    select = _SELECT.format(col="r.from_col", origins="r.origins")
     return conn.execute(
-        f"""{_SELECT}
+        f"""{select}
               AND r.to_usr = ? {kind_filter}
-            ORDER BY r.from_file, r.from_line, r.rowid
+            ORDER BY r.from_file, r.from_line, r.from_col, r.rowid
             LIMIT ? OFFSET ?""",
         params,
     ).fetchall()

@@ -36,7 +36,7 @@ import logging
 
 import clang.cindex as cx
 
-from .models import Reference
+from .models import Reference, RefOrigin
 
 _log = logging.getLogger(__name__)
 
@@ -156,4 +156,6 @@ def runtime_vector_reference(
         from_usr=cur_fn,
         ref_kind=RUNTIME_VECTOR_REF_KIND,
         slot_index=irq,
+        from_col=location.column,
+        origins=RefOrigin.DIRECT,
     )

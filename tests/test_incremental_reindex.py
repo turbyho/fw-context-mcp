@@ -4207,7 +4207,7 @@ class TestHeaderScopedRowCleanup:
 
     - a call removed from a header kept its refs row, so ``find_callers``
       reported a caller that no longer exists.  A call that only moved got a
-      second row, because ``idx_refs_unique`` includes ``from_line``.
+      second row, because ``idx_refs_site`` includes ``from_line``.
     - a ``#define`` removed from a header kept its macros row.  One that
       moved got a second row, because the UNIQUE key is
       ``(config_hash, file_id, line)``.
@@ -4269,7 +4269,7 @@ class TestHeaderScopedRowCleanup:
         One call site legitimately produces two rows — ``ref_kind='call'``
         and ``ref_kind='ref'``.  The count must stay at two after the move;
         four rows would mean the pre-move pair survived, because
-        ``idx_refs_unique`` includes ``from_line``.
+        ``idx_refs_site`` includes ``from_line``.
         """
         db_path = _db_path_for_project(c_project)
         hdr = c_project / "src" / "inline_ref.h"

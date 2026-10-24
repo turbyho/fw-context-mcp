@@ -37,7 +37,7 @@ def _symbol(fid: int, name: str, usr: str, line: int, *, kind: str = "function",
 
 
 def _ref(to_usr: str, line: int, from_usr: str, ref_kind: str) -> tuple:
-    return (CH, to_usr, "src/uart.c", line, from_usr, ref_kind, None)
+    return (CH, to_usr, "src/uart.c", line, from_usr, ref_kind, None, 0, 1)
 
 
 @pytest.fixture

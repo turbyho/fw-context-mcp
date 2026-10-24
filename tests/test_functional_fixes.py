@@ -228,7 +228,7 @@ class TestRunSourceLineFallback:
             refs: list = []
             fp_assignments: list = []
             pending_dispatches: list = []
-            seen: set = set()
+            seen: dict = {}
             usr_to_qn = {u: q for q, u in qn_to_usr.items()}
             fn_spans = [("u_self", 1, len(source.splitlines()))]
             self._fallback(
@@ -633,7 +633,7 @@ class TestDispatchDetectionFallback:
         refs: list = []
         fp_assignments: list = []
         pending: list = []
-        seen: set = set()
+        seen: dict = {}
         usr_to_qn = {u: q for q, u in qn_to_usr.items()}
         fn_spans = [("u_caller", 1, len(source.splitlines()))]
         self._fallback(
@@ -792,7 +792,7 @@ class TestCallGraphDispatchAndGlobalCtors:
         ref_rows = [
             # The trailing None is slot_index, which only a vector table
             # slot carries.
-            (CH, to_usr, fp, line, from_usr, rk, None)
+            (CH, to_usr, fp, line, from_usr, rk, None, 0, 1)
             for to_usr, fp, line, from_usr, rk in refs_data
         ]
         insert_refs_batch(conn, ref_rows)
@@ -828,11 +828,11 @@ class TestCallGraphDispatchAndGlobalCtors:
             # Re-add only the dispatch and direct call edges (no implicit_construct)
             from fw_context_mcp.indexer.db import insert_refs_batch
             insert_refs_batch(conn, [
-                (ch, "u_dispatch_forever", "src/main.cpp", 2, "u_main", "call", None),
+                (ch, "u_dispatch_forever", "src/main.cpp", 2, "u_main", "call", None, 0, 1),
                 (ch, "u_watch_ble", "src/zble.cpp", 26, "u_dispatch_forever",
-                 "dispatch", None),
-                (ch, "u_swdt_check", "src/zble.cpp", 27, "u_watch_ble", "call", None),
-                (ch, "u_wdt_reset", "src/wdt.cpp", 46, "u_swdt_check", "call", None),
+                 "dispatch", None, 0, 1),
+                (ch, "u_swdt_check", "src/zble.cpp", 27, "u_watch_ble", "call", None, 0, 1),
+                (ch, "u_wdt_reset", "src/wdt.cpp", 46, "u_swdt_check", "call", None, 0, 1),
             ])
             paths = self._find_call_path(conn, ch, "main", "watch_ble", max_depth=6)
             assert paths, (

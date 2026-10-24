@@ -1058,6 +1058,7 @@ def _store_aliases(
     same file is already there to point at.
     """
     from fw_context_mcp.indexer.db import insert_refs_batch
+    from fw_context_mcp.indexer.models import RefOrigin
     from fw_context_mcp.indexer.ops import _normalize_file_path
 
     rows = []
@@ -1070,9 +1071,10 @@ def _store_aliases(
             # alias edge to the wrong symbol would be worse than none.
             continue
         db_path = _normalize_file_path(symbol.file, project_root)
+        # Column 0: the assembly reader gives no column.
         rows.append((
             config_hash, target, db_path, symbol.line,
-            f"{_ASM_USR_PREFIX}{db_path}@{symbol.name}", ALIAS_REF_KIND, None,
+            f"{_ASM_USR_PREFIX}{db_path}@{symbol.name}", ALIAS_REF_KIND, None, 0, int(RefOrigin.ASM),
         ))
     if rows:
         insert_refs_batch(conn, rows)
@@ -1214,6 +1216,7 @@ def _store_vectors(
     row would make matters worse rather than better.
     """
     from fw_context_mcp.indexer.db import insert_refs_batch
+    from fw_context_mcp.indexer.models import RefOrigin
     from fw_context_mcp.indexer.ops import _normalize_file_path
 
     rows = []
@@ -1229,12 +1232,16 @@ def _store_vectors(
         if usr is None:
             unresolved += 1
             continue
+        # Column 0: the assembly reader gives no column; the slot separates
+        # the entries of one line.
         rows.append((
             config_hash, usr,
             _normalize_file_path(entry.file, project_root), entry.line,
             None,
             VECTOR_DATA_REF_KIND if entry.is_data else VECTOR_REF_KIND,
             entry.index,
+            0,
+            int(RefOrigin.ASM),
         ))
 
     if rows:

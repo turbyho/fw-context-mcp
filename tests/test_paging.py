@@ -58,10 +58,10 @@ def db():
         _symbol_row(fid, "src/main.cpp", "caller", "Caller::run", "u_run", 50),
     ])
     insert_refs_batch(conn, [
-        (CH, "u_a", "src/main.cpp", 100 + i, "u_run", "call", None)
+        (CH, "u_a", "src/main.cpp", 100 + i, "u_run", "call", None, 0, 1)
         for i in range(12)
     ] + [
-        (CH, "u_b", "src/main.cpp", 200 + i, "u_run", "call", None)
+        (CH, "u_b", "src/main.cpp", 200 + i, "u_run", "call", None, 0, 1)
         for i in range(3)
     ])
     yield conn
@@ -235,7 +235,7 @@ class TestCountMatchesThePage:
 
     def test_the_kind_filter_reaches_the_count(self, db):
         """A count over a different filter would describe a different answer."""
-        insert_refs_batch(db, [(CH, "u_a", "src/main.cpp", 300, "u_run", "member", None)])
+        insert_refs_batch(db, [(CH, "u_a", "src/main.cpp", 300, "u_run", "member", None, 0, 1)])
         db.commit()
         calls = count_refs_for_symbol(db, CH, "u_a", "method", ref_kind=["call"])
         every = count_refs_for_symbol(db, CH, "u_a", "method", ref_kind=None)
@@ -289,9 +289,9 @@ class TestAggregateMembersMatchExactly:
             _symbol_row(fid, "src/types.cpp", "run", "App::run", "u_app", 40),
         ])
         insert_refs_batch(db, [
-            (CH, "c:@S@my_type@FI@field", "src/types.cpp", 100, "u_app", "member", None),
-            (CH, "c:@S@myXtype@FI@field", "src/types.cpp", 101, "u_app", "member", None),
-            (CH, "c:@S@MY_TYPE@FI@field", "src/types.cpp", 102, "u_app", "member", None),
+            (CH, "c:@S@my_type@FI@field", "src/types.cpp", 100, "u_app", "member", None, 0, 1),
+            (CH, "c:@S@myXtype@FI@field", "src/types.cpp", 101, "u_app", "member", None, 0, 1),
+            (CH, "c:@S@MY_TYPE@FI@field", "src/types.cpp", 102, "u_app", "member", None, 0, 1),
         ])
         db.commit()
         return db
@@ -317,7 +317,7 @@ class TestAggregateMembersMatchExactly:
     def test_the_owner_itself_is_not_a_member(self, types_db):
         """A reference to the type itself carries the bare USR, no ``@``."""
         insert_refs_batch(types_db, [
-            (CH, "c:@S@my_type", "src/types.cpp", 110, "u_app", "ref", None),
+            (CH, "c:@S@my_type", "src/types.cpp", 110, "u_app", "ref", None, 0, 1),
         ])
         types_db.commit()
         rows = refs_for_symbol(types_db, CH, "c:@S@my_type", "struct")
@@ -350,7 +350,7 @@ class TestAggregatePageWalk:
         # Every reference sits on the SAME file and line, thus the order
         # ties unless it also carries the caller.
         insert_refs_batch(db, [
-            (CH, f"c:@S@Holder@FI@f{i}", "src/atomic.h", 769, f"u_c{i}", "member", None)
+            (CH, f"c:@S@Holder@FI@f{i}", "src/atomic.h", 769, f"u_c{i}", "member", None, 0, 1)
             for i in range(6)
         ])
         db.commit()
@@ -434,7 +434,7 @@ class TestVirtualCallersPaging:
         )
         # Seven call sites on the peer override, none on u_flash itself.
         insert_refs_batch(db, [
-            (CH, "u_sd", "src/dl.cpp", 400 + i, "u_app", "call", None)
+            (CH, "u_sd", "src/dl.cpp", 400 + i, "u_app", "call", None, 0, 1)
             for i in range(7)
         ])
         db.commit()
@@ -478,7 +478,7 @@ class TestVirtualCallersPaging:
 def tied_refs_db():
     """One symbol whose references all sit on ONE line of ONE file.
 
-    ``idx_refs_unique`` covers ``from_usr`` and ``ref_kind``, thus rows that
+    ``idx_refs_site`` covers ``from_usr`` and ``ref_kind``, thus rows that
     share a file and a line are legal and common: measured over six
     firmware indexes, 4792 to 80635 lines carry such a pair.  Here every
     row ties, which is the extreme of the same shape.
@@ -496,7 +496,7 @@ def tied_refs_db():
                        100 + i, kind="function") for i in range(40)],
     )
     insert_refs_batch(conn, [
-        (CH, "u_t", "src/main.cpp", 42, f"u_c{i}", "call", None)
+        (CH, "u_t", "src/main.cpp", 42, f"u_c{i}", "call", None, 0, 1)
         for i in range(40)
     ])
     yield conn

@@ -116,7 +116,7 @@ def _index(tmp_path, *, declared=8, named=(0, 1, 2), handlers=(),
         ])
         insert_refs_batch(conn, [
             (CONFIG, f"c:@F@stub{slot}", "isr_tables.c", 11 + slot, None,
-             "indirect", slot)
+             "indirect", slot, 0, 1)
             for slot in named
         ])
     conn.commit()

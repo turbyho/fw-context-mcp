@@ -2159,7 +2159,7 @@ a maximum:
 
 | List | Maximum | Tool that pages it |
 |------|---------|--------------------|
-| `callers` | 50 `call` and `indirect` references, each with its line | `find_callers` |
+| `callers` | 50 `call` and `indirect` references, each with its line, column and `origins` | `find_callers` |
 | `callees` | 100 rows, one for each callee and kind of reference | `find_callees_recursive` with `max_depth=1` |
 | `indirect_call_sites` | 200 entries | `find_indirect_call_sites`, for a field or a variable |
 
@@ -2278,11 +2278,30 @@ lookup** when fw-context does not find the symbol as a function or method.
 ```
 Input:  {"name": "uart_write", "project_root?": "/path/to/project", "limit?": 50, "offset?": 0}
 Output: [{"total": 2, "offset": 0, "shown": 2, "more": false},
-         {"file": "/path/src/main.c", "line": 35, "ref_kind": "call",
-          "caller": "main", "caller_kind": "function"},
-         {"file": "/path/src/setup.c", "line": 12, "ref_kind": "indirect",
-          "caller": "setup", "caller_kind": "function"}]
+         {"file": "/path/src/main.c", "line": 35, "col": 5, "ref_kind": "call",
+          "origins": ["direct"], "caller": "main", "caller_kind": "function"},
+         {"file": "/path/src/setup.c", "line": 12, "col": 19, "ref_kind": "indirect",
+          "origins": ["direct"], "caller": "setup", "caller_kind": "function"}]
 ```
+
+Each row is one reference site of one caller. `line` and `col` are the
+place of the site, thus two calls on one line are two rows. For an
+indirect reference, the place is the name of the function (`f` in
+`reg(f)`, `tick` in `&WDT::tick`), not the start of the call. `col` is 0
+when the index has no column for the site (an assembly vector table, a
+dispatch bridge, a scan of the source text). In a macro expansion, the
+place is the place of the expansion.
+
+`origins` lists the analyses that found the site:
+
+- `"direct"` — the AST of the compiler names the target.
+- `"text"` — a name in the tokens or in the source text gave the target,
+  where the AST is opaque (`&Class::method`). A name can give a wrong
+  target. A row with `"text"` alone is a guess.
+- `"asm"` — the assembly reader (a vector table slot, an alias).
+- `"dispatch"` — a dispatch bridge, such as `EventQueue::call_every`.
+
+A site that two analyses find is one row with both names.
 
 Indirect edges (`ref_kind: "indirect"`) appear when a function pointer
 references a function through any of these patterns:
@@ -2328,8 +2347,8 @@ back to a **macro lookup**. In that case, this tool returns
 Input:  {"name": "g_sensor_data", "project_root?": "/path/to/project", "limit?": 50, "offset?": 0}
 Output: [{"total": 74, "offset": 0, "shown": 50, "more": true,
           "hint": "find_references('g_sensor_data', offset=50) reads the next page."},
-         {"file": "/path/src/sensor.c", "line": 12, "ref_kind": "ref",
-          "caller": "sensor_task", "caller_kind": "function"}, …]
+         {"file": "/path/src/sensor.c", "line": 12, "col": 9, "ref_kind": "ref",
+          "origins": ["direct"], "caller": "sensor_task", "caller_kind": "function"}, …]
 ```
 
 Macro fallback:

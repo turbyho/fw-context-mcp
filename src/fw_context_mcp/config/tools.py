@@ -313,6 +313,9 @@ For the footprint of one feature, run both.
   Cite `file:line-end_line`.
 - `read_file` → pass `line_numbers=True`, or read a window with
   `start_line` / `end_line`. Never count the lines of a bare `content`.
+- `find_callers`, `find_references` → `line` and `col` of each site; two
+  calls on one line are two rows. `origins` `["text"]` alone means a name
+  gave the target: it can be wrong.
 - A field with NO leading underscore is an answer to cite. An `_`-prefixed
   field (`_match_snippet`, `_fallback`, `_source_truncated`) says where the
   answer came from.

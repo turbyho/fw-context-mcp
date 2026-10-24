@@ -13,7 +13,46 @@ without pulling in libclang or sqlite3.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import enum
+from dataclasses import dataclass, field
+
+
+class RefOrigin(enum.IntFlag):
+    """The analysis that found a reference (``refs.origins``, a bit set).
+
+    WHY a set of bits and not one value: one reference site can be found by
+    more than one analysis, and each of them is a fact about the edge.  The
+    row of a site keeps each one, thus a reader can tell an edge that the
+    AST of the compiler gives from an edge that a name resolved.
+
+    * ``DIRECT`` — the AST walk: the cursor of the reference names its target.
+    * ``TEXT`` — tokens or source text, with the target resolved by its
+      name (``&Class::method`` where the AST is opaque).  The name can be
+      wrong; a later step replaces these.
+    * ``ASM`` — the assembly reader: a vector table slot or an alias.
+    * ``DISPATCH`` — a dispatch bridge of the post-processing: an entry
+      point that runs a callback which a call site registered.
+    """
+
+    DIRECT = 1
+    TEXT = 2
+    ASM = 4
+    DISPATCH = 8
+
+
+def origins_or_sql(column: str) -> str:
+    """Give an SQL aggregate expression: the bitwise OR of *column* over a group.
+
+    SQLite has no bitwise OR aggregate, thus the expression takes the MAX of
+    each bit.  It is built from ``RefOrigin``, thus a new bit needs no edit.
+    *column* is a column name of the caller's query, never user input.
+    """
+    return " | ".join(f"MAX({column} & {int(flag)})" for flag in RefOrigin)
+
+
+def origin_names(origins: int) -> list[str]:
+    """Give the names of the bits of *origins*, in bit order (``["direct", "text"]``)."""
+    return [str(flag.name).lower() for flag in RefOrigin if origins & flag]
 
 
 @dataclass
@@ -24,6 +63,15 @@ class Reference:
         to_usr: USR of the referenced definition (links to ``Symbol.usr``).
         from_file: Absolute path of the file containing the reference.
         from_line: Source line of the reference expression.
+        from_col: Source column of the reference expression, counted from
+            1 as libclang counts it, or 0 when the producer has no column
+            (the assembly reader, the scan of the source text).  The column
+            separates two calls on one line: ``f(); f();`` are two sites.
+            For a reference in a macro expansion it is the column of the
+            expansion, thus two calls of one expansion share it.  For an
+            indirect reference it is the place of the expression that
+            names the function (``f`` in ``reg(f)``), so that each
+            enclosing call that reaches the reference gives one key.
         from_usr: USR of the enclosing function or method (the caller), or
             None when the reference appears at file scope.
         ref_kind: Classification of the reference — ``"call"`` for direct
@@ -49,6 +97,18 @@ class Reference:
             index), and every reference that no initializer holds.  A wrong
             slot number in front of a reader is worse than none, so the
             conditions are strict — see ``symbols._init_list_gives_slots``.
+        origins: The analyses that found the reference, a set of
+            ``RefOrigin`` bits.  Required: a reference with no origin
+            would read as a fact of nothing.
+
+    One row of ``refs`` is one reference site of one caller: the target,
+    the place (file, line, column), the kind, the slot and ``from_usr``.
+    WHY the caller is part of the identity: a macro that defines several
+    functions on one line gives each of them a call at one place of the
+    expansion (measured: ``readMR`` and ``writeMR`` of one register macro,
+    the ``_u8``/``_u16``/``_u32`` variants of one atomic macro).  A second
+    analysis that finds the same site adds its bit to ``origins``
+    (``db._refs.insert_refs_batch``).
     """
     to_usr: str        # USR of the referenced definition (links to Symbol.usr)
     from_file: str     # file containing the reference (absolute, as clang reports)
@@ -56,6 +116,8 @@ class Reference:
     from_usr: str | None   # USR of the enclosing function/method (caller), or None
     ref_kind: str      # "call" | "ref" | "member" | "indirect" | "implicit_construct"
     slot_index: int | None = None
+    from_col: int = field(kw_only=True)
+    origins: int = field(kw_only=True)
 
 
 @dataclass

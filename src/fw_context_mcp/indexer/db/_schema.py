@@ -127,7 +127,12 @@ __all__ = [
 #      parenthesized aggregate initialization), and each
 #      ``__malloc__(dealloc)`` attribute of a Zephyr header was an error
 #      (5715 errors in 7 images of one project, measured 2026-10-24).
-CURRENT_ROW_FORMAT = "fw-context-rows/7"
+# /8 — a row of `refs` is one reference site of one caller: the column
+#      (`from_col`) separates two calls on one line, the slot is in the key,
+#      and `origins` records each analysis that found the site.  Before it,
+#      two calls on one line were one row, two slots of one function inside
+#      a body were one row, and nothing said which edges came from a name.
+CURRENT_ROW_FORMAT = "fw-context-rows/8"
 
 # The config-hash format that was current when CURRENT_ROW_FORMAT last moved.
 #
@@ -142,7 +147,7 @@ CURRENT_ROW_FORMAT = "fw-context-rows/7"
 # the build, thus a plain `fw-context index` writes every file and every
 # body again.  The two must therefore move together, and
 # `test_row_format_invalidation.py` fails when only one of them does.
-ROW_FORMAT_PAIRED_WITH = "fw-context-cc/9"
+ROW_FORMAT_PAIRED_WITH = "fw-context-cc/10"
 
 
 def _row_format_number(value: str) -> int | None:
@@ -205,6 +210,10 @@ _ROW_FORMAT_FAULTS: tuple[tuple[int, str], ...] = (
     (6, "libclang 18 parsed the index: its binding did not know the "
         "C++20 cursor kind of a parenthesized aggregate initialization, and each "
         "__malloc__(dealloc) attribute of a Zephyr header was a parse error"),
+    (7, "two calls of one function on one line are one row of the call "
+        "graph, two slots of one function inside a body are one row, and no "
+        "row says which analysis found the edge (origins), thus an edge from "
+        "a name in the text reads as a fact of the compiler"),
 )
 
 
@@ -450,6 +459,10 @@ _MIGRATION_ADD_COLUMNS = [
     # Cortex-M slot 15 is SysTick and 16+n is external IRQ n, on arm64 it
     # selects an exception class.  The position is a fact of the file.
     "ALTER TABLE refs ADD COLUMN slot_index INTEGER",
+    # The column of a reference site and the analyses that found it (see
+    # the table comment of refs).
+    "ALTER TABLE refs ADD COLUMN from_col INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE refs ADD COLUMN origins INTEGER NOT NULL DEFAULT 0",
     # The entry point the linker script names with `ENTRY()`.  It belongs to
     # the build and not to a file, thus a column here rather than a symbol
     # row: a Cortex-M build says `ENTRY(Reset_Handler)` and a Zephyr build
@@ -756,9 +769,13 @@ END;
 -- variable initialization).
 -- Why from_usr can be NULL: the constructor calls of objects at namespace
 -- scope lack an enclosing function.
--- Why no UNIQUE constraint initially: duplicates can occur when the same
--- TU is indexed twice.  A UNIQUE index is created during data migration
--- AFTER deduplication.
+-- One row is one reference SITE of one caller: the target, the place
+-- (file, line, column), the kind, the slot and from_usr.  The caller is in
+-- the identity, because a macro that defines several functions on one line
+-- gives each of them a call at one place.  origins records each analysis
+-- that found the site.
+-- The UNIQUE index idx_refs_site is created during data migration, after
+-- the rows of an older key are deduplicated.
 CREATE TABLE IF NOT EXISTS refs (
     id           INTEGER PRIMARY KEY,
     config_hash  TEXT    NOT NULL,
@@ -780,12 +797,19 @@ CREATE TABLE IF NOT EXISTS refs (
     -- target constant into the data, and the number the build stated is
     -- the one worth keeping.
     --
-    -- Note that idx_refs_unique, built during migration below, does not
-    -- cover this column.  Two elements of one array that share a target, a
-    -- line AND a from_usr therefore keep only the first.  A table at file
-    -- scope has from_usr NULL, which SQLite treats as distinct, so a real
-    -- vector table is not affected.
-    slot_index   INTEGER
+    -- idx_refs_site covers this column (as ifnull(slot_index, -1)), thus
+    -- two slots of one table that hold the same function on one line stay
+    -- two rows, and so do two IRQs that one line gives the same handler.
+    slot_index   INTEGER,
+    -- The column of the site, counted from 1 as libclang counts it, or 0
+    -- when the producer has no column (the assembly reader, the scan of
+    -- the source text, a dispatch bridge).  It separates two calls on one
+    -- line.  In a macro expansion it is the column of the expansion.
+    from_col     INTEGER NOT NULL DEFAULT 0,
+    -- The analyses that found the site: a set of models.RefOrigin bits
+    -- (1 the AST walk, 2 a name in the tokens or the text, 4 the assembly
+    -- reader, 8 a dispatch bridge).  0 only in a row of an older version.
+    origins      INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_refs_to_usr   ON refs(config_hash, to_usr);
 CREATE INDEX IF NOT EXISTS idx_refs_from_usr ON refs(config_hash, from_usr);
@@ -1285,33 +1309,37 @@ def _run_data_migrations(conn: sqlite3.Connection) -> None:
 
     rebuild_fts(conn)
 
-    # ── Deduplicate refs + create unique index ─────────────────────
-    # Duplicate refs can accumulate when the same TU is indexed multiple
-    # times (e.g., reindex after a header change).  The UNIQUE index
-    # prevents future duplicates; this step cleans up existing ones.
-    # Why MIN(rowid): keeps the first-inserted row — deterministic
-    # and avoids choosing arbitrarily between identical duplicates.
+    # ── Deduplicate refs + create the unique index of a reference site ──
+    # One row is one site of one caller: the target, the file, the line,
+    # the column, the kind, the slot and the caller (``insert_refs_batch``).
+    # An older index has the key idx_refs_unique, which held no column and
+    # no slot: it goes, and the rows of one site under the new key become
+    # one, the first row wins.  The ifnull of the two nullable columns
+    # makes two NULLs one value, as the new index reads them.  Its origins
+    # stay 0 (an older version did not record them), and the row format
+    # asks for a reindex of such an index.
     idx_exists = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_refs_unique'"
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_refs_site'"
     ).fetchone()
     if not idx_exists:
-        dup_count = conn.execute(
-            """SELECT COUNT(*) FROM refs WHERE rowid NOT IN (
-                SELECT MIN(rowid) FROM refs
-                GROUP BY config_hash, to_usr, from_file, from_line, from_usr, ref_kind
+        conn.execute("DROP INDEX IF EXISTS idx_refs_unique")
+        cur = conn.execute(
+            """DELETE FROM refs WHERE rowid NOT IN (
+                SELECT rowid FROM (
+                    SELECT rowid, ROW_NUMBER() OVER (
+                        PARTITION BY config_hash, to_usr, from_file, from_line, from_col,
+                                     ref_kind, ifnull(slot_index, -1), ifnull(from_usr, '')
+                        ORDER BY rowid
+                    ) AS rank FROM refs
+                ) WHERE rank = 1
             )"""
-        ).fetchone()[0]
-        if dup_count > 0:
-            log.info("Deduplicating %d duplicate ref rows", dup_count)
-            conn.execute(
-                """DELETE FROM refs WHERE rowid NOT IN (
-                    SELECT MIN(rowid) FROM refs
-                    GROUP BY config_hash, to_usr, from_file, from_line, from_usr, ref_kind
-                )"""
-            )
+        )
+        if cur.rowcount > 0:
+            log.info("Deduplicated %d ref rows of one reference site", cur.rowcount)
         conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_refs_unique "
-            "ON refs(config_hash, to_usr, from_file, from_line, from_usr, ref_kind)"
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_refs_site "
+            "ON refs(config_hash, to_usr, from_file, from_line, from_col, ref_kind, "
+            "ifnull(slot_index, -1), ifnull(from_usr, ''))"
         )
 
     # ── Embeddings composite PK migration ───────────────────────────

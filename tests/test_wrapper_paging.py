@@ -38,7 +38,7 @@ def _fill(conn, file_ids: list[int]) -> None:
             usr = f"c:@S@{cls}@F@m{m:02d}"
             symbols.append(symbol_row(fid, path, f"m{m:02d}", f"{cls}::m{m:02d}", usr, line,
                                       kind="method", parent_usr=f"c:@S@{cls}"))
-            refs.append((CH, "c:@S@UART_DRIVER@F@write", path, line + 1, usr, "call", None))
+            refs.append((CH, "c:@S@UART_DRIVER@F@write", path, line + 1, usr, "call", None, 0, 1))
             line += 3
     insert_symbols_batch(conn, symbols)
     insert_refs_batch(conn, refs)

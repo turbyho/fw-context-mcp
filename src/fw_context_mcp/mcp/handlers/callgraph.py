@@ -76,6 +76,7 @@ from ...indexer.db import (
 )
 from ...indexer.db._resolve import ambiguity_notice, candidate_labels, count_candidates
 from ...indexer.intlist import read_isr_registrations
+from ...indexer.models import origin_names
 from ...utils import abs_path
 from ...utils import escape_like as _escape_like
 from ...utils import format_number_ranges as _as_ranges
@@ -197,7 +198,7 @@ def _resolve_virtual_callers(conn, config_hash: str, usr: str, root, ref_kind: l
     # does not: libclang wrote that one because the static type was the
     # sibling.  Without this column a reader cannot tell the two apart,
     # and the answer reads as one set of call sites.
-    virtual_select = f"""SELECT DISTINCT r.from_file, r.from_line, r.ref_kind,
+    virtual_select = f"""SELECT DISTINCT r.from_file, r.from_line, r.from_col, r.origins, r.ref_kind,
                     r.to_usr AS recorded_usr,
                     caller.name AS caller_name,
                     caller.qualified_name AS caller_qname,
@@ -225,7 +226,7 @@ def _resolve_virtual_callers(conn, config_hash: str, usr: str, root, ref_kind: l
     # neither repeat nor skip a row.
     caller_rows = conn.execute(
         f"""{virtual_select}
-             ORDER BY r.from_file, r.from_line, r.ref_kind, r.to_usr,
+             ORDER BY r.from_file, r.from_line, r.from_col, r.origins, r.ref_kind, r.to_usr,
                       caller.qualified_name, caller.name, caller.kind
              LIMIT ? OFFSET ?""",
         (config_hash, *all_derived, *kind_params, limit, max(0, offset)),
@@ -245,7 +246,9 @@ def _resolve_virtual_callers(conn, config_hash: str, usr: str, root, ref_kind: l
         {
             "file": abs_path(root, r["from_file"]),
             "line": r["from_line"],
+            "col": r["from_col"],
             "ref_kind": r["ref_kind"],
+            "origins": origin_names(r["origins"]),
             "caller": r["caller_qname"] or r["caller_name"] or "<file scope>",
             "caller_kind": r["caller_kind"],
             # Which symbol the index records this reference against.  It is
@@ -280,8 +283,8 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
 
     Returns:
         list of dicts.  The page notice leads the answer — ``total``, ``offset``,
-        ``shown``, ``more`` — and each that follows holds: file, line,
-        ref_kind, caller, caller_kind.
+        ``shown``, ``more`` — and each that follows holds: file, line, col,
+        ref_kind, origins, caller, caller_kind.
     """
     try:
         db = BaseHandler.resolve_db_context(project_root, variant=variant, image=image)
@@ -496,7 +499,9 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
             {
                 "file": abs_path(root, r["from_file"]),
                 "line": r["from_line"],
+                "col": r["from_col"],
                 "ref_kind": r["ref_kind"],
+                "origins": origin_names(r["origins"]),
                 "caller": r["caller_qname"] or r["caller_name"] or "<file scope>",
                 "caller_kind": r["caller_kind"],
                 **({"target_qualified_name": r["target_qualified_name"]} if tagged else {}),
@@ -584,8 +589,13 @@ def find_callers(
 
     Returns:
         The page notice first — ``total``, ``offset``, ``shown``, ``more``
-        — then a dict per call site with: file, line, ref_kind (``"call"``,
-        ``"indirect"``, ``"implicit_construct"``, or ``"macro_use"``),
+        — then a dict per call site with: file, line, col (the column of the
+        site, 0 when the index has none; two calls on one line are two rows),
+        ref_kind (``"call"``, ``"indirect"``, ``"implicit_construct"``, or
+        ``"macro_use"``), origins (list — the analyses that found the site: ``"direct"``, the AST
+        of the compiler names the target; ``"text"``, a name in the tokens or
+        the source text gave the target, which can be wrong; ``"asm"``, the
+        assembly reader; ``"dispatch"``, a dispatch bridge),
         caller (enclosing function name), caller_kind (``"function"``,
         ``"method"``, …). Macro fallback puts a dict with ``kind="macro"``,
         ``signature`` (``#define`` free: ``NAME`` or ``NAME(a, b)``),
@@ -659,8 +669,8 @@ def find_references(
 
     Returns:
         The page notice first — ``total``, ``offset``, ``shown``, ``more``
-        — then a dict per reference with: file, line, ref_kind, caller,
-        caller_kind.
+        — then a dict per reference with: file, line, col, ref_kind,
+        origins (as in ``find_callers``), caller, caller_kind.
         ``ref_kind`` is one of: ``"call"``, ``"ref"``, ``"member"``,
         ``"indirect"`` (function-pointer reference in arguments, assignments,
         initializers, or init lists), ``"implicit_construct"`` (the
@@ -1707,7 +1717,7 @@ def find_wrapper_callers(
         # caller, file and line.
         placeholders = ",".join("?" * len(driver_usr_map))
         rows = conn.execute(
-            f"""SELECT r.from_usr, r.to_usr, r.from_file, r.from_line, r.ref_kind,
+            f"""SELECT r.from_usr, r.to_usr, r.from_file, r.from_line, r.from_col, r.origins, r.ref_kind,
                        caller.name AS caller_name,
                        caller.qualified_name AS caller_qname,
                        caller.kind AS caller_kind
@@ -1717,7 +1727,7 @@ def find_wrapper_callers(
                 WHERE r.config_hash = ?
                   AND r.to_usr IN ({placeholders})
                   AND r.ref_kind IN ('call', 'indirect', 'implicit_construct')
-                ORDER BY caller.qualified_name, r.from_file, r.from_line, r.rowid""",
+                ORDER BY caller.qualified_name, r.from_file, r.from_line, r.from_col, r.rowid""",
             (config_hash, *driver_usr_map.keys()),
         ).fetchall()
 
@@ -1760,6 +1770,8 @@ def find_wrapper_callers(
                 cm[caller_qn]["calls"].append({
                     "driver_method": target["name"],
                     "line": r["from_line"],
+                    "col": r["from_col"],
+                    "origins": origin_names(r["origins"]),
                 })
 
         # Flatten for output.  The class name is the key of ``wrapped``,

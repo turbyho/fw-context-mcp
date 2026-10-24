@@ -29,6 +29,7 @@ from typing import Annotated
 
 from pydantic import Field
 
+from ...indexer.models import origin_names
 from ...utils import abs_path
 from ..shared.paging import (
     call_text,
@@ -224,12 +225,12 @@ def find_variables(
             # line tie on file and line.
             ref_rows = c.execute(
                 f"""SELECT * FROM (
-                        SELECT r.to_usr, r.from_file, r.from_line, r.ref_kind,
+                        SELECT r.to_usr, r.from_file, r.from_line, r.from_col, r.origins, r.ref_kind,
                                r.from_usr, c.name AS caller_name,
                                c.qualified_name AS caller_qname, c.kind AS caller_kind,
                                ROW_NUMBER() OVER (
                                    PARTITION BY r.to_usr
-                                   ORDER BY r.from_file, r.from_line, r.rowid
+                                   ORDER BY r.from_file, r.from_line, r.from_col, r.rowid
                                ) AS rn,
                                COUNT(*) OVER (PARTITION BY r.to_usr) AS ref_total
                         FROM refs r
@@ -238,7 +239,7 @@ def find_variables(
                         WHERE r.config_hash = ? AND r.to_usr IN ({placeholders})
                     )
                     WHERE rn <= ?
-                    ORDER BY from_file, from_line, rn""",
+                    ORDER BY from_file, from_line, from_col, rn""",
                 (config_hash, *var_usrs, _REFS_PER_VARIABLE),
             ).fetchall()
             for ref in ref_rows:
@@ -248,7 +249,9 @@ def find_variables(
                     "function": rdict.get("caller_qname") or rdict.get("caller_name") or "<unknown>",
                     "file": abs_path(root, rdict["from_file"]),
                     "line": rdict["from_line"],
+                    "col": rdict["from_col"],
                     "ref_kind": rdict["ref_kind"],
+                    "origins": origin_names(rdict["origins"]),
                 })
 
         results = []

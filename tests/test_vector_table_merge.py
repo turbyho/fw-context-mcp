@@ -58,7 +58,7 @@ def _assembly_table(conn, slots, table_file="startup.S"):
         ])
         insert_refs_batch(conn, [
             (CONFIG, f"asm:{name}", table_file, 40 + slot, None,
-             "vector", slot)
+             "vector", slot, 0, 1)
             for slot, name in slots.items()
         ])
 
@@ -85,7 +85,7 @@ def _c_table(conn, table_name, slots, table_file="isr_tables.c",
         ])
         insert_refs_batch(conn, [
             (CONFIG, f"c:@F@{name}", table_file, first_line + slot, None,
-             "indirect", slot)
+             "indirect", slot, 0, 1)
             for slot, name in slots.items()
         ])
 
@@ -113,7 +113,7 @@ def _aliases_default(conn, *names, table_file="startup.S"):
         ])
         insert_refs_batch(conn, [
             (CONFIG, "asm:Default_Handler", table_file, 70, f"asm:{name}",
-             "alias", None)
+             "alias", None, 0, 1)
             for name in names
         ])
 
@@ -134,7 +134,7 @@ def _installs_at_runtime(conn, irq, handler, offset="16", at_line=90,
         ])
         insert_refs_batch(conn, [
             (CONFIG, f"c:@F@{handler}", at_file, at_line, None,
-             "runtime_vector", irq),
+             "runtime_vector", irq, 0, 1),
         ])
         if offset is not None:
             insert_macros_batch(conn, [
@@ -299,7 +299,7 @@ def test_an_unhandled_stub_is_not_relabelled_as_a_dispatcher(tmp_path):
             ])
             insert_refs_batch(conn, [
                 (CONFIG, "asm:Default_Handler", "startup.S", 70,
-                 "asm:Stub_Handler", "alias", None),
+                 "asm:Stub_Handler", "alias", None, 0, 1),
             ])
             insert_indirect_call_sites_batch(conn, [
                 (CONFIG, "startup.S", 91, "asm:Stub_Handler", "p()",
@@ -393,7 +393,7 @@ class TestADeclarationIsNotTheDefinition:
             ])
             insert_refs_batch(conn, [
                 (CONFIG, "c:@F@_isr_wrapper", "isr_tables.c", 11 + slot,
-                 None, "indirect", slot)
+                 None, "indirect", slot, 0, 1)
                 for slot in (0, 1)
             ])
 
@@ -578,7 +578,7 @@ class TestASlotThatHoldsData:
                 ])
                 insert_refs_batch(conn, [
                     (CONFIG, "c:@z_main_stack", "vector_table.S", 39, None,
-                     "vector_data", 0),
+                     "vector_data", 0, 0, 1),
                 ])
 
             rows = get_vector_table(conn, CONFIG)

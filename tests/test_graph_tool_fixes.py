@@ -60,7 +60,7 @@ def db(tmp_path):
         # fails, and the fn_ptr_type fallback runs.
         _symbol(fid, "onData", "u_on_data", kind="field", signature="Callback onData"),
     ])
-    insert_refs_batch(conn, [(CH, "u_on_rx_done", "src/drv.c", 30, "u_main", "call", None)])
+    insert_refs_batch(conn, [(CH, "u_on_rx_done", "src/drv.c", 30, "u_main", "call", None, 0, 1)])
     insert_fp_assignments_batch(conn, [
         (CH, "src/drv.c", 40, "u_on_data", "onData", "u_on_rx_done", "on_rx_done",
          "void (*)(int)", "assignment", "u_main"),

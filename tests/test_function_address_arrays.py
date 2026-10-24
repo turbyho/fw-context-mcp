@@ -221,16 +221,16 @@ def test_an_index_without_slots_reports_nothing(tmp_path):
     Reading it is not an error — every C reference in it carries NULL, and
     the reader has to say "no array recognised" rather than fail.
     """
-    from fw_context_mcp.indexer.models import Reference
+    from fw_context_mcp.indexer.models import Reference, RefOrigin
 
     conn = _open(tmp_path, CONFIG)
     try:
         insert_refs_batch(conn, [
             (CONFIG, r.to_usr, r.from_file, r.from_line, r.from_usr,
-             r.ref_kind, r.slot_index)
+             r.ref_kind, r.slot_index, r.from_col, int(r.origins))
             for r in (
-                Reference("c:@F@reset", "v.c", 3, None, "indirect", None),
-                Reference("c:@F@nmi", "v.c", 4, None, "indirect", None),
+                Reference("c:@F@reset", "v.c", 3, None, "indirect", None, from_col=0, origins=RefOrigin.DIRECT),
+                Reference("c:@F@nmi", "v.c", 4, None, "indirect", None, from_col=0, origins=RefOrigin.DIRECT),
             )
         ])
         conn.commit()

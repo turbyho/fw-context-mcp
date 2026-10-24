@@ -277,8 +277,8 @@ class TestFetchReferencers:
                        usr="c:@F@update", name="update", kind="function")
 
         refs = [
-            ("hash-deadbeef", "c:@g_count", "/tmp/test.c", 10, "c:@F@init", "ref", None),
-            ("hash-deadbeef", "c:@g_count", "/tmp/test.c", 20, "c:@F@update", "ref", None),
+            ("hash-deadbeef", "c:@g_count", "/tmp/test.c", 10, "c:@F@init", "ref", None, 0, 1),
+            ("hash-deadbeef", "c:@g_count", "/tmp/test.c", 20, "c:@F@update", "ref", None, 0, 1),
         ]
         insert_refs_batch(populated_db, refs)
 
@@ -309,8 +309,8 @@ class TestFetchReferencers:
                        qualified_name="writer")
 
         refs = [
-            ("hash-deadbeef", "c:@g_level", "/tmp/test.c", 5, "c:@F@reader", "ref", None),
-            ("hash-deadbeef", "c:@g_level", "/tmp/test.c", 8, "c:@F@writer", "ref", None),
+            ("hash-deadbeef", "c:@g_level", "/tmp/test.c", 5, "c:@F@reader", "ref", None, 0, 1),
+            ("hash-deadbeef", "c:@g_level", "/tmp/test.c", 8, "c:@F@writer", "ref", None, 0, 1),
         ]
         insert_refs_batch(populated_db, refs)
 
@@ -529,8 +529,8 @@ class TestFindVariablesHandler:
             _insert_symbol(conn, "hash-other", other_fid, "src/a.c", usr="c:@F@run",
                            name="Run", kind="struct")
             insert_refs_batch(conn, [
-                (chash, "c:a.c@F@run@counter", "src/a.c", 5, "c:@F@run", "ref", None),
-                ("hash-other", "c:a.c@F@run@counter", "src/a.c", 99, "c:@F@run", "ref", None),
+                (chash, "c:a.c@F@run@counter", "src/a.c", 5, "c:@F@run", "ref", None, 0, 1),
+                ("hash-other", "c:a.c@F@run@counter", "src/a.c", 99, "c:@F@run", "ref", None, 0, 1),
             ])
 
         results = self._run(tmp_path, conn, "counter")
@@ -549,8 +549,8 @@ class TestFindVariablesHandler:
             _insert_symbol(conn, chash, fid, "src/a.c", usr="c:@g_b", name="g_b", kind="varglobal")
             # g_a has 150 references, all before the one of g_b in file order.
             insert_refs_batch(conn, [
-                (chash, "c:@g_a", "src/a.c", line, "c:@F@f", "ref", None) for line in range(1, 151)
-            ] + [(chash, "c:@g_b", "src/z.c", 1, "c:@F@f", "ref", None)])
+                (chash, "c:@g_a", "src/a.c", line, "c:@F@f", "ref", None, 0, 1) for line in range(1, 151)
+            ] + [(chash, "c:@g_b", "src/z.c", 1, "c:@F@f", "ref", None, 0, 1)])
 
         results = {r["name"]: r for r in self._run(tmp_path, conn, "g_")}
 
@@ -613,8 +613,8 @@ class TestFindVariablesHandler:
             _insert_symbol(conn, chash, fid, "src/a.c", usr="c:@g_a", name="g_a", kind="varglobal")
             _insert_symbol(conn, chash, fid, "src/a.c", usr="c:@g_b", name="g_b", kind="varglobal")
             insert_refs_batch(conn, [
-                (chash, "c:@g_a", "src/a.c", line, "c:@F@f", "ref", None) for line in range(1, 151)
-            ] + [(chash, "c:@g_b", "src/z.c", 1, "c:@F@f", "ref", None)])
+                (chash, "c:@g_a", "src/a.c", line, "c:@F@f", "ref", None, 0, 1) for line in range(1, 151)
+            ] + [(chash, "c:@g_b", "src/z.c", 1, "c:@F@f", "ref", None, 0, 1)])
 
         results = {r["name"]: r for r in self._run(tmp_path, conn, "g_")}
 

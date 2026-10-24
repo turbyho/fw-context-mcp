@@ -33,13 +33,13 @@ def _fill(conn, file_ids: list[int]) -> None:
     for i in range(CALLERS):
         usr = f"c:@F@caller{i:03d}"
         symbols.append(symbol_row(fid, path, f"caller{i:03d}", f"caller{i:03d}", usr, 10 + i))
-        refs.append((CH, "c:@F@hub", path, 10 + i, usr, "call", None))
+        refs.append((CH, "c:@F@hub", path, 10 + i, usr, "call", None, 0, 1))
     for i in range(CALLEES):
         usr = f"c:@F@callee{i:03d}"
         symbols.append(symbol_row(fid, path, f"callee{i:03d}", f"callee{i:03d}", usr, 100 + i))
-        refs.append((CH, usr, path, 2, "c:@F@hub", "call", None))
+        refs.append((CH, usr, path, 2, "c:@F@hub", "call", None, 0, 1))
     # A second call of one callee: the same row, and it must not count twice.
-    refs.append((CH, "c:@F@callee000", path, 3, "c:@F@hub", "call", None))
+    refs.append((CH, "c:@F@callee000", path, 3, "c:@F@hub", "call", None, 0, 1))
     symbols.append(symbol_row(fid, path, "reg_id_t", "reg_id_t", "c:@E@reg_id_t", 300, kind="enum"))
     symbols += [
         symbol_row(fid, path, f"REG_{i:03d}", f"reg_id_t::REG_{i:03d}", f"c:@E@reg_id_t@REG_{i:03d}",

@@ -52,7 +52,7 @@ def _symbol(file_id: int, path: str, name: str, qname: str, usr: str, line: int)
 
 
 def _call(to_usr: str, path: str, line: int, from_usr: str) -> tuple:
-    return (CH, to_usr, path, line, from_usr, "call", None)
+    return (CH, to_usr, path, line, from_usr, "call", None, 0, 1)
 
 
 @pytest.fixture

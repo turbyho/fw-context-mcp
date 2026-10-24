@@ -1845,7 +1845,7 @@ class TestTheSlotPositionReachesTheIndex:
                 upsert_build_config(conn, "ch", "pid", str(tmp_path / "cc.json"))
                 insert_refs_batch(conn, [
                     ("ch", "c:@F@callee", "src/a.c", 10, "c:@F@caller",
-                     "call", None),
+                     "call", None, 0, 1),
                 ])
             value = conn.execute(
                 "SELECT slot_index FROM refs WHERE ref_kind='call'"
