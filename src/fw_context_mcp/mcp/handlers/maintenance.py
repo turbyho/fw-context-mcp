@@ -3835,6 +3835,37 @@ def check_ollama(
         ``"disabled"`` gives only status, ollama_enabled,
         ollama_running, configured_model, num_ctx, and message;
         embedding_backend is present on every other status.
+
+    What to do for each status:
+
+    - ``"ok"``, ``"disabled"``: continue. ``"disabled"`` means that no
+      tool calls the LLM.
+    - ``"not_configured"``: when ``message`` says that the url of the
+      Ollama profile names a server that is not Ollama, the operator
+      corrects that profile.  Else ask the operator: a local Ollama or a
+      cloud service?  For a local Ollama, the operator installs it from
+      https://ollama.com (without internet: the installer from a
+      different computer).  Do not install Ollama yourself.  For a cloud
+      service, the operator runs ``fw-context llm setup`` in a terminal,
+      then you call ``configure_llm(profile=<name>)``.
+    - ``"model_missing"``: give the size of each model as your estimate,
+      and say that it can be wrong.  Ask: pull the model, or use a cloud
+      service?  Run a command of ``message`` only after the approval.  In
+      a different shell, set ``OLLAMA_HOST`` as the command does: without
+      it, the model can go to a different server.  When the pull fails
+      on the network, the operator can pull the model on a computer with
+      internet and copy ``~/.ollama/models/``.  With
+      ``suggest_cloud: true``, no installed model is large enough for
+      code: recommend a cloud service.
+    - ``"embedding_unavailable"``: tell the operator that
+      ``semantic_search`` does not work, and give the cause from
+      ``message``.
+    - ``"error"``: give ``message`` to the operator.
+
+    WHY these rules are here and not only in the server instructions: an
+    LLM client can cut the instructions of a server (Claude Code keeps
+    approximately 2500 characters), and it always sends the description
+    of a tool.
     """
     try:
         _, cfg, _, _ = _resolve_context(project_root)
