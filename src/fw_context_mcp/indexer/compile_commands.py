@@ -74,6 +74,24 @@ _DROP_FLAGS = frozenset({
     # Measured 2026-10-24: the parse goes on, but the error counts against
     # the health of the index and hides a real error among the others.
     "-fno-defer-pop",
+    # Xtensa GCC (ESP32): code generation flags that clang does not know.
+    # libclang 22 parses an ESP32 build for the real Xtensa target, where
+    # libclang 18 used an x86 proxy without the -m flags, thus the flags now
+    # reach the parse: "unknown argument '-mlongcalls'" in each unit of two
+    # ESP32 projects (measured 2026-10-24).  Each flag below gave "unknown
+    # argument" or "unsupported option" in libclang 22 for
+    # --target=xtensa-esp32-elf (probe of 2026-10-24).  The names exist only
+    # in Xtensa GCC, thus no other target loses a flag.
+    "-mlongcalls", "-mno-longcalls",
+    "-mtext-section-literals", "-mno-text-section-literals",
+    "-mauto-litpools", "-mno-auto-litpools",
+    "-mtarget-align", "-mno-target-align",
+    "-mserialize-volatile", "-mno-serialize-volatile",
+    "-mfix-esp32-psram-cache-issue",
+    "-mdisable-hardware-atomics",
+    "-mforce-no-pic",
+    "-mconst16", "-mno-const16",
+    "-mabi=windowed", "-mabi=call0",
 })
 
 # GCC-only warning flags that take a level suffix (=1, =2) — drop any token
@@ -87,6 +105,13 @@ _DROP_PREFIXES = frozenset({
     # GCC-only ABI switch carrying a value (=ieee, =alternative).  A prefix
     # rather than an exact match, because the value varies by project.
     "-mfp16-format=",
+    # Xtensa GCC (ESP32 with PSRAM): the value names the work-around.
+    "-mfix-esp32-psram-cache-strategy=",
+    # GCC tuning parameters of the code generation (--param=name=value).
+    # Zephyr/NCS: "argument unused during compilation:
+    # '--param=min-pagesize=0'" was an error in 33 units of three images
+    # (measured 2026-10-24).  No parameter changes what the source means.
+    "--param=",
 })
 
 # Two-token flags: drop both the flag and its next argument
@@ -95,6 +120,7 @@ _DROP_WITH_ARG = frozenset({
     "-MF",   # dependency file path
     "-MT",   # dependency target
     "-MQ",   # dependency target (quoted)
+    "--param",  # the two-token form of the GCC tuning parameters above
 })
 
 
@@ -396,6 +422,13 @@ def normalize_args(
         else:
             resolved.append(token)
 
+    # A flag that the parse does not use is no fault of the source: libclang
+    # parses and makes no object, thus "-c" and the code generation flags are
+    # unused.  Under the -Werror of a unit the warning was an error.
+    # Measured with libclang 22 on Zephyr/NCS (mbedtls units, -Werror):
+    # "argument unused during compilation: '-c'" in 33 units of each of
+    # two images.
+    resolved.append("-Wno-unused-command-line-argument")
     # Silences clang's "unknown warning option" diagnostic for every GCC-only
     # -W flag at once.  Appended last so it also wins over an earlier -Werror,
     # which would otherwise turn the diagnostic into a hard parse error.

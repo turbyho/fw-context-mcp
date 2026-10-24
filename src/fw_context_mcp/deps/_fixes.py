@@ -34,7 +34,12 @@ STALL_TIMEOUT = 300
 
 
 def _pip_install(package: str) -> tuple[bool, str]:
-    """Install a Python package. Returns (ok, output).
+    """Install a Python package. Returns (ok, output)."""
+    return _pip(["install", package])
+
+
+def _pip(arguments: list[str]) -> tuple[bool, str]:
+    """Run pip (or uv pip) with *arguments* in the environment of fw-context. Returns (ok, output).
 
     WHY (uv preference): ``uv pip install`` is 10-100× faster than
     ``pip install`` for cached packages.  However, uv only works inside
@@ -47,9 +52,12 @@ def _pip_install(package: str) -> tuple[bool, str]:
     # uv pip install fails with "No virtual environment found".
     # Always fall back to sys.executable which knows where its own venv is.
     if which("uv") and os.environ.get("VIRTUAL_ENV"):
-        cmd = ["uv", "pip", "install", "--python", sys.executable, package]
+        # `uv pip uninstall` never asks, and it refuses `-y` as an unknown
+        # argument (measured with uv 0.11.7).
+        rest = [a for a in arguments[1:] if not (arguments[0] == "uninstall" and a == "-y")]
+        cmd = ["uv", "pip", arguments[0], "--python", sys.executable, *rest]
     else:
-        cmd = [sys.executable, "-m", "pip", "install", package]
+        cmd = [sys.executable, "-m", "pip", *arguments]
 
     try:
         result = subprocess.run(
@@ -275,8 +283,30 @@ def fix_sqlite_vec(_result, _project_root=None) -> tuple[bool, str]:
 
 
 def fix_libclang_python(_result, _project_root=None) -> tuple[bool, str]:
-    """Install libclang."""
-    return _pip_install("libclang")
+    """Install the libclang-ng wheel that fw-context declares, and remove the old ``libclang``.
+
+    WHY the reinstall after the removal: the two install the same ``clang``
+    package, thus the removal of ``libclang`` also removes files that
+    libclang-ng wrote.
+
+    WHY the removal also when another package of the environment needs
+    ``libclang``: the two packages write the same files, thus that package
+    gets the files of libclang-ng anyway, and fw-context the files of
+    whichever package pip wrote last.  No environment holds both correctly.
+    """
+    import importlib.metadata
+
+    from ..indexer._clang_resource import libclang_requirement
+
+    try:
+        importlib.metadata.version("libclang")
+    except importlib.metadata.PackageNotFoundError:
+        pass
+    else:
+        ok, output = _pip(["uninstall", "-y", "libclang"])
+        if not ok:
+            return False, f"cannot remove the old libclang: {output}"
+    return _pip(["install", "--force-reinstall", "--no-deps", libclang_requirement()])
 
 
 def fix_watchfiles(_result, _project_root=None) -> tuple[bool, str]:

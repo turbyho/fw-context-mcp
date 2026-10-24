@@ -908,10 +908,11 @@ without `config` does not repair the config files.
   redirect of fw-context is active.
 - `sqlite-ext` — SQLite can load extensions (`enable_load_extension()`).
 - `sqlite-vec` — the `sqlite-vec` extension loads into SQLite.
-- `libclang-python` — the clang Python bindings are installed, version
-  18.1.1 or later.
-- `libclang-so` — fw-context finds the native libclang shared library,
-  and the library loads.
+- `libclang-python` — the `libclang-ng` package is installed, in the
+  version that fw-context pins, and the old `libclang` package is not
+  installed next to it (the two install the same `clang` package).
+- `libclang-so` — fw-context finds the native libclang shared library of
+  the `libclang-ng` package, and the library loads.
 - `clang-resource` — the clang compiler headers of the libclang major
   version are there. Not critical: without them, some GCC headers do not
   parse, and the index holds the errors.
@@ -3125,9 +3126,7 @@ error: `units`, `errors` (the sum of the errors), `fatal_units`, and
 name and line when the diagnostic has a location. After a fatal error the compiler stops, thus symbols and
 calls of that unit can be missing. `index_message` then gives a warning.
 A reindex gives the same result, because it parses with the same flags
-and headers. A non-fatal error leaves the parse complete. A known example
-is an attribute that libclang 18 does not know, such as
-`__malloc__(dealloc)`. A unit that libclang did not load is not in the
+and headers. A non-fatal error leaves the parse complete. A unit that libclang did not load is not in the
 counts, and the index log names it (`skip TU`). A file that `compile_commands.json` lists more than once
 counts once, with the values of the listing that the last run parsed.
 `parse_errors` is `null` for an index of an older row format, because its
@@ -3337,7 +3336,7 @@ Input:  {"project_root?": "/path/to/project"}
 Output: [{"name": "libclang-so", "status": "missing", "critical": true,
           "message": "…",
           "action": {"message": "libclang shared library not found.",
-                     "command": "apt install libclang-18-dev"}}, …]
+                     "command": "pip install --force-reinstall 'libclang-ng==22.1.4.2'"}}, …]
 ```
 
 Call it when `get_project_status` or another tool reports a problem of

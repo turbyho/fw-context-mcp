@@ -36,7 +36,7 @@ UV := $(shell uv --version >/dev/null 2>&1 && command -v uv)
 
 # ---- install ----
 install: venv pip-install link-add clean-path
-	@# The clang compiler headers of the libclang version: the wheel has none.
+	@# The clang compiler headers of the libclang version: the wheel lacks the ARM ones.
 	@# Not fatal — `fw-context doctor` reports it, and `--fix` repairs it later.
 	@$(VENV)/bin/fw-context doctor --fix --only clang-resource || true
 	@echo ""

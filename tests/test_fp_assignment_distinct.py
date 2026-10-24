@@ -83,20 +83,15 @@ def test_two_calls_on_one_line_stay_two_call_sites(extracted):
     assert len([s for s in extracted.indirect_call_sites if s.from_line == line]) == 2
 
 
-@pytest.mark.libclang
-def test_without_the_c_api_each_binary_operator_assigns_as_before(tmp_path):
-    from unittest import mock
+def test_the_binding_reads_the_operator_of_a_binary_expression():
+    """The fix rests on ``Cursor.binary_operator`` (binding of libclang 19 and later).
 
-    from fw_context_mcp.indexer import symbols
-    from fw_context_mcp.indexer.compile_commands import CompilationUnit
+    The ctypes code that it replaced broke under the libclang 22 binding,
+    and a broad ``except`` made each operator an assignment without a word.
+    """
+    from fw_context_mcp.indexer._libclang import cindex
 
-    src = tmp_path / "fp.c"
-    src.write_text(SOURCE, encoding="utf-8")
-    unit = CompilationUnit(file=src, directory=tmp_path, language="c", clang_args=["-std=c11"])
-    with mock.patch.object(symbols, "_binary_operator_spelling_call", return_value=None):
-        rows = symbols.extract_all(unit, with_refs=True).fp_assignments
-    line = _line("dev->cb != handler_a")
-    assert {f.rhs_name for f in rows if f.from_line == line} == {"handler_a", "handler_b"}
+    assert isinstance(getattr(cindex.Cursor, "binary_operator", None), property)
 
 
 @pytest.mark.libclang

@@ -128,29 +128,44 @@ def sqlite_ext_instructions(ctx: dict) -> str:
 
 
 def libclang_python_instructions(ctx: dict) -> str:
-    """How to install the clang Python bindings (libclang>=18.1.1)."""
+    """How to install the libclang-ng wheel: libclang, its binding and its compiler headers."""
+    from ..indexer._clang_resource import libclang_requirement
+
     pip = ctx.get("pip_cmd", "pip install")
-    return f"{pip} 'libclang>=18.1.1'"
+    return f"{pip} '{libclang_requirement()}'"
+
+
+def libclang_conflict_instructions(ctx: dict) -> str:
+    """How to remove the old ``libclang`` package that is installed next to libclang-ng.
+
+    WHY both steps: the two packages install the same ``clang`` package, and
+    the removal of ``libclang`` also removes files that libclang-ng wrote.
+    The reinstall writes them again.
+    """
+    from ..indexer._clang_resource import libclang_requirement
+
+    pip = ctx.get("pip_cmd", "pip install")
+    if pip.startswith("uv pip install"):
+        # `uv pip uninstall` never asks, and it refuses `-y`.
+        uninstall = "uv pip uninstall" + pip[len("uv pip install"):]
+    elif pip.endswith(" install"):
+        uninstall = pip[: -len(" install")] + " uninstall -y"
+    else:
+        uninstall = "pip uninstall -y"
+    return f"{uninstall} libclang && {pip} --force-reinstall '{libclang_requirement()}'"
 
 
 def libclang_so_instructions(ctx: dict) -> str:
-    """How to install the native libclang shared library.
+    """How to repair the native libclang library.
 
-    The clang Python bindings (``pip install libclang``) ship without the
-    ``libclang.so``/``libclang.dylib`` shared object.  Parsing C/C++ needs
-    that native library, so it must be installed separately through the
-    system package manager — ``pip`` cannot install a shared library.
+    The libclang-ng wheel holds the library (``libclang.so``,
+    ``libclang.dylib`` or ``libclang.dll``), thus a reinstall of the wheel
+    repairs a missing or damaged one.  No system package is necessary.
     """
-    pkg = ctx.get("pkg_manager", "unknown")
-    if pkg == "apt":
-        return "apt install libclang-18-dev"
-    if pkg == "dnf":
-        return "dnf install clang-devel"
-    if pkg == "pacman":
-        return "pacman -S clang"
-    if pkg == "brew":
-        return "brew install llvm@18"
-    return "Install libclang (system package) and clang Python bindings (pip install libclang)"
+    from ..indexer._clang_resource import libclang_requirement
+
+    pip = ctx.get("pip_cmd", "pip install")
+    return f"{pip} --force-reinstall '{libclang_requirement()}'"
 
 
 def clang_resource_instructions(ctx: dict, major: int, *, bundled: bool = True) -> str:

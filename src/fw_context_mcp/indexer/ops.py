@@ -389,9 +389,9 @@ def _build_filtered_file_content(
         (config_hash,),
     ).fetchone()[0]
 
-    from clang import cindex as cx
-
     from fw_context_mcp.indexer.symbols import _get_index
+
+    from ._libclang import cindex as cx
 
     if existing_tu is not None:
         tu = existing_tu  # reuse TU from extract_all — avoid double parse

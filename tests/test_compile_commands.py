@@ -151,6 +151,14 @@ class TestNormalizeArgs:
         """Zephyr/NCS mbedtls units: libclang gave an error for it in 33 units of each image."""
         assert "-fno-defer-pop" not in normalize_args(["-fno-defer-pop", "-O2"], Path.cwd())
 
+    def test_drops_the_gcc_tuning_parameters_in_both_forms(self):
+        """Zephyr/NCS: libclang gave an error for --param=min-pagesize=0 in 33 units of three images."""
+        result = normalize_args(
+            ["--param=min-pagesize=0", "--param", "max-inline-insns=10", "-DKEEP=1"], Path.cwd(),
+        )
+        assert not any("param" in arg or "pagesize" in arg or "inline-insns" in arg for arg in result), result
+        assert "-DKEEP=1" in result
+
     def test_a_flag_that_changes_meaning_is_kept(self):
         """The strip list must stay narrow — these decide what compiles."""
         result = normalize_args(
@@ -215,6 +223,15 @@ class TestNormalizeArgs:
         result = normalize_args(["-Werror", "-std=c99", "main.c"], Path.cwd())
         assert result[-1] == "-Wno-unknown-warning-option"
         assert result.index("-Werror") < result.index("-Wno-unknown-warning-option")
+
+    def test_an_unused_flag_is_no_error_under_werror(self):
+        """libclang 22, Zephyr/NCS mbedtls units: "argument unused during compilation: '-c'" was an error."""
+        result = normalize_args(["-Werror", "-c", "main.c"], Path.cwd())
+        assert result.index("-Werror") < result.index("-Wno-unused-command-line-argument")
+
+    def test_drops_the_xtensa_long_calls_flag(self):
+        """ESP32 with libclang 22: "unknown argument '-mlongcalls'" in each unit."""
+        assert "-mlongcalls" not in normalize_args(["-mlongcalls", "-O2"], Path.cwd())
 
 
 class TestGccSystemIncludes:

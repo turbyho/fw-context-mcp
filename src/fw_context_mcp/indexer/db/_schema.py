@@ -121,7 +121,13 @@ __all__ = [
 #      also holds the error diagnostics of its parse (`files.parse_*`).
 #      Before it, those columns did not exist, and their default 0 is not
 #      "no error".
-CURRENT_ROW_FORMAT = "fw-context-rows/6"
+# /7 — the rows come from libclang 22 (libclang-ng) with the compiler headers
+#      of clang 22.  Before it, libclang 18 parsed: its binding raised
+#      ValueError for the C++20 cursor kinds that it did not know (155, a
+#      parenthesized aggregate initialization), and each
+#      ``__malloc__(dealloc)`` attribute of a Zephyr header was an error
+#      (5715 errors in 7 images of one project, measured 2026-10-24).
+CURRENT_ROW_FORMAT = "fw-context-rows/7"
 
 # The config-hash format that was current when CURRENT_ROW_FORMAT last moved.
 #
@@ -136,7 +142,7 @@ CURRENT_ROW_FORMAT = "fw-context-rows/6"
 # the build, thus a plain `fw-context index` writes every file and every
 # body again.  The two must therefore move together, and
 # `test_row_format_invalidation.py` fails when only one of them does.
-ROW_FORMAT_PAIRED_WITH = "fw-context-cc/8"
+ROW_FORMAT_PAIRED_WITH = "fw-context-cc/9"
 
 
 def _row_format_number(value: str) -> int | None:
@@ -196,6 +202,9 @@ _ROW_FORMAT_FAULTS: tuple[tuple[int, str], ...] = (
         "constructor of a type, thus find_callers and the call paths can "
         "name callers that do not call; and the index did not record the "
         "parse errors of its units"),
+    (6, "libclang 18 parsed the index: its binding did not know the "
+        "C++20 cursor kind of a parenthesized aggregate initialization, and each "
+        "__malloc__(dealloc) attribute of a Zephyr header was a parse error"),
 )
 
 

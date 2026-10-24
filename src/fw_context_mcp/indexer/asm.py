@@ -216,8 +216,7 @@ def read_unit_texts(unit) -> dict[Path, UnitText] | None:
     ``-x assembler-with-cpp`` is such a unit: the build does not
     preprocess it, and ``clang -E`` gives no output for it either.
     """
-    from clang import cindex as cx
-
+    from ._libclang import cindex as cx
     from ._parsed_text import file_of_parse, parsed_bytes
     from .skipped_ranges import collect_skipped_lines
     from .symbols import _get_index

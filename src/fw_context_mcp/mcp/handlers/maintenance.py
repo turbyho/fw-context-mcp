@@ -485,9 +485,9 @@ def _parse_errors(conn, config_hash: str) -> dict:
     WHY always counts and a warning only for a fatal error (decision of
     the user, 2026-10-24): after a fatal error clang stops, thus symbols and
     calls of that unit are missing, and a reindex gives the same result.
-    A non-fatal error leaves the parse complete, and some are known and
-    harmless (an attribute that libclang 18 does not know), thus a warning
-    for each would hide the fatal one.
+    A non-fatal error leaves the parse complete, and one build can hold
+    many of them (libclang 18 gave 5715 for one attribute in 7 images of
+    one project), thus a warning for each would hide the fatal one.
 
     The row of the main file of each unit holds the values of its last
     parse (``ops.store_symbols_for_unit``), and a header row holds 0, thus
@@ -4056,7 +4056,7 @@ def _dep_to_schema(r, root: Path) -> dict:
 
 # The checks that need no project config: they run also before `fw-context
 # init`.  libclang-so needs only libclang-python, thus the signal "missing
-# libclang .so → apt install libclang-18-dev" works before the first init.
+# libclang .so → reinstall libclang-ng" works before the first init.
 _PRE_INIT_CHECKS = frozenset({"pysqlite3", "sqlite-vec", "libclang-python", "libclang-so", "watchfiles", "tomli-w"})
 
 

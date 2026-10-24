@@ -24,12 +24,17 @@ dependencies = [
     # ID token of the sign-in against the JWKS of OpenAI.  mcp requires it
     # too; the line names the direct use.  MIT; cryptography: Apache-2.0/BSD.
     "pyjwt[crypto]>=2.10",
-    # <19 is a hard bound: fw-context ships the clang compiler headers of
-    # ONE major version (data/clang-resource), and the headers of another
-    # version break the parse (clang 22 headers in libclang 18: 312 errors
-    # from arm_neon.h).  To move, rebuild them with
-    # scripts/build_clang_headers.py and move this bound with them.
-    "libclang>=18.1.1,<19",
+    # libclang 22 and its Python binding, in one wheel for Linux, macOS and
+    # Windows (x86 and ARM).  WHY not the "libclang" package: its last
+    # release is 18.1.1 (2024-03).  An exact pin: the binding and the
+    # library must be of one version, and a new major version changes the
+    # parse (measure the unit errors before a move).  fw-context ships the
+    # clang compiler headers of the same major version (data/clang-resource):
+    # the headers of the wheel lack the generated ARM and RISC-V intrinsics.
+    # To move, rebuild them with scripts/build_clang_headers.py and move this
+    # pin with them.  The two packages install the same "clang" package:
+    # never install both.  Apache-2.0 WITH LLVM-exception.
+    "libclang-ng==22.1.4.2",
     # <2 is a hard bound, not caution.  mcp 2.x renamed FastMCP to
     # MCPServer and mcp.server.fastmcp now raises ModuleNotFoundError on
     # import, so mcp/server.py does not merely fail to type-check under it

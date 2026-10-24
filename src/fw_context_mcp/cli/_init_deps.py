@@ -13,6 +13,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..deps import DepCheckResult, run_fixes, run_full_check
+from ..deps._instructions import get_platform_info, libclang_so_instructions
 from ._init_build import _count_cc_entries
 
 _PIP_DEPS = ("pysqlite3", "sqlite-vec", "libclang-python", "watchfiles", "tomli-w")
@@ -133,7 +134,7 @@ def _print_checklist(
     needs_init_rerun = False
     libclang = next((r for r in after_results if r.name == "libclang-so"), None)
     if libclang is not None and libclang.status == "missing":
-        cmd = libclang.fix_cmd or "apt install libclang-18-dev"
+        cmd = libclang.fix_cmd or libclang_so_instructions(get_platform_info())
         remaining.append(("[system]", cmd))
         needs_init_rerun = True
 

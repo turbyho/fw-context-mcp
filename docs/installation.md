@@ -8,13 +8,13 @@ This is the complete installation guide. This guide covers prerequisites, setup,
 
 ```bash
 # Ubuntu / Debian
-sudo apt install python3 bear libclang-dev
+sudo apt install python3 bear
 
 # Arch / Manjaro
-sudo pacman -S python bear libclang
+sudo pacman -S python bear
 
 # Fedora / RHEL
-sudo dnf install python3 bear libclang-devel
+sudo dnf install python3 bear
 
 # uv (all distros)
 curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -49,8 +49,10 @@ uv pip install fw-context-mcp
 ```
 
 This command installs the latest release from PyPI with all dependencies
-(libclang, pysqlite3, sqlite-vec, watchfiles, httpx, mcp, tomli-w, tomlkit,
-keyring, pyjwt, packaging, PyYAML).
+(libclang-ng, pysqlite3, sqlite-vec, watchfiles, httpx, mcp, tomli-w, tomlkit,
+keyring, pyjwt, packaging, PyYAML).  The `libclang-ng` wheel holds the
+libclang library and its Python binding, thus no system libclang package is
+necessary.
 
 The `fw-context` binary lands in your active Python environment's `bin/`
 directory — typically `~/.local/bin` for user installs, or the virtual
@@ -144,7 +146,7 @@ defines = [
 ## Dependencies by Build System
 
 Install only the tools that your build system needs. `pip install fw-context-mcp`
-installs the core Python packages automatically: `libclang`, `pysqlite3`,
+installs the core Python packages automatically: `libclang-ng`, `pysqlite3`,
 `sqlite-vec`, `watchfiles`, `httpx`, `mcp`, `tomli-w`, `tomlkit`, `keyring`,
 `pyjwt`, `packaging`, and `PyYAML`.
 
@@ -650,19 +652,17 @@ existing content.
 
 ## libclang
 
-If you get `clang.cindex` errors:
+The `libclang-ng` package gives the libclang library and its Python
+binding, in one exact version that fw-context pins. If you get
+`clang.cindex` errors, run `fw-context doctor`: the `libclang-python` and
+`libclang-so` checks tell the cause and the command that repairs it.
+
+An upgrade from a fw-context that used the old `libclang` package leaves
+that package installed. The two packages install the same `clang` package,
+thus remove the old one and reinstall `libclang-ng` (`fw-context doctor
+--fix` does both):
 
 ```bash
-# Arch / Manjaro
-sudo pacman -S libclang
-
-# Ubuntu / Debian
-sudo apt install libclang-dev
-
-# Fedora / RHEL
-sudo dnf install libclang-devel
-
-# macOS
-brew install llvm
-echo 'export PATH="/opt/homebrew/opt/llvm/bin:$PATH"' >> ~/.zshrc
+pip uninstall -y libclang
+pip install --force-reinstall "libclang-ng==22.1.4.2"
 ```

@@ -395,20 +395,26 @@ class TestTheFlagValueJoin:
         b = [_FakeUnit("/tmp/proj/src/main.c", ["-U", "BAR"])]
         assert _cfg_hash(a) != _cfg_hash(b)
 
-    def test_a_param_value_is_kept(self):
+    def test_a_separated_flag_value_is_kept(self):
         """The interaction between the join and the dropped extension whitelist.
 
-        A whitelist of "flags that take a value" would forget --param, and
+        A whitelist of "flags that take a value" would forget a flag, and
         the extension test that used to catch the orphan is gone.  The value
-        would then vanish and two builds with different inlining limits would
-        share one hash.  Measured on the STM32 project:
-        "--param max-inline-insns-single=500".
+        would then vanish and two builds would share one hash.  Measured on
+        the STM32 project, the forgotten ones were
+        "--param max-inline-insns-single=500" and the separated --sysroot
+        form.  normalize_args now drops --param (a tuning value of the code
+        generation, which changes no parse), thus --sysroot carries the test.
         """
-        a = [_FakeUnit("/tmp/proj/src/main.c",
-                       ["--param", "max-inline-insns-single=500"])]
-        b = [_FakeUnit("/tmp/proj/src/main.c",
-                       ["--param", "max-inline-insns-single=900"])]
+        a = [_FakeUnit("/tmp/proj/src/main.c", ["--sysroot", "/opt/toolchain-a"])]
+        b = [_FakeUnit("/tmp/proj/src/main.c", ["--sysroot", "/opt/toolchain-b"])]
         assert _cfg_hash(a) != _cfg_hash(b)
+
+    def test_a_tuning_parameter_does_not_split_a_build(self):
+        """--param changes the code generation and never the meaning of the source."""
+        a = [_FakeUnit("/tmp/proj/src/main.c", ["--param", "max-inline-insns-single=500"])]
+        b = [_FakeUnit("/tmp/proj/src/main.c", ["--param", "max-inline-insns-single=900"])]
+        assert _cfg_hash(a) == _cfg_hash(b)
 
     def test_a_flag_value_starting_with_a_dash_is_not_joined(self):
         """Two flags in a row stay two flags."""

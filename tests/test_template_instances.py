@@ -107,10 +107,10 @@ int use(void) { return plain_value.value; }
 
 
 class TestBindingEntryPoint:
-    def test_a_way_to_read_the_template_of_an_instance_exists(self) -> None:
-        # The repair rests on this.  When a later binding drops the C entry
-        # point AND still has no property, this fails loudly instead of
-        # letting every template_usr go quietly empty again.
-        from fw_context_mcp.indexer.symbols import _template_of_instance_call
+    def test_the_binding_reads_the_template_of_an_instance(self) -> None:
+        # The repair rests on this property (binding of libclang 21 and
+        # later).  Under libclang 18 its absence made every template_usr
+        # empty without a word; this fails loudly instead.
+        from fw_context_mcp.indexer._libclang import cindex
 
-        assert _template_of_instance_call() is not None
+        assert isinstance(getattr(cindex.Cursor, "specialized_template", None), property)

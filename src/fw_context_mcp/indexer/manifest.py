@@ -256,9 +256,9 @@ def _collect_headers_from_tokens(
     so that the builder's actual build-output directories (not just the
     hardcoded fallback set) are used to mark generated headers.
     """
-    from clang import cindex as cx
-
     from fw_context_mcp.indexer.symbols import _get_index
+
+    from ._libclang import cindex as cx
 
     try:
         translation_unit = _get_index().parse(
@@ -1084,6 +1084,11 @@ def compute_config_hash(
         # the text gave, and each constructor edge goes to the constructor
         # that the compiler selected.  A changed TU alone rewrites its refs,
         # thus without a new config_hash an unchanged TU kept its old edges.
+        # /9 marks the move from libclang 18 to libclang 22 (libclang-ng) and
+        # the compiler headers of clang 22.  Another parser gives other rows:
+        # the binding of libclang 18 raised ValueError for the C++20 cursor
+        # kinds that it did not know, and libclang 18 gave an error for each
+        # ``__malloc__(dealloc)`` attribute of a Zephyr header.
         #
         # WHY the format version belongs in THIS hash: a new config_hash
         # leaves no row for the build, thus a plain `fw-context index` writes
@@ -1094,7 +1099,7 @@ def compute_config_hash(
         #
         # Every existing index therefore gets one final reindex, which is
         # intended.
-        "_format": "fw-context-cc/8",
+        "_format": "fw-context-cc/9",
         "project_root": str(project_root),
         # WHY only these two: config_hash answers "could the same source text
         # compile to something different now?"  Macros flip #ifdef, and the

@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Build the clang compiler-header archive that the fw-context package carries.
 
-WHY: the libclang wheel has no compiler headers (``stddef.h``,
-``arm_acle.h`` ...).  fw-context carries the headers of the same clang major
-version as the libclang it pins, thus ``pip install fw-context-mcp`` gives
-both, offline and on every host.
+WHY: the libclang-ng wheel has compiler headers, but not the intrinsic
+headers that the clang build generates for ARM and RISC-V (``arm_neon.h``,
+``arm_mve.h`` ...): it builds only the X86 target.  fw-context carries the
+headers of the same clang major version as the libclang it pins, thus
+``pip install fw-context-mcp`` gives both, offline and on every host.
 
-The headers come from the Debian package ``libclang-common-18-dev``.  This
+The headers come from the Debian package ``libclang-common-22-dev``.  This
 script checks the whole chain of trust before it writes anything:
 
 1. ``dists/<suite>/InRelease`` has a valid signature by the Debian archive
@@ -42,12 +43,12 @@ import tempfile
 import urllib.request
 from pathlib import Path, PurePosixPath
 
-MAJOR = 18
+MAJOR = 22
 SUITE = "trixie"
-PACKAGE = "libclang-common-18-dev"
-DEBIAN_VERSION = "1:18.1.8-18+b1"
-CLANG_VERSION = "18.1.8"
-MEMBER_PREFIX = "./usr/lib/llvm-18/lib/clang/18/include/"
+PACKAGE = "libclang-common-22-dev"
+DEBIAN_VERSION = "1:22.1.8-1~deb13u4"
+CLANG_VERSION = "22.1.8"
+MEMBER_PREFIX = "./usr/lib/llvm-22/lib/clang/22/include/"
 MIRROR = "https://deb.debian.org/debian"
 ARCHIVE_KEY_URL = "https://ftp-master.debian.org/keys/archive-key-13.asc"
 #: The primary key fingerprint of the Debian 13/trixie archive signing key, as

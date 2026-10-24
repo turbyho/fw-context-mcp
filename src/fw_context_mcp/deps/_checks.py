@@ -29,6 +29,7 @@ from ._instructions import (
     db_integrity_instructions,
     disk_space_instructions,
     get_platform_info,
+    libclang_conflict_instructions,
     libclang_python_instructions,
     libclang_so_instructions,
     ollama_instructions,
@@ -210,28 +211,49 @@ def check_sqlite_vec() -> DepCheckResult:
 
 
 def check_libclang_python() -> DepCheckResult:
-    """Verify the clang Python bindings are installed."""
+    """Verify that the libclang-ng wheel is installed, in the version that fw-context declares.
+
+    WHY the check of the old ``libclang`` package: an upgrade of fw-context
+    installs libclang-ng, and pip does not remove ``libclang``.  The two
+    install the same ``clang`` package, thus each file comes from the
+    package that pip wrote last, and a later removal of ``libclang`` removes
+    files of libclang-ng.
+    """
+    from packaging.requirements import Requirement
+
+    from ..indexer._clang_resource import LIBCLANG_DISTRIBUTION, libclang_requirement
+
     platform_ctx = get_platform_info()
     try:
         _import("clang.cindex")
-        ver = _version("libclang")
-        try:
-            from packaging.version import Version
-            if Version(ver) < Version("18.1.1"):
-                return DepCheckResult(
-                    name="libclang-python",
-                    status="degraded",
-                    message=f"libclang {ver} is too old — 18.1.1+ required",
-                    fix_cmd=libclang_python_instructions(platform_ctx),
-                    instructions=libclang_python_instructions(platform_ctx),
-                    critical=True,
-                )
-        except ImportError:
-            pass  # packaging not installed, skip version check
+        ver = _version(LIBCLANG_DISTRIBUTION)
+        old = _version("libclang")
+        if old != "unknown":
+            return DepCheckResult(
+                name="libclang-python",
+                status="degraded",
+                message=(
+                    f"the old libclang {old} is installed next to {LIBCLANG_DISTRIBUTION} {ver}; "
+                    "the two install the same clang package"
+                ),
+                fix_cmd=libclang_conflict_instructions(platform_ctx),
+                instructions=libclang_conflict_instructions(platform_ctx),
+                critical=True,
+            )
+        requirement = Requirement(libclang_requirement())
+        if ver == "unknown" or not requirement.specifier.contains(ver, prereleases=True):
+            return DepCheckResult(
+                name="libclang-python",
+                status="degraded",
+                message=f"{LIBCLANG_DISTRIBUTION} {ver} is installed, and fw-context needs {requirement}",
+                fix_cmd=libclang_python_instructions(platform_ctx),
+                instructions=libclang_python_instructions(platform_ctx),
+                critical=True,
+            )
         return DepCheckResult(
             name="libclang-python",
             status="ok",
-            message=f"libclang {ver}",
+            message=f"{LIBCLANG_DISTRIBUTION} {ver}",
             critical=True,
         )
     except ImportError:
@@ -250,7 +272,7 @@ def check_libclang_so() -> DepCheckResult:
     platform_ctx = get_platform_info()
     # First, make sure the Python bindings are available
     try:
-        import clang.cindex
+        from ..indexer._libclang import cindex
     except ImportError:
         return DepCheckResult(
             name="libclang-so",
@@ -262,13 +284,13 @@ def check_libclang_so() -> DepCheckResult:
     # Check if the library file exists.
     # Config().lib returns a CDLL object — extract the real path via ._name.
     try:
-        lib_cdll = clang.cindex.Config().lib
+        lib_cdll = cindex.Config().lib
         lib_path = getattr(lib_cdll, "_name", str(lib_cdll))
     except Exception as exc:
         return DepCheckResult(
             name="libclang-so",
             status="missing",
-            message=f"clang.cindex.Config().lib failed: {exc}",
+            message=f"cindex.Config().lib failed: {exc}",
             fix_cmd=libclang_so_instructions(platform_ctx),
             instructions=libclang_so_instructions(platform_ctx),
             critical=True,
@@ -277,7 +299,7 @@ def check_libclang_so() -> DepCheckResult:
     if lib_path and "/" in lib_path and Path(lib_path).exists():
         # Smoke test: try to actually load the library
         try:
-            clang.cindex.Index.create()
+            cindex.Index.create()
             return DepCheckResult(
                 name="libclang-so",
                 status="ok",
@@ -307,8 +329,9 @@ def check_libclang_so() -> DepCheckResult:
 def check_clang_resource() -> DepCheckResult:
     """Verify that the clang compiler headers of the libclang major version are there.
 
-    WHY a check of its own: the libclang wheel has no compiler headers.
-    Without them a GCC build parses with the headers of GCC, and some of
+    WHY a check of its own: the libclang-ng wheel lacks the generated ARM
+    and RISC-V intrinsic headers.  Without clang's headers a GCC build
+    parses with the headers of GCC, and some of
     those do not parse in libclang (2574 errors from ``arm_acle.h`` in one
     STM32 build).  Not critical: the index works, with those errors.
     """

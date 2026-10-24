@@ -1,10 +1,17 @@
 """The clang compiler headers of the same major version as libclang.
 
-WHY: the libclang wheel (18.1.1) has no resource directory, thus clang's own
-compiler headers (``stddef.h``, ``arm_acle.h``, ``arm_neon.h`` ...) are not
-on the machine.  The parse then used the internal include directory of GCC,
+WHY: without clang's own compiler headers (``stddef.h``, ``arm_acle.h``,
+``arm_neon.h`` ...) the parse used the internal include directory of GCC,
 whose intrinsic headers are written for GCC builtins: the ``arm_acle.h`` of
 ARM GCC 12 gave 2574 errors in 143 of 215 units of one STM32 build.
+
+WHY not the resource directory of the libclang-ng wheel: it lacks the
+intrinsic headers that the clang build generates for ARM and RISC-V
+(``arm_neon.h``, ``arm_mve.h``, ``arm_fp16.h``, ``arm_bf16.h``,
+``arm_cde.h``, ``arm_sve.h``, ``arm_sme.h``, ``arm_vector_types.h``,
+``riscv_vector.h``), because the wheel builds only the X86 target.  Checked
+2026-10-24 in the wheels for Linux x86_64 and aarch64, macOS arm64 and
+Windows amd64.  CMSIS-DSP with MVE (Cortex-M55) includes ``arm_mve.h``.
 
 WHY the SAME major version: the headers of a newer clang use types that
 libclang 18 does not know.  Measured with the clang 22 headers in libclang
@@ -85,13 +92,35 @@ class InstallError(RuntimeError):
     """The managed copy could not be installed."""
 
 
+#: The distribution that gives the library and the binding.
+LIBCLANG_DISTRIBUTION = "libclang-ng"
+
+
+def libclang_requirement() -> str:
+    """Give the requirement of the libclang distribution that this fw-context declares.
+
+    WHY from the metadata: pyproject.toml holds the pin, and a second copy
+    here would go out of date at the next move.  Without the metadata (a
+    source tree that is not installed), the bare name.
+    """
+    try:
+        requirements = importlib.metadata.requires("fw-context-mcp") or []
+    except importlib.metadata.PackageNotFoundError:
+        requirements = []
+    for requirement in requirements:
+        if re.match(rf"{re.escape(LIBCLANG_DISTRIBUTION)}\b", requirement):
+            return requirement.split(";")[0].strip()
+    return LIBCLANG_DISTRIBUTION
+
+
 def libclang_major() -> int | None:
     """Give the major version of the libclang that the parse uses, or None.
 
-    The version of the ``libclang`` wheel is the version of its library.
+    The version of the libclang-ng wheel starts with the version of its
+    library (``22.1.4.2`` is libclang 22.1.4).
     """
     try:
-        version = importlib.metadata.version("libclang")
+        version = importlib.metadata.version(LIBCLANG_DISTRIBUTION)
     except importlib.metadata.PackageNotFoundError:
         return None
     match = re.match(r"(\d+)\.", version)

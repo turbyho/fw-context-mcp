@@ -57,7 +57,6 @@ For each translation unit it produces:
 
 from __future__ import annotations
 
-import ctypes
 import logging
 import re
 import threading
@@ -66,9 +65,8 @@ from dataclasses import astuple, dataclass, field
 from functools import cache
 from pathlib import Path
 
-import clang.cindex as cx
-
 from ._dispatch_bridges import _DISPATCH_ENTRY_POINTS, _DISPATCH_METHOD_NAMES, _TYPE_ERASED_ISR_FUNCTIONS
+from ._libclang import cindex as cx
 from .compile_commands import CompilationUnit
 from .models import (
     FnPointerAssignment,
@@ -84,6 +82,9 @@ from .nvic import runtime_vector_reference
 _log = logging.getLogger(__name__)
 
 _INDEX: cx.Index | None = None
+#: The resource directory of the libclang-ng wheel, read at import, before
+#: ``_get_index`` replaces it (see there).
+_WHEEL_RESOURCE_DIR = cx.Config.resource_dir
 _index_lock = threading.Lock()
 
 
@@ -93,8 +94,26 @@ def _get_index() -> cx.Index:
     ``cx.Index.create()`` is lightweight and Index objects internally
     serialize concurrent ``parse()`` calls, so a single shared instance
     is sufficient.
+
+    At each call, ``Config.resource_dir`` gets the directory of the compiler
+    headers that ``_clang_resource`` finds.  libclang-ng adds it as
+    ``-resource-dir`` to each parse that has none: a unit without a GCC
+    driver then gets clang's ``stddef.h``.  WHY not the directory of the
+    wheel: it lacks the generated ARM and RISC-V intrinsic headers.  WHY at
+    each call and not once: the GCC driver path looks the headers up for
+    each unit (``_driver_query.clang_resource_include``), and the two paths
+    must give one unit the same headers, also after a copy that a long MCP
+    process saw removed or unpacked later.  When the lookup finds nothing,
+    the wheel directory serves: its headers are of the right version, and
+    fewer headers are better than none.  Each parse of a unit goes through
+    this function (``asm``, ``manifest`` and ``ops`` call it too); only the
+    target probe of ``_driver_query`` parses an empty file on its own.
     """
     global _INDEX
+    from ._clang_resource import find_resource_include
+
+    found = find_resource_include()
+    cx.Config.resource_dir = str(found.include.parent) if found is not None else _WHEEL_RESOURCE_DIR
     if _INDEX is None:
         with _index_lock:
             if _INDEX is None:
@@ -242,20 +261,19 @@ def _cursor_kind_label(kind: cx.CursorKind) -> str:
 
 
 def _is_anonymous_struct_or_union(cursor: cx.Cursor) -> bool:
-    """True when *cursor* is an anonymous (unnamed) struct or union.
+    """True when *cursor* is a struct or union without a name.
 
-    libclang reports the spelling as ``""`` for some compilers or as
-    ``"struct (unnamed at file:line)"`` / ``"union (anonymous at file:line)"``
-    on others.  Both are treated as anonymous.
+    Both kinds count: a standard anonymous member (``union { int a; };``)
+    and an unnamed type of a field (``struct { int x; } field;``).  A
+    ``typedef struct { ... } T;`` has the name ``T`` and does not count.
+    ``is_anonymous()`` asks the AST.  The earlier code matched the text
+    ``"(unnamed"`` and ``"(anonymous"`` in the spelling, which is not a
+    stable interface; measured on libclang 22 in C and C++, the two agree
+    for each of these forms.
     """
     if cursor.kind not in (cx.CursorKind.STRUCT_DECL, cx.CursorKind.UNION_DECL):
         return False
-    spelling = cursor.spelling
-    if not spelling:
-        return True
-    if "(unnamed" in spelling or "(anonymous" in spelling:
-        return True
-    return False
+    return bool(cursor.is_anonymous())
 
 
 def _build_anon_usr_to_field(
@@ -648,7 +666,6 @@ def _extract_lhs_field(
 def _process_one_base_specifier(
     child: cx.Cursor,
     cls_usr: str,
-    cls_spelling: str,
     access_map: dict[cx.AccessSpecifier, str],
 ) -> InheritanceRecord | None:
     """Build an InheritanceRecord from one CXX_BASE_SPECIFIER child cursor.
@@ -657,9 +674,8 @@ def _process_one_base_specifier(
     cannot be resolved (e.g. forward-declared template base with no
     instantiation visible in this TU).
 
-    Calls ``clang_isVirtualBase`` directly through the C-API to detect
-    virtual inheritance — libclang does not expose a Python wrapper for
-    this query.
+    ``is_virtual_base()`` (binding of libclang 20 and later) tells a
+    virtual base.
     """
     if child.kind != cx.CursorKind.CXX_BASE_SPECIFIER:
         return None
@@ -673,17 +689,11 @@ def _process_one_base_specifier(
     if not base_loc.file:
         return None
     access = access_map.get(child.access_specifier, "public")
-    try:
-        from clang.cindex import conf as _ciconf
-        is_virt = bool(_ciconf.lib.clang_isVirtualBase(child))
-    except (ValueError, TypeError, RuntimeError, AttributeError):
-        _log.debug("clang_isVirtualBase failed for %s", cls_spelling)
-        is_virt = False
     return InheritanceRecord(
         derived_usr=cls_usr,
         base_usr=base_usr,
         access=access,
-        is_virtual=is_virt,
+        is_virtual=child.is_virtual_base(),
     )
 
 
@@ -701,7 +711,7 @@ def _extract_inheritance(class_cursors: list[cx.Cursor]) -> list[InheritanceReco
             continue
         try:
             for child in cls_cursor.get_children():
-                rec = _process_one_base_specifier(child, cls_usr, cls_cursor.spelling, _access_map)
+                rec = _process_one_base_specifier(child, cls_usr, _access_map)
                 if rec is not None:
                     inheritance.append(rec)
         except (ValueError, TypeError, RuntimeError, AttributeError):
@@ -790,9 +800,9 @@ def _extract_macros(tu_cursor: cx.Cursor, resolve_fn, skip_files=None) -> list[M
         # thus they are read once and `_split_macro_definition` reads them.
         #
         # WHY the tokens decide whether a macro is function-like, and not
-        # libclang: the pinned binding (libclang 18.1.1) has no
-        # ``Cursor.is_macro_function_like`` — the name is absent from
-        # ``clang/cindex.py``.  The call raised AttributeError on EVERY
+        # libclang: the binding (libclang 18.1.1, and also the one of
+        # libclang 22) has no ``Cursor.is_macro_function_like`` — the name is
+        # absent from ``clang/cindex.py``.  The call raised AttributeError on EVERY
         # macro, and a broad ``except`` turned each one into a silent False.
         # Measured over six indexes: 734 386 macros, 0 marked function-like,
         # and 453 256 of them held a value that opens with a parameter list.
@@ -1245,49 +1255,8 @@ def _build_refs_and_fp_assignments(
     return refs, indirect_call_sites, _distinct_records(fp_assignments), pending_dispatches
 
 
-@cache
-def _template_of_instance_call() -> Callable[[cx.Cursor], cx.Cursor | None] | None:
-    """Resolve, ONCE, how to ask libclang which template a cursor instantiates.
-
-    WHY this exists instead of a plain ``cursor.specialized_template``: the
-    pinned binding (libclang 18.1.1) does not define that property — the name
-    is absent from ``clang/cindex.py``.  The attribute lookup raised
-    AttributeError on every cursor, and the broad ``except`` around it made
-    each one a silent default.  Measured over five C++ indexes: 11 934
-    templates and 0 instances, thus ``get_template_instances`` could never
-    answer and the two suite cases over it ended as SKIP in every round.
-
-    The C entry point ``clang_getSpecializedCursorTemplate`` IS in the
-    binding's function table, with the same argtypes, restype and errcheck
-    that the property would use, thus it gives exactly what the property
-    gives: the template cursor, or None for a cursor that instantiates none.
-
-    The property comes first so that a later binding which defines it wins
-    without a code change.  When NEITHER is available the answer is None and
-    the reason is said ONCE at WARNING — a DEBUG line is what hid the first
-    absence through every index run.
-
-    Resolution is lazy because ``cx.conf.lib`` loads libclang, and a module
-    that only imports this file must not pay for that.
-    """
-    if getattr(cx.Cursor, "specialized_template", None) is not None:
-        return lambda cursor: cursor.specialized_template
-    entry = getattr(cx.conf.lib, "clang_getSpecializedCursorTemplate", None)
-    if entry is not None:
-        return entry
-    _log.warning(
-        "libclang gives no way to read the template of an instance: "
-        "neither Cursor.specialized_template nor "
-        "clang_getSpecializedCursorTemplate is available. "
-        "symbols.template_usr stays empty, thus get_template_instances "
-        "cannot answer."
-    )
-    return None
-
-
-@cache
-def _binary_operator_spelling_call() -> Callable[[cx.Cursor], str] | None:
-    """Resolve, ONCE, how to ask libclang for the operator of a BINARY_OPERATOR.
+def _is_plain_assignment(cursor: cx.Cursor) -> bool:
+    """Tell if the BINARY_OPERATOR *cursor* is ``=``.
 
     WHY: every BINARY_OPERATOR was read as an assignment, thus a comparison
     such as ``hi2c->XferISR != I2C_Master_ISR_DMA`` became an
@@ -1295,59 +1264,19 @@ def _binary_operator_spelling_call() -> Callable[[cx.Cursor], str] | None:
     second time.  Measured over every index on one machine: 353 such
     repeated rows of the method ``assignment``.
 
-    The pinned binding (libclang 18.1.1) has no ``Cursor.binary_operator``.
-    The C entry points ``clang_getCursorBinaryOperatorKind`` and
-    ``clang_getBinaryOperatorKindSpelling`` (libclang 17 and later) are in
-    the library, but not in the function table of the binding, thus this
-    function gives them their types.  They read the AST, not the tokens,
-    thus they also answer for an operator that a macro expands to.
+    ``binary_operator`` (binding of libclang 19 and later) reads the AST,
+    not the tokens, thus it also answers for an operator that a macro
+    expands to.  A compound operator such as ``+=`` is a
+    COMPOUND_ASSIGNMENT_OPERATOR, a different cursor kind, thus ``=`` is
+    the only assignment here.
 
-    When the library does not have them, the answer is None.  The caller
-    then reads each BINARY_OPERATOR as an assignment, as before, and the
-    reason is said ONCE at WARNING.
+    No ``except`` around the call: the ctypes code that this replaced broke
+    under the libclang 22 binding (a TypeError in each call), and a broad
+    ``except`` made each operator an assignment without a word.  An error
+    of the binding must stop the parse of the unit, where the run reports
+    it.
     """
-    lib = cx.conf.lib
-    kind_of = getattr(lib, "clang_getCursorBinaryOperatorKind", None)
-    spelling_of = getattr(lib, "clang_getBinaryOperatorKindSpelling", None)
-    cx_string = getattr(cx, "_CXString", None)
-    if kind_of is None or spelling_of is None or cx_string is None:
-        _log.warning(
-            "libclang gives no way to read the operator of a binary "
-            "expression. Each one is read as an assignment, thus a "
-            "comparison with a function can show as an fp_assignments row."
-        )
-        return None
-    kind_of.argtypes = [cx.Cursor]
-    kind_of.restype = ctypes.c_uint
-    spelling_of.argtypes = [ctypes.c_uint]
-    spelling_of.restype = cx_string
-    spelling_of.errcheck = cx_string.from_result
-
-    def _spelling(cursor: cx.Cursor) -> str:
-        # clang_getCString gives None for a NULL string: "" then means
-        # "unknown", and the caller reads that as the old behaviour.
-        return spelling_of(kind_of(cursor)) or ""
-
-    return _spelling
-
-
-def _is_plain_assignment(cursor: cx.Cursor) -> bool:
-    """Tell if the BINARY_OPERATOR *cursor* is ``=``.
-
-    A compound operator such as ``+=`` is a COMPOUND_ASSIGNMENT_OPERATOR,
-    a different cursor kind, thus ``=`` is the only assignment here.
-    When the operator is unknown (no C API, a failed call, no spelling),
-    the answer is True, which is the old behaviour.
-    """
-    spelling_call = _binary_operator_spelling_call()
-    if spelling_call is None:
-        return True
-    try:
-        spelling = spelling_call(cursor)
-    except (ValueError, TypeError, RuntimeError, AttributeError, ctypes.ArgumentError):
-        _log.debug("binary operator kind failed for %s", cursor.spelling)
-        return True
-    return spelling == "=" if spelling else True
+    return cursor.binary_operator == cx.BinaryOperator.Assign
 
 
 def _distinct_records(records: list[FnPointerAssignment]) -> list[FnPointerAssignment]:
@@ -1491,30 +1420,24 @@ def _process_one_symbol(
             cx.CursorKind.CONSTRUCTOR, cx.CursorKind.FIELD_DECL,
             cx.CursorKind.VAR_DECL, cx.CursorKind.PARM_DECL,
         )
-        # The kind comes first: a C project reaches no cursor of these kinds,
-        # thus it never asks the binding and never logs the warning.
-        template_of = (
-            _template_of_instance_call() if cursor.kind in _template_check_kinds else None
-        )
-        if template_of is not None:
-            try:
-                specialized = template_of(cursor)
-                if specialized is not None:
-                    template_usr = specialized.get_usr() or ""
-                if not template_usr:
-                    parent = cursor.semantic_parent
-                    if parent is not None:
-                        parent_spec = template_of(parent)
-                        if parent_spec is not None:
-                            template_usr = parent_spec.get_usr() or ""
-                if not template_usr:
-                    decl = cursor.type.get_declaration()
-                    if decl is not None and decl != cursor:
-                        decl_spec = template_of(decl)
-                        if decl_spec is not None:
-                            template_usr = decl_spec.get_usr() or ""
-            except (ValueError, TypeError, RuntimeError, AttributeError):
-                _log.debug("specialized_template failed for %s", cursor.spelling)
+        # ``specialized_template`` (binding of libclang 21 and later) gives
+        # the template that a cursor instantiates, or None.
+        if cursor.kind in _template_check_kinds:
+            specialized = cursor.specialized_template
+            if specialized is not None:
+                template_usr = specialized.get_usr() or ""
+            if not template_usr:
+                parent = cursor.semantic_parent
+                if parent is not None:
+                    parent_spec = parent.specialized_template
+                    if parent_spec is not None:
+                        template_usr = parent_spec.get_usr() or ""
+            if not template_usr:
+                decl = cursor.type.get_declaration()
+                if decl is not None and decl != cursor:
+                    decl_spec = decl.specialized_template
+                    if decl_spec is not None:
+                        template_usr = decl_spec.get_usr() or ""
 
     # Deduplication: seen_usrs[usr] = bool(is_definition).
     # Forward declaration (False) → definition (True) is promoted.
@@ -2069,8 +1992,6 @@ def _strip_arrays(type_: cx.Type) -> cx.Type:
     for _ in range(32):
         if type_.kind in _ARRAY_TYPE_KINDS:
             type_ = type_.element_type
-        elif type_.kind == cx.TypeKind.ELABORATED:
-            type_ = type_.get_named_type()
         elif type_.kind == cx.TypeKind.TYPEDEF and type_.get_canonical().kind in _ARRAY_TYPE_KINDS:
             type_ = type_.get_declaration().underlying_typedef_type
         else:
@@ -2135,12 +2056,14 @@ def _resolve_overload_set(overload_ref: cx.Cursor, expected: cx.Type) -> list[cx
     Anything else gives no target: a wrong edge in the call graph is
     worse than a missing one.
     """
+    # WHY from_result: the libclang 22 binding registers
+    # clang_getOverloadedDecl without the errcheck that gives the cursor its
+    # translation unit, thus ``.type`` of the raw cursor raised
+    # AttributeError, and the ``except`` below made each set give no target.
+    # ``from_result`` does what the errcheck did: a null cursor becomes None.
     lib = cx.conf.lib
-    try:
-        count = int(lib.clang_getNumOverloadedDecls(overload_ref))
-        decls = [lib.clang_getOverloadedDecl(overload_ref, i) for i in range(count)]
-    except (ValueError, TypeError, RuntimeError, AttributeError, ctypes.ArgumentError):
-        return []
+    count = int(lib.clang_getNumOverloadedDecls(overload_ref))
+    decls = [cx.Cursor.from_result(lib.clang_getOverloadedDecl(overload_ref, i), overload_ref) for i in range(count)]
     decls = [d for d in decls if d is not None and d.kind in _INDIRECT_TARGET_KINDS]
     functions = [d for d in decls if d.kind != cx.CursorKind.FUNCTION_TEMPLATE]
     templates = [d for d in decls if d.kind == cx.CursorKind.FUNCTION_TEMPLATE]
@@ -2456,14 +2379,9 @@ def _bare_type_name(type_: cx.Type) -> str:
 def _class_and_template(record: cx.Cursor) -> list[cx.Cursor]:
     """*record*, and the class template that it instantiates, when there is one."""
     candidates = [record]
-    template_of = _template_of_instance_call()
-    if template_of is not None:
-        try:
-            template = template_of(record)
-        except (ValueError, TypeError, RuntimeError, AttributeError, ctypes.ArgumentError):
-            template = None
-        if template is not None:
-            candidates.append(template)
+    template = record.specialized_template
+    if template is not None:
+        candidates.append(template)
     return candidates
 
 
@@ -2593,11 +2511,7 @@ def _stored_functions(
                 found |= _walk(branch, depth + 1)
             return found
         if kind == cx.CursorKind.BINARY_OPERATOR:
-            spelling_call = _binary_operator_spelling_call()
-            try:
-                is_comma = spelling_call is not None and spelling_call(node) == ","
-            except (ValueError, TypeError, RuntimeError, AttributeError, ctypes.ArgumentError):
-                is_comma = False
+            is_comma = node.binary_operator == cx.BinaryOperator.Comma
             return _walk(children[-1], depth + 1) if is_comma and children else set()
         if kind == cx.CursorKind.INIT_LIST_EXPR:
             try:

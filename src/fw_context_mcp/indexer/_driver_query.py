@@ -428,7 +428,7 @@ def libclang_supports(triple: str) -> bool:
     ``avr-g++`` gives the triple ``avr`` and the list held the prefix
     ``avr-``.  The probe asks the library that does the parse.
     """
-    from clang import cindex
+    from ._libclang import cindex
 
     try:
         cindex.Index.create().parse(
@@ -442,8 +442,8 @@ def libclang_supports(triple: str) -> bool:
 def clang_resource_include() -> str | None:
     """Give the clang compiler headers of the libclang version, or None (see ``_clang_resource``).
 
-    WHY: the libclang wheel has no resource directory, thus the compiler
-    headers came from the internal include directory of GCC, whose
+    WHY: without clang's compiler headers, the headers came from the
+    internal include directory of GCC, whose
     intrinsic headers are written for GCC builtins: the ``arm_acle.h`` of
     ARM GCC 12 gave 2574 errors in one STM32 build.  The headers must be
     of the libclang major version: newer ones use types that libclang does
@@ -565,9 +565,11 @@ def libclang_args(info: DriverInfo, args: Sequence[str]) -> list[str]:
         result.append("-fshort-wchar")
     if info.macro("__cpp_sized_deallocation") is not None:
         # GCC turns sized deallocation on from C++14, and libstdc++ then
-        # calls the sized operator delete.  clang 18 has it off by default,
+        # calls the sized operator delete.  clang 18 had it off by default,
         # and each such call was an error ("selects non-usual deallocation
-        # function"): 55 in one ESP-IDF build with GCC 13.
+        # function"): 55 in one ESP-IDF build with GCC 13.  clang 19 and later
+        # have it on by default; the flag stays, because it is the setting of
+        # the GCC driver and not a default of clang.
         result.append("-fsized-deallocation")
     result.append("-funsigned-char" if info.macro("__CHAR_UNSIGNED__") is not None else "-fsigned-char")
     result += [f"-D{name}={value}" for name, value in info.macros]
