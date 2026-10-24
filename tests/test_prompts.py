@@ -31,6 +31,30 @@ class TestParseAnalysisResponse:
         assert len(result) == 1
         assert "must not include" in result[0]["inputs"]
 
+    def test_a_trailing_comma_does_not_lose_the_answer(self):
+        """The answer of gemma4:26b in a real analysis (2026-10-24), shortened.
+
+        A comma after the last field made the answer invalid JSON, and the
+        symbol got no analysis.
+        """
+        resp = (
+            '```json\n[\n  {\n    "id": 1489569,\n'
+            '    "summary": "A constant of 60000 ms for error timing.",\n'
+            '    "inputs": "-",\n'
+            '    "outputs": "The value 60000.",\n'
+            '  }\n]\n```'
+        )
+        result = parse_analysis_response(resp, [{"id": 1489569}])
+        assert result is not None
+        assert result[0]["outputs"] == "The value 60000."
+
+    def test_a_comma_and_brace_in_a_string_stay(self):
+        """The removal works outside strings only."""
+        resp = json.dumps([{"summary": "writes ',}' and ', ]' to the log", "inputs": "-", "outputs": "-"}])
+        result = parse_analysis_response(resp, [{"id": 1}])
+        assert result is not None
+        assert result[0]["summary"] == "writes ',}' and ', ]' to the log"
+
     def test_json_array_in_markdown_fence(self):
         """Response with ```json fence should be stripped."""
         resp = '```json\n[{"summary":"test","inputs":"x","outputs":"y"}]\n```'

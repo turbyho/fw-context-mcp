@@ -246,6 +246,39 @@ def _sanitize_json_escapes(text: str) -> str:
     return _INVALID_JSON_ESCAPE.sub("", text)
 
 
+def _strip_trailing_commas(text: str) -> str:
+    """Remove a comma that comes right before ``}`` or ``]``, outside a string.
+
+    Models sometimes write a comma after the last field of an object
+    (measured with gemma4:26b: ``"outputs": "...",\\n  }``).  That is not
+    valid JSON, and the whole answer of the symbol was lost.  Valid JSON
+    has no such comma outside a string, thus the removal never changes a
+    valid answer.  The scan knows strings and escapes, so that a ``,}``
+    in the text of a summary stays as it is.
+    """
+    out: list[str] = []
+    in_string = False
+    escape = False
+    for i, ch in enumerate(text):
+        if in_string:
+            out.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == ",":
+            rest = text[i + 1:].lstrip()
+            if rest[:1] in ("}", "]"):
+                continue
+        out.append(ch)
+    return "".join(out)
+
+
 def parse_analysis_response(
     response: str,
     batch: list[dict[str, Any]],
@@ -271,7 +304,7 @@ def parse_analysis_response(
         text = text[:-3].strip()
 
     # Fix common LLM JSON mistakes before parsing
-    text = _sanitize_json_escapes(text)
+    text = _strip_trailing_commas(_sanitize_json_escapes(text))
 
     # Parse JSON
     parsed: list[dict[str, Any]] = []
