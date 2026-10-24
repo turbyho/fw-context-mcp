@@ -36,7 +36,7 @@ Project: demo-fw  path=/home/u/demo-fw  build=zephyr
 16:45:15 INFO zephyr build_multi[nrf52840-dev]: west build --sysbuild
 fw-context: error: Build command failed (exit 126): west build --sysbuild (nrf52840-dev)
 stderr: [BLOCKED — DO NOT RETRY] Command uses eval or $()/ backticks at command position.
-Command: source /home/u/demo-fw/scripts/setup_nordic_env.sh && west build
+Command: source /home/u/demo-fw/scripts/sdk_env.sh && west build
 lean-ctx:
 """
 

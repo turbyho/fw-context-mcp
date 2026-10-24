@@ -7,7 +7,7 @@ from a plain shell passed::
       (nrf52840-dev)
     stderr: [BLOCKED — DO NOT RETRY] Command uses eval or $()/ backticks at
       command position, which is blocked regardless of allowlist.
-    Command: source .../scripts/setup_nordic_env.sh && west build --sysbuild
+    Command: source .../scripts/sdk_env.sh && west build --sysbuild
 
 Cause: ``run_build_command`` wraps an ``activate`` script in ``bash -c
 "source <script> && <cmd>"``.  ``bash -c`` reads the file named by BASH_ENV
