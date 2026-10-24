@@ -26,6 +26,7 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import signal
 import socket
 import sqlite3
@@ -63,6 +64,7 @@ __all__ = [
     "abs_path",
     "build_dir_patterns_with_fw_context",
     "build_env",
+    "build_tool_available",
     "cc_output_path",
     "cc_staging_path",
     "clear_dead_temporaries",
@@ -75,6 +77,7 @@ __all__ = [
     "is_db_exception",
     "is_fatal",
     "macro_signature",
+    "missing_tool_message",
     "owner_is_dead",
     "owner_token",
     "process_group_is_gone",
@@ -678,6 +681,57 @@ def run_build_command(
             f"{_quote_stream('stderr', result.stderr)}"
         )
     return result
+
+
+# The longest time that the lookup of one tool can take.  The activate script
+# of NCS runs `nrfutil sdk-manager toolchain env`: measured 0.5 s.
+_TOOL_LOOKUP_TIMEOUT_S = 60
+
+
+def build_tool_available(name: str, cwd: Path, build_cfg: BuildConfig | None) -> bool:
+    """Say if the build of *build_cfg* finds the program *name*.
+
+    With ``activate``, the answer comes from the environment of the
+    project: ``command -v`` runs after ``source <activate>``, as each build
+    command does (:func:`run_build_command`).  The PATH of the fw-context
+    process does not count.  The activate script of NCS puts ``west`` and
+    ``ninja`` on PATH, and a ``west`` from outside that environment can
+    name a different workspace.  Without ``activate``, the build gets the
+    PATH of :func:`build_cfg_env`, with ``extra_path``, and this looks
+    there.
+
+    A failed activate script also gives False, and the caller names the
+    script in its message.
+    """
+    if build_cfg is not None and build_cfg.activate:
+        try:
+            run_build_command(
+                ["command", "-v", name],
+                cwd=cwd,
+                timeout=_TOOL_LOOKUP_TIMEOUT_S,
+                description=f"look for {name}",
+                build_cfg=build_cfg,
+            )
+        except RuntimeError:
+            return False
+        return True
+    return shutil.which(name, path=build_cfg_env(build_cfg).get("PATH")) is not None
+
+
+def missing_tool_message(name: str, build_cfg: BuildConfig | None, install_hint: str) -> str:
+    """Return the error text for a build that cannot find the program *name*.
+
+    With ``activate``, the cause is the environment of the project: the
+    message names the script, because a ``west`` on the PATH of the
+    operator does not help that build.
+    """
+    if build_cfg is not None and build_cfg.activate:
+        return (
+            f"{name} is not on PATH after `source {build_cfg.activate}` "
+            "([build] activate).  Correct the script, or set [build] activate "
+            "to the script that sets up the environment of the project."
+        )
+    return f"{name} is required.  {install_hint}"
 
 
 class AmbiguousProjectError(ValueError):

@@ -55,6 +55,7 @@ def esp_idf_project(tmp_path: Path, monkeypatch) -> tuple[Path, list[list[str]]]
 
     monkeypatch.setattr(mod, "run_build_command", fake_run)
     monkeypatch.setattr(mod.shutil, "which", lambda n: f"/usr/bin/{n}")
+    monkeypatch.setattr(mod, "build_tool_available", lambda *a, **kw: True, raising=False)
     return root, calls
 
 
@@ -121,6 +122,7 @@ class TestESPIDFOutputDirectory:
 
         monkeypatch.setattr(mod, "run_build_command", lambda *a, **kw: _Result())  # writes nothing
         monkeypatch.setattr(mod.shutil, "which", lambda n: f"/usr/bin/{n}")
+        monkeypatch.setattr(mod, "build_tool_available", lambda *a, **kw: True, raising=False)
 
         with pytest.raises(RuntimeError, match=r"default/out"):
             ESPIDFBuildSystem().build(root, replace(BuildConfig(), clean=False))
@@ -179,6 +181,7 @@ class TestESPIDFLeavesSdkconfigAlone:
 
         monkeypatch.setattr(mod, "run_build_command", fake_run)
         monkeypatch.setattr(mod.shutil, "which", lambda n: f"/usr/bin/{n}")
+        monkeypatch.setattr(mod, "build_tool_available", lambda *a, **kw: True, raising=False)
 
         ESPIDFBuildSystem().build(root, replace(BuildConfig(), clean=False))
 
@@ -227,6 +230,7 @@ class TestEveryBackendBuildsIntoTheOutputDirectory:
 
         monkeypatch.setattr(mod, "run_build_command", fake_run)
         monkeypatch.setattr(mod.shutil, "which", lambda n: f"/usr/bin/{n}")
+        monkeypatch.setattr(mod, "build_tool_available", lambda *a, **kw: True, raising=False)
         return calls
 
     @staticmethod
@@ -341,6 +345,7 @@ class TestPlatformIO:
 
         monkeypatch.setattr(mod, "run_build_command", fake_run)
         monkeypatch.setattr(mod.shutil, "which", lambda n: f"/usr/bin/{n}")
+        monkeypatch.setattr(mod, "build_tool_available", lambda *a, **kw: True, raising=False)
         return calls
 
     def test_the_only_environment_builds_into_out(self, tmp_path: Path, monkeypatch):
@@ -465,6 +470,7 @@ class TestPlatformIO:
         old.write_text("[]", encoding="utf-8")
         monkeypatch.setattr(mod, "run_build_command", lambda *a, **kw: _Result())
         monkeypatch.setattr(mod.shutil, "which", lambda n: f"/usr/bin/{n}")
+        monkeypatch.setattr(mod, "build_tool_available", lambda *a, **kw: True, raising=False)
 
         with pytest.raises(RuntimeError, match="COMPILATIONDB_PATH"):
             mod.PlatformIOBuildSystem().build(tmp_path, BuildConfig(clean=False, environment="esp32dev"))

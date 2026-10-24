@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 import yaml
 
-from fw_context_mcp.utils import is_fatal, run_build_command
+from fw_context_mcp.utils import build_tool_available, is_fatal, missing_tool_message, run_build_command
 
 from ..build_layout import COMPILE_COMMANDS_NAME, BuildLayout
 from . import _linker, registry
@@ -270,6 +270,12 @@ class SdkChoice:
 # first, so `get_linker_scripts` moves this name to the front.
 _FINAL_LINKER_SCRIPT = "linker.cmd"
 
+# The text for a build without activate that finds no west.
+_WEST_INSTALL_HINT = (
+    "Install the Zephyr SDK and west, or set [build] activate to the script "
+    "that sets up the environment of the project."
+)
+
 
 class ZephyrBuildSystem:
     """Zephyr RTOS build system (``west build``).
@@ -298,8 +304,10 @@ class ZephyrBuildSystem:
 
     def build(self, project_root: Path, cfg: BuildConfig) -> Path:
         """Generate compile_commands.json via ``west build``."""
-        if not shutil.which("west"):
-            raise RuntimeError("west is required for Zephyr builds.  Install the Zephyr SDK and west tool.")
+        # In the environment of the project: west outside it can name a
+        # different workspace (build_tool_available).
+        if not build_tool_available("west", project_root, cfg):
+            raise RuntimeError(missing_tool_message("west", cfg, _WEST_INSTALL_HINT))
 
         if not cfg.board:
             raise RuntimeError(
@@ -438,8 +446,6 @@ class ZephyrBuildSystem:
         """
         from ..build import build_variant_config
 
-        if not shutil.which("west"):
-            raise RuntimeError("west is required for Zephyr builds.  Install the Zephyr SDK and west tool.")
         if not cfg.variants:
             raise RuntimeError("build_multi() requires [[build.variants]] in config.")
 
@@ -449,6 +455,10 @@ class ZephyrBuildSystem:
 
         for variant in cfg.variants if variants is None else variants:
             vcfg = build_variant_config(cfg, variant)
+            # A variant can set its own activate, thus each variant looks
+            # for west in its own environment.
+            if not build_tool_available("west", project_root, vcfg):
+                raise RuntimeError(missing_tool_message("west", vcfg, _WEST_INSTALL_HINT))
             if not vcfg.board:
                 raise RuntimeError(
                     f"variant '{variant.name}' has no board.  Set it in "

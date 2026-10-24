@@ -9,7 +9,7 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from fw_context_mcp.utils import run_build_command
+from fw_context_mcp.utils import build_tool_available, missing_tool_message, run_build_command
 
 from ..build_layout import COMPILE_COMMANDS_NAME, BuildLayout
 from . import _linker, registry
@@ -89,13 +89,17 @@ class ESPIDFBuildSystem:
 
     def build(self, project_root: Path, cfg: BuildConfig) -> Path:
         """Generate compile_commands.json via ``idf.py build``."""
-        idf_py = shutil.which("idf.py")
-        if not idf_py:
-            raise RuntimeError(
-                "idf.py is required for ESP-IDF builds.  Install the ESP-IDF framework:\n"
+        # The name, not a path from the PATH of this process: with activate,
+        # the build finds idf.py after `source <activate>`, in the
+        # environment of the project (build_tool_available).
+        idf_py = "idf.py"
+        if not build_tool_available(idf_py, project_root, cfg):
+            raise RuntimeError(missing_tool_message(
+                idf_py, cfg,
+                "Install the ESP-IDF framework:\n"
                 "  git clone --recursive https://github.com/espressif/esp-idf.git\n"
-                "  cd esp-idf && ./install.sh && source export.sh"
-            )
+                "  cd esp-idf && ./install.sh && source export.sh",
+            ))
 
         # ONE value for every use below: the directory idf.py writes into,
         # the gate that asks whether it is configured, and the read of the
