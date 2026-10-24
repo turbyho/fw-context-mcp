@@ -1037,15 +1037,18 @@ def resolve_build_env(
             _write_build_key(project_root, "python", detected_python)
         print(f"  [ok] Build python: {detected_python} (auto-detected)")
     detected_activate = detected.get("activate")
+    origin = "auto-detected"
     if detected_activate and system == "zephyr":
-        detected_activate = _choose_activate_script(
+        chosen_activate = _choose_activate_script(
             project_root, detected_activate, non_interactive=non_interactive,
         )
-        detected["activate"] = detected_activate
+        if chosen_activate != detected_activate:
+            origin = "your choice"
+        detected_activate = detected["activate"] = chosen_activate
     if detected_activate:
         if not dry_run:
             _write_build_key(project_root, "activate", detected_activate)
-        print(f"  [ok] Build activate: {detected_activate} (auto-detected)")
+        print(f"  [ok] Build activate: {detected_activate} ({origin})")
 
     if system == "esp-idf" and not detected.get("activate"):
         val = prompt_text(

@@ -718,7 +718,11 @@ def build_tool_available(name: str, cwd: Path, build_cfg: BuildConfig | None) ->
                 description=f"look for {name}",
                 build_cfg=build_cfg,
             )
-        except RuntimeError:
+        except RuntimeError as exc:
+            # The error of the caller names only the script.  The log keeps
+            # why: a timeout, a failed script, or no such tool, with the
+            # end of the output of the script.
+            log.warning("%s not found after source %s: %s", name, build_cfg.activate, exc)
             return False
         return True
     return shutil.which(name, path=build_cfg_env(build_cfg).get("PATH")) is not None
