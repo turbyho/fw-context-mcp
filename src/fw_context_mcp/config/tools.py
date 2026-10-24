@@ -333,6 +333,10 @@ payload already carried.
 3. Never invent a symbol name because "it should be called that".
    Take the name from a result. A guess costs a whole call.
 4. A caller is `find_callers`, never a comment that reads like one.
+5. For ONE symbol whose name you know, use `lookup_symbol(name,
+   exact=True)`, not `search_code`. `search_code` splits a name into
+   words (`kb_open_disp` → `kb`, `open`, `disp`), thus it also finds
+   unrelated symbols that have one of these words.
 
 ### llm_analysis is not evidence
 
@@ -453,6 +457,16 @@ wording.
 `update_notice` is not a status either. PyPI has a newer fw-context than
 the installed one. Tell the operator one time. Do NOT upgrade fw-context
 yourself: the operator knows the tool that installed it.
+
+### LLM setup
+
+`check_ollama` tells if the LLM works; give its `message` to the operator.
+
+- NEVER ask for an API key, and never run `fw-context llm key set`. The
+  operator sets up a service with `fw-context llm setup` in a terminal.
+- Do NOT install Ollama, and ALWAYS ask before you pull a model (some GB).
+- ALWAYS show a `compliance_warning` or `embedding_compliance_warning`:
+  source code goes to another host.
 
 ### Diff verification
 
