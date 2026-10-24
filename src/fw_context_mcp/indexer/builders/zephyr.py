@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path, PurePath
@@ -13,7 +12,7 @@ from typing import TYPE_CHECKING
 
 import yaml
 
-from fw_context_mcp.utils import build_tool_available, is_fatal, missing_tool_message, run_build_command
+from fw_context_mcp.utils import build_tool_available, missing_tool_message, run_build_command
 
 from ..build_layout import COMPILE_COMMANDS_NAME, BuildLayout
 from . import _linker, registry
@@ -785,22 +784,22 @@ class ZephyrBuildSystem:
     def preferred_ncs_version(cls, project_root: Path) -> str | None:
         """Return the NCS version this project's environment points at.
 
-        ``ZEPHYR_BASE`` and ``west config zephyr.base`` both resolve to
-        ``<ncs_root>/<version>/zephyr``, so the version is right there in the
-        path.  It used to be discarded — both signals were reduced to the NCS
-        root and the version re-derived as "the newest directory under it",
-        which on a machine with several installs answers with a version the
-        project does not use.  The index would then be built against
-        different headers and different macros than the developer compiles
-        with, which is the one thing this tool must not get wrong.
+        ``ZEPHYR_BASE`` resolves to ``<ncs_root>/<version>/zephyr``, so the
+        version is right there in the path.  It used to be discarded — the
+        signal was reduced to the NCS root and the version re-derived as "the
+        newest directory under it", which on a machine with several installs
+        answers with a version the project does not use.  The index would
+        then be built against different headers and different macros than
+        the developer compiles with, which is the one thing this tool must
+        not get wrong.
 
-        Returns None when neither signal is present; the caller asks instead
-        of guessing.
+        ``west config zephyr.base`` is not a signal: init runs before the
+        environment of the project exists, and a ``west`` from outside that
+        environment can name a different workspace.
+
+        Returns None without the signal; the caller asks instead of guessing.
         """
-        for source in (cls._zephyr_base_version(), cls._west_config_version(project_root)):
-            if source is not None:
-                return source
-        return None
+        return cls._zephyr_base_version()
 
     @staticmethod
     def _version_from_zephyr_path(zephyr_dir: str | None) -> str | None:
@@ -815,21 +814,6 @@ class ZephyrBuildSystem:
     @classmethod
     def _zephyr_base_version(cls) -> str | None:
         return cls._version_from_zephyr_path(os.environ.get("ZEPHYR_BASE"))
-
-    @classmethod
-    def _west_config_version(cls, project_root: Path) -> str | None:
-        if not shutil.which("west"):
-            return None
-        try:
-            r = subprocess.run(
-                ["west", "config", "zephyr.base"],
-                capture_output=True, text=True, timeout=5, cwd=str(project_root),
-            )
-        except (OSError, subprocess.SubprocessError):
-            return None
-        if r.returncode != 0:
-            return None
-        return cls._version_from_zephyr_path(r.stdout.strip())
 
     @staticmethod
     def _ncs_version(ncs_root: Path) -> str | None:
@@ -850,10 +834,11 @@ class ZephyrBuildSystem:
     def _detect_ncs(cls, project_root: Path) -> tuple[str, str, str] | None:
         """Detect an NCS install and return ``(nrfutil, version, ncs_root)``.
 
-        NCS root candidates, most specific first: ``ZEPHYR_BASE`` env,
-        ``west config zephyr.base``, and ``~/ncs``.  A project-local ``ncs``
-        symlink is deliberately NOT used — it is a project-custom convention,
-        not a generic signal.  Returns None when no usable NCS install is found.
+        NCS root candidates, most specific first: ``ZEPHYR_BASE`` env and
+        ``~/ncs``.  A project-local ``ncs`` symlink is deliberately NOT used —
+        it is a project-custom convention, not a generic signal.  ``west`` is
+        not asked: this runs before the environment of the project exists.
+        Returns None when no usable NCS install is found.
         """
         candidates: list[Path] = []
 
@@ -862,22 +847,6 @@ class ZephyrBuildSystem:
             p = Path(zb).resolve()
             if p.name == "zephyr" and p.parent.name.startswith("v"):
                 candidates.append(p.parent.parent)
-
-        west = shutil.which("west")
-        if west:
-            try:
-                r = subprocess.run(
-                    ["west", "config", "zephyr.base"],
-                    capture_output=True, text=True, timeout=5,
-                )
-                if r.returncode == 0 and r.stdout.strip():
-                    p = Path(r.stdout.strip()).resolve()
-                    if p.name == "zephyr" and p.parent.name.startswith("v"):
-                        candidates.append(p.parent.parent)
-            except Exception as e:  # nosec B110 — best-effort env detection
-                # A stop of the run (SIGTERM under the index lock) must not vanish here.
-                if is_fatal(e):
-                    raise
 
         home_ncs = Path.home() / "ncs"
         if home_ncs.is_dir():
@@ -946,22 +915,15 @@ class ZephyrBuildSystem:
             activate = cls._write_ncs_env_script(project_root, nrfutil, version, ncs_root)
             return {"python": None, "activate": activate}
 
-        # 2. Zephyr source tree — zephyr-env.sh (sets ZEPHYR_BASE).
-        west = shutil.which("west")
-        if west:
-            try:
-                r = subprocess.run(
-                    ["west", "config", "zephyr.base"],
-                    capture_output=True, text=True, timeout=5,
-                )
-                if r.returncode == 0 and r.stdout.strip():
-                    zephyr_env = Path(r.stdout.strip()) / "zephyr-env.sh"
-                    if zephyr_env.exists():
-                        return {"python": None, "activate": str(zephyr_env)}
-            except Exception as e:  # nosec B110 — best-effort env detection
-                # A stop of the run (SIGTERM under the index lock) must not vanish here.
-                if is_fatal(e):
-                    raise
+        # 2. Zephyr source tree — zephyr-env.sh of the ZEPHYR_BASE that the
+        #    shell of the operator exports.  Not `west config zephyr.base`:
+        #    init runs before the environment of the project exists, and a
+        #    west from outside it can name a different workspace.
+        zephyr_base = os.environ.get("ZEPHYR_BASE")
+        if zephyr_base:
+            zephyr_env = Path(zephyr_base) / "zephyr-env.sh"
+            if zephyr_env.is_file():
+                return {"python": None, "activate": str(zephyr_env)}
 
         # 3. Plain Zephyr SDK — environment-setup-* (sets toolchain env).
         for sdk_dir in sorted(Path.home().glob("zephyr-sdk-*"), reverse=True):

@@ -14,6 +14,7 @@ the user replaces.
 
 from __future__ import annotations
 
+import shutil
 from dataclasses import replace
 from pathlib import Path
 
@@ -54,7 +55,7 @@ def esp_idf_project(tmp_path: Path, monkeypatch) -> tuple[Path, list[list[str]]]
         return _Result()
 
     monkeypatch.setattr(mod, "run_build_command", fake_run)
-    monkeypatch.setattr(mod.shutil, "which", lambda n: f"/usr/bin/{n}")
+    monkeypatch.setattr(shutil, "which", lambda n, path=None: f"/usr/bin/{n}")
     monkeypatch.setattr(mod, "build_tool_available", lambda *a, **kw: True, raising=False)
     return root, calls
 
@@ -121,7 +122,7 @@ class TestESPIDFOutputDirectory:
         (root / "sdkconfig").write_text('CONFIG_IDF_TARGET="esp32"\n', encoding="utf-8")
 
         monkeypatch.setattr(mod, "run_build_command", lambda *a, **kw: _Result())  # writes nothing
-        monkeypatch.setattr(mod.shutil, "which", lambda n: f"/usr/bin/{n}")
+        monkeypatch.setattr(shutil, "which", lambda n, path=None: f"/usr/bin/{n}")
         monkeypatch.setattr(mod, "build_tool_available", lambda *a, **kw: True, raising=False)
 
         with pytest.raises(RuntimeError, match=r"default/out"):
@@ -180,7 +181,7 @@ class TestESPIDFLeavesSdkconfigAlone:
             return _Result()
 
         monkeypatch.setattr(mod, "run_build_command", fake_run)
-        monkeypatch.setattr(mod.shutil, "which", lambda n: f"/usr/bin/{n}")
+        monkeypatch.setattr(shutil, "which", lambda n, path=None: f"/usr/bin/{n}")
         monkeypatch.setattr(mod, "build_tool_available", lambda *a, **kw: True, raising=False)
 
         ESPIDFBuildSystem().build(root, replace(BuildConfig(), clean=False))
@@ -229,7 +230,7 @@ class TestEveryBackendBuildsIntoTheOutputDirectory:
             return _Result()
 
         monkeypatch.setattr(mod, "run_build_command", fake_run)
-        monkeypatch.setattr(mod.shutil, "which", lambda n: f"/usr/bin/{n}")
+        monkeypatch.setattr(shutil, "which", lambda n, path=None: f"/usr/bin/{n}")
         monkeypatch.setattr(mod, "build_tool_available", lambda *a, **kw: True, raising=False)
         return calls
 
@@ -344,7 +345,7 @@ class TestPlatformIO:
             return result
 
         monkeypatch.setattr(mod, "run_build_command", fake_run)
-        monkeypatch.setattr(mod.shutil, "which", lambda n: f"/usr/bin/{n}")
+        monkeypatch.setattr(shutil, "which", lambda n, path=None: f"/usr/bin/{n}")
         monkeypatch.setattr(mod, "build_tool_available", lambda *a, **kw: True, raising=False)
         return calls
 
@@ -469,7 +470,7 @@ class TestPlatformIO:
         old.parent.mkdir(parents=True)
         old.write_text("[]", encoding="utf-8")
         monkeypatch.setattr(mod, "run_build_command", lambda *a, **kw: _Result())
-        monkeypatch.setattr(mod.shutil, "which", lambda n: f"/usr/bin/{n}")
+        monkeypatch.setattr(shutil, "which", lambda n, path=None: f"/usr/bin/{n}")
         monkeypatch.setattr(mod, "build_tool_available", lambda *a, **kw: True, raising=False)
 
         with pytest.raises(RuntimeError, match="COMPILATIONDB_PATH"):

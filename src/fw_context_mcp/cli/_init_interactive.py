@@ -71,6 +71,34 @@ def prompt_build_system(non_interactive: bool, *, current: str | None = None) ->
     return current
 
 
+def _choose_activate_script(project_root: Path, default: str, *, non_interactive: bool) -> str:
+    """Ask for the script that sets up the environment of a Zephyr project; Enter keeps *default*.
+
+    WHY ask (decision of the user, 2026-10-24): each build of a Zephyr or
+    NCS project runs after ``source <activate>``, and a project can have its
+    own script for that.  fw-context cannot know its name, thus init offers
+    the script that it found or generated (``.fw-context/ncs-env.sh``) and
+    takes a different one.  A relative path is relative to the project
+    root, because each build runs there.  A path that is not a file asks
+    again.  Without a terminal, the default stays and a line tells how to
+    change it.
+    """
+    if non_interactive:
+        print("  To use a different script, set [build] activate in .fw-context/local.toml.")
+        return default
+    while True:
+        answer = prompt_text(
+            "Script that sets up the environment of the project (Enter keeps it)",
+            default=default, non_interactive=False,
+        )
+        if not answer or answer == default:
+            return default
+        path = Path(answer).expanduser()
+        if (path if path.is_absolute() else project_root / path).is_file():
+            return answer
+        print(f"  {answer}: no such file.")
+
+
 def _configure_ncs_version(
     project_root: Path, *, dry_run: bool, non_interactive: bool,
     current: str | None = None,
@@ -960,13 +988,14 @@ def resolve_build_env(
         if b.activate and system == "zephyr":
             # Show what is configured — a hand-written script included — as
             # the standing choice, with the installed SDKs behind it so a
-            # re-run can switch.  init never asks for a script path: a custom
-            # one is set by hand in the config, and this only offers to move
-            # off it.
+            # re-run can switch.  Then the script itself can change: Enter
+            # keeps it (_choose_activate_script).
             chosen = _configure_ncs_version(
                 project_root, dry_run=dry_run, non_interactive=non_interactive,
                 current=b.activate,
             )
+            if chosen is not None:
+                chosen = _choose_activate_script(project_root, chosen, non_interactive=non_interactive)
             if chosen is not None and chosen != b.activate and not dry_run:
                 from ._init import _write_build_key
 
@@ -1008,6 +1037,11 @@ def resolve_build_env(
             _write_build_key(project_root, "python", detected_python)
         print(f"  [ok] Build python: {detected_python} (auto-detected)")
     detected_activate = detected.get("activate")
+    if detected_activate and system == "zephyr":
+        detected_activate = _choose_activate_script(
+            project_root, detected_activate, non_interactive=non_interactive,
+        )
+        detected["activate"] = detected_activate
     if detected_activate:
         if not dry_run:
             _write_build_key(project_root, "activate", detected_activate)

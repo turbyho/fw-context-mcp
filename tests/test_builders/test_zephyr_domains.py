@@ -112,7 +112,6 @@ class TestBuild:
             commands.append(cmd)
             make_output(out_dir)
 
-        monkeypatch.setattr(zephyr.shutil, "which", lambda name: f"/usr/bin/{name}")
         monkeypatch.setattr(zephyr, "build_tool_available", lambda *a, **kw: True)
         monkeypatch.setattr(zephyr, "run_build_command", fake_run)
         return ZephyrBuildSystem().build(tmp_path, cfg), commands[0]
