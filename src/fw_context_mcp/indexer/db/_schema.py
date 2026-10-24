@@ -111,7 +111,14 @@ __all__ = [
 #      the devicetree header were blank, thus `search_content` could not
 #      find a devicetree macro, and a header of the architecture read as
 #      blank lines.
-CURRENT_ROW_FORMAT = "fw-context-rows/5"
+# /6 — `refs` holds no call edge that a name gave: no call edge from the
+#      text of a comment, an inactive line or a definition line, none to a
+#      method of the class of the caller instead of the receiver, and none
+#      to every constructor of a type.  Each constructor edge goes to the
+#      constructor that the compiler selected.  Before it, on a real index,
+#      50 of 51 callers of one driver method were calls of an AT parser
+#      method of the same name.
+CURRENT_ROW_FORMAT = "fw-context-rows/6"
 
 # The config-hash format that was current when CURRENT_ROW_FORMAT last moved.
 #
@@ -126,7 +133,7 @@ CURRENT_ROW_FORMAT = "fw-context-rows/5"
 # the build, thus a plain `fw-context index` writes every file and every
 # body again.  The two must therefore move together, and
 # `test_row_format_invalidation.py` fails when only one of them does.
-ROW_FORMAT_PAIRED_WITH = "fw-context-cc/7"
+ROW_FORMAT_PAIRED_WITH = "fw-context-cc/8"
 
 
 def _row_format_number(value: str) -> int | None:
@@ -180,6 +187,11 @@ _ROW_FORMAT_FAULTS: tuple[tuple[int, str], ...] = (
         "directive lines, a short skipped block reads as live code, and a "
         "header that C code also reads lost its C-only lines: search_content "
         "and read_file can miss a #define or #include there"),
+    (5, "the call graph holds edges that came from names in the text: calls "
+        "in comments and on inactive lines, a method of the class of the "
+        "caller instead of the method of the receiver, and an edge to every "
+        "constructor of a type, thus find_callers and the call paths can "
+        "name callers that do not call"),
 )
 
 

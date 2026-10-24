@@ -1080,6 +1080,10 @@ def compute_config_hash(
         # and a file that a C unit also reads keeps the C text.  Before it, the
         # assembly pass wrote the ``clang -E`` view over the C text: each
         # directive was blank, and a short skipped block read as live.
+        # /8 marks a sixth change: ``refs`` holds no call edge that a name in
+        # the text gave, and each constructor edge goes to the constructor
+        # that the compiler selected.  A changed TU alone rewrites its refs,
+        # thus without a new config_hash an unchanged TU kept its old edges.
         #
         # WHY the format version belongs in THIS hash: a new config_hash
         # leaves no row for the build, thus a plain `fw-context index` writes
@@ -1090,7 +1094,7 @@ def compute_config_hash(
         #
         # Every existing index therefore gets one final reindex, which is
         # intended.
-        "_format": "fw-context-cc/7",
+        "_format": "fw-context-cc/8",
         "project_root": str(project_root),
         # WHY only these two: config_hash answers "could the same source text
         # compile to something different now?"  Macros flip #ifdef, and the
