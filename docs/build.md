@@ -49,6 +49,8 @@ The index reads `compile_commands.json` where the build system writes it in
 | Build | Database |
 |-------|----------|
 | One program (CMake, Arduino, Mbed OS, Makefile, Keil, IAR, manual) | `out/compile_commands.json` |
+| PlatformIO | `out/<env>/compile_commands.json`, for the environment that the variant builds |
+| `[build] command` | `out/compile_commands.json`, a copy of the `compile_commands.json` that the command writes into the project root |
 | ESP-IDF, two images | `out/compile_commands.json` (the application), `out/bootloader/compile_commands.json` (the bootloader) |
 | Zephyr without sysbuild (upstream Zephyr, or `west build --no-sysbuild`) | `out/compile_commands.json` |
 | Zephyr sysbuild, one per image | `out/<image>/compile_commands.json`, for each image that `out/domains.yaml` names |
@@ -83,8 +85,11 @@ own PID namespace.
 
 A variant name is a directory name. It must not be empty, it must not start
 with `.`, and it must not hold `/ \ : * ? " < > |` or a control character.
-Two names that differ only in case are an error, because they are one
-directory on macOS and Windows.
+It must not end with `.` or a space, and it must not be a device name that
+Windows reserves (`CON`, `PRN`, `AUX`, `NUL`, `COM1` to `COM9`, `LPT1` to
+`LPT9`), in any case and with any extension. Windows removes such an end, or
+refuses such a name. Two names that differ only in case are an error,
+because they are one directory on macOS and Windows.
 
 `fw-context init` writes the rules for the build tree into `.gitignore`
 automatically:
@@ -93,6 +98,10 @@ automatically:
 **/.fw-context/*
 !**/.fw-context/config.toml
 ```
+
+`init` also adds the line `compile_commands.json`, and for Mbed OS the line
+`mbed_config.h`, when the `.gitignore` does not hold them. Mbed OS writes
+`mbed_config.h` into the project root when it builds.
 
 Everything under `.fw-context/` stays out of the repository, and
 `config.toml` is the one exception — it holds the build configuration of the
@@ -108,23 +117,36 @@ line of the older form when it finds one.
 ### Detection order
 
 When you do not set `system` explicitly, `fw-context` detects the build
-system automatically, from project markers, in this order. `fw-context`
-checks a higher item first:
+system automatically, from the markers in the project root. A marker is the
+name of a file or a directory. A marker with `*` is a pattern: `*.uvprojx`
+matches each `.uvprojx` file in the project root.
 
-1. Mbed OS (`.mbed`, `mbed-os/`, `mbed_app.json`)
+Each builder gets one point for each of its markers that is in the project
+root. The builder with the most points wins. When two builders have the same
+number of points, the builder that is higher in this list wins:
+
+1. Mbed OS (`.mbed`, `mbed-os`, `mbed_app.json`)
 2. PlatformIO (`platformio.ini`)
-3. Zephyr (`west.yml`, `zephyr/`)
-4. ESP-IDF (`sdkconfig` + `CMakeLists.txt` with `idf_build`)
-5. Arduino (`.ino`, `sketch.yaml`)
+3. Zephyr (`west.yml`, `zephyr`)
+4. Arduino (`sketch.yaml`)
+5. ESP-IDF (`sdkconfig`)
 6. Generic CMake (`CMakeLists.txt`)
-7. Keil MDK (`*.uvprojx`)
-8. IAR EWARM (`*.ewp`, `*.eww`)
+7. STM32CubeIDE (`.cproject`, `.project`)
+8. TI CCS (`.projectspec`)
 9. Makefile (`Makefile`)
-10. STM32CubeIDE (`.cproject`, `.project`)
-11. TI CCS (`.projectspec`)
+10. Keil MDK (`*.uvprojx`)
+11. IAR EWARM (`*.ewp`, `*.eww`)
 
-The first builder that matches, wins. Set `system` explicitly, to skip
-detection or to force a specific builder.
+For example, an ESP-IDF project has `sdkconfig` and `CMakeLists.txt`. ESP-IDF
+and Generic CMake get one point each, and ESP-IDF wins, because it is higher
+in the list. For an ESP-IDF project without `sdkconfig`, detection selects
+Generic CMake. A
+`.ino` file is not a marker: a sketch without `sketch.yaml` needs
+`system = "arduino"`. Manual / bare mode has no marker, thus detection never
+selects it. When the project root holds no marker, detection finds no build
+system.
+
+Set `system` explicitly, to skip detection or to force a specific builder.
 
 ## Automatic build
 
@@ -149,7 +171,22 @@ unit would get wrong system headers and macros.
 
 A run with an explicit `compile_commands.json`, or a project with
 `[[build.variants]]`, does not do this check. `get_project_status` does
-not do it for such an index either.
+not do it for such an index either. A database of your own in
+`[index] compile_commands` is an error together with `[[build.variants]]`,
+because each variant builds its own database. It is also an error together
+with `--build`, because the run would then index the build of fw-context.
+
+A run that you start also builds in two more cases. This applies to a
+project without `[[build.variants]]`:
+
+- `platformio.ini`, `CMakeLists.txt`, `.mbed` or `west.yml` in the project
+  root is newer than `compile_commands.json`. For an explicit
+  `compile_commands.json`, the run does not build and gives a warning.
+- The check of `compile_commands.json` finds an error. The run then checks
+  the new database again. This case does not apply to an explicit
+  `compile_commands.json`, or to a run with `--build`.
+
+A background run does not build for these two reasons.
 
 A run builds when an index exists and a build can repair something that a
 reindex cannot:
@@ -170,8 +207,8 @@ and removes a reason that said it is not there. A failed automatic build
 is not paused: the next background run builds again. The daemon starts
 that run when a C/C++ file changes, and when the checkout changes (another
 branch, a tag, or a commit on a detached HEAD). A commit on the branch
-changes no checkout. A change of a build file only (for
-example `CMakeLists.txt`) starts no run. For the triggers of the background runs, see
+changes no checkout. For a change of a build file only (for
+example `CMakeLists.txt`), the daemon starts no run. For the triggers of the background runs, see
 [`fw-context index`](tools.md#fw-context-index).
 
 fw-context starts the build on its own only for a backend that cannot
@@ -202,8 +239,10 @@ Exceptions:
   build does. That directory holds the source of the libraries, not build
   output.
 - ESP-IDF: fw-context runs `idf.py set-target` only when the project has
-  no `sdkconfig`. `set-target` renames `<project>/sdkconfig`, and `-B`
-  does not move that file.
+  no `sdkconfig` and the output directory does not exist. `set-target`
+  renames `<project>/sdkconfig`, and `-B` does not move that file. The
+  target is then `esp32`, and fw-context logs a warning. For another chip,
+  run `idf.py set-target <chip>` yourself.
 - Makefile: a real `make` (`make_dry_run = false`) needs `out_dir_var`, the
   variable that names the output directory in your Makefile.
 
@@ -214,11 +253,13 @@ Exceptions:
 | Parameter | Type | Default | Systems | Description |
 |-----------|------|---------|---------|-------------|
 | `system` | `str` | (auto-detect) | all | Build system: `mbed-os`, `zephyr`, `platformio`, `esp-idf`, `arduino`, `cmake`, `keil-mdk`, `iar-ewarm`, `makefile`, `bare`, `stm32cubeide`, `ti-ccs` |
-| `clean` | `bool` | `true` | all | Run a clean build before fw-context generates the file. **Recommended.** A clean build ensures a complete `compile_commands.json` file. |
-| `command` | `str` | — | all | A full override for the shell command. Highest priority: fw-context ignores all other settings. |
+| `clean` | `bool` | `true` | Mbed OS, PlatformIO, Zephyr, ESP-IDF, Arduino, CMake | Run a clean build before fw-context generates the file. **Recommended.** A clean build makes sure that `compile_commands.json` is complete. The other builders do not read this key. A Zephyr sysbuild variant does not read it either: it always builds with `--pristine=auto`. |
+| `command` | `str` | — | all | A command that replaces the build of the builder. Highest priority: fw-context ignores the settings of the builder. It runs `pre_build` first, and it applies `[build] env` to the command. The command must write `compile_commands.json` into the project root. `timeout` does not apply: the command has no time limit. The command runs without a shell, see [example 11](#11-shell-override--bear-wrapping-a-custom-build). |
 | `python` | `str` | (auto-detect) | all | The Python interpreter for pip-based CLI tools, such as `mbed-cli`, `platformio`, `keil2clangd`, or `compiledb`. `fw-context init` detects this automatically, from pyenv, venv, and common install paths. Set this parameter manually when automatic detection fails. |
 | `activate` | `str` | (auto-detect) | all | A shell script that fw-context sources before the build, for example the toolchain environment of NCS, or `export.sh` for ESP-IDF. `fw-context init` detects this automatically. Set this parameter manually when automatic detection fails. |
 | `pre_build` | `str` | — | all | A shell command that fw-context runs before the build, the convert step, or the generate step. Put it in `config.toml` when the whole team uses it, or in `local.toml` when it is specific to your machine. |
+| `env` | `dict[str,str]` | `{}` | all | Environment variables for each command of the build: the builder commands, `pre_build` and `command`. |
+| `timeout` | `float` | `7200` | all | The maximum time in seconds of each build command and of `pre_build`. When a command runs longer, fw-context stops it, and the build fails. |
 
 The build process does not get an inherited `BASH_ENV`. fw-context removes
 it from the build environment, because `bash -c` reads that file before
@@ -230,12 +271,18 @@ after the removal.
 commands, the `pre_build` hook, and the `command` override. `activate`
 applies to the builder commands only.
 
+fw-context looks for some tools in the `PATH` of its own process, before
+it applies `activate`: `west` and `ninja` for Zephyr, and `idf.py` and
+`ninja` for ESP-IDF. `activate` wraps only the build command, thus it does
+not make a missing `west` or `idf.py` available. These tools must be on the
+`PATH` of the fw-context process, also when you set `activate`.
+
 ### Mbed OS
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `target` | `str` | (from `.mbed`) | The target board name, for example `"BOARD_V2_BOARD"` |
-| `toolchain` | `str` | (from `.mbed`) | The toolchain, for example `"GCC_ARM"` |
+| `target` | `str` | (from `.mbed`, else from `custom_targets.json`) | The target board name, for example `"BOARD_V2_BOARD"`. Without `TARGET` in `.mbed`, fw-context uses the first target of `custom_targets.json` that has `inherits`. Without a target, the build stops with an error. |
+| `toolchain` | `str` | (from `.mbed`, else `"GCC_ARM"`) | The toolchain, for example `"GCC_ARM"` |
 | `profile` | `str` | `"develop"` | The build profile |
 | `app_config` | `str` | `"mbed_app.json"` | The application configuration JSON file |
 | `extra_profiles` | `list[str]` | `["lto.json"]` | Additional profiles that fw-context merges on top |
@@ -277,6 +324,9 @@ board and flags. Thus each environment is a variant:
 - A project with more than one environment and no `[[build.variants]]`
   gets one variant for each environment, with the name of the environment.
   Each query then must name the `variant`.
+- `[build] environment` in a project without `[[build.variants]]` selects
+  one environment. The project then has no variants, and fw-context builds
+  only that environment.
 - A `[[build.variants]]` entry builds the environment that `environment`
   names (in the entry, or in `[build]`), or else the environment with the
   name of the variant.
@@ -294,6 +344,11 @@ build, and the queries of the old variants stop.
 
 PlatformIO decides the set (`pio project config`), thus `extends`,
 `extra_configs` and `default_envs` apply as in your build.
+
+`PLATFORMIO_BUILD_DIR` in `[build] env`, or in the `env` of a variant, is
+an error, and the build stops.
+fw-context sets this variable to its own output directory, and your value
+would send the build to a different directory.
 
 ### ESP-IDF
 
@@ -400,17 +455,26 @@ the call with the arguments of one build. See
 | `description` | `str` | — | A human-readable description. |
 | `build_dir` | — | — | Retired, here and in `[build]`. Each variant builds into `.fw-context/build/<name>/out`. `fw-context index` removes the key from the config at its start (see [Obsolete keys and files](configuration.md#obsolete-keys-and-files)). When it cannot write the config, the run stops with an error. |
 | `env` | `dict` | — | Build environment variables. fw-context folds these variables into the `config_hash`. |
-| `images` | `list` | — | The sysbuild images (Zephyr only). |
+| `images` | `list` | — | Data about the sysbuild images (Zephyr only). It does not set which images the build makes. |
+| `vendor_paths`, `project_paths` | `list[str]` | — | `[index]` keys. They add to the `[index]` lists for this variant only, and they do not replace them. |
+| `transient_defines` | — | — | Not permitted here: the list applies to the whole project. In a variant table, it stops `fw-context index` with an error. Set it in `[index]`. |
 | *(any other `[build]` key)* | — | — | Overrides the shared `[build]` value for this variant only. |
+
+The other `[index]` keys have no effect in a variant table. For the
+`[index]` keys, see [`[index]`](configuration.md#index--indexer).
 
 The `images` sub-table:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `name` | `str` | — | The image name. |
-| `dir` | `str` | — | The path to the image source. |
-| `type` | `str` | `"project"` | `"project"` or `"sdk"`. |
-| `board` | `str` | — | A per-image board override. |
+| `dir` | `str` | — | The path to the image source. Information only: fw-context does not use it. |
+| `type` | `str` | `"project"` | `"project"` or `"sdk"`. Information only: fw-context does not use it. |
+| `board` | `str` | — | A per-image board override. fw-context records it as the board of that image. |
+
+The images of a sysbuild variant come from `out/domains.yaml`, not from
+`images`. An image that `images` names and the build does not make gets no
+index.
 
 Shared `[build]` keys for multi-variant projects:
 
@@ -456,6 +520,14 @@ because one build makes all images of a variant (Zephyr sysbuild, ESP-IDF).
 A variant name that cannot be a directory name, for example a name with
 `/`, stops the run before any build. See [Where the build goes](#where-the-build-goes).
 
+A failed build of one variant does not stop the other variants, also for a
+Zephyr sysbuild. The run logs an error for that variant, and builds and
+indexes the other variants.
+
+For all options of `fw-context index`, for example `--force`, `--llm`,
+`--force-llm`, and `--takeover` for the lock of the index, see
+[`fw-context index`](tools.md#fw-context-index).
+
 ### Manage the variants
 
 ```bash
@@ -489,7 +561,11 @@ two environment variables:
   `compile_commands.json` in the project root, which your clangd reads,
   stays as your build wrote it.
 
-fw-context configures dependency tracking (`-MMD`) automatically.
+fw-context adds no compiler flag for dependency tracking, such as `-MMD`.
+The last step, after `compiledb` and `envdump` (see below), runs
+`pio run -e <env>`, a full build, for the dependency (`.d`) files. When
+this step fails, fw-context logs a warning and continues, but the
+detection of header changes is then limited.
 
 The build also runs `pio run -e <env> --target envdump`. This target compiles
 nothing. It prints the SCons environment, and fw-context reads the link
@@ -559,7 +635,13 @@ clean = false
 ```
 
 `fqbn` is required. Find your board's `fqbn` with `arduino-cli board list`.
-Build command: `arduino-cli compile --fqbn arduino:avr:uno --export-compile-commands`.
+The build runs two commands:
+
+1. `arduino-cli compile --fqbn arduino:avr:uno --build-path <out> --only-compilation-database`
+   writes `compile_commands.json` and compiles nothing.
+2. `arduino-cli compile --fqbn arduino:avr:uno --build-path <out>` compiles
+   the sketch, for the dependency (`.d`) files. When this step fails,
+   fw-context logs a warning and keeps the database of step 1.
 
 ### 6. Manual / bare — ARM project without a build system
 
@@ -594,6 +676,11 @@ source_dirs = ["src", "lib"]
 `.cpp` file in `source_dirs`, with the same flags for each entry. This mode
 works well for small projects that have no real build system.
 
+Before it writes the database, fw-context compiles each file with
+`-fsyntax-only`, for the dependency (`.d`) files. This step writes no
+object file. The first file that does not compile stops the generation
+with an error, and fw-context writes no `compile_commands.json`.
+
 ### 7. Makefile with compiledb (dry-run)
 
 ```toml
@@ -620,8 +707,10 @@ idf_path = "/home/user/esp/esp-idf"
 clean = false
 ```
 
-`idf_path` is optional when `idf.py` is on `$PATH`.  Set it here for
-non-standard installations.
+`idf_path` sets only the `IDF_PATH` variable of the build. It does not
+make `idf.py` available: `idf.py` and `ninja` must be on the `PATH` of the
+fw-context process (see [General](#general)). Set `idf_path` when
+`$IDF_PATH` does not name your ESP-IDF installation.
 
 fw-context reads the linker scripts from the link of the application in
 `build.ninja`. `project_description.json` names the ELF of the
@@ -676,9 +765,24 @@ CMake project that is not Zephyr or ESP-IDF.
 command = "bear -- make -j8"
 ```
 
-When no other builder fits, `command` runs as-is. `bear` intercepts the
-build, and records the compile commands. fw-context ignores all other
-`[build]` settings. This example requires `bear`, as a system package:
+When no other builder fits, `command` runs as-is, without a shell.
+fw-context splits the text into words as a shell does (`shlex.split`), and
+then starts the first word as the program. Thus a pipe (`|`), `&&`, a
+redirection (`>`) and a shell variable (`$VAR`) do not work in `command`.
+For a command that needs a shell, write the command into a script file, and
+set the script as `command`. You can also give the shell as the program:
+
+```toml
+[build]
+command = "bash -c 'make clean && bear -- make -j8'"
+```
+
+`bear` intercepts the
+build, records the compile commands, and writes `compile_commands.json`
+into the project root. fw-context copies that file to
+`out/compile_commands.json`. fw-context ignores the settings of the
+builder, but it runs `pre_build` first and applies `[build] env`. This
+example requires `bear`, as a system package:
 `sudo pacman -S bear`.
 
 ### 12. Build environment — custom Python for mbed-cli
@@ -741,6 +845,10 @@ When you set `activate`, the builder wraps the command:
 bash -c "source /path/to/setup.sh && west build -b nrf52840dk ..."
 ```
 
+The script applies only to the build command. fw-context looks for `west`
+and `ninja` before it sources the script, thus the two tools must also be
+on the `PATH` of the fw-context process (see [General](#general)).
+
 ### 14. Build environment — ESP-IDF
 
 ```toml
@@ -749,8 +857,17 @@ bash -c "source /path/to/setup.sh && west build -b nrf52840dk ..."
 activate = "/home/user/esp/esp-idf/export.sh"
 ```
 
-`fw-context init` checks `$IDF_PATH`, `~/esp/esp-idf/export.sh`, and
-`idf.py` on PATH.
+`fw-context init` finds the script in this order:
+
+1. A `~/.espressif/tools/activate_idf_*.sh` of the Espressif Installation
+   Manager (EIM), the last one in name order
+2. `export.sh` in `$IDF_PATH`
+3. `~/esp/esp-idf/export.sh`
+4. `~/esp-idf/export.sh`.
+
+When it finds none of them, `init` sets no `activate`. As for Zephyr,
+`activate` applies only to the build command: `idf.py` and `ninja` must be
+on the `PATH` of the fw-context process (see [General](#general)).
 
 ### 15. Multi-variant — one codebase, several boards (bare mode)
 
@@ -838,8 +955,11 @@ Also check that `*.uvprojx` exists with `ls *.uvprojx`.
 
 ### `arduino-cli: command not found`
 
+`arduino-cli` is not a Python package. Install it with the install script
+of the Arduino CLI project, as the error of fw-context gives it:
+
 ```bash
-pip install arduino-cli
+curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
 ```
 
 ### `west: command not found`
@@ -882,6 +1002,10 @@ The error quotes the last 2000 characters of `stdout` and of `stderr`. A
 stream that is longer says how many characters it holds. An empty stream
 is not shown. The cause of a failure is usually at the end of the log.
 
+Each build command has a time limit of `[build] timeout` seconds, 7200 by
+default. When a first build takes longer, set a larger value in
+`[build] timeout`. The `[build] command` override has no time limit.
+
 ### `keil2clangd: command not found`
 
 ```bash
@@ -918,7 +1042,13 @@ python = "/home/user/.pyenv/versions/3.11.8/bin/python"
 
 ### `west: command not found` (Zephyr/NCS)
 
-Zephyr builds need an active toolchain environment. `fw-context init` finds the environment in this order:
+fw-context looks for `west` in the `PATH` of its own process, before it
+sources `activate`. Thus `activate` does not repair the error
+`west is required for Zephyr builds`. Put `west` on the `PATH` of the
+fw-context process, for example in the shell where you run
+`fw-context index`.
+
+The build command also needs an active toolchain environment. `fw-context init` finds the environment in this order:
 
 1. An `activate` that the config already holds. A new run of
    `fw-context init` shows it and keeps it by default.
