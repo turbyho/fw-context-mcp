@@ -57,7 +57,8 @@ any call-path query that can reach ``main``.
 
 - ``call`` — direct function call (``foo()``).
 - ``indirect`` — function pointer assignment (``driver.onData = &handler``).
-- ``implicit_construct`` — global/static object constructor.
+- ``implicit_construct`` — constructor of an object at namespace or class
+  scope (a global, a file-scope static, a static data member).
 - ``dispatch`` — synthetic edge through event loop / thread start.
 """
 
@@ -1152,7 +1153,7 @@ def count_hotspots(
                 JOIN symbols s ON s.usr = r.to_usr AND s.config_hash = r.config_hash
                 WHERE r.config_hash = ?
                   AND s.is_definition = 1
-                  AND r.ref_kind IN ('call', 'indirect')
+                  AND r.ref_kind IN ('call', 'indirect', 'implicit_construct')
                   {path_clauses} {proj_clause}
                 GROUP BY s.usr)""",
         params,
@@ -1170,7 +1171,8 @@ def find_hotspots(
 ) -> list[dict]:
     """Find the most-called functions ranked by caller count.
 
-    Only counts call edges (``ref_kind IN ('call', 'indirect')``) —
+    Only counts call edges (``ref_kind IN ('call', 'indirect',
+    'implicit_construct')``) —
     plain references (``ref_kind='ref'``) and member accesses are excluded
     so enum constants and field declarations do not appear as hotspots.
 
@@ -1235,7 +1237,7 @@ def find_hotspots(
            JOIN symbols s ON s.usr = r.to_usr AND s.config_hash = r.config_hash
            WHERE r.config_hash = ?
              AND s.is_definition = 1
-             AND r.ref_kind IN ('call', 'indirect')
+             AND r.ref_kind IN ('call', 'indirect', 'implicit_construct')
              {path_clauses}
              {proj_clause}
            GROUP BY s.usr

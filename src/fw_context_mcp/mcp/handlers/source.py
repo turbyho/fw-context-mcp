@@ -1275,7 +1275,7 @@ def _collect_callers(
     answer now describe one symbol.
     """
     callers = refs_for_symbol(
-        conn, config_hash, row["usr"], row["kind"], ref_kind=["call", "indirect"],
+        conn, config_hash, row["usr"], row["kind"], ref_kind=["call", "indirect", "implicit_construct"],
         limit=_CALLERS_SHOWN,
     )
     return [
@@ -1345,7 +1345,7 @@ def _list_totals(
     tells the reader that a tool that pages it has more.
     """
     callers = count_refs_for_symbol(
-        conn, config_hash, symbol_usr, row["kind"], ref_kind=["call", "indirect"],
+        conn, config_hash, symbol_usr, row["kind"], ref_kind=["call", "indirect", "implicit_construct"],
     )
     callees = int(conn.execute(
         f"""SELECT COUNT(*) FROM (
@@ -1372,9 +1372,9 @@ def _list_hints(
 ) -> dict[str, str]:
     """Name the tool that pages each list that the cap cut.
 
-    The hint names no offset: the paged tool counts a wider set (for
-    example find_callers also counts ``implicit_construct``), thus its
-    pages do not continue this list row for row.
+    The hint names no offset: this list and the paged tool do not promise
+    one order of rows, thus a page of the tool need not continue this list
+    row for row.
     """
     name = row["qualified_name"] or row["name"]
     tools = {

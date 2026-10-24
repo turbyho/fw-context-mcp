@@ -1,0 +1,16 @@
+{
+  "description": "A constructor call that the source writes has an edge: a member initializer (m(1)), a delegation (Delegating(1)), and the call of a default member initializer (Foo m{5}), which keeps its own line and no caller. A construction that the source does not write has no edge: the default construction of a member that the initializer list does not name (n), and the member constructions of an implicit constructor (imp, nest, local). That gap is known and intended: a derivation by the rules of C++ was measured and dropped. When a later layer fills it, this truth changes.",
+  "units": ["main.cpp"],
+  "compiler": "c++",
+  "present": [
+    ["Named::Named", "Foo::Foo", 10, "call"],
+    [null, "Foo::Foo", 14, "call"],
+    ["Delegating::Delegating", "Delegating::Delegating", 37, "call"],
+    ["Delegating::Delegating", "Foo::Foo", 39, "call"]
+  ],
+  "absent": [
+    [null, "Foo::Foo", 7, "implicit_construct"],
+    [null, "Foo::Foo", 19, "implicit_construct"]
+  ],
+  "exact": true
+}

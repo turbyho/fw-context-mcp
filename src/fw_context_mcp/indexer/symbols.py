@@ -1160,6 +1160,10 @@ def _build_refs_and_fp_assignments(
     _fn_spans: list[tuple[str, int, int]] = []
 
     fn_stack: list[tuple[str, int, str]] = []
+    # The constructor calls of the initializers of objects at namespace or
+    # class scope, by cursor hash: they run before main.  A VAR_DECL comes
+    # before its initializer in the preorder walk.
+    static_init_calls: set[int] = set()
 
     for cursor in (
         _iter_cursor_skip(tu.cursor, skip_files, resolve_fn)
@@ -1222,9 +1226,13 @@ def _build_refs_and_fp_assignments(
                 )
                 fn_stack.append((cur_fn or '', 0, ""))
 
+        if cursor.kind == cx.CursorKind.VAR_DECL:
+            static_init_calls |= _static_init_constructor_calls(cursor)
+
         _process_ref_cursor(
             cursor, cur_fn, refs, indirect_call_sites, fp_assignments,
             pending_dispatches, seen_ref, qn_to_usr, tu_path_str, resolve_fn, _log,
+            static_init_calls,
         )
 
     # Source-line scan for dispatch calls and &Class::method (indirect only)
@@ -1563,18 +1571,18 @@ def _process_ref_cursor(
     tu_path_str: str,
     resolve_fn: Callable[..., object],
     _log: logging.Logger,
+    static_init_calls: set[int],
 ) -> None:
     """Process a single cursor for references and indirect calls — dispatcher."""
     loc = cursor.location
     if not loc.file:
         return
 
-    _handle_direct_refs(cursor, cur_fn, refs, seen_ref)
+    _handle_direct_refs(cursor, cur_fn, refs, seen_ref, static_init_calls)
     _handle_indirect_invocations(cursor, cur_fn, refs, indirect_call_sites,
                                  fp_assignments, pending_dispatches, seen_ref, tu_path_str, resolve_fn,
                                  qn_to_usr, _log)
     _handle_fn_ptr_cases(cursor, cur_fn, refs, fp_assignments, seen_ref, tu_path_str, _log)
-    _handle_implicit_constructors(cursor, cur_fn, refs, seen_ref, _log)
     _handle_token_fallbacks(cursor, cur_fn, refs, fp_assignments, seen_ref, qn_to_usr, tu_path_str, _log)
 
 
@@ -1592,7 +1600,7 @@ def _add_ref(refs: list[Reference], seen_ref: set[tuple], to_usr: str,
 
 
 def _handle_direct_refs(cursor: cx.Cursor, cur_fn: str | None, refs: list[Reference],
-                       seen_ref: set[tuple]) -> None:
+                       seen_ref: set[tuple], static_init_calls: set[int]) -> None:
     """Direct call/ref/member references from ``cursor.referenced``, and run-time vectors.
 
     WHY no fallback for a CALL_EXPR without a target: two fallbacks once
@@ -1604,6 +1612,18 @@ def _handle_direct_refs(cursor: cx.Cursor, cur_fn: str | None, refs: list[Refere
     template body.  An unresolved call names no constructor, thus those
     edges were guesses (seen in libstdc++: ``std::push_heap`` to the
     constructor of its comparator).
+
+    A constructor call in the initializer of an object at namespace or
+    class scope gets ``ref_kind='implicit_construct'``: its hash is in
+    *static_init_calls* (see :func:`_static_init_constructor_calls`).
+
+    Limit: a construction that has no CALL_EXPR in the source gets no
+    edge.  These are a member that a constructor does not name in its
+    initializer list, and each member construction of an implicit
+    constructor, which has no body.  A rule-based derivation of those was
+    measured and dropped: each review found more C++ forms that it got
+    wrong (defaulted copy constructors, unions, aggregates, template
+    instances).  A missing edge is honest; a wrong edge reads like a fact.
     """
     loc = cursor.location
     ref_kind = _REF_KINDS.get(cursor.kind)
@@ -1613,6 +1633,10 @@ def _handle_direct_refs(cursor: cx.Cursor, cur_fn: str | None, refs: list[Refere
             to_usr = referenced.get_usr()
             ref_loc = referenced.location
             if to_usr and ref_loc.file:
+                if (cursor.kind == cx.CursorKind.CALL_EXPR
+                        and referenced.kind == cx.CursorKind.CONSTRUCTOR
+                        and cursor.hash in static_init_calls):
+                    ref_kind = "implicit_construct"
                 _add_ref(refs, seen_ref, to_usr, loc.file.name, loc.line, cur_fn, ref_kind)
 
         if cursor.kind == cx.CursorKind.CALL_EXPR:
@@ -2721,50 +2745,64 @@ def _handle_fn_ptr_cases(cursor: cx.Cursor, cur_fn: str | None,
                                  stored=stored)
 
 
-def _handle_implicit_constructors(cursor: cx.Cursor, cur_fn: str | None,
-                                  refs: list[Reference], seen_ref: set[tuple],
-                                  _log: logging.Logger) -> None:
-    """Implicit constructor calls from global/static objects and member fields.
+# The scopes whose variables have static storage duration and get their
+# constructor before main: namespace scope, and a class for a static data
+# member.  A variable of a function body is not in this set, a static local
+# included: its constructor runs from the function.
+_STATIC_OBJECT_SCOPES = frozenset({
+    cx.CursorKind.TRANSLATION_UNIT, cx.CursorKind.NAMESPACE,
+    cx.CursorKind.CLASS_DECL, cx.CursorKind.STRUCT_DECL, cx.CursorKind.UNION_DECL,
+    cx.CursorKind.CLASS_TEMPLATE,
+})
 
-    Detects ``ref_kind='implicit_construct'`` edges: when a VAR_DECL or
-    FIELD_DECL has a RECORD type (class/struct), iterates all constructors
-    of that class and emits a call reference at the declaration site.
-    This is necessary because libclang does not emit CALL_EXPR for implicit
-    or default constructor invocations (e.g. ``Foo obj;`` or
-    ``static Bar _bar;`` at file scope).
 
-    The specific constructor overload is NOT distinguished — every
-    constructor of the class gets a reference.  This is sufficient for
-    call-graph dead-code detection and hotspot analysis, where the
-    caller count should reflect all construction sites.
+def _static_init_constructor_calls(var: cx.Cursor) -> set[int]:
+    """Give the hashes of the constructor calls that the initialization of *var* makes before main.
+
+    *var* must be the definition of a variable at namespace scope or of a
+    static data member, else the answer is empty.  libclang gives a
+    CALL_EXPR for each construction, with the constructor that the compiler
+    selected as its referenced cursor.  Each constructor call in the
+    initializer of such a variable runs before main and from no function:
+    the object itself (``Foo g;``, ``Foo g(7);``, ``Foo arr[2];``) and each
+    temporary (``Foo g = Foo(1);``, ``Foo g = 5;``).  The tools read those
+    edges as global constructors (``implicit_construct``, no caller).  The
+    body of a lambda in the initializer runs when the lambda is called,
+    thus its calls are not part of the set.
+
+    WHY the whole initializer and not ``semantic_parent``: libclang gives
+    the VAR_DECL as the semantic parent of the CALL_EXPR of ``Foo g;``, but
+    no semantic parent for the CALL_EXPR of a temporary or a conversion.
+
+    WHY not from the declaration: an earlier pass wrote an edge from each
+    VAR_DECL and FIELD_DECL of class type to EVERY constructor of the
+    class.  That gave the overloads that the compiler did not select, an
+    edge for an extern declaration, and an edge for a member declaration,
+    which constructs nothing at its own line.
+
+    A local object, a static local, a new-expression and a member
+    initializer construct from the function that holds them, thus they stay
+    calls.
     """
-    if cursor.kind not in (cx.CursorKind.VAR_DECL, cx.CursorKind.FIELD_DECL):
-        return
-    loc = cursor.location
+    calls: set[int] = set()
     try:
-        canon = cursor.type.get_canonical()
+        if not var.is_definition() or var.semantic_parent is None:
+            return calls
+        if var.semantic_parent.kind not in _STATIC_OBJECT_SCOPES:
+            return calls
+        pending = list(var.get_children())
+        while pending:
+            node = pending.pop()
+            if node.kind == cx.CursorKind.LAMBDA_EXPR:
+                continue
+            if node.kind == cx.CursorKind.CALL_EXPR:
+                target = node.referenced
+                if target is not None and target.kind == cx.CursorKind.CONSTRUCTOR:
+                    calls.add(node.hash)
+            pending.extend(node.get_children())
     except (ValueError, TypeError, RuntimeError, AttributeError):
-        _log.debug("implicit_construct: get_canonical failed for %s", cursor.spelling)
-        return
-    if canon is None or canon.kind != cx.TypeKind.RECORD:
-        return
-    try:
-        class_cursor = canon.get_declaration()
-    except (ValueError, TypeError, RuntimeError, AttributeError):
-        _log.debug("implicit_construct: get_declaration failed")
-        return
-    if class_cursor is None:
-        return
-    for child in class_cursor.get_children():
-        if child.kind != cx.CursorKind.CONSTRUCTOR:
-            continue
-        ctor_usr = child.get_usr()
-        if not ctor_usr:
-            continue
-        ctor_loc = child.location
-        if not ctor_loc.file:
-            continue
-        _add_ref(refs, seen_ref, ctor_usr, loc.file.name, loc.line, cur_fn, "implicit_construct")
+        _log.debug("static init: walk failed for %s", var.spelling)
+    return calls
 
 
 def _handle_token_fallbacks(cursor: cx.Cursor, cur_fn: str | None,

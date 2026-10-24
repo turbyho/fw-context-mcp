@@ -272,8 +272,8 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
     Args:
         name: Symbol name to find references for.
         project_root: Project root directory.
-        ref_kind: Reference kind filter (``["call", "indirect"]`` for callers,
-            ``None`` for all kinds).
+        ref_kind: Reference kind filter (``["call", "indirect",
+            "implicit_construct"]`` for callers, ``None`` for all kinds).
         limit: Maximum results of one page.
         caller_mode: If True, use "callers" in info messages instead of "references".
         offset: How many rows to walk past before the page begins.
@@ -663,9 +663,10 @@ def find_references(
         caller_kind.
         ``ref_kind`` is one of: ``"call"``, ``"ref"``, ``"member"``,
         ``"indirect"`` (function-pointer reference in arguments, assignments,
-        initializers, or init lists), ``"implicit_construct"`` (implicit
-        constructor call from global/static object or member-field
-        initialization), ``"dispatch"`` (synthetic edge from a dispatch
+        initializers, or init lists), ``"implicit_construct"`` (the
+        constructor that the compiler selects for an object at namespace
+        or class scope; a local object, a new-expression and a member
+        initializer give a ``"call"``), ``"dispatch"`` (synthetic edge from a dispatch
         bridge such as ``EventQueue::call_every``), ``"vector"`` (a slot of
         an assembly vector table names the symbol; file and line are the
         table entry), ``"vector_data"`` (a slot holds an address computed
@@ -1053,8 +1054,8 @@ def find_call_path(
     (e.g. ``"main → app_run → modem_init"``).
 
     **Edge types traversed:** The BFS includes ``call``, ``indirect``
-    (function pointers / ISRs), ``implicit_construct`` (global/static
-    object constructors), and ``dispatch`` (synthetic edges through event
+    (function pointers / ISRs), ``implicit_construct`` (the constructors
+    of the objects at namespace or class scope), and ``dispatch`` (synthetic edges through event
     loops like ``EventQueue::dispatch_forever`` and thread starts like
     ``Thread::start``).
 
@@ -1067,13 +1068,12 @@ def find_call_path(
       FreeRTOS.  Add other RTOS patterns in
       ``[call_graph.dispatch_bridges]`` (``.fw-context/config.toml``); a
       bridge whose entry symbol is not in the index is skipped silently.
-    - **Ambiguous fallback names:** for a call that libclang cannot
-      resolve (template-obscured ``_timeout.attach(...)``), a source-line
-      regex matches the method name.  When several methods share that
-      unqualified name and neither the receiver field type nor the caller
-      class disambiguates, fw-context creates NO edge — conservative, to
-      avoid false paths.
-    - **Global constructors:** file-scope ``implicit_construct`` edges
+    - **Calls without a target:** a call that libclang cannot resolve
+      (a dependent call in a template that is never instantiated) has NO
+      call edge.  fw-context does not take a target from the name of the
+      call: that once gave false paths through a method of the same name.
+    - **Global constructors:** the ``implicit_construct`` edges of the
+      objects at namespace or class scope
       hang off a synthetic ``<global ctors>`` node between ``main`` and
       every global constructor.  Any query that can reach ``main`` uses
       it, not only a query that starts at ``main``.
@@ -1201,16 +1201,17 @@ def find_all_callers_recursive(
     each caller appears once at its shortest distance to the target.
 
     **Edge types traversed:** Includes ``call``, ``indirect`` (function
-    pointers / ISRs), ``implicit_construct`` (constructors reachable through
-    file-scope global objects), and ``dispatch`` (synthetic edges through
-    event loops and thread starts).
+    pointers / ISRs), ``implicit_construct`` (the constructors of the
+    objects at namespace or class scope), and ``dispatch`` (synthetic edges
+    through event loops and thread starts).
 
-    **Limitation — ambiguous name resolution:** When a source-line fallback
-    cannot disambiguate which method is called (e.g. ``attach()`` matching
-    both ``Timeout::attach`` and ``SerialBase::attach``), the edge is
-    conservatively omitted to avoid false callers.  If you suspect a
-    missing caller, verify with ``search_bodies("target_name")`` and
-    ``find_indirect_targets``.
+    **Limitation — calls without a target:** a call that libclang cannot
+    resolve (a dependent call in a template that is never instantiated)
+    has no edge, because fw-context does not take a target from a name.
+    A construction that the source does not write has no edge either: the
+    default construction of a member, and the member constructions of an
+    implicit constructor.  If you suspect a missing caller, verify with
+    ``search_bodies("target_name")`` and ``find_indirect_targets``.
 
     For a flat, single-level caller list use ``find_callers`` (faster).
     For the reverse direction use ``find_callees_recursive``.
@@ -1355,14 +1356,15 @@ def find_callees_recursive(
     by shortest distance.
 
     **Edge types traversed:** Includes ``call``, ``indirect`` (function
-    pointers / ISRs), ``implicit_construct`` (constructors reachable through
-    file-scope global objects), and ``dispatch`` (synthetic edges through
-    event loops and thread starts).
+    pointers / ISRs), ``implicit_construct`` (the constructors of the
+    objects at namespace or class scope), and ``dispatch`` (synthetic edges
+    through event loops and thread starts).
 
-    **Limitation — ambiguous name resolution:** When a source-line fallback
-    cannot disambiguate which method is called, the edge is conservatively
-    omitted to avoid false callees.  If you suspect a missing callee,
-    verify with ``search_bodies("target_name")``.
+    **Limitation — calls without a target:** a call that libclang cannot
+    resolve (a dependent call in a template that is never instantiated)
+    has no edge, because fw-context does not take a target from a name.
+    If you suspect a missing callee, verify with
+    ``search_bodies("target_name")``.
 
     For direct callees only, ``get_symbol_context`` gives a faster flat
     list along with the function body and callers. For the reverse
@@ -1462,8 +1464,14 @@ def find_dead_code(
       API can still call it.  Treat it as uncertain, and check each hit
       with ``find_indirect_targets`` before you delete anything.
 
-    fw-context detects a constructor call through global/static object and
-    member-field initialization as an ``implicit_construct`` reference.
+    fw-context records the constructor call of an object at namespace or
+    class scope as an ``implicit_construct`` reference, and the
+    constructor call of a local object, a new-expression or a member
+    initializer as a ``call``.  A construction that the source does not
+    write has no reference: the default construction of a member that a
+    constructor does not name, and the member constructions of an implicit
+    constructor.  A constructor that only such constructions call can show
+    as dead; check its class with ``find_references`` before you delete it.
 
     ISRs: a handler that an assembly vector table names (``.word``) has a
     ``vector`` reference, and one that ``NVIC_SetVector`` installs has a
@@ -1708,7 +1716,7 @@ def find_wrapper_callers(
                   ON caller.config_hash = r.config_hash AND caller.usr = r.from_usr
                 WHERE r.config_hash = ?
                   AND r.to_usr IN ({placeholders})
-                  AND r.ref_kind IN ('call', 'indirect')
+                  AND r.ref_kind IN ('call', 'indirect', 'implicit_construct')
                 ORDER BY caller.qualified_name, r.from_file, r.from_line, r.rowid""",
             (config_hash, *driver_usr_map.keys()),
         ).fetchall()
@@ -1901,7 +1909,7 @@ def trace_data_flow(
                       s.signature, s.usr,
                       (SELECT COUNT(*) FROM refs r
                        WHERE r.to_usr = s.usr AND r.config_hash = s.config_hash
-                         AND r.ref_kind IN ('call', 'indirect')) AS caller_count
+                         AND r.ref_kind IN ('call', 'indirect', 'implicit_construct')) AS caller_count
                FROM symbols s
                WHERE {match}
                ORDER BY caller_count DESC, s.usr

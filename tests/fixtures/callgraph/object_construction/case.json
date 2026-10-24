@@ -1,0 +1,21 @@
+{
+  "description": "Each construction calls one constructor, the one that the compiler selects. An object at namespace scope gives an implicit_construct edge with no caller (a global constructor); a local object, a new-expression and a member initializer give a call edge from the function. An extern declaration and a member declaration construct nothing.",
+  "units": ["main.cpp"],
+  "compiler": "c++",
+  "present": [
+    [null, "Foo::Foo", 7, "implicit_construct"],
+    [null, "Foo::Foo", 8, "implicit_construct"],
+    [null, "Foo::Foo", 9, "implicit_construct"],
+    ["Holder::Holder", "Foo::Foo", 13, "call"],
+    ["local", "Foo::Foo", 21, "call"],
+    ["local", "Foo::Foo", 22, "call"],
+    ["local", "Foo::Foo", 23, "call"],
+    [null, "Foo::Foo", 27, "implicit_construct"]
+  ],
+  "absent": [
+    [null, "Foo::Foo", 6, "implicit_construct"],
+    [null, "Foo::Foo", 12, "implicit_construct"],
+    [null, "Foo::Foo", 17, "implicit_construct"]
+  ],
+  "exact": true
+}

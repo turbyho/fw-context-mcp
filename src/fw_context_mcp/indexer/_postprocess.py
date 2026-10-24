@@ -544,7 +544,7 @@ def _build_hotspot_cache(conn, config_hash: str, *,
                    JOIN symbols s ON s.usr = r.to_usr AND s.config_hash = r.config_hash
                    WHERE r.config_hash = ?
                      AND s.is_definition = 1
-                     AND r.ref_kind IN ('call', 'indirect')
+                     AND r.ref_kind IN ('call', 'indirect', 'implicit_construct')
                    GROUP BY s.usr
                 """,
                 (config_hash,),

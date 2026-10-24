@@ -2341,8 +2341,9 @@ Output: [{"kind": "macro", "name": "CONFIG_BUFFER_SIZE", "file": "…", "line": 
 `ref_kind` values: `"call"` (direct call), `"ref"` (variable read/write),
 `"member"` (member access), `"indirect"` (function pointer reference in
 arguments, assignments, initializers, or init lists),
-`"implicit_construct"` (implicit constructor call from a global or static
-object, or from member-field initialization), `"dispatch"` (a synthetic
+`"implicit_construct"` (the constructor that the compiler selects for an
+object at namespace or class scope; a local object, a new-expression and a
+member initializer give a `"call"`), `"dispatch"` (a synthetic
 edge from a dispatch bridge, such as `EventQueue::call_every`), `"macro_use"` (macro usage
 in file), `"vector"` (a slot of an assembly vector table names the
 symbol; `file` and `line` are the table entry), `"vector_data"` (a slot

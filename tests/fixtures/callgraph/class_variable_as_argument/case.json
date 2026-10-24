@@ -8,6 +8,5 @@
     ["use", "Tag::Tag", 12, "call"],
     [null, "Tag::Tag", 6, "implicit_construct"]
   ],
-  "exact": true,
-  "xfail": "phase 1"
+  "exact": true
 }

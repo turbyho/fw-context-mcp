@@ -724,8 +724,8 @@ END;
 -- points at the referenced definition; from_usr is the enclosing function
 -- that contains the reference (NULL when at file scope — e.g. a global
 -- variable initialization).
--- Why from_usr can be NULL: implicit constructor calls from global/static
--- objects lack an enclosing function.
+-- Why from_usr can be NULL: the constructor calls of objects at namespace
+-- scope lack an enclosing function.
 -- Why no UNIQUE constraint initially: duplicates can occur when the same
 -- TU is indexed twice.  A UNIQUE index is created during data migration
 -- AFTER deduplication.
