@@ -13,7 +13,9 @@ Before you index a project, you need:
 -   Python 3.11+
 -   libclang
 -   Bear (or another way to generate `compile_commands.json`)
--   Optional: Ollama (for semantic search and symbol explanation)
+-   Optional: an LLM service (for semantic search and symbol explanation):
+    a local Ollama, or a cloud service such as OpenRouter, DeepSeek or the
+    ChatGPT plan
 
 See the installation guide for platform-specific instructions.
 
@@ -32,6 +34,15 @@ Register the MCP server with your preferred LLM client:
 ``` bash
 fw-context init
 ```
+
+`fw-context init` also asks which LLM services you use. To change them
+later, run:
+
+``` bash
+fw-context llm setup
+```
+
+For the details, see [LLM setup](installation.md#llm-setup).
 
 ## Index your first project
 

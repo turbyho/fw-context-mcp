@@ -1,6 +1,6 @@
 # Installation
 
-This is the complete installation guide. This guide covers prerequisites, setup, Ollama, and AI assistant integration.
+This is the complete installation guide. This guide covers prerequisites, setup, Ollama, the LLM setup, and AI assistant integration.
 
 ## Prerequisites
 
@@ -49,7 +49,8 @@ uv pip install fw-context-mcp
 ```
 
 This command installs the latest release from PyPI with all dependencies
-(libclang, pysqlite3, sqlite-vec, watchfiles, httpx, mcp, tomli-w).
+(libclang, pysqlite3, sqlite-vec, watchfiles, httpx, mcp, tomli-w, tomlkit,
+keyring, pyjwt, packaging, PyYAML).
 
 The `fw-context` binary lands in your active Python environment's `bin/`
 directory — typically `~/.local/bin` for user installs, or the virtual
@@ -61,7 +62,6 @@ environment's `bin/` if you use one. Ensure that directory is on your
 ```bash
 # Clone
 git clone git@github.com:turbyho/fw-context-mcp.git ~/.fw-context/src
-# or: git clone git@git.montyho.com:turbyho/fw-context-mcp.git ~/.fw-context/src
 
 # Install (creates venv, installs package, symlinks binaries into ~/.local/bin)
 cd ~/.fw-context/src && make install
@@ -88,6 +88,8 @@ Two project-level files exist:
 | `.fw-context/local.toml` | Private overrides (LLM profile, db path, analysis toggles) | Gitignore |
 
 The LLM profiles (server, model, API key variable) are in the global config `~/.fw-context/config.toml`. A project file only selects a profile.
+
+A config file never holds an API key. fw-context gets the key of a profile from the environment variable that `api_key_env` names, then from the keyring of the system, then from `secrets.toml` in `~/.fw-context`. To store a key, run `fw-context llm key set <profile>`. See [API keys](configuration.md#api-keys).
 
 For the full reference, see **[Configuration →](configuration.md)**.
 
@@ -143,7 +145,8 @@ defines = [
 
 Install only the tools that your build system needs. `pip install fw-context-mcp`
 installs the core Python packages automatically: `libclang`, `pysqlite3`,
-`sqlite-vec`, `watchfiles`, `httpx`, `mcp`, and `tomli-w`.
+`sqlite-vec`, `watchfiles`, `httpx`, `mcp`, `tomli-w`, `tomlkit`, `keyring`,
+`pyjwt`, `packaging`, and `PyYAML`.
 
 ### Core (All Projects)
 
@@ -339,12 +342,24 @@ keeps the old tool names. Run `fw-context init` again in each project to
 write the new block. For a global install, run
 `fw-context init --scope global` again.
 
+An older release can leave files and config keys that no release reads
+now. `fw-context index` and `fw-context doctor --fix` remove them. To see
+the list first, run `fw-context cleanup --dry-run`. To remove them now,
+run `fw-context cleanup`. See
+[`fw-context cleanup`](tools.md#fw-context-cleanup).
+
 ## Verify
 
 ```bash
 fw-context --help
 fw-context status
+fw-context doctor                       # audit the dependencies, the index and the config
+fw-context doctor --fix                 # audit, and repair what it can
+fw-context doctor --only clang-resource # run only these checks
 ```
+
+For each check of `fw-context doctor`, see
+[`fw-context doctor`](tools.md#fw-context-doctor).
 
 ## Ollama (optional)
 
@@ -361,11 +376,16 @@ With the default configuration, Ollama does three jobs:
 
 Alternatives:
 
-- **Chat on another server.** Select an LLM profile with
-  `provider = "openai_compatible"` (see
-  [External chat API examples](configuration.md#external-chat-api-examples)).
-  Symbol analysis and query generation then use that API. The embeddings
-  still use Ollama.
+- **Chat through an API.** Select an LLM profile of the provider
+  `openrouter`, `deepseek`, `openai_compatible` or `chatgpt` (the ChatGPT
+  plan). Symbol analysis and query generation then use that service, and
+  the source code goes to its host. See
+  [External chat API examples](configuration.md#external-chat-api-examples)
+  and [ChatGPT plan](configuration.md#chatgpt-plan).
+- **Embeddings through an API.** Set `[llm] embed_profile` to a profile of
+  the provider `openrouter` or `openai_compatible`, and `[llm] embed_model`
+  to a model of that API. See
+  [Embeddings through an API](configuration.md#embeddings-through-an-api).
 - **Embeddings without Ollama.** Install the `st` extra
   (`pip install "fw-context-mcp[st]"`) and set `embed_model` to a
   sentence-transformers model, for example `"BAAI/bge-small-en-v1.5"`.
@@ -404,47 +424,45 @@ you run `fw-context index` (embeddings, symbol analysis), and when you call
 ollama serve &   # start daemon if not running as a service
 ```
 
+fw-context needs Ollama 0.30.1 or later. An older server cannot give the
+count of the tokens of a prompt to the LLM analysis, and it can cut a long
+prompt or a long embedding input without an error. `fw-context doctor`
+reports an older server (the checks `ollama` and `chat-model`).
+
 ### Pull models
 
+The LLM step of `fw-context init` and `fw-context llm setup` recommend a
+chat model and an embedding model for this machine, and offer to pull a
+local model. `auto_pull` of an LLM profile is `false` by default, thus
+fw-context pulls no model at an index run. To pull a model yourself:
+
 ```bash
-# LLM — required for smart_search + explain_symbol (min. 14B parameters)
-ollama pull qwen2.5-coder:14b        # recommended (~12 GB VRAM)
-
-# Cloud alternative — no GPU needed (requires ollama signin)
-ollama pull deepseek-v4-flash:cloud  # 284B MoE, 13B active, great value
-ollama pull qwen3-coder:480b-cloud   # coding-focused, top quality
-
-# Embedding model — required for vector search. With an empty embed_model
-# (default), fw-context selects qwen3-embedding:8b on a machine with a GPU,
-# and qwen3-embedding:0.6b without one. auto_pull of an LLM profile is false
-# by default, so pull the model yourself:
-ollama pull qwen3-embedding:0.6b     # or qwen3-embedding:8b with a GPU (4b: the same quality, less VRAM)
-
-# Verify
-ollama run qwen2.5-coder:14b "Explain: void uart_init(int baudrate)"
+ollama pull <model>
 ```
+
+With an empty `embed_model` (default), fw-context selects
+`qwen3-embedding:8b` on a machine with a GPU, and `qwen3-embedding:0.6b`
+without one. `qwen3-embedding:4b` has the same quality as 8b, and uses
+less VRAM.
 
 ### Model recommendations
 
-**With GPU:**
+The global config holds the list of the models of Ollama that fw-context
+knows, with the measured quality and the size of each model:
+`[llm.models]` for the LLM analysis and `[llm.embed_models]` for the
+embeddings. `fw-context init` and `fw-context doctor --fix` copy the list
+of the installed release into the global config. To get the
+recommendation for this machine, run:
 
-| VRAM | Model | Tag | Notes |
-|------|-------|-----|-------|
-| 12 GB | **Qwen2.5-Coder 14B** | `qwen2.5-coder:14b` | Minimum recommended. Produces robust JSON, with good code comprehension |
-| 16 GB | Qwen2.5-Coder 14B Q8 | `qwen2.5-coder:14b-q8_0` | Higher precision, slightly better quality |
-| 24 GB+ | Qwen2.5-Coder 32B | `qwen2.5-coder:32b` | Best local quality for embedded C++ |
+```bash
+fw-context llm recommend           # measure the installed models, then recommend
+fw-context llm recommend --again   # measure each installed model again
+```
 
-> **Do you have less than 12 GB of VRAM?** Use the cloud models below. A smaller
-> local model produces inconsistent JSON, and writes poor descriptions for
-> embedded C++ code.
-
-**Without GPU (cloud models, requires `ollama signin`):**
-
-| Model | Tag | Notes |
-|-------|-----|-------|
-| **DeepSeek V4 Flash** | `deepseek-v4-flash:cloud` | 284B MoE (13B active), great value |
-| **Qwen3-Coder 480B** | `qwen3-coder:480b-cloud` | Coding-focused, best analysis quality |
-| Gemini 3 Flash | `gemini-3-flash-preview:cloud` | Fast, affordable |
+On a machine without a GPU, or with little memory, a cloud model or an API
+is the only practical way. See
+[`[llm.models]` and `[llm.embed_models]`](configuration.md#llmmodels-and-llmembed_models--the-list-of-the-models-of-ollama)
+and [The recommendation of a model](configuration.md#the-recommendation-of-a-model).
 
 ### Configure
 
@@ -466,12 +484,55 @@ num_ctx  = 16384
 ```
 
 > **Remote Ollama:** Add a profile with `url = "http://192.168.1.50:11434"`
-> when Ollama runs on another machine, and select it with `[llm] profile`.
-> **Per-project model:** Add a profile with a different `model`, for example
-> a 32B model for a large codebase. Then select it in
-> `<project>/.fw-context/local.toml`: `[llm] profile = "<name>"`.
+> when Ollama runs on another machine. To make it the Ollama profile of this
+> machine, run `fw-context llm default <name> --ollama`.
+> **One Ollama profile for each machine:** Each project that uses Ollama
+> uses the Ollama profile of this machine. A project cannot select another
+> Ollama profile. A project can select an external profile (an API, the
+> ChatGPT plan, a cloud model of Ollama) in
+> `<project>/.fw-context/local.toml`: `[llm] profile = "<name>"`. For one
+> run with another model, use `--llm <name>`. See
+> [One Ollama profile for each machine](configuration.md#one-ollama-profile-for-each-machine).
 > A profile in a project file is an error. For each key, see
 > [Configuration](configuration.md#llm--llm-and-embeddings).
+
+## LLM setup
+
+The LLM step of `fw-context init` sets up the LLM services: a local
+Ollama, an Ollama on another computer, Ollama Cloud, the ChatGPT plan,
+OpenRouter, DeepSeek, or another OpenAI-compatible API. To change the
+setup later, run `fw-context llm setup`. It has the same steps, and one
+more step that removes the profiles that you do not use. See
+[How config works](configuration.md#how-config-works).
+
+```bash
+fw-context llm setup                       # set up the LLM services (needs a terminal)
+fw-context llm list                        # each profile, and where it sends the source code
+fw-context llm test <profile>              # send a request without code through a profile
+fw-context llm default <profile>           # the profile of this project (local.toml)
+fw-context llm default <profile> --global  # the profile of each project that selects none
+fw-context llm default <profile> --ollama  # the Ollama profile of this machine
+fw-context llm key set <profile>           # store the API key of a profile
+fw-context llm login <profile>             # sign a chatgpt profile in with ChatGPT
+fw-context llm recommend                   # recommend a local chat and embedding model
+fw-context llm remove <profile>            # remove a profile, its own key and its sign-in
+```
+
+- `[llm] ollama_profile` of the global config names the Ollama profile of
+  this machine. `fw-context llm default <profile> --ollama` writes it. See
+  [One Ollama profile for each machine](configuration.md#one-ollama-profile-for-each-machine).
+- A profile of the provider `chatgpt` uses the ChatGPT plan of the user.
+  To sign it in, run `fw-context llm login <profile>`. See
+  [ChatGPT plan](configuration.md#chatgpt-plan).
+- `--llm <profile>` of `fw-context index` and `fw-context analyze` selects
+  the profile of the LLM analysis for one run. `--force-llm` makes the LLM
+  analysis of each symbol again. See
+  [The LLM profile of one run](tools.md#the-llm-profile-of-one-run).
+
+For each command, see
+[`fw-context llm`](tools.md#fw-context-llm-setup-list-test-default-remove-recommend),
+[`fw-context llm key`](tools.md#fw-context-llm-key) and
+[`fw-context llm login`](tools.md#fw-context-llm-login-logout-models).
 
 ## AI assistant setup
 
@@ -492,35 +553,45 @@ fw-context quickstart              # alias for `init --quick`
 **Provisioning:** `fw-context init` now does more than AI-tool setup. It
 runs these steps, in order:
 
-1. Audit the dependencies, and auto-fix what it can (missing pip packages).
-   Model pulls (`ollama pull`) never run here. `--skip-doctor` skips this
-   step. This step comes first, because the next steps write config files.
+1. Audit the dependencies, and auto-fix what it can. This step runs each
+   fix of `fw-context doctor --fix` (for example the missing pip packages,
+   the clang headers and the obsolete files) except two: the model pulls
+   (`ollama pull`), and the fix of `config`, which removes values from the
+   config files. `--skip-doctor` skips this step. This step comes first,
+   because the next steps write config files.
 2. Convert the old `[llm]` backend keys (`ollama_url`, `model`,
    `chat_api_base` and the other keys) to LLM profiles of the global
    config (see
    [Configuration](configuration.md#the-old-llm-backend-keys)).
-3. Detect the build system and its parameters (for example the board).
-4. Generate the project ID when the config has none, and register the
+3. Copy the list of the models of Ollama of this release into the global
+   config (`[llm.models]` and `[llm.embed_models]`, see
+   [Model recommendations](#model-recommendations)). An entry that you
+   changed stays.
+4. Detect the build system and its parameters (for example the board).
+5. Generate the project ID when the config has none, and register the
    project in the global project registry.
-5. Detect the build environment of this machine (`python`, `activate`,
+6. Detect the build environment of this machine (`python`, `activate`,
    `idf_path`), and write it to `local.toml`.
-6. Create a missing config file from its template, and add the missing
+7. Create a missing config file from its template, and add the missing
    keys to an existing one: the global config, `.fw-context/config.toml`
    and `.fw-context/local.toml`.
-7. Generate `compile_commands.json` when the project is buildable.
+8. Generate `compile_commands.json` when the project is buildable.
    `--skip-build` skips this step, and so does a project of several variants.
-8. Register the AI tools (skipped by `--quick`).
-9. Update `.gitignore`, and install the skills and the agents (the two
-   skipped by `--quick`).
-10. Configure the LLM backend (the LLM step, see
-    [Configuration](configuration.md#how-config-works)). Options 1 and 2
-    write an LLM profile to the global config, and select it in
-    `local.toml`.
+9. Register the AI tools (skipped by `--quick`).
+10. Update `.gitignore`, and install the skills and the agents (the two
+    skipped by `--quick`).
+11. Set up the LLM services (the LLM step). The step has two parts: the
+    services that you use, then the service of the LLM analysis and the
+    service of the embeddings, in two different lists. In a project, each
+    choice asks for its scope: this project only (`local.toml`), or each
+    project (the global config). `fw-context llm setup` runs the same step
+    later. See [LLM setup](#llm-setup) and
+    [Configuration](configuration.md#how-config-works).
     In a pipe, or with `--non-interactive`, this step writes nothing.
-11. Save the detected embedding model one time to the global config. This
+12. Save the detected embedding model one time to the global config. This
     step writes nothing when a config file sets `[llm] embed_model`, or
     when the LLM is off.
-12. Print a checklist of the remaining manual steps.
+13. Print a checklist of the remaining manual steps.
 
 When build-system detection fails, `fw-context init` asks for the missing
 value interactively (build system, board, FQBN, and so on). In a pipe, or
@@ -528,12 +599,18 @@ with `--non-interactive`, the missing value goes to the checklist instead.
 
 **What `fw-context init` does:**
 
-By default, with `--scope project`, `fw-context init` configures only the current project:
+By default, with `--scope project`, `fw-context init` writes the instructions
+only into the current project. It detects each AI tool on the system: a
+binary on `PATH`, or a global config directory. `fw-context init --list-tools`
+shows the result.
 
-| Tool | Detection | Action |
+| Tool (`--tool`) | Detection | Instructions in the project |
 |------|-----------|--------|
-| **Claude Code** | `.claude/` dir in project | Adds `<!-- fw-context -->` to `CLAUDE.md`. Installs the `code-explorer` and `general-purpose` agents. Installs the `fw-review` skill. |
-| **OpenCode** | `.opencode/` dir in project | Writes the rules file. Installs the skill. |
+| **Claude Code** (`claude-code`) | `claude` on `PATH`, or `~/.claude` | Adds `<!-- fw-context -->` to `CLAUDE.md`. Installs the `code-explorer` and `general-purpose` agents. Installs the `fw-review` skill. |
+| **OpenCode** (`opencode`) | `~/.config/opencode` | Adds a marked section to `AGENTS.md`. Installs the skill. |
+| **Kilo Code** (`kilocode`) | `~/.kilocode` | Reads the instructions of OpenCode (`AGENTS.md`). |
+| **Codex** (`codex`) | `~/.codex` | Writes `.codex/rules/fw-context.md`. |
+| **Cursor** (`cursor`) | `~/.cursor` or `~/.config/Cursor` | Writes `.cursor/rules/fw-context.mdc`. |
 
 **Project agents:** `fw-context init` creates two subagent definitions in `.claude/agents/`:
 - `code-explorer`: this subagent includes a `CRITICAL — C/C++ source access` block. This block enforces fw-context for all C/C++ code reading
@@ -550,20 +627,14 @@ custom domain knowledge.
 **Project skill:** `fw-context init` installs the `fw-review` skill in
 the project's `.claude/skills/` directory, alongside the global copy.
 
-**If `fw-context init` detects no AI tool in the project** (no `.claude/` or
-`.opencode/` directory, for example), `fw-context init` prints instructions.
-`fw-context init` does not fall back to a global install:
+**If `fw-context init` detects no AI tool on the system**, and you give no
+`--tool`, it configures Claude Code:
 
 ```
-No AI assistant detected in this project.
-
-Run an AI assistant (Claude Code, OpenCode, etc.) in this project
-directory first — it will create its config directory. Then re-run
-'fw-context init'.
-
-Alternatively, use --scope global to install fw-context for all
-projects, or --tool to target a specific assistant.
+No AI assistants detected — falling back to Claude Code configuration.
 ```
+
+To configure a different tool, give `--tool <id>`.
 
 **Global install**, with `--scope global` or `--scope all`, is also available.
 Global install injects instructions into `~/.claude/CLAUDE.md` and similar

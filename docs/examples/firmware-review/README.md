@@ -114,13 +114,10 @@ effective savings**.
    direct callers, then go transitive for cross-module impact analysis.
 
 5. **`search_bodies` for implementations, `search_content` for file scope** —
-   macros, `#ifdef`, `extern "C"`, and type declarations only exist in
-   `search_content`.
+   `search_bodies` searches the body of each definition: a function, and
+   also a class, struct, union, enum or namespace. Macros, `#ifdef`,
+   `extern "C"`, and file-scope comments are in no definition: they only
+   exist in `search_content`.
 
 6. **fw-context is for C/C++ only** — JSON, YAML, Python, and git operations
    still use standard tools. Do not force fw-context on other languages.
-
----
-
-*You can find the raw source files for this case study in
-[`docs/examples/raw/`](../raw/).*
