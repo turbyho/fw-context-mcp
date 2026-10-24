@@ -1569,7 +1569,7 @@ def _process_ref_cursor(
     if not loc.file:
         return
 
-    _handle_direct_refs(cursor, cur_fn, refs, seen_ref, tu_path_str, resolve_fn)
+    _handle_direct_refs(cursor, cur_fn, refs, seen_ref)
     _handle_indirect_invocations(cursor, cur_fn, refs, indirect_call_sites,
                                  fp_assignments, pending_dispatches, seen_ref, tu_path_str, resolve_fn,
                                  qn_to_usr, _log)
@@ -1591,21 +1591,20 @@ def _add_ref(refs: list[Reference], seen_ref: set[tuple], to_usr: str,
     return False
 
 
-def _callee_has_file(referenced: cx.Cursor | None) -> bool:
-    """Check a referenced cursor has a valid file location."""
-    if referenced is None:
-        return False
-    try:
-        rl = referenced.location
-        return rl is not None and rl.file is not None
-    except (ValueError, TypeError, RuntimeError, AttributeError):
-        return False
-
-
 def _handle_direct_refs(cursor: cx.Cursor, cur_fn: str | None, refs: list[Reference],
-                       seen_ref: set[tuple], tu_path_str: str,
-                       resolve_fn: Callable[..., object]) -> None:
-    """Direct call/ref/member references + field-access fallback + constructor fallback."""
+                       seen_ref: set[tuple]) -> None:
+    """Direct call/ref/member references from ``cursor.referenced``, and run-time vectors.
+
+    WHY no fallback for a CALL_EXPR without a target: two fallbacks once
+    wrote a call edge for it.  The field-call fallback took the method of a
+    MEMBER_REF_EXPR child; measured on 100 units, it wrote no edge, because
+    a call with a resolved member has a resolved target too.  The
+    constructor fallback wrote an edge to every constructor of the type of
+    each variable that the call passes, typically a dependent call in a
+    template body.  An unresolved call names no constructor, thus those
+    edges were guesses (seen in libstdc++: ``std::push_heap`` to the
+    constructor of its comparator).
+    """
     loc = cursor.location
     ref_kind = _REF_KINDS.get(cursor.kind)
     if ref_kind is not None:
@@ -1617,8 +1616,6 @@ def _handle_direct_refs(cursor: cx.Cursor, cur_fn: str | None, refs: list[Refere
                 _add_ref(refs, seen_ref, to_usr, loc.file.name, loc.line, cur_fn, ref_kind)
 
         if cursor.kind == cx.CursorKind.CALL_EXPR:
-            _handle_field_call_fallback(cursor, cur_fn, refs, seen_ref, tu_path_str)
-            _handle_constructor_fallback(cursor, cur_fn, refs, seen_ref, tu_path_str, resolve_fn)
             _handle_runtime_vector(cursor, referenced, cur_fn, refs, seen_ref)
 
 
@@ -1644,85 +1641,6 @@ def _handle_runtime_vector(cursor: cx.Cursor, referenced: cx.Cursor | None,
         return
     seen_ref.add(key)
     refs.append(found)
-
-
-def _handle_field_call_fallback(cursor: cx.Cursor, cur_fn: str | None,
-                                refs: list[Reference], seen_ref: set[tuple],
-                                tu_path_str: str) -> None:
-    """Field-access call fallback: obj.method() where method is not directly resolved."""
-    loc = cursor.location
-    if _callee_has_file(cursor.referenced):
-        return
-    for child in cursor.get_children():
-        if child.kind == cx.CursorKind.MEMBER_REF_EXPR:
-            child_ref = child.referenced
-            if child_ref is not None and child_ref.kind in _CALLABLE_KINDS:
-                child_usr = child_ref.get_usr()
-                child_loc = child_ref.location
-                if child_usr and child_loc.file:
-                    _add_ref(refs, seen_ref, child_usr, loc.file.name, loc.line, cur_fn, "call")
-                    return
-
-
-def _collect_ctor_refs_from_type(
-    child_type: cx.Type, loc_file: str, loc_line: int, cur_fn: str | None,
-    refs: list[Reference], seen_ref: set[tuple],
-) -> None:
-    """Emit a ``call`` reference for every constructor of a RECORD type.
-
-    Called from ``_handle_constructor_fallback`` when a variable or field
-    declaration has a class type whose constructor call was not resolved
-    by libclang (common with implicit/default constructors).
-
-    Iterates all child constructors of the class — the specific overload
-    is not distinguished; each constructor gets a call reference at the
-    declaration site.
-    """
-    if child_type.kind != cx.TypeKind.RECORD:
-        return
-    try:
-        class_cursor = child_type.get_declaration()
-    except (ValueError, TypeError, RuntimeError, AttributeError):
-        _log.debug("get_declaration failed for record type")
-        return
-    if class_cursor is None:
-        return
-    for ctor in class_cursor.get_children():
-        if ctor.kind != cx.CursorKind.CONSTRUCTOR:
-            continue
-        ctor_usr = ctor.get_usr()
-        if not ctor_usr:
-            continue
-        ctor_loc = ctor.location
-        if not ctor_loc.file:
-            continue
-        _add_ref(refs, seen_ref, ctor_usr, loc_file, loc_line, cur_fn, "call")
-
-
-def _handle_constructor_fallback(cursor: cx.Cursor, cur_fn: str | None,
-                                 refs: list[Reference], seen_ref: set[tuple],
-                                 tu_path_str: str,
-                                 resolve_fn: Callable[..., object]) -> None:
-    """Constructor call fallback: detecting implicit constructor invocations."""
-    loc = cursor.location
-    if _callee_has_file(cursor.referenced):
-        return
-    for child in cursor.get_children():
-        if child.kind != cx.CursorKind.DECL_REF_EXPR:
-            continue
-        child_ref = child.referenced
-        if child_ref is None:
-            continue
-        if child_ref.kind not in (cx.CursorKind.FIELD_DECL, cx.CursorKind.VAR_DECL):
-            continue
-        try:
-            child_type = child_ref.type.get_canonical()
-        except (ValueError, TypeError, RuntimeError, AttributeError):
-            _log.debug("get_canonical failed for %s", child_ref.spelling)
-            continue
-        _collect_ctor_refs_from_type(
-            child_type, loc.file.name, loc.line, cur_fn, refs, seen_ref,
-        )
 
 
 def _handle_indirect_invocations(cursor: cx.Cursor, cur_fn: str | None,

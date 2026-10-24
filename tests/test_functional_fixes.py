@@ -576,6 +576,42 @@ class TestCallbackTargetIndirectRef:
         assert attach_refs, "The attach(&WDT::_timeout_interrupt) call must be detected"
 
 
+@pytest.mark.libclang
+class TestCallWithoutTargetGivesNoGuess:
+    """A CALL_EXPR without a target gets no call edge from a fallback."""
+
+    def test_an_unresolved_call_gives_no_constructor_edge(self, tmpdir):
+        """A dependent call to an overload set passes a variable of class type.
+
+        The call has no target, because the template is never instantiated.
+        The constructor fallback wrote a call edge to every constructor of
+        the type of the passed variable.  An unresolved call names no
+        constructor, thus each of those edges was a guess.
+        """
+        from fw_context_mcp.indexer.compile_commands import CompilationUnit
+        from fw_context_mcp.indexer.symbols import extract_all
+
+        src = tmpdir / "pass.cpp"
+        src.write_text(
+            "struct Tag { Tag() {} explicit Tag(int v) { (void)v; } };\n"
+            "Tag tag;\n"
+            "template <class T> void take(T value, const Tag& marker);\n"
+            "template <class T> void take(T value, int count);\n"
+            "template <class T> void use(T value) {\n"
+            "    take(value, tag);\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        unit = CompilationUnit(file=src, clang_args=["-std=c++17"], directory=tmpdir, language="cpp")
+        result = extract_all(unit, with_refs=True)
+
+        ctor_usrs = {s.usr for s in result.symbols if s.kind == "constructor"}
+        assert ctor_usrs, "the constructors of Tag must be extracted"
+        from_use = [r for r in result.references
+                    if r.from_line == 6 and r.to_usr in ctor_usrs and r.ref_kind == "call"]
+        assert from_use == [], f"an unresolved call names no constructor, got {from_use}"
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # F8 — dispatch bridge detection + deferred resolution
 # ═══════════════════════════════════════════════════════════════════════════

@@ -1,5 +1,5 @@
 {
-  "description": "A dependent call to an overload set in a template that is never instantiated has no target. Passing a variable of class type (tag) constructs nothing: the constructor fallback wrote an edge to every constructor of Tag (seen in libstdc++: std::push_heap, std::weak_ptr::lock), and the token heuristic wrote use -> take by name. The extern declaration of tag constructs nothing either.",
+  "description": "A dependent call to an overload set in a template that is never instantiated has no target, thus it names no constructor. The constructor fallback wrote an edge to every constructor of the type of the passed variable tag (seen in libstdc++: std::push_heap, std::weak_ptr::lock), and the token heuristic wrote use -> take by name. The extern declaration of tag constructs nothing either.",
   "units": ["main.cpp"],
   "compiler": "c++",
   "present": [],
