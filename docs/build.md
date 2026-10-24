@@ -716,9 +716,10 @@ clean = false
 ```
 
 `idf_path` sets only the `IDF_PATH` variable of the build. It does not
-make `idf.py` available: `idf.py` and `ninja` must be on the `PATH` of the
-fw-context process (see [General](#general)). Set `idf_path` when
-`$IDF_PATH` does not name your ESP-IDF installation.
+make `idf.py` available: `idf.py` and `ninja` must be on the `PATH` after
+`source <activate>`, or on the `PATH` of the build without `activate` (see
+[General](#general)). Set `idf_path` when `$IDF_PATH` does not name your
+ESP-IDF installation.
 
 fw-context reads the linker scripts from the link of the application in
 `build.ninja`. `project_description.json` names the ELF of the
