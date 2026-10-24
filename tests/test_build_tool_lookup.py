@@ -16,7 +16,10 @@ from pathlib import Path
 import pytest
 
 from fw_context_mcp.indexer.build import BuildConfig
-from fw_context_mcp.utils import build_tool_available, missing_tool_message
+from fw_context_mcp.utils import build_tool_available, missing_tool_message, run_build_command
+
+# A name that no system has, so that a west of the system cannot answer.
+TOOL = "fwctx-test-west"
 
 
 def _tool_dir(tmp_path: Path, name: str) -> Path:
@@ -37,47 +40,67 @@ def _activate(tmp_path: Path, body: str) -> Path:
 
 @pytest.fixture
 def path_without_west(monkeypatch) -> None:
-    """A PATH with the system tools and without west."""
+    """A PATH with the system tools and without the test tool."""
     monkeypatch.setenv("PATH", os.pathsep.join(["/usr/bin", "/bin"]))
+
+
+def test_a_relative_activate_is_the_script_of_the_project(tmp_path: Path, monkeypatch) -> None:
+    """`source env.sh` looks in PATH first: the env.sh of the project must win.
+
+    A relative activate is relative to the directory of the build.  Bash
+    reads a name without a slash from PATH before the current directory,
+    thus a different env.sh on PATH set up a different environment.
+    """
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    (other / "env.sh").write_text("export FWCTX_SOURCE=path\n", encoding="utf-8")
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "env.sh").write_text("export FWCTX_SOURCE=project\n", encoding="utf-8")
+    monkeypatch.setenv("PATH", os.pathsep.join([str(other), "/usr/bin", "/bin"]))
+
+    result = run_build_command(["printenv", "FWCTX_SOURCE"], cwd=project, build_cfg=BuildConfig(activate="env.sh"))
+
+    assert result.stdout.strip() == "project"
 
 
 @pytest.mark.usefixtures("path_without_west")
 def test_a_tool_that_only_the_activate_script_gives_is_found(tmp_path: Path) -> None:
-    tools = _tool_dir(tmp_path, "west")
+    tools = _tool_dir(tmp_path, TOOL)
     script = _activate(tmp_path, f'export PATH="{tools}:$PATH"\n')
 
-    assert build_tool_available("west", tmp_path, BuildConfig(activate=str(script)))
+    assert build_tool_available(TOOL, tmp_path, BuildConfig(activate=str(script)))
 
 
 @pytest.mark.usefixtures("path_without_west")
 def test_without_activate_the_tool_of_that_script_is_not_found(tmp_path: Path) -> None:
-    _tool_dir(tmp_path, "west")
+    _tool_dir(tmp_path, TOOL)
 
-    assert not build_tool_available("west", tmp_path, BuildConfig())
+    assert not build_tool_available(TOOL, tmp_path, BuildConfig())
 
 
 @pytest.mark.usefixtures("path_without_west")
 def test_extra_path_of_the_build_counts_without_activate(tmp_path: Path) -> None:
-    tools = _tool_dir(tmp_path, "west")
+    tools = _tool_dir(tmp_path, TOOL)
 
-    assert build_tool_available("west", tmp_path, BuildConfig(extra_path=[str(tools)]))
+    assert build_tool_available(TOOL, tmp_path, BuildConfig(extra_path=[str(tools)]))
 
 
 @pytest.mark.usefixtures("path_without_west")
 def test_a_failed_activate_script_finds_no_tool(tmp_path: Path) -> None:
-    tools = _tool_dir(tmp_path, "west")
+    tools = _tool_dir(tmp_path, TOOL)
     script = _activate(tmp_path, f'export PATH="{tools}:$PATH"\nreturn 1\n')
 
-    assert not build_tool_available("west", tmp_path, BuildConfig(activate=str(script)))
+    assert not build_tool_available(TOOL, tmp_path, BuildConfig(activate=str(script)))
 
 
 def test_the_tool_on_the_path_of_the_process_does_not_count_with_activate(tmp_path: Path, monkeypatch) -> None:
     """A west outside the environment of the project must not answer for it."""
-    host = _tool_dir(tmp_path, "west")
+    host = _tool_dir(tmp_path, TOOL)
     monkeypatch.setenv("PATH", os.pathsep.join([str(host), "/usr/bin", "/bin"]))
     script = _activate(tmp_path, 'export PATH="/usr/bin:/bin"\n')
 
-    assert not build_tool_available("west", tmp_path, BuildConfig(activate=str(script)))
+    assert not build_tool_available(TOOL, tmp_path, BuildConfig(activate=str(script)))
 
 
 @pytest.mark.usefixtures("path_without_west")

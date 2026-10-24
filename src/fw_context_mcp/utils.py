@@ -649,7 +649,13 @@ def run_build_command(
 
     if build_cfg:
         if build_cfg.activate:
-            expanded = str(Path(build_cfg.activate).expanduser())
+            script = Path(build_cfg.activate).expanduser()
+            # A relative path is relative to the directory of the build.
+            # `source env.sh`, a name without a slash, looks in PATH before
+            # the current directory, thus a different env.sh on PATH won.
+            if not script.is_absolute():
+                script = Path(cwd) / script
+            expanded = str(script)
             cmd_str = " ".join(shlex.quote(c) for c in cmd)
             cmd = ["bash", "-c", f"source {shlex.quote(expanded)} && {cmd_str}"]
 
