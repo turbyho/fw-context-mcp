@@ -69,6 +69,11 @@ _DROP_FLAGS = frozenset({
     "-fno-tree-switch-conversion",
     # ESP-IDF with GCC 13: every one of 833 units gave "unknown argument".
     "-fno-shrink-wrap",
+    # Zephyr/NCS (mbedtls units): libclang gives the error "optimization
+    # flag '-fno-defer-pop' is not supported" in 33 units of each image.
+    # Measured 2026-10-24: the parse goes on, but the error counts against
+    # the health of the index and hides a real error among the others.
+    "-fno-defer-pop",
 })
 
 # GCC-only warning flags that take a level suffix (=1, =2) — drop any token

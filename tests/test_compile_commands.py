@@ -147,6 +147,10 @@ class TestNormalizeArgs:
         """ESP-IDF with GCC 13: clang rejected it in every unit."""
         assert "-fno-shrink-wrap" not in normalize_args(["-fno-shrink-wrap", "-O2"], Path.cwd())
 
+    def test_drops_the_gcc_defer_pop_flag(self):
+        """Zephyr/NCS mbedtls units: libclang gave an error for it in 33 units of each image."""
+        assert "-fno-defer-pop" not in normalize_args(["-fno-defer-pop", "-O2"], Path.cwd())
+
     def test_a_flag_that_changes_meaning_is_kept(self):
         """The strip list must stay narrow — these decide what compiles."""
         result = normalize_args(
