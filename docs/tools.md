@@ -4,6 +4,12 @@ This is the complete reference for all fw-context CLI commands and MCP server to
 
 ## CLI commands
 
+Each command that operates on one project takes `--project DIR`, the
+project root. The default is the current directory. These commands take no
+`--project`: `fw-context list`, `fw-context version`, `fw-context llm key`,
+`fw-context llm login`, `fw-context llm logout`, `fw-context llm models`,
+and `fw-context llm remove`.
+
 ### `fw-context index`
 
 Build or update the symbol index from `compile_commands.json`.
@@ -408,6 +414,8 @@ fw-context db delete --all              # delete the entire index
 fw-context db delete --all -y           # delete all without confirmation
 ```
 
+`-y` is the short form of `--yes`.
+
 You cannot delete a row that the queries of its build read (`queried` in
 `fw-context db list`) without `--force`. The queries of that build then
 read an older row of the build, or no row. You cannot delete an
@@ -611,6 +619,8 @@ fw-context export --no-refs           # symbols only
 fw-context export --variant nrf52840-dev --image app -o app.json
 ```
 
+`-o` is the short form of `--output`.
+
 The format is `fw-context-export/1`. This format is suitable for sharing
 between machines, for debugging, or as input to other tools.
 
@@ -644,7 +654,13 @@ fw-context analyze --project /path        # specific project
 fw-context analyze --variant nrf52840-dev --image app   # one build
 fw-context analyze --force-llm            # make each analysis again (takes hours on a large project)
 fw-context analyze --force-llm --llm deepseek   # with another LLM profile, without a question
+fw-context analyze --analyze-vendor       # also analyze the vendor and SDK code
+fw-context analyze --no-analyze-vendor    # skip the vendor and SDK code
 ```
+
+`--analyze-vendor` also analyzes the vendor and SDK code, as
+`[llm] analyze_vendor = true` does. `--no-analyze-vendor` skips that code,
+and wins over `--analyze-vendor` and the config.
 
 The command holds the index lock of the project, as `fw-context index`
 does. When an index run (also a background run) holds the index, the
@@ -733,7 +749,7 @@ fw-context cache stats --remote           # Tier 2 only (remote server)
 Output:
 ```
 $ fw-context cache stats --remote
-Remote cache (Tier 2): https://fw-cache.montyho.com
+Remote cache (Tier 2): https://fw-cache.example.com
   Total entries: 14486
   Newest entry:  2026-07-06 11:32:23
   Models:
@@ -742,7 +758,7 @@ Remote cache (Tier 2): https://fw-cache.montyho.com
 
 $ fw-context cache stats
 Local cache (Tier 1): 3160 entries  (/home/user/.fw-context/llm_cache.db)
-Remote cache (Tier 2): https://fw-cache.montyho.com
+Remote cache (Tier 2): https://fw-cache.example.com
   Total entries: 14486
   ...
   Project cache: 3138/3138 cached (452361ffbf84f774)
@@ -763,6 +779,8 @@ fw-context cache clear --remote           # project's entries from server (Tier 
 fw-context cache clear --all              # both tiers
 fw-context cache clear --remote -y        # skip confirmation prompt
 ```
+
+`-y` is the short form of `--yes`.
 
 The `--remote` flag reads all the content hashes from the project's
 `llm_analysis_cache` table, and sends the hashes to the server's
@@ -834,14 +852,14 @@ Typical output:
 ```
 No remote cache configured.
 
-Cache server URL [https://fw-cache.example.com]: https://fw-cache.montyho.com
+Cache server URL [https://fw-cache.example.com]: https://fw-cache.example.com
 
 Token (paste your read or read+write token): <token>
 
-Verifying connection to https://fw-cache.montyho.com ...
+Verifying connection to https://fw-cache.example.com ...
   Connected. Server has 14486 cached entries.
 
-Remote cache configured: https://fw-cache.montyho.com
+Remote cache configured: https://fw-cache.example.com
 Config written to: /path/to/project/.fw-context/local.toml
 Run 'fw-context cache stats --remote' to verify.
 ```
@@ -907,6 +925,11 @@ without `config` does not repair the config files.
   [`[llm.models]`](configuration.md#llmmodels-and-llmembed_models--the-list-of-the-models-of-ollama)).
   Not critical. `--fix` adds, updates and removes the entries of
   fw-context, and keeps each entry that you changed or added.
+- `llm-profile` — the project uses the Ollama profile of this machine and
+  the global embedding model (see
+  [One Ollama profile for each machine](configuration.md#one-ollama-profile-for-each-machine)).
+  Not critical. `--fix` makes `.fw-context/local.toml` select the Ollama
+  profile of this machine; the other findings are only reported.
 - `gpu-tools` — on Linux, `nvidia-smi` gives the GPU memory on a machine
   with an NVIDIA GPU. Without it, the recommendation of a model counts no
   GPU. `degraded` with the package to install when `nvidia-smi` is not
@@ -916,18 +939,20 @@ without `config` does not repair the config files.
   install needs root. `skipped` without an NVIDIA GPU, when no model of
   the config runs on the Ollama of this machine, and on Windows and macOS.
 - `ollama` — the Ollama server answers. `skipped` when the LLM is off.
+  `degraded` when the version of the server is older than 0.30.1: the LLM
+  analysis then cannot count the tokens of a prompt, and the server can
+  cut a long input without an error.
 - `chat-model` — the chat model is installed on the Ollama server of the
-  chat calls. For an API profile and the ChatGPT plan: the model list of
+  chat calls. When that server is not the server of the check `ollama`,
+  the check is `degraded` for a version older than 0.30.1. For an API
+  profile and the ChatGPT plan: the model list of
   the provider holds the model, and the context of the model is known
   (see [The context of an API model](configuration.md#the-context-of-an-api-model)).
   `error` when not, with `fw-context llm setup`; `degraded` when the key
   `context` of the profile differs from the list.
 - `embed-model` — the embedding model is installed on the Ollama server.
-- `llm-profile` — the project uses the Ollama profile of this machine and
-  the global embedding model (see
-  [One Ollama profile for each machine](configuration.md#one-ollama-profile-for-each-machine)).
-  Not critical. `--fix` makes `.fw-context/local.toml` select the Ollama
-  profile of this machine; the other findings are only reported.
+  `skipped` for an API profile of the embeddings: that API runs the
+  model, and the check sends no request to it.
 - `llm-recommend` — no local model of the list is better than the chat
   model and the embedding model of the config (see
   [The recommendation of a model](configuration.md#the-recommendation-of-a-model)).
@@ -1345,8 +1370,11 @@ runs, with an error that names the parameter:
 | `offset`, `context_lines`, `max_per_kind`, `start_line`, `end_line` | 0 or more |
 | `threshold` | 0.0 to 1.0 |
 | A required string (for example `name`, `query`) | not empty |
+| `max_depth` of `get_inheritance_chain` | 1 to 50 |
 
-Only a value that is too large is clamped to the maximum of the tool.
+Only a value that is too large is clamped to the maximum of the tool. The
+exception is `max_depth` of `get_inheritance_chain`: the schema refuses a
+value larger than 50.
 
 ### Search & lookup
 
@@ -1355,7 +1383,7 @@ Only a value that is too large is clamped to the maximum of the tool.
 Full-text search with FTS5 syntax.
 
 ```
-Input:  {"query": "uart init", "project_root?": "/path/to/project", "kind?": "function", "limit?": 20, "offset?": 0}
+Input:  {"query": "uart init", "project_root?": "/path/to/project", "kind?": "function", "limit?": 20, "offset?": 0, "project_only?": false}
 Output: [{"total": 3, "offset": 0, "shown": 3, "more": false},
          {"name": "uart_init", "qualified_name": "drv::uart_init", "kind": "function",
           "file": "/path/src/uart.c", "line": 42, "is_definition": true,
@@ -1371,6 +1399,8 @@ Results include `is_template`, `is_virtual`, `is_pure_virtual` flags
 (boolean, always present). When the symbol is a template instantiation,
 `template_usr` references the template definition. When the symbol is
 a member (method/field/nested type), `parent_usr` references the parent class.
+Set `project_only=True` to filter to application code only. The default
+is `false`, which includes the vendor SDK code.
 When fw-context generates LLM analysis (with `fw-context index --analyze`),
 a result carries `llm_analysis` — `{summary, inputs, outputs}`, with
 plain-English descriptions.
@@ -1406,7 +1436,10 @@ tool automatically broadens the search in up to six steps:
    the results.
 6. *Macro FTS5 fallback* — searches the `macros_fts` table for matching
    `#define` names, parameter lists and values (`kind="macro"`,
-   `_fallback="macros_fts"`).
+   `_fallback="macros_fts"`). A macro result also holds `_macro_value` and
+   `_macro_expanded_value` when they are not empty.
+
+Steps 3 to 6 ignore `kind`.
 
 Results from fallback steps carry `_fallback` indicating which method
 succeeded: `"fts5"` (step 2, the retry without `kind`),
@@ -1566,7 +1599,9 @@ no line there holds `self_test`. Read `_match_snippet` in that case.
 
 When `files_fts` is missing, in a legacy index, this tool falls back to a
 LIKE search on `files.content`. The results include `_fallback: "like"`,
-and no snippet highlighting. Run `fw-context index` to upgrade. A query
+and no snippet highlighting. Run `fw-context index` to upgrade. The LIKE
+search splits the query on spaces and underscores, and a file must hold
+EVERY word as a substring (AND, not the OR of the FTS5 search). A query
 that FTS5 refuses to parse takes the same path and adds a `warning` with
 a `hint` at the head of the list.
 
@@ -1577,6 +1612,11 @@ term a trailing `*` and OR-joins them. Prefer single-word queries.
 
 Find a symbol by name (exact or prefix match). Searches functions, methods,
 classes, enums, typedefs, variables, fields, and **macros**.
+
+`name` matches the name or the qualified name. When a name with `::`
+matches nothing, the tool tries its last part one more time. It keeps only
+the symbols whose qualified name ends with `name`: `Foo::bar` finds
+`ns::Foo::bar`. The tool searches the macros only when no symbol matches.
 
 ```
 Input:  {"name": "uart_init", "project_root?": "/path/to/project", "exact?": true, "limit?": 50, "offset?": 0}
@@ -1599,18 +1639,24 @@ has no page notice.
 Macro example:
 ```
 Input:  {"name": "CONFIG_UART_BAUDRATE", "project_root?": "/path/to/project", "exact?": true}
-Output: [{"name": "CONFIG_UART_BAUDRATE", "kind": "macro",
-          "file": "/path/include/config.h", "line": 15,
+Output: [{"total": 1, "offset": 0, "shown": 1, "more": false},
+         {"name": "CONFIG_UART_BAUDRATE", "qualified_name": "CONFIG_UART_BAUDRATE",
+          "kind": "macro", "file": "/path/include/config.h", "line": 15,
           "signature": "#define CONFIG_UART_BAUDRATE",
           "is_function_like": false,
           "value": "115200", "expanded_value": "115200"}]
 ```
 
+A macro result has the page notice of a symbol result, and its
+`qualified_name` is the name of the macro. `expanded_value` is absent when
+the index holds no expanded value.
+
 A function-like macro shows its parameters in `signature`, and `value` holds
 the replacement text alone:
 ```
-Output: [{"name": "MIN", "kind": "macro", "signature": "#define MIN(a, b)",
-          "is_function_like": true, "value": "((a) < (b) ? (a) : (b))"}]
+Output: [{"total": 1, "offset": 0, "shown": 1, "more": false},
+         {"name": "MIN", "qualified_name": "MIN", "kind": "macro", "signature": "#define MIN(a, b)",
+          "is_function_like": true, "value": "((a) < (b) ? (a) : (b))", …}]
 ```
 
 `signature` is `#define NAME` for an object-like macro, `#define NAME()` for
@@ -1631,7 +1677,8 @@ include `enum_value` when the value is not `None`.
 
 #### `smart_search`
 
-Natural language → FTS5 keywords via Ollama (optional).
+Natural language → FTS5 keywords through the chat model of the LLM
+profile of the project (optional).
 
 ```
 Input:  {"query": "how does the modem connect to the network?", "project_root?": "/path/to/project", "limit?": 20, "offset?": 0}
@@ -1646,6 +1693,12 @@ Output: [
 Multi-phase pipeline: translate → rough search → LLM query generation
 → FTS5 search → refine → vector re-rank → adaptive fusion → deduplicate
 → expand context → format.
+
+Each symbol holds `name`, `qualified_name`, `kind`, `file`, `line`,
+`is_definition`, `signature`, and `docstring`. A symbol also holds
+`summary`, `inputs`, and `outputs` as flat keys when
+`fw-context index --analyze` wrote them (model text, not a fact). There is
+no `llm_analysis` dict here.
 
 When no symbol matches, the result holds the metadata entries and a dict
 with `info`. One dict with `error` means that the query failed.
@@ -1672,8 +1725,8 @@ no time limit. An index run that keeps the build keeps the stored answer.
 The metadata entries come with each page. A page after the last symbol
 gives one `info` dict that names the total.
 
-The whole pipeline has a time limit: `[llm] timeout` of the project
-(default 600 s). When the pipeline passes it, a leading dict holds
+The whole pipeline has a time limit: the `timeout` of the LLM profile of
+the project (default 600 s). When the pipeline passes it, a leading dict holds
 `_partial: true`, a `warning` with the timeout, and a `hint`. The symbols
 that follow are the ones that the steps before the timeout found, without
 the later re-rank steps; there can be none. This answer has no page
@@ -1681,7 +1734,7 @@ notice, and the server does not store it. Thus a next page runs the
 search again. A timeout at `offset` 0 also removes the older stored
 answer.
 
-When you disable Ollama (`[llm] enabled = false`), this tool falls back to
+When you disable the LLM (`[llm] enabled = false`), this tool falls back to
 a word-split FTS5 search. Phase 0 auto-translates a non-English query.
 
 #### `semantic_search`
@@ -1701,7 +1754,8 @@ Output: [{"total": 175, "offset": 0, "shown": 20, "more": true, "hint": "…offs
 
 Uses cosine similarity over variable-dimension embeddings (generated during
 `fw-context index --embeddings`). Models: mxbai-embed-large → 1024-dim,
-qwen3-embedding → 4096-dim. **When to prefer over `search_code`:**
+qwen3-embedding:0.6b → 1024-dim, qwen3-embedding:4b → 2560-dim,
+qwen3-embedding:8b → 4096-dim. **When to prefer over `search_code`:**
 conceptual queries ("power consumption" → `get_load_power`) where keywords
 do not match. **When to prefer `search_code`:** known keywords or symbol
 names (`"fram_write"`, `"cbor encode"`).
@@ -1752,7 +1806,9 @@ When the index of the build is not current, a leading row holds a
 
 Requires `[llm] enabled = true`, embeddings in the index, and, for an
 Ollama embedding model, a running Ollama server. A sentence-transformers or
-`ft://` model embeds the query locally and needs no Ollama. When one of
+`ft://` model embeds the query locally and needs no Ollama. With an API
+profile of the embeddings (`openrouter` or `openai_compatible`), that API
+embeds the query, and Ollama is not necessary. When one of
 them is missing, when the embedding model fails, or when no match is above
 `threshold`, this tool runs ONE plain FTS5 symbol search (the first step of
 `search_code`, with no kind filter and no relaxation). The fallback gives
@@ -2020,14 +2076,15 @@ Output: {"name": "CONFIG_UART_BAUDRATE", "kind": "macro",
 **Pre-computed (instant):** When you build the index with `--analyze` (the
 default), symbols have pre-generated descriptions, stored in the
 `llm_analysis` table. `explain_symbol` returns these descriptions
-instantly. This tool makes no Ollama call, so there is no waiting.
+instantly. This tool makes no LLM call, so there is no waiting.
 
 **On-demand fallback (10–30 s):** When no pre-computed analysis exists, for
 example when you built the index with `--no-analyze`, or when fw-context
 re-indexed the symbol without re-analysis, this tool falls back to calling
-Ollama directly. When the LLM is disabled (`[llm] enabled = false`), this
+the chat model of the LLM profile of the project. The call stops after the
+`timeout` of that profile. When the LLM is disabled (`[llm] enabled = false`), this
 tool returns `explain_prompt` and no `source`. The source window is part
-of the prompt text. When the Ollama call fails (timeout, missing model,
+of the prompt text. When the LLM call fails (timeout, missing model,
 or another error), the result holds a `warning`, `source`, and
 `explain_prompt`. In both cases, the AI assistant can answer with its own
 model.
@@ -2325,6 +2382,8 @@ when the answer can leave out paths:
 - The search found 5 paths and stopped. More paths can exist.
 - The search used its budget of node expansions before it reached each
   node within the depth. More paths can exist.
+- `from_name` calls `to_name` directly. The search stopped at the direct
+  call and did not look for longer paths.
 
 When the search used its budget and found no path, the answer is one
 `info` row. That row says that a path can still exist, and NOT "no path".
@@ -3098,9 +3157,17 @@ project symbols that still need analysis:
 - `project.analyzed` / `project.total` — project definition symbols.
 - `vendor.analyzed` / `vendor.total` — vendor/SDK definition symbols.
 - `project.skipped` / `vendor.skipped` — symbols that the pipeline tried
-  and cannot analyze. The body is larger than the model context, or the
-  model gave an unparseable answer. fw-context stores a `skip:` sentinel
-  for these symbols and does not try them again.
+  and did not analyze. fw-context stores a `skip:` sentinel for each of
+  these symbols. A later analysis tries the symbol again when the cause
+  is gone:
+  - `skip:toolarge` — the body is larger than the model context. The
+    symbol goes to the model again when the context of the model is
+    larger than the context in the sentinel.
+  - `skip:unparseable` — the model gave an unparseable answer. Each
+    analysis run (`fw-context index`, `fw-context analyze`, and
+    `reindex_file`) tries the symbol again.
+  - `skip:nobody` — fw-context cannot read the body. The symbol goes to
+    the model again when fw-context can read the body.
 - `analyze_vendor` — whether vendor analysis was enabled at index time.
 - `complete` — `true` when the pipeline has no more work: every project
   symbol is analyzed or skipped (and, when `analyze_vendor` is true, every
@@ -3266,8 +3333,11 @@ missing. For example, the audit skips `libclang-so` when
 `libclang-python` is absent. A skipped check is not a failure.
 
 In a project that is not initialized, only the checks that need no
-project config run: the Python packages and libclang. The Ollama, model,
-database, and build checks need the config. This tool is the MCP wrapper
+project config run: the Python packages and libclang. The checks
+`gpu-tools`, `ollama`, `chat-model`, `embed-model`, `llm-recommend`,
+`db-integrity`, and `disk-space` read the config. When fw-context cannot
+use a config file, the `config` check gives the error, and these checks
+give `skipped`. The other checks still run. This tool is the MCP wrapper
 for `fw-context doctor` without `--fix`, and it repairs nothing.
 
 #### `reindex_file`
@@ -3304,7 +3374,11 @@ nothing: `error` names the run, and `index_state: "reindexing"` tells the
 LLM to wait for it. When `fw-context analyze` holds the index, the tool
 does nothing either, and the LLM does not wait: an analysis does not
 change the index of the code. The index of the file stays old until an
-index run reads it.
+index run reads it. When a different holder has the index, the tool does
+nothing too. This holder is another tool of this server (`reset_index`,
+`reindex_file`), or a command such as `fw-context db delete`,
+`fw-context db cleanup`, or `fw-context cleanup`. The `error` then ends
+with `Call again`, and the answer holds no `index_state`.
 
 When one build compiles the file, the top level holds the full result of
 that build, as before. When several builds do, the top level holds:
@@ -3364,12 +3438,20 @@ answer holds no `index_state`. This tool requires an existing index.
 
 **Limitation:** A source file must appear in `compile_commands.json`.
 compile_commands.json lists no headers, thus fw-context re-parses a header
-through ONE translation unit that includes it, from the manifest: the unit
-with the lowest path in sort order, in each build. The result then
+through ONE translation unit in each build. This unit is the owner of the
+header in the index (`header_owners`): the unit that wrote the rows of the
+header in the last index run. Only for a header without an owner does
+fw-context use the manifest: the unit that includes the header and has
+the lowest path in sort order. The result then
 holds a `warning` ("Header re-indexed via one TU…"). Other units can include the header
 with other `#define` values and still hold stale symbols. Run a full
 `fw-context index` for full accuracy. A file that no unit builds or
 includes gives an `error`.
+
+Each re-parse writes only the files that the parsed unit owns, as an index
+run does. When a header that the unit includes changed on disk and a
+different unit owns that header, the tool also re-parses that owner. Thus
+the changed header gets its new rows.
 
 #### `reset_index`
 
@@ -3380,7 +3462,11 @@ It stops a background index run, and the daemon runs it again after the
 tool. When a manual `fw-context index` run holds the index, the tool does
 nothing: `error` names the run, and `index_state: "reindexing"` tells the
 LLM to wait for it. When `fw-context analyze` holds the index, the tool
-does nothing either: call it again after the analysis.
+does nothing either: call it again after the analysis. When a different
+holder has the index (another tool of this server, or a command such as
+`fw-context db delete`, `fw-context db cleanup`, or `fw-context cleanup`),
+the tool does nothing too. The `error` then ends with `Call again`, and
+the answer holds no `index_state`.
 
 ```
 Input:  {"project_root?": "/path/to/project", "confirm": false}     → {"action": "dry_run", "build_count": 2, "symbol_count": 8586, …}
@@ -3401,7 +3487,9 @@ absent. The reset can delete a corrupt database.
 The delete removes the database with its `-wal`, `-shm`, and `-journal`
 files. It also removes the automatic-build markers `build_problem.json` and
 `excluded_sources.json` next to the database, because they describe the
-index that is gone.
+index that is gone. It also removes the `force_llm.json` marker of an
+interrupted `--force-llm` command, because the analyses of that command
+were in the deleted index.
 
 #### `list_projects`
 
@@ -3439,7 +3527,8 @@ and `complete` fields, call `get_build_info` for that build.
 `reindex_needed` is `true`, and `status` is `"reindex_needed"`, when one of
 these is true:
 
-- The schema of the database is older than the schema of this version.
+- The schema of the database is different from the schema of this
+  version.
 - The `compile_commands.json` of a build changed after the index, or it is
   missing.
 - A build of the project holds rows of an older row format.
@@ -3490,8 +3579,9 @@ Returns `status: "disabled"` when `[llm] enabled = false`. In that case,
 this tool needs no Ollama.
 
 `chat_api` says whether the chat goes to a server that is not the Ollama
-server of the embeddings, and which model it names. This is true for an
-`openai_compatible` profile, and for an Ollama profile on a different
+server of the embeddings, and which model it names. This is true for each
+profile that is not an Ollama profile (`openai_compatible`, `openrouter`,
+`deepseek`, and `chatgpt`), and for an Ollama profile on a different
 server. When it is configured, `chat_api` also holds `endpoint` and
 `format`, and a `compliance_warning` for a host that is not local.
 
@@ -3509,8 +3599,12 @@ systems. `status: "error"` also means that the Ollama server of the chat
 profile gives no model list.
 
 `embedding_backend` is `"ollama"` for an Ollama embedding model, and
-`"local"` for a sentence-transformers or `ft://` model. A local model needs
-no Ollama: it counts as installed, and with chat on an external API the
+`"local"` for a sentence-transformers or `ft://` model. For an API profile
+of the embeddings, it is the provider of that profile: `"openrouter"` or
+`"openai_compatible"`. When that API is not on this machine, the result
+also holds `embedding_compliance_warning`: the source code and each search
+query go to that host. A local model and an API model need
+no Ollama: each counts as installed, and with chat on an external API the
 status is `"ok"` even when Ollama does not run. `"embedding_unavailable"`
 thus means an Ollama embedding model and an Ollama that fw-context cannot
 use. `"not_configured"` and `"embedding_unavailable"` come when Ollama does
@@ -3533,8 +3627,8 @@ configuration with a simple API call.
 ```
 Input:  {"project_root?": "/path/to/project", "profile?": "deepseek",
          "embed_model?": "qwen3-embedding:0.6b"}
-Output: {"status": "ok", "profile": "deepseek", "provider": "openai_compatible",
-         "model": "deepseek-flash", "test_latency_s": 1.2, …}
+Output: {"status": "ok", "profile": "deepseek", "provider": "deepseek",
+         "model": "deepseek-flash", "context": 131072, "test_latency_s": 1.2, …}
 ```
 
 `profile` must name a profile of the global config
@@ -3546,13 +3640,23 @@ profile that is not the Ollama profile of this machine also returns
 The tool takes no URL, no API key and no model. An API key must not pass through
 the conversation of the LLM client, and a tool call must not send the
 source code to a host that it selects. The operator adds a profile with
-`fw-context init` (see [`fw-context init`](#fw-context-init)), or with a
-text editor.
+`fw-context init` (see [`fw-context init`](#fw-context-init)), with
+`fw-context llm setup`, or with a text editor.
 
-When the selected profile sends the chat to a host that is not this
-machine, the result holds a `compliance_warning`: the source code in chat
-prompts goes to that host. Make sure that this agrees with your data
-security policy.
+When the chat or the embeddings go to a host that is not this machine,
+the result holds a `compliance_warning`: the source code goes to that
+host. This includes a cloud model of Ollama, which runs on a remote host
+behind a local Ollama server. The warning names the chat, the
+embeddings, or the two, and each host. Make sure that this agrees with
+your data security policy.
+
+For an API profile (`deepseek`, `openrouter`, `chatgpt`, or
+`openai_compatible`), the result also holds `context`: the context of the
+chat model in tokens. This value comes from the model list of the API,
+or else from the `context` of the profile. When neither gives the
+context, the analysis cannot operate. The tool then restores the previous
+settings, and the result holds `status: "error"` with a message that
+starts with `The profile cannot analyse`.
 
 Every parameter you omit keeps its current value. A call that changes
 nothing returns `status: "error"` and writes nothing.
@@ -3616,6 +3720,20 @@ Output: # uart_init
 
 When fw-context does not find the symbol, this resource returns a JSON
 error object.
+
+#### `fw-context://skills/fw-review`
+
+The `SKILL.md` of the `fw-review` skill, as Markdown text. This skill is
+the review method for embedded C/C++ firmware. The resource gives it to
+each MCP client through one URI.
+
+```
+URI:    fw-context://skills/fw-review
+Output: the text of SKILL.md
+```
+
+When the installed package does not hold the file, this resource returns
+the text `Skill not found — reinstall with 'fw-context init --force'.`
 
 ---
 
@@ -3821,13 +3939,29 @@ avoids duplicate searches and expensive merging.
 
 ## Auto-detection of build system
 
-| Ecosystem | Detected by | compile_commands.json location |
+When `[build] system` is not set, fw-context counts the markers of each
+builder that are in the project root. The builder with the most markers
+wins. On a tie, the builder that is first in this table wins. A marker
+with `*` is a glob pattern.
+
+Each build writes into `.fw-context/build/<variant>/out`. A project
+without variants uses the variant name `default`. In the column of the
+location, `out/` is this directory.
+
+| Ecosystem (`[build] system`) | Markers | compile_commands.json location |
 |-----------|------------|-------------------------------|
-| **Zephyr** | `west.yml` or `prj.conf` | `build/compile_commands.json` |
-| **PlatformIO** | `platformio.ini` | Project root |
-| **Mbed OS** | `mbed-os/` directory or `mbed_app.json` | Project root |
-| **CMake** | `CMakeLists.txt` + `compile_commands.json` | `build/` |
-| **Bare-metal** | Any build with `bear` | Project root |
+| **Mbed OS** (`mbed-os`) | `.mbed`, `mbed-os`, `mbed_app.json` | `out/compile_commands.json` |
+| **PlatformIO** (`platformio`) | `platformio.ini` | `out/<env>/compile_commands.json` |
+| **Zephyr** (`zephyr`) | `west.yml`, `zephyr` | `out/compile_commands.json`; with sysbuild, `out/<image>/compile_commands.json` for each image in `domains.yaml` |
+| **Arduino** (`arduino`) | `sketch.yaml` | `out/compile_commands.json` |
+| **ESP-IDF** (`esp-idf`) | `sdkconfig` | `out/compile_commands.json`; the bootloader in `out/bootloader/compile_commands.json` |
+| **CMake** (`cmake`) | `CMakeLists.txt` | `out/compile_commands.json` |
+| **STM32CubeIDE** (`stm32cubeide`) | `.cproject`, `.project` | No build: the IDE makes the file, and `[index] compile_commands` names it |
+| **TI Code Composer Studio** (`ti-ccs`) | `.projectspec` | No build: the IDE makes the file, and `[index] compile_commands` names it |
+| **Manual** (`bare`) | None: set `[build] system = "bare"` | `out/compile_commands.json` |
+| **Makefile** (`makefile`) | `Makefile` | `out/compile_commands.json` |
+| **Keil MDK** (`keil-mdk`) | `*.uvprojx` | `out/compile_commands.json` |
+| **IAR EWARM** (`iar-ewarm`) | `*.ewp`, `*.eww` | `out/compile_commands.json` |
 
 ---
 
