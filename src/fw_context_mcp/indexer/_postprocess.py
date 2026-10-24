@@ -7,8 +7,8 @@ after the full symbol table is available:
 
 **Why post-processing is separate from parsing**
 
-1. **Global knowledge required.**  The inheritance graph, call graph,
-   and cross-TU reference resolution need the complete symbol table —
+1. **Global knowledge required.**  The inheritance graph, the call graph
+   and the dispatch edges need the complete symbol table —
    they cannot work on a single TU at a time.
 
 2. **Dependency ordering.**  Steps have strict dependencies:
@@ -42,14 +42,12 @@ after the full symbol table is available:
 8. **Embeddings** — compute vector embeddings for semantic search
 9. **LLM analysis** — generate natural-language symbol explanations
 10. **Override graph** — build the virtual-method override map
-11. **Cross-TU ref backfill** — resolve method calls whose target
-    was defined in a different translation unit
-12. **PageRank + hotspot cache** — compute call-graph centrality
+11. **PageRank + hotspot cache** — compute call-graph centrality
     and pre-aggregate caller counts
-13. **Finalize manifest** — stamp build config with verification status
-14. **Cleanup old builds** — delete data from previous indexing runs
+12. **Finalize manifest** — stamp build config with verification status
+13. **Cleanup old builds** — delete data from previous indexing runs
     (unless a reindex is paused)
-15. **WAL checkpoint** — flush SQLite write-ahead log to disk
+14. **WAL checkpoint** — flush SQLite write-ahead log to disk
 
 Two functions are also used before the pipeline during TU-parallel
 parsing: ``_extract_param_types`` for override matching and
@@ -1228,9 +1226,6 @@ def _step_repair_from_usr(conn: sqlite3.Connection, ctx: dict) -> None:
     caller of each row, thus a NULL there is the same hole in a different
     tool.
 
-    This step runs BEFORE the cross-TU backfill, which skips a line that
-    already has a reference and must thus see the repaired rows.
-
     The AST walk itself does not change.  Its docstring records an earlier
     regression from a change to those pop conditions, and a repair after
     the fact cannot cause one.
@@ -1275,28 +1270,11 @@ def _step_repair_from_usr(conn: sqlite3.Connection, ctx: dict) -> None:
         log.info("Repaired the caller of %d reference(s)", cur.rowcount)
 
 
-def _step_backfill_cross_tu_refs(conn: sqlite3.Connection, ctx: dict) -> None:
-    """Backfill call references that per-TU symbol lookup could not resolve.
-
-    Per-TU ``_qn_to_usr`` only contains symbols from the current
-    translation unit.  Cross-TU method calls (e.g. a private method
-    defined in another ``.cpp`` file) are resolved here using the
-    complete symbols table, which is available after the TU loop.
-    Must run BEFORE PageRank so the call graph is complete.
-    """
-    from .ops import backfill_cross_tu_refs
-
-    config_hash = ctx["config_hash"]
-    project_root = ctx["project_root"]
-    added = backfill_cross_tu_refs(conn, config_hash, project_root)
-    if added:
-        log.info("Cross-TU ref backfill: %d references added", added)
-
-
 def _step_pagerank_hotspot(conn: sqlite3.Connection, ctx: dict) -> None:
     """Compute PageRank scores and build the hotspot cache from the call graph.
 
-    Runs after cross-TU backfill to ensure the call graph is complete.
+    Runs after every step that writes call edges (dispatch, caller repair)
+    to see the complete call graph.
     Two outputs are computed sequentially from the same call-graph data:
     PageRank scores (centrality) and the pre-aggregated hotspot cache
     (caller counts for instant ``find_hotspots`` queries).
@@ -1706,10 +1684,8 @@ def _step_wal_checkpoint(conn: sqlite3.Connection, ctx: dict) -> None:
 #    hashed.  Otherwise the first run stores a hash without summaries, the
 #    analysis step fills them, and the NEXT run re-embeds every analyzed
 #    symbol (a spurious full re-embed on every run that follows analysis).
-#  • dispatch_edges MUST run before cross_tu_refs — dispatch edges add
-#    new from_usr values that the backfill needs.
-#  • cross_tu_refs MUST run before pagerank_hotspot — PageRank needs the
-#    complete call graph.
+#  • dispatch_edges and repair_from_usr MUST run before pagerank_hotspot —
+#    PageRank needs the complete call graph.
 #  • verify_integrity MUST run before finalize_manifest and cleanup_old.
 #    Before finalize so a failing index is never stamped "full"; before
 #    cleanup so the previous build is still there to fall back on.
@@ -1782,7 +1758,6 @@ _STEPS: list[tuple[str, Callable[..., None], Callable[..., bool] | None]] = [
     ("embeddings",       _step_build_embeddings,   lambda c: c["index_embeddings"] and c["llm_config"] is not None and c["llm_config"].enabled),
     ("overrides",        _step_build_overrides,    lambda c: c["analyze_overrides"]),
     ("repair_from_usr",  _step_repair_from_usr,    lambda c: c["index_refs"]),
-    ("cross_tu_refs",    _step_backfill_cross_tu_refs, lambda c: c["index_refs"]),
     ("pagerank_hotspot", _step_pagerank_hotspot,   lambda c: c["index_refs"]),
     ("verify_integrity", _step_verify_integrity,   None),
     ("finalize_manifest", _step_finalize_manifest,  None),

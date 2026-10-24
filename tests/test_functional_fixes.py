@@ -180,7 +180,7 @@ class TestResolveMethodUsr:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# F2 — self-reference suppression (_run_source_line_fallback)
+# F2 — the source-line fallback (_run_source_line_fallback)
 # ═══════════════════════════════════════════════════════════════════════════
 
 
@@ -208,8 +208,8 @@ def disk_buffers(monkeypatch):
     monkeypatch.setattr(_parsed_text, "file_of_parse", lambda tu, name: name)
 
 
-class TestRunSourceLineFallbackSelfRef:
-    """Verify the definition line does not create a self-caller edge."""
+class TestRunSourceLineFallback:
+    """The scan of the source text: no call edge, and the indirect patterns that stay for now."""
 
     @pytest.fixture(autouse=True)
     def _import(self, disk_buffers):
@@ -240,40 +240,30 @@ class TestRunSourceLineFallbackSelfRef:
         finally:
             os.unlink(path)
 
-    def test_no_self_caller_at_definition_line(self):
-        """The signature line `void WDT::wdt_reset(` must not produce a self edge."""
+    def test_a_name_in_the_text_gives_no_call_edge(self):
+        """The scan reads text: a bare `name(` or `obj.name(` is no call edge.
+
+        The scan once took the target from the name. It read the definition
+        line, comments and inactive lines too, and its name lookup took the
+        class of the caller. The compiler gives each direct call itself.
+        """
         src = (
             "void WDT::wdt_reset(int delay) {\n"
             "    helper(delay);\n"
-            "}\n"
-        )
-        qn = {"the Mbed project::WDT::wdt_reset": "u_self", "the Mbed project::WDT::helper": "u_helper"}
-        refs, _fp = self._run(src, qn)
-
-        self_refs = [r for r in refs if r.to_usr == "u_self" and r.from_usr == "u_self"]
-        assert not self_refs, (
-            f"Definition line must not create a self-reference, got {self_refs}"
-        )
-        helper_refs = [r for r in refs if r.to_usr == "u_helper"]
-        assert helper_refs, "A real bare call on a non-definition line must be kept"
-
-    def test_real_recursion_still_detected(self):
-        """A genuine self-call inside the body (not the signature) must be kept."""
-        src = (
-            "void WDT::wdt_reset(int delay) {\n"
-            "    helper(delay);\n"
+            "    // feed() is not called here\n"
+            "    _timer.start(delay);\n"
             "    wdt_reset(delay + 1);\n"
             "}\n"
         )
-        qn = {"the Mbed project::WDT::wdt_reset": "u_self", "the Mbed project::WDT::helper": "u_helper"}
+        qn = {
+            "WDT::wdt_reset": "u_self",
+            "WDT::helper": "u_helper",
+            "WDT::feed": "u_feed",
+            "Timer::start": "u_start",
+        }
         refs, _fp = self._run(src, qn)
 
-        body_self = [r for r in refs
-                     if r.to_usr == "u_self" and r.from_usr == "u_self" and r.from_line == 3]
-        assert body_self, "Real recursion inside the body must be kept"
-        sig_self = [r for r in refs
-                    if r.to_usr == "u_self" and r.from_usr == "u_self" and r.from_line == 1]
-        assert not sig_self, "Signature line must not create a self edge"
+        assert [r for r in refs if r.ref_kind == "call"] == []
 
     def test_callback_address_of_method_indirect_via_raw_text(self):
         """`&Class::method` inside a call arg must emit an indirect ref from the

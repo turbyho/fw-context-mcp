@@ -6,6 +6,5 @@
   "absent": [
     ["Led::~Led", "Led::Led", 9, "call"]
   ],
-  "exact": true,
-  "xfail": "phase 1"
+  "exact": true
 }

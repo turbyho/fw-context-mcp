@@ -8,6 +8,5 @@
   "absent": [
     ["run", "probe", 6, "call"]
   ],
-  "exact": true,
-  "xfail": "phase 1"
+  "exact": true
 }

@@ -22,9 +22,16 @@ Pipeline, per TU (``store_symbols_for_unit``):
   7. Fill ``files.content`` with ``#ifdef``-filtered text — tokenize the
      TU to find which lines are active for the build configuration
 
-Post-processing (after all TUs):
-  * ``backfill_cross_tu_refs`` — resolve method calls whose callee lives
-    in a different TU (invisible to per-TU ``_qn_to_usr``)
+No post-processing pass writes call edges here.  A cross-TU backfill once
+read ``obj.method(`` in the stored text of each file and took the target
+from the name.  libclang resolves a call to a method of another TU through
+its declaration, thus the backfill only wrote edges that the AST did not
+give.  Most were wrong: calls in comments, and the method of the class of
+the caller instead of the method of the receiver.  The others were guesses
+that happened to be right: a call on a dependent receiver in a template
+body, and a call in a parse with errors.  A name cannot tell the two kinds
+apart, thus the pass is gone; the calls of a template come from its
+instantiations instead.
 
 Design decisions:
   - All database writes happen inside a caller-managed transaction —
@@ -42,7 +49,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import re
 import sqlite3
 import time
 from functools import cache
@@ -1719,203 +1725,3 @@ def store_symbols_for_unit(
         )
 
     return syms_added, refs_added, headers
-
-
-# ---------------------------------------------------------------------------
-# Cross-TU reference backfill — post-processing phase
-# ---------------------------------------------------------------------------
-
-# Regex matching obj.method( and obj->method( patterns in source lines.
-# Used by backfill_cross_tu_refs to find call sites that per-TU fallback
-# could not resolve (because the callee was defined in another TU and not
-# declared in any included header).
-#
-# Captures two groups:
-#   group(1) — the object/receiver name, the hint for the receiver class
-#   group(2) — the method name (used to resolve against the symbols table)
-_CALL_PATTERN_RE = re.compile(r"(\w+)(?:\.|->)(\w+)\s*\(")
-
-
-def backfill_cross_tu_refs(
-    conn: sqlite3.Connection,
-    config_hash: str,
-    project_root: Path,
-) -> int:
-    """Post-processing: backfill cross-TU call references.
-
-    Scans project source files for ``obj.method(`` and ``obj->method(``
-    patterns on lines inside known function bodies that have no existing
-    call/indirect reference.  Resolves the callee with
-    ``_resolve_method_usr``, the same function that the per-TU fallback in
-    ``symbols.py`` uses, over a symbol map built from the WHOLE symbols
-    table.  The per-TU ``qn_to_usr`` holds one translation unit, so a
-    method that another ``.cpp`` file defines is out of its reach.  The
-    map built here has no such limit.
-
-    WHY ``_resolve_method_usr`` and not ``_resolve_target_usr``: this
-    function WRITES an edge into ``refs``, and ``refs`` has no column that
-    marks where a row came from.  A wrong edge is thus permanent and
-    indistinguishable from one that libclang made.  ``_resolve_target_usr``
-    answers an ambiguous name with the most-referenced candidate, which is
-    a guess.  ``_resolve_method_usr`` answers it with ``None``, and it
-    takes the receiver name as a hint for the class.  Its own docstring
-    records why: an arbitrary candidate once made ``_timeout.attach(...)``
-    point at ``mbed::SerialBase::attach``.  The per-TU path learned that
-    lesson; this path had not.
-
-    A name that stays ambiguous gets NO edge.  That loses a true edge
-    sometimes, and the trade is deliberate: a missing edge shows up as an
-    empty answer, which a reader can test, but a wrong edge reads exactly
-    like a fact.
-
-    Returns:
-        Number of new references inserted.
-    """
-    # _resolve_method_usr lives in symbols.py, which imports libclang at
-    # module scope.  The import stays inside the function, as the other
-    # symbols.py imports in this module do, to keep libclang out of the
-    # import time of ops.py.
-    from fw_context_mcp.indexer.symbols import _resolve_method_usr
-
-    total_added = 0
-
-    # One map for every TU, built once.  _resolve_method_usr matches on the
-    # qualified name, thus the map holds the qualified name as its key.
-    #
-    # A qualified name is NOT unique: every overload of one method carries
-    # the same one, and the map holds one USR per key.  The overloads thus
-    # collapse into one entry, and _resolve_method_usr then sees a single
-    # candidate and answers with it.  That is a coin flip between two
-    # bodies, and the rule of this function — an ambiguous name gets no
-    # edge — never reached the shape.  The regex below reads ``obj.emit(``
-    # and nothing more, thus it cannot tell two overloads apart and
-    # neither can the answer.
-    #
-    # ``setdefault`` keeps the FIRST row of a key, so that the map does not
-    # depend on the order of a scan that carries no ORDER BY.
-    qn_to_usr: dict[str, str] = {}
-    usr_to_qn: dict[str, str] = {}
-    overloaded_qns: set[str] = set()
-    for srow in conn.execute(
-        """SELECT qualified_name, usr FROM symbols
-           WHERE config_hash = ? AND qualified_name != ''
-             AND kind IN ('function', 'method', 'constructor', 'destructor')""",
-        (config_hash,),
-    ):
-        qualified_name, usr = srow["qualified_name"], srow["usr"]
-        if qn_to_usr.setdefault(qualified_name, usr) != usr:
-            overloaded_qns.add(qualified_name)
-        usr_to_qn.setdefault(usr, qualified_name)
-
-    # 1. Get all project source files (.c/.cpp) with indexed content.
-    #    Only project files are scanned — vendor SDK code is not expected
-    #    to have cross-TU method calls that libclang misses.  Files without
-    #    content (content='') are skipped because we need the ifdef-filtered
-    #    source text to scan for method call patterns.
-    source_files = conn.execute(
-        """SELECT f.path, f.content, f.language
-           FROM files f
-           WHERE f.config_hash = ? AND f.is_project = 1
-             AND f.content != ''
-             AND (f.path LIKE '%.cpp' OR f.path LIKE '%.c'
-                  OR f.path LIKE '%.cc' OR f.path LIKE '%.cxx')""",
-        (config_hash,),
-    ).fetchall()
-
-    for frow in source_files:
-        file_path_rel = frow["path"]
-        content = frow["content"]
-        if not content:
-            continue
-
-        lines = content.splitlines()
-        n_lines = len(lines)
-
-        # 2. Get function/method definitions in this file → fn_spans.
-        #    Only definitions (is_definition=1) with valid end_line.
-        fn_rows = conn.execute(
-            """SELECT usr, line, end_line
-               FROM symbols
-               WHERE config_hash = ? AND file_path = ?
-                 AND is_definition = 1
-                 AND kind IN ('function', 'method', 'constructor', 'destructor')
-                 AND end_line > line""",
-            (config_hash, file_path_rel),
-        ).fetchall()
-
-        if not fn_rows:
-            continue  # No function bodies in this file
-
-        # Build function spans: [(usr, start_line, end_line)]
-        fn_spans: list[tuple[str, int, int]] = [
-            (r["usr"], r["line"], r["end_line"]) for r in fn_rows
-        ]
-
-        # 3. Get lines that already have call/indirect refs in this file.
-        existing_ref_lines = {
-            r["from_line"]
-            for r in conn.execute(
-                """SELECT DISTINCT from_line FROM refs
-                   WHERE config_hash = ? AND from_file = ?
-                     AND ref_kind IN ('call', 'indirect')""",
-                (config_hash, file_path_rel),
-            ).fetchall()
-        }
-
-        # 4. For each function span, scan lines without existing refs.
-        new_refs: list[tuple] = []
-        for fn_usr, fn_start, fn_end in fn_spans:
-            # Clamp to actual line count — fn_end may extend past
-            # the file length if the source was truncated or if
-            # libclang reported an extent beyond EOF.
-            span_end = min(fn_end, n_lines)
-            for lineno in range(fn_start, span_end + 1):
-                if lineno in existing_ref_lines:
-                    continue
-                line_text = lines[lineno - 1] if 0 < lineno <= n_lines else ""
-                if not line_text:
-                    continue
-                # Scan for obj.method( and obj->method( patterns.
-                # Each match yields a potential cross-TU call that
-                # libclang's per-TU cursor visitor could not resolve.
-                for m in _CALL_PATTERN_RE.finditer(line_text):
-                    receiver_name = m.group(1)
-                    method_name = m.group(2)
-                    # Skip common false positives — C++ keywords and
-                    # builtins that match the regex but are not method
-                    # calls (e.g. `if (` in minified code).
-                    if method_name in ("if", "for", "while", "switch", "sizeof", "return"):
-                        continue
-                    # The receiver name is the hint for the class, and the
-                    # enclosing function gives the second hint.  An
-                    # ambiguous name gives None, and then no edge is made.
-                    target_usr = _resolve_method_usr(
-                        method_name,
-                        qn_to_usr,
-                        field_name=receiver_name,
-                        caller_qn=usr_to_qn.get(fn_usr, ""),
-                    )
-                    # Avoid self-references — a function calling itself
-                    # (recursion) would already have a per-TU ref.  An
-                    # overload is refused here rather than inside
-                    # _resolve_method_usr, because the collapse happens in
-                    # the map and that function cannot see it.
-                    if (
-                        target_usr
-                        and target_usr != fn_usr
-                        and usr_to_qn.get(target_usr, "") not in overloaded_qns
-                    ):
-                        new_refs.append(
-                            (config_hash, target_usr, file_path_rel, lineno,
-                             fn_usr, "call", None)
-                        )
-                        # Mark this line as having a ref to avoid
-                        # inserting duplicate references when multiple
-                        # method calls appear on the same line.
-                        existing_ref_lines.add(lineno)
-
-        if new_refs:
-            insert_refs_batch(conn, new_refs)
-            total_added += len(new_refs)
-
-    return total_added

@@ -1,5 +1,5 @@
 {
-  "description": "Two classes have a method send. The cross-TU backfill reads _parser->send by name and writes it as a call of Driver::send, the method of the class of the caller. Measured on a real index (2026-10-24): 50 of 51 callers of a driver method were calls of the AT parser method of the same name.",
+  "description": "Two classes have a method send. The runner sorts the units by path, thus parser.cpp walks parser.h first and parser.h is in the skip set when driver.cpp is parsed. The name lookup of the token heuristic then saw only Driver::send and wrote _parser->send as a call of Driver::send. Measured on a real index (2026-10-24): 50 of 51 callers of a driver method were calls of the AT parser method of the same name.",
   "units": ["parser.cpp", "driver.cpp", "app.cpp"],
   "compiler": "c++",
   "present": [
@@ -12,6 +12,5 @@
     ["Driver::send", "Driver::send", 4, "call"],
     ["Driver::off", "Driver::send", 8, "call"]
   ],
-  "exact": true,
-  "xfail": "phase 1"
+  "exact": true
 }

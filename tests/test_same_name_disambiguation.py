@@ -6,14 +6,17 @@ qualified name could not change that answer.  The tie-break ran on the
 reference counts of the candidates, which have nothing to do with the name
 that the caller gave.
 
-Four parts of the repair are pinned here:
+Three parts of the repair are pinned here:
 
 1. The resolver ranks a match on its specificity, thus an exact qualified
    name wins over a bare sibling.
 2. The graph tools walk every match of the best rank and label each row.
 3. A reference that the AST walk left without a caller gets one, because a
    NULL ``from_usr`` drops out of the recursive CTE.
-4. The cross-TU backfill writes no edge for an ambiguous method name.
+
+A fourth part pinned that the cross-TU backfill wrote no edge for an
+ambiguous method name.  The backfill is gone: it took every target from a
+name, and tests/test_callgraph_truth.py now pins that no pass does that.
 """
 
 from __future__ import annotations
@@ -520,85 +523,6 @@ class TestRepairFromUsr:
         assert self._callers_of(db_with_one_line_body, 600) == "u_also", (
             "the span tied, thus the USR must settle it"
         )
-
-
-class TestBackfillWritesNoGuess:
-    """The cross-TU backfill must not invent an edge for an ambiguous name."""
-
-    @pytest.fixture
-    def db_for_backfill(self, db):
-        """Give the file text that the backfill scans, and mark it a project file."""
-        source = "\n".join([
-            "void top() {",                 # line 1  (u_top spans 100..110, so use
-            "    obj.probe();",             # line 2   a separate span below)
-            "    obj.only();",              # line 3
-            "    obj.emit(1);",             # line 4
-            "}",                            # line 5
-        ])
-        db.execute(
-            "UPDATE files SET content = ?, is_project = 1"
-            " WHERE config_hash = ? AND path = ?",
-            (source, CH, "src/main.cpp"),
-        )
-        # A body that covers the call lines, so the scan looks at them.
-        fid = upsert_file(db, CH, "src/main.cpp", "cpp")
-        insert_symbols_batch(db, [
-            _symbol_row(fid, "src/main.cpp", "scan", "Scan::scan", "u_scan", 1, 5),
-            # Two overloads.  They share a qualified name and differ in the
-            # parameters, which the regex of the backfill never sees.
-            _symbol_row(fid, "src/main.cpp", "emit", "Scan::emit", "u_emit_int",
-                        10, 12, signature="void emit(int)"),
-            _symbol_row(fid, "src/main.cpp", "emit", "Scan::emit", "u_emit_char",
-                        14, 16, signature="void emit(char)"),
-        ])
-        db.commit()
-        return db
-
-    def _edges_from_scan(self, conn) -> set[str]:
-        return {
-            r["to_usr"]
-            for r in conn.execute(
-                "SELECT to_usr FROM refs WHERE config_hash = ? AND from_usr = ?",
-                (CH, "u_scan"),
-            )
-        }
-
-    def test_an_ambiguous_method_name_makes_no_edge(self, db_for_backfill):
-        """``probe`` means two methods, thus the backfill must stay silent."""
-        from fw_context_mcp.indexer.ops import backfill_cross_tu_refs
-
-        backfill_cross_tu_refs(db_for_backfill, CH, Path("/tmp/test"))
-        edges = self._edges_from_scan(db_for_backfill)
-        assert "u_a_probe" not in edges, "the backfill guessed ClassA::probe"
-        assert "u_b_probe" not in edges, "the backfill guessed ClassB::probe"
-
-    def test_an_unambiguous_method_name_still_makes_an_edge(self, db_for_backfill):
-        """The guard must not silence the resolution that was always right."""
-        from fw_context_mcp.indexer.ops import backfill_cross_tu_refs
-
-        backfill_cross_tu_refs(db_for_backfill, CH, Path("/tmp/test"))
-        assert "u_solo" in self._edges_from_scan(db_for_backfill), (
-            "the one clear name lost its edge too"
-        )
-
-    def test_an_overload_makes_no_edge_either(self, db_for_backfill):
-        """Two overloads share a qualified name, thus the name is ambiguous.
-
-        The symbol map keys on the qualified name, and the two overloads
-        collapse to one entry in it.  ``_resolve_method_usr`` then saw ONE
-        candidate and answered with it, which is a coin flip between two
-        bodies — the rule that an ambiguous name gets no edge never
-        reached this shape.
-
-        The regex of the backfill reads ``obj.emit(`` and nothing more.
-        It cannot tell the overloads apart, thus neither can the answer.
-        """
-        from fw_context_mcp.indexer.ops import backfill_cross_tu_refs
-
-        backfill_cross_tu_refs(db_for_backfill, CH, Path("/tmp/test"))
-        edges = self._edges_from_scan(db_for_backfill)
-        assert "u_emit_int" not in edges, "the backfill guessed one overload"
-        assert "u_emit_char" not in edges, "the backfill guessed one overload"
 
 
 class TestReferenceQueries:

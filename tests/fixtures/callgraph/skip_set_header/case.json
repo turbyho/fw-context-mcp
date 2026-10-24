@@ -1,5 +1,5 @@
 {
-  "description": "Driver::off in driver.h calls Parser::send. The runner sorts the units by path, thus parser.cpp walks parser.h first and parser.h is in the skip set when zapp.cpp walks driver.h. The name lookup of the token heuristic then misses Parser::send and takes Driver::send.",
+  "description": "Driver::off in driver.h calls Parser::send. The runner sorts the units by path, thus parser.cpp walks parser.h first and parser.h is in the skip set when zapp.cpp walks driver.h. The name lookup of the token heuristic then missed Parser::send and took Driver::send.",
   "units": ["parser.cpp", "zapp.cpp"],
   "compiler": "c++",
   "present": [
@@ -9,6 +9,5 @@
   "absent": [
     ["Driver::off", "Driver::send", 8, "call"]
   ],
-  "exact": true,
-  "xfail": "phase 1"
+  "exact": true
 }

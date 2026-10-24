@@ -1,0 +1,10 @@
+{
+  "description": "A member call in a comment is not a call. The cross-TU backfill of the post-processing read obj.method( in the stored text of the file, comments included, and took the target from the name.",
+  "units": ["main.cpp"],
+  "compiler": "c++",
+  "present": [],
+  "absent": [
+    ["Driver::off", "Parser::send", 11, "call"]
+  ],
+  "exact": true
+}

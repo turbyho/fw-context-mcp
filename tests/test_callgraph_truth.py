@@ -2,9 +2,9 @@
 
 Each case in tests/fixtures/callgraph/ is indexed as a project, with the full
 pipeline: the skip set of headers and the post-processing take part, because
-two of the measured false edges come from them (a header in the skip set hides
-a symbol from the name lookup of the text heuristic; the cross-TU backfill runs
-in post-processing). A test of extract_all alone would miss both.
+measured false edges came from them (a header in the skip set hid a symbol from
+the name lookup of a text heuristic, and a text heuristic ran in the
+post-processing). A test of extract_all alone would miss both.
 
 A case with the key "xfail" names the phase that repairs it. The test is then
 xfail(strict=True): the commit of that phase must remove the key, because a
@@ -133,7 +133,6 @@ def test_the_call_edges_equal_the_truth(case_dir: Path, tmp_path: Path):
 
 
 @pytest.mark.libclang
-@pytest.mark.xfail(strict=True, reason="repaired in phase 1")
 def test_another_unit_does_not_change_the_edges_of_a_function(tmp_path: Path):
     """The edges of Driver::off come from its code, not from the other units of the build.
 

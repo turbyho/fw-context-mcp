@@ -1136,9 +1136,9 @@ def _build_refs_and_fp_assignments(
 
     **Phase 2 — source-line fallback**: after the AST walk,
     :func:`_run_source_line_fallback` scans raw source text inside known
-    function spans and emits call/indirect edges via regex matching.
-    This catches ``obj.method()`` and ``&Class::method`` patterns that
-    template-obscured AST cursors cannot resolve.
+    function spans for dispatch calls, type-erased ISR registrations and
+    ``&Class::method``.  It emits indirect edges and pending dispatches,
+    and no call edge.
 
     Returns (refs, indirect_call_sites, fp_assignments, pending_dispatches).
     """
@@ -1224,10 +1224,10 @@ def _build_refs_and_fp_assignments(
 
         _process_ref_cursor(
             cursor, cur_fn, refs, indirect_call_sites, fp_assignments,
-            pending_dispatches, seen_ref, qn_to_usr, usr_to_qn, tu_path_str, resolve_fn, _log,
+            pending_dispatches, seen_ref, qn_to_usr, tu_path_str, resolve_fn, _log,
         )
 
-    # Source-line fallback for template-obscured method calls
+    # Source-line scan for dispatch calls and &Class::method (indirect only)
     _run_source_line_fallback(
         tu, refs, fp_assignments, pending_dispatches, seen_ref, _fn_spans, qn_to_usr, usr_to_qn, _log,
     )
@@ -1560,7 +1560,6 @@ def _process_ref_cursor(
     pending_dispatches: list[PendingDispatch],
     seen_ref: set[tuple],
     qn_to_usr: dict[str, str],
-    usr_to_qn: dict[str, str],
     tu_path_str: str,
     resolve_fn: Callable[..., object],
     _log: logging.Logger,
@@ -1576,7 +1575,7 @@ def _process_ref_cursor(
                                  qn_to_usr, _log)
     _handle_fn_ptr_cases(cursor, cur_fn, refs, fp_assignments, seen_ref, tu_path_str, _log)
     _handle_implicit_constructors(cursor, cur_fn, refs, seen_ref, _log)
-    _handle_token_fallbacks(cursor, cur_fn, refs, fp_assignments, seen_ref, qn_to_usr, usr_to_qn, tu_path_str, _log)
+    _handle_token_fallbacks(cursor, cur_fn, refs, fp_assignments, seen_ref, qn_to_usr, tu_path_str, _log)
 
 
 def _add_ref(refs: list[Reference], seen_ref: set[tuple], to_usr: str,
@@ -2854,34 +2853,42 @@ def _handle_token_fallbacks(cursor: cx.Cursor, cur_fn: str | None,
                             refs: list[Reference],
                             fp_assignments: list[FnPointerAssignment],
                             seen_ref: set[tuple], qn_to_usr: dict[str, str],
-                            usr_to_qn: dict[str, str], tu_path_str: str,
+                            tu_path_str: str,
                             _log: logging.Logger) -> None:
-    """Token-based fallback detection: UNEXPOSED_EXPR and template-obscured calls.
+    """Token-based detection of ``&Class::method`` that the AST leaves opaque.
 
-    Operates on the raw token stream, not the libclang AST — necessary when
-    template expansion produces ``UNEXPOSED_EXPR`` wrappers that hide the
-    actual call/ref structure.
+    Operates on the raw token stream, not the libclang AST.  Two patterns:
 
-    Three detection patterns:
-
-    1. **UNEXPOSED_EXPR** → extracts ``&Class::method`` via
+    1. **UNEXPOSED_EXPR**: extracts ``&Class::method`` via
        ``_extract_fn_refs_from_unexposed`` from any opaque expression node.
 
-    2. **Token-level obj.method()** — scans CALL_EXPR tokens for
-       ``IDENTIFIER DOT/ARROW IDENTIFIER LPAREN`` sequences and resolves
-       via ``_resolve_method_usr`` with the field name as hint.
-
-    3. **Token-level bare call** — matches ``IDENTIFIER LPAREN`` where the
-       identifier is not preceded by ``.`` or ``->`` (avoids double-counting
-       with pattern 2).  Resolves via ``_resolve_method_usr`` with the
-       enclosing class as hint.
-
-    4. **Callback-style indirect targets** — ``&Class::method`` inside a
+    2. **Callback-style indirect targets**: ``&Class::method`` inside a
        CALL_EXPR argument list.  Emits ``ref_kind='indirect'`` and an
        ``FnPointerAssignment`` with ``method='call_arg'``.
+
+    WHY no call edge from the tokens: the scan once also read each
+    ``name(`` and ``obj.name(`` token of a CALL_EXPR, and it took the
+    target from the name.  On a clean parse, libclang resolves each
+    non-dependent direct call itself.  Where the AST gave no target, the
+    name gave wrong targets:
+
+    - the method of the class of the caller instead of the method of the
+      receiver;
+    - a symbol of the same name in another class;
+    - with a header in the skip set, a target that changed with the other
+      units of the build.
+
+    Some targets were right: a call on a dependent receiver in a template
+    body, where the name happened to be unique.  A name cannot tell those
+    from the wrong ones; the calls of a template come from its
+    instantiations instead.
+
+    The tokens of a CALL_EXPR in a macro expansion also reach far past the
+    call.  The two patterns here stay until a later step resolves the
+    indirect calls from the assignments to fields, variables and
+    parameters ("slots"), with no names.
     """
     loc = cursor.location
-    caller_qn = usr_to_qn.get(cur_fn or "") or ""
 
     if cursor.kind == cx.CursorKind.UNEXPOSED_EXPR:
         pairs = _extract_fn_refs_from_unexposed(cursor, qn_to_usr)
@@ -2894,27 +2901,6 @@ def _handle_token_fallbacks(cursor: cx.Cursor, cur_fn: str | None,
         except (ValueError, TypeError, RuntimeError, AttributeError):
             _log.debug("_handle_token_fallbacks: get_tokens failed")
             return
-        for i, tok in enumerate(tokens):
-            if (tok.kind.name == "IDENTIFIER"
-                    and i + 3 < len(tokens)
-                    and tokens[i + 1].spelling in (".", "->")
-                    and tokens[i + 2].kind.name == "IDENTIFIER"
-                    and tokens[i + 3].spelling == "("):
-                target_usr = _resolve_method_usr(
-                    tokens[i + 2].spelling, qn_to_usr, tok.spelling, caller_qn,
-                )
-                if target_usr:
-                    _add_ref(refs, seen_ref, target_usr, loc.file.name, loc.line, cur_fn, "call")
-                else:
-                    _log.debug("Token fallback: no USR for %s.%s() at %s:%d",
-                               tok.spelling, tokens[i + 2].spelling, loc.file.name, loc.line)
-            if (tok.kind.name == "IDENTIFIER"
-                    and i + 1 < len(tokens)
-                    and tokens[i + 1].spelling == "("
-                    and (i == 0 or tokens[i - 1].spelling not in (".", "->"))):
-                target_usr = _resolve_method_usr(tok.spelling, qn_to_usr, caller_qn=caller_qn)
-                if target_usr:
-                    _add_ref(refs, seen_ref, target_usr, loc.file.name, loc.line, cur_fn, "call")
         # Callback-style indirect targets: `&Class::method` passed as a call
         # argument (e.g. `_timeout.attach(callback(&WDT::_timeout_interrupt), delay)`).
         # libclang often resolves the outer call (attach) but leaves the
@@ -2937,16 +2923,6 @@ def _handle_token_fallbacks(cursor: cx.Cursor, cur_fn: str | None,
                         from_usr=cur_fn,
                     ))
 
-# Keywords and built-in operators that the bare-call regex in
-# _run_source_line_fallback must not emit as call edges.
-# A frozenset gives O(1) containment check and prevents accidental
-# mutation across the module's lifetime.
-_BARE_CALL_KEYWORD_DENYLIST: frozenset[str] = frozenset({
-    'if', 'while', 'for', 'return', 'switch', 'catch',
-    'sizeof', 'decltype', 'typeof', 'alignof', 'noexcept',
-    'static_cast', 'dynamic_cast', 'const_cast', 'reinterpret_cast',
-})
-
 def _run_source_line_fallback(
     tu: cx.TranslationUnit,
     refs: list[Reference],
@@ -2958,35 +2934,34 @@ def _run_source_line_fallback(
     usr_to_qn: dict[str, str],
     _log,
 ) -> None:
-    """Post-processing: scan source lines inside known function bodies for
-    template-obscured patterns and emit missing references.
+    """Post-processing: scan the source lines of known function bodies for
+    patterns that the AST leaves opaque, and emit indirect references.
 
-    Operates in four sequential phases per source line:
+    WHY no call edge: the scan once also read ``obj.method(`` and bare
+    ``name(`` on each line without an AST call edge, and it took the target
+    from the name.  It read comments, inactive ``#if`` lines and definition
+    lines too, and the name lookup took the method of the class of the
+    caller or a symbol of the same name in another class.  The compiler
+    gives each direct call that the code makes; a name gives no more.
 
-    **Phase 1 — obj.method() fallback**: regex-matches ``obj.method(`` patterns
-    on lines NOT already covered by AST-extracted call/indirect edges.  Uses
-    ``_resolve_method_usr`` with the field name as a disambiguation hint.
-    When the matched method name is in ``_DISPATCH_METHOD_NAMES``, also
-    scans for ``&Class::callback`` arguments and records ``PendingDispatch``.
+    Three phases per source line remain until a later step resolves the
+    indirect calls from the assignments, with no names.  They keep their
+    old numbers, which comments and tests use; phase 2 (bare ``name(``) is
+    gone:
 
-    **Phase 2 — bare call fallback**: matches ``function(args)`` and
-    ``function<T>(args)`` patterns (excluding language keywords in
-    ``_BARE_CALL_KEYWORD_DENYLIST``).  Suppresses self-references on the
-    function's own definition line — the regex would otherwise match the
-    declaration signature as a self-call.
+    **Phase 1 — dispatch API detection**: for ``obj.method(`` with a method
+    name in ``_DISPATCH_METHOD_NAMES``, scans for ``&Class::callback``
+    arguments and records a ``PendingDispatch``.
 
-    **Phase 3 — type-erased ISR registration**: detects patterns like
+    **Phase 3 — type-erased ISR registration**: detects patterns like
     ``NVIC_SetVector(IRQn, (uint32_t)handler)`` where the integer cast
     obliterates the function-pointer type.  Uses ``_TYPE_ERASED_ISR_FUNCTIONS``
     (a registry of known ISR-registration function names mapped to their
     handler-argument position) and attempts to resolve the handler name
     through both ``&Class::method`` regex and bare-name lookup.
 
-    **Phase 4 — &Class::method on source text**: a final blanket scan for
-    ``&Class::method`` patterns.  This runs on raw source text, not AST
-    cursors, so it fires even when the TU is too degraded for libclang to
-    produce ``CALL_EXPR`` cursors (common in embedded mbed-os builds where
-    the AST-based ``_handle_token_fallbacks`` cannot see empty bodies).
+    **Phase 4 — &Class::method on source text**: a final blanket scan for
+    ``&Class::method`` patterns on raw source text.
 
     Each phase uses ``seen_ref`` for deduplication — a reference already
     found by an earlier phase or the AST walk is never re-emitted.
@@ -2997,13 +2972,6 @@ def _run_source_line_fallback(
     _lines_with_calls: set[int] = {
         r.from_line for r in refs
         if r.ref_kind in ("call", "indirect") and r.from_file == _tu_file
-    }
-    # Map each function's definition start line → its USR.  Used to suppress
-    # the false self-reference created when the bare-call regex matches the
-    # function's OWN name in its definition signature (e.g. ``void WDT::
-    # wdt_reset(`` → a self-caller edge at the definition line).
-    _fn_def_lines: dict[int, str] = {
-        _fn_start: _fn_usr for _fn_usr, _fn_start, _fn_end in _fn_spans
     }
     # The text that the parse read, not the disk now: the line numbers below
     # meet the extents of that parse.  A read of the disk after the parse
@@ -3026,85 +2994,42 @@ def _run_source_line_fallback(
         if _line_fn is None:
             continue
         _line_qn = usr_to_qn.get(_line_fn or "") or ""
-        # ── Phase 1: obj.method() fallback ─────────────────────────────
-        # Matches ``field.method(...)`` or ``field->method(...)`` patterns.
-        # Runs only on lines NOT already covered by AST-extracted call/indirect
-        # edges (checked via _lines_with_calls fast-path above).
-        # _resolve_method_usr uses the field name hint for receiver-class
-        # disambiguation — e.g. ``_timeout.attach(...)`` resolves to
-        # ``Timeout::attach`` because the field is named ``_timeout``.
+        # ── Phase 1: dispatch API detection ────────────────────────────
+        # The regex reads ``field.method(`` and ``field->method(``.  It
+        # writes NO call edge: a target taken from the name of the method
+        # is a guess (the class of the caller, a method of another class).
+        # It only finds a dispatch call (``queue.call(&Class::cb)``) and
+        # records a PendingDispatch, until a later step resolves the
+        # indirect calls from the assignments, with no names.
         for _m in _re.finditer(r'(\w+)(?:\.|->)(\w+)\s*\(', _line):
             _field_name = _m.group(1)
             _method_name = _m.group(2)
+            if _method_name not in _DISPATCH_METHOD_NAMES:
+                continue
             _target_usr = _resolve_method_usr(_method_name, qn_to_usr, _field_name, _line_qn)
             if _target_usr:
-                _key = (_target_usr, _tu_file, _lineno, _line_fn, "call")
-                if _key not in seen_ref:
-                    seen_ref.add(_key)
-                    refs.append(Reference(
-                        to_usr=_target_usr,
-                        from_file=_tu_file,
-                        from_line=_lineno,
-                        from_usr=_line_fn,
-                        ref_kind="call",
-                    ))
-                # ── Dispatch API detection ──────────────────────────────
-                if _method_name in _DISPATCH_METHOD_NAMES:
-                    # Look up the matched method's QN to check against
-                    # _DISPATCH_ENTRY_POINTS (which maps callee QN → entry QN)
-                    _dispatch_callee_qn = ""
-                    for _dq in _DISPATCH_ENTRY_POINTS:
-                        if qn_to_usr.get(_dq) == _target_usr:
-                            _dispatch_callee_qn = _dq
-                            break
-                    if _dispatch_callee_qn:
-                        # Find callback targets in &Class::method arguments
-                        for _cm in _re.finditer(r'&(\w+)::(\w+)', _line):
-                            _partial = f"{_cm.group(1)}::{_cm.group(2)}"
-                            _cb_usr = _resolve_partial_qn(_partial, qn_to_usr)
-                            if _cb_usr:
-                                pending_dispatches.append(PendingDispatch(
-                                    callee_qn=_dispatch_callee_qn,
-                                    target_qn_partial=_partial,
-                                    target_name=_cm.group(2),
-                                    target_usr=_cb_usr,
-                                    file=_tu_file,
-                                    line=_lineno,
-                                    caller_usr=_line_fn,
-                                ))
-            else:
-                _log.debug(
-                    "Source-line fallback: no USR for %s.%s() at %s:%d",
-                    _field_name, _method_name, _tu_file, _lineno,
-                )
-        # ── Phase 2: bare call fallback ────────────────────────────────
-        # Matches ``func(args)`` or ``func<T>(args)`` — direct function
-        # calls without a receiver object.  Filters out C/C++ keywords via
-        # _BARE_CALL_KEYWORD_DENYLIST (e.g. ``if(x)`` is not a call to
-        # function ``if``).  Suppresses the self-reference false-positive:
-        # a bare match of the enclosing function's own name on its
-        # definition line is the declaration signature, not a recursive
-        # call (e.g. ``void wdt_reset(void)`` matches ``wdt_reset(``).
-        # Bare call fallback: function(args) or function<T>(args)
-        for _m in _re.finditer(r'(?<![.\w])(\w+)(<[^>]+>)?\s*\(', _line):
-            _method_name = _m.group(1)
-            if _method_name in _BARE_CALL_KEYWORD_DENYLIST:
-                continue
-            _target_usr = _resolve_method_usr(_method_name, qn_to_usr, caller_qn=_line_qn)
-            if not _target_usr:
-                continue
-            # Suppress the false self-reference: a bare match of the enclosing
-            # function's own name on its definition start line is the
-            # declaration signature, not a call to itself.
-            if (_target_usr == _line_fn and _fn_def_lines.get(_lineno) == _line_fn):
-                continue
-            _key = (_target_usr, _tu_file, _lineno, _line_fn, "call")
-            if _key not in seen_ref:
-                seen_ref.add(_key)
-                refs.append(Reference(
-                    to_usr=_target_usr, from_file=_tu_file,
-                    from_line=_lineno, from_usr=_line_fn, ref_kind="call",
-                ))
+                # Look up the matched method's QN to check against
+                # _DISPATCH_ENTRY_POINTS (which maps callee QN → entry QN)
+                _dispatch_callee_qn = ""
+                for _dq in _DISPATCH_ENTRY_POINTS:
+                    if qn_to_usr.get(_dq) == _target_usr:
+                        _dispatch_callee_qn = _dq
+                        break
+                if _dispatch_callee_qn:
+                    # Find callback targets in &Class::method arguments
+                    for _cm in _re.finditer(r'&(\w+)::(\w+)', _line):
+                        _partial = f"{_cm.group(1)}::{_cm.group(2)}"
+                        _cb_usr = _resolve_partial_qn(_partial, qn_to_usr)
+                        if _cb_usr:
+                            pending_dispatches.append(PendingDispatch(
+                                callee_qn=_dispatch_callee_qn,
+                                target_qn_partial=_partial,
+                                target_name=_cm.group(2),
+                                target_usr=_cb_usr,
+                                file=_tu_file,
+                                line=_lineno,
+                                caller_usr=_line_fn,
+                            ))
         # ── Phase 3: Type-erased ISR registration detection ────────────
         # APIs like NVIC_SetVector(IRQn, (uint32_t)handler) where
         # libclang cannot see the fn-ptr because of the integer cast.

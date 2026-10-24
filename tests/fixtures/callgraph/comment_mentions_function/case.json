@@ -6,6 +6,5 @@
   "absent": [
     ["plan", "serve", 4, "call"]
   ],
-  "exact": true,
-  "xfail": "phase 1"
+  "exact": true
 }
