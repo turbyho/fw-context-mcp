@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 import yaml
 
-from fw_context_mcp.utils import is_fatal, resolve_real_binary, run_build_command
+from fw_context_mcp.utils import is_fatal, run_build_command
 
 from ..build_layout import COMPILE_COMMANDS_NAME, BuildLayout
 from . import _linker, registry
@@ -274,21 +274,13 @@ _FINAL_LINKER_SCRIPT = "linker.cmd"
 class ZephyrBuildSystem:
     """Zephyr RTOS build system (``west build``).
 
-    WHY ninja wrapper for .d files: Ninja deletes .d dependency files after
-    reading them by default (``-d keepdepfile`` is needed to persist them).
-    Zephyr's sysbuild uses Ninja as both outer and inner build tool.  The
-    wrapper shadows the real ninja binary in PATH with ``-d keepdepfile``
-    appended, ensuring .d files survive the build for header-change tracking.
-
-    WHY PATH injection (not CMAKE_MAKE_PROGRAM): sysbuild's
-    ExternalProject_Add does not forward CMAKE_MAKE_PROGRAM to the inner
-    Zephyr CMake project.  Injecting the wrapper via PATH works for both
-    the outer and inner Ninja invocations.
-
-    WHY CCACHE_DEPEND=1: ccache with ``depend_mode=false`` (default) skips
-    .d file regeneration on cache hits, meaning reindex can't detect which
-    headers a TU depends on.  Setting ``CCACHE_DEPEND=1`` forces ccache to
-    write .d files on every build, cache hit or not.
+    The build asks for no ``.d`` dependency files.  The manifest of the
+    index records the headers of each unit (from libclang), and no part of
+    fw-context reads a ``.d`` file.  An older version put a ninja wrapper
+    with ``-d keepdepfile`` first on PATH, set ``CCACHE_DEPEND=1`` and added
+    ``-MMD``.  The activate script of NCS puts its own ninja before the
+    wrapper, and the wrapper looked for ninja outside the environment of
+    the project.
     """
 
     name: str = "Zephyr"
@@ -316,8 +308,6 @@ class ZephyrBuildSystem:
 
         build_dir = BuildLayout(project_root).out_dir(cfg.variant_name)
 
-        _, env = self._prepare_ninja_wrapper(project_root)
-
         cmd: list[str] = [
             "west",
             "build",
@@ -339,15 +329,11 @@ class ZephyrBuildSystem:
 
         cmd.append("--")
         cmd.append("-DCMAKE_EXPORT_COMPILE_COMMANDS=ON")
-        # Inject .d dependency tracking via Zephyr's built-in EXTRA_CPPFLAGS
-        # mechanism (cmake/extra_flags.cmake).  This propagates -MMD through
-        # zephyr_interface to all Zephyr targets and survives sysbuild.
-        cmd.append("-DEXTRA_CPPFLAGS=-MMD")
 
         log.info("zephyr build: %s", " ".join(cmd))
         # NOTE: no timeout= — build commands can run for minutes; adding a fixed
         # timeout would break long builds.  Network-filesystem stalls remain a risk.
-        run_build_command(cmd, cwd=project_root, description="west build", env=env, build_cfg=cfg)
+        run_build_command(cmd, cwd=project_root, description="west build", build_cfg=cfg)
 
         # The database of the application stays beside its build.ninja,
         # which the linker pass reads.
@@ -426,45 +412,6 @@ class ZephyrBuildSystem:
         """
         return board.replace("_", "/")
 
-    def _prepare_ninja_wrapper(self, project_root: Path) -> tuple[str, dict[str, str]]:
-        """Create the ninja ``-d keepdepfile`` wrapper and return ``(dir, env)``.
-
-        WHY a wrapper: Ninja deletes ``.d`` depfiles after reading them by
-        default (``-d keepdepfile`` is needed to persist them).  The wrapper is
-        placed at PATH priority (not CMAKE_MAKE_PROGRAM) because sysbuild's
-        ExternalProject_Add does not forward CMAKE_MAKE_PROGRAM to the inner
-        Zephyr CMake project.
-
-        WHY resolve the REAL ninja: a pyenv/asdf shim re-execs ``ninja`` by
-        name; with the wrapper dir prepended to PATH that re-resolution finds
-        the wrapper again and recurses.
-
-        The returned env sets ``CCACHE_DEPEND=1`` (ccache with depend_mode=false
-        skips ``.d`` regeneration on cache hits) and prepends the wrapper dir to
-        PATH for both sysbuild (outer) and Zephyr (inner) CMake projects.
-        """
-        ninja = resolve_real_binary("ninja")
-        if ninja is None:
-            raise RuntimeError("ninja is required for Zephyr builds")
-        wrapper_dir = project_root / ".fw-context"
-        wrapper_dir.mkdir(parents=True, exist_ok=True)
-        ninja_wrapper = wrapper_dir / "ninja"
-        expected = f'#!/bin/sh\nexec "{ninja}" -d keepdepfile "$@"\n'
-        # Atomic write via temp file + rename — prevents TOCTOU between
-        # check and write where another process could replace the wrapper.
-        if not ninja_wrapper.exists() or ninja_wrapper.read_text(encoding="utf-8") != expected:
-            tmp_wrapper = wrapper_dir / ".ninja.tmp"
-            tmp_wrapper.write_text(expected, encoding="utf-8")
-            tmp_wrapper.chmod(0o755)
-            tmp_wrapper.rename(ninja_wrapper)
-
-        env = {
-            **os.environ,
-            "CCACHE_DEPEND": "1",
-            "PATH": f"{wrapper_dir}{os.pathsep}{os.environ.get('PATH', '')}",
-        }
-        return str(wrapper_dir), env
-
     def build_multi(
         self, project_root: Path, cfg: BuildConfig, variants: list | None = None,
     ) -> list[tuple[str, str, Path]]:
@@ -496,7 +443,6 @@ class ZephyrBuildSystem:
         if not cfg.variants:
             raise RuntimeError("build_multi() requires [[build.variants]] in config.")
 
-        _, env = self._prepare_ninja_wrapper(project_root)
         layout = BuildLayout(project_root)
         layout.ensure_ignored()
         results: list[tuple[str, str, Path]] = []
@@ -520,16 +466,14 @@ class ZephyrBuildSystem:
                 "--pristine=auto",
                 "--",
                 "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
-                "-DEXTRA_CPPFLAGS=-MMD",
             ]
 
-            variant_env = {**env, **(vcfg.env or {})}
+            # run_build_command applies vcfg.env (build_cfg_env).
             log.info("zephyr build_multi[%s]: %s", variant.name, " ".join(cmd))
             run_build_command(
                 cmd,
                 cwd=project_root,
                 description=f"west build --sysbuild ({variant.name})",
-                env=variant_env,
                 build_cfg=vcfg,
             )
 
@@ -718,7 +662,7 @@ class ZephyrBuildSystem:
             literal = str(path)
             if not path.is_file():
                 return
-            # Same marker resolve_real_binary() uses — pyenv and asdf share it.
+            # pyenv and asdf put each shim in a "/shims/" directory.
             is_shim = "/shims/" in literal
             # A non-shim candidate is deduplicated by its REAL path.
             # /usr/bin/nrfutil and /bin/nrfutil are one binary behind a

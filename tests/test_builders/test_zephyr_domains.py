@@ -114,7 +114,6 @@ class TestBuild:
 
         monkeypatch.setattr(zephyr.shutil, "which", lambda name: f"/usr/bin/{name}")
         monkeypatch.setattr(zephyr, "run_build_command", fake_run)
-        monkeypatch.setattr(ZephyrBuildSystem, "_prepare_ninja_wrapper", lambda self, root: ("", {}))
         return ZephyrBuildSystem().build(tmp_path, cfg), commands[0]
 
     def test_a_sysbuild_returns_the_database_of_the_application(self, tmp_path, monkeypatch):

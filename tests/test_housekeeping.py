@@ -546,6 +546,28 @@ class TestFiles:
         assert not toolchains.exists()
         assert report.removed_paths == [toolchains]
 
+    def test_the_old_ninja_wrapper_goes(self, tmp_path: Path, home: Path) -> None:
+        """The Zephyr and ESP-IDF builds wrote it, and no build uses it now."""
+        _project(tmp_path)
+        wrapper = tmp_path / ".fw-context" / "ninja"
+        wrapper.write_text('#!/bin/sh\nexec "/usr/bin/ninja" -d keepdepfile "$@"\n', encoding="utf-8")
+
+        report = clean(tmp_path)
+
+        assert not wrapper.exists()
+        assert report.removed_paths == [wrapper]
+
+    def test_a_ninja_file_of_the_user_stays(self, tmp_path: Path, home: Path) -> None:
+        """A doubt never removes a file: a different text is not the wrapper."""
+        _project(tmp_path)
+        own = tmp_path / ".fw-context" / "ninja"
+        own.write_text("#!/bin/sh\nexec /opt/ninja \"$@\"\n", encoding="utf-8")
+
+        report = clean(tmp_path)
+
+        assert own.exists()
+        assert own not in report.removed_paths
+
     def test_the_toolchains_file_goes_also_when_the_index_cannot_be_read(self, tmp_path: Path, home, monkeypatch) -> None:
         """Only the build output can be a database that an index reads."""
         _project(tmp_path)

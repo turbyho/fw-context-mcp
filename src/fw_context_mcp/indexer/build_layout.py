@@ -188,6 +188,35 @@ _LEGACY_DEPS_NAME = "deps"
 # ``config.settings._RETIRED_TOOLCHAINS_FILE``).
 _LEGACY_TOOLCHAINS_REL: Path = Path(".fw-context") / "toolchains.toml"
 
+# The ninja wrapper with ``-d keepdepfile`` that the Zephyr and ESP-IDF
+# builds wrote, and its temporary file.  The builds ask for no .d files
+# now, because no part of fw-context reads one.
+_LEGACY_NINJA_WRAPPERS_REL: tuple[Path, ...] = (
+    Path(".fw-context") / "ninja",
+    Path(".fw-context") / ".ninja.tmp",
+)
+
+
+def _is_legacy_ninja_wrapper(path: Path) -> bool:
+    """Say if *path* holds the ninja wrapper as fw-context wrote it.
+
+    The wrapper was ``#!/bin/sh`` and one ``exec "<ninja>" -d keepdepfile
+    "$@"`` line.  A file of the user with the same name has a different
+    text, and it stays: a doubt never removes a file.
+    """
+    if not path.is_file() or path.is_symlink():
+        return False
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return False
+    return (
+        len(lines) == 2
+        and lines[0] == "#!/bin/sh"
+        and lines[1].startswith('exec "')
+        and lines[1].endswith('" -d keepdepfile "$@"')
+    )
+
 
 def _is_legacy_database(path: Path) -> bool:
     """Say if *path* is a copy of a database in the build root, as fw-context wrote it before this layout.
@@ -200,7 +229,7 @@ def _is_legacy_database(path: Path) -> bool:
 
 
 def _legacy_candidates(project_root: Path) -> list[Path]:
-    """Return the paths of the layout before this one that are there, and the retired allowlist.
+    """Return the paths of the layout before this one that are there, the retired allowlist and the ninja wrapper.
 
     A directory in the build root is the directory of a variant when it
     holds ``out/``: then it stays, also when its name is ``deps``, also on a
@@ -211,6 +240,10 @@ def _legacy_candidates(project_root: Path) -> list[Path]:
     toolchains = project_root / _LEGACY_TOOLCHAINS_REL
     if toolchains.is_file() and not toolchains.is_symlink():
         candidates.append(toolchains)
+    candidates += [
+        project_root / rel for rel in _LEGACY_NINJA_WRAPPERS_REL
+        if _is_legacy_ninja_wrapper(project_root / rel)
+    ]
     autobuild = project_root / _LEGACY_AUTOBUILD_REL
     if autobuild.exists() or autobuild.is_symlink():
         candidates.append(autobuild)

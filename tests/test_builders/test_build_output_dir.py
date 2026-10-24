@@ -55,7 +55,6 @@ def esp_idf_project(tmp_path: Path, monkeypatch) -> tuple[Path, list[list[str]]]
 
     monkeypatch.setattr(mod, "run_build_command", fake_run)
     monkeypatch.setattr(mod.shutil, "which", lambda n: f"/usr/bin/{n}")
-    monkeypatch.setattr(mod, "resolve_real_binary", lambda n: Path(f"/usr/bin/{n}"))
     return root, calls
 
 
@@ -90,6 +89,27 @@ class TestESPIDFOutputDirectory:
         build_cmd = next(c for c in calls if "build" in c)
         assert build_cmd[build_cmd.index("-B") + 1] == str(_out(root))
 
+    def test_the_build_asks_for_no_dependency_files(self, esp_idf_project, monkeypatch):
+        """No ninja wrapper, no -MMD and no CCACHE_DEPEND: no part of fw-context reads a .d file."""
+        import fw_context_mcp.indexer.builders.esp_idf as mod
+        from fw_context_mcp.indexer.builders.esp_idf import ESPIDFBuildSystem
+
+        root, _ = esp_idf_project
+        envs: list[dict] = []
+        recorded = mod.run_build_command
+
+        def keep_env(cmd, cwd=None, description="", env=None, build_cfg=None, timeout=None):
+            envs.append(dict(env or {}))
+            return recorded(cmd, cwd=cwd, description=description, env=env, build_cfg=build_cfg, timeout=timeout)
+
+        monkeypatch.setattr(mod, "run_build_command", keep_env)
+
+        ESPIDFBuildSystem().build(root, replace(BuildConfig(), clean=False))
+
+        assert envs and all("-MMD" not in env.get("EXTRA_CFLAGS", "") for env in envs)
+        assert all("CCACHE_DEPEND" not in env for env in envs)
+        assert not (root / ".fw-context" / "ninja").exists()
+
     def test_the_error_names_the_directory_it_looked_in(self, tmp_path: Path, monkeypatch):
         import fw_context_mcp.indexer.builders.esp_idf as mod
         from fw_context_mcp.indexer.builders.esp_idf import ESPIDFBuildSystem
@@ -101,7 +121,6 @@ class TestESPIDFOutputDirectory:
 
         monkeypatch.setattr(mod, "run_build_command", lambda *a, **kw: _Result())  # writes nothing
         monkeypatch.setattr(mod.shutil, "which", lambda n: f"/usr/bin/{n}")
-        monkeypatch.setattr(mod, "resolve_real_binary", lambda n: Path(f"/usr/bin/{n}"))
 
         with pytest.raises(RuntimeError, match=r"default/out"):
             ESPIDFBuildSystem().build(root, replace(BuildConfig(), clean=False))
@@ -160,7 +179,6 @@ class TestESPIDFLeavesSdkconfigAlone:
 
         monkeypatch.setattr(mod, "run_build_command", fake_run)
         monkeypatch.setattr(mod.shutil, "which", lambda n: f"/usr/bin/{n}")
-        monkeypatch.setattr(mod, "resolve_real_binary", lambda n: Path(f"/usr/bin/{n}"))
 
         ESPIDFBuildSystem().build(root, replace(BuildConfig(), clean=False))
 
@@ -250,12 +268,18 @@ class TestEveryBackendBuildsIntoTheOutputDirectory:
         def on_call(cmd, env, cwd):
             self._write_cc(Path(cmd[cmd.index("-d") + 1]))
 
-        self._record(monkeypatch, mod, on_call)
-        monkeypatch.setattr(mod.ZephyrBuildSystem, "_prepare_ninja_wrapper", lambda self, root: ("", {}))
+        calls = self._record(monkeypatch, mod, on_call)
 
         result = mod.ZephyrBuildSystem().build(tmp_path, BuildConfig(board="nrf52840dk/nrf52840"))
 
         assert result == _out(tmp_path) / "compile_commands.json"
+        # No .d files: no part of fw-context reads one (the manifest records
+        # the headers), and the ninja wrapper looked for ninja outside the
+        # environment of the project.
+        command, env = calls[0]
+        assert not any("-MMD" in arg for arg in command)
+        assert "CCACHE_DEPEND" not in env
+        assert not (tmp_path / ".fw-context" / "ninja").exists()
 
     def test_mbed(self, tmp_path: Path, monkeypatch):
         import fw_context_mcp.indexer.builders.mbed_os as mod

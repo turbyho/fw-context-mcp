@@ -9,7 +9,7 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from fw_context_mcp.utils import resolve_real_binary, run_build_command
+from fw_context_mcp.utils import run_build_command
 
 from ..build_layout import COMPILE_COMMANDS_NAME, BuildLayout
 from . import _linker, registry
@@ -118,27 +118,10 @@ class ESPIDFBuildSystem:
             except RuntimeError:
                 pass  # clean is best-effort — build dir may not exist yet
 
-        # Ninja deletes .d depfiles after reading them by default.
-        # Create a wrapper that adds -d keepdepfile so .d files persist
-        # for incremental re-indexing.
-        #
-        # Resolve the REAL ninja binary, not a pyenv/asdf shim: the shim
-        # re-execs `ninja` by name, and since the wrapper dir is prepended
-        # to PATH below, that re-resolution would find the wrapper again
-        # and recurse (appending -d keepdepfile each cycle).
-        ninja = resolve_real_binary("ninja")
-        if ninja is None:
-            raise RuntimeError("ninja is required for ESP-IDF builds")
-        wrapper_dir = project_root / ".fw-context"
-        wrapper_dir.mkdir(parents=True, exist_ok=True)
-        ninja_wrapper = wrapper_dir / "ninja"
-        expected = f'#!/bin/sh\nexec "{ninja}" -d keepdepfile "$@"\n'
-        if not ninja_wrapper.exists() or ninja_wrapper.read_text(encoding="utf-8") != expected:
-            tmp_wrapper = wrapper_dir / ".ninja.tmp"
-            tmp_wrapper.write_text(expected, encoding="utf-8")
-            tmp_wrapper.chmod(0o755)
-            tmp_wrapper.rename(ninja_wrapper)
-
+        # The build asks for no .d dependency files: the manifest of the
+        # index records the headers of each unit, and no part of fw-context
+        # reads a .d file.  An older version put a ninja wrapper with
+        # `-d keepdepfile` first on PATH and added -MMD and CCACHE_DEPEND=1.
         env = dict(os.environ)
         if cfg.idf_path:
             env["IDF_PATH"] = cfg.idf_path
@@ -150,22 +133,11 @@ class ESPIDFBuildSystem:
         if not os.environ.get("ESP_ROM_ELF_DIR"):
             env["ESP_ROM_ELF_DIR"] = "/dev/null"
 
-        # Prepend our ninja wrapper directory to PATH so Ninja keeps .d files.
-        # Also enable ccache depend_mode so .d files are regenerated on cache hits.
-        env["PATH"] = f"{wrapper_dir}{os.pathsep}{env['PATH']}"
-        env["CCACHE_DEPEND"] = "1"
-
-        # Inject .d dependency tracking via EXTRA_CFLAGS / EXTRA_CXXFLAGS.
-        # These environment variables are respected by the ESP-IDF build system
-        # and appended to compiler flags without overriding the toolchain.
-        env.pop("EXTRA_CFLAGS", None)  # Don't inherit from parent env
+        # The ESP-IDF build appends EXTRA_CFLAGS / EXTRA_CXXFLAGS to the
+        # flags of each unit.  A value from the shell of the operator does
+        # not go into the build of the index, as before.
         env["EXTRA_CFLAGS"] = ""
-        env.pop("EXTRA_CXXFLAGS", None)  # Don't inherit from parent env
         env["EXTRA_CXXFLAGS"] = ""
-        if "-MMD" not in env["EXTRA_CFLAGS"]:
-            env["EXTRA_CFLAGS"] += " -MMD" if env["EXTRA_CFLAGS"] else "-MMD"
-        if "-MMD" not in env["EXTRA_CXXFLAGS"]:
-            env["EXTRA_CXXFLAGS"] += " -MMD" if env["EXTRA_CXXFLAGS"] else "-MMD"
 
         # Configure the build directory when it holds no cmake cache.
         #

@@ -26,7 +26,6 @@ import logging
 import os
 import re
 import shlex
-import shutil
 import signal
 import socket
 import sqlite3
@@ -83,7 +82,6 @@ __all__ = [
     "read_file_lines",
     "record_build_groups",
     "resolve_project_root",
-    "resolve_real_binary",
     "run_in_process_group",
     "staging_owner",
     "stop_process_group",
@@ -680,48 +678,6 @@ def run_build_command(
             f"{_quote_stream('stderr', result.stderr)}"
         )
     return result
-
-def resolve_real_binary(name: str) -> str | None:
-    """Resolve *name* to a real binary, skipping version-manager shims.
-
-    ``shutil.which`` returns the first match on PATH, which for tools
-    installed through pyenv/asdf is a shim script that re-execs *name*
-    by looking it up on PATH again.  When a build prepends a wrapper
-    directory to PATH (the ninja ``-d keepdepfile`` wrapper), that
-    re-resolution picks up the wrapper and recurses infinitely — each
-    cycle appends another flag until the argument list overflows.
-
-    WHY a PATH scan instead of trusting ``shutil.which``: a shim
-    re-resolves the program by name, so the only reliable way to get a
-    real executable is to walk PATH and skip known shim directories
-    (``/shims/`` — pyenv and asdf both use this layout).
-
-    Returns the first non-shim match, or the shim itself as a last
-    resort when no real binary exists (preserving the old
-    ``shutil.which`` behaviour for callers that only need a path).
-    """
-    which = shutil.which(name)
-    if which is None:
-        return None
-
-    _SHIM_MARKERS = ("/shims/",)
-
-    def _is_shim(p: str) -> bool:
-        return any(m in p for m in _SHIM_MARKERS)
-
-    if not _is_shim(which):
-        return which
-
-    for entry in os.environ.get("PATH", "").split(os.pathsep):
-        if not entry:
-            continue
-        candidate = Path(entry) / name
-        if not candidate.is_file() or not os.access(candidate, os.X_OK):
-            continue
-        if _is_shim(str(candidate)):
-            continue
-        return str(candidate)
-    return which
 
 
 class AmbiguousProjectError(ValueError):
