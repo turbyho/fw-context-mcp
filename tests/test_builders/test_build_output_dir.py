@@ -91,6 +91,31 @@ class TestESPIDFOutputDirectory:
         build_cmd = next(c for c in calls if "build" in c)
         assert build_cmd[build_cmd.index("-B") + 1] == str(_out(root))
 
+    def test_the_build_does_not_give_back_bash_env(self, esp_idf_project, monkeypatch):
+        """The overrides of the build must not carry BASH_ENV of the process.
+
+        build_env() removes BASH_ENV and then applies the overrides.  The
+        ESP-IDF build gave a full copy of os.environ as overrides, thus
+        BASH_ENV came back, and `bash -c` of activate ran the hook of a harness.
+        """
+        import fw_context_mcp.indexer.builders.esp_idf as mod
+        from fw_context_mcp.indexer.builders.esp_idf import ESPIDFBuildSystem
+
+        root, _ = esp_idf_project
+        monkeypatch.setenv("BASH_ENV", "/harness/hook.sh")
+        overrides: list[dict] = []
+        recorded = mod.run_build_command
+
+        def keep_env(cmd, cwd=None, description="", env=None, build_cfg=None, timeout=None):
+            overrides.append(dict(env or {}))
+            return recorded(cmd, cwd=cwd, description=description, env=env, build_cfg=build_cfg, timeout=timeout)
+
+        monkeypatch.setattr(mod, "run_build_command", keep_env)
+
+        ESPIDFBuildSystem().build(root, replace(BuildConfig(), clean=False))
+
+        assert overrides and all("BASH_ENV" not in env for env in overrides)
+
     def test_the_build_asks_for_no_dependency_files(self, esp_idf_project, monkeypatch):
         """No ninja wrapper, no -MMD and no CCACHE_DEPEND: no part of fw-context reads a .d file."""
         import fw_context_mcp.indexer.builders.esp_idf as mod

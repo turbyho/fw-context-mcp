@@ -126,7 +126,12 @@ class ESPIDFBuildSystem:
         # index records the headers of each unit, and no part of fw-context
         # reads a .d file.  An older version put a ninja wrapper with
         # `-d keepdepfile` first on PATH and added -MMD and CCACHE_DEPEND=1.
-        env = dict(os.environ)
+        #
+        # Only the overrides go here: build_env() gives the inherited
+        # environment without the shell startup hooks (BASH_ENV), and it
+        # applies these values after that removal.  A full copy of
+        # os.environ put BASH_ENV back into each idf.py build.
+        env: dict[str, str] = {}
         if cfg.idf_path:
             env["IDF_PATH"] = cfg.idf_path
 
