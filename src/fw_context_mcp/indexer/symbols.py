@@ -3084,6 +3084,34 @@ class ExtractionResult:
     macros: list = field(default_factory=list)
     pending_dispatches: list = field(default_factory=list)
     newly_seen_files: set[str] = field(default_factory=set)
+    # The error diagnostics of the parse (see _parse_diagnostics).
+    parse_errors: int = 0
+    parse_fatal: bool = False
+    parse_first_error: str = ""
+
+
+def _parse_diagnostics(tu: cx.TranslationUnit) -> tuple[int, bool, str]:
+    """Give the count of the error diagnostics of *tu*, whether one is fatal, and the first one.
+
+    WHY the index keeps them: a parse with errors can hide code.  After a
+    fatal error ("too many errors") clang stops and instantiates no
+    template, thus calls and symbols are missing from the index.  On 4 Mbed
+    projects that once cost 76 to 216 units each, and nothing told the user
+    (plans of 2026-10-05).  A non-fatal error is reported too: the parse goes
+    on, but a new one can be the first sign of a wrong flag or header.
+
+    The first error carries the name and the line of its file, not the
+    whole path: the text is for a person who reads the status of a build.
+    """
+    errors = [d for d in tu.diagnostics if d.severity >= cx.Diagnostic.Error]
+    if not errors:
+        return 0, False, ""
+    fatal = any(d.severity == cx.Diagnostic.Fatal for d in errors)
+    first = errors[0]
+    where = ""
+    if first.location.file:
+        where = f" ({Path(first.location.file.name).name}:{first.location.line})"
+    return len(errors), fatal, f"{first.spelling}{where}"[:300]
 
 def extract_all(
     unit: CompilationUnit,
@@ -3137,6 +3165,7 @@ def extract_all(
         options=cx.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD,
     )
     _t_parse = _time.monotonic() - _t_start
+    parse_errors, parse_fatal, parse_first_error = _parse_diagnostics(tu)
 
     cwd = unit.directory
 
@@ -3202,6 +3231,7 @@ def extract_all(
             tu=tu if return_tu else None, symbols=symbols, references=[],
             inheritance=inheritance, indirect_call_sites=[], fp_assignments=[],
             macros=macros, newly_seen_files=_newly_seen,
+            parse_errors=parse_errors, parse_fatal=parse_fatal, parse_first_error=parse_first_error,
         )
         return result
 
@@ -3221,5 +3251,6 @@ def extract_all(
         inheritance=inheritance, indirect_call_sites=indirect_call_sites,
         fp_assignments=fp_assignments, macros=macros,
         pending_dispatches=pending_dispatches, newly_seen_files=_newly_seen,
+        parse_errors=parse_errors, parse_fatal=parse_fatal, parse_first_error=parse_first_error,
     )
     return result

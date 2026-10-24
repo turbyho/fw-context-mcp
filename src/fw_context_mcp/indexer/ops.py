@@ -1339,6 +1339,8 @@ def _store_macros_for_unit(
     if macro_rows:
         insert_macros_batch(conn, macro_rows)
 
+
+
 def store_symbols_for_unit(
     conn,
     unit,
@@ -1574,6 +1576,14 @@ def store_symbols_for_unit(
             mtime=current_mtime,
             source_hash=file_hashes.get(unit.file.resolve(), ""),
         )
+
+    # The row of the main file holds the diagnostics of the parse of its
+    # unit, thus an unchanged unit keeps the values of its last parse and the
+    # status of the build counts every unit, also after an incremental run.
+    conn.execute(
+        "UPDATE files SET parse_errors = ?, parse_fatal = ?, parse_first_error = ? WHERE id = ?",
+        (result.parse_errors, int(result.parse_fatal), result.parse_first_error, tu_file_id),
+    )
 
     syms_added = 0
     refs_added = 0

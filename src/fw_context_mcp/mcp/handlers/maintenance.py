@@ -474,6 +474,67 @@ def _analysis_of(conn, config_hash: str) -> tuple[dict, bool]:
     return make_analysis_summary(coverage, stored_analyze_vendor, models), stored_analyze_vendor
 
 
+# The count of first errors that ``parse_errors`` lists.  The units with a
+# fatal error come first, because only those lose code.
+_PARSE_ERRORS_SHOWN = 3
+
+
+def _parse_errors(conn, config_hash: str) -> dict:
+    """Return the parse errors of the units of a build: the counts, and the first errors.
+
+    WHY always counts and a warning only for a fatal error (decision of
+    the user, 2026-10-24): after a fatal error clang stops, thus symbols and
+    calls of that unit are missing, and a reindex gives the same result.
+    A non-fatal error leaves the parse complete, and some are known and
+    harmless (an attribute that libclang 18 does not know), thus a warning
+    for each would hide the fatal one.
+
+    The row of the main file of each unit holds the values of its last
+    parse (``ops.store_symbols_for_unit``), and a header row holds 0, thus
+    the sums count units and not headers.  A file that compile_commands.json
+    lists more than once has one row, thus it counts once, with the values
+    of the listing that the last run parsed (decision of the user,
+    2026-10-24): ``header_affected_tus`` also counts such a file once.
+    """
+    counts = conn.execute(
+        "SELECT COUNT(*) AS units, COALESCE(SUM(parse_errors), 0) AS errors, "
+        "COALESCE(SUM(parse_fatal), 0) AS fatal FROM files "
+        "WHERE config_hash = ? AND parse_errors > 0",
+        (config_hash,),
+    ).fetchone()
+    first = conn.execute(
+        "SELECT path, parse_first_error, parse_fatal FROM files "
+        "WHERE config_hash = ? AND parse_errors > 0 "
+        "ORDER BY parse_fatal DESC, parse_errors DESC, path LIMIT ?",
+        (config_hash, _PARSE_ERRORS_SHOWN),
+    ).fetchall()
+    return {
+        "units": counts["units"],
+        "errors": counts["errors"],
+        "fatal_units": counts["fatal"],
+        "first": [
+            {"file": row["path"], "error": row["parse_first_error"], "fatal": bool(row["parse_fatal"])}
+            for row in first
+        ],
+    }
+
+
+def _parse_fatal_note(parse_errors: dict | None) -> str:
+    """Return the warning of the units that stopped at a fatal parse error, or "".
+
+    Not a reindex reason: a reindex parses with the same flags and headers,
+    thus it gives the same error.  The text names what a repair changes.
+    """
+    if not parse_errors or not parse_errors["fatal_units"]:
+        return ""
+    first = next(entry for entry in parse_errors["first"] if entry["fatal"])
+    return (
+        f" | Parse: {parse_errors['fatal_units']} unit(s) stopped at a fatal error, thus their "
+        f"symbols and calls can be missing (first: {first['file']}: {first['error']}). "
+        "A reindex gives the same result: the flags or the headers of these units need a repair"
+    )
+
+
 def _build_health(
     conn,
     target: _IndexTarget,
@@ -564,6 +625,10 @@ def _build_health(
     stored_format = stored_row_format(cfg)
     row_format_old = row_format_is_older(stored_format)
     row_format_newer = row_format_is_newer(stored_format)
+    # None for an index of an older row format: its run did not record the
+    # errors, and the columns that the migration added hold 0 there, which
+    # is not "no error".
+    parse_errors = None if row_format_old else _parse_errors(conn, config_hash)
 
     # ── The build: what the last run found, and what is there now ──
     # The marker is the text of the last index run that stopped without
@@ -938,6 +1003,7 @@ def _build_health(
             # it is not sufficient: the reason names what to repair before
             # the run, or that the run needs `--build`.
             index_message += " — run `fw-context index` for a changed header"
+    index_message += _parse_fatal_note(parse_errors)
 
     # Another action of this message comes first: the run of a reason or
     # of a degraded index also does the analysis and the embeddings, and a
@@ -987,6 +1053,7 @@ def _build_health(
         "reference_count": ref_count,
         "modified_files_count": modified_count,
         "header_affected_tus": header_affected_tus,
+        "parse_errors": parse_errors,
         "analysis": analysis if detail else None,
         "manifest_verification": manifest_verification,
         "description": cfg["description"] if "description" in cfg.keys() else "",
@@ -1094,7 +1161,7 @@ _INTERNAL_HEALTH_KEYS = frozenset({
 # The fields of one build in the `builds` list of get_project_status.
 _BUILD_ROW_FIELDS = (
     "symbol_count", "file_count", "indexed_at", "status", "reindex_state", "reindex_needed", "stale",
-    "modified_files_count", "header_affected_tus",
+    "modified_files_count", "header_affected_tus", "parse_errors",
 )
 
 
@@ -1195,6 +1262,28 @@ def _project_embedding_note(labels: list[str], healths: list[dict], bg_running: 
     )
 
 
+def _project_parse_note(labels: list[str], healths: list[dict]) -> str:
+    """Return the warning of a project of several builds about fatal parse errors, or "".
+
+    The counterpart of :func:`_parse_fatal_note`: one count for each build
+    and no sum, as in :func:`_project_analysis_note`.  The first errors are
+    in ``parse_errors`` of each entry of ``builds``.
+    """
+    fatal = [
+        (label, health["parse_errors"]["fatal_units"])
+        for label, health in zip(labels, healths, strict=True)
+        if health["parse_errors"] and health["parse_errors"]["fatal_units"]
+    ]
+    if not fatal:
+        return ""
+    listing = ", ".join(f"{label}: {count}" for label, count in fatal)
+    return (
+        f" Units stopped at a fatal parse error in {len(fatal)} of {len(healths)} builds ({listing}), "
+        "thus their symbols and calls can be missing. A reindex gives the same result: read "
+        "parse_errors in builds for the first errors."
+    )
+
+
 def _project_health(builds: list, healths: list[dict], bg_running: bool) -> dict:
     """Join the health of several builds into the health of the project.
 
@@ -1258,6 +1347,7 @@ def _project_health(builds: list, healths: list[dict], bg_running: bool) -> dict
         )
     message += _project_analysis_note(labels, healths, bg_running)
     message += _project_embedding_note(labels, healths, bg_running)
+    message += _project_parse_note(labels, healths)
     result = {
         "status": status,
         "reindex_needed": status == "reindex_needed",
@@ -1336,6 +1426,17 @@ def get_project_status(
     from quick checks only. A query thus can miss a changed header, a
     changed file that its answer does not name, or a new source file when
     its answer is not empty. This tool does the full check.
+
+    ``parse_errors`` of a build counts the units whose parse gave an
+    error: ``units``, ``errors``, ``fatal_units``, and ``first`` (at most
+    3, the fatal ones first, each ``{file, error, fatal}``).  After a fatal
+    error the compiler stops, thus symbols and calls of that unit can be
+    missing, and ``index_message`` says so.  A reindex gives the same
+    result: the flags or the headers need a repair.  A non-fatal error
+    leaves the parse complete.  A unit that libclang did not load is not
+    counted: the index log names it ("skip TU").  A file that
+    compile_commands.json lists more than once counts once.  ``null``: the
+    index has an older row format, and its run did not record the errors.
 
     ``status`` gives the state of the project:
 
@@ -1504,7 +1605,7 @@ def get_project_status(
         symbol_count, file_count, indexed_at, status, reindex_state (str
         or None — "reindexing", "pending", "not_scheduled", "failed", or
         None for a current index), reindex_needed, stale,
-        modified_files_count, header_affected_tus, reasons}, and
+        modified_files_count, header_affected_tus, parse_errors, reasons}, and
         ``manifest_verification`` on a build whose manifest is not "full"),
         declared_not_indexed (list[dict], optional — each
         variant that the config declares and the index does not hold:
@@ -1524,7 +1625,8 @@ def get_project_status(
         (int — files whose content no longer matches the index; counted in
         both modes), header_affected_tus (int — number of source files with
         stale header dependencies; a file that compile_commands.json lists
-        more than once counts once), manifest_verification (str — "full"
+        more than once counts once), parse_errors (dict or None — see
+        above), manifest_verification (str — "full"
         when manifest.json exists, "partial" when it exists and the
         embeddings are not complete, "none" without one), analysis (dict — LLM
         analysis coverage split by project/vendor: {model, analyze_vendor,
@@ -1721,7 +1823,8 @@ def get_build_info(
         dict: {variant, image, board, config_hash, project_id, project_root,
         build_system, compile_commands, indexed_at (str — UTC),
         first_indexed_at, symbol_count, file_count, reference_count,
-        modified_files_count, header_affected_tus, manifest_verification,
+        modified_files_count, header_affected_tus, parse_errors (dict or
+        None — see get_project_status), manifest_verification,
         analysis, description, vendor_paths, project_paths,
         effective_vendor_patterns (list[str] — the SQL LIKE patterns that
         this build really used to mark vendor code, for example

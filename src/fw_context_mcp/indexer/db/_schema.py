@@ -117,7 +117,10 @@ __all__ = [
 #      to every constructor of a type.  Each constructor edge goes to the
 #      constructor that the compiler selected.  Before it, on a real index,
 #      50 of 51 callers of one driver method were calls of an AT parser
-#      method of the same name.
+#      method of the same name.  The row of the main file of each unit
+#      also holds the error diagnostics of its parse (`files.parse_*`).
+#      Before it, those columns did not exist, and their default 0 is not
+#      "no error".
 CURRENT_ROW_FORMAT = "fw-context-rows/6"
 
 # The config-hash format that was current when CURRENT_ROW_FORMAT last moved.
@@ -191,7 +194,8 @@ _ROW_FORMAT_FAULTS: tuple[tuple[int, str], ...] = (
         "in comments and on inactive lines, a method of the class of the "
         "caller instead of the method of the receiver, and an edge to every "
         "constructor of a type, thus find_callers and the call paths can "
-        "name callers that do not call"),
+        "name callers that do not call; and the index did not record the "
+        "parse errors of its units"),
 )
 
 
@@ -454,6 +458,11 @@ _MIGRATION_ADD_COLUMNS = [
     # string, thus neither could be read out of it.  A real column moves
     # CURRENT_SCHEMA_VERSION by itself and needs no _schema_bump_ marker.
     "ALTER TABLE macros ADD COLUMN params TEXT NOT NULL DEFAULT ''",
+    # The error diagnostics of the parse of the unit whose main file the row
+    # is: count, fatal (0/1), and the first error.  A header row keeps 0.
+    "ALTER TABLE files ADD COLUMN parse_errors INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE files ADD COLUMN parse_fatal INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE files ADD COLUMN parse_first_error TEXT NOT NULL DEFAULT ''",
     # Schema version bump — DO NOT REMOVE. When adding new migration steps after this
     # column, also add a NEW ALTER TABLE … ADD COLUMN _schema_bump_… line. The hash
     # of _MIGRATION_ADD_COLUMNS drives CURRENT_SCHEMA_VERSION.

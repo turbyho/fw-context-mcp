@@ -2881,11 +2881,13 @@ Output: {"project_id": "c3d4…", "project_root": "/path/to/project",
            {"variant": "nrf52840-dev", "image": "app", "board": "nrf52840dk/nrf52840",
             "symbol_count": 12430, "file_count": 1502, "indexed_at": "2026-06-05 09:35:18",
             "status": "ready", "reindex_state": null, "reindex_needed": false, "stale": false,
-            "modified_files_count": 0, "header_affected_tus": 0, "reasons": []},
+            "modified_files_count": 0, "header_affected_tus": 0,
+            "parse_errors": {"units": 0, "errors": 0, "fatal_units": 0, "first": []}, "reasons": []},
            {"variant": "nrf52840-dev", "image": "mcuboot", "board": "nrf52840dk/nrf52840",
             "symbol_count": 3120, "file_count": 480, "indexed_at": "2026-06-05 09:31:02",
             "status": "ready", "reindex_state": null, "reindex_needed": false, "stale": false,
-            "modified_files_count": 0, "header_affected_tus": 0, "reasons": []}],
+            "modified_files_count": 0, "header_affected_tus": 0,
+            "parse_errors": {"units": 0, "errors": 0, "fatal_units": 0, "first": []}, "reasons": []}],
          "bg_reindex_running": false, "vec_available": true}
 ```
 
@@ -2914,7 +2916,7 @@ holds the reason. `vec_error` is not there when the extension loads.
 **`builds`** lists every build of the index, one entry for each
 `(variant, image)` pair: `{variant, image, board, symbol_count,
 file_count, indexed_at, status, reindex_state, reindex_needed, stale,
-modified_files_count, header_affected_tus, reasons}`. A build whose
+modified_files_count, header_affected_tus, parse_errors, reasons}`. A build whose
 manifest is not `"full"` also holds `manifest_verification`. The list shows
 what fw-context has indexed, not what the config declares. On a project
 of more than one build, fw-context selects no build: each query tool must
@@ -2938,8 +2940,8 @@ No query reaches such a variant until you run the command.
 fields of that build at the top level: `status`, `reindex_state`,
 `reindex_needed`, `reindex_reasons`, `stale`, `indexed_at`,
 `first_indexed_at`, `symbol_count`, `file_count`, `reference_count`,
-`modified_files_count`, `header_affected_tus`, `manifest_verification`,
-`analysis`, and `description`. A project of several builds gets
+`modified_files_count`, `header_affected_tus`, `parse_errors`,
+`manifest_verification`, `analysis`, and `description`. A project of several builds gets
 `status`, `reindex_needed`, `reindex_reasons`, and `stale` of the project
 at the top level, and no `reindex_state`. It gets no sums, because a file
 that two images compile is in the index of each. The counts of each build
@@ -3116,6 +3118,21 @@ dependencies. A file that `compile_commands.json` lists more than once
 counts once. This count is non-zero when headers changed since the
 last index with `manifest_verification: "full"` or `"partial"`.
 
+`parse_errors` counts the translation units whose last parse gave an
+error: `units`, `errors` (the sum of the errors), `fatal_units`, and
+`first`. `first` lists at most 3 units, the fatal ones first, each as
+`{file, error, fatal}`. `error` holds the first error, and also its file
+name and line when the diagnostic has a location. After a fatal error the compiler stops, thus symbols and
+calls of that unit can be missing. `index_message` then gives a warning.
+A reindex gives the same result, because it parses with the same flags
+and headers. A non-fatal error leaves the parse complete. A known example
+is an attribute that libclang 18 does not know, such as
+`__malloc__(dealloc)`. A unit that libclang did not load is not in the
+counts, and the index log names it (`skip TU`). A file that `compile_commands.json` lists more than once
+counts once, with the values of the listing that the last run parsed.
+`parse_errors` is `null` for an index of an older row format, because its
+run did not record the errors.
+
 `manifest_verification` is `"full"` when `manifest.json` is available. In
 that case, fw-context tracks header staleness with SHA-256 hashes that
 fw-context collects during indexing. The two other values:
@@ -3236,7 +3253,9 @@ Output: {"variant": "nrf52840-dev", "image": "app", "board": "nrf52840dk/nrf5284
          "indexed_at": "2026-06-05 09:35:18", "first_indexed_at": "2026-06-01 11:02:44",
          "symbol_count": 12430, "file_count": 1502,
          "reference_count": 8900, "modified_files_count": 0,
-         "header_affected_tus": 0, "manifest_verification": "full",
+         "header_affected_tus": 0,
+         "parse_errors": {"units": 0, "errors": 0, "fatal_units": 0, "first": []},
+         "manifest_verification": "full",
          "analysis": {"model": "qwen2.5-coder:14b", "models": {"qwen2.5-coder:14b": 8450},
                       "analyze_vendor": false,
                       "project": {"analyzed": 8450, "skipped": 6, "total": 8570},
