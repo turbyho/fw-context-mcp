@@ -2300,8 +2300,17 @@ place is the place of the expansion.
   target. A row with `"text"` alone is a guess.
 - `"asm"` — the assembly reader (a vector table slot, an alias).
 - `"dispatch"` — a dispatch bridge, such as `EventQueue::call_every`.
+- `"instantiation"` — the body of a template instance. A call in a
+  template body that names a dependent type (`device.sample()` with
+  `T& device`) has a target only in an instance. The edge is stored on the
+  template (caller and target), at the place of the call in the template.
 
 A site that two analyses find is one row with both names.
+
+**Templates.** A call to an implicit template instance (`read_twice<Sensor>`,
+`Box<int>::get`) is an edge to the template, because the template is the
+code of the instance and the instance has no symbol of its own. An
+explicit specialization is written code, and an edge to it stays on it.
 
 Indirect edges (`ref_kind: "indirect"`) appear when a function pointer
 references a function through any of these patterns:

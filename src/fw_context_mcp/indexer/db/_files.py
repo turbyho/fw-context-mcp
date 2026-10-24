@@ -535,6 +535,7 @@ def _delete_rows_owned_by(
     files: list[tuple[int, str]],
     *,
     stash_embeddings: bool = False,
+    keep_instance_edges: bool = False,
 ) -> list[str]:
     """Delete every row OWNED by *files*; return the USRs that were removed.
 
@@ -569,6 +570,9 @@ def _delete_rows_owned_by(
     index run also removes the rows of a header that lost its owner through
     ``replace_file_data``; its stash rows are not used, and the end of the
     run removes them.
+
+    *keep_instance_edges*: a re-parse keeps the edges of template instances
+    that other units produce (``delete_refs_for_files``).
     """
     from ._embeddings import stash_embeddings_for_files
     from ._inheritance import delete_inheritance_for_file
@@ -603,7 +607,7 @@ def _delete_rows_owned_by(
 
     delete_macros_for_files(conn, [fid for fid, _ in files])
     paths = [path for _, path in files if path]
-    delete_refs_for_files(conn, config_hash, paths)
+    delete_refs_for_files(conn, config_hash, paths, keep_instance_edges=keep_instance_edges)
     delete_indirect_call_sites_for_files(conn, config_hash, paths)
     delete_fp_assignments_for_files(conn, config_hash, paths)
     return purged_usrs
@@ -642,7 +646,7 @@ def replace_file_data(
             ).fetchall()
         )
     if rows:
-        _delete_rows_owned_by(conn, config_hash, rows, stash_embeddings=True)
+        _delete_rows_owned_by(conn, config_hash, rows, stash_embeddings=True, keep_instance_edges=True)
 
 
 def purge_file_records(

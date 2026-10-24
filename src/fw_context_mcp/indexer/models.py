@@ -32,12 +32,18 @@ class RefOrigin(enum.IntFlag):
     * ``ASM`` — the assembly reader: a vector table slot or an alias.
     * ``DISPATCH`` — a dispatch bridge of the post-processing: an entry
       point that runs a callback which a call site registered.
+    * ``INSTANTIATION`` — the walk of the body of a template instance: a
+      call that the template body names through a dependent type, which
+      only an instantiation resolves.  The edge is stored on the template
+      (caller and target), at the place of the call in the template.  The
+      units that found it are in ``ref_producers``.
     """
 
     DIRECT = 1
     TEXT = 2
     ASM = 4
     DISPATCH = 8
+    INSTANTIATION = 16
 
 
 def origins_or_sql(column: str) -> str:

@@ -114,6 +114,7 @@ __all__ = [
     "insert_overrides_batch",
     "insert_refs_batch",
     "insert_symbols_batch",
+    "link_ref_producers",
     "listing_key",
     "load_ownership",
     "lookup_macro",
@@ -130,6 +131,7 @@ __all__ = [
     "record_claims",
     "refs_for_symbol",
     "release_files",
+    "release_ref_producer",
     "replace_file_data",
     "replace_memory_regions",
     "row_format_effect",
@@ -297,7 +299,9 @@ from ._refs import (
     insert_fp_assignments_batch,
     insert_indirect_call_sites_batch,
     insert_refs_batch,
+    link_ref_producers,
     refs_for_symbol,
+    release_ref_producer,
 )
 from ._schema import (
     CURRENT_ROW_FORMAT,

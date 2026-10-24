@@ -236,6 +236,9 @@ def delete_build_data(conn: sqlite3.Connection, config_hash: str) -> None:
     """
     conn.execute("DELETE FROM symbols WHERE config_hash = ?", (config_hash,))
     conn.execute("DELETE FROM macros WHERE config_hash = ?", (config_hash,))
+    # ON DELETE CASCADE from refs also removes these links, but only on a
+    # connection with foreign_keys ON.  An explicit delete does not depend on it.
+    conn.execute("DELETE FROM ref_producers WHERE config_hash = ?", (config_hash,))
     conn.execute("DELETE FROM refs WHERE config_hash = ?", (config_hash,))
     conn.execute("DELETE FROM fp_assignments WHERE config_hash = ?", (config_hash,))
     conn.execute("DELETE FROM indirect_call_sites WHERE config_hash = ?", (config_hash,))

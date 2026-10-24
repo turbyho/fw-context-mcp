@@ -132,7 +132,13 @@ __all__ = [
 #      and `origins` records each analysis that found the site.  Before it,
 #      two calls on one line were one row, two slots of one function inside
 #      a body were one row, and nothing said which edges came from a name.
-CURRENT_ROW_FORMAT = "fw-context-rows/8"
+# /9 — the edges of templates: an edge to an implicit template instance goes
+#      to the template (the instance is no symbol), and a call in the body of
+#      an instance that a dependent type resolves is an edge of the template
+#      (origins INSTANTIATION, the units that found it in ref_producers).
+#      Before it, 14 to 19 % of the call edges of a C++ project went to a USR
+#      that is no symbol, and a dependent call had no edge.
+CURRENT_ROW_FORMAT = "fw-context-rows/9"
 
 # The config-hash format that was current when CURRENT_ROW_FORMAT last moved.
 #
@@ -147,7 +153,7 @@ CURRENT_ROW_FORMAT = "fw-context-rows/8"
 # the build, thus a plain `fw-context index` writes every file and every
 # body again.  The two must therefore move together, and
 # `test_row_format_invalidation.py` fails when only one of them does.
-ROW_FORMAT_PAIRED_WITH = "fw-context-cc/10"
+ROW_FORMAT_PAIRED_WITH = "fw-context-cc/11"
 
 
 def _row_format_number(value: str) -> int | None:
@@ -214,6 +220,9 @@ _ROW_FORMAT_FAULTS: tuple[tuple[int, str], ...] = (
         "graph, two slots of one function inside a body are one row, and no "
         "row says which analysis found the edge (origins), thus an edge from "
         "a name in the text reads as a fact of the compiler"),
+    (8, "an edge to a template instance goes to the instance, which is no "
+        "symbol, thus find_callers of the template misses it, and a call in "
+        "a template body that a dependent type resolves has no edge"),
 )
 
 
@@ -808,12 +817,33 @@ CREATE TABLE IF NOT EXISTS refs (
     from_col     INTEGER NOT NULL DEFAULT 0,
     -- The analyses that found the site: a set of models.RefOrigin bits
     -- (1 the AST walk, 2 a name in the tokens or the text, 4 the assembly
-    -- reader, 8 a dispatch bridge).  0 only in a row of an older version.
+    -- reader, 8 a dispatch bridge, 16 the body of a template instance).  0
+    -- only in a row of an older version.
     origins      INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_refs_to_usr   ON refs(config_hash, to_usr);
 CREATE INDEX IF NOT EXISTS idx_refs_from_usr ON refs(config_hash, from_usr);
 CREATE INDEX IF NOT EXISTS idx_refs_fromfile ON refs(config_hash, from_file);
+
+-- ── ref_producers: the units that found an edge of a template instance ──
+-- An edge from the body of an instantiation (origins bit INSTANTIATION) lies
+-- in the file of the template, which one unit owns (header_owners), but each
+-- unit that uses the instance finds it.  A row of refs is deleted by the
+-- file that it lies in when the owner of that file is parsed again, thus an
+-- edge that other units found was lost until they were parsed again, and an
+-- incremental run gave another graph than a full run.  This table holds
+-- each unit that found the INSTANTIATION bit of a row: the bit goes when no
+-- unit is left (``_refs.release_ref_producer``), and a new parse of the
+-- owner keeps a row that a unit still produces (``delete_refs_for_files``).
+CREATE TABLE IF NOT EXISTS ref_producers (
+    ref_id          INTEGER NOT NULL REFERENCES refs(id) ON DELETE CASCADE,
+    config_hash     TEXT    NOT NULL,
+    unit_path       TEXT    NOT NULL,
+    unit_flags_hash TEXT    NOT NULL,
+    PRIMARY KEY (ref_id, unit_path, unit_flags_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_ref_producers_unit
+    ON ref_producers(config_hash, unit_path, unit_flags_hash);
 
 -- ── indirect_call_sites: function pointer invocation tracking ───────────
 -- Records every call through a function pointer (driver.onData(buf, len)).

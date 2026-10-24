@@ -940,6 +940,258 @@ def _resolve_method_usr(
 #: The references of one unit, by the key of their site (see ``_claim_ref``).
 _SeenRefs = dict[tuple, Reference]
 
+#: A bound on the steps from an instance to its template; a real chain has 1 to 3.
+_TEMPLATE_CHAIN_LIMIT = 16
+
+
+def _same_place(a: cx.Cursor, b: cx.Cursor) -> bool:
+    """Tell if the two cursors have the same location (file, line and column)."""
+    la, lb = a.location, b.location
+    if not la.file or not lb.file:
+        return False
+    return (la.file.name, la.line, la.column) == (lb.file.name, lb.line, lb.column)
+
+
+def _has_place_of(instance: cx.Cursor, template: cx.Cursor) -> bool:
+    """Tell if *instance* has the place of *template*: of its declaration, or of its definition.
+
+    WHY the definition too: ``specialized_template`` gives the first
+    declaration of the template, and an instance has the place of the
+    declaration that it instantiates.  A member defined out of its class
+    (``template <class T> int A<T>::put() {...}``) and a function template
+    declared before its definition give an instance at the definition.
+    """
+    if _same_place(instance, template):
+        return True
+    definition = template.get_definition()
+    return definition is not None and _same_place(instance, definition)
+
+
+def _code_usr(target: cx.Cursor) -> str:
+    """Give the USR of the code that *target* names: the template of an implicit instance, else its own.
+
+    WHY: an implicit instantiation (``read_twice<Sensor>``, ``Box<int>::get``)
+    is no symbol of the index: the code of it is the template.  An edge to
+    the USR of the instance was invisible to ``find_callers`` of the
+    template.  Measured: 14 to 19 % of the call edges of a C++ project went
+    to a USR that is no symbol, and this mapping repairs 16 to 53 % of them
+    (probe s6, plan of the call edges, phase 4).
+
+    WHY the test of the place: clang gives an implicit instantiation the
+    location of its template, and an explicit specialization
+    (``template <> int f<char>(char)``, ``template <> int Box<short>::get()``)
+    its own.  An explicit specialization is written code with a symbol of
+    its own, thus it keeps its USR.  ``specialized_template`` alone gives
+    the template for both.  The step repeats, because a member of an
+    instance of a partial specialization names the member of the partial
+    specialization first.
+
+    Only a function maps.  The instance of a static data member of a class
+    template is a symbol of its own (with ``template_usr``), thus a
+    reference to it stays on it.
+
+    Limit: a template and an explicit specialization that one macro
+    expansion writes have the same place (the place of the expansion),
+    thus the specialization maps to the template there.
+    """
+    if target.kind not in _INSTANCE_FUNCTION_KINDS:
+        return target.get_usr()
+    current = target
+    for _ in range(_TEMPLATE_CHAIN_LIMIT):
+        template = current.specialized_template
+        if template is None or not _has_place_of(current, template):
+            break
+        current = template
+    return current.get_usr() or target.get_usr()
+
+
+# The cursor kinds of a function that a template instance can be.
+_INSTANCE_FUNCTION_KINDS = frozenset({
+    cx.CursorKind.FUNCTION_DECL,
+    cx.CursorKind.CXX_METHOD,
+    cx.CursorKind.CONSTRUCTOR,
+    cx.CursorKind.DESTRUCTOR,
+    cx.CursorKind.CONVERSION_FUNCTION,
+})
+_INSTANCE_CLASS_KINDS = frozenset({
+    cx.CursorKind.CLASS_DECL,
+    cx.CursorKind.STRUCT_DECL,
+    cx.CursorKind.UNION_DECL,
+})
+
+
+def _is_implicit_instance(cursor: cx.Cursor) -> bool:
+    """Tell if *cursor* is an implicit instantiation: it has the place of its template (see ``_code_usr``)."""
+    template = cursor.specialized_template
+    return template is not None and _has_place_of(cursor, template)
+
+
+def _seed_instance(seeds: dict[str, cx.Cursor], cursor: cx.Cursor) -> None:
+    """Add *cursor* to *seeds* when it is a function that is an implicit template instance."""
+    if cursor.kind in _INSTANCE_FUNCTION_KINDS and _is_implicit_instance(cursor):
+        usr = cursor.get_usr()
+        if usr:
+            seeds.setdefault(usr, cursor)
+
+
+def _seed_explicit_instantiation(seeds: dict[str, cx.Cursor], cursor: cx.Cursor) -> None:
+    """Add the members of an explicit class instantiation (``template class Box<int>;``) to *seeds*.
+
+    WHY: no call of the unit names those members, but the instantiation
+    defines each of them.  Measured: without it, a ``template class
+    FIFO<...>;`` of a project lost 17 edges (probe s6).  An explicit
+    specialization (``template <> struct Box<char>``) also has a template,
+    but its members are written code and no implicit instance, thus
+    ``_seed_instance`` leaves them out.
+
+    Limit: libclang 22 gives no cursor for an explicit instantiation of a
+    function (``template int twice<Dev>(Dev&);``), thus the body of such an
+    instance gives edges only when a call of the unit names it.
+    """
+    if cursor.kind in _INSTANCE_CLASS_KINDS and cursor.specialized_template is not None and cursor.is_definition():
+        for method in cursor.type.get_methods():
+            _seed_instance(seeds, method)
+
+
+def _closure_owner(cursor: cx.Cursor) -> cx.Cursor | None:
+    """Give the function that a lambda closure belongs to when *cursor* is a member of it, else None.
+
+    A closure class is an anonymous class whose semantic parent is a
+    function (measured on libclang 22: ``(lambda at ...)`` is a CLASS_DECL
+    with ``is_anonymous()`` and the enclosing function as its parent).
+    """
+    parent = cursor.semantic_parent
+    if parent is None or parent.kind != cx.CursorKind.CLASS_DECL or not parent.is_anonymous():
+        return None
+    owner = parent.semantic_parent
+    if owner is None or owner.kind not in _CALLABLE_KINDS | _INSTANCE_FUNCTION_KINDS:
+        return None
+    return owner
+
+
+def _caller_of(definition: cx.Cursor) -> cx.Cursor:
+    """Give the function that the AST walk names as the caller of the calls in *definition*.
+
+    WHY: the AST walk attributes the body of a lambda to the function that
+    holds it (a LAMBDA_EXPR is no callable), thus the walk of an instance
+    does the same.  The call operator of a closure, walked as an instance
+    of its own, then gives the key that the walk of the enclosing body
+    gives, and the two claims are one row.  Nested lambdas go to the
+    outermost function.
+    """
+    current = definition
+    for _ in range(_TEMPLATE_CHAIN_LIMIT):
+        owner = _closure_owner(current)
+        if owner is None:
+            return current
+        current = owner
+    return current
+
+
+def _walk_template_instances(
+    seeds: dict[str, cx.Cursor], refs: list[Reference], seen_ref: _SeenRefs,
+) -> None:
+    """Walk the bodies of the template instances that the unit uses, and claim their calls.
+
+    WHY: a call in a template body that names a dependent type
+    (``device.sample()`` in ``template <class T> int read_twice(T& device)``)
+    has no target in the template: only an instantiation resolves it.  The
+    AST walk visits the written code, thus such calls had no edge.  The
+    body of each implicit instance has the target; its edge goes to the
+    template (caller and target, ``_code_usr``) at the place of the call in
+    the template, with the origin ``INSTANTIATION``.  Measured on three
+    projects, the cursors give 91 to 97 % of the edges of the indexing API
+    of libclang for instantiations, at 0.3 to 0.7 % of the time of a parse
+    (probe s6).  Bodies that no cursor reaches: implicit or defaulted
+    special members, and some members of an ``extern template``.
+
+    The work list starts from *seeds*: the instances that the written code
+    of the unit names.  A body can name more instances, and a class
+    instance can define members that no call names (a destructor, a
+    virtual method): ``Type.get_methods()`` of each class instance that a
+    walked body belongs to adds them.  A body is walked where it lies, also
+    in a header of the skip set, because the instance of this unit is not
+    the instance of the unit that owns the header.  An explicit
+    specialization is written code, not an instance: the AST walk has it.
+
+    Only calls give an edge here; a function address in an instance body
+    is a later step (the slots of the indirect calls).
+
+    A body is walked as the AST walk reads it: the calls in a lambda belong
+    to the function that holds it (``_caller_of``), and a call of a lambda
+    (``l()``) is no edge.  A function defined inside the body (a method of
+    a local class) is a definition of its own: the walk does not descend
+    into it, and it is walked as an instance when a call names it.
+    """
+    work = list(seeds.values())
+    queued = set(seeds)
+    walked: set[str] = set()
+    classes: dict[str, cx.Cursor] = {}
+    classes_done: set[str] = set()
+    while True:
+        if not work:
+            for class_usr, class_cursor in list(classes.items()):
+                if class_usr in classes_done:
+                    continue
+                classes_done.add(class_usr)
+                for method in class_cursor.type.get_methods():
+                    _queue_instance(method, queued, work)
+            if not work:
+                return
+        declaration = work.pop()
+        definition = declaration.get_definition()
+        if definition is None or not definition.is_definition() or not _is_implicit_instance(definition):
+            continue
+        definition_usr = definition.get_usr()
+        if not definition_usr or definition_usr in walked:
+            continue
+        walked.add(definition_usr)
+        parent = definition.semantic_parent
+        if parent is not None and parent.kind in _INSTANCE_CLASS_KINDS and _is_implicit_instance(parent):
+            classes.setdefault(parent.get_usr(), parent)
+        caller = _code_usr(_caller_of(definition))
+        for node in _body_cursors(definition):
+            if node.kind not in _REF_KINDS:
+                continue
+            target = node.referenced
+            if target is None:
+                continue
+            _queue_instance(target, queued, work)
+            if node.kind != cx.CursorKind.CALL_EXPR or _closure_owner(target) is not None:
+                continue
+            site = node.location
+            if not site.file or not target.location.file or not target.get_usr():
+                continue
+            _claim_ref(refs, seen_ref, Reference(
+                to_usr=_code_usr(target), from_file=site.file.name, from_line=site.line,
+                from_usr=caller, ref_kind="call", from_col=site.column,
+                origins=RefOrigin.INSTANTIATION,
+            ))
+
+
+def _body_cursors(definition: cx.Cursor) -> Generator[cx.Cursor, None, None]:
+    """Yield the cursors of the body of *definition* in preorder, without nested definitions.
+
+    A function or a class defined inside the body is code of its own (see
+    ``_walk_template_instances``); a lambda is part of the body.
+    """
+    stack = list(reversed(list(definition.get_children())))
+    while stack:
+        node = stack.pop()
+        if node.kind in _INSTANCE_CLASS_KINDS or (node.kind in _CALLABLE_KINDS and node.is_definition()):
+            continue
+        yield node
+        stack.extend(reversed(list(node.get_children())))
+
+
+def _queue_instance(cursor: cx.Cursor, queued: set[str], work: list[cx.Cursor]) -> None:
+    """Put *cursor* on the work list of ``_walk_template_instances`` when it is a new implicit instance."""
+    if cursor.kind in _INSTANCE_FUNCTION_KINDS and _is_implicit_instance(cursor):
+        usr = cursor.get_usr()
+        if usr and usr not in queued:
+            queued.add(usr)
+            work.append(cursor)
+
 
 def _claim_ref(refs: list[Reference], seen_ref: _SeenRefs, ref: Reference) -> bool:
     """Add *ref* to *refs*, or join its origins to the reference of the same site.
@@ -1091,9 +1343,9 @@ def _emit_fn_ptr_targets(
         if not targets:
             continue
         for target, site in targets:
-            target_usr = target.get_usr()
-            if target_usr == skip_usr:
+            if target.get_usr() == skip_usr:
                 continue
+            target_usr = _code_usr(target)
             target_loc = target.location
             if target_loc.file and site.file:
                 _claim_ref(refs, seen_ref, Reference(
@@ -1106,8 +1358,10 @@ def _emit_fn_ptr_targets(
                     from_col=site.column,
                     origins=RefOrigin.DIRECT,
                 ))
+                # The filter holds the USRs as libclang gives them, thus the
+                # test takes the USR of the cursor, not the one of its template.
                 if ((lhs_usr and lhs_usr != target_usr) or lhs_name) and (
-                    stored is None or target_usr in stored
+                    stored is None or target.get_usr() in stored
                 ):
                     try:
                         _fp_type = lhs_fp_type or child.type.spelling
@@ -1227,6 +1481,9 @@ def _build_refs_and_fp_assignments(
     # class scope, by cursor hash: they run before main.  A VAR_DECL comes
     # before its initializer in the preorder walk.
     static_init_calls: set[int] = set()
+    # The template instances that the written code of this unit names, by
+    # USR, in the order of the walk (see _walk_template_instances).
+    instance_seeds: dict[str, cx.Cursor] = {}
 
     for cursor in (
         _iter_cursor_skip(tu.cursor, skip_files, resolve_fn)
@@ -1291,12 +1548,16 @@ def _build_refs_and_fp_assignments(
 
         if cursor.kind == cx.CursorKind.VAR_DECL:
             static_init_calls |= _static_init_constructor_calls(cursor)
+        _seed_explicit_instantiation(instance_seeds, cursor)
 
         _process_ref_cursor(
             cursor, cur_fn, refs, indirect_call_sites, fp_assignments,
             pending_dispatches, seen_ref, qn_to_usr, tu_path_str, resolve_fn, _log,
-            static_init_calls,
+            static_init_calls, instance_seeds,
         )
+
+    # The calls that only the instances of the templates resolve.
+    _walk_template_instances(instance_seeds, refs, seen_ref)
 
     # Source-line scan for dispatch calls and &Class::method (indirect only)
     _run_source_line_fallback(
@@ -1548,13 +1809,14 @@ def _process_ref_cursor(
     resolve_fn: Callable[..., object],
     _log: logging.Logger,
     static_init_calls: set[int],
+    instance_seeds: dict[str, cx.Cursor],
 ) -> None:
     """Process a single cursor for references and indirect calls — dispatcher."""
     loc = cursor.location
     if not loc.file:
         return
 
-    _handle_direct_refs(cursor, cur_fn, refs, seen_ref, static_init_calls)
+    _handle_direct_refs(cursor, cur_fn, refs, seen_ref, static_init_calls, instance_seeds)
     _handle_indirect_invocations(cursor, cur_fn, refs, indirect_call_sites,
                                  fp_assignments, pending_dispatches, seen_ref, tu_path_str, resolve_fn,
                                  qn_to_usr, _log)
@@ -1573,7 +1835,8 @@ def _add_ref(refs: list[Reference], seen_ref: _SeenRefs, to_usr: str,
 
 
 def _handle_direct_refs(cursor: cx.Cursor, cur_fn: str | None, refs: list[Reference],
-                       seen_ref: _SeenRefs, static_init_calls: set[int]) -> None:
+                       seen_ref: _SeenRefs, static_init_calls: set[int],
+                       instance_seeds: dict[str, cx.Cursor]) -> None:
     """Direct call/ref/member references from ``cursor.referenced``, and run-time vectors.
 
     WHY no fallback for a CALL_EXPR without a target: two fallbacks once
@@ -1603,7 +1866,10 @@ def _handle_direct_refs(cursor: cx.Cursor, cur_fn: str | None, refs: list[Refere
     if ref_kind is not None:
         referenced = cursor.referenced
         if referenced is not None:
-            to_usr = referenced.get_usr()
+            # A seed of the walk of the template instances: the written code
+            # of this unit names the instance.
+            _seed_instance(instance_seeds, referenced)
+            to_usr = _code_usr(referenced)
             ref_loc = referenced.location
             if to_usr and ref_loc.file:
                 if (cursor.kind == cx.CursorKind.CALL_EXPR
@@ -1864,8 +2130,9 @@ def _handle_fn_ptr_as_argument(cursor: cx.Cursor, cur_fn: str | None,
         if targets:
             param_usr, _fp_type = _param_info(i, arg)
             for target, site in targets:
-                target_usr = target.get_usr()
-                if target_usr and target_usr != direct_callee_usr and site.file:
+                raw_usr = target.get_usr()
+                target_usr = _code_usr(target)
+                if raw_usr and raw_usr != direct_callee_usr and site.file:
                     _add_ref(refs, seen_ref, target_usr, site, cur_fn, "indirect", RefOrigin.DIRECT)
                     _lhs_name = callee_expr_text or target.spelling
                     fp_assignments.append(FnPointerAssignment(

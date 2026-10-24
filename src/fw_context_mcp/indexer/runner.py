@@ -69,6 +69,7 @@ from .db import (
     open_db,
     rebuild_fts,
     release_files,
+    release_ref_producer,
     replace_file_data,
     skip_form,
     transaction,
@@ -292,6 +293,8 @@ def _settle_left(
     with write_lock(db_dir, timeout=120.0), transaction(conn):
         for unit_key in left:
             forget_unit(conn, config_hash, unit_key)
+            # The edges of template instances that only this listing found.
+            release_ref_producer(conn, config_hash, unit_key)
     paths = unclaimed(
         (path for unit_key in left for path in ownership.files_of(unit_key)), skip_files, project_root,
     )

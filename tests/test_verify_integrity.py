@@ -64,6 +64,14 @@ def _insert_probe_row(conn, table: str, overrides: dict) -> None:
     the dummy values need not resolve to anything.
     """
     info = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    # Only a sole INTEGER primary key is an alias of the rowid.  A column of
+    # a composite key (ref_producers.ref_id) gets no value from SQLite.
+    key_columns = [col for col in info if col[5]]
+    rowid_alias = (
+        key_columns[0][1]
+        if len(key_columns) == 1 and (key_columns[0][2] or "").upper() == "INTEGER"
+        else None
+    )
     names: list[str] = []
     values: list[object] = []
     for col in info:
@@ -72,7 +80,7 @@ def _insert_probe_row(conn, table: str, overrides: dict) -> None:
             names.append(name)
             values.append(overrides[name])
             continue
-        if pk and "INT" in (ctype or "").upper():
+        if name == rowid_alias:
             continue  # let SQLite assign the rowid
         if not notnull or default is not None:
             continue

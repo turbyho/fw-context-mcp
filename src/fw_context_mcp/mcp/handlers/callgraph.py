@@ -595,7 +595,9 @@ def find_callers(
         ``"macro_use"``), origins (list — the analyses that found the site: ``"direct"``, the AST
         of the compiler names the target; ``"text"``, a name in the tokens or
         the source text gave the target, which can be wrong; ``"asm"``, the
-        assembly reader; ``"dispatch"``, a dispatch bridge),
+        assembly reader; ``"dispatch"``, a dispatch bridge;
+        ``"instantiation"``, the body of a template instance, stored on the
+        template),
         caller (enclosing function name), caller_kind (``"function"``,
         ``"method"``, …). Macro fallback puts a dict with ``kind="macro"``,
         ``signature`` (``#define`` free: ``NAME`` or ``NAME(a, b)``),

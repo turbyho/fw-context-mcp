@@ -76,7 +76,9 @@ from fw_context_mcp.indexer.db import (
     insert_macros_batch,
     insert_refs_batch,
     insert_symbols_batch,
+    link_ref_producers,
     record_claims,
+    release_ref_producer,
     replace_file_data,
     split_tokens,
     upsert_file,
@@ -1543,6 +1545,10 @@ def store_symbols_for_unit(
     # db/_owners.py).  A caller that does not name the listing records nothing.
     if listing is not None:
         record_claims(conn, config_hash, listing, owned_paths)
+        # The edges of template instances that this listing found in the
+        # last run: they go, and the parse below writes them again.  An edge
+        # that another listing also found stays (see ``ref_producers``).
+        release_ref_producer(conn, config_hash, listing)
 
     # Upsert the TU file record and capture its id.
     # The index run gives the hashes that its decision computed
@@ -1632,6 +1638,8 @@ def store_symbols_for_unit(
             for r in refs
         ]
         insert_refs_batch(conn, ref_rows)
+        if listing is not None:
+            link_ref_producers(conn, ref_rows, listing)
         refs_added = len(ref_rows)
 
     # Indirect call sites (function pointer invocations)

@@ -80,6 +80,8 @@ __all__ = [
     "insert_fp_assignments_batch",
     "insert_indirect_call_sites_batch",
     "insert_refs_batch",
+    "link_ref_producers",
+    "release_ref_producer",
 ]
 
 
@@ -119,6 +121,77 @@ def insert_refs_batch(conn: sqlite3.Connection, rows: list[tuple]) -> int:
 
 
 
+# The site of a row, as the key of ``idx_refs_site`` compares it.  The
+# parameters are those of a row of ``insert_refs_batch``, see _site_params.
+_SITE_MATCH = (
+    "config_hash = ? AND to_usr = ? AND from_file = ? AND from_line = ? AND from_col = ? "
+    "AND ref_kind = ? AND ifnull(slot_index, -1) = ifnull(?, -1) AND ifnull(from_usr, '') = ifnull(?, '')"
+)
+
+
+def _site_params(row: tuple) -> tuple:
+    """Give the parameters of ``_SITE_MATCH`` for a row of ``insert_refs_batch``."""
+    config_hash, to_usr, from_file, from_line, from_usr, ref_kind, slot_index, from_col, _origins = row
+    return (config_hash, to_usr, from_file, from_line, from_col, ref_kind, slot_index, from_usr)
+
+
+def link_ref_producers(conn: sqlite3.Connection, rows: Sequence[tuple], unit: tuple[str, str]) -> None:
+    """Record *unit* as a producer of each row of *rows* that has the INSTANTIATION bit.
+
+    *rows* are rows of ``insert_refs_batch`` that are already stored; *unit*
+    is ``(normalized path, flags_hash)`` of the listing that parsed them.
+    See the table comment of ``ref_producers`` for why.
+    """
+    from ..models import RefOrigin
+
+    links = [
+        (unit[0], unit[1], *_site_params(row))
+        for row in rows
+        if row[8] & RefOrigin.INSTANTIATION
+    ]
+    if links:
+        conn.executemany(
+            "INSERT OR IGNORE INTO ref_producers (ref_id, config_hash, unit_path, unit_flags_hash) "
+            f"SELECT id, config_hash, ?, ? FROM refs WHERE {_SITE_MATCH}",  # noqa: S608 — a constant
+            links,
+        )
+
+
+def release_ref_producer(conn: sqlite3.Connection, config_hash: str, unit: tuple[str, str]) -> None:
+    """Remove *unit* as a producer: before its new parse, or when it left the build.
+
+    A row that no unit produces any more loses the INSTANTIATION bit, and a
+    row with no bit left goes.  Only the rows of *unit* are read, thus the
+    cost follows the edges of that unit and not the size of the build.
+    """
+    from ..models import RefOrigin
+
+    ref_ids = [
+        row[0] for row in conn.execute(
+            "SELECT ref_id FROM ref_producers WHERE config_hash = ? AND unit_path = ? AND unit_flags_hash = ?",
+            (config_hash, unit[0], unit[1]),
+        )
+    ]
+    if not ref_ids:
+        return
+    conn.execute(
+        "DELETE FROM ref_producers WHERE config_hash = ? AND unit_path = ? AND unit_flags_hash = ?",
+        (config_hash, unit[0], unit[1]),
+    )
+    bit = int(RefOrigin.INSTANTIATION)
+    orphan = "NOT EXISTS (SELECT 1 FROM ref_producers p WHERE p.ref_id = refs.id)"
+    for chunk in chunked(ref_ids):
+        placeholders = ",".join("?" * len(chunk))
+        conn.execute(
+            f"DELETE FROM refs WHERE id IN ({placeholders}) AND origins = ? AND {orphan}",  # noqa: S608
+            (*chunk, bit),
+        )
+        conn.execute(
+            f"UPDATE refs SET origins = origins & ~? WHERE id IN ({placeholders}) AND {orphan}",  # noqa: S608
+            (bit, *chunk),
+        )
+
+
 def _delete_by_from_file(
     conn: sqlite3.Connection,
     table: str,
@@ -149,6 +222,8 @@ def delete_refs_for_files(
     conn: sqlite3.Connection,
     config_hash: str,
     from_files: Sequence[str],
+    *,
+    keep_instance_edges: bool = False,
 ) -> None:
     """Delete all refs originating in any of *from_files* under *config_hash*.
 
@@ -163,8 +238,33 @@ def delete_refs_for_files(
     *from_files* must be normalised exactly the way ``insert_refs_batch``
     normalises the paths it writes.  A path built by a different normaliser
     would not match, and the stale row would survive the delete.
+
+    *keep_instance_edges*: the owner of the files is parsed again.  A row
+    that a unit still produces as the edge of a template instance stays,
+    with the INSTANTIATION bit only: the other bits came from the parse of
+    the owner, which writes them again.  WHY: the producing unit is not
+    parsed again, thus the edge would be lost (see ``ref_producers``).  A
+    file that left the build loses each row.
     """
-    _delete_by_from_file(conn, "refs", config_hash, from_files)
+    if not keep_instance_edges:
+        _delete_by_from_file(conn, "refs", config_hash, from_files)
+        return
+    from ..models import RefOrigin
+
+    paths = list(dict.fromkeys(from_files))
+    produced = "EXISTS (SELECT 1 FROM ref_producers p WHERE p.ref_id = refs.id)"
+    for chunk in chunked(paths):
+        placeholders = ",".join("?" * len(chunk))
+        conn.execute(
+            f"UPDATE refs SET origins = ? WHERE config_hash = ? AND from_file IN ({placeholders}) "  # noqa: S608
+            f"AND {produced}",
+            (int(RefOrigin.INSTANTIATION), config_hash, *chunk),
+        )
+        conn.execute(
+            f"DELETE FROM refs WHERE config_hash = ? AND from_file IN ({placeholders}) "  # noqa: S608
+            f"AND NOT {produced}",
+            (config_hash, *chunk),
+        )
 
 
 # ---------------------------------------------------------------------------
