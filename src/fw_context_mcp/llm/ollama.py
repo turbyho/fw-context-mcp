@@ -1489,21 +1489,45 @@ class OllamaPromptTooLong(OllamaError):
         self.context = context
 
 
+# The message of the runner (llama-server) for a prompt longer than the
+# context.  Ollama 0.40 gives it as the plain string of ``error``.
+_TOO_LONG_MESSAGE = re.compile(
+    r"request \((\d+) tokens\) exceeds the available context size \((\d+) tokens\)"
+)
+
+
 def _prompt_too_long(resp: httpx.Response) -> OllamaPromptTooLong | None:
     """Return the error of a 400 answer that says the prompt is too long, else None.
 
-    Ollama 0.35 puts the error of its runner as a JSON string into the
-    field ``error``: ``{"error": {"type": "exceed_context_size_error",
-    "n_prompt_tokens": 6413, "n_ctx": 2048, ...}}``.
+    Two forms, both with the exact counts of the server:
+
+    - Ollama 0.35 puts the error of its runner as a JSON string into the
+      field ``error``: ``{"error": {"type": "exceed_context_size_error",
+      "n_prompt_tokens": 6413, "n_ctx": 2048, ...}}``.
+    - Ollama 0.40 puts only the message of the runner there: ``{"error":
+      "request (18924 tokens) exceeds the available context size (16384
+      tokens), try increasing it"}``.  Measured with Ollama 0.40.7: the
+      parse of the first form alone did not see it, thus the analysis got
+      HTTP 400 for a long prompt instead of a second pass with a larger
+      context.
     """
     if resp.status_code != 400:
         return None
     try:
         outer = resp.json().get("error")
-        inner = json.loads(outer) if isinstance(outer, str) else outer
-        error = inner.get("error") if isinstance(inner, dict) else None
-    except (ValueError, TypeError, AttributeError):
+    except (ValueError, AttributeError):
         return None
+    if isinstance(outer, str):
+        try:
+            inner = json.loads(outer)
+        except ValueError:
+            inner = None
+        if not isinstance(inner, dict):
+            match = _TOO_LONG_MESSAGE.search(outer)
+            return OllamaPromptTooLong(int(match[1]), int(match[2])) if match else None
+    else:
+        inner = outer
+    error = inner.get("error") if isinstance(inner, dict) else None
     if not isinstance(error, dict) or error.get("type") != "exceed_context_size_error":
         return None
     prompt_tokens, context = error.get("n_prompt_tokens"), error.get("n_ctx")

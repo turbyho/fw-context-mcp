@@ -26,6 +26,13 @@ _TOO_LONG = {"error": json.dumps({"error": {
 }})}
 
 
+# The error of Ollama 0.40.7: only the message of its runner, as a plain string.
+# Taken from the log of a real analysis (2026-10-24).
+_TOO_LONG_040 = {
+    "error": "request (18924 tokens) exceeds the available context size (16384 tokens), try increasing it",
+}
+
+
 def _response(status: int, body: dict, url: str = "http://localhost:11434/api/generate") -> httpx.Response:
     return httpx.Response(status, json=body, request=httpx.Request("POST", url))
 
@@ -88,6 +95,19 @@ def test_a_streamed_prompt_longer_than_the_context_raises_with_the_count():
     assert raised.value.prompt_tokens == 6413
 
 
+def test_the_plain_message_of_ollama_040_raises_with_the_count():
+    """Ollama 0.40 gives the message of its runner, not the JSON of 0.35.
+
+    The parse of the JSON form alone took it as another HTTP 400: the count
+    request failed three times, and the symbol got no analysis and no
+    second pass with a larger context.
+    """
+    with mock.patch.object(ollama.httpx, "post", return_value=_response(400, _TOO_LONG_040)), \
+            pytest.raises(ollama.OllamaPromptTooLong) as raised:
+        call_llm("p", LLMConfig())
+    assert (raised.value.prompt_tokens, raised.value.context) == (18924, 16384)
+
+
 def test_another_error_400_stays_an_ollama_error():
     with mock.patch.object(ollama.httpx, "post", return_value=_response(400, {"error": "invalid options"})), \
             pytest.raises(ollama.OllamaError) as raised:
@@ -98,6 +118,7 @@ def test_another_error_400_stays_an_ollama_error():
 @pytest.mark.parametrize(("answer", "count"), [
     (_response(200, {"response": "x", "prompt_eval_count": 812}), 812),
     (_response(400, _TOO_LONG), 6413),
+    (_response(400, _TOO_LONG_040), 18924),
 ])
 def test_the_count_comes_from_the_server(answer, count):
     sent: dict = {}
