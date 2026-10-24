@@ -271,11 +271,19 @@ after the removal.
 commands, the `pre_build` hook, and the `command` override. `activate`
 applies to the builder commands only.
 
-fw-context looks for some tools in the `PATH` of its own process, before
-it applies `activate`: `west` and `ninja` for Zephyr, and `idf.py` and
-`ninja` for ESP-IDF. `activate` wraps only the build command, thus it does
-not make a missing `west` or `idf.py` available. These tools must be on the
-`PATH` of the fw-context process, also when you set `activate`.
+fw-context looks for `west` (Zephyr) and `idf.py` (ESP-IDF) in the
+environment of the project. With `activate`, it runs `command -v <tool>`
+after `source <activate>`, as the build command does. Without `activate`,
+it looks in the `PATH` of the build, which includes `extra_path`. The
+`PATH` of the fw-context process does not count when you set `activate`:
+a `west` from outside the environment of the project can name a different
+workspace. A sysbuild variant with its own `activate` looks in its own
+environment.
+
+The Zephyr and ESP-IDF builds ask for no dependency (`.d`) files: the
+manifest of the index records the headers of each unit. An older version
+wrote a ninja wrapper to `.fw-context/ninja`. `fw-context cleanup` and
+each index run remove it.
 
 ### Mbed OS
 
@@ -820,14 +828,25 @@ setup script. fw-context must source this script before `west build`.
 3. The nRF Connect SDK versions that `nrfutil sdk-manager list` gives. You
    select the version, and `fw-context init` writes
    `.fw-context/ncs-env.sh` from `nrfutil sdk-manager toolchain env` and
-   `ZEPHYR_BASE`.
-4. `zephyr-env.sh` in the directory that `west config zephyr.base` names,
-   or `~/zephyr-sdk-*/environment-setup-*`.
+   `ZEPHYR_BASE`. The default version comes from `ZEPHYR_BASE` of your
+   shell.
+4. `zephyr-env.sh` in the `ZEPHYR_BASE` of your shell, or
+   `~/zephyr-sdk-*/environment-setup-*`.
 5. When it finds nothing, `fw-context init` asks for the path of the
    script.
 
-When detection fails, or you use another setup script, set it in
-`.fw-context/local.toml` (gitignored, machine-specific):
+The detection does not run `west`: it runs before the environment of the
+project exists, and a `west` from outside that environment can name a
+different workspace.
+
+When `fw-context init` finds a script, it asks for the script that sets up
+the environment of the project. Press Enter to keep the script that it
+found, or type the path of the script of your project. A relative path is
+relative to the project root. Without a terminal, `init` keeps the script
+that it found.
+
+To change the script later, set it in `.fw-context/local.toml`
+(gitignored, machine-specific):
 
 ```toml
 [build]
@@ -845,9 +864,15 @@ When you set `activate`, the builder wraps the command:
 bash -c "source /path/to/setup.sh && west build -b nrf52840dk ..."
 ```
 
-The script applies only to the build command. fw-context looks for `west`
-and `ninja` before it sources the script, thus the two tools must also be
-on the `PATH` of the fw-context process (see [General](#general)).
+fw-context also looks for `west` after it sources the script, thus `west`
+must be on the `PATH` that the script gives (see [General](#general)).
+
+The vendor boundary of a Zephyr project comes from the build: the
+`-fmacro-prefix-map` flags in `compile_commands.json` name `ZEPHYR_BASE`
+and `WEST_TOPDIR`. `CONFIG_BUILD_OUTPUT_STRIP_PATHS` (default `y`) adds
+them. fw-context does not read `ZEPHYR_BASE` of its own process for it,
+and it does not run `west`. Without the flags, only a `zephyr/` directory
+in the project marks vendor code.
 
 ### 14. Build environment — ESP-IDF
 
@@ -866,8 +891,8 @@ activate = "/home/user/esp/esp-idf/export.sh"
 4. `~/esp-idf/export.sh`.
 
 When it finds none of them, `init` sets no `activate`. As for Zephyr,
-`activate` applies only to the build command: `idf.py` and `ninja` must be
-on the `PATH` of the fw-context process (see [General](#general)).
+fw-context looks for `idf.py` after it sources `activate` (see
+[General](#general)).
 
 ### 15. Multi-variant — one codebase, several boards (bare mode)
 
@@ -964,11 +989,15 @@ curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.
 
 ### `west: command not found`
 
-Install the Zephyr SDK. Make sure `west` is on `$PATH`:
+Install the Zephyr SDK and `west`:
 ```bash
 pip install west
 west init ~/zephyrproject
 ```
+
+`west` must be on the `PATH` of the environment of the project: after
+`source <activate>` when you set `activate`. See
+[`west: command not found` (Zephyr/NCS)](#west-command-not-found-zephyrncs).
 
 ### `bear: command not found`
 
@@ -1042,28 +1071,17 @@ python = "/home/user/.pyenv/versions/3.11.8/bin/python"
 
 ### `west: command not found` (Zephyr/NCS)
 
-fw-context looks for `west` in the `PATH` of its own process, before it
-sources `activate`. Thus `activate` does not repair the error
-`west is required for Zephyr builds`. Put `west` on the `PATH` of the
-fw-context process, for example in the shell where you run
-`fw-context index`.
+With `activate`, the error names the script:
+`west is not on PATH after source <script>`. The script did not put
+`west` on `PATH`, or it failed. Correct the script, or set `activate` to
+the script that sets up the environment of the project.
 
-The build command also needs an active toolchain environment. `fw-context init` finds the environment in this order:
+Without `activate`, the error is `west is required`. Set `activate` to the
+script that sets up the environment of the project, or put `west` on the
+`PATH` of the build. `fw-context init` finds the script in the order of
+[example 13](#13-build-environment--activation-script-for-zephyrncs).
 
-1. An `activate` that the config already holds. A new run of
-   `fw-context init` shows it and keeps it by default.
-2. The Zephyr SDK of the current environment: the `environment-setup-*`
-   script of `ZEPHYR_SDK_INSTALL_DIR`.
-3. The nRF Connect SDK versions that `nrfutil sdk-manager list` gives. You
-   select the version, and `fw-context init` writes
-   `.fw-context/ncs-env.sh` from `nrfutil sdk-manager toolchain env` and
-   `ZEPHYR_BASE`.
-4. `zephyr-env.sh` in the directory that `west config zephyr.base` names,
-   or `~/zephyr-sdk-*/environment-setup-*`.
-5. When it finds nothing, `fw-context init` asks for the path of the
-   script.
-
-If detection fails, set the activation script manually in `.fw-context/local.toml`:
+To set the activation script manually, edit `.fw-context/local.toml`:
 ```toml
 [build]
 activate = "/home/user/ncs-v3.2.3-env.sh"

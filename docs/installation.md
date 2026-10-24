@@ -180,9 +180,13 @@ xcode-select --install   # ships clang as part of Command Line Tools
 > activation script for that toolchain, `.fw-context/ncs-env.sh`, from
 > `nrfutil sdk-manager toolchain env` and `ZEPHYR_BASE`, and writes its path
 > to `.fw-context/local.toml`, as `activate`. For plain Zephyr,
-> `fw-context init` uses `ZEPHYR_SDK_INSTALL_DIR`, `west config zephyr.base`
-> (`zephyr-env.sh`) or `~/zephyr-sdk-*/` (`environment-setup-*`).
-> See [Build Configuration](build.md#west-command-not-found-zephyrncs).
+> `fw-context init` uses `ZEPHYR_SDK_INSTALL_DIR`, the `ZEPHYR_BASE` of your
+> shell (`zephyr-env.sh`) or `~/zephyr-sdk-*/` (`environment-setup-*`).
+> Then it asks for the script that sets up the environment of the project:
+> Enter keeps the script that it found, and a path selects the script of
+> your project. Each build, and each lookup of `west`, runs after
+> `source <activate>`.
+> See [Build Configuration](build.md#13-build-environment--activation-script-for-zephyrncs).
 
 ### PlatformIO
 
