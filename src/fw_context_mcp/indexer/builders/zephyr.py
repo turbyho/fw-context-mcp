@@ -8,7 +8,6 @@ import os
 import shutil
 import subprocess
 from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path, PurePath
 from typing import TYPE_CHECKING
 
@@ -189,37 +188,6 @@ def _prefix_map_roots(units: list | None) -> tuple[Path | None, Path | None]:
         if zephyr_base is not None and west_topdir is not None:
             break
     return zephyr_base, west_topdir
-
-
-@lru_cache(maxsize=32)
-def _west_paths(project_root: str) -> tuple[str | None, str | None]:
-    """Return ``(zephyr.base, topdir)`` that ``west`` reports for this project.
-
-    Cached for the life of the process.  ``west`` starts a Python
-    interpreter, and get_vendor_patterns() also runs on the MCP query path,
-    where that cost is paid for every request.  The two values name the
-    workspace the project sits in, and that does not change while
-    fw-context runs.
-
-    Returns ``(None, None)`` when ``west`` is not on PATH or when it fails.
-    The caller then uses a different source.
-    """
-    if not shutil.which("west"):
-        return None, None
-
-    def ask(*args: str) -> str | None:
-        try:
-            r = subprocess.run(
-                ["west", *args],
-                capture_output=True, text=True, timeout=5, cwd=project_root,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return None
-        if r.returncode != 0:
-            return None
-        return r.stdout.strip() or None
-
-    return ask("config", "zephyr.base"), ask("topdir")
 
 
 # The two toolchain families a Zephyr project can build with.  They are not
@@ -568,36 +536,26 @@ class ZephyrBuildSystem:
     ) -> tuple[Path | None, Path | None]:
         """Return ``(ZEPHYR_BASE, WEST_TOPDIR)`` for this build, or None for each.
 
-        Four sources, in falling order of how well each one describes the
+        Two sources, in falling order of how well each one describes the
         build that is indexed:
 
-        1. ``-fmacro-prefix-map`` in *units*.  It comes from the build that
-           is indexed, so it beats every other source.
-        2. ``ZEPHYR_BASE`` in the environment.
-        3. ``west config zephyr.base`` and ``west topdir``.
-        4. A ``zephyr/`` directory in project_root, which is the T3
-           workspace layout.  This is the last resort: it is the only
-           source that reads the filesystem instead of the build.
+        1. ``-fmacro-prefix-map`` in *units*.  The build writes it in the
+           environment of the project (after ``[build] activate``):
+           ``CONFIG_BUILD_OUTPUT_STRIP_PATHS``, default ``y``, maps
+           ``ZEPHYR_BASE`` and ``WEST_TOPDIR``.  Measured on one NCS
+           project, each unit of its 7 images had the two maps.
+        2. A ``zephyr/`` directory in project_root, which is the T3
+           workspace layout.  It reads the filesystem of the project.
 
-        The first source that answers wins, and the sources are not mixed:
-        a value from the environment and a value from ``west`` can name two
-        different workspaces, and a mix of the two describes neither.
-
+        The first source that answers wins.  ``ZEPHYR_BASE`` of this
+        process and ``west`` are not sources: they come from the
+        environment of fw-context, not of the project, and they can name a
+        different workspace.  Without the maps the answer is ``(None,
+        None)``, which is correct for an SDK outside the project.
         """
         from_flags = _prefix_map_roots(units)
         if from_flags != (None, None):
             return from_flags
-
-        env_base = os.environ.get("ZEPHYR_BASE")
-        if env_base:
-            return Path(env_base).resolve(), None
-
-        west_base, west_top = _west_paths(str(project_root))
-        if west_base or west_top:
-            return (
-                Path(west_base).resolve() if west_base else None,
-                Path(west_top).resolve() if west_top else None,
-            )
 
         in_tree = project_root / "zephyr"
         if in_tree.is_dir():

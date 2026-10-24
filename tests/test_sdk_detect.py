@@ -265,11 +265,11 @@ class TestBuildSdkExcludes:
         (tmp_path / "CMakeLists.txt").write_text("cmake_minimum_required(VERSION 3.20)\n")
         workspace = tmp_path / "deps" / "ncs"
         (workspace / "zephyr").mkdir(parents=True)
-        monkeypatch.setenv("ZEPHYR_BASE", str(workspace / "zephyr"))
+        units = [_FakeUnit([f"-fmacro-prefix-map={workspace / 'zephyr'}=ZEPHYR_BASE"])]
 
         assert detect_build_system(tmp_path) == "cmake"
-        assert _build_sdk_excludes(tmp_path) == []
-        assert _build_sdk_excludes(tmp_path, "zephyr") == ["deps/ncs/zephyr/%"]
+        assert _build_sdk_excludes(tmp_path, units=units) == []
+        assert _build_sdk_excludes(tmp_path, "zephyr", units=units) == ["deps/ncs/zephyr/%"]
 
     def test_detection_stays_the_fallback(self, tmp_path: Path):
         """With no configured system the markers still decide."""
@@ -308,14 +308,21 @@ class TestZephyrVendorPatterns:
             "zephyr/%"
         ]
 
-    def test_the_environment_is_the_fallback(self, tmp_path: Path, monkeypatch):
-        """Without the compiler flags, ZEPHYR_BASE from the environment decides."""
+    def test_the_environment_of_fw_context_is_not_a_source(self, tmp_path: Path, monkeypatch):
+        """ZEPHYR_BASE and west of the fw-context process do not name the SDK.
+
+        They come from the environment of fw-context, not of the project, and
+        they can name a different workspace.  The test had the opposite sign:
+        the variable of the process decided when the build gave no flags.
+        """
         (tmp_path / "west.yml").write_text("")
         workspace = tmp_path / "workspace"
         (workspace / "zephyr").mkdir(parents=True)
         monkeypatch.setenv("ZEPHYR_BASE", str(workspace / "zephyr"))
+        import fw_context_mcp.indexer.builders.zephyr as zephyr
 
-        assert _build_sdk_excludes(tmp_path, "zephyr") == ["workspace/zephyr/%"]
+        assert not hasattr(zephyr, "_west_paths")
+        assert _build_sdk_excludes(tmp_path, "zephyr") == []
 
     def test_zephyr_base_comes_from_the_prefix_map(self, tmp_path: Path, monkeypatch):
         """The compiler flags beat the environment, because they describe THIS build.
@@ -368,17 +375,18 @@ class TestZephyrVendorPatterns:
         (tmp_path / "west.yml").write_text("")
         workspace = tmp_path / "workspace"
         (workspace / "zephyr").mkdir(parents=True)
-        monkeypatch.setenv("ZEPHYR_BASE", str(workspace / "zephyr"))
+        base = f"-fmacro-prefix-map={workspace / 'zephyr'}=ZEPHYR_BASE"
 
         app = _build_sdk_excludes(
             tmp_path, "zephyr",
-            units=[_FakeUnit([f"-fmacro-prefix-map={tmp_path}/proj/app=CMAKE_SOURCE_DIR"])],
+            units=[_FakeUnit([base, f"-fmacro-prefix-map={tmp_path}/proj/app=CMAKE_SOURCE_DIR"])],
         )
         mcuboot = _build_sdk_excludes(
             tmp_path, "zephyr",
             units=[_FakeUnit([
+                base,
                 f"-fmacro-prefix-map={workspace}/bootloader/mcuboot/boot/zephyr"
-                "=CMAKE_SOURCE_DIR"
+                "=CMAKE_SOURCE_DIR",
             ])],
         )
 
