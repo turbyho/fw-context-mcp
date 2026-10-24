@@ -1,0 +1,13 @@
+{
+  "description": "A dependent call in a template body has its target only in an instantiation. The edge of the instantiation read_twice<Sensor> is stored on the template read_twice (plan, phase 4). Two calls on line 6 are two call sites (phase 3).",
+  "units": ["main.cpp"],
+  "compiler": "c++",
+  "present": [
+    ["poll", "read_twice", 10, "call"],
+    ["read_twice", "Sensor::sample", 6, "call"],
+    ["read_twice", "Sensor::sample", 6, "call"]
+  ],
+  "absent": [],
+  "exact": true,
+  "xfail": "phase 4"
+}

@@ -1,0 +1,13 @@
+{
+  "description": "A call in an inactive #if branch does not compile, thus it is no edge.",
+  "units": ["main.c"],
+  "compiler": "cc",
+  "present": [
+    ["run", "reset", 8, "call"]
+  ],
+  "absent": [
+    ["run", "probe", 6, "call"]
+  ],
+  "exact": true,
+  "xfail": "phase 1"
+}

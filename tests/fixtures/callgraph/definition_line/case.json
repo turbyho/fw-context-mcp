@@ -1,0 +1,11 @@
+{
+  "description": "The definition line of a destructor names the class, but it calls nothing. Measured on a real index (2026-10-24): the destructor got a call edge to the constructor.",
+  "units": ["main.cpp"],
+  "compiler": "c++",
+  "present": [],
+  "absent": [
+    ["Led::~Led", "Led::Led", 9, "call"]
+  ],
+  "exact": true,
+  "xfail": "phase 1"
+}

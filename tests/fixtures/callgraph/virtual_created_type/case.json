@@ -1,0 +1,14 @@
+{
+  "description": "A virtual call reaches the override of a class that the code creates (Made) and not the override of a class that it never creates (Never): rapid type analysis (plan, phase 6).",
+  "units": ["main.cpp"],
+  "compiler": "c++",
+  "present": [
+    ["fire", "Base::handler", 14, "call"],
+    ["fire", "Made::handler", 14, "call"]
+  ],
+  "absent": [
+    ["fire", "Never::handler", 14, "call"]
+  ],
+  "exact": false,
+  "xfail": "phase 6"
+}

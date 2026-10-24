@@ -1,0 +1,12 @@
+{
+  "description": "Two calls of one function on one line are two call sites. The unique key of refs has no column, thus they merge into one row (plan, phase 3).",
+  "units": ["main.c"],
+  "compiler": "cc",
+  "present": [
+    ["twice", "tick", 2, "call"],
+    ["twice", "tick", 2, "call"]
+  ],
+  "absent": [],
+  "exact": true,
+  "xfail": "phase 3"
+}

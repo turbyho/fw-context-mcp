@@ -1,0 +1,17 @@
+{
+  "description": "Two classes have a method send. The cross-TU backfill reads _parser->send by name and writes it as a call of Driver::send, the method of the class of the caller. Measured on a real index (2026-10-24): 50 of 51 callers of a driver method were calls of the AT parser method of the same name.",
+  "units": ["parser.cpp", "driver.cpp", "app.cpp"],
+  "compiler": "c++",
+  "present": [
+    ["Driver::send", "Parser::send", 4, "call"],
+    ["Driver::off", "Parser::send", 8, "call"],
+    ["Driver::off", "Parser::recv", 8, "call"],
+    ["app", "Driver::send", 4, "call"]
+  ],
+  "absent": [
+    ["Driver::send", "Driver::send", 4, "call"],
+    ["Driver::off", "Driver::send", 8, "call"]
+  ],
+  "exact": true,
+  "xfail": "phase 1"
+}

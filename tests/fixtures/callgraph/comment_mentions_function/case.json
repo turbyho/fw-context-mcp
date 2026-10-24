@@ -1,0 +1,11 @@
+{
+  "description": "A function name in a comment is not a call. Measured on a real index (2026-10-24): a comment that named another method gave a call edge.",
+  "units": ["main.cpp"],
+  "compiler": "c++",
+  "present": [],
+  "absent": [
+    ["plan", "serve", 4, "call"]
+  ],
+  "exact": true,
+  "xfail": "phase 1"
+}

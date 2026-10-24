@@ -1,0 +1,11 @@
+{
+  "description": "Plain direct calls in C: the control case.",
+  "units": ["main.c"],
+  "compiler": "cc",
+  "present": [
+    ["twice", "helper", 2, "call"],
+    ["main", "twice", 3, "call"]
+  ],
+  "absent": [],
+  "exact": true
+}

@@ -1,0 +1,13 @@
+{
+  "description": "Radio::configure calls the free function ::configure. The name lookup of the text heuristic prefers the class of the caller and writes a false self-call, in every order of the units.",
+  "units": ["board.cpp", "radio.cpp"],
+  "compiler": "c++",
+  "present": [
+    ["Radio::configure", "configure", 4, "call"]
+  ],
+  "absent": [
+    ["Radio::configure", "Radio::configure", 4, "call"]
+  ],
+  "exact": true,
+  "xfail": "phase 1"
+}

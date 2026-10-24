@@ -1,0 +1,13 @@
+{
+  "description": "A call through a function pointer field reaches the functions that the code assigns to that field, and no other function of the same type.",
+  "units": ["main.c"],
+  "compiler": "cc",
+  "present": [
+    ["load", "read_flash", 13, "indirect"]
+  ],
+  "absent": [
+    ["load", "read_card", 13, "indirect"]
+  ],
+  "exact": false,
+  "xfail": "phase 5"
+}
