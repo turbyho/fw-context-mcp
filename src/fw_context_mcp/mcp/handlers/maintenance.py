@@ -3114,7 +3114,8 @@ def reindex_file(
     gets "server busy".  After 300 s the call returns an ``error``, and a
     part of the work can continue or fail.  Call ``get_project_status``
     for the state of each build, and repeat the call for a build that is
-    not current.  The answer holds no ``index_state``.
+    not current.  The answer holds no ``index_state``, except when a
+    manual ``fw-context index`` run holds the index (see Returns).
 
     A source file must be listed in ``compile_commands.json``.  A header is
     not listed there — compile_commands.json names translation units — so it
@@ -4040,7 +4041,8 @@ def configure_llm(
     Writes to ``<project>/.fw-context/local.toml`` ONLY (gitignored,
     per-developer). Does NOT modify the global config or the shared
     project ``config.toml``.  The profiles themselves are in the global
-    config, and only the operator writes them (``fw-context init``): this
+    config, and only the operator writes them (``fw-context llm setup``
+    or ``fw-context init``): this
     tool takes no URL and no API key.  After writing, tests the
     configuration by making a simple API call (skipped when LLM is
     disabled).  When the test fails, the previous ``local.toml`` is
@@ -4060,9 +4062,11 @@ def configure_llm(
     Returns:
         dict: {status ("ok"|"error"), profile (str), provider (str),
         chat_api (dict — configured, endpoint, format, model), model (str),
-        auto_pull (bool), stream (bool), test_latency_s (float, on
-        success), test_response (str, on success), compliance_warning
-        (str, when the chat goes to another host), message (str)}
+        auto_pull (bool), stream (bool), context (int, for a profile of an
+        API or of the ChatGPT plan: the context of the model in tokens),
+        test_latency_s (float, on success), test_response (str, on
+        success), compliance_warning (str, when the chat goes to another
+        host), message (str)}
     """
     from ...config.settings import ProjectNotInitializedError, read_config_file
 
@@ -4098,7 +4102,7 @@ def configure_llm(
                 "message": (
                     f"{profile!r} is not a profile of the global config ({settings._GLOBAL_CONFIG_PATH}; "
                     f"profiles: {', '.join(sorted(profiles)) or 'none'}). The operator adds a profile with "
-                    "'fw-context init'."
+                    "'fw-context llm setup' or 'fw-context init'."
                 ),
             }
         # One Ollama profile for each machine (llm.profile_state): another

@@ -100,7 +100,7 @@ including those added dynamically.
 ## Phase 1: Structural verification
 For each symbol, verify impact through the call graph and type system.
 
-**Per function/method:** `get_symbol_context(name)` → body, callers, callees, LLM analysis in one call. Then `find_all_callers_recursive()` for the full upstream tree. If empty, fall back: `search_bodies` + `search_content` + `find_indirect_call_sites` + `find_indirect_targets` (function pointers, callbacks, ISRs invisible to call graph).
+**Per function/method:** `get_symbol_context(name)` → body, callers, callees, LLM analysis in one call. Then `find_all_callers_recursive()` for the full upstream tree. If empty, fall back: `search_bodies` + `search_content` + `find_indirect_targets(name)` (function pointers, callbacks, ISRs invisible to call graph). `find_indirect_targets` gives each function pointer that the function is assigned to, and the call sites of that pointer. It also matches a part of a function name, thus read `rhs_name` of each row. `find_indirect_call_sites` takes the name of the POINTER (a field, variable or parameter), not the name of the function.
 **Per class/struct:** `get_inheritance_chain(transitive=True)` → `get_method_overrides` → `get_class_members` → `find_wrapper_callers` → `get_template_instances`.
 **Per enum:** `find_references` on each changed/removed constant → `lookup_symbol` to verify new values.
 **Per preprocessor change:** `search_content` (NOT `search_bodies` — preprocessor is file-scope).

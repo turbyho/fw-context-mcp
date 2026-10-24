@@ -161,9 +161,10 @@ transient_defines = ["MBED_BUILD_TIMESTAMP", "BUILD_TIMESTAMP", "BUILD_TIME", "B
 # The LLM profile (see [llm.profiles.*] below) of each project.  A project
 # selects a different one in its .fw-context/local.toml: [llm] profile = "<name>".
 profile = "local"
-# The Ollama server of the embeddings: the name of a profile with provider
-# "ollama".  Default: the profile above when it is an Ollama one, else
-# http://localhost:11434.
+# The server of the embeddings: the name of a profile with provider
+# "ollama", "openrouter" or "openai_compatible".  An API profile also needs
+# embed_model: the embedding model of that API.  Default: the profile above
+# when it is an Ollama one, else http://localhost:11434.
 # embed_profile = "local"
 # debug_log = "~/.fw-context/llm-debug.jsonl"   # write LLM prompts/responses to JSONL
 
@@ -362,7 +363,7 @@ _PROJECT_LOCAL_DEFAULTS_TEMPLATE = """\
 # profile = "local"   # the LLM profile of this project: a profile of the global config
 # enabled = false   # disable the LLM, return raw prompts for the agent to answer
 # debug_log = "~/.fw-context/llm-debug.jsonl"   # write LLM prompts/responses to JSONL
-# embed_profile = "local"   # the Ollama profile of the embeddings
+# embed_profile = "local"   # the profile of the embeddings: Ollama, or an API (then also embed_model)
 # Embedding model for semantic_search (auto-detected when not set).
 # Auto-detect: GPU available → qwen3-embedding:8b, CPU-only → qwen3-embedding:0.6b.
 # Set explicitly below to override.

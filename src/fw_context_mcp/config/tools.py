@@ -129,8 +129,12 @@ Your project has TWO kinds of code:
   • Vendor SDK: `mbed-os/`, `.pio/`, `zephyr/` — framework code.
 Set `project_only=True` for questions about YOUR code. The parameter is on
 `search_code`, `search_bodies`, `search_content`, `find_dead_code` and
-`find_hotspots`.
-Leave `project_only=False` (default) when vendor code is relevant.
+`find_hotspots`. The default is not the same on each tool:
+
+- `search_code`, `search_bodies`, `search_content` — default `False`: the
+  answer includes vendor code. Leave it when vendor code is relevant.
+- `find_dead_code`, `find_hotspots` — default `True`: the answer holds only
+  project code. Give `project_only=False` to see vendor code there.
 
 ### A question about a DIFFERENT project
 
@@ -141,7 +145,8 @@ operator asked about.
 1. Call `list_projects`. It gives the `name`, the `project_id`, and the
    `root_path` of each indexed project.
 2. Give `project="<name>"` (or `project_root="<root_path>"`) to EVERY
-   call that follows, `get_project_status` included.
+   call that follows, `get_project_status` included. `get_project_info`
+   is the exception: it takes no `project`, but the `project_id`.
 
 A name that several projects share gives an error that lists each one
 with its `project_id`. Repeat the call with that `project_id`.
@@ -236,12 +241,16 @@ Every tool rejects an unknown argument, thus a guess costs a whole call.
 The schema of each tool is in the tool list — read it there. Three names
 cover almost every tool:
 
-- `name` — the symbol. NOT `symbol`, NOT `symbol_name`. Exceptions:
-  `find_call_path` (`from_name`, `to_name`), `trace_data_flow`
+- `name` — the symbol. NOT `symbol`, NOT `symbol_name`. (`lookup_symbol`,
+  `get_source`, `get_symbol_context`, `explain_symbol`, `find_callers`,
+  `find_references`, `find_all_callers_recursive`,
+  `find_callees_recursive`, `find_indirect_*`, `find_variables`).
+  Exceptions: `find_call_path` (`from_name`, `to_name`), `trace_data_flow`
   (`type_name`, `to_symbol`), `find_wrapper_callers` and the inheritance
   tools (`class_name`, `method_name`, `template_name`).
-- `file_path` — the file (`read_file`, `get_file_map`).
-- `query` — the search terms (every search tool).
+- `file_path` — the file (`read_file`, `get_file_map`, `reindex_file`).
+- `query` — the search terms (`search_code`, `search_bodies`,
+  `search_content`, `smart_search`, `semantic_search`).
 
 No tool takes a filler argument. `get_project_status` accepts only
 `project`, `project_root` and `fast`. When a call fails on an argument,
@@ -339,7 +348,13 @@ as a `warning` + `hint` instead, thus `[]` is an answer, not a failure.
 3. Switch tools — search_bodies → search_content (wider query, and it
    covers the preprocessor and extern "C", which belong to no definition).
 4. Use `lookup_symbol` for known names.
-5. Only AFTER exhausting all fw-context tools — use other tools.
+5. `find_callers` empty → callers can exist through member-field accesses
+   (`obj.method()`), base-class pointers or function pointers. Use
+   `search_bodies("function_name")`, which searches the text of the bodies
+   and not the call graph. If it is empty too, use
+   `search_content("function_name")`. For a function pointer, use
+   `find_indirect_targets("function_name")`.
+6. Only AFTER exhausting all fw-context tools — use other tools.
 
 ### A name that means several symbols
 
@@ -446,6 +461,7 @@ codebase. After inspecting a diff, verify with fw-context:
   • `find_references("<symbol>")` — all callers/readers
   • `search_bodies("<pattern>")` — pattern consistency across codebase
   • `find_call_path` / `find_all_callers_recursive` — cross-module impact
+  • `trace_data_flow("<type>", "<target>")` — cross-module data dependencies
   • `find_dead_code` / `find_hotspots` — structural effects
 
 Do NOT use fw-context in Python, JS, Go, or other non-C/C++ projects.

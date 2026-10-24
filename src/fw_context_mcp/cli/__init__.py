@@ -471,7 +471,7 @@ def main() -> None:
     p_db_delete = p_db_sub.add_parser("delete", help="Delete a specific build or all builds (--all)")
     p_db_delete.add_argument("config_hash", nargs="?", default=None, help="Build config hash to delete")
     p_db_delete.add_argument("--project", metavar="DIR", help="Project root (default: cwd)")
-    p_db_delete.add_argument("--force", action="store_true", help="Allow deleting the active build")
+    p_db_delete.add_argument("--force", action="store_true", help="Also delete a row that the queries of its build read, or a row of an index run")
     p_db_delete.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
     p_db_delete.add_argument("--all", action="store_true", help="Delete the entire index (all builds)")
     p_db_delete.set_defaults(func=cmd_db_delete)

@@ -469,8 +469,9 @@ async def smart_search(
         ``outputs`` when ``fw-context index --analyze`` wrote them.  A model
         wrote that text, and the code did not: never quote it as a fact.
 
-        When the pipeline passes the LLM timeout (``[llm] timeout`` of the
-        project), a leading dict holds ``_partial: True``, a ``warning``
+        When the pipeline passes the LLM timeout (``timeout`` of the LLM
+        profile of the project, ``[llm.profiles.<name>]`` of the global
+        config), a leading dict holds ``_partial: True``, a ``warning``
         with the timeout, and a ``hint``.  The symbols that follow are the
         ones that the steps before the timeout found, without the later
         re-rank steps; there can be none.  This answer has no page notice
@@ -644,7 +645,8 @@ async def semantic_search(
     words don't appear literally in the code. Uses cosine similarity over
     variable-dimension embeddings generated during ``fw-context index``.
     Dimensions vary by model: mxbai-embed-large → 1024,
-    qwen3-embedding → 4096.
+    qwen3-embedding:0.6b → 1024, qwen3-embedding:4b → 2560,
+    qwen3-embedding:8b → 4096.
 
     **When to prefer over search_code:** When you're describing a *concept*
     rather than searching for a known keyword.  Examples:
@@ -673,8 +675,11 @@ async def semantic_search(
     is on the same scale as ``threshold`` and never above 1.0.
 
     **Requires** ``[llm] enabled = true``, embeddings in the index, and
-    for an Ollama embedding model a running Ollama server at
-    ``llm.ollama_url``.  A sentence-transformers or ``ft://`` model embeds
+    for an Ollama embedding model a running Ollama server at the ``url``
+    of the profile of the embeddings (``[llm] embed_profile``, else the
+    Ollama profile of the chat, else ``http://localhost:11434``).  An
+    ``embed_profile`` of an API (provider openrouter or openai_compatible)
+    needs that API.  A sentence-transformers or ``ft://`` model embeds
     the query locally and needs no Ollama.  Without one of them, the tool
     falls back to a lexical search with a warning.
 
