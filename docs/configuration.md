@@ -79,7 +79,7 @@ fw-context stops with an error when one of the three files has one of these prob
   - `[index]` `db_dir`, `compile_commands`, `config_header`, `vendor_paths`, `project_paths` and `transient_defines`
   - each key of `[build]` except `timeout` and `clean`, and each key of a `[[build.variants]]` table
   - `[llm]` `profile`, `embed_profile`, `embed_model`, `embed_dim`, `embed_query_prompt`, `embed_doc_prompt` and `debug_log`
-  - `provider`, `model`, `url` and `api_key_env` of an LLM profile (`[llm.profiles.<name>]`)
+  - `provider`, `model`, `url`, `api_key_env` and `embed_context` of an LLM profile (`[llm.profiles.<name>]`)
   - `[cache_server] url` and `[call_graph] dispatch_bridges`
 - A `[[build.variants]]` table has no `name`.
 - A URL is not valid, for example `url = "http://[::1"` in an LLM profile.
@@ -88,12 +88,13 @@ fw-context stops with an error when one of the three files has one of these prob
   - A table `[llm.profiles]` in `config.toml` or `local.toml` of a project.
   - A profile without `provider` or `model`, or an `openai_compatible` profile without `url`.
   - A key in a profile that the provider of the profile does not know. A typo there can select a different backend.
-  - `[llm] profile` or `[llm] embed_profile` names a profile that the global config does not have, or `embed_profile` names a profile that is not an Ollama profile. The error names the file that sets the key.
+  - `[llm] profile` or `[llm] embed_profile` names a profile that the global config does not have, or `embed_profile` names a profile of provider `deepseek` or `chatgpt`. These providers have no embedding endpoint. The error names the file that sets the key.
+  - `[llm] embed_profile` names an API profile (provider `openrouter` or `openai_compatible`), and `[llm] embed_model` is empty or not set. The automatic model is an Ollama model, and the API does not serve it.
   - The global config has two or more profiles, and no file sets `[llm] profile`.
 
 The error names the file and the key, but not the value, because a value can be a secret. `fw-context status` gives exit code 1, and the MCP status tools give the status `config_error`. fw-context does not use the default value in place of these values: a default gives answers about other data, or sends the source code to a different place.
 
-A value of the wrong type in a different key gives a warning: for example a timeout, a limit or a switch (`timeout = "x"`, `enabled = "flase"`). In an LLM profile, these keys are `timeout`, `stream`, `num_ctx`, `keep_alive`, `auto_pull` and `max_concurrent`. A section `[updates]` that is not a table gives a warning too. fw-context then uses the value of a lower file, or the default of the key, and the tools work. Each command writes the warning to the log one time (a CLI command to stderr), `fw-context doctor` shows it, and the MCP status tools give it in the list `config_warnings`.
+A value of the wrong type in a different key gives a warning: for example a timeout, a limit or a switch (`timeout = "x"`, `enabled = "flase"`). In an LLM profile, these keys are `timeout`, `stream`, `num_ctx`, `keep_alive`, `auto_pull`, `max_concurrent` and `context`. A section `[updates]` that is not a table gives a warning too. fw-context then uses the value of a lower file, or the default of the key, and the tools work. Each command writes the warning to the log one time (a CLI command to stderr), `fw-context doctor` shows it, and the MCP status tools give it in the list `config_warnings`.
 
 An older form of a value still works: a string that holds a number (`num_ctx = "4096"`), and `"yes"`, `"no"`, `"on"`, `"off"`, `"1"` and `"0"` for a switch. A key of a `[[build.variants]]` table goes to the build as it is, thus it must have the TOML type.
 
@@ -155,6 +156,7 @@ Each `[[build.variants]]` table:
 | `env` | *(none)* | Build environment variables. fw-context folds these variables into the `config_hash`. |
 | `images` | *(none)* | The sysbuild images (Zephyr only). Each image has `name`, `dir`, `type` (`"project"` or `"sdk"`), and an optional `board`. |
 | *(any other `[build]` key)* | — | Overrides the shared `[build]` value for this variant only. |
+| *(an `[index]` key)* | — | `vendor_paths` and `project_paths` add to the list of `[index]` for this variant only. They do not replace it, thus a variant cannot remove a vendor pattern of `[index]`. `transient_defines` stops `fw-context index` with an error, because the list applies to the whole project. Each other `[index]` key has no effect here, and gives no warning. |
 
 Variant overrides merge with the shared `[build]` section by type. A
 scalar value (such as `board`) replaces the shared value. A list value
@@ -237,8 +239,8 @@ Put the other `[llm]` keys in `~/.fw-context/config.toml` for global defaults, o
 |-----|---------|-------|-------------|
 | `enabled` | `true` | global, local | Enable the LLM and the Ollama calls. When this key is `false`, `smart_search` falls back to word-split FTS5. Also, `explain_symbol` returns the source code and a prompt for the AI assistant. `fw-context index` then skips the embeddings and the symbol analysis, also for a sentence-transformers `embed_model`. To keep the embeddings and skip only the analysis, set `analyze_symbols = false`. |
 | `profile` | *(the only profile)* | global, project, local | The name of the LLM profile of the chat (analysis, `smart_search`, `explain_symbol`). It must name a profile of the global config. |
-| `ollama_profile` | *(see description)* | global | The Ollama profile of this machine: the profile of each project that uses Ollama. Without this key: the global `profile` when it is an Ollama profile, else the only Ollama profile. See [One Ollama profile for each machine](#one-ollama-profile-for-each-machine). |
-| `embed_profile` | *(see description)* | global, project, local | The name of the profile of the server of the embeddings: an Ollama profile (its `url`), or an API profile of provider `openrouter` or `openai_compatible` (see [Embeddings through an API](#embeddings-through-an-api)). With an Ollama profile here and an `openai_compatible` chat profile, fw-context also uses `keep_alive`, `auto_pull` and `max_concurrent` of this profile. Without this key, the embeddings use the server of the selected profile when it is an Ollama profile, else `http://localhost:11434`. A profile of another provider (`deepseek`, `chatgpt`) is an error: it has no embedding endpoint. An API profile selected in `config.toml` (in git) sends the code of the project and its search queries to that API for each developer of the project. |
+| `ollama_profile` | *(see description)* | global | The Ollama profile of this machine: the profile of each project that uses Ollama. Without this key: the global `profile` when it is an Ollama profile, else the only Ollama profile. See [One Ollama profile for each machine](#one-ollama-profile-for-each-machine). The config loader does not read this key, thus no value of it changes the server of a request. A problem of the key gives a warning, not an error. The key in a project file has no effect. A value that is not a string has no effect, and the rule without the key applies. A name that is not an Ollama profile of the global config gives no Ollama profile of this machine. |
+| `embed_profile` | *(see description)* | global, project, local | The name of the profile of the server of the embeddings: an Ollama profile (its `url`), or an API profile of provider `openrouter` or `openai_compatible` (see [Embeddings through an API](#embeddings-through-an-api)). With an Ollama profile here and a chat profile that is not an Ollama profile (an API or the ChatGPT plan), fw-context also uses `keep_alive`, `auto_pull` and `max_concurrent` of this profile. Without this key, the embeddings use the server of the selected profile when it is an Ollama profile, else `http://localhost:11434`. A profile of another provider (`deepseek`, `chatgpt`) is an error: it has no embedding endpoint. An API profile selected in `config.toml` (in git) sends the code of the project and its search queries to that API for each developer of the project. |
 | `embed_model` | `""` *(auto-detect)* | global, local | The embedding model for vector search. Empty: fw-context selects `qwen3-embedding:8b` on a machine with a GPU (about 5.7 GB of VRAM, 4096-dimension vectors), and `qwen3-embedding:0.6b` without one (about 1.2 GB of VRAM, 1024 dimensions). Measured 2026-10-21 on the search of firmware symbols: `qwen3-embedding:4b` (about 3.4 GB of VRAM, 2560 dimensions) has the same quality as 8b, thus the setup of `fw-context init` recommends it; `mxbai-embed-large` and `nomic-embed-text` are weaker for a query in natural language. A change of the model embeds the index again at the next index run, and until then the search by meaning finds nothing. A name with the prefix `BAAI/`, `ibm-granite/`, `lightonai/`, `cross-encoder/` or `sentence-transformers/` uses sentence-transformers (requires the `st` extra); `ft://` selects a fine-tuned local model; with an API profile in `embed_profile`, the name is a model of that API (for example `mistralai/codestral-embed-2505`), and the field is necessary; any other name is an Ollama model. When the selected Ollama profile sets `auto_pull = true`, fw-context pulls an Ollama model automatically on first use; otherwise pull it manually. A change of model invalidates the stored embeddings. The setup writes the model to the global config. A project file sets another model for one project, for example to keep an index of that model; `fw-context doctor` reports the difference (the check `llm-profile`). |
 | `embed_query_prompt` | *(auto-detect)* | global, local | An instruction that fw-context adds before the query text, before it creates the embedding. fw-context detects this instruction automatically from the model name prefix: for `mxbai-*`, fw-context uses `"Represent this sentence for searching relevant passages: "`; for `nomic-embed-text*`, `"search_query: "`; for `qwen3-embedding*`, fw-context uses a code-retrieval instruction in the format of the model (`"Instruct: <task>\nQuery:"`). The instruction goes before the query with no separator, thus it must end as the model expects. fw-context replaces the instruction of older releases (`"Retrieve C/C++ functions, …"` without `Instruct:`) for `qwen3-embedding*`: in that form the search found the right symbol much less often. Set this key explicitly to override the default, or set it to `""` to disable it. A query instruction needs no new embeddings. |
 | `embed_dim` | *(none)* | global, local | The dimension of the stored vectors, for a sentence-transformers or `ft://` model with Matryoshka training. When the value is smaller than the dimension of the model, fw-context cuts each vector to this size and normalizes it again. An Ollama model ignores this key. A negative value means "not set". For a sentence-transformers or `ft://` model, the next `fw-context index` after a change of this key computes each stored embedding again. |
@@ -254,9 +256,9 @@ Each profile is one LLM backend. The name of a profile has only letters, digits,
 
 | Key | Default | Provider | Description |
 |-----|---------|----------|-------------|
-| `provider` | *(required)* | each | `"ollama"` for an Ollama server, `"openai_compatible"` for an API with the OpenAI chat format, `"openrouter"` for OpenRouter, `"deepseek"` for the API of DeepSeek, or `"chatgpt"` for the ChatGPT plan of the user (see [ChatGPT plan](#chatgpt-plan)). For `openrouter` and `deepseek`, fw-context knows the URL, the key variable and the request fields that turn the reasoning of the model off. A request to `ollama` sends `think: false`: a model that thinks by default (gemma4) otherwise used each answer token for its reasoning and gave an empty answer. gpt-oss ignores the key. A `chatgpt` profile has `provider`, `model` and, as each profile, `timeout`; `stream` has no effect, because each request of the plan streams. |
+| `provider` | *(required)* | each | `"ollama"` for an Ollama server, `"openai_compatible"` for an API with the OpenAI chat format, `"openrouter"` for OpenRouter, `"deepseek"` for the API of DeepSeek, or `"chatgpt"` for the ChatGPT plan of the user (see [ChatGPT plan](#chatgpt-plan)). For `openrouter` and `deepseek`, fw-context knows the URL, the key variable and the request fields that turn the reasoning of the model off. A request to `ollama` sends `think: false`: a model that thinks by default (gemma4) otherwise used each answer token for its reasoning and gave an empty answer. gpt-oss ignores the key. A `chatgpt` profile has `provider`, `model`, `context` and, as each profile, `timeout` and `stream`. `stream` has no effect there, because each request of the plan streams. |
 | `model` | *(required)* | each | The chat model. Use a model with 14B parameters or more: a smaller model gives JSON that is not consistent, and poor descriptions of embedded C++ code. |
-| `url` | `"http://localhost:11434"` for Ollama, `"https://openrouter.ai/api/v1"` for OpenRouter, `"https://api.deepseek.com"` for DeepSeek | each | The server. Required for `openai_compatible`. fw-context adds `/chat/completions` to a URL that contains `/v1`, and `/v1/chat/completions` to a URL without `/v1`. A URL that ends with `/chat/completions` stays as it is. |
+| `url` | `"http://localhost:11434"` for Ollama, `"https://openrouter.ai/api/v1"` for OpenRouter, `"https://api.deepseek.com"` for DeepSeek | each, except `chatgpt` | The server. Required for `openai_compatible`. fw-context adds `/chat/completions` to a URL that contains `/v1`, and `/v1/chat/completions` to a URL without `/v1`. A URL that ends with `/chat/completions` stays as it is. |
 | `timeout` | `600.0` | each | The HTTP request timeout, in seconds. Embed requests use `timeout × 2`. |
 | `stream` | `false` | each | When `true`, fw-context sends `stream: true` and reads SSE chunks for chat requests. This setting keeps the HTTP connection open with a continuous data flow, and prevents reverse-proxy idle timeouts (nginx default: 60 s, Cloudflare: 100 s). When `false`, fw-context uses a non-streaming path. |
 | `num_ctx` | `16384` | `ollama` | The context window, in tokens. This size allows full function bodies during analysis generation. For the LLM analysis, it is the upper limit of the context that fw-context selects from the measured speed of the model, see [The context of the LLM analysis](#the-context-of-the-llm-analysis). |
@@ -269,9 +271,9 @@ Each profile is one LLM backend. The name of a profile has only letters, digits,
 | `context` | *(the model list of the API)* | `deepseek`, `openrouter`, `chatgpt`, `openai_compatible` | The context of the chat model in tokens, only for a model whose model list gives none: in practice an `openai_compatible` API. The model list of the API has priority, and `fw-context doctor` reports a different value. Without a context, the LLM analysis does not run, see [The context of an API model](#the-context-of-an-api-model). |
 | `embed_context` | *(the model list of OpenRouter)* | `openrouter`, `openai_compatible` | The tokens of one input of the embedding model of this API. OpenRouter names it in its model list; another API needs this key, else the embedding step stops with an error. fw-context guesses no value: it sets the chunks of a long body, thus a change embeds the long bodies again. |
 
-fw-context reads `timeout`, `stream`, `num_ctx`, `keep_alive`, `auto_pull` and `max_concurrent` from the selected profile. Thus these values also apply to the embeddings. When the selected profile is an `openai_compatible` profile, `keep_alive`, `auto_pull` and `max_concurrent` come from the profile of `embed_profile`, because only the embeddings use Ollama. Without `embed_profile`, these keys have their defaults.
+fw-context reads `timeout`, `stream`, `num_ctx`, `keep_alive`, `auto_pull` and `max_concurrent` from the selected profile. Thus these values also apply to the embeddings. When the selected profile is not an Ollama profile, `keep_alive`, `auto_pull` and `max_concurrent` come from the Ollama profile of `embed_profile`, because only the embeddings use Ollama. Without `embed_profile`, these keys have their defaults.
 
-A key that the provider of the profile does not know is an error, because a typo can select a different backend. A value of the wrong type in `provider`, `model`, `url` or `api_key_env`, and each problem of `routing`, is an error. In the other keys, it gives a warning, and fw-context uses the default.
+A key that the provider of the profile does not know is an error, because a typo can select a different backend. A value of the wrong type in `provider`, `model`, `url`, `api_key_env` or `embed_context`, and each problem of `routing` or `embed_routing`, is an error. In the other keys (`timeout`, `stream`, `num_ctx`, `keep_alive`, `auto_pull`, `max_concurrent` and `context`), it gives a warning, and fw-context uses the default.
 
 ```toml
 # ~/.fw-context/config.toml
@@ -359,7 +361,8 @@ fingerprint = "b82e286eb5d0770b"
 | `dimension` | Embeddings only: the size of a vector. |
 | `remote` | `true` for a cloud model of Ollama, or an embedding model of an API: the source code goes to another computer. |
 | `provider`, `usd_per_mtok` | An embedding model of an API only: the provider of its API profile (`[llm] embed_profile`), and its price for one million tokens in USD. |
-| `usd_per_1k_symbols`, `usd_per_1k_symbols_off_peak`, `price_source` | A cloud model only: the price of the LLM analysis of 1000 symbols in USD, from the price list of Ollama and the tokens that the benchmark measured. A thinking model counts its reasoning. The off-peak price applies outside 12:00–18:00 UTC on weekdays, for the models that Ollama gives it. |
+| `usd_per_1k_symbols`, `usd_per_1k_symbols_off_peak` | A cloud model only: the price of the LLM analysis of 1000 symbols in USD, from the price list of Ollama and the tokens that the benchmark measured. A thinking model counts its reasoning. The off-peak price applies outside 12:00–18:00 UTC on weekdays, for the models that Ollama gives it. |
+| `price_source` | A cloud model of the LLM analysis, or an embedding model of an API: the source of the price and its date. |
 | `enabled` | `false` takes a model out of each recommendation. fw-context does not change this key. |
 | `source`, `fingerprint` | An entry of fw-context: the release that wrote it, and a fingerprint of its values. |
 
@@ -449,7 +452,7 @@ A key goes into an HTTP header, thus it can hold only printable ASCII characters
 
 #### External chat API examples
 
-A profile with `provider = "openai_compatible"` sends the chat requests (analysis generation, `smart_search`, `explain_symbol`) to its `url`, with OpenAI-compatible JSON. The embeddings still use Ollama, see `embed_profile`.
+A profile with `provider = "openai_compatible"` sends the chat requests (analysis generation, `smart_search`, `explain_symbol`) to its `url`, with OpenAI-compatible JSON. The chat profile does not select the server of the embeddings: `[llm] embed_profile` selects it, see [Embeddings through an API](#embeddings-through-an-api). Without `embed_profile`, the embeddings use the Ollama server at `http://localhost:11434`.
 
 **OpenAI:**
 
@@ -575,7 +578,7 @@ Configure a remote cache server, to share `llm_analysis` data across developers.
 | Key | Default | Scope | Description |
 |-----|---------|-------|-------------|
 | `url` | *(none)* | global, local | The cache server URL. Example: `"https://fw-cache.example.com"`. |
-| `token` | *(none)* | global, local | A bearer token with `can_read` and `can_write` permissions. Create this token with the `fw-cache-admin token create` command. |
+| `token` | *(none)* | global, local | A bearer token with `can_read` and `can_write` permissions. Create this token with the `fw-cache-admin token create` command. When no file sets this key, or the value is empty, fw-context reads the token from `~/.fw-context/.cache_token`. `fw-context cache remote-init` writes that file with mode 0600, thus the token is not in a config file. `FW_CONTEXT_HOME` does not move this file. |
 | `batch_size` | `100` | global, local | The maximum number of hashes or entries in each HTTP request. |
 | `force` | `false` | global, local | When this key is `true`, fw-context sends the `X-Cache-Overwrite` header, and overwrites existing entries. This key applies to the writes during `fw-context index` and `fw-context analyze`. `fw-context index --force-llm` and `fw-context analyze --force-llm` also turn it on. `fw-context cache push` does not read this key: use `fw-context cache push --overwrite`. This key requires a `can_overwrite` token. |
 
@@ -671,7 +674,7 @@ transient_defines = ["MBED_BUILD_TIMESTAMP", "BUILD_TIMESTAMP", "BUILD_TIME", "B
 [llm]
 # enabled = true   # set false to disable the LLM entirely
 profile = "local"  # the default LLM profile of each project
-# embed_profile = "local"   # the Ollama profile of the embeddings
+# embed_profile = "local"   # the profile of the embeddings: Ollama, OpenRouter or openai_compatible
 # debug_log = "~/.fw-context/llm-debug.jsonl"
 analyze_symbols = true
 
@@ -761,7 +764,7 @@ Keep this file out of git. `fw-context init` already ignores it: its `.gitignore
 [llm]
 # profile = "local"                      # the LLM profile of this project: a profile of the global config
 # enabled = false                        # set false if you do not use an LLM
-# embed_profile = "local"                # the Ollama profile of the embeddings
+# embed_profile = "local"                # the profile of the embeddings: Ollama, OpenRouter or openai_compatible
 # analyze_symbols = true
 #
 # ── Embedding model ──
