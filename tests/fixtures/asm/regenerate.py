@@ -48,6 +48,7 @@ COMPLETE = {
     "macro_substitution": True,
     "refuse": False,
     "repeat": True,
+    "sections": True,
     "statements_semicolon": True,
     "vector_table": True,
 }
@@ -70,6 +71,8 @@ DESCRIPTIONS = {
     "macro_substitution": "\\name, \\() and \\@ inside a body.",
     "refuse": "Constructs an expander must refuse rather than guess at.",
     "repeat": ".rept, .irp and .irpc.",
+    "sections": "Section switches around a vector table: a return to a "
+                "section, .pushsection, .popsection and .previous.",
     "statements_semicolon": "Several statements on one line, the shape a "
                             "C-preprocessor macro expands into.",
     "vector_table": "A vector table, its reserved slots and its weak "

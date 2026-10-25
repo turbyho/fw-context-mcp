@@ -1006,9 +1006,12 @@ class VectorEntry:
             on Cortex-M slot 15 is SysTick and slot 16+n is external IRQ
             n, on arm64 the position selects an exception class instead.
             The position is a fact of the file; its meaning is not.
-            None after a barrier (a refused construct) anywhere before it
-            in the unit: the skipped statements can hold slots of any
-            table, thus no later position is known.
+            None when the ordinal is not known to be the slot: after a
+            barrier (a refused construct) anywhere before it in the unit,
+            after a statement in the table that can write bytes (`.space`,
+            an instruction, an alignment after the first entry), after an
+            entry of another directive (another size), and in a section
+            with a subsection, a group or `unique`.
         is_data: True when the slot holds an ADDRESS derived from the
             symbol rather than the symbol itself — written as an
             expression, ``.word z_main_stack + CONFIG_MAIN_STACK_SIZE``.
@@ -1027,14 +1030,45 @@ class VectorEntry:
 
 
 # Data directives that build a table, and the sections that hold code or
-# ordinary data rather than a table.
+# ordinary data rather than a table.  The directive is captured: a
+# position is the ordinal of an entry, and that is a slot index only while
+# every entry of the table has one size.  One spelling always has one
+# size, whatever the target (`.word` is 4 bytes on ARM and 2 on x86).
 _DATA_DIRECTIVE = re.compile(
-    r"^\s*(?:\.word|\.long|\.quad|\.short|\.hword|DCD|DCQ|DCW)\s+(.+?)\s*$",
+    r"^\s*(\.word|\.long|\.int|\.4byte|\.quad|\.8byte|\.short|\.hword|\.2byte"
+    r"|DCD|DCQ|DCW)\s+(.+?)\s*$",
     re.IGNORECASE,
 )
+# A section switch, with the full name (`.vec-a` and `.vec-b` are two
+# sections) and the rest of the directive.
 _SECTION_RE = re.compile(
-    r"^\s*\.(?:section\s+\"?([.\w]+)|(text|data|bss|rodata)\b)", re.IGNORECASE
+    r'^\s*\.(section|pushsection)\s+("[^"]*"|[^\s,]+)\s*,?\s*(.*?)\s*$', re.IGNORECASE
 )
+_SHORT_SECTION_RE = re.compile(r"^\s*\.(text|data|bss|rodata)\b\s*(.*?)\s*$", re.IGNORECASE)
+# The section stack of gas: `.pushsection` saves the current section and
+# switches, `.popsection` returns to the saved one, `.previous` swaps the
+# current section with the one before the last switch.
+_POP_SECTION_RE = re.compile(r"^\s*\.popsection\b", re.IGNORECASE)
+_PREVIOUS_SECTION_RE = re.compile(r"^\s*\.previous\b", re.IGNORECASE)
+_SUBSECTION_RE = re.compile(r"^\s*\.subsection\b", re.IGNORECASE)
+# What may follow the name of a section with the positions still known:
+# flags without a group (`G` makes one section of each group name) and a
+# type.  A subsection number or `unique,N` gives a section with its own
+# location counter, which this does not track.
+_PLAIN_SECTION_REST = re.compile(r'^(?:"[A-Za-z]*"\s*(?:,\s*[@%]\w+\s*)?)?$')
+# A statement in a table that writes no byte: a label, an assignment, and
+# the directives that only describe symbols or the assembler state.
+_NO_BYTES = re.compile(
+    r"^\s*(?:$|[A-Za-z_.$][\w.$]*\s*:\s*$|[A-Za-z_.$][\w.$]*\s*=(?!=)"
+    r"|\.(?:globl|global|weak|type|size|set|equ|equiv|eqv|thumb_set|thumb_func"
+    r"|syntax|thumb|arm|code|cpu|fpu|arch|eabi_attribute|file|ident|loc|hidden"
+    r"|protected|internal|local|extern|fnstart|fnend|cantunwind|cfi_\w+)\b)",
+    re.IGNORECASE,
+)
+# Alignment writes padding only where the location counter is not aligned.
+# Before the first entry it moves the table as a whole, which leaves the
+# ordinals of the entries as they are.
+_ALIGN_RE = re.compile(r"^\s*\.(?:align|balign|p2align)\b", re.IGNORECASE)
 _ORDINARY_SECTION = re.compile(
     r"^\.(?:text|data|bss|rodata|init|fini|note|comment|debug|ARM)\b",
     re.IGNORECASE,
@@ -1072,6 +1106,23 @@ def _entry_symbol(value: str) -> tuple[str, bool] | None:
     return None
 
 
+@dataclass
+class _TableState:
+    """The entries of one table section so far.
+
+    Attributes:
+        count: How many entries it holds: the position of the next one.
+        directive: The data directive of its entries, while it has one.
+        known: False when an entry is no longer at its ordinal: after a
+            statement that can write bytes, an entry of another size, a
+            subsection, or a barrier.  Each later slot then has no position.
+    """
+
+    count: int = 0
+    directive: str | None = None
+    known: bool = True
+
+
 def extract_vectors(source: AsmSource) -> list[VectorEntry]:
     """Return the vector table slots that name a symbol, with their positions.
 
@@ -1104,18 +1155,43 @@ def extract_vectors(source: AsmSource) -> list[VectorEntry]:
     here — a miss, never a wrong answer.
     """
     found: dict[tuple[str, str, int], VectorEntry] = {}
-    in_table = False
-    position: int | None = 0
+    # The current section, the one before the last switch, and the saved
+    # pairs of `.pushsection`.  None: not known (after a barrier).  gas
+    # starts in `.text`.
+    current: str | None = ".text"
+    previous: str | None = None
+    saved: list[tuple[str | None, str | None]] | None = []
+    # The entries of each table so far.  gas appends to a section when the
+    # code returns to it: measured, `.word h1` after `.text` and a second
+    # `.section .isr_vector` is at offset 4, not 0.
+    tables: dict[str, _TableState] = {}
     positions_known = True
 
+    def table(name: str) -> _TableState:
+        return tables.setdefault(name, _TableState(known=positions_known))
+
     for file, line, stmt in _statements(source):
-        section = _SECTION_RE.match(stmt)
-        if section is not None:
-            name = section.group(1) or f".{section.group(2)}"
-            was = in_table
-            in_table = not _ORDINARY_SECTION.match(name)
-            if in_table and not was:
-                position = 0 if positions_known else None
+        switch = _SECTION_RE.match(stmt) or _SHORT_SECTION_RE.match(stmt)
+        if switch is not None:
+            groups = switch.groups()
+            name = groups[1].strip('"') if len(groups) == 3 else f".{groups[0].lower()}"
+            rest = groups[-1]
+            if len(groups) == 3 and groups[0].lower() == "pushsection" and saved is not None:
+                saved.append((current, previous))
+            previous, current = current, name
+            plain = (
+                _PLAIN_SECTION_REST.match(rest) is not None if len(groups) == 3 else rest == ""
+            )
+            if not plain:
+                table(name).known = False
+            continue
+        if _POP_SECTION_RE.match(stmt):
+            # An empty stack is an error of gas; an unknown one (after a
+            # barrier) gives an unknown section.
+            current, previous = saved.pop() if saved else (None, None)
+            continue
+        if _PREVIOUS_SECTION_RE.match(stmt):
+            current, previous = previous, current
             continue
         if stmt == BARRIER:
             # A refused construct: its statements are unknown, and they can
@@ -1123,33 +1199,48 @@ def extract_vectors(source: AsmSource) -> list[VectorEntry]:
             # section is not known until the next section directive (a
             # `.word` before it is no slot: in `.text` it would be a wrong
             # edge), and no later slot of the unit has a known position.
-            in_table = False
+            current = previous = None
+            saved = None
             positions_known = False
-            position = None
+            for state in tables.values():
+                state.known = False
             continue
-        if not in_table:
+        if current is None or _ORDINARY_SECTION.match(current):
+            continue
+        state = table(current)
+        if _SUBSECTION_RE.match(stmt):
+            state.known = False
             continue
         data = _DATA_DIRECTIVE.match(stmt)
         if data is None:
+            if not (_NO_BYTES.match(stmt) or (_ALIGN_RE.match(stmt) and state.count == 0)):
+                # It can write bytes into the table, thus the entries after
+                # it are not at the next ordinal.
+                state.known = False
             continue
+        spelling = data.group(1).lower()
+        if state.directive not in (None, spelling):
+            # Another size of entry: the ordinal is no slot index any more.
+            state.known = False
+        state.directive = spelling
         # `.word a, b, c` is three entries, and each takes a position.
-        for value in data.group(1).split(","):
+        for value in data.group(2).split(","):
             value = value.strip()
             named = _entry_symbol(value)
             if named is not None:
-                name, is_data = named
+                entry_name, is_data = named
                 # Keyed, not appended: cpp can emit the same source line
                 # more than once — measured, a Zephyr unit appears twice
                 # in its own output — and one slot must not become two
                 # edges.  The symbol side dedupes the same way.
-                key = (name, file, line)
+                key = (entry_name, file, line)
                 found.setdefault(
                     key,
-                    VectorEntry(name=name, file=file, line=line,
-                                index=position, is_data=is_data),
+                    VectorEntry(name=entry_name, file=file, line=line,
+                                index=state.count if state.known else None,
+                                is_data=is_data),
                 )
-            if position is not None:
-                position += 1
+            state.count += 1
     return list(found.values())
 
 

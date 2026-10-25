@@ -628,6 +628,91 @@ class TestVectorTable:
             "First": 0, "Taken": 1, "Last": 2,
         }
 
+    def test_the_position_follows_the_section_across_switches(self, tmp_path: Path):
+        """Measured with objdump -r on tests/fixtures/asm/sections.S."""
+        from fw_context_mcp.indexer.asm import extract_vectors
+
+        text = (Path(__file__).parent / "fixtures" / "asm" / "sections.S").read_text()
+        src = preprocess(_unit(tmp_path, "sections.S", text))
+        assert src is not None
+
+        assert {v.name: v.index for v in extract_vectors(src)} == {
+            "h0": 0, "h1": 1, "h2": 2, "h3": 3, "h4": 4, "o0": 0, "o1": 1,
+        }
+
+    @staticmethod
+    def _positions(tmp_path: Path, text: str) -> dict[str, int | None]:
+        """The positions of the slots of *text*, which writes its own sections."""
+        from fw_context_mcp.indexer.asm import extract_vectors
+
+        src = preprocess(_unit(tmp_path, "t.S", text))
+        assert src is not None
+        return {v.name: v.index for v in extract_vectors(src)}
+
+    def test_two_sections_with_a_dash_are_two_tables(self, tmp_path: Path):
+        """Measured: b0 is at offset 0 of `.vec-b`."""
+        positions = self._positions(
+            tmp_path,
+            "  .section .vec-a, \"a\"\n  .word a0\n  .section .vec-b, \"a\"\n  .word b0\n",
+        )
+
+        assert positions == {"a0": 0, "b0": 0}
+
+    def test_word_sized_spellings_are_entries(self, tmp_path: Path):
+        """Measured: `.4byte` and `.int` make an R_ARM_ABS32 each."""
+        positions = self._positions(
+            tmp_path,
+            "  .section .isr_vector, \"a\"\n  .4byte h0\n  .4byte h1\n  .int h2\n",
+        )
+
+        assert positions == {"h0": 0, "h1": 1, "h2": None}
+
+    @pytest.mark.parametrize(
+        "between",
+        ["  .space 8\n", "  .align 4\n", "  .org 16\n", "  nop\n", "  .byte 1\n",
+         "  .subsection 1\n"],
+    )
+    def test_a_statement_that_can_write_bytes_ends_the_known_positions(
+        self, tmp_path: Path, between: str
+    ):
+        """Measured: after `.space 8` the next word is slot 3, not 1."""
+        positions = self._positions(
+            tmp_path,
+            "  .section .isr_vector, \"a\"\n  .word h0\n" + between + "  .word h1\n",
+        )
+
+        assert positions == {"h0": 0, "h1": None}
+
+    def test_an_alignment_before_the_first_entry_keeps_the_positions(self, tmp_path: Path):
+        positions = self._positions(
+            tmp_path,
+            "  .section .isr_vector, \"a\"\n  .align 2\n  .globl tab\ntab:\n"
+            "  .word h0\n  .word h1\n",
+        )
+
+        assert positions == {"h0": 0, "h1": 1}
+
+    def test_an_entry_of_another_size_ends_the_known_positions(self, tmp_path: Path):
+        """Measured: after `.word h0; .short s1; .hword s2`, h2 is the third word."""
+        positions = self._positions(
+            tmp_path,
+            "  .section .isr_vector, \"a\"\n  .word h0\n  .short s1\n  .word h2\n",
+        )
+
+        assert positions == {"h0": 0, "s1": None, "h2": None}
+
+    @pytest.mark.parametrize(
+        "flags",
+        ['.section .vec, "a", %progbits, unique, 1',
+         '.section .vec, "aG", %progbits, grp, comdat',
+         ".pushsection .vec, 1"],
+    )
+    def test_a_section_with_its_own_counter_has_no_positions(self, tmp_path: Path, flags: str):
+        """`unique`, a group and a subsection make a counter this does not track."""
+        positions = self._positions(tmp_path, f"  {flags}\n  .word h0\n")
+
+        assert positions == {"h0": None}
+
     def test_after_a_barrier_a_word_is_no_slot_until_a_section(self, tmp_path: Path):
         """The skipped statements can change the section: a refused macro
         that switches to `.text` makes the next `.word` a constant there.

@@ -67,6 +67,13 @@ description = '.rept, .irp and .irpc.'
 complete = true
 defined = ["from_macro_with_rept", "irp_alpha", "irp_beta", "irp_gamma", "irp_ran_once", "irpc_1", "irpc_2", "irpc_3", "nest_a_1", "nest_a_2", "nest_b_1", "nest_b_2", "quoted_one", "quoted_two", "repeated_data"]
 
+[sections]
+description = 'Section switches around a vector table: a return to a section, .pushsection, .popsection and .previous.'
+complete = true
+defined = []
+undefined = ["h0", "h1", "h2", "h3", "h4", "in_text", "o0", "o1"]
+vectors = ["h0", "h1", "h2", "h3", "h4", "o0", "o1"]
+
 [statements_semicolon]
 description = 'Several statements on one line, the shape a C-preprocessor macro expands into.'
 complete = true
