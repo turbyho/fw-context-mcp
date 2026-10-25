@@ -88,17 +88,52 @@ class BarrierEffects:
         exports: The names the text can export or type (`.global`, `.weak`,
             `.type`, `.size`), or None when not known.  Such a name can be
             the owner of code, also of code outside the barrier.
+        text: The statements of the text that write bytes (instructions and
+            data, of all its branches, in order), its labels and the
+            directives of its conditionals, or None when not known.  The
+            flow of control reads them: a path through them to the end
+            reaches the code after the barrier.  A construct that the
+            assembler can skip as a whole (`OPTIONAL_OPEN`) is in a
+            conditional of its own.
     """
 
     section: bool
     emits: bool
     names: frozenset[str] | None
     exports: frozenset[str] | None
+    text: tuple[str, ...] | None = None
 
 
 # The effects of statements that are not known at all: an `.include`, a
 # directive that a macro argument gives.
-FULL = BarrierEffects(section=True, emits=True, names=None, exports=None)
+FULL = BarrierEffects(section=True, emits=True, names=None, exports=None, text=None)
+# Separates the statements of the text in a barrier statement: no statement
+# holds it.
+_TEXT_SEPARATOR = "\x01"
+# The conditional around the text of a construct that the assembler can
+# skip as a whole: a conditional with no known value, a repetition whose
+# count can be zero, text that can be a comment.  `?` is no condition of
+# gas: the reader of the flow takes both ways.
+OPTIONAL_OPEN = ".if ?"
+OPTIONAL_CLOSE = ".endif"
+# The text of a macro that a refused text invokes.
+MACRO_OPEN = ".macro ?"
+MACRO_CLOSE = ".endm"
+# A local label of the expansion counter: `.Lskip\@:`.
+_COUNTER_LOCAL_LABEL = re.compile(r"^\s*\.L(?:[\w.$]|\\@)*\\@(?:[\w.$]|\\@)*\s*:\s*$")
+# A name in an expression: when the refused text can set it, its value
+# there is not known.
+_EXPRESSION_NAME = re.compile(r"[A-Za-z_.$][\w.$]*")
+
+
+def optional(effects: BarrierEffects) -> BarrierEffects:
+    """The effects of a text that the assembler can also skip as a whole."""
+    if effects.text is None:
+        return effects
+    return BarrierEffects(
+        section=effects.section, emits=effects.emits, names=effects.names,
+        exports=effects.exports, text=(OPTIONAL_OPEN, *effects.text, OPTIONAL_CLOSE),
+    )
 
 
 def make_barrier(effects: BarrierEffects) -> str:
@@ -107,7 +142,9 @@ def make_barrier(effects: BarrierEffects) -> str:
         return "?" if value is None else ",".join(sorted(value))
 
     flags = ("s" if effects.section else "") + ("e" if effects.emits else "")
-    return f"{BARRIER}|{flags}|{names(effects.names)}|{names(effects.exports)}"
+    text = "?" if effects.text is None else _TEXT_SEPARATOR.join(effects.text)
+    # The text comes last: a statement can hold `|`, a name cannot.
+    return f"{BARRIER}|{flags}|{names(effects.names)}|{names(effects.exports)}|{text}"
 
 
 def is_barrier(statement: str) -> bool:
@@ -119,8 +156,8 @@ def barrier_effects(statement: str) -> BarrierEffects | None:
     """Give the effects of a barrier statement, or None for any other."""
     if not is_barrier(statement):
         return None
-    parts = statement.removeprefix(BARRIER).split("|")
-    if len(parts) != 4:
+    parts = statement.removeprefix(BARRIER).split("|", 4)
+    if len(parts) != 5:
         return FULL
 
     def names(value: str) -> frozenset[str] | None:
@@ -131,6 +168,9 @@ def barrier_effects(statement: str) -> BarrierEffects | None:
     return BarrierEffects(
         section="s" in parts[1], emits="e" in parts[1],
         names=names(parts[2]), exports=names(parts[3]),
+        text=None if parts[4] == "?" else tuple(
+            statement for statement in parts[4].split(_TEXT_SEPARATOR) if statement
+        ),
     )
 
 # A macro may invoke a macro.  Twenty levels is far past anything a
@@ -198,7 +238,12 @@ _IF_END = re.compile(r"^\s*\.endif\b", re.IGNORECASE)
 # assembler reads `KEXC_areg: .if 4` as a label and a conditional, and a
 # macro expansion gives `stacking_is_interrupt: addi sp, sp, -32`.  `(?!:)`
 # keeps `::` out.  A numeric local label (`1:`) is a label too.
-_LABEL_HEAD = re.compile(r"^(\s*(?:[A-Za-z_.$][\w.$]*|\d+)\s*:)(?!:)(.*)$")
+# A name can hold the mark of an expansion count that is not known
+# (`skip\@3`, `_Expander._count`).
+_LABEL_HEAD = re.compile(r"^(\s*(?:[A-Za-z_.$](?:[\w.$]|\\@)*|\d+)\s*:)(?!:)(.*)$")
+# A statement that is one label: never a macro invocation, also when its
+# name starts with the name of a macro (`wait_ready\@3:`).
+_LABEL_STATEMENT = re.compile(r"^\s*(?:[A-Za-z_.$](?:[\w.$]|\\@)*|\d+)\s*:\s*$")
 # What defines a symbol, for `.ifdef` and for the values of `.if`.
 _LABEL_ONLY = re.compile(r"^\s*([A-Za-z_.$][\w.$]*)\s*:\s*$")
 _ASSIGN = re.compile(
@@ -452,7 +497,7 @@ def bind(macro: Macro, arguments: list[str]) -> dict[str, str] | None:
     return values
 
 
-def substitute(statement: str, values: dict[str, str], counter: int | None) -> str:
+def substitute(statement: str, values: dict[str, str], counter: int | str | None) -> str:
     """Replace ``\\name``, ``\\()`` and ``\\@`` in one body statement.
 
     An unknown ``\\name`` is left exactly as it stands.  Replacing it
@@ -522,6 +567,104 @@ class _Repetition:
         return [{symbol: item} for item in items] or [{symbol: ""}]
 
 
+@dataclass
+class _RunFrame:
+    """A conditional or a repetition that `_Runs` is in."""
+
+    kind: str  # "if" or "rept"
+    parent: str
+    status: str
+    seen: list[str] = field(default_factory=list)
+    times: int | None = 1
+    exited: str = "no"
+
+
+@dataclass
+class _RepetitionExit:
+    """Whether an `.exitm` ended a repetition: "no", "maybe" or "yes"."""
+
+    state: str = "no"
+
+
+class _Runs:
+    """Whether the statement at this point of a refused text runs.
+
+    The answer is "yes", "no" or "maybe", from the markers of the text
+    (`_Expander._marker`): the value of each conditional, the count of each
+    repetition, and an `.exitm` before it.  An `.exitm` in a repetition
+    ends the repetition (measured, gas 2.40), else the macro text.
+    """
+
+    def __init__(self, base: str) -> None:
+        self.base = base
+        self.frames: list[_RunFrame] = []
+        self.exited = "no"
+
+    def status(self) -> str:
+        current = self.frames[-1].status if self.frames else self.base
+        exits = [self.exited, *(frame.exited for frame in self.frames if frame.kind == "rept")]
+        if "yes" in exits:
+            return "no"
+        if "maybe" in exits and current == "yes":
+            return "maybe"
+        return current
+
+    def times(self) -> int | None:
+        """How many times the statement runs when it runs: the product of
+        the counts of its repetitions, or None when one is not known."""
+        product = 1
+        for frame in self.frames:
+            if frame.kind == "rept":
+                if frame.times is None:
+                    return None
+                product *= frame.times
+        return product
+
+    def feed(self, marker: str) -> None:
+        """Move past the marker *marker*."""
+        word, _, value = marker.partition(" ")
+        if word == ".if":
+            parent = self.status()
+            self.frames.append(_RunFrame("if", parent, _branch(parent, [], value), [value]))
+        elif word in (".elseif", ".else") and self.frames and self.frames[-1].kind == "if":
+            frame = self.frames[-1]
+            branch_value = "1" if word == ".else" else value
+            frame.status = _branch(frame.parent, frame.seen, branch_value)
+            frame.seen.append(branch_value)
+        elif word == ".rept":
+            parent = self.status()
+            times = int(value) if value.isdigit() else None
+            status = "no" if times == 0 or parent == "no" else (parent if times else "maybe")
+            self.frames.append(_RunFrame("rept", parent, status, times=times))
+        elif word in (".endif", ".endr") and self.frames and self.frames[-1].kind == (
+            "if" if word == ".endif" else "rept"
+        ):
+            self.frames.pop()
+        elif word == ".exitm":
+            current = self.status()
+            if current == "no":
+                return
+            owner = next((frame for frame in reversed(self.frames) if frame.kind == "rept"), None)
+            if current == "yes":
+                if owner is None:
+                    self.exited = "yes"
+                else:
+                    owner.exited = "yes"
+            elif owner is None:
+                self.exited = "maybe" if self.exited == "no" else self.exited
+            elif owner.exited == "no":
+                owner.exited = "maybe"
+
+
+def _branch(parent: str, seen: list[str], value: str) -> str:
+    """Whether a branch with *value* runs after branches with the values *seen*."""
+    if parent == "no" or value == "0" or "1" in seen:
+        return "no"
+    if value == "1" and parent == "yes" and all(earlier == "0" for earlier in seen):
+        return "yes"
+    return "maybe"
+
+
 class _Expander:
     """Holds the definitions, the mode and the budgets while a unit is read.
 
@@ -536,7 +679,17 @@ class _Expander:
     ) -> None:
         self.macros: dict[str, Macro] = {}
         self.report = report
+        # The value of `\@` in the next expansion: gas counts from 0
+        # (`_count`).  Not known after a refused text that can invoke a
+        # macro or not.
         self.counter = 0
+        self.counter_known = True
+        # The repetitions being expanded, innermost last: whether an
+        # `.exitm` of their body ran (`_repeat`).
+        self.repetition_exits: list[_RepetitionExit] = []
+        # Whether the text that `_scan` read last can run an `.exitm` of
+        # its own level (not of a repetition or a macro inside it).
+        self.scan_exits = False
         self.emitted = 0
         self.exhausted = False
         self.alternate = False
@@ -782,7 +935,9 @@ class _Expander:
                     )
                     continue
 
-                invocation = _INVOKE.match(statement)
+                invocation = (
+                    None if _LABEL_STATEMENT.match(statement) else _INVOKE.match(statement)
+                )
                 if invocation is not None:
                     macro = self.macros.get(invocation.group(1))
                     if macro is not None:
@@ -790,6 +945,14 @@ class _Expander:
                             macro, invocation.group(2), located, depth
                         )
                         continue
+
+                if _EXITM.match(statement):
+                    # It ends the repetition around it (`_repeat` reads the
+                    # state before its next statement).  An `.exitm` of a
+                    # macro body never comes here (`_invoke`).
+                    if self.repetition_exits:
+                        self.repetition_exits[-1].state = "yes"
+                    continue
 
                 if self.exhausted:
                     return
@@ -823,7 +986,7 @@ class _Expander:
             self.report.refused["rest of the unit after it"] += 1
         if not skipping:
             self.report.refused["text that may be a comment"] += 1
-            yield from self._barrier(located, effects)
+            yield from self._barrier(located, optional(effects))
 
     def _skip(self, located: Located) -> Iterator[Located]:
         """Read one statement of a skipped branch: only its conditionals.
@@ -874,7 +1037,13 @@ class _Expander:
             self.stopped = True
             self.report.refused["rest of the unit after it"] += 1
         _, effects = self._scan(region)
-        yield from self._barrier(at, effects)
+        if self.scan_exits and self.repetition_exits:
+            # The region can end the repetition around it.
+            exit_state = self.repetition_exits[-1]
+            exit_state.state = "yes" if exit_state.state == "yes" else "maybe"
+        # No branch can be the one the assembler takes: the text of the
+        # region holds `.else` of its own conditional, the `.if` is around it.
+        yield from self._barrier(at, optional(effects))
 
     def _conditional(self, located: Located) -> bool:
         """Handle a conditional directive in a taken branch.
@@ -910,7 +1079,8 @@ class _Expander:
         return False
 
     def _refuse(
-        self, reason: str, at: Located, body: list[str] | None = None
+        self, reason: str, at: Located, body: list[str] | None = None,
+        skippable: bool = False,
     ) -> Iterator[Located]:
         """Count a refusal and leave a barrier at its place.
 
@@ -919,20 +1089,90 @@ class _Expander:
         that outlives it (measured: an `.if` in an `.irp` body can end after
         the `.endr`), the conditional state of the rest of the unit is not
         known, and the reading stops.  The barrier carries what the text can
-        do (`_scan`).
+        do (`_scan`).  *skippable*: the assembler can take none of the text
+        (a repetition whose count can be zero).
         """
         self.report.refused[reason] += 1
         if body is None:
             effects = FULL
         else:
-            nesting, effects = self._scan(body)
+            nesting, effects = self._scan(body, base="maybe" if skippable else "yes")
             if nesting:
                 self.stopped = True
                 self.report.refused["rest of the unit after it"] += 1
+            if skippable:
+                effects = optional(effects)
         yield from self._barrier(at, effects)
 
+    def _count(self) -> str:
+        """The value of `\\@` in an expansion that starts now; then count it.
+
+        gas gives the expansions 0, 1, 2 and so on.  When the count is not
+        known, the value is a mark `\\@<n>`, one for each expansion: the
+        labels of one expansion still name each other in the flow, and no
+        symbol gets a number that can be wrong (`_asm_layout` does not index
+        a name that holds `\\@`).
+        """
+        value = self._current()
+        self.counter += 1
+        return value
+
+    def _current(self) -> str:
+        """The value of `\\@` at this point, with no new expansion.  A
+        repetition takes it once for all its iterations (measured, gas
+        2.40: `.irp x,a,b` with `i\\@\\x:` and a macro call gives `i0a` and
+        `i0b`, and the two calls get 0 and 1)."""
+        return str(self.counter) if self.counter_known else f"\\@{self.counter}"
+
+    def _marker(self, piece: str, names: set[str] | None) -> str | None:
+        """The statement that marks a directive of structure in a barrier text.
+
+        A conditional gets its value (`.if 1`, `.if 0`, `.if ?`), a
+        repetition its count (`.rept 3`, `.rept 0`, `.rept ?`; `.irp` and
+        `.irpc` count their values).  The value is not known when the
+        directive holds a substitution that was not made, or a name that
+        the text can set before it.  None: *piece* is no such directive.
+        """
+        opened = _IF_OPEN.match(piece)
+        if opened is not None:
+            return f".if {self._known(opened.group(1).lower(), opened.group(2).strip(), names)}"
+        elseif = _IF_ELSEIF.match(piece)
+        if elseif is not None:
+            return f".elseif {self._known('if', elseif.group(1).strip(), names)}"
+        if _IF_ELSE.match(piece):
+            return ".else"
+        if _IF_END.match(piece):
+            return ".endif"
+        repeat = _REPEAT_OPEN.match(piece)
+        if repeat is not None:
+            kind, argument = repeat.group(1).lower(), repeat.group(2).strip()
+            if "\\" in argument or (kind == "rept" and self._unknown_in(argument, names)):
+                return ".rept ?"
+            iterations = _Repetition(kind, argument, [], 0).iterations(self._symbols())
+            return ".rept ?" if iterations is None else f".rept {len(iterations)}"
+        if _REPEAT_CLOSE.match(piece):
+            return ".endr"
+        if _EXITM.match(piece):
+            return ".exitm"
+        return None
+
+    def _known(self, kind: str, argument: str, names: set[str] | None) -> str:
+        """`1`, `0` or `?`: the value of a conditional in a barrier text."""
+        if self._unknown_in(argument, names):
+            return "?"
+        taken = self._condition(kind, argument)
+        return "?" if taken is None else ("1" if taken else "0")
+
+    @staticmethod
+    def _unknown_in(argument: str, names: set[str] | None) -> bool:
+        """Whether *argument* holds a value that the text can change."""
+        return "\\" in argument or names is None or any(
+            name in names for name in _EXPRESSION_NAME.findall(argument)
+        )
+
     def _scan(
-        self, body: list[str], seen: frozenset[str] = frozenset()
+        self, body: list[str], seen: frozenset[str] = frozenset(),
+        names_before: set[str] | frozenset[str] | None = frozenset(), base: str = "maybe",
     ) -> tuple[bool, BarrierEffects]:
         """Read the text of a refused construct: what can it change?
 
@@ -946,38 +1186,75 @@ class _Expander:
         they bind.  Anything not known gives the answer "can": a directive
         that a macro argument supplies (`\\dir`), a macro defined inside, an
         `.include`, a recursion.
+
+        *names_before*: the names that a text around this one set before
+        it, thus a conditional here has no known value on them.  *base*:
+        whether the text runs ("yes": the body of a refused macro, "maybe":
+        a branch of no known value, a repetition of no known count), which
+        decides how a macro that it invokes counts for `\\@` (`_Runs`).
         """
         depth = 0
         nesting = False
         section = emits = False
-        names: set[str] | None = set()
+        names: set[str] | None = None if names_before is None else set(names_before)
+        runs = _Runs(base)
         exports: set[str] | None = set()
+        written: list[str] | None = []
 
         def merge(other: BarrierEffects) -> None:
-            nonlocal section, emits, names, exports
+            nonlocal section, emits, names, exports, written
             section |= other.section
             emits |= other.emits
             names = None if names is None or other.names is None else names | other.names
             exports = (
                 None if exports is None or other.exports is None else exports | other.exports
             )
+            written = (
+                None if written is None or other.text is None else written + list(other.text)
+            )
+
+        def write(statement: str) -> None:
+            nonlocal emits
+            emits = True
+            if written is not None:
+                written.append(statement.strip())
 
         for statement in body:
             for _, _, piece in _split_labels((("", 0, statement),)):
                 text = piece.strip()
-                if not text or _NUMERIC_LABEL.match(piece):
+                if not text:
+                    continue
+                if _NUMERIC_LABEL.match(piece):
+                    if written is not None:
+                        written.append(text)
                     continue
                 label = _LABEL_ONLY.match(piece)
                 if label is not None:
                     if names is not None:
                         names.add(label.group(1))
+                    if written is not None:
+                        written.append(text)
                     continue
                 if _SUBSTITUTED_LABEL.match(piece):
-                    # A label whose name an argument gives.
-                    names = None
+                    # A label whose name a substitution gives.  A local label
+                    # of the expansion counter (`.Lskip\@:`) names no other
+                    # symbol.  Any other one can be any name, a numeric one
+                    # too.  The text keeps it as written.
+                    if not _COUNTER_LOCAL_LABEL.match(piece):
+                        names = None
+                    if written is not None:
+                        written.append(text)
                     continue
                 if text.startswith("\\") or _DEFINE.match(piece) or _INCLUDE.match(piece):
                     return True, FULL
+                marker = self._marker(piece, names)
+                if marker is not None:
+                    runs.feed(marker)
+                if marker is not None and written is not None:
+                    # The flow reads the branches as branches, a repetition
+                    # as one that can run no time, and `.exitm` as the end
+                    # of its macro (`_asm_cfg._Structure`).
+                    written.append(marker)
                 if depth == 0 and (_IF_ELSE.match(piece) or _IF_ELSEIF.match(piece)):
                     nesting = True
                     continue
@@ -989,15 +1266,18 @@ class _Expander:
                     if depth < 0:
                         nesting = True
                     continue
-                if "\\" in piece:
+                if "\\" in piece.replace("\\@", "") or ("\\@" in piece and text.startswith(".")):
                     # A substitution that was not made is left in place: the
                     # name it makes (`lab\@:`, `.set \name\@, 1`) and what it
-                    # writes are not known.
+                    # writes are not known.  Only the counter in an
+                    # instruction (`cbz r0, .Lskip\@`) keeps the text: it
+                    # names a label of the same expansion.
                     names = exports = None
                     if _SECTION_SWITCH.match(piece):
                         section = True
                     elif not NO_BYTES.match(piece):
                         emits = True
+                        written = None
                     continue
                 if _CONDITIONAL.match(piece) or any(
                     pattern.match(piece) for pattern in (
@@ -1018,7 +1298,7 @@ class _Expander:
                     if name == ".":
                         # `. = expr` moves the location counter: it writes
                         # bytes (padding), and defines no symbol.
-                        emits = True
+                        write(piece)
                     elif names is not None:
                         names.add(name)
                     continue
@@ -1026,7 +1306,7 @@ class _Expander:
                 if common is not None:
                     if names is not None:
                         names.add(common.group(1))
-                    emits = True
+                    write(piece)
                     continue
                 export = _EXPORT.match(piece)
                 if export is not None:
@@ -1042,24 +1322,52 @@ class _Expander:
                 invocation = _INVOKE.match(piece)
                 macro = self.macros.get(invocation.group(1)) if invocation else None
                 if macro is not None and invocation is not None:
+                    run = runs.status()
                     if macro.name in seen:
+                        self.counter_known = self.counter_known and run == "no"
                         return True, FULL
                     values = bind(macro, split_arguments(invocation.group(2)))
                     if values is None:
+                        self.counter_known = self.counter_known and run == "no"
                         return True, FULL
+                    # gas expands it when this point runs: it counts for
+                    # `\@` there.  When that is not sure, or it runs a count
+                    # of times that is not known, the count after it is not
+                    # known either.
+                    counter: str | None = None
+                    once = run == "yes" and runs.times() == 1
+                    if run != "no":
+                        if runs.times() != 1:
+                            # Several expansions in one text: no one number
+                            # names them all.
+                            self.counter_known = False
+                        counter = self._count()
+                        if not once:
+                            self.counter_known = False
                     inner_nesting, inner = self._scan(
-                        [substitute(raw, values, None) for raw in macro.body],
-                        seen | {macro.name},
+                        [substitute(raw, values, counter) for raw in macro.body],
+                        seen | {macro.name}, names,
+                        "no" if run == "no" else ("yes" if once else "maybe"),
                     )
                     nesting |= inner_nesting
-                    merge(inner)
+                    # Its own scope: `.exitm` ends it, and its `\@` is
+                    # another number than the one of the text around it.
+                    merge(BarrierEffects(
+                        section=inner.section, emits=inner.emits, names=inner.names,
+                        exports=inner.exports,
+                        text=None if inner.text is None else (
+                            MACRO_OPEN, *inner.text, MACRO_CLOSE
+                        ),
+                    ))
                     continue
                 if not NO_BYTES.match(piece):
-                    emits = True
+                    write(piece)
+        self.scan_exits = runs.exited != "no"
         return nesting or depth != 0, BarrierEffects(
             section=section, emits=emits,
             names=frozenset(names) if names is not None else None,
             exports=frozenset(exports) if exports is not None else None,
+            text=tuple(written) if written is not None else None,
         )
 
     def _invoke(
@@ -1067,17 +1375,22 @@ class _Expander:
     ) -> Iterator[Located]:
         """Yield what one macro invocation produces."""
         if self.alternate:
+            # gas expands it: it counts for `\@`.
+            self._count()
             yield from self._refuse("alternate macro mode", at, macro.body)
             return
         if macro.refuse_reason:
             # The arguments bind: the text is the body with them in place.
+            # gas expands it, thus it counts for `\@` as an expansion does.
             bound = bind(macro, split_arguments(argument_text))
+            counter = None if bound is None else self._count()
             text = macro.body if bound is None else [
-                substitute(raw, bound, None) for raw in macro.body
+                substitute(raw, bound, counter) for raw in macro.body
             ]
             yield from self._refuse(macro.refuse_reason, at, text)
             return
         if depth + 1 > MAX_DEPTH:
+            self._count()
             yield from self._refuse("recursion deeper than the limit", at, macro.body)
             return
         values = bind(macro, split_arguments(argument_text))
@@ -1085,15 +1398,21 @@ class _Expander:
             yield from self._refuse("arguments do not match the parameters", at, macro.body)
             return
 
-        self.counter += 1
-        counter = self.counter
+        counter = self._count()
         self.report.expanded += 1
         file, line, _ = at
 
         def body() -> Iterator[Located]:
+            nested = 0
             for raw in macro.body:
                 statement = substitute(raw, values, counter)
-                if _EXITM.match(statement):
+                # `.exitm` in a repetition of the body ends that repetition
+                # (`_repeat`), not the macro (measured, gas 2.40).
+                if _REPEAT_OPEN.match(statement):
+                    nested += 1
+                elif _REPEAT_CLOSE.match(statement):
+                    nested -= 1
+                elif _EXITM.match(statement) and nested == 0:
                     return
                 # The location is the INVOCATION's.  A reader looking for
                 # POWER_CLOCK_IRQHandler wants the startup line that says
@@ -1109,13 +1428,14 @@ class _Expander:
         """Yield what one `.rept` / `.irp` / `.irpc` produces.
 
         *at* is the `.endr` that closed it: the place of a barrier when
-        the repetition is refused.
+        the repetition is refused.  `.exitm` in the body ends all of its
+        iterations (measured, gas 2.40).
         """
         bindings = repetition.iterations(self._symbols())
         if bindings is None:
             yield from self._refuse(
                 f".{repetition.kind} this cannot evaluate", at,
-                [statement for _, _, statement in repetition.body],
+                [statement for _, _, statement in repetition.body], skippable=True,
             )
             return
         if depth + 1 > MAX_DEPTH:
@@ -1125,16 +1445,55 @@ class _Expander:
             )
             return
         self.report.repeated += 1
+        # One value of `\@` for every iteration (`_current`).
+        counter = self._current()
+        exit_state = _RepetitionExit()
+        frames_before = len(self.frames)
 
         def body() -> Iterator[Located]:
-            for values in bindings:
-                for file, line, raw in repetition.body:
-                    # The location is the body statement's own.  Unlike a
-                    # macro body, this one is right here in the file, so
-                    # the more precise answer is available.
-                    yield file, line, substitute(raw, values, self.counter)
+            # `.exitm` ends all the iterations (measured, gas 2.40).  The
+            # expander tells it when it takes one (`process`), thus an
+            # `.exitm` in a branch that does not run ends nothing.
+            self.repetition_exits.append(exit_state)
+            try:
+                for number, values in enumerate(bindings):
+                    for index, (file, line, raw) in enumerate(repetition.body):
+                        if exit_state.state == "yes":
+                            # gas also leaves the conditionals of the body.
+                            del self.frames[frames_before:]
+                            return
+                        if exit_state.state == "maybe":
+                            rest = [
+                                substitute(statement, values, counter)
+                                for _, _, statement in repetition.body[index:]
+                            ] + [
+                                substitute(statement, later, counter)
+                                for later in bindings[number + 1:]
+                                for _, _, statement in repetition.body
+                            ]
+                            yield from self._rest_after_exit(rest, (file, line, raw), frames_before)
+                            return
+                        # The location is the body statement's own.  Unlike a
+                        # macro body, this one is right here in the file, so
+                        # the more precise answer is available.
+                        yield file, line, substitute(raw, values, counter)
+            finally:
+                self.repetition_exits.remove(exit_state)
 
         yield from self.process(body(), depth + 1)
+
+    def _rest_after_exit(
+        self, rest: list[str], at: Located, frames_before: int
+    ) -> Iterator[Located]:
+        """Leave a barrier for the rest of a repetition that an `.exitm` of
+        a refused text can end: the assembler takes all of it, or none."""
+        self.report.refused["repetition after an .exitm of no known branch"] += 1
+        nesting, effects = self._scan(rest)
+        if nesting:
+            self.stopped = True
+            self.report.refused["rest of the unit after it"] += 1
+        del self.frames[frames_before:]
+        yield from self._barrier(at, optional(effects))
 
 
 def expand_stream(

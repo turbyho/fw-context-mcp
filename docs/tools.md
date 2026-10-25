@@ -1473,7 +1473,7 @@ word, or write an explicit phrase.
   carries `_fallback: "sanitized"` and `_query_used`; a query FTS5 accepts
   (`NEAR(a b)`, `^term`, a column filter) always runs untouched
 
-**Kind filter:** `function`, `method`, `constructor`, `destructor`, `class`, `struct`, `union`, `enum`, `enum_constant`, `typedef`, `varglobal`, `varlocal`, `variable`, `field`, `namespace`, `label` (a local label of assembly, inside the code of a function: its `parent_usr` names the function)
+**Kind filter:** `function`, `method`, `constructor`, `destructor`, `class`, `struct`, `union`, `enum`, `enum_constant`, `typedef`, `varglobal`, `varlocal`, `variable`, `field`, `namespace`, `label` (a local label of assembly, inside the code of a function: its `parent_usr` names the function, or is empty when no single function holds the label)
 
 #### `search_bodies`
 
@@ -2298,7 +2298,8 @@ place is the place of the expansion.
 - `"text"` — a name in the tokens or in the source text gave the target,
   where the AST is opaque (`&Class::method`). A name can give a wrong
   target. A row with `"text"` alone is a guess.
-- `"asm"` — the assembly reader (a vector table slot, an alias).
+- `"asm"` — the assembly reader (a vector table slot, an alias, a call
+  or jump instruction, control that falls into another routine).
 - `"dispatch"` — a dispatch bridge, such as `EventQueue::call_every`.
 - `"instantiation"` — the body of a template instance. A call in a
   template body that names a dependent type (`device.sample()` with
@@ -2306,6 +2307,49 @@ place is the place of the expansion.
   template (caller and target), at the place of the call in the template.
 
 A site that two analyses find is one row with both names.
+
+**Assembly.** In assembly a function has no extent, thus fw-context finds
+the routines from the flow of control, as a disassembler does:
+
+- A routine starts at a label that code enters from elsewhere: a label
+  that the file exports or types as code (`.global`, `.weak`,
+  `.type ...,%function`, `.size`, `.thumb_func`), a label that a construct
+  which fw-context cannot read can export, the target of a call, and a
+  label whose address the file takes (`ldr r0, =X`, `la t0, X`, `.word X`).
+- Its body is the code that its start reaches: by falling through, and by
+  a jump to a label that starts no routine. Code that several routines
+  reach (a shared tail) belongs to each of them. The code of a call to a
+  label with no symbol (`bl .Lsub`, `bl 1f`) is part of the body too. The
+  flow goes on after such a call only when that code comes back. A
+  `pop {pc}` there without its own `push {lr}` (the far branch of Thumb-1)
+  is a return of the routine.
+- Its edges: each call, each jump to the start of another routine or to a
+  symbol outside the file (a tail call, kind `"call"`), and falling into
+  the start of another routine that holds code. A jump inside its body is
+  no edge. A fall reaches the label of the same file also when the label
+  is weak and a C function of the same name wins the link.
+- A register call counts when the register gets the address just before
+  (`ldr r0, =SystemInit` then `blx r0`).
+
+The instruction sets that fw-context reads are ARM and Thumb, RISC-V and
+Xtensa, from the `--target` of the file. Four limits:
+
+- A call returns, as the instruction set says, unless it calls a routine
+  of the same file that never returns. A routine elsewhere that never
+  returns (a panic handler, an RTOS exit that replaces the return
+  address) can thus give an edge for falling into the routine after the
+  call.
+- The code of a construct that fw-context cannot read (a macro with a
+  condition in its body) gives no edge. The flow passes the construct
+  only when a path through its statements reaches its end. The branches
+  of its conditionals are alternatives, and a conditional or a repetition
+  that fw-context cannot evaluate can also take none of its text. When a
+  path can leave it (a return, a jump out of it), the routine can return
+  there. A jump out of it to a label of the file ends that path.
+- A jump whose target is not known (a table branch) ends the flow, and so
+  does a jump to its own place (`b .`).
+- Code in a subsection (`.text 1`, `.subsection 1`), a section group or a
+  `unique` section gets no fall from code in another piece of it.
 
 **Templates.** A call to an implicit template instance (`read_twice<Sensor>`,
 `Box<int>::get`) is an edge to the template, because the template is the

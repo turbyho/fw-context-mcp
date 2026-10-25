@@ -35,7 +35,26 @@ from collections.abc import Collection, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ._asm_macro import NO_BYTES, UNSURE, BarrierEffects, barrier_effects
+from ._asm_cfg import AsmCall, unit_flow
+from ._asm_isa import ARM, RISCV, XTENSA
+from ._asm_layout import (
+    _ALIGN_RE,
+    _CODE_TYPES,
+    _DATA_DIRECTIVE,
+    _DATA_TYPES,
+    _GLOBAL_RE,
+    _LABEL_RE,
+    _LOCAL_LABEL_PREFIX,
+    _SUBSECTION_RE,
+    _TYPE_RE,
+    _WEAK_RE,
+    ABSOLUTE_SECTION,
+    _entries,
+    _listed,
+    _Ownership,
+    _SectionTracker,
+)
+from ._asm_macro import NO_BYTES, UNSURE, barrier_effects
 from ._asm_macro import Report as MacroReport
 from ._asm_macro import expand_stream as expand_macros
 from ._parsed_text import decode_lines
@@ -60,12 +79,13 @@ _SYNTHETIC_FILES = frozenset({"<built-in>", "<command line>", "<stdin>", ""})
 
 @dataclass(frozen=True)
 class Lexicon:
-    """The comment characters of the assembler of one target.
+    """The comment characters and the instruction set of one target.
 
     Attributes:
         comment: Each character starts a comment anywhere outside a string.
         line_comment: Each character starts a comment at the start of a
             line only.  On ARM `#` in the middle of a line is an immediate.
+        isa: The instruction set (`_asm_isa`), which decides what a call is.
 
     From binutils (``gas/config/tc-*.c``, ``comment_chars`` and
     ``line_comment_chars``).  ARM was also measured with
@@ -75,14 +95,15 @@ class Lexicon:
 
     comment: str
     line_comment: str
+    isa: str
 
 
 # The target prefix of the `--target` triple, and its lexicon.  A target
 # that is not here has no known comment character.
 _LEXICONS: tuple[tuple[tuple[str, ...], Lexicon], ...] = (
-    (("arm", "thumb"), Lexicon(comment="@", line_comment="#")),
-    (("riscv",), Lexicon(comment="#", line_comment="#")),
-    (("xtensa",), Lexicon(comment="#", line_comment="#")),
+    (("arm", "thumb"), Lexicon(comment="@", line_comment="#", isa=ARM)),
+    (("riscv",), Lexicon(comment="#", line_comment="#", isa=RISCV)),
+    (("xtensa",), Lexicon(comment="#", line_comment="#", isa=XTENSA)),
 )
 
 
@@ -373,8 +394,10 @@ def _clear_previous_pass(conn, config_hash: str) -> None:
       the row from the earlier index survives untouched, line number,
       is_project and all.  Measured: an is_project fix looked like it had
       no effect at all until this function existed.
-    * ``refs`` has no unique constraint, so a vector edge is appended
-      again on every run.  Measured on the STM32 project: one edge reported, two rows.
+    * An edge that the source no longer holds would stay for ever: the
+      pass writes the edges it finds, and nothing else removes the old
+      ones.  Measured on the STM32 project before ``refs`` had a key: one
+      edge reported, two rows.
 
     The C path solves the same problem with ``replace_file_data``, keyed by
     file id.  That is the wrong key here: an assembly unit can include a
@@ -416,6 +439,12 @@ def _clear_previous_pass(conn, config_hash: str) -> None:
     conn.execute(
         "DELETE FROM refs WHERE config_hash=? AND ref_kind IN (?, ?, ?)",
         (config_hash, VECTOR_REF_KIND, VECTOR_DATA_REF_KIND, ALIAS_REF_KIND),
+    )
+    # The call edges of instructions: their caller is an assembly symbol.
+    # Not every "call" row: that would delete the edges of C.
+    conn.execute(
+        "DELETE FROM refs WHERE config_hash=? AND ref_kind='call' AND from_usr LIKE 'asm:%'",
+        (config_hash,),
     )
 
 
@@ -470,7 +499,7 @@ def store_units(conn, config_hash: str, units: list, project_root: Path,
     # after every symbol is stored, without running the preprocessor again.
     # Assembly units are few — one on the STM32 project, three on the Mbed
     # project, seven per Zephyr image.
-    preprocessed: list[tuple[AsmSource, list[AsmSymbol]]] = []
+    preprocessed: list[tuple[AsmSource, list[AsmSymbol], list[AsmCall]]] = []
     # The live lines of each file that the units of this run read.
     views: dict[Path, UnitText] = {}
     for unit in units:
@@ -500,7 +529,7 @@ def store_units(conn, config_hash: str, units: list, project_root: Path,
         # slot pointed at the placeholder and the name appeared twice.
         # The STM32 project and the Mbed project hid it — their table and handlers share one
         # file.
-        preprocessed.append((source, symbols))
+        preprocessed.append((source, symbols, extract_calls(source)))
         texts = read_unit_texts(unit)
         if texts is None:
             # The symbols of the unit are stored, thus its files must stay
@@ -577,11 +606,11 @@ def store_units(conn, config_hash: str, units: list, project_root: Path,
 
     # Second pass: every symbol of every unit is now in the index, so an
     # alias or a slot can reach a symbol its own unit does not define.
-    for _source, symbols in preprocessed:
+    for _source, symbols, _calls in preprocessed:
         result.aliases += _store_aliases(
             conn, config_hash, symbols, project_root, _unit_names(symbols, project_root),
         )
-    for source, symbols in preprocessed:
+    for source, symbols, _calls in preprocessed:
         linked, unresolved = _store_vectors(
             conn, config_hash, source, project_root,
             vendor_patterns or [], project_patterns or [],
@@ -589,7 +618,24 @@ def store_units(conn, config_hash: str, units: list, project_root: Path,
         )
         result.vectors += linked
         result.unresolved += unresolved
+    for _source, symbols, calls in preprocessed:
+        result.calls += _store_calls(
+            conn, config_hash, calls, symbols, project_root,
+            vendor_patterns or [], project_patterns or [],
+            _unit_names(symbols, project_root),
+        )
     return result
+
+
+def extract_calls(source: AsmSource) -> list[AsmCall]:
+    """Return the call edges of *source* (`_asm_cfg`).
+
+    None without a known instruction set: then what is a call is not known.
+    """
+    if source.lexicon is None:
+        return []
+    statements = list(_statements(source))
+    return unit_flow(statements, source.lexicon.isa, _entries(statements)).calls
 
 
 def _unit_names(symbols: list[AsmSymbol], project_root: Path) -> dict[str, str]:
@@ -609,27 +655,6 @@ def _unit_names(symbols: list[AsmSymbol], project_root: Path) -> dict[str, str]:
     }
 
 
-# Directives that name a symbol.  GNU as accepts both spellings of the
-# global one, and the projects measured use `.global`; a regex that knows
-# only `.globl` returns nothing on any of them.
-# `.global` and `.weak` take a list of names: `.global a, b` exports both.
-_GLOBAL_RE = re.compile(r"^\s*\.(?:globl|global)\s+(.+?)\s*$")
-_WEAK_RE = re.compile(r"^\s*\.weak\s+(.+?)\s*$")
-_TYPE_RE = re.compile(r"^\s*\.type\s+([A-Za-z_.$][\w.$]*)\s*,\s*[%@#]?(\w+)")
-_NAME = re.compile(r"^[A-Za-z_.$][\w.$]*$")
-# The symbol types of `.type` that are code, and those that are data.  The
-# last `.type` of a name counts, as for gas.  `notype` is neither.
-_CODE_TYPES = frozenset({"function", "gnu_indirect_function"})
-_DATA_TYPES = frozenset({"object", "tls_object", "common", "gnu_unique_object"})
-
-
-def _listed(pattern: re.Pattern[str], stmt: str) -> list[str]:
-    """The names that a `.global` or `.weak` statement lists."""
-    found = pattern.match(stmt)
-    if found is None:
-        return []
-    return [name.strip() for name in found.group(1).split(",") if _NAME.match(name.strip())]
-_LABEL_RE = re.compile(r"^\s*([A-Za-z_.$][\w.$]*)\s*:")
 # `.thumb_set alias, target` is how CMSIS points an unimplemented interrupt
 # at the default handler.  `.set` and `.equ` do the same for other targets.
 #
@@ -667,6 +692,7 @@ class AsmResult:
             handler an assembler macro defines, which the C preprocessor
             does not expand.
         failed: units the preprocessor could not read.
+        calls: call edges written from instructions (one per owner).
         paths: the files rows written, in the spelling files.path uses.
             The coverage purge in _postprocess deletes any row that does
             not belong to the build, and it builds that set from the
@@ -683,6 +709,7 @@ class AsmResult:
     vectors: int = 0
     unresolved: int = 0
     aliases: int = 0
+    calls: int = 0
     failed: int = 0
     paths: set[str] = field(default_factory=set)
     macros: MacroReport = field(default_factory=MacroReport)
@@ -728,12 +755,6 @@ class AsmSymbol:
     parent: str | None = None
 
 
-# GNU as treats a label with this prefix as local to the file and keeps it
-# out of the object symbol table.  A compiler-written branch target is
-# spelled that way — startup_NRF52840.S has `.LC0` and `.LC1` around its
-# copy loop — and indexing them puts names in `lookup_symbol` that no
-# linker, debugger or reader will ever ask for.
-_LOCAL_LABEL_PREFIX = ".L"
 
 
 def _strip_block_comments(text: str, in_comment: bool) -> tuple[str, bool]:
@@ -957,6 +978,13 @@ def extract_symbols(
         if m is not None:
             aliases.setdefault(m.group(1), (m.group(2), file, line))
 
+    # With a known instruction set, the flow of control decides which
+    # labels start a routine and which routine holds a label.  Without
+    # one, the position does (`_Ownership`).
+    flow = unit_flow(statements, source.lexicon.isa, entries) if source.lexicon else None
+    if flow is not None:
+        parents = {name: flow.parents.get(name) for name in labels}
+
     found: list[AsmSymbol] = []
     for name, (file, line) in labels.items():
         typed = kinds.get(name)
@@ -969,6 +997,9 @@ def extract_symbols(
             kind = typed or "function"
         else:
             kind = "label"
+        if flow is not None and kind == "label" and name in flow.code_roots:
+            # Code enters it from elsewhere (a call, a taken address).
+            kind = "function"
         found.append(AsmSymbol(
             name=name, file=file, line=line, kind=kind,
             is_global=name in globals_, is_weak=name in weaks,
@@ -1095,37 +1126,6 @@ class VectorEntry:
     is_data: bool = False
 
 
-# Data directives that build a table, and the sections that hold code or
-# ordinary data rather than a table.  The directive is captured: a
-# position is the ordinal of an entry, and that is a slot index only while
-# every entry of the table has one size.  One spelling always has one
-# size, whatever the target (`.word` is 4 bytes on ARM and 2 on x86).
-_DATA_DIRECTIVE = re.compile(
-    r"^\s*(\.word|\.long|\.int|\.4byte|\.quad|\.8byte|\.short|\.hword|\.2byte"
-    r"|DCD|DCQ|DCW)\s+(.+?)\s*$",
-    re.IGNORECASE,
-)
-# A section switch, with the full name (`.vec-a` and `.vec-b` are two
-# sections) and the rest of the directive.
-_SECTION_RE = re.compile(
-    r'^\s*\.(section|pushsection)\s+("[^"]*"|[^\s,]+)\s*,?\s*(.*?)\s*$', re.IGNORECASE
-)
-_SHORT_SECTION_RE = re.compile(r"^\s*\.(text|data|bss|rodata)\b\s*(.*?)\s*$", re.IGNORECASE)
-# The section stack of gas: `.pushsection` saves the current section and
-# switches, `.popsection` returns to the saved one, `.previous` swaps the
-# current section with the one before the last switch.
-_POP_SECTION_RE = re.compile(r"^\s*\.popsection\b", re.IGNORECASE)
-_PREVIOUS_SECTION_RE = re.compile(r"^\s*\.previous\b", re.IGNORECASE)
-_SUBSECTION_RE = re.compile(r"^\s*\.subsection\b", re.IGNORECASE)
-# What may follow the name of a section with the positions still known:
-# flags without a group (`G` makes one section of each group name) and a
-# type.  A subsection number or `unique,N` gives a section with its own
-# location counter, which this does not track.
-_PLAIN_SECTION_REST = re.compile(r'^(?:"[A-Za-z]*"\s*(?:,\s*[@%]\w+\s*)?)?$')
-# Alignment writes padding only where the location counter is not aligned.
-# Before the first entry it moves the table as a whole, which leaves the
-# ordinals of the entries as they are.
-_ALIGN_RE = re.compile(r"^\s*\.(?:align|balign|p2align)\b", re.IGNORECASE)
 _ORDINARY_SECTION = re.compile(
     r"^\.(?:text|data|bss|rodata|init|fini|note|comment|debug|ARM)\b",
     re.IGNORECASE,
@@ -1161,243 +1161,6 @@ def _entry_symbol(value: str) -> tuple[str, bool] | None:
     if expression is not None:
         return expression.group(1), True
     return None
-
-
-@dataclass
-class _SectionMove:
-    """What one section directive did.
-
-    Attributes:
-        name: The current section after it, or None when not known.
-        plain: The section has one location counter that this tracks: no
-            subsection number, no group, no `unique`.
-    """
-
-    name: str | None
-    plain: bool = True
-
-
-class _SectionTracker:
-    """The current section of gas, as the statements of a unit move it.
-
-    gas starts in `.text`.  `.pushsection` saves the current section and
-    the one before it, `.popsection` returns to them, and `.previous` swaps
-    the current section with the one before the last switch.
-    """
-
-    def __init__(self) -> None:
-        self.current: str | None = ".text"
-        self.previous: str | None = None
-        self.saved: list[tuple[str | None, str | None]] | None = []
-
-    def feed(self, stmt: str) -> _SectionMove | None:
-        """Move the section by *stmt*; None when it is no section directive."""
-        switch = _SECTION_RE.match(stmt) or _SHORT_SECTION_RE.match(stmt)
-        if switch is not None:
-            groups = switch.groups()
-            name = groups[1].strip('"') if len(groups) == 3 else f".{groups[0].lower()}"
-            rest = groups[-1]
-            if len(groups) == 3 and groups[0].lower() == "pushsection" and self.saved is not None:
-                self.saved.append((self.current, self.previous))
-            self.previous, self.current = self.current, name
-            plain = _PLAIN_SECTION_REST.match(rest) is not None if len(groups) == 3 else rest == ""
-            return _SectionMove(name, plain)
-        if _STRUCT_RE.match(stmt):
-            # `.struct` and `.offset` switch to the absolute section: the
-            # labels there are offsets of a structure, not code and not a
-            # table.  What `.previous` returns to after it is not measured.
-            self.current, self.previous = ABSOLUTE_SECTION, None
-            return _SectionMove(ABSOLUTE_SECTION)
-        if _POP_SECTION_RE.match(stmt):
-            # An empty stack is an error of gas; an unknown one (after a
-            # barrier) gives an unknown section.
-            self.current, self.previous = self.saved.pop() if self.saved else (None, None)
-            return _SectionMove(self.current)
-        if _PREVIOUS_SECTION_RE.match(stmt):
-            self.current, self.previous = self.previous, self.current
-            return _SectionMove(self.current)
-        return None
-
-    def lose(self) -> None:
-        """Forget the section: statements that are not known can move it."""
-        self.current = self.previous = None
-        self.saved = None
-
-
-_THUMB_FUNC_RE = re.compile(r"^\s*\.thumb_func\b", re.IGNORECASE)
-_STRUCT_RE = re.compile(r"^\s*\.(?:struct|offset)\b", re.IGNORECASE)
-# The name this reader gives the absolute section of `.struct`.
-ABSOLUTE_SECTION = "*ABS*"
-_SIZE_RE = re.compile(r"^\s*\.size\s+([A-Za-z_.$][\w.$]*)\s*,", re.IGNORECASE)
-
-
-@dataclass(frozen=True)
-class _Entries:
-    """The entry labels of a unit: the labels that own code.
-
-    An entry is a label that the unit exports or types as code: `.global`,
-    `.weak`, `.type name, %function`, `.size`, or the label after
-    `.thumb_func`.  A label typed `%object` is data and owns no code.  The
-    other labels are local labels of the entry before them.  This is a
-    convention of naming, not a fact of the assembler: without `.size` gas
-    gives a function no extent, and a debugger names an address by the
-    nearest label.  The convention gives `find_callers(main)` the answer
-    `Reset_Handler`, not the loop label before the call.
-
-    Attributes:
-        names: The entry labels.
-        maybe: The names that a refused construct can export, thus can be
-            entries; None when any name can be.
-    """
-
-    names: frozenset[str]
-    maybe: frozenset[str] | None
-
-
-def _entries(statements: list[tuple[str, int, str]]) -> _Entries:
-    """Find the entry labels of a unit.  The directives can come after the label."""
-    names: set[str] = set()
-    types: dict[str, str] = {}
-    maybe: set[str] | None = set()
-    thumb_next = False
-    for _file, _line, stmt in statements:
-        label = _LABEL_RE.match(stmt)
-        if label is not None:
-            # gas gives `.thumb_func` to the next label it keeps: a `.L`
-            # label is not one.
-            if thumb_next and not label.group(1).startswith(_LOCAL_LABEL_PREFIX):
-                names.add(label.group(1))
-                thumb_next = False
-            continue
-        names.update(_listed(_GLOBAL_RE, stmt))
-        names.update(_listed(_WEAK_RE, stmt))
-        size = _SIZE_RE.match(stmt)
-        if size is not None:
-            names.add(size.group(1))
-        typed = _TYPE_RE.match(stmt)
-        if typed is not None:
-            types[typed.group(1)] = typed.group(2)
-        if _THUMB_FUNC_RE.match(stmt):
-            thumb_next = True
-        effects = barrier_effects(stmt)
-        if effects is not None:
-            if effects.exports is None:
-                maybe = None
-            elif maybe is not None:
-                maybe |= effects.exports
-    names.update(name for name, kind in types.items() if kind in _CODE_TYPES)
-    objects = {name for name, kind in types.items() if kind in _DATA_TYPES}
-    return _Entries(
-        names=frozenset(names - objects),
-        maybe=None if maybe is None else frozenset(maybe),
-    )
-
-
-@dataclass
-class _Owned:
-    """The owner of the code of one section at the current point.
-
-    Attributes:
-        owners: The entries that own the code here: more than one when
-            several entries are at one place (no byte between them), none
-            when no entry came yet, None when it is not known.
-        group_open: No byte was written since the last entry, thus a next
-            entry is at the same place.
-    """
-
-    owners: tuple[str, ...] | None = ()
-    group_open: bool = False
-
-
-class _Ownership:
-    """Which entry owns the code at each point of the statements of a unit.
-
-    Each section keeps its own owner: a function can switch to another
-    section and back (`.pushsection`), and the code after the return still
-    belongs to it.  `.size` of an owner ends it.  A barrier that can define
-    or export an entry makes the owner unknown, because its hidden text can
-    start another function.  An alignment keeps a group of entries open: in
-    code it pads with instructions that run into the next entry.
-    """
-
-    def __init__(self, entries: _Entries) -> None:
-        self.entries = entries
-        self.tracker = _SectionTracker()
-        self.sections: dict[str, _Owned] = {}
-
-    def _state(self) -> _Owned | None:
-        current = self.tracker.current
-        if current is None:
-            return None
-        if current == ABSOLUTE_SECTION:
-            # No code is there: a fresh state that no entry ever owns.
-            return _Owned()
-        return self.sections.setdefault(current, _Owned())
-
-    def owners(self) -> tuple[str, ...] | None:
-        """The entries that own the code at this point, or None when not known."""
-        state = self._state()
-        return None if state is None else state.owners
-
-    def feed(self, stmt: str) -> None:
-        """Move the point past *stmt*."""
-        if self.tracker.feed(stmt) is not None:
-            return
-        effects = barrier_effects(stmt)
-        if effects is not None:
-            self._barrier(effects)
-            return
-        state = self._state()
-        if state is None:
-            return
-        label = _LABEL_RE.match(stmt)
-        if label is not None:
-            name = label.group(1)
-            if name in self.entries.names:
-                joined = state.group_open and state.owners
-                state.owners = (*state.owners, name) if joined and state.owners else (name,)
-                state.group_open = True
-            elif self.entries.maybe is None or name in self.entries.maybe:
-                # A refused construct can export it: it can be an entry.
-                state.owners = None
-                state.group_open = False
-            return
-        size = _SIZE_RE.match(stmt)
-        if size is not None:
-            if state.owners and size.group(1) in state.owners:
-                state.owners = tuple(owner for owner in state.owners if owner != size.group(1))
-            return
-        if NO_BYTES.match(stmt) or _ALIGN_RE.match(stmt):
-            return
-        state.group_open = False
-
-    def _barrier(self, effects: BarrierEffects) -> None:
-        # The hidden text can start an entry when it exports a name, or when
-        # it defines a name that is (or can be) an entry.
-        maybe = self.entries.maybe
-        names = effects.names
-        if effects.exports is None or effects.exports or names is None:
-            defines_entry = True
-        elif not names:
-            defines_entry = False
-        else:
-            defines_entry = maybe is None or bool(names & (self.entries.names | maybe))
-        if effects.section:
-            self.tracker.lose()
-            for owned in self.sections.values():
-                if defines_entry:
-                    owned.owners = None
-                if effects.emits:
-                    # It can write bytes into any section.
-                    owned.group_open = False
-            return
-        state = self._state()
-        if state is None:
-            return
-        if defines_entry:
-            state.owners = None
-        if effects.emits:
-            state.group_open = False
 
 
 @dataclass
@@ -1465,6 +1228,10 @@ def extract_vectors(source: AsmSource) -> list[VectorEntry]:
             if move.name is not None and not move.plain:
                 table(move.name).known = False
             continue
+        if _SUBSECTION_RE.match(stmt):
+            # `.previous` after it returns to the same section (the table
+            # below loses its positions).
+            sections.subsection()
         current = sections.current
         effects = barrier_effects(stmt)
         if effects is not None:
@@ -1607,10 +1374,10 @@ def _store_aliases(
 
 
 def _declare_referenced_only(
-    conn, config_hash: str, entry: VectorEntry, project_root: Path,
+    conn, config_hash: str, name: str, file: str, line: int, project_root: Path,
     vendor_patterns: list[str], project_patterns: list[str],
 ) -> str | None:
-    """Record a vector slot's target that no unit in the build defines.
+    """Record the target of a vector slot or a call that no unit in the build defines.
 
     A startup file's first slot holds the initial stack pointer and names
     something like `_estack` or `__StackTop`, which the LINKER SCRIPT
@@ -1640,24 +1407,23 @@ def _declare_referenced_only(
 
     existing = conn.execute(
         "SELECT 1 FROM symbols WHERE config_hash=? AND link_name=? LIMIT 1",
-        (config_hash, entry.name),
+        (config_hash, name),
     ).fetchone()
     if existing is not None:
         return None
 
-    db_path = _normalize_file_path(entry.file, project_root)
-    file_id = upsert_file(conn, config_hash, db_path, "c", **_file_state(entry.file))
-    usr = f"{_ASM_USR_PREFIX}@{entry.name}"
+    db_path = _normalize_file_path(file, project_root)
+    file_id = upsert_file(conn, config_hash, db_path, "c", **_file_state(file))
+    usr = f"{_ASM_USR_PREFIX}@{name}"
     insert_symbols_batch(conn, [(
-        config_hash, file_id, db_path, entry.name, usr, entry.name, entry.name,
-        _UNDEFINED_KIND, entry.line, 1, entry.line,
+        config_hash, file_id, db_path, name, usr, name, name,
+        _UNDEFINED_KIND, line, 1, line,
         0,  # is_definition: the slot references it, nothing defines it
         "", "", None, 0, 0, "", 0, "",
-        _is_project_file(entry.file, project_root, vendor_patterns,
-                         project_patterns),
+        _is_project_file(file, project_root, vendor_patterns, project_patterns),
         0.0, "", 0,
         # It stands for the symbol the linker resolves from elsewhere.
-        entry.name,
+        name,
     )])
     return usr
 
@@ -1726,6 +1492,58 @@ def _resolve_handler(
     return pick(rows)
 
 
+def _store_calls(
+    conn, config_hash: str, calls: list[AsmCall], symbols: list[AsmSymbol],
+    project_root: Path, vendor_patterns: list[str], project_patterns: list[str],
+    unit_names: dict[str, str],
+) -> int:
+    """Write an edge for each call and jump of one unit.  Returns how many.
+
+    The caller is each entry that owns the instruction (entries at one
+    place share their code).  The target is resolved as a vector slot is
+    (`_resolve_handler`): a name of the unit, else the symbol the linker
+    resolves.  A name that nothing defines gets the placeholder that a
+    slot gets (`_declare_referenced_only`): newlib's `__libc_init_array`
+    and the `_start` of a C runtime are such names.  The kind is "call"
+    for a jump too, as for a tail call of C.  A fall through is no
+    reference that the linker resolves: it reaches the label of this unit,
+    also when the label is weak and a strong definition wins the link.
+    """
+    from fw_context_mcp.indexer.db import insert_refs_batch
+    from fw_context_mcp.indexer.models import RefOrigin
+    from fw_context_mcp.indexer.ops import _normalize_file_path
+
+    files = {sym.name: sym.file for sym in symbols}
+    rows = []
+    for call in calls:
+        if call.fall and call.target in files:
+            target: str | None = (
+                f"{_ASM_USR_PREFIX}{_normalize_file_path(files[call.target], project_root)}"
+                f"@{call.target}"
+            )
+        else:
+            target = _resolve_handler(conn, config_hash, call.target, unit_names)
+        if target is None and call.target not in files:
+            target = _declare_referenced_only(
+                conn, config_hash, call.target, call.file, call.line, project_root,
+                vendor_patterns, project_patterns,
+            )
+        if target is None:
+            continue
+        for owner in call.owners:
+            if owner not in files:
+                continue
+            caller = f"{_ASM_USR_PREFIX}{_normalize_file_path(files[owner], project_root)}@{owner}"
+            # Column 0: the assembly reader gives no column.
+            rows.append((
+                config_hash, target, _normalize_file_path(call.file, project_root), call.line,
+                caller, "call", None, 0, int(RefOrigin.ASM),
+            ))
+    if rows:
+        insert_refs_batch(conn, rows)
+    return len(rows)
+
+
 def _store_vectors(
     conn, config_hash: str, source: AsmSource,
     project_root: Path, vendor_patterns: list[str], project_patterns: list[str],
@@ -1772,7 +1590,7 @@ def _store_vectors(
         usr = _resolve_handler(conn, config_hash, entry.name, unit_names)
         if usr is None:
             usr = _declare_referenced_only(
-                conn, config_hash, entry, project_root,
+                conn, config_hash, entry.name, entry.file, entry.line, project_root,
                 vendor_patterns, project_patterns,
             )
         if usr is None:

@@ -22,6 +22,7 @@ assertion on when the construct lands.
 
 from __future__ import annotations
 
+import importlib.util
 import shutil
 import subprocess
 import tomllib
@@ -30,7 +31,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from fw_context_mcp.indexer.asm import extract_symbols, extract_vectors, preprocess
+from fw_context_mcp.indexer.asm import (
+    extract_calls,
+    extract_symbols,
+    extract_vectors,
+    preprocess,
+)
 
 CORPUS = Path(__file__).parent / "fixtures" / "asm"
 EXPECTED = tomllib.loads((CORPUS / "expected.toml").read_text(encoding="utf-8"))
@@ -104,6 +110,20 @@ class TestAgainstTheAssembler:
             "`.word Sym` makes one and a reserved `.word 0` does not"
         )
 
+    def test_the_call_edges_match(self, name: str):
+        """Each call or jump relocation is an edge of the function that holds it."""
+        entry = EXPECTED[name]
+        if "calls" not in entry:
+            pytest.skip(f"{name}.S has no call to a symbol")
+        unit = SimpleNamespace(
+            file=CORPUS / f"{name}.S", directory=CORPUS, clang_args=["--target=arm-none-eabi"]
+        )
+        source = preprocess(unit)
+        assert source is not None
+        edges = {f"{'+'.join(call.owners)}>{call.target}" for call in extract_calls(source)}
+
+        assert edges == set(entry["calls"])
+
 
 @needs_arm
 @pytest.mark.parametrize("name", _corpus_files())
@@ -148,5 +168,20 @@ class TestTheCorpusItself:
                 defined.add(parts[2])
 
         assert defined == set(EXPECTED[name]["defined"]), (
+            f"{name}.S and expected.toml disagree; regenerate the file"
+        )
+
+    def test_expected_calls_still_match_the_assembler(self, name: str, tmp_path: Path):
+        """The call edges of expected.toml come from the relocations (regenerate.py)."""
+        spec = importlib.util.spec_from_file_location("regenerate", CORPUS / "regenerate.py")
+        assert spec is not None and spec.loader is not None
+        regenerate = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(regenerate)
+        path = CORPUS / f"{name}.S"
+        assert self._assemble(path, tmp_path).returncode == 0
+
+        edges = regenerate.call_edges(tmp_path / f"{name}.o")
+
+        assert edges == set(EXPECTED[name].get("calls", [])), (
             f"{name}.S and expected.toml disagree; regenerate the file"
         )

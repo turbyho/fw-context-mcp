@@ -15,6 +15,13 @@ description = 'Alternate macro mode, which the reader refuses rather than guesse
 complete = false
 defined = ["bracket_delimited", "defined_after", "defined_before"]
 
+[calls]
+description = 'Calls and jumps that name their target: each one with a relocation is a call edge of the function that holds it.'
+complete = true
+defined = ["CopyData", "Dispatch", "HardFault_Handler", "Helper", "LoopCopy", "LoopForever", "Reset_Handler"]
+undefined = ["SystemInit", "fault_common", "fault_from_task", "from_private", "helper_work", "init_array", "main"]
+calls = ["Dispatch>Helper", "Dispatch>from_private", "HardFault_Handler>fault_common", "HardFault_Handler>fault_from_task", "Helper>helper_work", "Reset_Handler>SystemInit", "Reset_Handler>init_array", "Reset_Handler>main"]
+
 [comments]
 description = 'Prose and directives inside block comments, which the preprocessor keeps and the reader must skip.'
 complete = true

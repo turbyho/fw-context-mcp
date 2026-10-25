@@ -38,6 +38,7 @@ FLAGS = ["-mcpu=cortex-m4", "-mthumb", "-c"]
 
 COMPLETE = {
     "altmacro": False,
+    "calls": True,
     "comments": True,
     "conditionals": True,
     "conditionals_unknown": False,
@@ -56,6 +57,8 @@ COMPLETE = {
 DESCRIPTIONS = {
     "altmacro": "Alternate macro mode, which the reader refuses rather "
                 "than guesses at.",
+    "calls": "Calls and jumps that name their target: each one with a "
+             "relocation is a call edge of the function that holds it.",
     "comments": "Prose and directives inside block comments, which the "
                 "preprocessor keeps and the reader must skip.",
     "conditionals": "Conditionals outside a macro body, which the reader "
@@ -135,6 +138,47 @@ def vector_targets(obj: Path) -> set[str]:
     return targets
 
 
+# The relocations of a call or a jump to a symbol, for ARM and Thumb.  A
+# branch to a local label is resolved by the assembler and leaves none.
+CALL_RELOCATIONS = frozenset({
+    "R_ARM_THM_CALL", "R_ARM_THM_JUMP24", "R_ARM_THM_JUMP19",
+    "R_ARM_CALL", "R_ARM_JUMP24", "R_ARM_PC24",
+})
+
+
+def call_edges(obj: Path) -> set[str]:
+    """Return "caller>target" for each call or jump relocation of `.text`.
+
+    The caller is the function whose symbol (address and size, from nm)
+    holds the place of the relocation.  The value of a Thumb function has
+    bit 0 set, which is not part of its address.
+    """
+    listed = subprocess.run([str(NM), "-S", "--defined-only", str(obj)],
+                            capture_output=True, text=True, timeout=60)
+    functions: list[tuple[int, int, str]] = []
+    for line in listed.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 4 and parts[2] in ("T", "t"):
+            functions.append((int(parts[0], 16) & ~1, int(parts[1], 16), parts[3]))
+    out = subprocess.run([str(OBJDUMP), "-r", str(obj)], capture_output=True,
+                         text=True, timeout=60)
+    edges: set[str] = set()
+    section = ""
+    for line in out.stdout.splitlines():
+        header = re.match(r"RELOCATION RECORDS FOR \[([^\]]+)\]", line)
+        if header:
+            section = header.group(1)
+            continue
+        parts = line.split()
+        if section != ".text" or len(parts) != 3 or parts[1] not in CALL_RELOCATIONS:
+            continue
+        offset = int(parts[0], 16)
+        callers = [name for start, size, name in functions if start <= offset < start + size]
+        if len(callers) == 1:
+            edges.add(f"{callers[0]}>{parts[2]}")
+    return edges
+
+
 def quoted(items: set[str]) -> str:
     return "[" + ", ".join(f'"{item}"' for item in sorted(items)) + "]"
 
@@ -169,6 +213,7 @@ def main() -> int:
             obj = assemble(path, Path(tmp))
             defined, undefined = symbols(obj)
             slots = vector_targets(obj)
+            calls = call_edges(obj)
             lines.append(f"[{key}]")
             # A TOML literal string: the descriptions carry backslashes,
             # which a basic string would read as escapes.
@@ -179,6 +224,8 @@ def main() -> int:
                 lines.append(f"undefined = {quoted(undefined)}")
             if slots:
                 lines.append(f"vectors = {quoted(slots)}")
+            if calls:
+                lines.append(f"calls = {quoted(calls)}")
             lines.append("")
 
     (CORPUS / "expected.toml").write_text("\n".join(lines), encoding="utf-8")

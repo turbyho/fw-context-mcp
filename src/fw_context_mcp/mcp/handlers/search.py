@@ -243,7 +243,7 @@ def search_code(
     ``destructor``, ``class``, ``struct``, ``union``, ``enum``, ``enum_constant``,
     ``typedef``, ``varglobal``, ``varlocal``, ``variable``, ``field``,
     ``namespace``, ``label`` (a local label of assembly, inside the code of
-    a function).
+    a function; ``parent_usr`` is empty when no single function holds it).
 
     **Local variables are out.**  FTS5 indexes the qualified name, thus a
     local matches through the function that holds it: a query for

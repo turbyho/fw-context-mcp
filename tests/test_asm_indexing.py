@@ -801,6 +801,17 @@ class TestVectorTable:
 
         assert positions == {"h0": None}
 
+    def test_previous_after_a_subsection_returns_to_the_table(self, tmp_path: Path):
+        """gas: `.previous` after `.subsection 1` goes back to subsection 0
+        of the same section, not to the section before it."""
+        positions = self._positions(
+            tmp_path,
+            "  .text\n  .section .vec, \"a\"\n  .word h0\n  .subsection 1\n  .word x\n"
+            "  .previous\n  .word h1\n",
+        )
+
+        assert "h1" in positions
+
     def test_a_barrier_that_can_switch_the_section_ends_the_table(self, tmp_path: Path):
         """A refused repetition that switches to `.text` makes the next
         `.word` a constant there.  Taking it for a slot would be a wrong
@@ -2577,3 +2588,121 @@ class TestLabelParent:
 
         assert rows["Loop"] == ("label", "asm:s.S@Entry")
         assert rows["Entry"] == ("function", "")
+
+
+class TestCallEdges:
+    """The call edges of instructions, stored by the assembly pass."""
+
+    _ARM = ["--target=arm-none-eabi"]
+
+    @staticmethod
+    def _store(tmp_path: Path, text: str, c_functions: list[str] = ()):
+        from fw_context_mcp.indexer.asm import store_units
+        from fw_context_mcp.indexer.db import insert_symbols_batch, transaction, upsert_file
+
+        conn = TestStoreUnits._db(tmp_path)
+        with transaction(conn):
+            if c_functions:
+                fid = upsert_file(conn, "ch", "src/main.c", "c")
+                insert_symbols_batch(conn, [
+                    ("ch", fid, "src/main.c", n, f"c:@F@{n}", n, n, "function",
+                     10, 1, 12, 1, "", "", None, 0, 0, "", 0, "", 1, 0.0, "", 0, n)
+                    for n in c_functions
+                ])
+            result = store_units(
+                conn, "ch", [_unit(tmp_path, "s.S", text, TestCallEdges._ARM)], tmp_path,
+            )
+        return conn, result
+
+    @staticmethod
+    def _rows(conn) -> set[tuple[str, str, int]]:
+        return {
+            (row["from_usr"], row["to_usr"], row["origins"])
+            for row in conn.execute(
+                "SELECT from_usr, to_usr, origins FROM refs WHERE ref_kind='call'"
+            )
+        }
+
+    def test_a_call_reaches_the_c_function(self, tmp_path: Path):
+        from fw_context_mcp.indexer.models import RefOrigin
+
+        conn, result = self._store(
+            tmp_path,
+            "  .syntax unified\n  .thumb\n  .text\n  .global Reset_Handler\n"
+            "Reset_Handler:\n  bl SystemInit\n  b .\n",
+            ["SystemInit"],
+        )
+        try:
+            rows = self._rows(conn)
+        finally:
+            conn.close()
+
+        assert rows == {("asm:s.S@Reset_Handler", "c:@F@SystemInit", int(RefOrigin.ASM))}
+        assert result.calls == 1
+
+    def test_a_target_that_nothing_defines_gets_a_placeholder(self, tmp_path: Path):
+        conn, _ = self._store(
+            tmp_path,
+            "  .syntax unified\n  .thumb\n  .text\n  .global f\nf:\n  bl __libc_init_array\n  b .\n",
+        )
+        try:
+            rows = self._rows(conn)
+        finally:
+            conn.close()
+
+        assert rows == {("asm:s.S@f", "asm:@__libc_init_array", 4)}
+
+    def test_a_fall_into_another_routine_is_an_edge(self, tmp_path: Path):
+        conn, _ = self._store(
+            tmp_path,
+            "  .syntax unified\n  .thumb\n  .text\n  .global a\na:\n  nop\n"
+            "  .global b\nb:\n  bx lr\n",
+        )
+        try:
+            rows = self._rows(conn)
+        finally:
+            conn.close()
+
+        assert rows == {("asm:s.S@a", "asm:s.S@b", 4)}
+
+    def test_a_fall_reaches_the_weak_label_of_the_unit(self, tmp_path: Path):
+        """The linker gives a call of `b` to the strong C definition, not a fall."""
+        conn, _ = self._store(
+            tmp_path,
+            "  .syntax unified\n  .thumb\n  .text\n  .global a\na:\n  nop\n"
+            "  .weak b\nb:\n  bx lr\n",
+            ["b"],
+        )
+        try:
+            rows = self._rows(conn)
+        finally:
+            conn.close()
+
+        assert rows == {("asm:s.S@a", "asm:s.S@b", 4)}
+
+    def test_a_new_run_removes_a_call_that_is_gone(self, tmp_path: Path):
+        """The pass writes its edges again on each run; C edges stay."""
+        from fw_context_mcp.indexer.asm import store_units
+        from fw_context_mcp.indexer.db import insert_refs_batch, transaction
+
+        conn, _ = self._store(
+            tmp_path,
+            "  .syntax unified\n  .thumb\n  .text\n  .global f\nf:\n  bl SystemInit\n  b .\n",
+            ["SystemInit"],
+        )
+        try:
+            with transaction(conn):
+                insert_refs_batch(conn, [(
+                    "ch", "c:@F@SystemInit", "src/main.c", 20, "c:@F@main", "call", None, 3, 1,
+                )])
+            (tmp_path / "s.S").write_text(
+                "  .syntax unified\n  .thumb\n  .text\n  .global f\nf:\n  b .\n", encoding="utf-8",
+            )
+            with transaction(conn):
+                store_units(conn, "ch", [_unit(tmp_path, "s.S", (tmp_path / "s.S").read_text(),
+                                               self._ARM)], tmp_path)
+            rows = self._rows(conn)
+        finally:
+            conn.close()
+
+        assert rows == {("c:@F@main", "c:@F@SystemInit", 1)}

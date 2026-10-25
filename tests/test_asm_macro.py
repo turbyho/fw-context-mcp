@@ -805,18 +805,41 @@ class TestBarrierEffects:
         assert effects.names == frozenset({"lbl"})
         assert effects.exports == frozenset({"lbl"})
 
+    def test_a_refused_macro_counts_as_an_expansion(self):
+        """gas (arm-none-eabi 2.40): `\\@` is 0 in the first expansion, also
+        in one that the reader refuses, thus `1\\@:` is the numeric label `10:`."""
+        [effects] = self._effects(".macro m\n  .if UNKNOWN\n1\\@:\n  nop\n  .endif\n.endm\n  m\n")
+
+        assert effects.text == (".if ?", "10:", "nop", ".endif")
+
+    def test_after_a_refused_text_that_invokes_a_macro_the_count_is_not_known(self):
+        """gas can expand the inner macro or not: `\\@` after it can be 2 or 3."""
+        effects = self._effects(
+            ".macro inner\n  nop\n.endm\n.macro m\n  .if UNKNOWN\n  inner\n  .endif\n.endm\n"
+            "  m\n  .if UNKNOWN\n1\\@:\n  .endif\n"
+        )
+
+        assert effects[-1].text == (".if ?", "1\\@:", ".endif")
+        assert effects[-1].names is None
+
+    def test_the_text_of_a_conditional_keeps_its_branches(self):
+        """The flow takes one branch, or none: `.if ?` wraps the region."""
+        [effects] = self._effects("  .if UNKNOWN\n  b fast\n  .else\n  bl slow\n  .endif\n")
+
+        assert effects.text == (".if ?", "b fast", ".else", "bl slow", ".endif")
+
     def test_a_section_switch_is_seen(self):
         [effects] = self._effects("  .rept UNKNOWN\n  .section .vec\n  .endr\n")
 
         assert effects.section
 
-    def test_a_label_with_the_expansion_count_has_no_known_name(self):
-        """`\\@` is the count of the expansion, which a refusal never makes."""
+    def test_a_label_with_the_expansion_count_has_the_name_gas_gives(self):
+        """gas counts the refused expansion too: the label is `l0`."""
         [effects] = self._effects(
             ".macro m\n  .if 1\nl\\@:\n  .endif\n.endm\n  m\n"
         )
 
-        assert effects.names is None
+        assert effects.names == frozenset({"l0"})
 
     def test_a_conditional_with_no_value_gives_the_effects_of_all_branches(self):
         [effects] = self._effects(
@@ -854,12 +877,12 @@ class TestBarrierEffectsTraps:
 
         assert "seen_ndef:" not in produced and "seen_def:" not in produced
 
-    def test_a_label_and_a_statement_with_the_count_is_unknown(self):
+    def test_a_label_and_a_statement_with_the_count_has_the_name_gas_gives(self):
         [effects] = TestBarrierEffects._effects(
             ".macro m\n  .if 1\n  .endif\nlab\\@: nop\n.endm\n  m\n"
         )
 
-        assert effects.names is None
+        assert effects.names == frozenset({"lab0"})
 
     def test_a_common_symbol_is_defined(self):
         """gas: after `.comm cbuf, 4`, `.ifdef cbuf` is true."""
@@ -888,3 +911,110 @@ class TestBarrierEffectsTraps:
         produced, _ = _run('  .if unknown\n  .include "x.s"\n  .endif\nafter:\n')
 
         assert "after:" not in produced
+
+
+class TestExpansionCount:
+    """`\\@` as gas 2.40 (arm-none-eabi) gives it, measured with nm."""
+
+    def test_an_expansion_in_alternate_mode_counts(self):
+        produced, _ = _run(
+            ".macro m\n  nop\n.endm\n.macro n\nn\\@:\n  nop\n.endm\n"
+            "  .altmacro\n  m\n  .noaltmacro\n  n\n"
+        )
+
+        assert "n1:" in produced
+
+    def test_a_repetition_takes_one_count_for_all_its_iterations(self):
+        """gas: `i0a m0 i0b m1`."""
+        produced, _ = _run(
+            ".macro m\nm\\@:\n  nop\n.endm\n  .irp x,a,b\ni\\@\\x:\n  m\n  .endr\n"
+        )
+
+        assert [s for s in produced if s.endswith(":")] == ["i0a:", "m0:", "i0b:", "m1:"]
+
+    def test_exitm_in_a_repetition_ends_the_repetition(self):
+        """gas: `r0` once, and `a0` after the repetition."""
+        produced, _ = _run(
+            ".macro m\n  .rept 2\nr\\@:\n  nop\n  .exitm\n  .endr\na\\@:\n  nop\n.endm\n  m\n"
+        )
+
+        assert [s for s in produced if s.endswith(":")] == ["r0:", "a0:"]
+
+    def test_a_macro_that_a_refused_text_surely_invokes_counts(self):
+        """gas: guarded 0, inner 1, over2 2."""
+        produced, _ = _run(
+            ".macro inner\n  nop\n.endm\n.macro guarded\n  .if 1\n  inner\n  .endif\n.endm\n"
+            ".macro over2\nskip\\@:\n  nop\n.endm\n  guarded\n  over2\n"
+        )
+
+        assert "skip2:" in produced
+
+    def test_after_a_macro_that_a_refused_text_may_invoke_the_count_is_a_mark(self):
+        produced, _ = _run(
+            ".macro inner\n  nop\n.endm\n.macro guarded\n  .if UNKNOWN\n  inner\n  .endif\n.endm\n"
+            ".macro over2\nskip\\@:\n  nop\n.endm\n  guarded\n  over2\n"
+        )
+
+        assert "skip\\@2:" in produced
+
+    def test_an_inner_macro_sees_the_names_that_the_text_set_before_it(self):
+        """`.set FLAG, 1` in the refused text: `.if FLAG` in the inner macro
+        has no known value (gas takes the branch)."""
+        [effects] = TestBarrierEffects._effects(
+            "  .set FLAG, 0\n.macro inner\n  .if FLAG\n  b elsewhere\n  .endif\n.endm\n"
+            ".macro outer\n  .if 1\n  nop\n  .endif\n  .set FLAG, 1\n  inner\n.endm\n  outer\n"
+        )
+
+        assert effects.text is not None
+        assert ".if ?" in effects.text and ".if 0" not in effects.text
+
+    def test_exitm_in_a_branch_ends_the_repetition_only_when_it_runs(self):
+        """gas 2.40: `m0 m1` from the first repetition, none from the second,
+        `m2` after it."""
+        produced, report = _run(
+            ".macro m\nm\\@:\n  nop\n.endm\n"
+            "  .rept 2\n  .if 0\n  .exitm\n  .endif\n  m\n  .endr\n"
+            "  .rept 2\n  .if 1\n  .exitm\n  .endif\n  m\n  .endr\n  m\n"
+        )
+
+        assert [s for s in produced if s.endswith(":")] == ["m0:", "m1:", "m2:"]
+        assert "unterminated conditional" not in report.refused
+
+    def test_exitm_in_a_branch_of_no_known_value_makes_the_rest_a_barrier(self):
+        produced, report = _run(
+            ".macro m\nm\\@:\n  nop\n.endm\n"
+            "  .rept 2\n  .if UNKNOWN\n  .exitm\n  .endif\n  m\n  .endr\n  m\n"
+        )
+
+        assert produced.count(BARRIER) == 2
+        assert "unterminated conditional" not in report.refused
+        assert any(s.startswith("m\\@") for s in produced)
+
+    def test_a_label_with_a_mark_is_no_invocation_of_its_macro(self):
+        """`wait_ready\\@2:` is a label, also in the macro `wait_ready`."""
+        produced, report = _run(
+            ".macro inner\n  nop\n.endm\n.macro guarded\n  .if UNKNOWN\n  inner\n  .endif\n.endm\n"
+            ".macro wait_ready\nwait_ready\\@:\n  beq wait_ready\\@\n.endm\n"
+            "  guarded\n  wait_ready\n"
+        )
+
+        assert "wait_ready\\@2:" in produced
+        assert "arguments do not match the parameters" not in report.refused
+
+    def test_a_label_with_a_mark_and_an_instruction_on_one_line_are_two(self):
+        produced, _ = _run(
+            ".macro inner\n  nop\n.endm\n.macro guarded\n  .if UNKNOWN\n  inner\n  .endif\n.endm\n"
+            ".macro body\n.Ld\\@: bl callee\n.endm\n  guarded\n  body\n"
+        )
+
+        assert ".Ld\\@2:" in produced and any(s.strip() == "bl callee" for s in produced)
+
+    def test_several_expansions_in_a_refused_text_get_no_number(self):
+        """`.rept 2` of a call: gas defines `m1` and `m2`, and one text names
+        neither exactly."""
+        [effects] = TestBarrierEffects._effects(
+            ".macro m\nm\\@:\n  nop\n.endm\n"
+            ".macro outer\n  .if 1\n  .endif\n  .rept 2\n  m\n  .endr\n.endm\n  outer\n"
+        )
+
+        assert effects.names is None
