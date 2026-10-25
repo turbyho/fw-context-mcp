@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from fw_context_mcp.indexer._asm_macro import (
     BARRIER,
+    is_barrier,
     MAX_DEPTH,
     Report,
     bind,
@@ -25,11 +26,16 @@ from fw_context_mcp.indexer._asm_macro import (
 )
 
 
+def _plain(statement: str) -> str:
+    """A barrier as BARRIER: these tests ask where one is, not its effects."""
+    return BARRIER if is_barrier(statement) else statement
+
+
 def _run(text: str) -> tuple[list[str], Report]:
     """Expand *text* as one file, returning the statements and the report."""
     report = Report()
     stream = (("a.S", i + 1, line) for i, line in enumerate(text.splitlines()))
-    produced = [stmt for _, _, stmt in expand_stream(stream, report)]
+    produced = [_plain(stmt) for _, _, stmt in expand_stream(stream, report)]
     return produced, report
 
 
@@ -753,7 +759,7 @@ class TestConditionalTraps:
         report = Report()
         lines = "  .ifc #0,#0\nsame:\n  .endif\n"
         stream = (("a.S", i + 1, line) for i, line in enumerate(lines.splitlines()))
-        produced = [s for _, _, s in expand_stream(stream, report, comments_removed=True)]
+        produced = [_plain(s) for _, _, s in expand_stream(stream, report, comments_removed=True)]
 
         assert produced == ["same:"]
 
@@ -761,6 +767,124 @@ class TestConditionalTraps:
         report = Report()
         lines = "known:\n  .ifdef known\nyes:\n  .endif\n  .ifndef OTHER\nmaybe:\n  .endif\n"
         stream = (("a.S", i + 1, line) for i, line in enumerate(lines.splitlines()))
-        produced = [s for _, _, s in expand_stream(stream, report, defsym=True)]
+        produced = [_plain(s) for _, _, s in expand_stream(stream, report, defsym=True)]
 
         assert produced == ["known:", "yes:", BARRIER]
+
+
+class TestBarrierEffects:
+    """What a barrier says about the text behind it.
+
+    A reader keeps its state across a barrier whose text cannot touch that
+    state: the owner of the code, the position in a table, a symbol value.
+    """
+
+    @staticmethod
+    def _effects(text: str):
+        from fw_context_mcp.indexer._asm_macro import barrier_effects
+
+        report = Report()
+        stream = (("a.S", i + 1, line) for i, line in enumerate(text.splitlines()))
+        found = [barrier_effects(s) for _, _, s in expand_stream(stream, report)]
+        return [effects for effects in found if effects is not None]
+
+    def test_a_refused_body_of_instructions_only_writes_bytes(self):
+        """The arguments bind, thus the text of the body is known."""
+        [effects] = self._effects(
+            ".macro m x\n  .if \\x\n  bl foo\n  .endif\n.endm\n  m 1\n"
+        )
+
+        assert effects.emits and not effects.section
+        assert effects.names == frozenset() and effects.exports == frozenset()
+
+    def test_a_label_and_an_export_are_named(self):
+        [effects] = self._effects(
+            ".macro m\n  .if 1\n  .globl lbl\nlbl:\n  .endif\n.endm\n  m\n"
+        )
+
+        assert effects.names == frozenset({"lbl"})
+        assert effects.exports == frozenset({"lbl"})
+
+    def test_a_section_switch_is_seen(self):
+        [effects] = self._effects("  .rept UNKNOWN\n  .section .vec\n  .endr\n")
+
+        assert effects.section
+
+    def test_a_label_with_the_expansion_count_has_no_known_name(self):
+        """`\\@` is the count of the expansion, which a refusal never makes."""
+        [effects] = self._effects(
+            ".macro m\n  .if 1\nl\\@:\n  .endif\n.endm\n  m\n"
+        )
+
+        assert effects.names is None
+
+    def test_a_conditional_with_no_value_gives_the_effects_of_all_branches(self):
+        [effects] = self._effects(
+            "  .if unknown\nL:\n  .set N, 2\n  .else\n  .text\n  .endif\n"
+        )
+
+        assert effects.section
+        assert effects.names == frozenset({"L", "N"})
+
+    def test_only_the_names_of_the_text_lose_their_values(self):
+        """B keeps its value: the skipped text does not name it."""
+        produced, _ = _run(
+            "  .set A, 1\n  .set B, 2\n  .if unknown\n  .set A, 3\n  .endif\n"
+            "  .if B == 2\nok:\n  .endif\n  .if A == 1\nunsure:\n  .endif\n"
+        )
+
+        assert produced == ["  .set A, 1", "  .set B, 2", BARRIER, "ok:", BARRIER]
+
+    def test_include_has_full_effects(self):
+        from fw_context_mcp.indexer._asm_macro import FULL
+
+        assert self._effects('  .include "x.s"\n') == [FULL]
+
+
+class TestBarrierEffectsTraps:
+    """Text whose effects a first reading got wrong (measured with gas)."""
+
+    def test_a_name_made_with_the_expansion_count_is_unknown(self):
+        """gas defines `foo0`: `.ifdef foo0` must not take a branch."""
+        produced, _ = _run(
+            ".macro m name\n  .if 1\n  nop\n  .endif\n  .set \\name\\@, 1\n.endm\n"
+            "  m foo\n  .ifdef foo0\nseen_def:\n  .endif\n"
+            "  .ifndef foo0\nseen_ndef:\n  .endif\n"
+        )
+
+        assert "seen_ndef:" not in produced and "seen_def:" not in produced
+
+    def test_a_label_and_a_statement_with_the_count_is_unknown(self):
+        [effects] = TestBarrierEffects._effects(
+            ".macro m\n  .if 1\n  .endif\nlab\\@: nop\n.endm\n  m\n"
+        )
+
+        assert effects.names is None
+
+    def test_a_common_symbol_is_defined(self):
+        """gas: after `.comm cbuf, 4`, `.ifdef cbuf` is true."""
+        [effects] = TestBarrierEffects._effects(
+            ".macro m\n  .if 1\n  .endif\n  .comm cbuf, 4\n.endm\n  m\n"
+        )
+
+        assert effects.names is not None and "cbuf" in effects.names
+
+    def test_every_name_of_a_global_list_is_exported(self):
+        [effects] = TestBarrierEffects._effects(
+            ".macro m\n  .if 1\n  .endif\n  .global x, y\n.endm\n  m\n"
+        )
+
+        assert effects.exports == frozenset({"x", "y"})
+
+    def test_moving_the_location_counter_writes_bytes(self):
+        [effects] = TestBarrierEffects._effects(
+            ".macro m\n  .if 1\n  .endif\n  . = . + 4\n.endm\n  m\n"
+        )
+
+        assert effects.emits
+
+    def test_an_include_in_a_conditional_with_no_value_stops_the_unit(self):
+        """The included file can leave a conditional open (measured)."""
+        produced, _ = _run('  .if unknown\n  .include "x.s"\n  .endif\nafter:\n')
+
+        assert "after:" not in produced

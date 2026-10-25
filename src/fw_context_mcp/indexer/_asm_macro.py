@@ -50,7 +50,7 @@ from __future__ import annotations
 import logging
 import re
 from collections import Counter
-from collections.abc import Generator, Iterable, Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 
 from ._asm_expr import evaluate
@@ -59,13 +59,79 @@ log = logging.getLogger(__name__)
 
 # The statement text of a barrier: a place where unknown statements were
 # skipped.  No assembly statement can hold a NUL character, thus no
-# pattern of a reader matches it by accident.
+# pattern of a reader matches it by accident.  A barrier statement is this
+# prefix and its effects (see `make_barrier`).
 BARRIER = "\x00barrier"
 # The prefix of a statement whose text may be a comment: the comment
 # character of the target is not known.  The text after the prefix is
 # what the line holds there.  The expander reads it like the body of a
 # refused construct and gives a BARRIER in its place.
 UNSURE = "\x00unsure:"
+
+
+@dataclass(frozen=True)
+class BarrierEffects:
+    """What the statements behind a barrier can do.
+
+    The text of a refused construct is mostly known: the body of a macro,
+    the body of a repetition, the branches of a conditional.  Only which
+    part of it the assembler takes is not.  Thus a reader can keep its
+    state across a barrier whose text cannot touch that state: a refused
+    macro that writes only instructions changes no section and defines no
+    label, and the function that owns the code around it stays the owner.
+
+    Attributes:
+        section: The text can switch the section.
+        emits: The text can write bytes (an instruction, data, padding).
+        names: The symbols the text can define (a label, `.set`), or None
+            when they are not known (a name that a macro argument gives).
+        exports: The names the text can export or type (`.global`, `.weak`,
+            `.type`, `.size`), or None when not known.  Such a name can be
+            the owner of code, also of code outside the barrier.
+    """
+
+    section: bool
+    emits: bool
+    names: frozenset[str] | None
+    exports: frozenset[str] | None
+
+
+# The effects of statements that are not known at all: an `.include`, a
+# directive that a macro argument gives.
+FULL = BarrierEffects(section=True, emits=True, names=None, exports=None)
+
+
+def make_barrier(effects: BarrierEffects) -> str:
+    """Give the barrier statement that carries *effects*."""
+    def names(value: frozenset[str] | None) -> str:
+        return "?" if value is None else ",".join(sorted(value))
+
+    flags = ("s" if effects.section else "") + ("e" if effects.emits else "")
+    return f"{BARRIER}|{flags}|{names(effects.names)}|{names(effects.exports)}"
+
+
+def is_barrier(statement: str) -> bool:
+    """Whether *statement* is a barrier."""
+    return statement.startswith(BARRIER)
+
+
+def barrier_effects(statement: str) -> BarrierEffects | None:
+    """Give the effects of a barrier statement, or None for any other."""
+    if not is_barrier(statement):
+        return None
+    parts = statement.removeprefix(BARRIER).split("|")
+    if len(parts) != 4:
+        return FULL
+
+    def names(value: str) -> frozenset[str] | None:
+        if value == "?":
+            return None
+        return frozenset(name for name in value.split(",") if name)
+
+    return BarrierEffects(
+        section="s" in parts[1], emits="e" in parts[1],
+        names=names(parts[2]), exports=names(parts[3]),
+    )
 
 # A macro may invoke a macro.  Twenty levels is far past anything a
 # startup file writes and still stops an unguarded recursion long before
@@ -151,6 +217,29 @@ _PLAIN_NAME = re.compile(r"^[A-Za-z_.$][\w.$]*$")
 _SUBSTITUTED_LABEL = re.compile(r"^\s*[\\\w.$()@]+\s*:\s*$")
 _COMMENT_START = re.compile(r"[@#]")
 _QUOTED_PAIR = re.compile(r'^"([^"\\]*)"\s*,\s*"([^"\\]*)"$')
+_NUMERIC_LABEL = re.compile(r"^\s*\d+\s*:\s*$")
+# A directive that switches the section, or the location counter of one.
+_SECTION_SWITCH = re.compile(
+    r"^\s*\.(?:section|pushsection|popsection|previous|subsection|text|data|bss"
+    r"|struct|offset)\b",
+    re.IGNORECASE,
+)
+# A directive that exports or types a name: it can make a label the owner
+# of code.  `.thumb_func` names no symbol: it marks the next label.
+_EXPORT = re.compile(
+    r"^\s*\.(globl|global|weak|type|size|thumb_func|hidden|protected|internal)\b\s*(.*)$",
+    re.IGNORECASE,
+)
+_COMMON_NAME = re.compile(r"^\s*\.(?:comm|lcomm)\s+([^\s,]+)", re.IGNORECASE)
+# A statement that writes no byte: a label, an assignment, and the
+# directives that only describe symbols or the state of the assembler.
+NO_BYTES = re.compile(
+    r"^\s*(?:$|[A-Za-z_.$][\w.$]*\s*:\s*$|(?!\.\s*=)[A-Za-z_.$][\w.$]*\s*=(?!=)"
+    r"|\.(?:globl|global|weak|type|size|set|equ|equiv|eqv|thumb_set|thumb_func"
+    r"|syntax|thumb|arm|code|cpu|fpu|arch|eabi_attribute|file|ident|loc|hidden"
+    r"|protected|internal|local|extern|fnstart|fnend|cantunwind|cfi_\w+)\b)",
+    re.IGNORECASE,
+)
 
 # The states of one open conditional.
 _TAKING = "taking"    # the current branch is assembled
@@ -363,11 +452,13 @@ def bind(macro: Macro, arguments: list[str]) -> dict[str, str] | None:
     return values
 
 
-def substitute(statement: str, values: dict[str, str], counter: int) -> str:
+def substitute(statement: str, values: dict[str, str], counter: int | None) -> str:
     """Replace ``\\name``, ``\\()`` and ``\\@`` in one body statement.
 
     An unknown ``\\name`` is left exactly as it stands.  Replacing it
     with nothing would be a guess, and a guess here writes a symbol name.
+    With no *counter* (the count of an expansion that is not done), ``\\@``
+    stays too: a label that holds it has a name that is not known.
     """
 
     def replace(match: re.Match[str]) -> str:
@@ -375,7 +466,7 @@ def substitute(statement: str, values: dict[str, str], counter: int) -> str:
         if token == "()":
             return ""
         if token == "@":
-            return str(counter)
+            return match.group(0) if counter is None else str(counter)
         if token in values:
             return values[token]
         return match.group(0)
@@ -474,6 +565,11 @@ class _Expander:
         # skips the statements after its `.endr` up to the `.endif`.
         self.frames: list[str] = []
         self.skipped = 0
+        # The text of a conditional whose condition has no exact value, from
+        # the place of that condition up to its `.endif`, and that place.
+        # Its barrier comes at the `.endif`, with the effects of the text.
+        self.region: list[str] | None = None
+        self.region_at: Located | None = None
 
     def _budget_left(self) -> bool:
         if self.emitted < MAX_STATEMENTS:
@@ -491,13 +587,22 @@ class _Expander:
         self._record(located[2])
         yield located
 
-    def _barrier(self, at: Located) -> Iterator[Located]:
-        """Yield a barrier at the place of a refused construct."""
-        self.uncertain = True
+    def _barrier(self, at: Located, effects: BarrierEffects) -> Iterator[Located]:
+        """Yield a barrier with *effects* at the place of a refused construct.
+
+        The names that the skipped text can define lose their values here,
+        and all values go when those names are not known.
+        """
+        if effects.names is None:
+            self.uncertain = True
+        else:
+            for name in effects.names:
+                self.values.pop(name, None)
+                self.uncertain_names.add(name)
         if not self._budget_left():
             return
         self.emitted += 1
-        yield at[0], at[1], BARRIER
+        yield at[0], at[1], make_barrier(effects)
 
     def _record(self, statement: str) -> None:
         """Note the symbol that *statement* defines, for later conditionals."""
@@ -633,8 +738,7 @@ class _Expander:
                     yield from self._skip(located)
                     continue
 
-                handled = yield from self._conditional(located)
-                if handled:
+                if self._conditional(located):
                     continue
 
                 if _INCLUDE.match(statement):
@@ -711,22 +815,34 @@ class _Expander:
         taken branch it can also define any symbol, thus it is a barrier.
         """
         hidden = located[2].removeprefix(UNSURE).split(";")
-        if self._can_change_nesting(hidden, frozenset()):
+        if skipping and self.frames and self.frames[-1] == _UNKNOWN and self.region is not None:
+            self.region.extend(hidden)
+        nesting, effects = self._scan(hidden)
+        if nesting:
             self.stopped = True
             self.report.refused["rest of the unit after it"] += 1
         if not skipping:
-            yield from self._refuse("text that may be a comment", located)
+            self.report.refused["text that may be a comment"] += 1
+            yield from self._barrier(located, effects)
 
     def _skip(self, located: Located) -> Iterator[Located]:
-        """Read one statement of a skipped branch: only its conditionals."""
+        """Read one statement of a skipped branch: only its conditionals.
+
+        In a conditional with no known branch the text is kept: its barrier
+        comes at the `.endif`, with what the text can do.
+        """
         statement = located[2]
+        closing = _IF_END.match(statement) is not None and self.skipped == 0
+        if self.frames[-1] == _UNKNOWN and self.region is not None and not closing:
+            self.region.append(statement)
         if _IF_OPEN.match(statement):
             self.skipped += 1
         elif _IF_END.match(statement):
             if self.skipped:
                 self.skipped -= 1
             else:
-                self.frames.pop()
+                if self.frames.pop() == _UNKNOWN:
+                    yield from self._close_region()
         elif self.skipped == 0 and self.frames[-1] == _WAITING:
             if _IF_ELSE.match(statement):
                 self.frames[-1] = _TAKING
@@ -735,15 +851,36 @@ class _Expander:
                 taken = self._condition("if", elseif.group(1).strip())
                 if taken is None:
                     self.frames[-1] = _UNKNOWN
-                    yield from self._refuse("conditional this cannot evaluate", located)
+                    self._open_region(located)
                 elif taken:
                     self.frames[-1] = _TAKING
 
-    def _conditional(self, located: Located) -> Generator[Located, None, bool]:
+    def _open_region(self, at: Located) -> None:
+        """Start to keep the text of a conditional with no known branch."""
+        self.report.refused["conditional this cannot evaluate"] += 1
+        self.region = []
+        self.region_at = at
+
+    def _close_region(self) -> Iterator[Located]:
+        """End such a conditional: one barrier with what its text can do."""
+        region, at = self.region, self.region_at
+        self.region = self.region_at = None
+        if region is None or at is None:
+            return
+        # The text holds the branches of its own conditional, thus its
+        # `.else` and `.endif` change no nesting.  An `.include` or a
+        # `.macro` in it can: the reading stops, as for a refused body.
+        if any(_INCLUDE.match(piece) or _DEFINE.match(piece) for piece in region):
+            self.stopped = True
+            self.report.refused["rest of the unit after it"] += 1
+        _, effects = self._scan(region)
+        yield from self._barrier(at, effects)
+
+    def _conditional(self, located: Located) -> bool:
         """Handle a conditional directive in a taken branch.
 
-        Returns True when *located* was one, and yields a barrier when its
-        condition has no exact value.
+        Returns True when *located* was one.  A condition with no exact value
+        starts a region, whose barrier comes at its `.endif`.
         """
         statement = located[2]
         opened = _IF_OPEN.match(statement)
@@ -752,7 +889,7 @@ class _Expander:
             taken = self._condition(opened.group(1).lower(), opened.group(2).strip())
             if taken is None:
                 self.frames.append(_UNKNOWN)
-                yield from self._refuse("conditional this cannot evaluate", located)
+                self._open_region(located)
             else:
                 self.frames.append(_TAKING if taken else _WAITING)
             return True
@@ -777,54 +914,153 @@ class _Expander:
     ) -> Iterator[Located]:
         """Count a refusal and leave a barrier at its place.
 
-        *body* is the text of the refused construct.  When it can open or
-        close a conditional that outlives it (measured: an `.if` in an
-        `.irp` body can end after the `.endr`), the conditional state of
-        the rest of the unit is not known, and the reading stops.
+        *body* is the text of the refused construct, or None when it is not
+        known (`.include`).  When the text can open or close a conditional
+        that outlives it (measured: an `.if` in an `.irp` body can end after
+        the `.endr`), the conditional state of the rest of the unit is not
+        known, and the reading stops.  The barrier carries what the text can
+        do (`_scan`).
         """
         self.report.refused[reason] += 1
-        if body is not None and self._can_change_nesting(body, frozenset()):
-            self.stopped = True
-            self.report.refused["rest of the unit after it"] += 1
-        yield from self._barrier(at)
+        if body is None:
+            effects = FULL
+        else:
+            nesting, effects = self._scan(body)
+            if nesting:
+                self.stopped = True
+                self.report.refused["rest of the unit after it"] += 1
+        yield from self._barrier(at, effects)
 
-    def _can_change_nesting(self, body: list[str], seen: frozenset[str]) -> bool:
-        """Whether expanding *body* can leave a conditional open or closed.
+    def _scan(
+        self, body: list[str], seen: frozenset[str] = frozenset()
+    ) -> tuple[bool, BarrierEffects]:
+        """Read the text of a refused construct: what can it change?
 
-        That is also an `.else` or `.elseif` of a conditional opened
-        before the body, and an `.endif` that closes one.  True also when it
-        is not known: a directive that a macro argument supplies (`\\dir`),
-        a macro defined inside, an `.include`, or a recursion.
+        Returns (nesting, effects).  *nesting* is True when expanding the
+        text can leave a conditional open or closed: an `.else` or
+        `.elseif` of a conditional opened before the text, or an `.endif`
+        that closes one.  *effects* says what the text can do to the state
+        of a reader (`BarrierEffects`).
+
+        A macro that the text invokes is read too, with its arguments when
+        they bind.  Anything not known gives the answer "can": a directive
+        that a macro argument supplies (`\\dir`), a macro defined inside, an
+        `.include`, a recursion.
         """
         depth = 0
+        nesting = False
+        section = emits = False
+        names: set[str] | None = set()
+        exports: set[str] | None = set()
+
+        def merge(other: BarrierEffects) -> None:
+            nonlocal section, emits, names, exports
+            section |= other.section
+            emits |= other.emits
+            names = None if names is None or other.names is None else names | other.names
+            exports = (
+                None if exports is None or other.exports is None else exports | other.exports
+            )
+
         for statement in body:
             for _, _, piece in _split_labels((("", 0, statement),)):
-                if _SUBSTITUTED_LABEL.match(piece):
+                text = piece.strip()
+                if not text or _NUMERIC_LABEL.match(piece):
                     continue
-                if (
-                    piece.lstrip().startswith("\\")
-                    or _DEFINE.match(piece)
-                    or _INCLUDE.match(piece)
-                ):
-                    return True
+                label = _LABEL_ONLY.match(piece)
+                if label is not None:
+                    if names is not None:
+                        names.add(label.group(1))
+                    continue
+                if _SUBSTITUTED_LABEL.match(piece):
+                    # A label whose name an argument gives.
+                    names = None
+                    continue
+                if text.startswith("\\") or _DEFINE.match(piece) or _INCLUDE.match(piece):
+                    return True, FULL
                 if depth == 0 and (_IF_ELSE.match(piece) or _IF_ELSEIF.match(piece)):
-                    # It changes the branch of a conditional opened before.
-                    return True
+                    nesting = True
+                    continue
                 if _IF_OPEN.match(piece):
                     depth += 1
-                elif _IF_END.match(piece):
+                    continue
+                if _IF_END.match(piece):
                     depth -= 1
                     if depth < 0:
-                        # It closes a conditional opened before.
-                        return True
-                elif (invocation := _INVOKE.match(piece)) is not None:
-                    macro = self.macros.get(invocation.group(1))
-                    if macro is not None:
-                        if macro.name in seen or self._can_change_nesting(
-                            macro.body, seen | {macro.name}
-                        ):
-                            return True
-        return depth != 0
+                        nesting = True
+                    continue
+                if "\\" in piece:
+                    # A substitution that was not made is left in place: the
+                    # name it makes (`lab\@:`, `.set \name\@, 1`) and what it
+                    # writes are not known.
+                    names = exports = None
+                    if _SECTION_SWITCH.match(piece):
+                        section = True
+                    elif not NO_BYTES.match(piece):
+                        emits = True
+                    continue
+                if _CONDITIONAL.match(piece) or any(
+                    pattern.match(piece) for pattern in (
+                        _REPEAT_OPEN, _REPEAT_CLOSE, _END, _EXITM, _PURGEM,
+                        _ALTMACRO, _NOALTMACRO,
+                    )
+                ):
+                    continue
+                if _SECTION_SWITCH.match(piece):
+                    section = True
+                    continue
+                assign = _ASSIGN.match(piece)
+                alias = _THUMB_SET.match(piece)
+                if assign is not None or alias is not None:
+                    name = alias.group(1) if alias is not None else (
+                        assign.group(2) or assign.group(3) if assign is not None else ""
+                    )
+                    if name == ".":
+                        # `. = expr` moves the location counter: it writes
+                        # bytes (padding), and defines no symbol.
+                        emits = True
+                    elif names is not None:
+                        names.add(name)
+                    continue
+                common = _COMMON_NAME.match(piece)
+                if common is not None:
+                    if names is not None:
+                        names.add(common.group(1))
+                    emits = True
+                    continue
+                export = _EXPORT.match(piece)
+                if export is not None:
+                    directive = export.group(1).lower()
+                    listed = [n.strip() for n in export.group(2).split(",")]
+                    # `.type` and `.size` name one symbol; the others a list.
+                    exported = listed[:1] if directive in ("type", "size") else listed
+                    if directive == "thumb_func" or not all(_PLAIN_NAME.match(n) for n in exported):
+                        exports = None
+                    elif exports is not None:
+                        exports.update(exported)
+                    continue
+                invocation = _INVOKE.match(piece)
+                macro = self.macros.get(invocation.group(1)) if invocation else None
+                if macro is not None and invocation is not None:
+                    if macro.name in seen:
+                        return True, FULL
+                    values = bind(macro, split_arguments(invocation.group(2)))
+                    if values is None:
+                        return True, FULL
+                    inner_nesting, inner = self._scan(
+                        [substitute(raw, values, None) for raw in macro.body],
+                        seen | {macro.name},
+                    )
+                    nesting |= inner_nesting
+                    merge(inner)
+                    continue
+                if not NO_BYTES.match(piece):
+                    emits = True
+        return nesting or depth != 0, BarrierEffects(
+            section=section, emits=emits,
+            names=frozenset(names) if names is not None else None,
+            exports=frozenset(exports) if exports is not None else None,
+        )
 
     def _invoke(
         self, macro: Macro, argument_text: str, at: Located, depth: int
@@ -834,7 +1070,12 @@ class _Expander:
             yield from self._refuse("alternate macro mode", at, macro.body)
             return
         if macro.refuse_reason:
-            yield from self._refuse(macro.refuse_reason, at, macro.body)
+            # The arguments bind: the text is the body with them in place.
+            bound = bind(macro, split_arguments(argument_text))
+            text = macro.body if bound is None else [
+                substitute(raw, bound, None) for raw in macro.body
+            ]
+            yield from self._refuse(macro.refuse_reason, at, text)
             return
         if depth + 1 > MAX_DEPTH:
             yield from self._refuse("recursion deeper than the limit", at, macro.body)

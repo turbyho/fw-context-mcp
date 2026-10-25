@@ -54,9 +54,15 @@ class TestStatements:
     def _statements(tmp_path: Path, text: str, args: list[str] | None = None):
         from fw_context_mcp.indexer.asm import _statements
 
+        from fw_context_mcp.indexer._asm_macro import BARRIER, is_barrier
+
         source = preprocess(_unit(tmp_path, "t.S", text, args))
         assert source is not None
-        return [stmt.strip() for _, _, stmt in _statements(source) if stmt.strip()]
+        # A barrier as BARRIER: these tests ask where one is.
+        return [
+            BARRIER if is_barrier(stmt) else stmt.strip()
+            for _, _, stmt in _statements(source) if stmt.strip()
+        ]
 
     def test_a_semicolon_in_a_string_does_not_split(self, tmp_path: Path):
         """`.asciz "x;.endif"` once closed the conditional around it."""
@@ -152,7 +158,7 @@ class TestStatements:
 
     def test_defsym_makes_ifdef_unknown(self, tmp_path: Path):
         """`--defsym X=1` defines X before the first statement."""
-        from fw_context_mcp.indexer._asm_macro import BARRIER
+        from fw_context_mcp.indexer._asm_macro import is_barrier
         from fw_context_mcp.indexer.asm import _statements
 
         unit = _unit(tmp_path, "t.S", "  .ifdef X\nmaybe:\n  .endif\n")
@@ -160,7 +166,7 @@ class TestStatements:
         source = preprocess(unit)
         assert source is not None and source.defsym
 
-        assert [stmt for _, _, stmt in _statements(source)] == [BARRIER]
+        assert [is_barrier(stmt) for _, _, stmt in _statements(source)] == [True]
 
 
 class TestPreprocess:
@@ -471,9 +477,91 @@ class TestExtractSymbols:
 
     def test_a_label_without_a_type_is_a_function(self, tmp_path: Path):
         """GNU as does not require .type, and an exported label is code."""
-        syms = self._syms(tmp_path, "Bare:\n  b .\n")
+        syms = self._syms(tmp_path, ".global Bare\nBare:\n  b .\n")
 
         assert syms["Bare"].kind == "function"
+
+    def test_a_label_that_is_no_entry_is_a_label_of_its_entry(self, tmp_path: Path):
+        """The loop label of a copy loop is a place inside Reset_Handler."""
+        syms = self._syms(
+            tmp_path,
+            ".global Reset_Handler\nReset_Handler:\n  nop\nLoop:\n  b Loop\n",
+        )
+
+        assert syms["Loop"].kind == "label"
+        assert syms["Loop"].parent == "Reset_Handler"
+        assert syms["Reset_Handler"].parent is None
+
+    def test_size_alone_makes_an_entry(self, tmp_path: Path):
+        """The STM32 startup gives Default_Handler only `.size`."""
+        syms = self._syms(
+            tmp_path,
+            "Default_Handler:\nInfinite_Loop:\n  b Infinite_Loop\n"
+            "  .size Default_Handler, .-Default_Handler\n",
+        )
+
+        assert syms["Default_Handler"].kind == "function"
+        assert syms["Infinite_Loop"].kind == "label"
+        assert syms["Infinite_Loop"].parent == "Default_Handler"
+
+    def test_each_section_keeps_its_owner(self, tmp_path: Path):
+        """A function that pushes another section and returns still owns
+        the code after the return."""
+        syms = self._syms(
+            tmp_path,
+            "  .text\n.global f\nf:\n  nop\n  .pushsection .rodata\n"
+            "  .word 1\n  .popsection\nafter:\n  nop\n",
+        )
+
+        assert syms["after"].parent == "f"
+
+    def test_a_label_of_a_struct_belongs_to_no_entry(self, tmp_path: Path):
+        """`.struct` switches to the absolute section: an offset, not code."""
+        syms = self._syms(
+            tmp_path,
+            ".global f\nf:\n  nop\n  .pushsection .text\n  .struct 0\n"
+            "OFS_A:\n  .space 4\n  .popsection\nlater:\n  nop\n",
+        )
+
+        assert syms["OFS_A"].parent is None
+        assert syms["later"].parent == "f"
+
+    def test_every_name_of_a_global_list_is_an_entry(self, tmp_path: Path):
+        """gas: `.global a, b` makes `b` GLOBAL too."""
+        syms = self._syms(tmp_path, ".global a, b\na:\n  nop\nb:\n  nop\n")
+
+        assert syms["b"].kind == "function" and syms["b"].is_global
+
+    def test_the_last_type_counts(self, tmp_path: Path):
+        """gas: `.type f,%object` then `.type f,%function` gives FUNC."""
+        syms = self._syms(
+            tmp_path, ".type f, %object\n.type f, %function\nf:\n  nop\n"
+        )
+
+        assert syms["f"].kind == "function"
+
+    def test_notype_makes_no_entry(self, tmp_path: Path):
+        syms = self._syms(
+            tmp_path, ".global e\ne:\n  nop\n.type g, %notype\ng:\n  nop\n"
+        )
+
+        assert syms["g"].kind == "label" and syms["g"].parent == "e"
+
+    def test_thumb_func_skips_a_local_label(self, tmp_path: Path):
+        """gas gives `.thumb_func` to the next label it keeps: not `.Lx`."""
+        syms = self._syms(tmp_path, ".thumb_func\n.Lx:\ng:\n  nop\n")
+
+        assert syms["g"].kind == "function"
+
+    def test_a_typed_object_owns_no_code(self, tmp_path: Path):
+        syms = self._syms(
+            tmp_path,
+            "  .text\n.global tab\n.type tab, %object\ntab:\n  .word 1\nnext:\n  nop\n",
+        )
+
+        assert syms["tab"].kind == "variable"
+        assert syms["next"].kind == "label"
+        assert syms["next"].parent is None
 
     def test_a_weak_symbol_is_marked(self, tmp_path: Path):
         syms = self._syms(tmp_path, ".weak Maybe\nMaybe:\n  b .\n")
@@ -713,30 +801,61 @@ class TestVectorTable:
 
         assert positions == {"h0": None}
 
-    def test_after_a_barrier_a_word_is_no_slot_until_a_section(self, tmp_path: Path):
-        """The skipped statements can change the section: a refused macro
-        that switches to `.text` makes the next `.word` a constant there.
-        Taking it for a slot would be a wrong edge."""
+    def test_a_barrier_that_can_switch_the_section_ends_the_table(self, tmp_path: Path):
+        """A refused repetition that switches to `.text` makes the next
+        `.word` a constant there.  Taking it for a slot would be a wrong
+        edge.  The skipped text can also write into any table: a later
+        table has no positions."""
         vec = self._vectors(
             tmp_path,
-            "  .word First\n  .rept UNKNOWN_COUNT\n  .word 0\n  .endr\n"
-            "  .word Unsure\n",
+            "  .word First\n  .rept UNKNOWN_COUNT\n  .text\n  .endr\n"
+            "  .word Unsure\n  .section .vectors_b, \"a\"\n  .word Later\n",
         )
 
         assert vec["First"].index == 0
         assert "Unsure" not in vec
+        assert vec["Later"].index is None
 
-    def test_after_a_barrier_no_position_is_known(self, tmp_path: Path):
-        """The skipped statements can hold slots of any table, thus a later
-        table entry still names its handler, with no position."""
+    def test_a_barrier_that_only_writes_bytes_keeps_the_table(self, tmp_path: Path):
+        """A refused repetition of `.word 0` stays in its table: the next
+        word is a slot, at a position that is not known.  Another table
+        keeps its positions."""
         vec = self._vectors(
             tmp_path,
             "  .word First\n  .rept UNKNOWN_COUNT\n  .word 0\n  .endr\n"
-            "  .text\n  .section .vectors_b, \"a\"\n  .word Later\n",
+            "  .word After\n  .section .vectors_b, \"a\"\n  .word Other\n",
         )
 
         assert vec["First"].index == 0
-        assert vec["Later"].index is None
+        assert vec["After"].index is None
+        assert vec["Other"].index == 0
+
+    def test_moving_the_location_counter_ends_the_known_positions(self, tmp_path: Path):
+        """gas: after `. = . + 4` the next word is at offset 8, slot 2."""
+        vec = self._vectors(tmp_path, "  .word h0\n  . = . + 4\n  .word h2\n")
+
+        assert vec["h0"].index == 0
+        assert vec["h2"].index is None
+
+    def test_a_word_of_a_struct_is_no_slot(self, tmp_path: Path):
+        vec = self._vectors(
+            tmp_path,
+            "  .word First\n  .pushsection .text\n  .struct 0\n  .word 4\n"
+            "  .word In_struct\n  .popsection\n  .word Second\n",
+        )
+
+        assert "In_struct" not in vec
+        assert vec["Second"].index == 1
+
+    def test_a_barrier_that_writes_nothing_keeps_the_positions(self, tmp_path: Path):
+        """A refused repetition of `.globl` writes no byte."""
+        vec = self._vectors(
+            tmp_path,
+            "  .word First\n  .rept UNKNOWN_COUNT\n  .globl x\n  .endr\n  .word Second\n",
+        )
+
+        assert vec["First"].index == 0
+        assert vec["Second"].index == 1
 
     def test_a_repeated_line_yields_one_entry(self, tmp_path: Path):
         """One source line is one slot, however often it reaches the reader.
@@ -2362,3 +2481,99 @@ class TestATableResolvesAcrossUnits:
 
         assert result.vectors == 1
         assert kind == "undefined"
+
+
+class TestOwnership:
+    """Which entry owns the code at each point (asm._Ownership)."""
+
+    @staticmethod
+    def _owners(lines: list[str]) -> list[tuple[str, ...] | None]:
+        """The owners after each statement of *lines*."""
+        from fw_context_mcp.indexer.asm import _entries, _Ownership
+
+        statements = [("a.S", i + 1, line) for i, line in enumerate(lines)]
+        ownership = _Ownership(_entries(statements))
+        found = []
+        for _file, _line, stmt in statements:
+            ownership.feed(stmt)
+            found.append(ownership.owners())
+        return found
+
+    def test_entries_at_one_place_own_the_code_together(self):
+        """Zephyr writes six fault entries before one body of code."""
+        owners = self._owners([
+            ".global a", ".global b", ".section .text.f", ".balign 4", "a:",
+            ".section .text.f", ".balign 4", "b:", "nop",
+        ])
+
+        assert owners[-1] == ("a", "b")
+
+    def test_a_byte_between_ends_the_group(self):
+        owners = self._owners([".global a", ".global b", "a:", "nop", "b:", "nop"])
+
+        assert owners[-1] == ("b",)
+
+    def test_size_ends_the_owner(self):
+        owners = self._owners([".global f", "f:", "nop", ".size f, .-f", "nop"])
+
+        assert owners[-1] == ()
+
+    def test_a_barrier_that_defines_nothing_keeps_the_owner(self):
+        from fw_context_mcp.indexer._asm_macro import BarrierEffects, make_barrier
+
+        hidden = make_barrier(BarrierEffects(False, True, frozenset(), frozenset()))
+        owners = self._owners([".global f", "f:", hidden, "nop"])
+
+        assert owners[-1] == ("f",)
+
+    def test_a_barrier_that_can_export_makes_the_owner_unknown(self):
+        from fw_context_mcp.indexer._asm_macro import BarrierEffects, make_barrier
+
+        hidden = make_barrier(BarrierEffects(False, True, frozenset({"g"}), frozenset({"g"})))
+        owners = self._owners([".global f", "f:", hidden, "nop"])
+
+        assert owners[-1] is None
+
+    def test_a_barrier_that_can_switch_the_section_loses_it(self):
+        from fw_context_mcp.indexer._asm_macro import BarrierEffects, make_barrier
+
+        hidden = make_barrier(BarrierEffects(True, False, frozenset(), frozenset()))
+        owners = self._owners([".global f", "f:", hidden, "nop", ".text", "nop"])
+
+        assert owners[3] is None
+        assert owners[-1] == ("f",)
+
+
+class TestOwnershipTraps:
+    def test_a_barrier_that_writes_into_any_section_ends_every_group(self):
+        """Bytes between `a` and `b`: `.size b` ends the owner of `after`."""
+        from fw_context_mcp.indexer._asm_macro import BarrierEffects, make_barrier
+
+        hidden = make_barrier(BarrierEffects(True, True, frozenset(), frozenset()))
+        owners = TestOwnership._owners([
+            ".global a", ".global b", "a:", hidden, ".text", "b:", "nop",
+            ".size b, .-b", "after:",
+        ])
+
+        assert owners[-1] == ()
+
+
+class TestLabelParent:
+    def test_the_parent_is_stored(self, tmp_path: Path):
+        from fw_context_mcp.indexer.asm import store_units
+        from fw_context_mcp.indexer.db import transaction
+
+        unit = _unit(tmp_path, "s.S", ".global Entry\nEntry:\n  nop\nLoop:\n  b Loop\n")
+        conn = TestStoreUnits._db(tmp_path)
+        try:
+            with transaction(conn):
+                store_units(conn, "ch", [unit], tmp_path)
+            rows = {
+                row["name"]: (row["kind"], row["parent_usr"])
+                for row in conn.execute("SELECT name, kind, parent_usr FROM symbols")
+            }
+        finally:
+            conn.close()
+
+        assert rows["Loop"] == ("label", "asm:s.S@Entry")
+        assert rows["Entry"] == ("function", "")

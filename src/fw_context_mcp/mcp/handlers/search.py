@@ -242,7 +242,8 @@ def search_code(
     **Kind filter values:** ``function``, ``method``, ``constructor``,
     ``destructor``, ``class``, ``struct``, ``union``, ``enum``, ``enum_constant``,
     ``typedef``, ``varglobal``, ``varlocal``, ``variable``, ``field``,
-    ``namespace``.
+    ``namespace``, ``label`` (a local label of assembly, inside the code of
+    a function).
 
     **Local variables are out.**  FTS5 indexes the qualified name, thus a
     local matches through the function that holds it: a query for

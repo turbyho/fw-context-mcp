@@ -1473,7 +1473,7 @@ word, or write an explicit phrase.
   carries `_fallback: "sanitized"` and `_query_used`; a query FTS5 accepts
   (`NEAR(a b)`, `^term`, a column filter) always runs untouched
 
-**Kind filter:** `function`, `method`, `constructor`, `destructor`, `class`, `struct`, `union`, `enum`, `enum_constant`, `typedef`, `varglobal`, `varlocal`, `variable`, `field`, `namespace`
+**Kind filter:** `function`, `method`, `constructor`, `destructor`, `class`, `struct`, `union`, `enum`, `enum_constant`, `typedef`, `varglobal`, `varlocal`, `variable`, `field`, `namespace`, `label` (a local label of assembly, inside the code of a function: its `parent_usr` names the function)
 
 #### `search_bodies`
 
