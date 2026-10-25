@@ -192,7 +192,10 @@ def insert_symbols_batch(
                qualified_name, kind, line, col, end_line, is_definition,
                signature, docstring, enum_value, is_virtual, is_pure_virtual,
                parent_usr, is_template, template_usr, is_project, pagerank, source,
-               is_weak)
+               is_weak[, link_name])
+
+    A row without the last value has no link name: a writer of symbols that
+    no linker resolves (a type, a test fixture) leaves it out.
 
     Returns count of rows inserted or upgraded to definition.
 
@@ -218,13 +221,14 @@ def insert_symbols_batch(
     would overwrite ``is_definition`` back to 0 — breaking the call graph.
     """
 
+    full = [row if len(row) == 25 else (*row, "") for row in rows]
     cur = conn.executemany(
         """INSERT INTO symbols
            (config_hash, file_id, file_path, name_tokens, usr, name, qualified_name, kind,
             line, col, end_line, is_definition, signature, docstring, enum_value,
             is_virtual, is_pure_virtual, parent_usr, is_template, template_usr, is_project, pagerank, source,
-            is_weak)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            is_weak, link_name)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(config_hash, usr) DO UPDATE SET
                file_id       = excluded.file_id,
                file_path     = excluded.file_path,
@@ -244,9 +248,10 @@ def insert_symbols_batch(
                is_project    = excluded.is_project,
                pagerank      = excluded.pagerank,
                source        = excluded.source,
-               is_weak       = excluded.is_weak
+               is_weak       = excluded.is_weak,
+               link_name     = excluded.link_name
            WHERE excluded.is_definition = 1 AND symbols.is_definition = 0""",
-        rows,
+        full,
     )
     return cur.rowcount  # approximate with ON CONFLICT DO UPDATE WHERE (used for logging only)
 

@@ -902,7 +902,9 @@ def _clear_previous_pass(conn, config_hash: str) -> None:
 def _already_defined(conn, config_hash: str, names: list[str]) -> set[str]:
     """Return the names of *names* that the index already defines.
 
-    A definition from C or from assembly is the real one.  This pass fills
+    A definition from C or from assembly is the real one.  The link name
+    decides, not the name: a `static` variable `end` in C is no definition
+    of the linker symbol `end`.  This pass fills
     the gap the compiled files leave — the boundary symbols of a memory
     layout — and must not put a second definition of one name in front of a
     user.
@@ -915,8 +917,8 @@ def _already_defined(conn, config_hash: str, names: list[str]) -> set[str]:
         chunk = names[start:start + 500]
         marks = ",".join("?" * len(chunk))
         rows = conn.execute(
-            f"SELECT DISTINCT name FROM symbols "  # noqa: S608
-            f"WHERE config_hash=? AND is_definition=1 AND name IN ({marks})",
+            f"SELECT DISTINCT link_name FROM symbols "  # noqa: S608
+            f"WHERE config_hash=? AND is_definition=1 AND link_name IN ({marks})",
             (config_hash, *chunk),
         )
         found.update(row[0] for row in rows)
@@ -1075,6 +1077,8 @@ def store_scripts(
                 # the linker.  `_resolve_handler` ranks weak below strong,
                 # thus a real definition of the same name still wins.
                 int(symbol.provide),
+                # The linker defines it, under this name.
+                symbol.name,
             ))
         if rows:
             insert_symbols_batch(conn, rows)

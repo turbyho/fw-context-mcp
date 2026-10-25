@@ -63,13 +63,16 @@ def _rows(conn) -> dict[str, dict]:
 
 
 def _define_in_c(conn, name: str, line: int = 7) -> None:
-    """Put a definition of *name* in the index, as a C unit would."""
+    """Put a definition of *name* in the index, as a C unit would.
+
+    A global variable of C: the linker sees it under its name.
+    """
     with transaction(conn):
         file_id = upsert_file(conn, "ch", "main.c", "c")
         insert_symbols_batch(conn, [(
             "ch", file_id, "main.c", name, f"c:@{name}", name, name,
             "varglobal", line, 1, line, 1,
-            "", "", None, 0, 0, "", 0, "", 1, 0.0, "", 0,
+            "", "", None, 0, 0, "", 0, "", 1, 0.0, "", 0, name,
         )])
 
 

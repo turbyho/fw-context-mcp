@@ -1788,12 +1788,52 @@ def _process_one_symbol(
         parent_usr=parent_usr,
         is_template=is_template,
         template_usr=template_usr,
+        link_name=_link_name(cursor),
     ))
 
     if cursor.kind in (cx.CursorKind.CLASS_DECL, cx.CursorKind.STRUCT_DECL) and is_def:
         class_cursors.append(cursor)
 
     return True
+
+
+# The kinds whose symbol a linker can resolve by name.
+_LINKABLE_KINDS = frozenset({
+    cx.CursorKind.FUNCTION_DECL,
+    cx.CursorKind.CXX_METHOD,
+    cx.CursorKind.CONSTRUCTOR,
+    cx.CursorKind.DESTRUCTOR,
+    cx.CursorKind.CONVERSION_FUNCTION,
+    cx.CursorKind.VAR_DECL,
+})
+
+
+def _link_name(cursor: cx.Cursor) -> str:
+    """Return the name the linker resolves to *cursor*, or "".
+
+    The mangled name of the compiler, for external linkage only: a name
+    that an assembly unit writes (`bl main`, a vector slot) reaches a
+    symbol only through it.  Measured with libclang 22: `main` in C++ has
+    the USR `c:@F@main#` and the mangled name `main`; `extern "C"` and C
+    give the plain name; a C++ function gives `_Z…`; `static` and an
+    anonymous namespace have internal linkage, and no other object can
+    name them.  A template gives no mangled name, and its instances are no
+    symbols.  For a constructor libclang gives one of the names that GCC
+    emits (`C1`/`C2`), thus a call by the other name finds no symbol.
+
+    A member of a class template is a template too, and libclang gives a
+    false name for a static data member of one (measured: `Box<T>::count`
+    gives `_ZN3Box5countE`, which no object holds).
+    """
+    if cursor.kind not in _LINKABLE_KINDS or cursor.linkage != cx.LinkageKind.EXTERNAL:
+        return ""
+    parent = cursor.semantic_parent
+    if parent is not None and parent.kind in (
+        cx.CursorKind.CLASS_TEMPLATE,
+        cx.CursorKind.CLASS_TEMPLATE_PARTIAL_SPECIALIZATION,
+    ):
+        return ""
+    return cursor.mangled_name or ""
 
 
 def _process_ref_cursor(

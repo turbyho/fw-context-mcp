@@ -773,7 +773,7 @@ class TestVectorEdges:
                 fid = upsert_file(conn, "ch", "src/main.c", "c")
                 insert_symbols_batch(conn, [
                     ("ch", fid, "src/main.c", n, f"c:@F@{n}", n, n, "function",
-                     10, 1, 12, 1, "", "", None, 0, 0, "", 0, "", 1, 0.0, "", 0)
+                     10, 1, 12, 1, "", "", None, 0, 0, "", 0, "", 1, 0.0, "", 0, n)
                     for n in c_symbols
                 ])
             result = store_units(conn, "ch", [_unit(tmp_path, "startup.S", _table(asm))],
@@ -879,20 +879,22 @@ class TestVectorEdges:
 
         Two units define the same name strongly, so the resolver cannot
         choose and the slot stays unlinked.  Declaring it as well would
-        add a third row and make the ambiguity worse, not better.
+        add a third row and make the ambiguity worse, not better.  The
+        table is in a third unit: a unit that defines the name itself
+        resolves it to its own definition, as the assembler does.
         """
         from fw_context_mcp.indexer.asm import store_units
         from fw_context_mcp.indexer.db import transaction
 
         first = _unit(tmp_path, "one.S", ".global Twice\nTwice:\n  b .\n")
         (tmp_path / "sub").mkdir()
-        second = _unit(tmp_path / "sub", "two.S",
-                       _table(".global Twice\nTwice:\n  b .\n  .word Twice\n"))
+        second = _unit(tmp_path / "sub", "two.S", ".global Twice\nTwice:\n  b .\n")
+        table = _unit(tmp_path, "table.S", _table("  .word Twice\n"))
 
         conn = TestStoreUnits._db(tmp_path)
         try:
             with transaction(conn):
-                result = store_units(conn, "ch", [first, second], tmp_path)
+                result = store_units(conn, "ch", [first, second, table], tmp_path)
             rows = conn.execute(
                 "SELECT COUNT(*) FROM symbols WHERE name='Twice'"
             ).fetchone()[0]
@@ -1570,7 +1572,7 @@ class TestAWeakAliasDoesNotHideTheCOverride:
             insert_symbols_batch(conn, [
                 ("ch", fid, "src/hal.c", name, f"c:@F@{name}", name, name,
                  "function", 10 + i, 1, 12 + i, 1,
-                 "", "", None, 0, 0, "", 0, "", 1, 0.0, "", 0)
+                 "", "", None, 0, 0, "", 0, "", 1, 0.0, "", 0, name)
                 for i, name in enumerate(c_handlers)
             ])
         unit = _unit(tmp_path, "startup.S",
@@ -1816,7 +1818,9 @@ class TestWeakLosesToStrong:
             insert_symbols_batch(conn, [
                 ("ch", fid, "src/a.c", "SysTick_Handler", usr, "SysTick_Handler",
                  "SysTick_Handler", "function", 10, 1, 12, definition,
-                 "", "", None, 0, 0, "", 0, "", 1, 0.0, "", weak)
+                 "", "", None, 0, 0, "", 0, "", 1, 0.0, "", weak,
+                 # Each one is a symbol the linker can resolve by the name.
+                 "SysTick_Handler")
                 for usr, definition, weak in rows
             ])
         return conn
@@ -1830,7 +1834,7 @@ class TestWeakLosesToStrong:
             ("asm:startup.S@SysTick_Handler", 1, 1),
         ])
         try:
-            assert _resolve_handler(conn, "ch", "SysTick_Handler") == (
+            assert _resolve_handler(conn, "ch", "SysTick_Handler", {}) == (
                 "asm:irq_cm4f.S@SysTick_Handler"
             )
         finally:
@@ -1846,7 +1850,7 @@ class TestWeakLosesToStrong:
             ("asm:two.S@SysTick_Handler", 1, 0),
         ])
         try:
-            assert _resolve_handler(conn, "ch", "SysTick_Handler") is None
+            assert _resolve_handler(conn, "ch", "SysTick_Handler", {}) is None
         finally:
             conn.close()
 
@@ -1858,7 +1862,7 @@ class TestWeakLosesToStrong:
             ("asm:two.S@SysTick_Handler", 1, 1),
         ])
         try:
-            assert _resolve_handler(conn, "ch", "SysTick_Handler") is None
+            assert _resolve_handler(conn, "ch", "SysTick_Handler", {}) is None
         finally:
             conn.close()
 
@@ -1868,7 +1872,7 @@ class TestWeakLosesToStrong:
 
         conn = self._db(tmp_path, [("asm:startup.S@SysTick_Handler", 1, 1)])
         try:
-            assert _resolve_handler(conn, "ch", "SysTick_Handler") == (
+            assert _resolve_handler(conn, "ch", "SysTick_Handler", {}) == (
                 "asm:startup.S@SysTick_Handler"
             )
         finally:
@@ -1883,7 +1887,7 @@ class TestWeakLosesToStrong:
             ("asm:startup.S@SysTick_Handler", 1, 1),
         ])
         try:
-            assert _resolve_handler(conn, "ch", "SysTick_Handler") == (
+            assert _resolve_handler(conn, "ch", "SysTick_Handler", {}) == (
                 "c:@F@SysTick_Handler"
             )
         finally:
@@ -2208,7 +2212,7 @@ class TestGetVectorTable:
                     insert_symbols_batch(conn, [
                         ("ch", fid, "src/main.c", n, f"c:@F@{n}", n, n,
                          "function", 10, 1, 12, 1, "", "", None, 0, 0, "", 0,
-                         "", 1, 0.0, "", 0)
+                         "", 1, 0.0, "", 0, n)
                         for n in c_symbols
                     ])
                 store_units(conn, "ch", [_unit(tmp_path, "startup.S", body)],

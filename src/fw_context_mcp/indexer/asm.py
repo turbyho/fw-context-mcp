@@ -470,7 +470,7 @@ def store_units(conn, config_hash: str, units: list, project_root: Path,
     # after every symbol is stored, without running the preprocessor again.
     # Assembly units are few — one on the STM32 project, three on the Mbed
     # project, seven per Zephyr image.
-    preprocessed: list[AsmSource] = []
+    preprocessed: list[tuple[AsmSource, list[AsmSymbol]]] = []
     # The live lines of each file that the units of this run read.
     views: dict[Path, UnitText] = {}
     for unit in units:
@@ -491,11 +491,6 @@ def store_units(conn, config_hash: str, units: list, project_root: Path,
             conn, config_hash, source, project_root, symbols,
             vendor_patterns or [], project_patterns or [],
         )
-        # Aliases before vectors: a slot naming an alias needs the edge
-        # that says what the alias really is.
-        result.aliases += _store_aliases(
-            conn, config_hash, symbols, project_root,
-        )
         result.symbols += len(symbols)
         # The vector pass waits for every unit.  A table in one file and
         # its handlers in another cannot resolve before both are stored,
@@ -505,7 +500,7 @@ def store_units(conn, config_hash: str, units: list, project_root: Path,
         # slot pointed at the placeholder and the name appeared twice.
         # The STM32 project and the Mbed project hid it — their table and handlers share one
         # file.
-        preprocessed.append(source)
+        preprocessed.append((source, symbols))
         texts = read_unit_texts(unit)
         if texts is None:
             # The symbols of the unit are stored, thus its files must stay
@@ -580,16 +575,38 @@ def store_units(conn, config_hash: str, units: list, project_root: Path,
         )
         result.files += 1
 
-    # Second pass: every symbol of every unit is now in the index, so a
-    # slot can reach a handler its own file does not define.
-    for source in preprocessed:
+    # Second pass: every symbol of every unit is now in the index, so an
+    # alias or a slot can reach a symbol its own unit does not define.
+    for _source, symbols in preprocessed:
+        result.aliases += _store_aliases(
+            conn, config_hash, symbols, project_root, _unit_names(symbols, project_root),
+        )
+    for source, symbols in preprocessed:
         linked, unresolved = _store_vectors(
             conn, config_hash, source, project_root,
             vendor_patterns or [], project_patterns or [],
+            _unit_names(symbols, project_root),
         )
         result.vectors += linked
         result.unresolved += unresolved
     return result
+
+
+def _unit_names(symbols: list[AsmSymbol], project_root: Path) -> dict[str, str]:
+    """Map each name that the unit defines, and does not define weakly, to its USR.
+
+    The assembler resolves such a name in its own unit: a local label is a
+    target there and nowhere else, and a strong definition of the unit is
+    the only one the link can hold.  A weak one can lose to a strong one
+    of another object, thus the linker decides it (`_resolve_handler`).
+    """
+    from fw_context_mcp.indexer.ops import _normalize_file_path
+
+    return {
+        sym.name: f"{_ASM_USR_PREFIX}{_normalize_file_path(sym.file, project_root)}@{sym.name}"
+        for sym in symbols
+        if not sym.is_weak
+    }
 
 
 # Directives that name a symbol.  GNU as accepts both spellings of the
@@ -987,6 +1004,10 @@ def _store_symbols(conn, config_hash: str, source: AsmSource, project_root: Path
             # exception weakly so an RTOS can define it properly, and the
             # linker keeps the strong one.
             int(sym.is_weak),
+            # The linker sees a label only when it is exported: `.global`,
+            # or `.weak`, which also exports.  A local label of this unit
+            # is no target of another one.
+            sym.name if sym.is_global or sym.is_weak else "",
         ))
     insert_symbols_batch(conn, rows)
     return len(rows)
@@ -1285,6 +1306,7 @@ _UNDEFINED_KIND = "undefined"
 
 def _store_aliases(
     conn, config_hash: str, symbols: list[AsmSymbol], project_root: Path,
+    unit_names: dict[str, str],
 ) -> int:
     """Write an edge for every `.thumb_set X, Y`.  Returns how many.
 
@@ -1308,7 +1330,7 @@ def _store_aliases(
     for symbol in symbols:
         if not symbol.alias_target:
             continue
-        target = _resolve_handler(conn, config_hash, symbol.alias_target)
+        target = _resolve_handler(conn, config_hash, symbol.alias_target, unit_names)
         if target is None:
             # The name resolves to nothing or to several things.  An
             # alias edge to the wrong symbol would be worse than none.
@@ -1357,7 +1379,7 @@ def _declare_referenced_only(
     from fw_context_mcp.indexer.ops import _normalize_file_path
 
     existing = conn.execute(
-        "SELECT 1 FROM symbols WHERE config_hash=? AND name=? LIMIT 1",
+        "SELECT 1 FROM symbols WHERE config_hash=? AND link_name=? LIMIT 1",
         (config_hash, entry.name),
     ).fetchone()
     if existing is not None:
@@ -1374,24 +1396,47 @@ def _declare_referenced_only(
         _is_project_file(entry.file, project_root, vendor_patterns,
                          project_patterns),
         0.0, "", 0,
+        # It stands for the symbol the linker resolves from elsewhere.
+        entry.name,
     )])
     return usr
 
-def _resolve_handler(conn, config_hash: str, name: str) -> str | None:
-    """Return the USR a vector slot points at, or None when it is not clear.
+def _resolve_handler(
+    conn, config_hash: str, name: str, unit_names: dict[str, str]
+) -> str | None:
+    """Return the USR of the symbol that *name* reaches, or None.
 
-    A handler often has two definitions — a weak one in the SDK's assembly
-    and a strong one in the project's C — and the linker takes the strong
-    one.  So does this: a definition outside assembly wins, and only when
-    there is none does an assembly definition answer.
+    A name that the unit itself defines, not weakly, is that definition
+    (*unit_names*): the assembler resolves it there.  Any other name is the
+    symbol the linker resolves it to.
 
-    None when nothing matches, and None when several equally good ones do.
-    A wrong edge here would claim the vector table reaches something it does
-    not, and on an interrupt that is the only edge a reader has.
+    The candidates are the symbols whose link name is *name*: an assembly
+    unit names a symbol as the linker does.  Thus a C++ method `write`, a
+    `static` function and a local label of another unit are never one, and
+    `main` of C++ (USR `c:@F@main#`) is.
+
+    The ranks, in this order:
+
+    1. A definition outside assembly (C, C++, a linker script symbol).  A
+       handler often has two definitions, a weak one in the assembly of the
+       SDK and a strong one in the C of the project, and the linker takes
+       the strong one.
+    2. A definition in assembly.
+    3. A declaration: a C `extern` declaration of a function that a library
+       defines (`longjmp`), or the placeholder of a name that only an
+       assembly unit references.  It stands for the symbol the linker
+       resolves from elsewhere.
+
+    In a rank, a strong definition wins over a weak one.  None when nothing
+    matches, and None when several equally good ones do: a wrong edge would
+    claim the vector table reaches something it does not, and on an
+    interrupt that is the only edge a reader has.
     """
+    if name in unit_names:
+        return unit_names[name]
     rows = conn.execute(
         "SELECT usr, is_definition, is_weak FROM symbols "
-        "WHERE config_hash=? AND name=?",
+        "WHERE config_hash=? AND link_name=?",
         (config_hash, name),
     ).fetchall()
     if not rows:
@@ -1402,31 +1447,29 @@ def _resolve_handler(conn, config_hash: str, name: str) -> str | None:
 
         A weak definition loses to a strong one of the same name — that is
         what `.weak` means — so the two are ranked before they are
-        counted.  Ambiguity within a rank is still refused: a wrong edge
-        would claim the vector table reaches something it does not, and
-        on an interrupt that edge is the only one a reader has.
+        counted.  Ambiguity within a rank is still refused.
         """
         for weak in (0, 1):
-            same_rank = [c for c in candidates if bool(c["is_weak"]) == bool(weak)]
+            same_rank = {str(c["usr"]) for c in candidates if bool(c["is_weak"]) == bool(weak)}
             if len(same_rank) == 1:
-                return str(same_rank[0]["usr"])
+                return same_rank.pop()
             if len(same_rank) > 1:
                 return None
         return None
 
-    strong = [
-        r for r in rows
-        if r["is_definition"] and not r["usr"].startswith(_ASM_USR_PREFIX)
-    ]
-    if strong:
-        return pick(strong)
-
-    return pick([r for r in rows if r["usr"].startswith(_ASM_USR_PREFIX)])
+    definitions = [r for r in rows if r["is_definition"]]
+    outside = [r for r in definitions if not r["usr"].startswith(_ASM_USR_PREFIX)]
+    if outside:
+        return pick(outside)
+    if definitions:
+        return pick(definitions)
+    return pick(rows)
 
 
 def _store_vectors(
     conn, config_hash: str, source: AsmSource,
     project_root: Path, vendor_patterns: list[str], project_patterns: list[str],
+    unit_names: dict[str, str],
 ) -> tuple[int, int]:
     """Write a reference for every vector slot.  Returns (linked, unresolved).
 
@@ -1466,7 +1509,7 @@ def _store_vectors(
     unresolved = 0
 
     for entry in extract_vectors(source):
-        usr = _resolve_handler(conn, config_hash, entry.name)
+        usr = _resolve_handler(conn, config_hash, entry.name, unit_names)
         if usr is None:
             usr = _declare_referenced_only(
                 conn, config_hash, entry, project_root,

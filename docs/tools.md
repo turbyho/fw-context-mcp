@@ -2705,6 +2705,23 @@ exceptions, and slot 16 + n is external interrupt n. fw-context does not
 renumber slots across tables: two tables both start at 0. Read `slot`
 together with `table_name` and `source`.
 
+**A slot has a position only when fw-context knows it.** This is not so
+when the table holds other bytes (`.space`, an instruction), entries of
+two sizes, a subsection, or a construct that fw-context cannot read (a
+macro it refuses, a condition with no known value). Such a slot is not in
+this list. Its edge stays, and `find_references` shows it.
+
+**A slot finds its handler by the link name**, as the linker does. A name
+that the assembly unit defines itself (not `.weak`) is that definition. A
+label of a file that the unit includes counts too. Else a definition
+outside assembly wins over one in assembly, and a strong one wins over a
+weak one. fw-context does not see `__attribute__((weak))` in C, thus a
+weak C definition counts as strong. When no file defines the name, a C
+declaration of it (a function that a library defines) is the handler. A
+C++ method or a `static` function with the same name is never the
+handler: the linker does not see it under that name. A name with two
+equal candidates gives no handler.
+
 **Paths are absolute**, as in the other graph tools. This applies to
 `file`, `table_file`, and the paths in `overridden`, `aliases`, and
 `installed` (also `at`, a `file:line`). A `"build"` row without a single
@@ -2714,7 +2731,7 @@ definition has an empty `file`.
 
 | Status | Meaning |
 |--------|---------|
-| `"c"` | A definition outside assembly. Code runs. `overridden` holds the weak definition that it replaced, when the index holds one. |
+| `"c"` | A definition outside assembly, or a C declaration of a function that a library defines (then `file` is the header). Code runs. `overridden` holds the weak definition that it replaced, when the index holds one. |
 | `"assembly"` | An assembly definition that is not an alias of another symbol. Assembly services the interrupt. |
 | `"unhandled"` | An assembly name that is an alias (`.thumb_set`) of another symbol, and nothing overrode it. fw-context reads this from the alias edge only, not from weakness. `aliases` names the target, usually `Default_Handler`, an infinite loop. |
 | `"runtime"` | The image holds that alias, but a `NVIC_SetVector` call installs a real handler at run time (a target with `CMSIS_VECTAB_VIRTUAL`). The interrupt is serviced only after the registering code has run. |
@@ -3957,9 +3974,12 @@ For manual recovery, use `reindex_file` or `fw-context index`.
 
 5. Assembly units (.S, after every other unit; indexer/asm.py):
    Preprocess with clang -E -C (#if resolves, C macros expand, comments stay)
+   Remove the comments of the target (ARM @, RISC-V and Xtensa #)
    Expand assembler macros (.macro, .rept, .irp)
+   Take only the branch of .if/.ifdef that the assembler takes
    Store labels, .global/.weak symbols, .equ/.set aliases
-   Link each vector-table slot to its handler (ref_kind "vector")
+   Link each alias and vector-table slot to its target by the link name
+   (ref_kind "alias", "vector")
 
 6. Write build metadata:
    compile_commands.json hash, file mtimes, symbol/file/ref/macro counts

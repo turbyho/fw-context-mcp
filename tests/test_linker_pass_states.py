@@ -235,6 +235,8 @@ class TestUnchangedInputs:
             insert_symbols_batch(db, [(
                 "ch", file_id, "main.c", "_sdata", "c:@_sdata", "_sdata", "_sdata",
                 "varglobal", 1, 1, 1, 1, "", "", None, 0, 0, "", 0, "", 1, 0.0, "", 0,
+                # A global variable of C: the linker sees it as `_sdata`.
+                "_sdata",
             )])
         _run(db, tmp_path)
         assert set(_ld_rows(db)) == {"_estack"}

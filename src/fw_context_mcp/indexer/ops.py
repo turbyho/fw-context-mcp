@@ -1011,6 +1011,7 @@ def _store_symbol_rows(
                 # it.  A C definition therefore counts as strong, which
                 # is what the code assumed before the column existed.
                 0,
+                s.link_name,
             )
         )
     # Batch insert — a single SQL statement for all symbols in the TU

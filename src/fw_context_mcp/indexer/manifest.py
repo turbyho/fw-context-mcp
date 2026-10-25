@@ -1096,6 +1096,10 @@ def compute_config_hash(
         # /11 marks the edges of template instances: an edge to an implicit
         # instance goes to the template, and the calls in the bodies of the
         # instances are edges (origins INSTANTIATION, ref_producers).
+        # /12 marks the link name of each symbol (``symbols.link_name``): the
+        # assembly pass resolves a vector slot or an alias by it.  A changed
+        # TU alone writes its symbols again, thus without a new config_hash
+        # an unchanged C unit kept rows with no link name.
         #
         # WHY the format version belongs in THIS hash: a new config_hash
         # leaves no row for the build, thus a plain `fw-context index` writes
@@ -1106,7 +1110,7 @@ def compute_config_hash(
         #
         # Every existing index therefore gets one final reindex, which is
         # intended.
-        "_format": "fw-context-cc/11",
+        "_format": "fw-context-cc/12",
         "project_root": str(project_root),
         # WHY only these two: config_hash answers "could the same source text
         # compile to something different now?"  Macros flip #ifdef, and the

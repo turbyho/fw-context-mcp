@@ -325,6 +325,9 @@ class Symbol:
         template_usr: USR of the primary template.  Non-empty only when
             this symbol is an instantiation of a template (e.g. a
             ``CLASS_DECL`` that was generated from a ``CLASS_TEMPLATE``).
+        link_name: The name the linker resolves to this symbol (its mangled
+            name), for a function or variable with external linkage.  Empty
+            for all else.
     """
     name: str
     qualified_name: str      # namespace::Class::method
@@ -344,3 +347,4 @@ class Symbol:
     is_template: bool = False  # True for CLASS_TEMPLATE, FUNCTION_TEMPLATE declarations
     template_usr: str = ""   # USR of the primary template (non-empty = this is an instantiation)
     source: str = ""        # function/method body text (from libclang extent, only for is_definition=True)
+    link_name: str = ""      # the name the linker resolves (external linkage only)

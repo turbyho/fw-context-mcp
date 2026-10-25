@@ -138,7 +138,12 @@ __all__ = [
 #      (origins INSTANTIATION, the units that found it in ref_producers).
 #      Before it, 14 to 19 % of the call edges of a C++ project went to a USR
 #      that is no symbol, and a dependent call had no edge.
-CURRENT_ROW_FORMAT = "fw-context-rows/9"
+# /10 — each symbol that a linker can resolve has its link name
+#      (`symbols.link_name`), and a name that an assembly unit writes (a
+#      vector slot, an alias) is resolved by it.  Before it, a C++ method or
+#      a `static` function with the same name could be the target, and `main`
+#      of C++ (USR `c:@F@main#`) was found only by its plain name.
+CURRENT_ROW_FORMAT = "fw-context-rows/10"
 
 # The config-hash format that was current when CURRENT_ROW_FORMAT last moved.
 #
@@ -153,7 +158,7 @@ CURRENT_ROW_FORMAT = "fw-context-rows/9"
 # the build, thus a plain `fw-context index` writes every file and every
 # body again.  The two must therefore move together, and
 # `test_row_format_invalidation.py` fails when only one of them does.
-ROW_FORMAT_PAIRED_WITH = "fw-context-cc/11"
+ROW_FORMAT_PAIRED_WITH = "fw-context-cc/12"
 
 
 def _row_format_number(value: str) -> int | None:
@@ -223,6 +228,10 @@ _ROW_FORMAT_FAULTS: tuple[tuple[int, str], ...] = (
     (8, "an edge to a template instance goes to the instance, which is no "
         "symbol, thus find_callers of the template misses it, and a call in "
         "a template body that a dependent type resolves has no edge"),
+    (9, "a symbol has no link name, thus a vector slot or an alias of "
+        "assembly can reach a C++ method or a static function with the same "
+        "name, and get_vector_table can say unhandled for an interrupt that "
+        "C services"),
 )
 
 
@@ -494,6 +503,8 @@ _MIGRATION_ADD_COLUMNS = [
     "ALTER TABLE files ADD COLUMN parse_errors INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE files ADD COLUMN parse_fatal INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE files ADD COLUMN parse_first_error TEXT NOT NULL DEFAULT ''",
+    # The name the linker resolves to the symbol (see the column in _SCHEMA).
+    "ALTER TABLE symbols ADD COLUMN link_name TEXT NOT NULL DEFAULT ''",
     # Schema version bump — DO NOT REMOVE. When adding new migration steps after this
     # column, also add a NEW ALTER TABLE … ADD COLUMN _schema_bump_… line. The hash
     # of _MIGRATION_ADD_COLUMNS drives CURRENT_SCHEMA_VERSION.
@@ -631,6 +642,15 @@ CREATE TABLE IF NOT EXISTS symbols (
     is_project     INTEGER NOT NULL DEFAULT 0,
     pagerank       REAL    NOT NULL DEFAULT 0.0,
     source         TEXT    NOT NULL DEFAULT '',
+    -- The name the linker resolves to this symbol: the mangled name of a
+    -- function or variable with external linkage (`main`, `SystemInit`,
+    -- `_ZN4Uart3irqEv`), the name of a `.global` or `.weak` assembly label,
+    -- the name of a linker script symbol.  Empty for all else: a `static`
+    -- function, a member of an anonymous namespace, a type.  A name that an
+    -- assembly unit writes (`bl main`, a vector slot) is found here, not in
+    -- `name`: `main` of C++ has the USR `c:@F@main#`, and a C++ method
+    -- `write` is no target of `bl write`.
+    link_name      TEXT    NOT NULL DEFAULT '',
     UNIQUE(config_hash, usr)
 );
 
@@ -1371,6 +1391,11 @@ def _run_data_migrations(conn: sqlite3.Connection) -> None:
             "ON refs(config_hash, to_usr, from_file, from_line, from_col, ref_kind, "
             "ifnull(slot_index, -1), ifnull(from_usr, ''))"
         )
+
+    # ── The lookup of a name that an assembly unit writes ──
+    # Here and not in _SCHEMA: an older index gets the column only from
+    # _ensure_migrated_columns, which runs after _SCHEMA.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_symbols_link_name ON symbols(link_name)")
 
     # ── Embeddings composite PK migration ───────────────────────────
     # Delegates to _ensure_embeddings_schema — idempotent, safe to call
