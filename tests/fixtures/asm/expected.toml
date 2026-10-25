@@ -20,6 +20,18 @@ description = 'Prose and directives inside block comments, which the preprocesso
 complete = true
 defined = ["after_a_comment_block", "after_a_line_comment", "after_the_long_block", "closed_on_one_line", "code_after_close", "trailing_comment"]
 
+[conditionals]
+description = 'Conditionals outside a macro body, which the reader evaluates: only the branch the assembler takes.'
+complete = true
+defined = ["HAVE_FPU", "LEVEL", "cond_vectors", "defined_later", "fpu_branch", "label_before_if", "live_64_bit_wrap", "live_after_char_pair", "live_after_label_and_if", "live_after_slash_else", "live_before_commented_else", "live_comparison_is_minus_one", "live_else_after_nested", "live_ifc", "live_ifdef_earlier_label", "live_ifeqs", "live_ifnb", "live_ifndef", "live_level_two", "live_or_before_plus", "live_reassigned", "live_right_macro"]
+undefined = ["FPU_IRQHandler", "Last_IRQHandler", "Reset_Handler"]
+vectors = ["FPU_IRQHandler", "Last_IRQHandler", "Reset_Handler"]
+
+[conditionals_unknown]
+description = 'Conditionals the reader cannot evaluate, which it skips rather than guesses at.'
+complete = false
+defined = ["after_two", "maybe_after_ifdef", "maybe_taken", "plain_after", "plain_before"]
+
 [directives_basic]
 description = 'Every directive that names a symbol, with no macro facility involved.'
 complete = true

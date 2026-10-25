@@ -47,6 +47,122 @@ def _table(body: str) -> str:
     return _VECTOR_SECTION + body
 
 
+class TestStatements:
+    """How a preprocessed line becomes statements."""
+
+    @staticmethod
+    def _statements(tmp_path: Path, text: str, args: list[str] | None = None):
+        from fw_context_mcp.indexer.asm import _statements
+
+        source = preprocess(_unit(tmp_path, "t.S", text, args))
+        assert source is not None
+        return [stmt.strip() for _, _, stmt in _statements(source) if stmt.strip()]
+
+    def test_a_semicolon_in_a_string_does_not_split(self, tmp_path: Path):
+        """`.asciz "x;.endif"` once closed the conditional around it."""
+        produced = self._statements(
+            tmp_path, '  .if 1\n  .asciz "x;.endif"\n  .else\ndead:\n  .endif\n'
+        )
+
+        assert produced == ['.asciz "x;.endif"']
+
+    def test_a_line_comment_is_cut(self, tmp_path: Path):
+        """The preprocessor of the build removes it; `-C` keeps it."""
+        produced = self._statements(
+            tmp_path, "  .if 0\nalive_not:\n  .else // the other branch\nlive:\n  .endif\n"
+        )
+
+        assert produced == ["live:"]
+
+    def test_two_slashes_in_a_string_stay(self, tmp_path: Path):
+        produced = self._statements(tmp_path, '  .ascii "http://x" // note\n')
+
+        assert produced == ['.ascii "http://x"']
+
+    def test_an_arm_comment_hides_the_statements_after_a_semicolon(self, tmp_path: Path):
+        """Measured: `nop @ note; lbl:` defines no `lbl` on ARM."""
+        produced = self._statements(
+            tmp_path, "  nop @ note; hidden:\n", ["--target=arm-none-eabi"]
+        )
+
+        assert produced == ["nop"]
+
+    def test_an_arm_hash_mid_line_is_an_immediate(self, tmp_path: Path):
+        produced = self._statements(
+            tmp_path, "  ldr r0, [r1, #4]; after:\n", ["--target=arm-none-eabi"]
+        )
+
+        assert produced == ["ldr r0, [r1, #4]", "after:"]
+
+    def test_a_hash_is_a_comment_on_risc_v(self, tmp_path: Path):
+        produced = self._statements(
+            tmp_path, "  nop # note; hidden:\n", ["--target=riscv32-unknown-elf"]
+        )
+
+        assert produced == ["nop"]
+
+    def test_with_no_target_a_semicolon_after_a_comment_char_is_unknown(self, tmp_path: Path):
+        """`@` is a comment on ARM and not elsewhere: what follows is a barrier."""
+        from fw_context_mcp.indexer._asm_macro import BARRIER
+
+        produced = self._statements(tmp_path, "  nop @ note; maybe:\n")
+
+        assert produced == ["nop @ note", BARRIER]
+
+    def test_a_character_constant_opens_no_string(self, tmp_path: Path):
+        """Measured: `.byte '"; lbl:` and `.byte ';; lbl:` define `lbl`."""
+        produced = self._statements(
+            tmp_path, "  .byte '\"; after_quote:\n  .byte ';; after_semi:\n",
+            ["--target=arm-none-eabi"],
+        )
+
+        assert produced == [".byte '\"", "after_quote:", ".byte ';", "after_semi:"]
+
+    def test_a_closing_quote_ends_a_character_constant(self, tmp_path: Path):
+        """Measured: `.byte 'a';.else` is a constant, then `.else`, and in
+        `.byte 'a'@ x; lbl:` the comment holds `lbl`."""
+        produced = self._statements(
+            tmp_path,
+            "  .if 1\n  .byte 'a';.else\ndead:\n  .endif\n  .byte 'a'@ x; hidden:\n"
+            "  .byte 'O','K'; after_pair:\n",
+            ["--target=arm-none-eabi"],
+        )
+
+        assert produced == [".byte 'a'", ".byte 'a'", ".byte 'O','K'", "after_pair:"]
+
+    def test_with_no_target_hidden_text_that_can_change_a_branch_stops(self, tmp_path: Path):
+        """On AArch64 `#1` is an immediate and `.else` after it is real."""
+        from fw_context_mcp.indexer._asm_macro import BARRIER
+
+        produced = self._statements(
+            tmp_path, "  .if 1\n  mov x0, #1; .else\nbad:\n  .endif\nlater:\n"
+        )
+
+        assert produced == ["mov x0, #1", BARRIER]
+
+    def test_with_no_target_hidden_text_makes_symbols_unknown(self, tmp_path: Path):
+        """The hidden text can hold `.set X, 1`."""
+        from fw_context_mcp.indexer._asm_macro import BARRIER
+
+        produced = self._statements(
+            tmp_path, "  mov x0, #1; .set X, 1\n  .ifndef X\nbad:\n  .endif\n"
+        )
+
+        assert produced == ["mov x0, #1", BARRIER, BARRIER]
+
+    def test_defsym_makes_ifdef_unknown(self, tmp_path: Path):
+        """`--defsym X=1` defines X before the first statement."""
+        from fw_context_mcp.indexer._asm_macro import BARRIER
+        from fw_context_mcp.indexer.asm import _statements
+
+        unit = _unit(tmp_path, "t.S", "  .ifdef X\nmaybe:\n  .endif\n")
+        unit.raw_entry = {"arguments": ["gcc", "-Wa,--defsym,X=1", "-c", "t.S"]}
+        source = preprocess(unit)
+        assert source is not None and source.defsym
+
+        assert [stmt for _, _, stmt in _statements(source)] == [BARRIER]
+
+
 class TestPreprocess:
     def test_an_inactive_branch_does_not_reach_the_output(self, tmp_path: Path):
         """The first version of this plan called `#if` filtering impossible."""
@@ -499,6 +615,43 @@ class TestVectorTable:
         vec = self._vectors(tmp_path, "  .word HardFault_Handler\n")
 
         assert vec["HardFault_Handler"].is_data is False
+
+    def test_a_taken_conditional_slot_keeps_the_positions(self, tmp_path: Path):
+        """Only the branch the assembler takes is a slot."""
+        vec = self._vectors(
+            tmp_path,
+            "  .word First\n  .if 1\n  .word Taken\n  .else\n"
+            "  .word Dead\n  .endif\n  .word Last\n",
+        )
+
+        assert {name: entry.index for name, entry in vec.items()} == {
+            "First": 0, "Taken": 1, "Last": 2,
+        }
+
+    def test_after_a_barrier_a_word_is_no_slot_until_a_section(self, tmp_path: Path):
+        """The skipped statements can change the section: a refused macro
+        that switches to `.text` makes the next `.word` a constant there.
+        Taking it for a slot would be a wrong edge."""
+        vec = self._vectors(
+            tmp_path,
+            "  .word First\n  .rept UNKNOWN_COUNT\n  .word 0\n  .endr\n"
+            "  .word Unsure\n",
+        )
+
+        assert vec["First"].index == 0
+        assert "Unsure" not in vec
+
+    def test_after_a_barrier_no_position_is_known(self, tmp_path: Path):
+        """The skipped statements can hold slots of any table, thus a later
+        table entry still names its handler, with no position."""
+        vec = self._vectors(
+            tmp_path,
+            "  .word First\n  .rept UNKNOWN_COUNT\n  .word 0\n  .endr\n"
+            "  .text\n  .section .vectors_b, \"a\"\n  .word Later\n",
+        )
+
+        assert vec["First"].index == 0
+        assert vec["Later"].index is None
 
     def test_a_repeated_line_yields_one_entry(self, tmp_path: Path):
         """One source line is one slot, however often it reaches the reader.

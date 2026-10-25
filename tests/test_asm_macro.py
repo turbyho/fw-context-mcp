@@ -14,6 +14,7 @@ the manual does not.
 from __future__ import annotations
 
 from fw_context_mcp.indexer._asm_macro import (
+    BARRIER,
     MAX_DEPTH,
     Report,
     bind,
@@ -263,7 +264,9 @@ class TestRefusals:
 
     Refusing is the rule that keeps a narrow sample of test projects
     honest: an unsupported construct degrades to a missing symbol, never
-    to an invented one.
+    to an invented one.  The refusal leaves one BARRIER at its place: the
+    skipped statements can hold a label or a section change, and a reader
+    must not carry its state across them.
     """
 
     def test_a_conditional_body_is_refused(self):
@@ -274,7 +277,7 @@ class TestRefusals:
             "  .globl B\n  .endif\n.endm\n  m 1\n"
         )
 
-        assert produced == []
+        assert produced == [BARRIER]
         assert report.refused["conditional body"] == 1
 
     def test_the_manuals_recursive_example_is_refused(self):
@@ -285,7 +288,7 @@ class TestRefusals:
             "  sum 0,5\n"
         )
 
-        assert produced == []
+        assert produced == [BARRIER]
         assert report.refused["conditional body"] == 1
 
     def test_a_recursion_without_a_conditional_hits_the_depth_limit(self):
@@ -295,14 +298,14 @@ class TestRefusals:
         )
 
         assert report.refused["recursion deeper than the limit"] == 1
-        assert len(produced) == MAX_DEPTH
+        assert produced == ["  .globl Deeper"] * MAX_DEPTH + [BARRIER]
 
     def test_a_call_that_does_not_fit_the_parameters_is_refused(self):
         produced, report = _run(
             ".macro m p:req\n  .globl \\p\n.endm\n  m\n"
         )
 
-        assert produced == []
+        assert produced == [BARRIER]
         assert report.refused["arguments do not match the parameters"] == 1
 
     def test_a_macro_with_no_endm_is_refused(self):
@@ -402,7 +405,7 @@ class TestAlternateMacroMode:
             "  with_local\n"
         )
 
-        assert produced == []
+        assert produced == [BARRIER]
         assert report.refused["alternate macro mode"] == 1
 
 
@@ -432,12 +435,17 @@ class TestRepetition:
 
         assert produced == []
 
-    def test_a_count_that_is_not_a_literal_is_refused(self):
-        """An expression needs an evaluator, which this does not have."""
+    def test_a_count_with_no_known_value_is_refused(self):
+        """SIZE is defined nowhere, thus the count has no value."""
         produced, report = _run("  .rept SIZE*2\n  .word 0\n  .endr\n")
 
-        assert produced == []
+        assert produced == [BARRIER]
         assert report.refused[".rept this cannot evaluate"] == 1
+
+    def test_a_count_from_a_constant_is_evaluated(self):
+        produced, _ = _run("  .equ SIZE, 1\n  .rept SIZE*2\n  .word 0\n  .endr\n")
+
+        assert produced == ["  .equ SIZE, 1", "  .word 0", "  .word 0"]
 
     def test_irp_binds_the_symbol_to_each_value(self):
         produced, _ = _run("  .irp n, 1, 2, 3\n  .word \\n\n  .endr\n")
@@ -495,3 +503,264 @@ class TestRepetition:
 
         assert produced == []
         assert report.refused["unterminated repetition"] == 1
+
+
+class TestConditionals:
+    """A conditional outside a macro body: one branch, the assembler's.
+
+    The values of the expressions are the subject of `test_asm_expr.py`;
+    these tests pin which statements reach the reader.
+    """
+
+    def test_only_the_taken_branch_is_read(self):
+        produced, report = _run(
+            "  .if 1\n  .globl A\n  .else\n  .globl B\n  .endif\n"
+        )
+
+        assert produced == ["  .globl A"]
+        assert report.conditionals == 1
+
+    def test_the_else_branch_when_the_condition_is_false(self):
+        produced, _ = _run(
+            "  .if 0\n  .globl A\n  .else\n  .globl B\n  .endif\n"
+        )
+
+        assert produced == ["  .globl B"]
+
+    def test_elseif_takes_the_first_true_branch_only(self):
+        produced, _ = _run(
+            "  .if 0\n  .globl A\n  .elseif 1\n  .globl B\n"
+            "  .elseif 1\n  .globl C\n  .else\n  .globl D\n  .endif\n"
+        )
+
+        assert produced == ["  .globl B"]
+
+    def test_a_conditional_in_a_skipped_branch_is_only_matched(self):
+        produced, _ = _run(
+            "  .if 0\n  .if 1\n  .globl Nested\n  .endif\n  .else\n"
+            "  .globl Outer\n  .endif\n"
+        )
+
+        assert produced == ["  .globl Outer"]
+
+    def test_a_value_from_set_is_used(self):
+        produced, _ = _run(
+            "  .equ LEVEL, 2\n  .if LEVEL == 2\n  .globl Two\n  .endif\n"
+        )
+
+        assert produced == ["  .equ LEVEL, 2", "  .globl Two"]
+
+    def test_a_later_set_changes_the_value(self):
+        produced, _ = _run(
+            "  .set N, 1\n  .set N, 5\n  .if N == 5\n  .globl Five\n  .endif\n"
+        )
+
+        assert "  .globl Five" in produced
+
+    def test_ifdef_sees_only_what_comes_before(self):
+        """Measured: `.ifdef` of a label defined later in the file is false."""
+        produced, _ = _run(
+            "early:\n  .ifdef early\n  .globl SeesEarly\n  .endif\n"
+            "  .ifdef later\n  .globl SeesLater\n  .endif\nlater:\n"
+        )
+
+        assert "  .globl SeesEarly" in produced
+        assert "  .globl SeesLater" not in produced
+
+    def test_a_global_alone_does_not_define(self):
+        """Measured: `.globl x` then `.ifdef x` is false."""
+        produced, _ = _run(
+            "  .globl only_global\n  .ifdef only_global\n  .globl Wrong\n  .endif\n"
+        )
+
+        assert "  .globl Wrong" not in produced
+
+    def test_a_label_and_a_conditional_in_one_statement(self):
+        """`KEXC_areg: .if 4` is a label, then a conditional."""
+        produced, _ = _run("lbl: .if 4\n  .space 16\n  .endif\n")
+
+        assert produced == ["lbl:", "  .space 16"]
+
+    def test_a_label_and_an_instruction_in_one_statement(self):
+        produced, _ = _run("here: addi sp, sp, -32\n")
+
+        assert produced == ["here:", " addi sp, sp, -32"]
+
+    def test_ifc_is_case_sensitive_and_ignores_blanks_after_the_comma(self):
+        produced, _ = _run(
+            "  .ifc abc, abc\n  .globl Same\n  .endif\n"
+            "  .ifc ABC,abc\n  .globl Case\n  .endif\n"
+        )
+
+        assert produced == ["  .globl Same"]
+
+    def test_a_macro_defined_in_a_skipped_branch_does_not_exist(self):
+        produced, _ = _run(
+            "  .if 0\n.macro pick\n  .globl Wrong\n.endm\n  .else\n"
+            ".macro pick\n  .globl Right\n.endm\n  .endif\n  pick\n"
+        )
+
+        assert produced == ["  .globl Right"]
+
+    def test_no_exact_value_skips_every_branch_and_leaves_a_barrier(self):
+        """A label has an address, which this never computes."""
+        produced, report = _run(
+            "a:\nb:\n  .if b - a\n  .globl A\n  .else\n  .globl B\n  .endif\n"
+            "  .globl After\n"
+        )
+
+        assert produced == ["a:", "b:", BARRIER, "  .globl After"]
+        assert report.refused["conditional this cannot evaluate"] == 1
+
+    def test_an_elseif_with_no_exact_value_leaves_a_barrier(self):
+        produced, _ = _run(
+            "  .if 0\n  .globl A\n  .elseif unknown\n  .globl B\n"
+            "  .else\n  .globl C\n  .endif\n"
+        )
+
+        assert produced == [BARRIER]
+
+    def test_after_a_barrier_ifdef_of_an_unknown_name_is_unknown(self):
+        """The skipped branch could have defined it."""
+        produced, _ = _run(
+            "  .if unknown\nmaybe:\n  .endif\n"
+            "  .ifdef maybe\n  .globl Wrong\n  .endif\n"
+        )
+
+        assert produced == [BARRIER, BARRIER]
+
+    def test_after_a_barrier_a_symbol_value_is_unknown(self):
+        """The skipped branch could have changed it with `.set`."""
+        produced, _ = _run(
+            "  .set N, 1\n  .if unknown\n  .set N, 2\n  .endif\n"
+            "  .if N == 1\n  .globl Wrong\n  .endif\n"
+        )
+
+        assert produced == ["  .set N, 1", BARRIER, BARRIER]
+
+    def test_a_stray_endif_is_counted(self):
+        produced, report = _run("  .endif\n  .globl A\n")
+
+        assert produced == ["  .globl A"]
+        assert report.refused["conditional with no .if"] == 1
+
+    def test_an_if_with_no_endif_is_counted(self):
+        _, report = _run("  .if 1\n  .globl A\n")
+
+        assert report.refused["unterminated conditional"] == 1
+
+    def test_the_report_counts_the_conditionals(self):
+        _, report = _run("  .if 1\n  .endif\n  .if 0\n  .elseif 1\n  .endif\n")
+
+        assert report.summary() == "3 conditional(s) evaluated"
+
+
+class TestConditionalTraps:
+    """Shapes the assembler reads differently from a naive reader.
+
+    Each one was assembled with `arm-none-eabi-gcc` 12.3 and read with `nm`.
+    """
+
+    def test_a_comment_after_else_still_ends_the_branch(self):
+        """The assembler takes nothing after `.else` but a comment."""
+        produced, _ = _run("  .if 1\nlive:\n  .else @ other\ndead:\n  .endif @ end\n")
+
+        assert produced == ["live:"]
+
+    def test_a_comment_in_the_argument_of_ifb_is_unknown(self):
+        """`@` starts a comment on ARM only; the target is not known here."""
+        produced, _ = _run("  .ifb @ note\nmaybe:\n  .endif\n")
+
+        assert produced == [BARRIER]
+
+    def test_the_location_counter_has_no_value(self):
+        """Measured: after `. = 0x10; nop`, `.if . == 0x10` is not taken."""
+        produced, _ = _run("  . = 0x10\n  nop\n  .if . == 0x10\nwrong:\n  .endif\n")
+
+        assert produced == ["  . = 0x10", "  nop", BARRIER]
+
+    def test_a_label_before_endif_in_a_skipped_branch_ends_nothing(self):
+        """Measured: in a skipped branch `lbl: .endif` is not an `.endif`."""
+        produced, _ = _run(
+            "  .if 0\nskipped_lbl: .endif\ndead_in_gas:\n  .endif\nafter_all:\n"
+        )
+
+        assert produced == ["after_all:"]
+
+    def test_a_conditional_may_close_after_the_endr_of_its_repetition(self):
+        """Measured: an `.if 0` in an `.irp` body skips up to its `.endif`."""
+        produced, report = _run(
+            "  .irp x, 1\n  .if 0\n  .endr\nin_rept_skip:\n  .endif\nafter:\n"
+        )
+
+        assert produced == ["after:"]
+        assert not report.refused
+
+    def test_include_stops_the_unit(self):
+        """Measured: a conditional the included file opens stays open after
+        it, thus nothing after it is known."""
+        produced, report = _run('  .include "defs.inc"\nmaybe:\n  .endif\nlater:\n')
+
+        assert produced == [BARRIER]
+        assert report.refused[".include this does not read"] == 1
+
+    def test_a_refused_body_that_opens_a_conditional_stops_the_unit(self):
+        """`.if 0` in a refused `.rept` can skip the statements after `.endr`."""
+        produced, report = _run(
+            "  .rept UNKNOWN\n  .if 0\n  .endr\nwrong:\n  .endif\nright:\n"
+        )
+
+        assert produced == [BARRIER]
+        assert report.refused["rest of the unit after it"] == 1
+
+    def test_a_refused_body_with_balanced_conditionals_does_not_stop(self):
+        produced, _ = _run(
+            ".macro m x\n  .if \\x\n  .endif\n.endm\n  m 1\nafter:\n"
+        )
+
+        assert produced == [BARRIER, "after:"]
+
+    def test_a_refused_body_that_invokes_an_unbalanced_macro_stops(self):
+        produced, _ = _run(
+            ".macro opens\n  .if 0\n.endm\n  .rept UNKNOWN\n  opens\n  .endr\nwrong:\n"
+        )
+
+        assert produced == [BARRIER]
+
+    def test_a_refused_body_with_else_stops_the_unit(self):
+        """Its `.else` changes the branch of the `.if` before it."""
+        produced, _ = _run(
+            "  .if 1\n  .rept UNKNOWN\n  .else\n  .endr\nbad:\n  .endif\n"
+        )
+
+        assert produced == [BARRIER]
+
+    def test_a_refused_body_with_include_stops_the_unit(self):
+        produced, _ = _run('  .rept UNKNOWN\n  .include "x.s"\n  .endr\nbad:\n')
+
+        assert produced == [BARRIER]
+
+    def test_a_refused_body_that_closes_and_opens_stops_the_unit(self):
+        """The depth is the same at the end, and the conditional is another."""
+        produced, _ = _run(
+            "  .if 1\n  .rept UNKNOWN\n  .endif\n  .if 0\n  .endr\nbad:\n  .endif\n"
+        )
+
+        assert produced == [BARRIER]
+
+    def test_a_hash_in_an_argument_is_kept_when_the_comments_are_removed(self):
+        """`.ifc #0,#0` on ARM: `#` is an immediate there."""
+        report = Report()
+        lines = "  .ifc #0,#0\nsame:\n  .endif\n"
+        stream = (("a.S", i + 1, line) for i, line in enumerate(lines.splitlines()))
+        produced = [s for _, _, s in expand_stream(stream, report, comments_removed=True)]
+
+        assert produced == ["same:"]
+
+    def test_defsym_makes_a_negative_ifdef_unknown(self):
+        report = Report()
+        lines = "known:\n  .ifdef known\nyes:\n  .endif\n  .ifndef OTHER\nmaybe:\n  .endif\n"
+        stream = (("a.S", i + 1, line) for i, line in enumerate(lines.splitlines()))
+        produced = [s for _, _, s in expand_stream(stream, report, defsym=True)]
+
+        assert produced == ["known:", "yes:", BARRIER]

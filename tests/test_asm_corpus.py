@@ -53,7 +53,11 @@ needs_arm = pytest.mark.skipif(
 
 def _read(path: Path) -> tuple[set[str], set[str]]:
     """Return (symbols, vector slots) the reader finds in *path*."""
-    unit = SimpleNamespace(file=path, directory=path.parent, clang_args=[])
+    # The target of the oracle: `arm-none-eabi-gcc` assembles the corpus,
+    # and the reader cuts the comments of that target (`@`).
+    unit = SimpleNamespace(
+        file=path, directory=path.parent, clang_args=["--target=arm-none-eabi"]
+    )
     source = preprocess(unit)
     assert source is not None, f"the preprocessor could not read {path.name}"
     return (

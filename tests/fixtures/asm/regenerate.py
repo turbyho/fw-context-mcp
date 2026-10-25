@@ -39,6 +39,8 @@ FLAGS = ["-mcpu=cortex-m4", "-mthumb", "-c"]
 COMPLETE = {
     "altmacro": False,
     "comments": True,
+    "conditionals": True,
+    "conditionals_unknown": False,
     "directives_basic": True,
     "macro_args": True,
     "macro_basic": True,
@@ -55,6 +57,10 @@ DESCRIPTIONS = {
                 "than guesses at.",
     "comments": "Prose and directives inside block comments, which the "
                 "preprocessor keeps and the reader must skip.",
+    "conditionals": "Conditionals outside a macro body, which the reader "
+                    "evaluates: only the branch the assembler takes.",
+    "conditionals_unknown": "Conditionals the reader cannot evaluate, "
+                            "which it skips rather than guesses at.",
     "directives_basic": "Every directive that names a symbol, with no "
                         "macro facility involved.",
     "macro_args": "Macro argument defaults, :req, :vararg, keyword calls "

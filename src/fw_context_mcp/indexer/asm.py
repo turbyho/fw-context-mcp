@@ -26,6 +26,7 @@ often an included file rather than the unit itself, as in that case.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 import sqlite3
@@ -34,6 +35,7 @@ from collections.abc import Collection, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ._asm_macro import BARRIER, UNSURE
 from ._asm_macro import Report as MacroReport
 from ._asm_macro import expand_stream as expand_macros
 from ._parsed_text import decode_lines
@@ -56,6 +58,57 @@ _LINEMARKER_RE = re.compile(r'^# (\d+) "([^"]*)"')
 _SYNTHETIC_FILES = frozenset({"<built-in>", "<command line>", "<stdin>", ""})
 
 
+@dataclass(frozen=True)
+class Lexicon:
+    """The comment characters of the assembler of one target.
+
+    Attributes:
+        comment: Each character starts a comment anywhere outside a string.
+        line_comment: Each character starts a comment at the start of a
+            line only.  On ARM `#` in the middle of a line is an immediate.
+
+    From binutils (``gas/config/tc-*.c``, ``comment_chars`` and
+    ``line_comment_chars``).  ARM was also measured with
+    ``arm-none-eabi-gcc`` 12.3: ``nop @ note; lbl:`` defines no ``lbl``,
+    and ``ldr r0, [r1, #4]; lbl:`` defines it.
+    """
+
+    comment: str
+    line_comment: str
+
+
+# The target prefix of the `--target` triple, and its lexicon.  A target
+# that is not here has no known comment character.
+_LEXICONS: tuple[tuple[tuple[str, ...], Lexicon], ...] = (
+    (("arm", "thumb"), Lexicon(comment="@", line_comment="#")),
+    (("riscv",), Lexicon(comment="#", line_comment="#")),
+    (("xtensa",), Lexicon(comment="#", line_comment="#")),
+)
+
+
+def lexicon_for(clang_args: list[str]) -> Lexicon | None:
+    """Return the lexicon of the target that *clang_args* select, or None.
+
+    The last `--target` wins, as it does for clang.  None when the flags
+    give no target, or a target this does not know.
+    """
+    target: str | None = None
+    for index, arg in enumerate(clang_args):
+        if arg.startswith("--target="):
+            target = arg.removeprefix("--target=")
+        elif arg == "-target" and index + 1 < len(clang_args):
+            target = clang_args[index + 1]
+    if target is None:
+        return None
+    if target.startswith("arm64"):
+        # The clang spelling of AArch64, whose comments differ from ARM.
+        return None
+    for prefixes, lexicon in _LEXICONS:
+        if target.startswith(prefixes):
+            return lexicon
+    return None
+
+
 @dataclass
 class AsmSource:
     """The preprocessed form of one assembly translation unit.
@@ -69,6 +122,13 @@ class AsmSource:
             line attributed to a synthetic file.  Indexed by output line,
             zero-based.
 
+        lexicon: The comment characters of the target of the unit, or
+            None when the target is not known.
+        defsym: The command of the unit gives the assembler `--defsym`.
+            Such a symbol is defined before the first statement, and no
+            statement shows it, thus `.ifdef` of a name that the statements
+            do not define has no known answer.
+
     The output does not decide the stored text of a file: it holds no line
     for a directive, and blank lines for a short skipped block.  The text
     comes from ``read_unit_texts``.
@@ -76,6 +136,8 @@ class AsmSource:
 
     text: str
     line_map: list[tuple[str, int] | None]
+    lexicon: Lexicon | None = None
+    defsym: bool = False
 
 
 def _args_without_source(unit) -> list[str]:
@@ -131,7 +193,12 @@ def preprocess(unit) -> AsmSource | None:
         return None
 
     base = unit.directory if unit.directory else unit.file.parent
-    return _map_output(result.stdout, Path(base))
+    source = _map_output(result.stdout, Path(base))
+    # The raw entry, not clang_args: the translation to clang flags keeps
+    # no `-Wa,` option.  Only the presence is read, never a value.
+    source.defsym = "defsym" in json.dumps(getattr(unit, "raw_entry", None) or {})
+    source.lexicon = lexicon_for(list(unit.clang_args))
+    return source
 
 
 def _map_output(text: str, base: Path) -> AsmSource:
@@ -672,8 +739,15 @@ def _raw_statements(source: AsmSource) -> Iterator[tuple[str, int, str]]:
       in the file — and prose reads like assembly often enough to matter.
       startup_NRF52840.S opens with ``NOTE: Template files ...`` inside
       ``/* */`` and the label pattern took ``NOTE`` for a definition.
+    * A ``//`` comment goes too.  ``-C`` keeps it, and the preprocessor of
+      the build removes it: irq_cm4f.S writes ``ldr r1,[r0,#24] // Load``.
+      Left in, ``.else // x`` is not read as ``.else``.
+    * The comment of the assembler goes: ``@`` on ARM, ``#`` on RISC-V and
+      Xtensa (:class:`Lexicon`).  A ``;`` in it separates nothing.
     * The line is then split on ``;``, because the assembler reads it that
       way and a macro expansion arrives as one line of several statements.
+      Not inside a string or a character constant: ``.asciz "x;.endif"``
+      and ``.byte ';`` are one statement each.
       Zephyr's ``SECTION_FUNC`` expands to
       ``.section .text.sym, "ax"; .thumb; .balign 4; sym :`` — anchoring on
       the start of the line finds ``.section`` and never the label, which
@@ -696,8 +770,68 @@ def _raw_statements(source: AsmSource) -> Iterator[tuple[str, int, str]]:
         if mapped is None:
             continue
         file, line = mapped
-        for stmt in clean.split(";"):
+        for stmt in _split_statements(clean, source.lexicon):
             yield file, line, stmt
+
+
+def _split_statements(text: str, lexicon: Lexicon | None) -> list[str]:
+    """Split one line on ``;`` and cut its comments, outside strings.
+
+    A string is double-quoted, and a backslash escapes the next character.
+    A character constant is ``'`` and the next character (two after a
+    backslash), and a closing ``'`` when one follows: measured,
+    ``.byte '"`` opens no string, and ``.byte 'a';.else`` ends at the ``;``.
+
+    With no *lexicon* the comment character is not known.  A ``@`` or
+    ``#`` can then start a comment, and a ``;`` after it can be in the
+    comment: the text after it becomes one UNSURE statement, which the
+    expander reads as a refused construct.
+    """
+    if lexicon is not None and text.lstrip()[:1] in tuple(lexicon.line_comment):
+        return [""]
+    pieces: list[str] = []
+    current: list[str] = []
+    in_string = False
+    unsure = False
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if in_string:
+            current.append(char)
+            if char == "\\" and index + 1 < len(text):
+                current.append(text[index + 1])
+                index += 2
+                continue
+            if char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+            current.append(char)
+        elif char == "'":
+            width = 3 if text.startswith("\\", index + 1) else 2
+            if text.startswith("'", index + width):
+                width += 1
+            current.append(text[index:index + width])
+            index += width
+            continue
+        elif lexicon is not None and char in lexicon.comment:
+            break
+        elif char == ";":
+            pieces.append("".join(current))
+            if unsure:
+                pieces.append(UNSURE + text[index + 1:])
+                return pieces
+            current = []
+        elif text.startswith("//", index):
+            break
+        elif lexicon is None and char in "@#":
+            unsure = True
+            current.append(char)
+        else:
+            current.append(char)
+        index += 1
+    pieces.append("".join(current))
+    return pieces
 
 
 def _statements(
@@ -712,7 +846,10 @@ def _statements(
     default discards it, which is what the callers that only want the
     statements do.
     """
-    return expand_macros(_raw_statements(source), report or MacroReport())
+    return expand_macros(
+        _raw_statements(source), report or MacroReport(),
+        defsym=source.defsym, comments_removed=source.lexicon is not None,
+    )
 
 
 def extract_symbols(
@@ -869,6 +1006,9 @@ class VectorEntry:
             on Cortex-M slot 15 is SysTick and slot 16+n is external IRQ
             n, on arm64 the position selects an exception class instead.
             The position is a fact of the file; its meaning is not.
+            None after a barrier (a refused construct) anywhere before it
+            in the unit: the skipped statements can hold slots of any
+            table, thus no later position is known.
         is_data: True when the slot holds an ADDRESS derived from the
             symbol rather than the symbol itself — written as an
             expression, ``.word z_main_stack + CONFIG_MAIN_STACK_SIZE``.
@@ -882,7 +1022,7 @@ class VectorEntry:
     name: str
     file: str
     line: int
-    index: int = -1
+    index: int | None = -1
     is_data: bool = False
 
 
@@ -965,7 +1105,8 @@ def extract_vectors(source: AsmSource) -> list[VectorEntry]:
     """
     found: dict[tuple[str, str, int], VectorEntry] = {}
     in_table = False
-    position = 0
+    position: int | None = 0
+    positions_known = True
 
     for file, line, stmt in _statements(source):
         section = _SECTION_RE.match(stmt)
@@ -974,7 +1115,17 @@ def extract_vectors(source: AsmSource) -> list[VectorEntry]:
             was = in_table
             in_table = not _ORDINARY_SECTION.match(name)
             if in_table and not was:
-                position = 0
+                position = 0 if positions_known else None
+            continue
+        if stmt == BARRIER:
+            # A refused construct: its statements are unknown, and they can
+            # hold slots of any table or a change of section.  Thus the
+            # section is not known until the next section directive (a
+            # `.word` before it is no slot: in `.text` it would be a wrong
+            # edge), and no later slot of the unit has a known position.
+            in_table = False
+            positions_known = False
+            position = None
             continue
         if not in_table:
             continue
@@ -997,7 +1148,8 @@ def extract_vectors(source: AsmSource) -> list[VectorEntry]:
                     VectorEntry(name=name, file=file, line=line,
                                 index=position, is_data=is_data),
                 )
-            position += 1
+            if position is not None:
+                position += 1
     return list(found.values())
 
 

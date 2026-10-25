@@ -2,8 +2,11 @@
 
 One `.S` file per family of GNU as constructs, written from the
 documentation (`as.info`, nodes `Macro`, `Altmacro`, `Irp`, `Irpc`,
-`Rept`, `Purgem`, `Exitm`) rather than from whatever a given SDK on a
-given machine happens to write.  Platforms differ; the manual does not.
+`Rept`, `Purgem`, `Exitm`, `If`, `Infix Ops`) rather than from whatever a
+given SDK on a given machine happens to write.  Platforms differ; the
+manual does not.  Where the manual is silent (the precedence of `|`
+against `+`, a logical `>>`), `conditionals.S` holds the answer of the
+assembler.
 
 ## The oracle
 
