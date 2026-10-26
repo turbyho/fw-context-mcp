@@ -99,5 +99,5 @@ class TestSourceBudget:
     def test_a_callable_gets_the_larger_budget(self) -> None:
         assert _SOURCE_CAP_CALLABLE > _SOURCE_CAP_TYPE
 
-    def test_the_callable_kinds_are_the_four_that_hold_statements(self) -> None:
-        assert _CALLABLE_KINDS == {"function", "method", "constructor", "destructor"}
+    def test_the_callable_kinds_are_the_ones_that_hold_statements(self) -> None:
+        assert _CALLABLE_KINDS == {"function", "method", "constructor", "destructor", "lambda"}

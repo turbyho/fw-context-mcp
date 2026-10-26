@@ -181,7 +181,7 @@ def _with_search_context(root: Path, tool_name: str, do_search, variant: str = "
 def search_code(
     query: Annotated[str, Field(description="FTS5 search terms. 1-3 words, omit underscores. E.g. 'modem init' not 'modem_init'. Supports trailing wildcard 'modem*'.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
-     kind: Annotated[str | None, Field(description="Optional kind filter: function, method, constructor, destructor, class, struct, union, enum, enum_constant, typedef, varglobal, varlocal, variable, field, namespace.")] = None,
+     kind: Annotated[str | None, Field(description="Optional kind filter: function, method, constructor, destructor, class, struct, union, enum, enum_constant, typedef, varglobal, varlocal, variable, field, namespace, lambda.")] = None,
      limit: Annotated[int, Field(description="Maximum results of one page (default 20, max 100).", ge=1)] = 20,
      offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a topic that many symbols carry.", ge=0)] = 0,
      project_only: Annotated[bool, Field(description="Exclude vendor SDK code. When True, only application code. Default False.")] = False,
@@ -243,7 +243,9 @@ def search_code(
     ``destructor``, ``class``, ``struct``, ``union``, ``enum``, ``enum_constant``,
     ``typedef``, ``varglobal``, ``varlocal``, ``variable``, ``field``,
     ``namespace``, ``label`` (a local label of assembly, inside the code of
-    a function; ``parent_usr`` is empty when no single function holds it).
+    a function; ``parent_usr`` is empty when no single function holds it),
+    ``lambda`` (a C++ lambda, named ``<lambda>`` after the code that holds
+    it; the calls in its body are its calls).
 
     **Local variables are out.**  FTS5 indexes the qualified name, thus a
     local matches through the function that holds it: a query for
@@ -964,7 +966,7 @@ async def semantic_search(
 # the type.
 _SOURCE_CAP_CALLABLE = 2000
 _SOURCE_CAP_TYPE = 500
-_CALLABLE_KINDS = frozenset({"function", "method", "constructor", "destructor"})
+_CALLABLE_KINDS = frozenset({"function", "method", "constructor", "destructor", "lambda"})
 
 # Cap on the line numbers reported for one result.  A common term appears on
 # many lines of a long body, and the caller needs enough anchors to find the
@@ -1105,7 +1107,8 @@ def search_bodies(
     a definition is not only a callable.  Measured on one project of 60,877
     symbols, the text covers:
 
-    - Callables — ``function``, ``method``, ``constructor``, ``destructor``.
+    - Callables — ``function``, ``method``, ``constructor``, ``destructor``,
+      ``lambda``.
       Call patterns (``.attach(``, ``.rise(``, ``callback(&``), ISR
       registration, one ``case`` label of a long ``switch``.
     - Types — ``class``, ``struct``, ``union``, ``enum``, ``namespace``.

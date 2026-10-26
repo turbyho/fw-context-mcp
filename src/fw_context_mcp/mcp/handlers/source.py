@@ -1332,7 +1332,7 @@ def _collect_callees(
 # the symbol (a function pointer), and the kinds for which it gives the
 # indirect calls made BY the symbol.
 _POINTER_KINDS = ("field", "variable", "varglobal", "varlocal")
-_CODE_KINDS = ("function", "method")
+_CODE_KINDS = ("function", "method", "lambda")
 
 
 def _list_totals(

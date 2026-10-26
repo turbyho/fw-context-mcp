@@ -247,12 +247,14 @@ def _calls_to(edges, target: str) -> list[tuple]:
 
 
 def test_a_call_in_a_lambda_of_an_instance_is_one_row_of_the_template(lambdas):
-    """The lambda belongs to the function that holds it, as in the walk of written code."""
-    assert _calls_to(lambdas, "Dev::run") == [("plain", "Dev::run", 6, 51), ("with_lambda", "Dev::run", 3, 68)]
+    """The call belongs to the lambda, in the walk of the written code and of the instance alike."""
+    assert _calls_to(lambdas, "Dev::run") == [
+        ("plain::<lambda>", "Dev::run", 6, 51), ("with_lambda::<lambda>", "Dev::run", 3, 68),
+    ]
 
 
 def test_a_call_in_nested_lambdas_is_one_row(lambdas):
-    assert _calls_to(lambdas, "Dev::stop") == [("nested", "Dev::stop", 4, 80)]
+    assert _calls_to(lambdas, "Dev::stop") == [("nested::<lambda>::<lambda>", "Dev::stop", 4, 80)]
 
 
 def test_a_method_of_a_local_class_is_its_own_caller(lambdas):
@@ -260,8 +262,15 @@ def test_a_method_of_a_local_class_is_its_own_caller(lambdas):
     assert len(callers) == 1 and next(iter(callers)).endswith("Local::go"), callers
 
 
+def test_a_call_of_a_lambda_is_an_edge_to_the_lambda(lambdas):
+    pairs = {(e[0], e[1]) for e in lambdas}
+    assert ("with_lambda", "with_lambda::<lambda>") in pairs, lambdas
+    assert ("nested::<lambda>", "nested::<lambda>::<lambda>") in pairs, lambdas
+    assert ("plain", "plain::<lambda>") in pairs, lambdas
+
+
 def test_the_walk_of_an_instance_gives_no_edge_to_the_call_operator_of_a_lambda(lambdas):
-    """A call of a lambda is code of the function that holds it."""
+    """The call operator of a closure is no symbol: the edge goes to the lambda."""
     templates = {"with_lambda", "nested", "local"}
     assert not [
         e for e in lambdas

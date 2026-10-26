@@ -994,6 +994,10 @@ def _code_usr(target: cx.Cursor) -> str:
     expansion writes have the same place (the place of the expansion),
     thus the specialization maps to the template there.
     """
+    if target.spelling == "operator()" and target.kind in _CLOSURE_CALL_KINDS:
+        expression = _lambda_of(target)
+        if expression is not None:
+            return _lambda_usr(expression)
     if target.kind not in _INSTANCE_FUNCTION_KINDS:
         return target.get_usr()
     current = target
@@ -1026,12 +1030,23 @@ def _is_implicit_instance(cursor: cx.Cursor) -> bool:
     return template is not None and _has_place_of(cursor, template)
 
 
+def _instance_key(cursor: cx.Cursor) -> str:
+    """The key of a template instance: its USR and its declaration.
+
+    WHY not the USR alone: libclang 22 gives the instances of one template
+    for two lambdas ONE USR (`post<#...@Sa>`: a closure type is `@Sa`
+    whatever the lambda), thus only the first instance was walked, and
+    only the first lambda got its edge.  The two instances are two
+    declarations, and the hash of the cursor tells them apart.
+    """
+    return f"{cursor.get_usr()}#{cursor.hash}"
+
+
 def _seed_instance(seeds: dict[str, cx.Cursor], cursor: cx.Cursor) -> None:
     """Add *cursor* to *seeds* when it is a function that is an implicit template instance."""
     if cursor.kind in _INSTANCE_FUNCTION_KINDS and _is_implicit_instance(cursor):
-        usr = cursor.get_usr()
-        if usr:
-            seeds.setdefault(usr, cursor)
+        if cursor.get_usr():
+            seeds.setdefault(_instance_key(cursor), cursor)
 
 
 def _seed_explicit_instantiation(seeds: dict[str, cx.Cursor], cursor: cx.Cursor) -> None:
@@ -1053,39 +1068,161 @@ def _seed_explicit_instantiation(seeds: dict[str, cx.Cursor], cursor: cx.Cursor)
             _seed_instance(seeds, method)
 
 
-def _closure_owner(cursor: cx.Cursor) -> cx.Cursor | None:
-    """Give the function that a lambda closure belongs to when *cursor* is a member of it, else None.
+# The kinds of the call operator of a closure (a generic lambda has a template).
+_CLOSURE_CALL_KINDS = frozenset({cx.CursorKind.CXX_METHOD, cx.CursorKind.FUNCTION_TEMPLATE})
+# The kinds whose code can own a lambda: the key of the lambda starts with
+# the key of that code (`_lambda_usr`).
+_LAMBDA_OWNER_KINDS = _CALLABLE_KINDS | _INSTANCE_FUNCTION_KINDS
 
-    A closure class is an anonymous class whose semantic parent is a
-    function (measured on libclang 22: ``(lambda at ...)`` is a CLASS_DECL
-    with ``is_anonymous()`` and the enclosing function as its parent).
+
+def _lambda_of(cursor: cx.Cursor) -> cx.Cursor | None:
+    """Give the LAMBDA_EXPR that *cursor* is, or whose closure class or call operator it is.
+
+    A closure class is an anonymous CLASS_DECL with the place of its lambda
+    (measured, libclang 22).  The cursor at that place tells it from an
+    unnamed struct with an ``operator()``: it is the LAMBDA_EXPR for a
+    closure, the STRUCT_DECL else.  An implicit instance of a template has
+    the place of the template, thus the closure of a lambda in an instance
+    body gives the lambda of the written template.
     """
-    parent = cursor.semantic_parent
-    if parent is None or parent.kind != cx.CursorKind.CLASS_DECL or not parent.is_anonymous():
+    if cursor.kind == cx.CursorKind.LAMBDA_EXPR:
+        return cursor
+    if cursor.kind == cx.CursorKind.CLASS_DECL:
+        closure: cx.Cursor | None = cursor
+    elif cursor.kind in _CLOSURE_CALL_KINDS and cursor.spelling == "operator()":
+        closure = cursor.semantic_parent
+    else:
         return None
-    owner = parent.semantic_parent
-    if owner is None or owner.kind not in _CALLABLE_KINDS | _INSTANCE_FUNCTION_KINDS:
+    if closure is None or closure.kind != cx.CursorKind.CLASS_DECL or not closure.is_anonymous():
         return None
-    return owner
+    if closure.location.file is None:
+        return None
+    seen = _seen_lambdas().get(_closure_key(closure))
+    if seen is not None:
+        return seen
+    at = cx.Cursor.from_location(closure.translation_unit, closure.location)
+    return at if at is not None and at.kind == cx.CursorKind.LAMBDA_EXPR else None
 
 
-def _caller_of(definition: cx.Cursor) -> cx.Cursor:
-    """Give the function that the AST walk names as the caller of the calls in *definition*.
+def _lambda_usr(expression: cx.Cursor) -> str:
+    """Give the key of the lambda *expression*: its owner and its place.
 
-    WHY: the AST walk attributes the body of a lambda to the function that
-    holds it (a LAMBDA_EXPR is no callable), thus the walk of an instance
-    does the same.  The call operator of a closure, walked as an instance
-    of its own, then gives the key that the walk of the enclosing body
-    gives, and the two claims are one row.  Nested lambdas go to the
-    outermost function.
+    WHY not the USR of libclang: the closure class and its call operator of
+    two lambdas of one function with one signature have ONE USR (measured,
+    libclang 22: both lambdas of `Client::start` give
+    `c:@S@Client@F@start#@Sa@F@operator()#I#1`), and the lambda expression
+    has none.  The owner is the code that holds the lambda (`_code_usr` of
+    it: the template for an instance, the outer lambda for a nested one),
+    or the scope of a lambda outside a function.  The place makes it one of
+    a kind, also in a header that several units read.  Limit: two lambdas
+    that one macro expansion writes have one place.
     """
-    current = definition
-    for _ in range(_TEMPLATE_CHAIN_LIMIT):
-        owner = _closure_owner(current)
-        if owner is None:
-            return current
-        current = owner
-    return current
+    closure = expression.type.get_declaration()
+    owner = closure.semantic_parent if closure is not None else None
+    if owner is not None and owner.kind in _LAMBDA_OWNER_KINDS:
+        owner_key = _code_usr(owner)
+    else:
+        owner_key = owner.get_usr() if owner is not None else ""
+    place = expression.location
+    file_name = Path(place.file.name).name if place.file is not None else ""
+    return f"{owner_key or 'c:'}@lambda@{file_name}:{place.line}:{place.column}"
+
+
+# The lambdas that the walks of the unit have seen, by the USR and place of
+# their closure: `_lambda_of` finds a lambda through it when the cursor at
+# the place of the closure is no LAMBDA_EXPR (a lambda written in the body
+# of a macro: the place is the expansion).  One registry for each thread
+# that extracts a unit (`extract_all` starts it).
+_SEEN_LAMBDAS = threading.local()
+
+
+def _seen_lambdas() -> dict[tuple[str, str, int, int], cx.Cursor]:
+    registry = getattr(_SEEN_LAMBDAS, "by_closure", None)
+    if registry is None:
+        registry = {}
+        _SEEN_LAMBDAS.by_closure = registry
+    return registry
+
+
+def _closure_key(closure: cx.Cursor) -> tuple[str, str, int, int]:
+    place = closure.location
+    return (closure.get_usr(), place.file.name if place.file else "", place.line, place.column)
+
+
+def _remember_lambda(expression: cx.Cursor) -> None:
+    """Register the closure of the lambda *expression* (see `_SEEN_LAMBDAS`)."""
+    closure = expression.type.get_declaration()
+    if closure is not None and closure.kind == cx.CursorKind.CLASS_DECL:
+        _seen_lambdas()[_closure_key(closure)] = expression
+
+
+def _lambda_body_cursors(expression: cx.Cursor) -> Generator[cx.Cursor, None, None]:
+    """Yield the cursors of the body of the lambda *expression*.
+
+    The body is the compound statement of the lambda.  A class or a
+    function defined in it is code of its own and is left out; a nested
+    lambda is in it.
+    """
+    stack = [child for child in expression.get_children() if child.kind == cx.CursorKind.COMPOUND_STMT]
+    while stack:
+        node = stack.pop()
+        yield node
+        if node.kind in _INSTANCE_CLASS_KINDS or (node.kind in _CALLABLE_KINDS and node.is_definition()):
+            continue
+        stack.extend(node.get_children())
+
+
+def _lambda_symbol(expression: cx.Cursor) -> Symbol | None:
+    """Give the symbol of the lambda *expression* (kind ``lambda``).
+
+    A lambda is code of its own: the calls in its body are calls of it, and
+    a call of it (`l()`) is an edge to it.  Its parent is the code that
+    holds it, and its name is `<lambda>` after the name of that code.  Its
+    last line is the last line of its body: a lambda in a macro argument has
+    an extent of no width (measured, libclang 22).
+    """
+    place = expression.location
+    if place.file is None:
+        return None
+    closure = expression.type.get_declaration()
+    owner = closure.semantic_parent if closure is not None else None
+    call = None
+    if closure is not None:
+        call = next((child for child in closure.get_children() if child.spelling == "operator()"), None)
+    parent_usr = ""
+    owner_name = ""
+    if owner is not None and owner.kind in _LAMBDA_OWNER_KINDS:
+        parent_usr = _code_usr(owner)
+        owner_lambda = _lambda_of(owner)
+        owner_name = (
+            _lambda_qualified_name(owner_lambda) if owner_lambda is not None
+            else _qualified_name(owner, {})
+        )
+    return Symbol(
+        name="<lambda>",
+        qualified_name=f"{owner_name}::<lambda>" if owner_name else "<lambda>",
+        kind="lambda",
+        file=place.file.name,
+        line=place.line,
+        column=place.column,
+        is_definition=True,
+        signature=call.type.spelling if call is not None else "",
+        docstring="",
+        usr=_lambda_usr(expression),
+        end_line=max(
+            [expression.extent.end.line] + [
+                child.extent.end.line for child in expression.get_children()
+                if child.kind == cx.CursorKind.COMPOUND_STMT
+            ]
+        ),
+        parent_usr=parent_usr,
+    )
+
+
+def _lambda_qualified_name(expression: cx.Cursor) -> str:
+    """The qualified name of a lambda: the name of its owner and `<lambda>`."""
+    symbol = _lambda_symbol(expression)
+    return symbol.qualified_name if symbol is not None else "<lambda>"
 
 
 def _walk_template_instances(
@@ -1118,10 +1255,10 @@ def _walk_template_instances(
     is a later step (the slots of the indirect calls).
 
     A body is walked as the AST walk reads it: the calls in a lambda belong
-    to the function that holds it (``_caller_of``), and a call of a lambda
-    (``l()``) is no edge.  A function defined inside the body (a method of
-    a local class) is a definition of its own: the walk does not descend
-    into it, and it is walked as an instance when a call names it.
+    to the lambda (`_lambda_usr`), and a call of a lambda (``l()``) is an
+    edge to it.  A function defined inside the body (a method of a local
+    class) is a definition of its own: the walk does not descend into it,
+    and it is walked as an instance when a call names it.
     """
     work = list(seeds.values())
     queued = set(seeds)
@@ -1142,23 +1279,26 @@ def _walk_template_instances(
         definition = declaration.get_definition()
         if definition is None or not definition.is_definition() or not _is_implicit_instance(definition):
             continue
-        definition_usr = definition.get_usr()
-        if not definition_usr or definition_usr in walked:
+        if not definition.get_usr():
             continue
-        walked.add(definition_usr)
+        definition_key = _instance_key(definition)
+        if definition_key in walked:
+            continue
+        walked.add(definition_key)
         parent = definition.semantic_parent
         if parent is not None and parent.kind in _INSTANCE_CLASS_KINDS and _is_implicit_instance(parent):
             classes.setdefault(parent.get_usr(), parent)
-        caller = _code_usr(_caller_of(definition))
-        for node in _body_cursors(definition):
+        definition_key = _code_usr(definition)
+        for node, frame in _body_cursors(definition):
             if node.kind not in _REF_KINDS:
                 continue
             target = node.referenced
             if target is None:
                 continue
             _queue_instance(target, queued, work)
-            if node.kind != cx.CursorKind.CALL_EXPR or _closure_owner(target) is not None:
+            if node.kind != cx.CursorKind.CALL_EXPR:
                 continue
+            caller = definition_key if frame is None else _lambda_usr(frame)
             site = node.location
             if not site.file or not target.location.file or not target.get_usr():
                 continue
@@ -1169,27 +1309,39 @@ def _walk_template_instances(
             ))
 
 
-def _body_cursors(definition: cx.Cursor) -> Generator[cx.Cursor, None, None]:
+def _body_cursors(
+    definition: cx.Cursor,
+) -> Generator[tuple[cx.Cursor, cx.Cursor | None], None, None]:
     """Yield the cursors of the body of *definition* in preorder, without nested definitions.
 
-    A function or a class defined inside the body is code of its own (see
-    ``_walk_template_instances``); a lambda is part of the body.
+    Each cursor comes with the innermost LAMBDA_EXPR whose body holds it,
+    or None: the body of a lambda is the lambda's code (see
+    ``_walk_template_instances``), and its captures are the code around it.
+    A function or a class defined inside the body is code of its own.
     """
-    stack = list(reversed(list(definition.get_children())))
+    stack: list[tuple[cx.Cursor, cx.Cursor | None]] = [
+        (child, None) for child in reversed(list(definition.get_children()))
+    ]
     while stack:
-        node = stack.pop()
+        node, frame = stack.pop()
         if node.kind in _INSTANCE_CLASS_KINDS or (node.kind in _CALLABLE_KINDS and node.is_definition()):
             continue
-        yield node
-        stack.extend(reversed(list(node.get_children())))
+        yield node, frame
+        is_lambda = node.kind == cx.CursorKind.LAMBDA_EXPR
+        if is_lambda:
+            _remember_lambda(node)
+        stack.extend(
+            (child, node if is_lambda and child.kind == cx.CursorKind.COMPOUND_STMT else frame)
+            for child in reversed(list(node.get_children()))
+        )
 
 
 def _queue_instance(cursor: cx.Cursor, queued: set[str], work: list[cx.Cursor]) -> None:
     """Put *cursor* on the work list of ``_walk_template_instances`` when it is a new implicit instance."""
     if cursor.kind in _INSTANCE_FUNCTION_KINDS and _is_implicit_instance(cursor):
-        usr = cursor.get_usr()
-        if usr and usr not in queued:
-            queued.add(usr)
+        key = _instance_key(cursor)
+        if cursor.get_usr() and key not in queued:
+            queued.add(key)
             work.append(cursor)
 
 
@@ -1477,6 +1629,12 @@ def _build_refs_and_fp_assignments(
     _fn_spans: list[tuple[str, int, int]] = []
 
     fn_stack: list[tuple[str, int, str]] = []
+    # The caller of each cursor in the body of a lambda, by cursor hash:
+    # the lambda (see _lambda_body_cursors).  A lambda shares its lines with
+    # the code around it (`reg([] { work(); }); other();`), and a lambda in
+    # a macro argument has no extent of its own, thus the tree decides and
+    # not a line or an offset.
+    lambda_callers: dict[tuple[int, int], str] = {}
     # The constructor calls of the initializers of objects at namespace or
     # class scope, by cursor hash: they run before main.  A VAR_DECL comes
     # before its initializer in the preorder walk.
@@ -1505,6 +1663,7 @@ def _build_refs_and_fp_assignments(
         while fn_stack and fn_stack[-1][1] > 0 and _cl is not None and _cl_line > fn_stack[-1][1]:
             fn_stack.pop()
         cur_fn = fn_stack[-1][0] if fn_stack else None
+        cur_fn = lambda_callers.get((cursor.hash, cursor.kind.value), cur_fn)
 
         if cursor.kind in _CALLABLE_KINDS and cursor.is_definition():
             own_usr = cursor.get_usr()
@@ -1555,6 +1714,16 @@ def _build_refs_and_fp_assignments(
             pending_dispatches, seen_ref, qn_to_usr, tu_path_str, resolve_fn, _log,
             static_init_calls, instance_seeds,
         )
+
+        # The body of a lambda is code of the lambda: the calls in it are
+        # its calls.  The expression itself (its address), its captures and
+        # the default arguments of its parameters belong to the code around
+        # it.  A nested lambda comes later in the walk and takes its body.
+        if cursor.kind == cx.CursorKind.LAMBDA_EXPR:
+            _remember_lambda(cursor)
+            key = _lambda_usr(cursor)
+            for node in _lambda_body_cursors(cursor):
+                lambda_callers[(node.hash, node.kind.value)] = key
 
     # The calls that only the instances of the templates resolve.
     _walk_template_instances(instance_seeds, refs, seen_ref)
@@ -1712,7 +1881,9 @@ def _process_one_symbol(
 
     if not parent_usr and kind in ("varlocal", "variable"):
         if sem_parent and sem_parent.kind in _CALLABLE_KINDS:
-            parent_usr = sem_parent.get_usr() or ""
+            # A local of a lambda belongs to the lambda (`_code_usr` of the
+            # call operator of its closure).
+            parent_usr = _code_usr(sem_parent) or ""
 
     is_template = cursor.kind in (
         cx.CursorKind.CLASS_TEMPLATE,
@@ -2032,6 +2203,15 @@ def _handle_direct_refs(cursor: cx.Cursor, cur_fn: str | None, refs: list[Refere
             _seed_instance(instance_seeds, referenced)
             to_usr = _code_usr(referenced)
             ref_loc = referenced.location
+            if referenced.kind == cx.CursorKind.CONVERSION_FUNCTION:
+                # The implicit conversion of a lambda to a function pointer
+                # (`reg([](int y) { ... })`) takes the address of the
+                # lambda: no call, and no symbol for the conversion.
+                closure_lambda = _lambda_of(referenced.semantic_parent)
+                if closure_lambda is not None:
+                    _add_ref(refs, seen_ref, _lambda_usr(closure_lambda), loc, cur_fn,
+                             "indirect", RefOrigin.DIRECT)
+                    return
             if to_usr and ref_loc.file:
                 if (cursor.kind == cx.CursorKind.CALL_EXPR
                         and referenced.kind == cx.CursorKind.CONSTRUCTOR
@@ -3549,6 +3729,8 @@ def extract_all(
     import time as _time
     _log = logging.getLogger(__name__)
     _t_start = _time.monotonic()
+    # The lambdas of an earlier unit are no lambdas of this one.
+    _SEEN_LAMBDAS.by_closure = {}
     tu = _get_index().parse(
         str(unit.file),
         args=unit.clang_args,
@@ -3603,6 +3785,13 @@ def extract_all(
             fpath = str(_resolve(str(cursor.location.file.name)))
             _newly_seen.add(fpath)
 
+        if cursor.kind == cx.CursorKind.LAMBDA_EXPR:
+            _remember_lambda(cursor)
+            lambda_symbol = _lambda_symbol(cursor)
+            if lambda_symbol is not None and lambda_symbol.usr not in seen_usrs:
+                seen_usrs[lambda_symbol.usr] = True
+                symbols.append(lambda_symbol)
+            continue
         if cursor.kind not in _SYMBOL_KINDS:
             continue
         _process_one_symbol(cursor, symbols, seen_usrs, class_cursors, anon_usr_to_field, _log)

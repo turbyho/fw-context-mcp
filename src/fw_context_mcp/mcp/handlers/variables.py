@@ -264,7 +264,7 @@ def find_variables(
                 parent = parents.get(parent_usr)
                 if parent:
                     pkind = parent["kind"]
-                    if pkind in ("function", "method", "constructor", "destructor"):
+                    if pkind in ("function", "method", "constructor", "destructor", "lambda"):
                         enclosing_function = parent["qualified_name"] or parent["name"]
                     elif pkind in ("class", "struct", "union"):
                         enclosing_class = parent["qualified_name"] or parent["name"]

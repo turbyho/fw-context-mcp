@@ -442,8 +442,8 @@ def _build_pagerank(conn, config_hash: str, *, write_lock_held: bool = False) ->
            JOIN symbols ts ON ts.usr = r.to_usr AND ts.config_hash = r.config_hash
            WHERE r.config_hash = ?
              AND r.ref_kind = 'call'
-             AND fs.kind IN ('function', 'method', 'constructor', 'destructor')
-             AND ts.kind IN ('function', 'method', 'constructor', 'destructor')
+             AND fs.kind IN ('function', 'method', 'constructor', 'destructor', 'lambda')
+             AND ts.kind IN ('function', 'method', 'constructor', 'destructor', 'lambda')
              AND r.from_usr != ''
              AND r.to_usr != ''
         """,
