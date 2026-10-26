@@ -75,6 +75,7 @@ __all__ = [
     "find_macro_refs",
     "insert_macros_batch",
     "insert_symbols_batch",
+    "link_definition",
     "lookup_macro",
     "search_symbols",
     "split_tokens",
@@ -254,6 +255,58 @@ def insert_symbols_batch(
         full,
     )
     return cur.rowcount  # approximate with ON CONFLICT DO UPDATE WHERE (used for logging only)
+
+
+# The USR prefix of a symbol that a linker script defines.
+_LINKER_SCRIPT_USR_PREFIX = "ld:"
+
+
+def link_definition(
+    conn: sqlite3.Connection, config_hash: str, link_name: str, *, declarations: bool = False,
+) -> str | None:
+    """Return the USR of the symbol that the linker gives *link_name*, or None.
+
+    The candidates are the symbols whose link name is *link_name*
+    (`symbols.link_name`): a `static` function, a C++ method and a local
+    label have another link name or none, thus they are never one.  The
+    ranks, as GNU ld takes them, in this order:
+
+    1. A strong definition: in C, in C++, in assembly, or an assignment in
+       a linker script.
+    2. A weak definition of an object file (`.weak`, `__attribute__((weak))`
+       when the index sees it).
+    3. A `PROVIDE` of a linker script (stored weak): ld uses it only when no
+       object defines the name.
+    4. With *declarations*: a declaration, which stands for the symbol that
+       the linker gets from elsewhere (a library).
+
+    The language of a definition gives no rank: two definitions of one
+    rank are a link error, or one of them is in a file that the link does
+    not use, and the index does not hold which.  Then the answer is None,
+    as when nothing matches: a wrong target is a claim about code that
+    does not run.
+    """
+    if not link_name:
+        return None
+    rows = conn.execute(
+        "SELECT usr, is_definition, is_weak FROM symbols "
+        "WHERE config_hash=? AND link_name=?",
+        (config_hash, link_name),
+    ).fetchall()
+    definitions = [row for row in rows if row["is_definition"]]
+    weak = [row for row in definitions if row["is_weak"]]
+    ranks = [
+        [row for row in definitions if not row["is_weak"]],
+        [row for row in weak if not str(row["usr"]).startswith(_LINKER_SCRIPT_USR_PREFIX)],
+        [row for row in weak if str(row["usr"]).startswith(_LINKER_SCRIPT_USR_PREFIX)],
+    ]
+    if declarations:
+        ranks.append([row for row in rows if not row["is_definition"]])
+    for rank in ranks:
+        found = {str(row["usr"]) for row in rank}
+        if found:
+            return found.pop() if len(found) == 1 else None
+    return None
 
 
 def insert_macros_batch(

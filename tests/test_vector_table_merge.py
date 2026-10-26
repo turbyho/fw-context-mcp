@@ -29,10 +29,10 @@ CONFIG = "ch"
 
 
 def _symbol_row(config, file_id, path, name, usr, kind="function",
-                line=10, end_line=12, is_weak=0):
-    """One symbols row in the 24-column shape the batch insert expects."""
+                line=10, end_line=12, is_weak=0, link_name=""):
+    """One symbols row in the 25-column shape the batch insert expects."""
     return (config, file_id, path, name, usr, name, name, kind, line, 1,
-            end_line, 1, "", "", None, 0, 0, "", 0, "", 1, 0.0, "", is_weak)
+            end_line, 1, "", "", None, 0, 0, "", 0, "", 1, 0.0, "", is_weak, link_name)
 
 
 def _db(tmp_path):
@@ -363,11 +363,14 @@ class TestADeclarationIsNotTheDefinition:
     """
 
     @staticmethod
-    def _riscv_shape(conn, definition_files=("isr.S",)):
+    def _riscv_shape(conn, definition_files=("isr.S",), weak=(), link_name="_isr_wrapper"):
         """Write the shape: a C declaration in a header, plus definitions.
 
-        More than one *definition_files* entry makes the name ambiguous,
-        which is the case the rule has to refuse.
+        Each definition is a `.global` label of assembly, thus its link
+        name is its name; *link_name* "" makes them `static`.  More than
+        one strong one in *definition_files* makes the link name
+        ambiguous (a link error), which the rule has to refuse.  *weak*
+        names the files whose definition is weak.
         """
         with transaction(conn):
             header = upsert_file(conn, CONFIG, "sw_isr_table.h", "c")
@@ -376,14 +379,15 @@ class TestADeclarationIsNotTheDefinition:
                 (CONFIG, header, "sw_isr_table.h", "_isr_wrapper",
                  "c:@F@_isr_wrapper", "_isr_wrapper", "_isr_wrapper",
                  "function", 29, 1, 29, 0, "", "", None, 0, 0, "", 0, "",
-                 1, 0.0, "", 0),
+                 1, 0.0, "", 0, "_isr_wrapper"),
             ])
             for index, name in enumerate(definition_files):
                 fid = upsert_file(conn, CONFIG, name, "asm")
                 insert_symbols_batch(conn, [
                     _symbol_row(CONFIG, fid, name, "_isr_wrapper",
                                 f"asm:{index}:_isr_wrapper", line=137 + index,
-                                end_line=200 + index),
+                                end_line=200 + index, is_weak=int(name in weak),
+                                link_name=link_name),
                 ])
             table = upsert_file(conn, CONFIG, "isr_tables.c", "c")
             insert_symbols_batch(conn, [
@@ -411,8 +415,30 @@ class TestADeclarationIsNotTheDefinition:
         finally:
             conn.close()
 
+    def test_a_static_function_of_the_same_name_is_not_the_definition(self, tmp_path):
+        """It has no link name: the linker never resolves the declaration to it."""
+        conn = _db(tmp_path)
+        try:
+            self._riscv_shape(conn, link_name="")
+
+            rows = get_vector_table(conn, CONFIG)
+            assert {r["file"] for r in rows} == {"sw_isr_table.h"}
+        finally:
+            conn.close()
+
+    def test_the_strong_definition_wins_over_a_weak_one(self, tmp_path):
+        conn = _db(tmp_path)
+        try:
+            self._riscv_shape(conn, definition_files=("weak.S", "isr.S"), weak=("weak.S",))
+
+            rows = get_vector_table(conn, CONFIG)
+            assert {r["file"] for r in rows} == {"isr.S"}
+        finally:
+            conn.close()
+
     def test_two_definitions_of_one_name_leave_the_row_alone(self, tmp_path):
-        """Two static functions may share a name; guessing between them is worse.
+        """Two strong definitions of one link name: a link error, and a
+        guess between them is worse.
 
         The row keeps the declaration, which is at least not a claim about
         the wrong file.
@@ -685,5 +711,47 @@ class TestASlotFilledAtRunTime:
 
             rows = get_vector_table(conn, CONFIG)
             assert all("installed" not in row for row in rows)
+        finally:
+            conn.close()
+
+
+class TestTheStubThatAHandlerReplaced:
+    """`overridden`: the weak definition of the same link name (CMSIS)."""
+
+    @staticmethod
+    def _shape(conn, stub_link_name):
+        with transaction(conn):
+            source = upsert_file(conn, CONFIG, "main.c", "c")
+            startup = upsert_file(conn, CONFIG, "startup.S", "asm")
+            insert_symbols_batch(conn, [
+                _symbol_row(CONFIG, source, "main.c", "SysTick_Handler",
+                            "c:@F@SysTick_Handler", line=5, link_name="SysTick_Handler"),
+                _symbol_row(CONFIG, startup, "startup.S", "SysTick_Handler",
+                            "asm:startup.S@SysTick_Handler", line=90, is_weak=1,
+                            link_name=stub_link_name),
+            ])
+            insert_refs_batch(conn, [
+                (CONFIG, "c:@F@SysTick_Handler", "startup.S", 55, None, "vector", 15, 0, 1),
+            ])
+
+    def test_the_weak_definition_of_the_link_name_is_named(self, tmp_path):
+        conn = _db(tmp_path)
+        try:
+            self._shape(conn, "SysTick_Handler")
+
+            [row] = get_vector_table(conn, CONFIG)
+            assert row["status"] == "c"
+            assert row["overridden"] == {"file": "startup.S", "line": 90}
+        finally:
+            conn.close()
+
+    def test_a_weak_symbol_of_another_link_name_is_no_stub(self, tmp_path):
+        """A weak `static` of the same plain name is not what the linker replaced."""
+        conn = _db(tmp_path)
+        try:
+            self._shape(conn, "")
+
+            [row] = get_vector_table(conn, CONFIG)
+            assert "overridden" not in row
         finally:
             conn.close()

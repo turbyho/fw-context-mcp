@@ -2008,7 +2008,24 @@ class TestWeakLosesToStrong:
         finally:
             conn.close()
 
-    def test_a_c_definition_still_wins_over_any_assembly_one(self, tmp_path: Path):
+    def test_a_strong_c_definition_wins_over_a_weak_assembly_one(self, tmp_path: Path):
+        """The CMSIS pattern: a stub in the startup, the handler in C."""
+        from fw_context_mcp.indexer.asm import _resolve_handler
+
+        conn = self._db(tmp_path, [
+            ("c:@F@SysTick_Handler", 1, 0),
+            ("asm:startup.S@SysTick_Handler", 1, 1),
+        ])
+        try:
+            assert _resolve_handler(conn, "ch", "SysTick_Handler", {}) == (
+                "c:@F@SysTick_Handler"
+            )
+        finally:
+            conn.close()
+
+    def test_strong_definitions_in_c_and_in_assembly_are_refused(self, tmp_path: Path):
+        """The language gives no rank: two strong definitions are a link
+        error, or one of them is in a file that the link does not use."""
         from fw_context_mcp.indexer.asm import _resolve_handler
 
         conn = self._db(tmp_path, [
@@ -2017,8 +2034,21 @@ class TestWeakLosesToStrong:
             ("asm:startup.S@SysTick_Handler", 1, 1),
         ])
         try:
+            assert _resolve_handler(conn, "ch", "SysTick_Handler", {}) is None
+        finally:
+            conn.close()
+
+    def test_a_provide_of_the_linker_script_loses_to_any_object(self, tmp_path: Path):
+        """GNU ld uses `PROVIDE` only when no object defines the name."""
+        from fw_context_mcp.indexer.asm import _resolve_handler
+
+        conn = self._db(tmp_path, [
+            ("ld:link.ld@SysTick_Handler", 1, 1),
+            ("asm:startup.S@SysTick_Handler", 1, 1),
+        ])
+        try:
             assert _resolve_handler(conn, "ch", "SysTick_Handler", {}) == (
-                "c:@F@SysTick_Handler"
+                "asm:startup.S@SysTick_Handler"
             )
         finally:
             conn.close()

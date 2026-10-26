@@ -230,8 +230,9 @@ _ROW_FORMAT_FAULTS: tuple[tuple[int, str], ...] = (
         "a template body that a dependent type resolves has no edge"),
     (9, "a symbol has no link name, thus a vector slot or an alias of "
         "assembly can reach a C++ method or a static function with the same "
-        "name, and get_vector_table can say unhandled for an interrupt that "
-        "C services"),
+        "name, get_vector_table can say unhandled for an interrupt that C "
+        "services, a slot of a table in C stays on the declaration in a "
+        "header, and no slot names the weak stub that its handler replaced"),
 )
 
 

@@ -1455,9 +1455,10 @@ def get_vector_table(
       a function.
 
     ``overridden`` holds the weak definition that a ``"c"`` row replaced,
-    when one is in the index.  This is the CMSIS pattern: the startup file
-    defines each handler weakly, and the project defines the same name
-    again.  The linker keeps the strong one.
+    when one is in the index: a weak definition of the same link name.
+    This is the CMSIS pattern: the startup file defines each handler
+    weakly, and the project defines the same name again.  The linker keeps
+    the strong one.
 
     Args:
         conn: An open index database connection.
@@ -1599,12 +1600,19 @@ def get_vector_table(
         if entry["status"] == "c":
             # The weak definition this one replaced, when the index holds
             # it.  A reader asking "who really services this" wants both:
-            # the code that runs, and the stub it took the place of.
+            # the code that runs, and the stub it took the place of.  The
+            # linker replaces a definition of the same LINK NAME: a weak
+            # `static` or a C++ method of the same plain name is no stub
+            # of this one.
             replaced = conn.execute(
-                """SELECT file_path AS file, line FROM symbols
-                   WHERE config_hash = ? AND name = ? AND is_weak = 1
+                """SELECT w.file_path AS file, w.line FROM symbols w
+                   JOIN symbols t ON t.config_hash = w.config_hash AND t.usr = ?
+                   WHERE w.config_hash = ? AND w.link_name = t.link_name
+                     AND w.link_name != '' AND w.is_weak = 1
+                     AND w.is_definition = 1 AND w.usr != t.usr
+                   ORDER BY w.file_path, w.line
                    LIMIT 1""",
-                (config_hash, entry["name"]),
+                (entry_usr, config_hash),
             ).fetchone()
             if replaced is not None:
                 entry["overridden"] = dict(replaced)
@@ -1667,12 +1675,12 @@ def get_function_address_arrays(
         recognised, which is also what an index written before slots were
         recorded returns.
 
-        ``file`` and ``line`` name the definition of the target wherever the
-        index holds exactly one — an initializer in C names the DECLARATION
+        ``file`` and ``line`` name the definition that the linker gives the
+        link name of the target — an initializer in C names the DECLARATION
         of a symbol defined in assembly, and that is a header with nothing
-        to read.  ``is_definition`` is 0 on the rows where no single
-        definition was found and the declaration had to stand.  See
-        ``_follow_declarations_to_definitions``.
+        to read.  ``is_definition`` is 0 on the rows where the index holds
+        no such definition, or two of one rank, and the declaration had to
+        stand.  See ``_follow_declarations_to_definitions``.
     """
     rows = conn.execute(
         """SELECT r.slot_index AS slot,
@@ -1847,57 +1855,55 @@ def _follow_declarations_to_definitions(
     read, and the status came out ``"c"``, which asserts that code outside
     assembly services the interrupt.
 
-    The definition is found by NAME, because a C declaration and an
-    assembly definition of one symbol do not share a USR: they live in the
-    ``c:@F@`` and ``asm:`` namespaces.
-
-    Matching by name is exactly the kind of rule that fails quietly — two
-    static functions in different files may share a name — so it applies
-    only when the config holds EXACTLY ONE definition of that name.  With
-    two or more the declaration stays, because a row pointing at the wrong
-    definition would be worse than one pointing at a header.
+    The definition is the one that the linker gives the LINK NAME of the
+    declaration (``link_definition``): a C declaration and an assembly
+    definition of one symbol do not share a USR, they live in the ``c:@F@``
+    and ``asm:`` namespaces, but they share the link name.  A ``static``
+    function of another file has another link name or none, thus it is
+    never the one.  When two definitions are equal candidates (a link
+    error, or a fact that the index does not hold), the declaration stays:
+    a row pointing at the wrong definition would be worse than one pointing
+    at a header.
 
     Rewrites *rows* in place, and leaves a row that already names a
     definition untouched.
     """
-    wanted = {
-        str(row["name"]) for row in rows if not row.get("is_definition")
-    }
+    from ._symbols import link_definition
+
+    wanted = sorted({str(row["usr"]) for row in rows if not row.get("is_definition")})
     if not wanted:
         return
 
-    definitions: dict[str, dict] = {}
-    ambiguous: set[str] = set()
-    names = sorted(wanted)
+    targets: dict[str, dict] = {}
     # SQLite caps the number of bound parameters (999 by default), and this
-    # list is one name per target that resolved to a declaration.  Real data
+    # list is one USR per target that resolved to a declaration.  Real data
     # measured at most 1, but a table whose handlers are all declared in a
     # header and defined in assembly would make it as long as the table, so
     # the query is chunked rather than trusted to stay small.
     chunk = 500
-    for start in range(0, len(names), chunk):
-        batch = names[start:start + chunk]
+    for start in range(0, len(wanted), chunk):
+        batch = wanted[start:start + chunk]
         placeholders = ",".join("?" * len(batch))
-        for found in conn.execute(
-            f"""SELECT name, usr, file_path AS file, line, kind, is_weak
-                FROM symbols
-                WHERE config_hash = ? AND is_definition = 1
-                  AND name IN ({placeholders})""",
+        for declaration in conn.execute(
+            f"""SELECT usr, link_name FROM symbols
+                WHERE config_hash = ? AND usr IN ({placeholders})""",
             (config_hash, *batch),
         ).fetchall():
-            name = str(found["name"])
-            if name in definitions:
-                ambiguous.add(name)
+            definition_usr = link_definition(conn, config_hash, str(declaration["link_name"] or ""))
+            if definition_usr is None:
                 continue
-            definitions[name] = dict(found)
+            found = conn.execute(
+                """SELECT name, usr, file_path AS file, line, kind, is_weak
+                   FROM symbols WHERE config_hash = ? AND usr = ?""",
+                (config_hash, definition_usr),
+            ).fetchone()
+            if found is not None:
+                targets[str(declaration["usr"])] = dict(found)
 
     for row in rows:
         if row.get("is_definition"):
             continue
-        name = str(row["name"])
-        if name in ambiguous:
-            continue
-        definition = definitions.get(name)
+        definition = targets.get(str(row["usr"]))
         if definition is None:
             continue
         row.update(definition)

@@ -1434,62 +1434,21 @@ def _resolve_handler(
 
     A name that the unit itself defines, not weakly, is that definition
     (*unit_names*): the assembler resolves it there.  Any other name is the
-    symbol the linker resolves it to.
-
-    The candidates are the symbols whose link name is *name*: an assembly
-    unit names a symbol as the linker does.  Thus a C++ method `write`, a
+    symbol the linker resolves it to (`db.link_definition`): an assembly
+    unit names a symbol as the linker does, thus a C++ method `write`, a
     `static` function and a local label of another unit are never one, and
-    `main` of C++ (USR `c:@F@main#`) is.
-
-    The ranks, in this order:
-
-    1. A definition outside assembly (C, C++, a linker script symbol).  A
-       handler often has two definitions, a weak one in the assembly of the
-       SDK and a strong one in the C of the project, and the linker takes
-       the strong one.
-    2. A definition in assembly.
-    3. A declaration: a C `extern` declaration of a function that a library
-       defines (`longjmp`), or the placeholder of a name that only an
-       assembly unit references.  It stands for the symbol the linker
-       resolves from elsewhere.
-
-    In a rank, a strong definition wins over a weak one.  None when nothing
-    matches, and None when several equally good ones do: a wrong edge would
-    claim the vector table reaches something it does not, and on an
-    interrupt that is the only edge a reader has.
+    `main` of C++ (USR `c:@F@main#`) is.  A declaration counts too: a C
+    `extern` declaration of a function that a library defines (`longjmp`),
+    or the placeholder of a name that only an assembly unit references.
+    None when nothing matches, and None when several equally good ones do:
+    a wrong edge would claim the vector table reaches something it does
+    not, and on an interrupt that is the only edge a reader has.
     """
     if name in unit_names:
         return unit_names[name]
-    rows = conn.execute(
-        "SELECT usr, is_definition, is_weak FROM symbols "
-        "WHERE config_hash=? AND link_name=?",
-        (config_hash, name),
-    ).fetchall()
-    if not rows:
-        return None
+    from fw_context_mcp.indexer.db import link_definition
 
-    def pick(candidates: list) -> str | None:
-        """One candidate, preferring the definition the linker keeps.
-
-        A weak definition loses to a strong one of the same name — that is
-        what `.weak` means — so the two are ranked before they are
-        counted.  Ambiguity within a rank is still refused.
-        """
-        for weak in (0, 1):
-            same_rank = {str(c["usr"]) for c in candidates if bool(c["is_weak"]) == bool(weak)}
-            if len(same_rank) == 1:
-                return same_rank.pop()
-            if len(same_rank) > 1:
-                return None
-        return None
-
-    definitions = [r for r in rows if r["is_definition"]]
-    outside = [r for r in definitions if not r["usr"].startswith(_ASM_USR_PREFIX)]
-    if outside:
-        return pick(outside)
-    if definitions:
-        return pick(definitions)
-    return pick(rows)
+    return link_definition(conn, config_hash, name, declarations=True)
 
 
 def _store_calls(

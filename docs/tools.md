@@ -2757,14 +2757,18 @@ this list. Its edge stays, and `find_references` shows it.
 
 **A slot finds its handler by the link name**, as the linker does. A name
 that the assembly unit defines itself (not `.weak`) is that definition. A
-label of a file that the unit includes counts too. Else a definition
-outside assembly wins over one in assembly, and a strong one wins over a
-weak one. fw-context does not see `__attribute__((weak))` in C, thus a
-weak C definition counts as strong. When no file defines the name, a C
+label of a file that the unit includes counts too. Else a strong
+definition wins over a weak one, and a `PROVIDE` of the linker script
+loses to any definition of an object file. The language gives no rank:
+a strong definition in C and one in assembly are two equal candidates.
+fw-context does not see `__attribute__((weak))` in C, thus a weak C
+definition counts as strong. When no file defines the name, a C
 declaration of it (a function that a library defines) is the handler. A
 C++ method or a `static` function with the same name is never the
 handler: the linker does not see it under that name. A name with two
-equal candidates gives no handler.
+equal candidates gives no handler. A slot of a table in C that names a
+declaration in a header gets the definition of the same rules, and
+`overridden` is the weak definition of the same link name.
 
 **Paths are absolute**, as in the other graph tools. This applies to
 `file`, `table_file`, and the paths in `overridden`, `aliases`, and
