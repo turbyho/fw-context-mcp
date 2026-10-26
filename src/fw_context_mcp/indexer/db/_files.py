@@ -527,6 +527,16 @@ def _delete_dangling_incoming_refs(conn: sqlite3.Connection, config_hash: str, p
             f"DELETE FROM fp_assignments WHERE config_hash = ? AND (lhs_usr IN ({ph}) OR rhs_usr IN ({ph}))",
             (config_hash, *batch, *batch),
         )
+        # A slot fact names a function by its code key, which is the USR of
+        # its symbol (or the key of a lambda symbol).
+        conn.execute(
+            f"DELETE FROM slot_sources WHERE config_hash = ? AND function IN ({ph})",
+            (config_hash, *batch),
+        )
+        conn.execute(
+            f"DELETE FROM slot_arguments WHERE config_hash = ? AND value_kind = 'function' AND value IN ({ph})",
+            (config_hash, *batch),
+        )
 
 
 def _delete_rows_owned_by(
@@ -581,6 +591,7 @@ def _delete_rows_owned_by(
         delete_indirect_call_sites_for_files,
         delete_refs_for_files,
     )
+    from ._slots import delete_slot_facts_for_files
     from ._symbols import delete_macros_for_files
 
     if stash_embeddings:
@@ -610,6 +621,7 @@ def _delete_rows_owned_by(
     delete_refs_for_files(conn, config_hash, paths, keep_instance_edges=keep_instance_edges)
     delete_indirect_call_sites_for_files(conn, config_hash, paths)
     delete_fp_assignments_for_files(conn, config_hash, paths)
+    delete_slot_facts_for_files(conn, config_hash, paths)
     return purged_usrs
 
 

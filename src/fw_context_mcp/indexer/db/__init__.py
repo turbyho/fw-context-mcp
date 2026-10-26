@@ -64,6 +64,8 @@ __all__ = [
     "delete_orphan_files",
     "delete_overrides_for_file",
     "delete_refs_for_files",
+    "delete_slot_facts_for_config",
+    "delete_slot_facts_for_files",
     "delete_symbols_for_file",
     "drop_fts_triggers",
     "ensure_schema",
@@ -113,6 +115,7 @@ __all__ = [
     "insert_macros_batch",
     "insert_overrides_batch",
     "insert_refs_batch",
+    "insert_slot_facts",
     "insert_symbols_batch",
     "link_definition",
     "link_ref_producers",
@@ -313,6 +316,11 @@ from ._schema import (
     row_format_effect,
     row_format_is_newer,
     row_format_is_older,
+)
+from ._slots import (
+    delete_slot_facts_for_config,
+    delete_slot_facts_for_files,
+    insert_slot_facts,
 )
 from ._symbols import (
     _expand_query,

@@ -22,6 +22,7 @@ import sqlite3
 
 from ._owners import delete_ownership_for_build
 from ._schema import _ensure_column
+from ._slots import delete_slot_facts_for_config
 
 __all__ = [
     "ANALYZABLE_KINDS",
@@ -242,6 +243,7 @@ def delete_build_data(conn: sqlite3.Connection, config_hash: str) -> None:
     conn.execute("DELETE FROM refs WHERE config_hash = ?", (config_hash,))
     conn.execute("DELETE FROM fp_assignments WHERE config_hash = ?", (config_hash,))
     conn.execute("DELETE FROM indirect_call_sites WHERE config_hash = ?", (config_hash,))
+    delete_slot_facts_for_config(conn, config_hash)
     conn.execute("DELETE FROM inheritance WHERE config_hash = ?", (config_hash,))
     conn.execute("DELETE FROM overrides WHERE config_hash = ?", (config_hash,))
     conn.execute("DELETE FROM hotspot_cache WHERE config_hash = ?", (config_hash,))

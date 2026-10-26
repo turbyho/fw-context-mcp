@@ -918,6 +918,88 @@ CREATE INDEX IF NOT EXISTS idx_fpa_config_lhs ON fp_assignments(config_hash, lhs
 CREATE INDEX IF NOT EXISTS idx_fpa_config_rhs ON fp_assignments(config_hash, rhs_usr);
 CREATE INDEX IF NOT EXISTS idx_fpa_config_file ON fp_assignments(config_hash, from_file);
 
+-- ── slot_*: the slot facts of the indirect calls (indexer/_slots.py) ─────
+-- A slot holds a function: a field `F|<USR>`, a variable `V|<USR>`, a
+-- parameter `P|<code key>|<index>`, a return value `R|<code key>`.  The
+-- facts come from the AST and match no name; the resolution over all the
+-- units of a build (phase 5b) turns them into call edges.  Each row is
+-- one place (file, line, col) of the unit that writes it, thus a re-parse
+-- deletes the rows of its files as it deletes their refs.
+-- slot_sources: the address of a function (or a lambda) goes into a slot,
+-- or into nothing known (slot '': the address is taken).
+CREATE TABLE IF NOT EXISTS slot_sources (
+    id             INTEGER PRIMARY KEY,
+    config_hash    TEXT    NOT NULL,
+    file           TEXT    NOT NULL,
+    line           INTEGER NOT NULL,
+    col            INTEGER NOT NULL,
+    function       TEXT    NOT NULL,
+    function_type  TEXT    NOT NULL,
+    slot           TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_slot_sources_slot ON slot_sources(config_hash, slot);
+CREATE INDEX IF NOT EXISTS idx_slot_sources_file ON slot_sources(config_hash, file);
+-- slot_flows: the value of one slot goes into another.
+CREATE TABLE IF NOT EXISTS slot_flows (
+    id           INTEGER PRIMARY KEY,
+    config_hash  TEXT    NOT NULL,
+    file         TEXT    NOT NULL,
+    line         INTEGER NOT NULL,
+    col          INTEGER NOT NULL,
+    source       TEXT    NOT NULL,
+    target       TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_slot_flows_target ON slot_flows(config_hash, target);
+CREATE INDEX IF NOT EXISTS idx_slot_flows_file   ON slot_flows(config_hash, file);
+-- slot_sites: an indirect call ("pointer": through a function pointer;
+-- "object": the operator() of a callable object), its caller and slot.
+-- ordinal: the position of the site among the sites at its place, from 0
+-- (the two calls of `f(x)(y)`, and the calls of one macro expansion, have
+-- one place).
+CREATE TABLE IF NOT EXISTS slot_sites (
+    id           INTEGER PRIMARY KEY,
+    config_hash  TEXT    NOT NULL,
+    file         TEXT    NOT NULL,
+    line         INTEGER NOT NULL,
+    col          INTEGER NOT NULL,
+    ordinal      INTEGER NOT NULL,
+    caller       TEXT,
+    kind         TEXT    NOT NULL,
+    slot         TEXT    NOT NULL,
+    slot_type    TEXT    NOT NULL,
+    reason       TEXT    NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_slot_sites_slot   ON slot_sites(config_hash, slot);
+CREATE INDEX IF NOT EXISTS idx_slot_sites_caller ON slot_sites(config_hash, caller);
+CREATE INDEX IF NOT EXISTS idx_slot_sites_file   ON slot_sites(config_hash, file);
+-- slot_arguments: a value that the indirect call at (file, line, col,
+-- ordinal) passes as argument arg_index ("function": a code key, "slot":
+-- a slot).
+CREATE TABLE IF NOT EXISTS slot_arguments (
+    id           INTEGER PRIMARY KEY,
+    config_hash  TEXT    NOT NULL,
+    file         TEXT    NOT NULL,
+    line         INTEGER NOT NULL,
+    col          INTEGER NOT NULL,
+    ordinal      INTEGER NOT NULL,
+    arg_index    INTEGER NOT NULL,
+    value_kind   TEXT    NOT NULL,
+    value        TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_slot_arguments_file ON slot_arguments(config_hash, file);
+-- slot_escapes: code that the AST does not show can write the slot.
+CREATE TABLE IF NOT EXISTS slot_escapes (
+    id           INTEGER PRIMARY KEY,
+    config_hash  TEXT    NOT NULL,
+    file         TEXT    NOT NULL,
+    line         INTEGER NOT NULL,
+    col          INTEGER NOT NULL,
+    slot         TEXT    NOT NULL,
+    reason       TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_slot_escapes_slot ON slot_escapes(config_hash, slot);
+CREATE INDEX IF NOT EXISTS idx_slot_escapes_file ON slot_escapes(config_hash, file);
+
 -- ── embeddings: semantic search vectors ─────────────────────────────────
 -- Stored as BLOB of float32 values packed with struct.pack('f', ...).
 -- Why BLOB over TEXT: binary packing is 4 bytes per float vs ~10 bytes

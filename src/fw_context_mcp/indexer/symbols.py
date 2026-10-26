@@ -64,6 +64,7 @@ from collections.abc import Callable, Generator
 from dataclasses import astuple, dataclass, field
 from functools import cache
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from ._dispatch_bridges import _DISPATCH_ENTRY_POINTS, _DISPATCH_METHOD_NAMES, _TYPE_ERASED_ISR_FUNCTIONS
 from ._libclang import cindex as cx
@@ -79,6 +80,10 @@ from .models import (
     Symbol,
 )
 from .nvic import runtime_vector_reference
+
+if TYPE_CHECKING:
+    # `_slots` imports this module: the walk of the slots uses its helpers.
+    from ._slots import SlotFacts
 
 _log = logging.getLogger(__name__)
 
@@ -2523,6 +2528,9 @@ def _init_list_is_positional(cursor: cx.Cursor) -> bool:
     * A float element such as ``{ .5, &fn }`` does NOT read as a designator,
       because clang emits ``.5`` as one FLOATING_LITERAL token, not as ``.``
       followed by ``5``.  This was measured, not assumed.
+    * A C++ lambda also starts with ``[`` (``{ [](void *) {...}, nullptr }``).
+      The AST tells it: the lambda starts where its element starts, and a
+      designator ``[5] = &fn`` starts before its first child.
 
     Returns False when the tokens cannot be read.  A slot number that is
     wrong is worse for a reader than a slot number that is absent, so an
@@ -2531,11 +2539,22 @@ def _init_list_is_positional(cursor: cx.Cursor) -> bool:
     try:
         for element in cursor.get_children():
             tokens = list(element.get_tokens())
-            if tokens and tokens[0].spelling in ("[", "."):
+            if tokens and tokens[0].spelling in ("[", ".") and not _starts_with_lambda(element):
                 return False
     except (ValueError, TypeError, RuntimeError, AttributeError):
         return False
     return True
+
+
+def _starts_with_lambda(element: cx.Cursor) -> bool:
+    """Tell if *element* starts with a lambda: it, or a first child at its start, is a LAMBDA_EXPR."""
+    start = element.extent.start.offset
+    node: cx.Cursor | None = element
+    while node is not None and node.extent.start.offset == start:
+        if node.kind == cx.CursorKind.LAMBDA_EXPR:
+            return True
+        node = next(iter(node.get_children()), None)
+    return False
 
 
 # Every way libclang spells an array type.  A slot number is an array index,
@@ -2804,6 +2823,18 @@ def _init_list_element_field(
     return (None, "", "", None)
 
 
+def _scalar_count(type_: cx.Type) -> int:
+    """The number of scalars in the array *type_* (each level of a known size), else 0."""
+    count = 1
+    current = type_.get_canonical()
+    while current.kind in _ARRAY_TYPE_KINDS:
+        if current.kind != cx.TypeKind.CONSTANTARRAY or current.element_count <= 0:
+            return 0
+        count *= current.element_count
+        current = current.element_type.get_canonical()
+    return count
+
+
 def _is_fn_pointer_storage(type_: cx.Type) -> bool:
     """Tell if *type_*, after its array levels, is a pointer to a function."""
     try:
@@ -2861,6 +2892,14 @@ def _positional_struct_fields(cursor: cx.Cursor) -> list[tuple[str | None, str, 
         record = list_type.get_declaration()
         members = list(record.get_children())
         elements = list(cursor.get_children())
+        template = record.specialized_template
+        if template is not None and not any(m.kind == cx.CursorKind.FIELD_DECL for m in members):
+            # An implicit instance of a class template shows no children
+            # (measured, libclang 22): its type gives its fields, and its
+            # template its base classes.
+            if any(m.kind == cx.CursorKind.CXX_BASE_SPECIFIER for m in template.get_children()):
+                return []
+            members = list(list_type.get_fields())
     except (ValueError, TypeError, RuntimeError, AttributeError):
         return []
     if any(m.kind == cx.CursorKind.CXX_BASE_SPECIFIER for m in members):
@@ -2893,7 +2932,17 @@ def _positional_struct_fields(cursor: cx.Cursor) -> list[tuple[str | None, str, 
             continue
         if aggregate and not _initializes_whole_field(element, member.type):
             if storage:
-                mapped.append(_field_entry(member))
+                # Brace elision: an array of function pointers takes one
+                # element for each of its slots (`std::array<cb_t, 3> a =
+                # {h1, h2}`, `{ f1, f2, 3 }` for `{ cb_t cbs[2]; int n; }`).
+                # A braced element among them stops the list.
+                count = _scalar_count(member.type)
+                taken = elements[len(mapped):len(mapped) + count] if count else []
+                if not taken or any(e.kind == cx.CursorKind.INIT_LIST_EXPR for e in taken):
+                    mapped.append(_field_entry(member))
+                    break
+                mapped.extend(_field_entry(member) for _ in taken)
+                continue
             break
         if aggregate and not storage:
             mapped.append((None, "", "", None))
@@ -3653,6 +3702,9 @@ class ExtractionResult:
     fp_assignments: list = field(default_factory=list)
     macros: list = field(default_factory=list)
     pending_dispatches: list = field(default_factory=list)
+    # The slot facts of the indirect calls (indexer/_slots.py), or None
+    # when the references are not extracted.
+    slots: SlotFacts | None = None
     newly_seen_files: set[str] = field(default_factory=set)
     # The error diagnostics of the parse (see _parse_diagnostics).
     parse_errors: int = 0
@@ -3825,6 +3877,9 @@ def extract_all(
         tu, tu_path_str, symbols, _resolve, anon_usr_to_field, _log,
         skip_files=_skip_frozen,
     )
+    from ._slots import collect_slot_facts
+
+    slots = collect_slot_facts(tu, _skip_frozen, _resolve)
 
     _t_total = _time.monotonic() - _t_start
     _t_refwalk = _t_total - _t_parse - _t_symwalk
@@ -3836,7 +3891,7 @@ def extract_all(
         tu=tu if return_tu else None, symbols=symbols, references=refs,
         inheritance=inheritance, indirect_call_sites=indirect_call_sites,
         fp_assignments=fp_assignments, macros=macros,
-        pending_dispatches=pending_dispatches, newly_seen_files=_newly_seen,
+        pending_dispatches=pending_dispatches, slots=slots, newly_seen_files=_newly_seen,
         parse_errors=parse_errors, parse_fatal=parse_fatal, parse_first_error=parse_first_error,
     )
     return result

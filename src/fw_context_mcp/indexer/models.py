@@ -269,6 +269,103 @@ class PendingDispatch:
     target_usr: str | None = None
 
 
+# The slot facts of the indirect calls (indexer/_slots.py).  A slot key is
+# `F|<field USR>`, `V|<variable USR>`, `P|<code key>|<index>` or
+# `R|<code key>`; the place of a fact is the file (absolute while the
+# unit is extracted), the line and the column of the expression.
+
+
+@dataclass(frozen=True)
+class SlotSource:
+    """The address of a function or a lambda goes into a slot.
+
+    Attributes:
+        function: The code key of the function (`symbols._code_usr`).
+        function_type: Its type key (`void (int)`, `M:` for a method with
+            `this`, `lambda`).
+        slot: The slot that receives it, or "" when nothing known does
+            (the address is taken: only its type tells its calls).
+    """
+
+    file: str
+    line: int
+    column: int
+    function: str
+    function_type: str
+    slot: str
+
+
+@dataclass(frozen=True)
+class SlotFlow:
+    """The value of the slot *source* goes into the slot *target*."""
+
+    file: str
+    line: int
+    column: int
+    source: str
+    target: str
+
+
+@dataclass(frozen=True)
+class SlotSite:
+    """An indirect call.
+
+    Attributes:
+        ordinal: The position of the site among the sites at its place,
+            from 0.  WHY: the place is the start of the call, thus the two
+            calls of `f(x)(y)`, and each call of one macro expansion, have
+            one place.  The place and the ordinal are the key that an
+            argument of the site carries.
+        caller: The code key of the code that makes it, or None.
+        kind: "pointer" (a call through a function pointer) or "object"
+            (the ``operator()`` of a callable object).
+        slot: The slot that the callee names, or "" (see *reason*).
+        slot_type: The type key of the callee.
+        reason: Why no slot is known, when *slot* is "".
+    """
+
+    file: str
+    line: int
+    column: int
+    ordinal: int
+    caller: str | None
+    kind: str
+    slot: str
+    slot_type: str
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class SlotArgument:
+    """A value that the indirect call at the place passes as argument *index*.
+
+    Attributes:
+        ordinal: The ordinal of the site at the place (`SlotSite.ordinal`).
+        value_kind: "function" (*value* is a code key) or "slot" (*value*
+            is a slot key).
+    """
+
+    file: str
+    line: int
+    column: int
+    ordinal: int
+    index: int
+    value_kind: str
+    value: str
+
+
+@dataclass(frozen=True)
+class SlotEscape:
+    """Code that the tree does not show can write the slot (its address is
+    taken, or its value is cast to an integer or to ``void *``)."""
+
+    file: str
+    line: int
+    column: int
+    slot: str
+    reason: str
+
+
 @dataclass
 class Symbol:
     """A parsed C/C++ symbol extracted from a translation unit.

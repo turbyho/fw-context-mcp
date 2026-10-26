@@ -75,6 +75,7 @@ from fw_context_mcp.indexer.db import (
     insert_inheritance_batch,
     insert_macros_batch,
     insert_refs_batch,
+    insert_slot_facts,
     insert_symbols_batch,
     link_ref_producers,
     record_claims,
@@ -1431,6 +1432,7 @@ def store_symbols_for_unit(
         fp_assignments = result.fp_assignments
         macros = result.macros
         pending_dispatches = result.pending_dispatches
+        slots = result.slots
         # Every file whose cursors this parse walked — the set this TU owns in
         # this run.  Headers already claimed by an earlier TU are absent
         # (skip_files excluded their subtrees).  Drives stale-row deletion and
@@ -1463,6 +1465,7 @@ def store_symbols_for_unit(
             fp_assignments = result.fp_assignments
             macros = result.macros
             pending_dispatches = getattr(result, 'pending_dispatches', [])
+            slots = result.slots
             # Every file whose cursors this parse walked — the set this TU
             # owns in this run.  Headers already claimed by an earlier TU are
             # absent (skip_files excluded their subtrees).  Drives stale-row
@@ -1673,6 +1676,21 @@ def store_symbols_for_unit(
             for fpa in fp_assignments
         ]
         insert_fp_assignments_batch(conn, fpa_rows)
+
+    # The slot facts of the indirect calls (indexer/_slots.py).  Phase 5b
+    # resolves them over all the units of the build.
+    if index_refs and slots is not None:
+        insert_slot_facts(
+            conn, config_hash,
+            [(_rel(s.file), s.line, s.column, s.function, s.function_type, s.slot)
+             for s in slots.sources],
+            [(_rel(f.file), f.line, f.column, f.source, f.target) for f in slots.flows],
+            [(_rel(s.file), s.line, s.column, s.ordinal, s.caller, s.kind, s.slot, s.slot_type, s.reason)
+             for s in slots.sites],
+            [(_rel(a.file), a.line, a.column, a.ordinal, a.index, a.value_kind, a.value)
+             for a in slots.arguments],
+            [(_rel(e.file), e.line, e.column, e.slot, e.reason) for e in slots.escapes],
+        )
 
     # Pending dispatch edges (for deferred resolution in post-processing)
     # Dispatch edges (event-loop callbacks, thread starts, timer callbacks)
