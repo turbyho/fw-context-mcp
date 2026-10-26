@@ -1836,6 +1836,127 @@ def _link_name(cursor: cx.Cursor) -> str:
     return cursor.mangled_name or ""
 
 
+# The declarations that hold other declarations at the level of a file.
+_DECLARATION_SCOPES = frozenset({
+    cx.CursorKind.LINKAGE_SPEC,
+    cx.CursorKind.NAMESPACE,
+    cx.CursorKind.CLASS_DECL,
+    cx.CursorKind.STRUCT_DECL,
+    cx.CursorKind.UNION_DECL,
+})
+
+
+def _weak_usrs(tu_cursor: cx.Cursor) -> set[str]:
+    """Return the USRs that a declaration of the translation unit makes weak.
+
+    GCC defines a symbol weakly when one declaration of it in the
+    translation unit has the attribute `weak`, also a declaration in a
+    header before the definition (measured, arm-none-eabi-gcc: `nm` gives
+    `W`).  libclang gives the attribute as an unexposed attribute, whose
+    tokens name the macro (`__weak`, `__WEAK`) and not the attribute.  The
+    declaration that holds it, pretty printed with no body, names it:
+    `__attribute__((weak)) void f(void)`.  A definition does not print an
+    attribute that it inherits, thus each declaration is read, and the
+    walk does not skip headers that an earlier translation unit read.
+
+    Only a declaration with external linkage and with an attribute is
+    printed.  Not seen: `#pragma weak` (libclang gives no attribute for
+    it), `weak` on a declaration after the definition, which clang drops
+    and GCC keeps, and a declaration in a function body
+    (`extern void f(void) __attribute__((weak));`), which the walk of the
+    file level does not reach.
+    """
+    policy = cx.PrintingPolicy.create(tu_cursor)
+    policy.set_property(cx.PrintingPolicyProperty.TerseOutput, 1)
+    found: set[str] = set()
+    work = list(tu_cursor.get_children())
+    while work:
+        cursor = work.pop()
+        if cursor.kind in _DECLARATION_SCOPES:
+            work.extend(cursor.get_children())
+            continue
+        if cursor.kind not in _LINKABLE_KINDS or cursor.linkage != cx.LinkageKind.EXTERNAL:
+            continue
+        if not any(child.kind.is_attribute() for child in cursor.get_children()):
+            continue
+        if "weak" in _attribute_names(cursor.pretty_printed(policy)):
+            found.add(cursor.get_usr())
+    return found
+
+
+_ATTRIBUTE_OPEN = re.compile(r"__attribute__\s*\(\(|\[\[")
+
+
+def _attribute_names(text: str) -> set[str]:
+    """The names of the attributes that the declaration *text* lists.
+
+    `__attribute__((weak, alias("f")))` gives `weak` and `alias`, and
+    `[[gnu::weak]]` gives `weak`.  A name in the declarator (`weak_var`)
+    is no attribute.  `__weak__` is `weak`, as GCC reads it.
+    """
+    names: set[str] = set()
+    quoted = False
+    at = 0
+    while at < len(text):
+        char = text[at]
+        if quoted:
+            # A string (an initializer, a message) holds no attribute.
+            quoted = char != '"' or text[at - 1] == "\\"
+            at += 1
+            continue
+        if char == '"':
+            quoted = True
+            at += 1
+            continue
+        opened = _ATTRIBUTE_OPEN.match(text, at)
+        if opened is None:
+            at += 1
+            continue
+        close = "))" if opened.group().startswith("__attribute__") else "]]"
+        items, at = _top_level_items(text, opened.end(), close)
+        names.update(_attribute_name(item) for item in items)
+    names.discard("")
+    return names
+
+
+def _top_level_items(text: str, start: int, close: str) -> tuple[list[str], int]:
+    """The items of the list at *start* up to *close*, split at the commas
+    outside parentheses, brackets and string literals, and the index after
+    the list."""
+    items: list[str] = []
+    item: list[str] = []
+    depth = 0
+    quoted = False
+    at = start
+    while at < len(text):
+        char = text[at]
+        if quoted:
+            quoted = char != '"' or text[at - 1] == "\\"
+        elif char == '"':
+            quoted = True
+        elif depth == 0 and text.startswith(close, at):
+            break
+        elif char in "([":
+            depth += 1
+        elif char in ")]":
+            depth -= 1
+        elif char == "," and depth == 0:
+            items.append("".join(item))
+            item = []
+            at += 1
+            continue
+        item.append(char)
+        at += 1
+    items.append("".join(item))
+    return items, at + len(close)
+
+
+def _attribute_name(item: str) -> str:
+    """`gnu::weak` and `__weak__` are `weak`; arguments are no part of a name."""
+    name = item.strip().split("(", 1)[0].strip().split("::")[-1]
+    return name.removeprefix("__").removesuffix("__")
+
+
 def _process_ref_cursor(
     cursor: cx.Cursor,
     cur_fn: str | None,
@@ -3485,6 +3606,13 @@ def extract_all(
         if cursor.kind not in _SYMBOL_KINDS:
             continue
         _process_one_symbol(cursor, symbols, seen_usrs, class_cursors, anon_usr_to_field, _log)
+
+    # Weakness is a fact of the object file: any declaration of the TU,
+    # also one in a header that the walk above skipped, can make it.
+    weak = _weak_usrs(tu.cursor)
+    for symbol in symbols:
+        if symbol.usr in weak:
+            symbol.is_weak = True
 
     _t_symwalk = _time.monotonic() - _t_start - _t_parse  # subtract parse time
 

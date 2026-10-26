@@ -220,3 +220,120 @@ class TestLinkerScript:
             conn.close()
 
         assert "end" in stored
+
+
+_WEAK = """\
+#define __weak __attribute__((__weak__))
+#define __WEAK __attribute__((weak))
+#include "weak.h"
+__attribute__((weak)) void plain_weak(void) {}
+__WEAK void cmsis_weak(void) {}
+void declared_in_header(void) {}
+void middle(void);
+__weak void middle(void);
+void middle(void) {}
+void strong(void) {}
+__attribute__((section(".text.x"))) void other_attribute(void) {}
+__attribute__((weak)) int weak_var = 1;
+int weak_variable_name = 2;
+"""
+
+_WEAK_HEADER = """\
+__weak void declared_in_header(void);
+"""
+
+
+@pytest.mark.libclang
+class TestWeakness:
+    """`nm` of arm-none-eabi-gcc gives `W` for each of the weak ones: a
+    declaration of the object file with `weak` makes the symbol weak."""
+
+    def test_each_form_of_weak(self, tmp_path: Path):
+        from fw_context_mcp.indexer.compile_commands import CompilationUnit
+        from fw_context_mcp.indexer.symbols import extract_all
+
+        (tmp_path / "weak.h").write_text(
+            "#define __weak __attribute__((__weak__))\n" + _WEAK_HEADER, encoding="utf-8",
+        )
+        src = tmp_path / "weak.c"
+        src.write_text(_WEAK, encoding="utf-8")
+        unit = CompilationUnit(file=src, directory=tmp_path, language="c", clang_args=[])
+        weak = {s.name for s in extract_all(unit).symbols if s.is_weak and s.is_definition}
+
+        assert weak == {"plain_weak", "cmsis_weak", "declared_in_header", "middle", "weak_var"}
+
+
+class TestAttributeNames:
+    @pytest.mark.parametrize(
+        ("text", "names"),
+        [
+            ("__attribute__((weak)) void f(void)", {"weak"}),
+            ('__attribute__((weak)) __attribute__((alias("strong"))) void f(void)',
+             {"weak", "alias"}),
+            ('__attribute__((section(".text, \\"x)"), weak)) void f(void)', {"section", "weak"}),
+            ("[[gnu::weak]] void f(void)", {"weak"}),
+            ("__attribute__((__weak__)) int weak_var = 1", {"weak"}),
+            ("int weak_var = 1", set()),
+            ("__attribute__((weakref(\"g\"))) void f(void)", {"weakref"}),
+            # A string holds no attribute (an initializer, a message).
+            ('__attribute__((used)) const char *h = "[[gnu::weak]]"', {"used"}),
+            ('__attribute__((deprecated("use __attribute__((weak))"))) void f(void)',
+             {"deprecated"}),
+        ],
+    )
+    def test_names(self, text, names):
+        from fw_context_mcp.indexer.symbols import _attribute_names
+
+        assert _attribute_names(text) == names
+
+
+class TestOneUsrWeakAndStrong:
+    """A weak HAL callback and the strong one of the project are one USR.
+    The units come in the order of their paths, thus the stub can come
+    first; the row must keep the strong definition, as the linker does."""
+
+    @staticmethod
+    def _store(tmp_path: Path, order: list[tuple[str, int]]):
+        conn = open_db(tmp_path / "index.db")
+        with transaction(conn):
+            upsert_project(conn, "pid", "p", str(tmp_path))
+            upsert_build_config(conn, "ch", "pid", str(tmp_path / "cc.json"))
+            for path, weak in order:
+                fid = upsert_file(conn, "ch", path, "c")
+                insert_symbols_batch(conn, [(
+                    "ch", fid, path, "HAL_GPIO_EXTI_Callback", "c:@F@HAL_GPIO_EXTI_Callback",
+                    "HAL_GPIO_EXTI_Callback", "HAL_GPIO_EXTI_Callback", "function", 10, 1, 12,
+                    1, "", "", None, 0, 0, "", 0, "", 1, 0.0, "", weak, "HAL_GPIO_EXTI_Callback",
+                )])
+        return conn
+
+    @pytest.mark.parametrize(
+        "order",
+        [
+            [("hal/gpio.c", 1), ("src/interrupt.c", 0)],
+            [("src/interrupt.c", 0), ("hal/gpio.c", 1)],
+        ],
+    )
+    def test_the_strong_definition_stays(self, tmp_path: Path, order):
+        conn = self._store(tmp_path, order)
+        try:
+            row = conn.execute("SELECT file_path, is_weak FROM symbols").fetchone()
+        finally:
+            conn.close()
+
+        assert (row["file_path"], row["is_weak"]) == ("src/interrupt.c", 0)
+
+
+@pytest.mark.libclang
+def test_a_weak_method_of_a_union(tmp_path: Path):
+    from fw_context_mcp.indexer.compile_commands import CompilationUnit
+    from fw_context_mcp.indexer.symbols import extract_all
+
+    src = tmp_path / "u.cpp"
+    src.write_text(
+        "union U { __attribute__((weak)) void m(); int i; };\nvoid U::m() {}\n", encoding="utf-8",
+    )
+    unit = CompilationUnit(file=src, directory=tmp_path, language="cpp", clang_args=["-std=c++17"])
+    weak = {s.name for s in extract_all(unit).symbols if s.is_weak and s.is_definition}
+
+    assert weak == {"m"}

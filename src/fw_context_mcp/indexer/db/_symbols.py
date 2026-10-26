@@ -208,15 +208,21 @@ def insert_symbols_batch(
     ``is_definition=0``; the definition row has ``is_definition=1``.
 
     ``ON CONFLICT(config_hash, usr) DO UPDATE`` merges duplicates on the
-    same USR.  The ``WHERE excluded.is_definition = 1 AND
-    symbols.is_definition = 0`` guard ensures:
+    same USR.  The guard ``WHERE excluded.is_definition = 1 AND
+    (symbols.is_definition = 0 OR (symbols.is_weak = 1 AND
+    excluded.is_weak = 0))`` ensures:
 
       • A **declaration** arriving before a definition is silently
         overwritten when the definition row arrives later.
       • A **definition** arriving first stays untouched — the declaration
         row cannot downgrade it.
-      • Two declarations for the same USR (e.g. from two headers) keep
-        whichever arrived first.
+      • A **weak definition** gives way to a strong one of the same USR,
+        as the linker does: the weak `HAL_GPIO_EXTI_Callback` of a HAL
+        file and the strong one of the project are one USR, and the units
+        come in the order of their paths, thus the stub can come first.
+        The row keeps one definition, thus the stub is not in the index.
+      • Two declarations for the same USR (e.g. from two headers), or two
+        definitions of one strength, keep whichever arrived first.
 
     Without this guard, a declaration row arriving AFTER a definition
     would overwrite ``is_definition`` back to 0 — breaking the call graph.
@@ -251,7 +257,9 @@ def insert_symbols_batch(
                source        = excluded.source,
                is_weak       = excluded.is_weak,
                link_name     = excluded.link_name
-           WHERE excluded.is_definition = 1 AND symbols.is_definition = 0""",
+           WHERE excluded.is_definition = 1 AND (
+               symbols.is_definition = 0 OR (symbols.is_weak = 1 AND excluded.is_weak = 0)
+           )""",
         full,
     )
     return cur.rowcount  # approximate with ON CONFLICT DO UPDATE WHERE (used for logging only)

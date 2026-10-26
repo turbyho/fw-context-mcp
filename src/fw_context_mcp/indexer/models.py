@@ -328,6 +328,10 @@ class Symbol:
         link_name: The name the linker resolves to this symbol (its mangled
             name), for a function or variable with external linkage.  Empty
             for all else.
+        is_weak: A declaration in the translation unit has the attribute
+            `weak` (`__attribute__((weak))`, `[[gnu::weak]]`, through a
+            macro too), thus the object file defines the symbol weakly.
+            `#pragma weak` is not seen: libclang does not give it.
     """
     name: str
     qualified_name: str      # namespace::Class::method
@@ -348,3 +352,4 @@ class Symbol:
     template_usr: str = ""   # USR of the primary template (non-empty = this is an instantiation)
     source: str = ""        # function/method body text (from libclang extent, only for is_definition=True)
     link_name: str = ""      # the name the linker resolves (external linkage only)
+    is_weak: bool = False    # a declaration of the TU makes it weak (`_weak_usrs`)

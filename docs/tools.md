@@ -2761,8 +2761,12 @@ label of a file that the unit includes counts too. Else a strong
 definition wins over a weak one, and a `PROVIDE` of the linker script
 loses to any definition of an object file. The language gives no rank:
 a strong definition in C and one in assembly are two equal candidates.
-fw-context does not see `__attribute__((weak))` in C, thus a weak C
-definition counts as strong. When no file defines the name, a C
+A C definition is weak when a declaration of its translation unit has
+`__attribute__((weak))` or `[[gnu::weak]]` (through a macro such as
+`__weak` too), as GCC reads it. `#pragma weak` is not seen: a definition
+made weak only by it counts as strong. A weak and a strong C definition
+of one function are one symbol of the index, and it keeps the strong one:
+thus `overridden` never names a C stub that C replaced. When no file defines the name, a C
 declaration of it (a function that a library defines) is the handler. A
 C++ method or a `static` function with the same name is never the
 handler: the linker does not see it under that name. A name with two

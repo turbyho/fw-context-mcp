@@ -1002,15 +1002,10 @@ def _store_symbol_rows(
                 is_proj,
                 0.0,
                 body,
-                # is_weak: always 0 on this path.  libclang's Python
-                # binding exposes no weak attribute, so a C definition
-                # marked `__attribute__((weak))` is indistinguishable
-                # from a strong one here.  The column exists for the
-                # assembly path, where `.weak` is a directive the reader
-                # sees plainly, and that is where the vector table needed
-                # it.  A C definition therefore counts as strong, which
-                # is what the code assumed before the column existed.
-                0,
+                # A declaration of the TU with `__attribute__((weak))`
+                # (`symbols._weak_usrs`): the linker then takes a strong
+                # definition of the same link name before this one.
+                int(s.is_weak),
                 s.link_name,
             )
         )
