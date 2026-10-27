@@ -58,9 +58,9 @@ class TestTheKeyOfASite:
         """One site that two analyses find is one row: a second row would count the call twice."""
         site = (CH, "u_cb", "drv.cpp", 8, "u_attach", "indirect", None, 22)
         insert_refs_batch(conn, [(*site, int(RefOrigin.DIRECT))])
-        insert_refs_batch(conn, [(*site, int(RefOrigin.TEXT))])
+        insert_refs_batch(conn, [(*site, int(RefOrigin.ASM))])
         (row,) = _rows(conn)
-        assert origin_names(row[6]) == ["direct", "text"]
+        assert origin_names(row[6]) == ["direct", "asm"]
 
     def test_two_slots_of_one_function_inside_a_body_stay_two_rows(self, conn):
         """The earlier key had no slot: ``{ reset, reset }`` in a body lost slot 1."""
@@ -200,25 +200,6 @@ class TestTheClaimsOfOneUnit:
         fields.update(changes)
         return Reference(**fields)
 
-    def test_a_text_reference_joins_an_earlier_site_of_its_line(self):
-        """The scan of the source text has no column: it joins a site of the line that is known."""
-        from fw_context_mcp.indexer.symbols import _claim_ref, _claim_text_ref
-
-        refs: list[Reference] = []
-        seen: dict = {}
-        _claim_ref(refs, seen, self._ref())
-        assert not _claim_text_ref(refs, seen, self._ref(from_col=0, origins=RefOrigin.TEXT))
-        assert len(refs) == 1 and origin_names(refs[0].origins) == ["direct", "text"]
-
-    def test_a_text_reference_of_another_caller_is_a_row_of_its_own(self):
-        from fw_context_mcp.indexer.symbols import _claim_ref, _claim_text_ref
-
-        refs: list[Reference] = []
-        seen: dict = {}
-        _claim_ref(refs, seen, self._ref())
-        assert _claim_text_ref(refs, seen, self._ref(from_col=0, from_usr="u_other", origins=RefOrigin.TEXT))
-        assert len(refs) == 2
-
     def test_a_nested_list_joins_the_slot_of_its_element(self):
         """The enclosing list gives the column of the element, the nested list the column of the function."""
         from fw_context_mcp.indexer.symbols import _claim_ref
@@ -240,7 +221,7 @@ class TestTheReaders:
         ])
         # Written out of the order of the source: the reader gives that order.
         insert_refs_batch(conn, [
-            (CH, "u_tick", "main.c", 2, "u_twice", "call", None, 13, int(RefOrigin.DIRECT | RefOrigin.TEXT)),
+            (CH, "u_tick", "main.c", 2, "u_twice", "call", None, 13, int(RefOrigin.DIRECT | RefOrigin.ASM)),
             (CH, "u_tick", "main.c", 2, "u_twice", "call", None, 5, int(RefOrigin.DIRECT)),
         ])
         conn.commit()
@@ -251,7 +232,7 @@ class TestTheReaders:
 
         rows = refs_for_symbol(calls, CH, "u_tick", "function", ref_kind="call")
         assert [(r["from_line"], r["from_col"]) for r in rows] == [(2, 5), (2, 13)]
-        assert [origin_names(r["origins"]) for r in rows] == [["direct"], ["direct", "text"]]
+        assert [origin_names(r["origins"]) for r in rows] == [["direct"], ["direct", "asm"]]
 
     def test_a_class_row_joins_the_origins_of_its_members(self, conn):
         """A class answers at member granularity: one row per caller and line, with each origin."""
@@ -264,9 +245,9 @@ class TestTheReaders:
         ])
         insert_refs_batch(conn, [
             (CH, "c:@S@Dev@F@a#", "dev.cpp", 12, "u_run", "call", None, 9, int(RefOrigin.DIRECT)),
-            (CH, "c:@S@Dev@F@b#", "dev.cpp", 12, "u_run", "call", None, 4, int(RefOrigin.TEXT)),
+            (CH, "c:@S@Dev@F@b#", "dev.cpp", 12, "u_run", "call", None, 4, int(RefOrigin.ASM)),
         ])
         conn.commit()
         (row,) = refs_for_symbol(conn, CH, "c:@S@Dev", "class", ref_kind="call")
         assert row["from_col"] == 4
-        assert origin_names(row["origins"]) == ["direct", "text"]
+        assert origin_names(row["origins"]) == ["direct", "asm"]

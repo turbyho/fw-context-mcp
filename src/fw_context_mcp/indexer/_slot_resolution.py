@@ -57,8 +57,11 @@ from .models import RefOrigin
 log = logging.getLogger(__name__)
 
 _ORIGINS = int(RefOrigin.SLOT | RefOrigin.TYPE_ONLY)
-# A site: its place (file, line, column) and its ordinal at the place.
-_SiteKey = tuple[str, int, int, int]
+# A site: its place (file, line, column), its ordinal at the place, and the
+# unit of a fact of a template instance ('' for the written code).  WHY the
+# unit: two units give the sites of an instance at one place, each with its
+# own ordinals, thus an argument belongs to the site of its own unit.
+_SiteKey = tuple[str, int, int, int, str]
 
 
 @dataclass
@@ -137,21 +140,22 @@ def _load(conn: sqlite3.Connection, config_hash: str) -> tuple[_Slots, dict[str,
         slots.escape(row["slot"])
     sites = [
         _Site(
-            key=(row["file"], row["line"], row["col"], row["ordinal"]), caller=row["caller"],
+            key=(row["file"], row["line"], row["col"], row["ordinal"], row["unit"]), caller=row["caller"],
             kind=row["kind"], slot=row["slot"], slot_type=row["slot_type"], callee=row["callee"],
         )
         for row in conn.execute(
-            "SELECT file, line, col, ordinal, caller, kind, slot, slot_type, callee FROM slot_sites"
-            " WHERE config_hash = ? ORDER BY file, line, col, ordinal",
+            "SELECT file, line, col, ordinal, caller, kind, slot, slot_type, callee, unit FROM slot_sites"
+            " WHERE config_hash = ? ORDER BY file, line, col, ordinal, unit",
             (config_hash,),
         )
     ]
     arguments: dict[_SiteKey, list[tuple[int, str, str]]] = defaultdict(list)
     for row in conn.execute(
-        "SELECT file, line, col, ordinal, arg_index, value_kind, value FROM slot_arguments WHERE config_hash = ?",
+        "SELECT file, line, col, ordinal, arg_index, value_kind, value, unit FROM slot_arguments"
+        " WHERE config_hash = ?",
         (config_hash,),
     ):
-        key = (row["file"], row["line"], row["col"], row["ordinal"])
+        key = (row["file"], row["line"], row["col"], row["ordinal"], row["unit"])
         arguments[key].append((row["arg_index"], row["value_kind"], row["value"]))
     return slots, by_type, sites, arguments
 
@@ -233,18 +237,29 @@ def resolve_slot_edges(conn: sqlite3.Connection, config_hash: str) -> dict[str, 
     slots, by_type, sites, arguments = _load(conn, config_hash)
     _pass_arguments(sites, slots, arguments, by_type)
 
-    counts = {"sites": len(sites), "slot": 0, "type_only": 0, "address": 0, "unresolved": 0}
+    # The counts of the log see one copy of each site, as the readers do
+    # (``db/_indirect.ONE_UNIT_SITES``): each unit that uses a template
+    # instance gives its sites.
+    counted_unit: dict[tuple, str] = {}
+    for site in sites:
+        content = (*site.key[:3], site.caller, site.kind, site.slot, site.slot_type, site.callee)
+        counted_unit[content] = min(counted_unit.get(content, site.key[4]), site.key[4])
+    counts = {"sites": 0, "slot": 0, "type_only": 0, "address": 0, "unresolved": 0}
     rows: list[tuple] = []
     for site in sites:
         targets = slots.targets.get(site.slot, set()) if site.slot else set()
         guessed = _guessed(site, slots, by_type)
-        file, line, column, _ordinal = site.key
+        file, line, column, _ordinal, unit = site.key
         for target in sorted(targets):
             rows.append((config_hash, target, file, line, site.caller, "call", None, column, int(RefOrigin.SLOT)))
         for target in sorted(guessed):
             rows.append((
                 config_hash, target, file, line, site.caller, "call", None, column, int(RefOrigin.TYPE_ONLY),
             ))
+        content = (file, line, column, site.caller, site.kind, site.slot, site.slot_type, site.callee)
+        if counted_unit[content] != unit:
+            continue
+        counts["sites"] += 1
         if site.kind == "address":
             counts["address"] += 1
         elif targets:
@@ -255,7 +270,7 @@ def resolve_slot_edges(conn: sqlite3.Connection, config_hash: str) -> dict[str, 
             counts["unresolved"] += 1
     if rows:
         insert_refs_batch(conn, rows)
-    counts["edges"] = len(rows)
+    counts["edges"] = len(set(rows))
     _store_targets(conn, config_hash, slots)
     return counts
 

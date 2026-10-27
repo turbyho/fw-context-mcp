@@ -35,7 +35,7 @@ The resolution over all the units of a build is ``_slot_resolution``
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -97,13 +97,22 @@ _Where = tuple[str | int, ...]
 
 @dataclass
 class SlotFacts:
-    """The slot facts of one translation unit (see the module docstring)."""
+    """The slot facts of one translation unit (see the module docstring).
+
+    *from_instances* holds the facts that only the bodies of the template
+    instances give, which the walk of the written code does not.  WHY
+    apart: such a fact can lie in a header that an other unit owns, and
+    each unit that uses the instance gives it.  The index keeps them with
+    the unit that gave them (column ``unit``), and a new parse of that unit
+    replaces them; the facts of the written code go with their file.
+    """
 
     sources: list[SlotSource] = field(default_factory=list)
     flows: list[SlotFlow] = field(default_factory=list)
     sites: list[SlotSite] = field(default_factory=list)
     arguments: list[SlotArgument] = field(default_factory=list)
     escapes: list[SlotEscape] = field(default_factory=list)
+    from_instances: SlotFacts | None = None
 
 
 def _kind(cursor: cx.Cursor) -> cx.CursorKind | None:
@@ -348,6 +357,12 @@ class _Collector:
 
     def __init__(self) -> None:
         self.facts = SlotFacts()
+        # The facts of the walks of instance bodies (`start_walk`), and the
+        # sites that they added, by place and ordinal: an argument belongs
+        # with its site.
+        self.instance_facts = SlotFacts()
+        self._in_instance = False
+        self._instance_sites: set[tuple[str, int, int, int]] = set()
         self._callable_records: dict[str, bool] = {}
         self._member_usrs: dict[str, str] = {}
         self._records_with_methods: dict[str, bool] = {}
@@ -355,6 +370,24 @@ class _Collector:
         # node, for the arguments of the site (`SlotSite.ordinal`).
         self._sites_at: dict[tuple[str, int, int], int] = {}
         self._site_ordinals: dict[tuple[tuple[str, int, int], int, cx.CursorKind | None], int] = {}
+        # The ordinals of the sites with one content (`SlotSite` but the
+        # ordinal), and how many of them the current walk gave
+        # (`start_walk`).  WHY: the template and each of its instances show
+        # a call that depends on no parameter at one place.  The n-th such
+        # site of a walk is the n-th site of the earlier walks, thus the
+        # place keeps one site, and two calls of one macro expansion stay
+        # two.
+        self._sites_like: dict[tuple, list[int]] = {}
+        self._walk_sites_like: dict[tuple, int] = {}
+
+    def start_walk(self, instance: bool) -> None:
+        """Start one walk: the written code of the unit, or the body of one instance."""
+        self._walk_sites_like = {}
+        self._in_instance = instance
+
+    def _out(self) -> SlotFacts:
+        """The facts that the current walk adds to."""
+        return self.instance_facts if self._in_instance else self.facts
 
     # ---- types and slots ------------------------------------------------
 
@@ -418,10 +451,19 @@ class _Collector:
         explicit specialization has a place of its own and keeps its USR.
         The references keep the instance member (``_code_usr``: only a
         function maps), but a slot must be one for the two codes.
+
+        A local variable of the body of an implicit instance maps the same
+        way, to the variable of the template body (``local_usr``): the walk
+        of the instance bodies gives its facts, and one call in a template
+        was a site of each instance.
         """
         usr = declaration.get_usr()
         parent = declaration.semantic_parent
-        if not usr or parent is None or _kind(parent) not in _sym._INSTANCE_CLASS_KINDS:
+        if not usr or parent is None:
+            return usr
+        if _kind(declaration) == _K.VAR_DECL and _kind(parent) in _sym._INSTANCE_FUNCTION_KINDS:
+            return self.local_usr(declaration, parent, usr)
+        if _kind(parent) not in _sym._INSTANCE_CLASS_KINDS:
             return usr
         known = self._member_usrs.get(usr)
         if known is not None:
@@ -444,6 +486,35 @@ class _Collector:
                 break
             current = match
         mapped = current.get_usr() or usr
+        self._member_usrs[usr] = mapped
+        return mapped
+
+    def local_usr(self, variable: cx.Cursor, function: cx.Cursor, usr: str) -> str:
+        """The USR of the local *variable* of the template body, when *function* is an implicit instance.
+
+        The instance of a function template, or of a method of a class
+        template, has the place of its template (``symbols._code_usr``), and
+        so has each local variable of its body.  The variable of the
+        template body at that place, with that name, is the slot.  An
+        explicit specialization has a place of its own and keeps its USR.
+        """
+        known = self._member_usrs.get(usr)
+        if known is not None:
+            return known
+        template = function
+        for _ in range(_sym._TEMPLATE_CHAIN_LIMIT):
+            following = template.specialized_template
+            if following is None or not _sym._has_place_of(template, following):
+                break
+            template = following
+        mapped = usr
+        if template is not function:
+            definition = template.get_definition() or template
+            for node in definition.walk_preorder():
+                if (_kind(node) == _K.VAR_DECL and node.spelling == variable.spelling
+                        and _sym._same_place(node, variable)):
+                    mapped = node.get_usr() or usr
+                    break
         self._member_usrs[usr] = mapped
         return mapped
 
@@ -812,36 +883,38 @@ class _Collector:
         if result[0] == "slot":
             for target in (str(key) for key in result[1:]):
                 if value[0] == "function":
-                    self.facts.sources.append(SlotSource(
+                    self._out().sources.append(SlotSource(
                         file=file, line=line, column=column, function=value[1],
                         function_type=value[2], slot=target,
                     ))
                 elif value[1] != target:
-                    self.facts.flows.append(SlotFlow(
+                    self._out().flows.append(SlotFlow(
                         file=file, line=line, column=column, source=value[1], target=target,
                     ))
         elif result[0] == "argument":
             site_file, site_line, site_column, ordinal, index = result[1:6]
-            self.facts.arguments.append(SlotArgument(
+            site_key = (str(site_file), int(site_line), int(site_column), int(ordinal))
+            owner = self.instance_facts if site_key in self._instance_sites else self.facts
+            owner.arguments.append(SlotArgument(
                 file=str(site_file), line=int(site_line), column=int(site_column), ordinal=int(ordinal),
                 index=int(index), value_kind=value[0], value=value[1],
             ))
             if value[0] == "function":
                 # Its address is taken too: a call that only its type
                 # resolves can reach it (`g_ops->reg(on_done)`).
-                self.facts.sources.append(SlotSource(
+                self._out().sources.append(SlotSource(
                     file=file, line=line, column=column, function=value[1],
                     function_type=value[2], slot="",
                 ))
         elif value[0] == "function":
             # The address is taken, and nothing known holds it: only its
             # type tells the calls that can reach it.
-            self.facts.sources.append(SlotSource(
+            self._out().sources.append(SlotSource(
                 file=file, line=line, column=column, function=value[1],
                 function_type=value[2], slot="",
             ))
         elif result[0] == "escape":
-            self.facts.escapes.append(SlotEscape(
+            self._out().escapes.append(SlotEscape(
                 file=file, line=line, column=column, slot=value[1], reason=str(result[1]),
             ))
 
@@ -849,11 +922,22 @@ class _Collector:
         self, call: cx.Cursor, place: tuple[str, int, int], caller: str | None,
         kind: str, slot: str | None, slot_type: str, reason: str, callee: str = "",
     ) -> None:
+        content = (place, caller, kind, slot or "", slot_type, reason, callee)
+        count = self._walk_sites_like.get(content, 0)
+        self._walk_sites_like[content] = count + 1
+        earlier = self._sites_like.setdefault(content, [])
+        if count < len(earlier):
+            # The same call in an other walk: its arguments go to that site.
+            self._site_ordinals[(place, *_node_key(call))] = earlier[count]
+            return
         ordinal = self._sites_at.get(place, 0)
         self._sites_at[place] = ordinal + 1
+        earlier.append(ordinal)
         # The key holds the place: the hash of a node has 32 bits.
         self._site_ordinals[(place, *_node_key(call))] = ordinal
-        self.facts.sites.append(SlotSite(
+        if self._in_instance:
+            self._instance_sites.add((*place, ordinal))
+        self._out().sites.append(SlotSite(
             file=place[0], line=place[1], column=place[2], ordinal=ordinal, caller=caller, kind=kind,
             slot=slot or "", slot_type=slot_type, reason=reason, callee=callee,
         ))
@@ -964,7 +1048,7 @@ class _Collector:
             if not slot or place is None:
                 return
             if self.address_taken(cursor, path, declaration) == _ADDRESS_WRITABLE:
-                self.facts.escapes.append(SlotEscape(
+                self._out().escapes.append(SlotEscape(
                     file=place[0], line=place[1], column=place[2], slot=slot, reason="address taken",
                 ))
             # A pointer to the slot flows on too: a table that a function
@@ -1252,24 +1336,27 @@ def _children(cursor: cx.Cursor) -> Iterator[cx.Cursor]:
     return iter(cursor.get_children())
 
 
-def collect_slot_facts(
-    tu: cx.TranslationUnit,
+def _walk(
+    collector: _Collector,
+    root: cx.Cursor,
+    path: list[cx.Cursor],
+    caller: str | None,
     skip_files: frozenset[str] | None,
     resolve: Callable[[str], Path],
-) -> SlotFacts:
-    """Walk *tu* and give its slot facts (see the module docstring).
+    *,
+    nested_definitions: bool,
+) -> None:
+    """Give each cursor below *root* to *collector*, with its path and its code key.
 
-    A subtree of a file in *skip_files* is left out, as in the walk of the
-    references: an earlier unit gave its facts.  The code key of a cursor
-    is the function whose definition holds it, or the lambda whose body
-    holds it.
+    *nested_definitions* False leaves out a function or a class that is
+    defined inside the body (a method of a local class): in an instance
+    body it is code of its own, and an instance of it is walked when a
+    call names it (``symbols._body_cursors``).
     """
-    collector = _Collector()
-    root = tu.cursor
-    stack: list[tuple[cx.Cursor, Iterator[cx.Cursor], str | None]] = [(root, _children(root), None)]
-    path: list[cx.Cursor] = [root]
+    collector.start_walk(instance=not nested_definitions)
+    stack: list[tuple[cx.Cursor, Iterator[cx.Cursor], str | None]] = [(root, _children(root), caller)]
     while stack:
-        parent, children, caller = stack[-1]
+        parent, children, code = stack[-1]
         cursor = next(children, None)
         if cursor is None:
             stack.pop()
@@ -1281,22 +1368,59 @@ def collect_slot_facts(
         place = cursor.location
         if skip_files and place.file is not None and str(resolve(place.file.name)) in skip_files:
             continue
-        inner = caller
-        if kind in _FUNCTIONS and cursor.is_definition():
+        is_definition = kind in _FUNCTIONS and cursor.is_definition()
+        if not nested_definitions and (is_definition or kind in _sym._INSTANCE_CLASS_KINDS):
+            continue
+        inner = code
+        if is_definition:
             inner = _sym._code_usr(cursor)
         elif kind == _K.COMPOUND_STMT and _kind(parent) == _K.LAMBDA_EXPR:
             inner = _sym._lambda_usr(parent)
-        collector.visit(cursor, path, caller)
+        collector.visit(cursor, path, code)
         stack.append((cursor, _children(cursor), inner))
         path.append(cursor)
+
+
+def collect_slot_facts(
+    tu: cx.TranslationUnit,
+    skip_files: frozenset[str] | None,
+    resolve: Callable[[str], Path],
+    instances: Sequence[cx.Cursor] = (),
+) -> SlotFacts:
+    """Walk *tu* and the bodies of its template *instances*, and give their slot facts (see the module docstring).
+
+    A subtree of a file in *skip_files* is left out, as in the walk of the
+    references: an earlier unit gave its facts.  The code key of a cursor
+    is the function whose definition holds it, or the lambda whose body
+    holds it.
+
+    *instances* are the definitions that ``symbols._walk_template_instances``
+    walked.  WHY their bodies: a call in a template body that depends on a
+    parameter has no target in the written code (`post(&Q::run<F>, e)`),
+    and only the instance shows the function whose address goes into the
+    parameter.  The keys of an instance are the keys of its template
+    (``_code_usr``, ``member_usr``), thus the facts of two instances at one
+    place are one fact.  A body is walked where it lies, also in a header
+    of the skip set, as the calls of the instances are.
+    """
+    collector = _Collector()
+    root = tu.cursor
+    _walk(collector, root, [root], None, skip_files, resolve, nested_definitions=True)
+    for definition in instances:
+        _walk(collector, definition, [definition], _sym._code_usr(definition), None, resolve,
+              nested_definitions=False)
     facts = collector.facts
     # A macro that expands more than one time at one place
     # (`FOR_EACH(DEFINE_OPS)`) gives equal facts, because each expansion has
     # the place of the macro.  A copy adds nothing to the resolution, and
     # find_indirect_targets would show the place two times.  The sites stay
-    # as they are: the ordinal tells apart two calls at one place.
-    facts.sources = list(dict.fromkeys(facts.sources))
-    facts.flows = list(dict.fromkeys(facts.flows))
-    facts.arguments = list(dict.fromkeys(facts.arguments))
-    facts.escapes = list(dict.fromkeys(facts.escapes))
+    # as they are: the ordinal tells apart two calls at one place.  A fact
+    # of an instance that the written code gives too is that fact.
+    instance = collector.instance_facts
+    for name in ("sources", "flows", "arguments", "escapes"):
+        written = list(dict.fromkeys(getattr(facts, name)))
+        setattr(facts, name, written)
+        known = set(written)
+        setattr(instance, name, [fact for fact in dict.fromkeys(getattr(instance, name)) if fact not in known])
+    facts.from_instances = instance
     return facts

@@ -61,6 +61,7 @@ from .db import (
     Ownership,
     UnitKey,
     clear_embedding_stash,
+    delete_slot_facts_of_unit,
     drop_fts_triggers,
     files_without_owner,
     forget_unit,
@@ -72,6 +73,7 @@ from .db import (
     release_ref_producer,
     replace_file_data,
     skip_form,
+    slot_unit_key,
     transaction,
     unclaimed,
     upsert_build_config,
@@ -295,6 +297,8 @@ def _settle_left(
             forget_unit(conn, config_hash, unit_key)
             # The edges of template instances that only this listing found.
             release_ref_producer(conn, config_hash, unit_key)
+            # The slot facts of the template instances of this listing.
+            delete_slot_facts_of_unit(conn, config_hash, slot_unit_key(unit_key))
     paths = unclaimed(
         (path for unit_key in left for path in ownership.files_of(unit_key)), skip_files, project_root,
     )

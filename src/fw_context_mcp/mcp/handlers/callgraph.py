@@ -590,8 +590,7 @@ def find_callers(
         site, 0 when the index has none; two calls on one line are two rows),
         ref_kind (``"call"``, ``"indirect"``, ``"implicit_construct"``, or
         ``"macro_use"``), origins (list — the analyses that found the site: ``"direct"``, the AST
-        of the compiler names the target; ``"text"``, a name in the tokens or
-        the source text gave the target, which can be wrong; ``"asm"``, the
+        of the compiler names the target; ``"asm"``, the
         assembly reader (a call, a jump or a fall into another routine, of a
         routine that the flow of control of the file gives); ``"dispatch"``,
         a dispatch bridge;

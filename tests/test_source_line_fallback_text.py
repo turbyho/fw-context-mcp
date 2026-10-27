@@ -1,10 +1,10 @@
-"""The source-line fallback of the reference pass scans the text that the parse read.
+"""The reference pass reads no source file after the parse.
 
-``_run_source_line_fallback`` read the main file of the unit from the disk
-after the parse.  A file saved during the parse gave the scan lines that no
-extent of the parse describes, and a file that the build removed after the
-parse raised ``FileNotFoundError`` out of ``extract_all``: the except clause
-named no ``OSError``.
+A scan of the source text once read the main file of the unit from the
+disk after the parse.  A file saved during the parse gave the scan lines
+that no extent of the parse describes, and a file that the build removed
+after the parse raised ``FileNotFoundError`` out of ``extract_all``.  The
+scan is gone; the test keeps the extraction free of a read of the disk.
 """
 
 from __future__ import annotations

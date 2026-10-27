@@ -26,9 +26,10 @@ class RefOrigin(enum.IntFlag):
     AST of the compiler gives from an edge that a name resolved.
 
     * ``DIRECT`` — the AST walk: the cursor of the reference names its target.
-    * ``TEXT`` — tokens or source text, with the target resolved by its
-      name (``&Class::method`` where the AST is opaque).  The name can be
-      wrong; a later step replaces these.
+    * The bit 2 is free.  It was ``TEXT``: a target that a scan of the
+      tokens or of the source text took from a name.  An index of an
+      older version that holds it gets a new config hash (the row format
+      ``fw-context-rows/11``), thus its next index run writes every row.
     * ``ASM`` — the assembly reader: a vector table slot or an alias.
     * ``DISPATCH`` — a dispatch bridge of the post-processing: an entry
       point that runs a callback which a call site registered.
@@ -48,7 +49,6 @@ class RefOrigin(enum.IntFlag):
     """
 
     DIRECT = 1
-    TEXT = 2
     ASM = 4
     DISPATCH = 8
     INSTANTIATION = 16
@@ -67,7 +67,7 @@ def origins_or_sql(column: str) -> str:
 
 
 def origin_names(origins: int) -> list[str]:
-    """Give the names of the bits of *origins*, in bit order (``["direct", "text"]``)."""
+    """Give the names of the bits of *origins*, in bit order (``["direct", "asm"]``)."""
     return [str(flag.name).lower() for flag in RefOrigin if origins & flag]
 
 
@@ -81,7 +81,7 @@ class Reference:
         from_line: Source line of the reference expression.
         from_col: Source column of the reference expression, counted from
             1 as libclang counts it, or 0 when the producer has no column
-            (the assembly reader, the scan of the source text).  The column
+            (the assembly reader).  The column
             separates two calls on one line: ``f(); f();`` are two sites.
             For a reference in a macro expansion it is the column of the
             expansion, thus two calls of one expansion share it.  For an

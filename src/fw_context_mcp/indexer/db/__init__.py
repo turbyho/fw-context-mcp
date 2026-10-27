@@ -60,6 +60,7 @@ __all__ = [
     "delete_refs_for_files",
     "delete_slot_facts_for_config",
     "delete_slot_facts_for_files",
+    "delete_slot_facts_of_unit",
     "delete_symbols_for_file",
     "drop_fts_triggers",
     "ensure_schema",
@@ -139,6 +140,7 @@ __all__ = [
     "set_analyze_vendor",
     "set_entry_point",
     "skip_form",
+    "slot_unit_key",
     "split_tokens",
     "stash_embeddings_for_files",
     "stash_embeddings_for_symbols",
@@ -300,7 +302,9 @@ from ._schema import (
 from ._slots import (
     delete_slot_facts_for_config,
     delete_slot_facts_for_files,
+    delete_slot_facts_of_unit,
     insert_slot_facts,
+    slot_unit_key,
 )
 from ._symbols import (
     _expand_query,

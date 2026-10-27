@@ -23,21 +23,6 @@ in ``.fw-context/config.toml`` are merged on top.  Entries whose entry point
 symbol does not exist in the index are silently skipped — the map can safely
 list all supported platforms in one place without causing errors for
 non-matching projects.
-
-Type-erased ISR functions
---------------------------
-
-Some ISR registration APIs type-erase the handler argument
-(e.g. ``NVIC_SetVector(IRQn, (uint32_t)handler)``), making the function
-pointer invisible to libclang.  ``_TYPE_ERASED_ISR_FUNCTIONS`` maps such
-function names to the (0-based) argument index that carries the handler.
-The source-line fallback in ``symbols.py`` uses this to extract the handler
-name from the raw source line.
-
-WHY source-line fallback: type-erased arguments (``(uint32_t)handler``) are
-invisible to libclang's AST — the function pointer assignment is completely
-hidden.  Without the source-line fallback, ISR registrations in CMSIS, Nordic
-SDK, and STM32 HAL would give no ``indirect`` reference to the handler.
 """
 
 # Map: dispatch-registration API qualified name → dispatch entry point QN.
@@ -68,20 +53,3 @@ _DISPATCH_ENTRY_POINTS: dict[str, str] = {
     "xTaskCreate":                      "prvTaskExitError",
     "xTaskCreateStatic":                "prvTaskExitError",
 }
-
-# Type-erased ISR registration functions: function name → handler arg index (0‑based).
-# These APIs cast the handler to an integer type so libclang cannot see the
-# function‑pointer assignment.  The source‑line fallback uses this map to
-# extract the handler name from the raw source line and give it an
-# ``indirect`` reference.
-_TYPE_ERASED_ISR_FUNCTIONS: dict[str, int] = {
-    # ── ARM CMSIS / Nordic / STM32 ──────────────────────────────────
-    "NVIC_SetVector":      1,   # NVIC_SetVector(IRQn, (uint32_t)handler)
-    "__NVIC_SetVector":    1,
-}
-
-# Unqualified dispatch method names — used for fast pre-filtering in
-# source-line fallback (``symbols.py:_run_source_line_fallback``).
-_DISPATCH_METHOD_NAMES: frozenset[str] = frozenset({
-    qn.rsplit("::", 1)[-1] for qn in _DISPATCH_ENTRY_POINTS
-})

@@ -143,7 +143,13 @@ __all__ = [
 #      vector slot, an alias) is resolved by it.  Before it, a C++ method or
 #      a `static` function with the same name could be the target, and `main`
 #      of C++ (USR `c:@F@main#`) was found only by its plain name.
-CURRENT_ROW_FORMAT = "fw-context-rows/10"
+# /11 — no reference comes from a name: the scan of the tokens and of the
+#      source text is gone, with the origin `text` (bit 2).  The slot facts
+#      also come from the bodies of the template instances (column `unit`
+#      of the slot tables).  Before it, 47 of 67 references that only the
+#      text gave were false (a return type on a definition line, commented
+#      code), and an address in a template body had no slot fact.
+CURRENT_ROW_FORMAT = "fw-context-rows/11"
 
 # The config-hash format that was current when CURRENT_ROW_FORMAT last moved.
 #
@@ -158,7 +164,7 @@ CURRENT_ROW_FORMAT = "fw-context-rows/10"
 # the build, thus a plain `fw-context index` writes every file and every
 # body again.  The two must therefore move together, and
 # `test_row_format_invalidation.py` fails when only one of them does.
-ROW_FORMAT_PAIRED_WITH = "fw-context-cc/12"
+ROW_FORMAT_PAIRED_WITH = "fw-context-cc/13"
 
 
 def _row_format_number(value: str) -> int | None:
@@ -233,6 +239,10 @@ _ROW_FORMAT_FAULTS: tuple[tuple[int, str], ...] = (
         "name, get_vector_table can say unhandled for an interrupt that C "
         "services, a slot of a table in C stays on the declaration in a "
         "header, and no slot names the weak stub that its handler replaced"),
+    (10, "some references came from a name in the source text (a return "
+         "type on a definition line, commented code), and an address that "
+         "a template body takes has no slot fact, thus its indirect calls "
+         "have no edge"),
 )
 
 
@@ -510,6 +520,13 @@ _MIGRATION_ADD_COLUMNS = [
     "ALTER TABLE slot_sites ADD COLUMN callee TEXT NOT NULL DEFAULT ''",
     # A C tentative definition (see the column in _SCHEMA).
     "ALTER TABLE symbols ADD COLUMN is_tentative INTEGER NOT NULL DEFAULT 0",
+    # The listing that gave a slot fact of a template instance (see the
+    # tables in _SCHEMA).
+    "ALTER TABLE slot_sources ADD COLUMN unit TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE slot_flows ADD COLUMN unit TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE slot_sites ADD COLUMN unit TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE slot_arguments ADD COLUMN unit TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE slot_escapes ADD COLUMN unit TEXT NOT NULL DEFAULT ''",
     # Schema version bump — DO NOT REMOVE. When adding new migration steps after this
     # column, also add a NEW ALTER TABLE … ADD COLUMN _schema_bump_… line. The hash
     # of _MIGRATION_ADD_COLUMNS drives CURRENT_SCHEMA_VERSION.
@@ -881,6 +898,11 @@ CREATE INDEX IF NOT EXISTS idx_ref_producers_unit
 -- units of a build (phase 5b) turns them into call edges.  Each row is
 -- one place (file, line, col) of the unit that writes it, thus a re-parse
 -- deletes the rows of its files as it deletes their refs.
+-- unit: '' for a fact of the written code.  A fact that only the body of
+-- a template instance gives has the key of the listing that parsed it
+-- (`<flags_hash>|<path>`, db/_slots.py): it can lie in a header that an
+-- other unit owns, and each unit that uses the instance gives it, thus a
+-- new parse of that listing deletes its rows by this key and not by file.
 -- slot_sources: the address of a function (or a lambda) goes into a slot,
 -- or into nothing known (slot '': the address is taken).
 CREATE TABLE IF NOT EXISTS slot_sources (
@@ -891,7 +913,8 @@ CREATE TABLE IF NOT EXISTS slot_sources (
     col            INTEGER NOT NULL,
     function       TEXT    NOT NULL,
     function_type  TEXT    NOT NULL,
-    slot           TEXT    NOT NULL
+    slot           TEXT    NOT NULL,
+    unit         TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_slot_sources_slot ON slot_sources(config_hash, slot);
 CREATE INDEX IF NOT EXISTS idx_slot_sources_file ON slot_sources(config_hash, file);
@@ -904,7 +927,8 @@ CREATE TABLE IF NOT EXISTS slot_flows (
     line         INTEGER NOT NULL,
     col          INTEGER NOT NULL,
     source       TEXT    NOT NULL,
-    target       TEXT    NOT NULL
+    target       TEXT    NOT NULL,
+    unit         TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_slot_flows_target ON slot_flows(config_hash, target);
 CREATE INDEX IF NOT EXISTS idx_slot_flows_source ON slot_flows(config_hash, source);
@@ -927,7 +951,8 @@ CREATE TABLE IF NOT EXISTS slot_sites (
     slot         TEXT    NOT NULL,
     slot_type    TEXT    NOT NULL,
     reason       TEXT    NOT NULL DEFAULT '',
-    callee       TEXT    NOT NULL DEFAULT ''
+    callee       TEXT    NOT NULL DEFAULT '',
+    unit         TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_slot_sites_slot   ON slot_sites(config_hash, slot);
 CREATE INDEX IF NOT EXISTS idx_slot_sites_caller ON slot_sites(config_hash, caller);
@@ -944,7 +969,8 @@ CREATE TABLE IF NOT EXISTS slot_arguments (
     ordinal      INTEGER NOT NULL,
     arg_index    INTEGER NOT NULL,
     value_kind   TEXT    NOT NULL,
-    value        TEXT    NOT NULL
+    value        TEXT    NOT NULL,
+    unit         TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_slot_arguments_file ON slot_arguments(config_hash, file);
 CREATE INDEX IF NOT EXISTS idx_slot_arguments_value ON slot_arguments(config_hash, value);
@@ -956,7 +982,8 @@ CREATE TABLE IF NOT EXISTS slot_escapes (
     line         INTEGER NOT NULL,
     col          INTEGER NOT NULL,
     slot         TEXT    NOT NULL,
-    reason       TEXT    NOT NULL
+    reason       TEXT    NOT NULL,
+    unit         TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_slot_escapes_slot ON slot_escapes(config_hash, slot);
 CREATE INDEX IF NOT EXISTS idx_slot_escapes_file ON slot_escapes(config_hash, file);
@@ -1463,6 +1490,11 @@ def _run_data_migrations(conn: sqlite3.Connection) -> None:
     # Here and not in _SCHEMA: an older index gets the column only from
     # _ensure_migrated_columns, which runs after _SCHEMA.
     conn.execute("CREATE INDEX IF NOT EXISTS idx_symbols_link_name ON symbols(link_name)")
+    # ── The delete of the slot facts of one listing ──
+    # Here for the same reason: an older index gets the column `unit` only
+    # from _ensure_migrated_columns.
+    for table in ("slot_sources", "slot_flows", "slot_sites", "slot_arguments", "slot_escapes"):
+        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_unit ON {table}(config_hash, unit)")
 
     # ── Embeddings composite PK migration ───────────────────────────
     # Delegates to _ensure_embeddings_schema — idempotent, safe to call

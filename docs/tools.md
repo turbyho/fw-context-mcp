@@ -2293,15 +2293,12 @@ place of the site, thus two calls on one line are two rows. For an
 indirect reference, the place is the name of the function (`f` in
 `reg(f)`, `tick` in `&WDT::tick`), not the start of the call. `col` is 0
 when the index has no column for the site (an assembly vector table, a
-dispatch bridge, a scan of the source text). In a macro expansion, the
+dispatch bridge). In a macro expansion, the
 place is the place of the expansion.
 
 `origins` lists the analyses that found the site:
 
 - `"direct"` — the AST of the compiler names the target.
-- `"text"` — a name in the tokens or in the source text gave the target,
-  where the AST is opaque (`&Class::method`). A name can give a wrong
-  target. A row with `"text"` alone is a guess.
 - `"asm"` — the assembly reader (a vector table slot, an alias, a call
   or jump instruction, control that falls into another routine).
 - `"dispatch"` — a dispatch bridge, such as `EventQueue::call_every`.

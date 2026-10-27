@@ -58,7 +58,7 @@ try:
 except ImportError:
     TranslationUnitLoadError = RuntimeError  # clang not available — use fallback
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from collections.abc import Set as AbstractSet
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -66,9 +66,11 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     # Type-only import: fw_context_mcp.indexer.symbols pulls in libclang at
     # import time, and ops is imported on paths that never parse.
+    from fw_context_mcp.indexer._slots import SlotFacts
     from fw_context_mcp.indexer.symbols import ExtractionResult
 
 from fw_context_mcp.indexer.db import (
+    delete_slot_facts_of_unit,
     get_file_mtimes,
     insert_inheritance_batch,
     insert_macros_batch,
@@ -79,6 +81,7 @@ from fw_context_mcp.indexer.db import (
     record_claims,
     release_ref_producer,
     replace_file_data,
+    slot_unit_key,
     split_tokens,
     upsert_file,
 )
@@ -1341,6 +1344,22 @@ def _store_macros_for_unit(
 
 
 
+def _insert_slot_facts(
+    conn: sqlite3.Connection, config_hash: str, slots: SlotFacts, rel: Callable[[str], str], unit: str,
+) -> None:
+    """Write *slots* (the facts of the written code, or of the instances) with the key *unit*."""
+    insert_slot_facts(
+        conn, config_hash,
+        [(rel(s.file), s.line, s.column, s.function, s.function_type, s.slot) for s in slots.sources],
+        [(rel(f.file), f.line, f.column, f.source, f.target) for f in slots.flows],
+        [(rel(s.file), s.line, s.column, s.ordinal, s.caller, s.kind, s.slot, s.slot_type, s.reason, s.callee)
+         for s in slots.sites],
+        [(rel(a.file), a.line, a.column, a.ordinal, a.index, a.value_kind, a.value) for a in slots.arguments],
+        [(rel(e.file), e.line, e.column, e.slot, e.reason) for e in slots.escapes],
+        unit,
+    )
+
+
 def store_symbols_for_unit(
     conn,
     unit,
@@ -1545,6 +1564,12 @@ def store_symbols_for_unit(
         # last run: they go, and the parse below writes them again.  An edge
         # that another listing also found stays (see ``ref_producers``).
         release_ref_producer(conn, config_hash, listing)
+    # The slot facts of the template instances of this unit, also in the
+    # headers that an other unit owns: they go, and the parse below writes
+    # them again.  A caller that names no listing has the key of the unit
+    # with no flags.
+    instance_unit = slot_unit_key(listing if listing is not None else (normalized_tu_path, ""))
+    delete_slot_facts_of_unit(conn, config_hash, instance_unit)
 
     # Upsert the TU file record and capture its id.
     # The index run gives the hashes that its decision computed
@@ -1641,18 +1666,9 @@ def store_symbols_for_unit(
     # The slot facts of the indirect calls (indexer/_slots.py).  Phase 5b
     # resolves them over all the units of the build.
     if index_refs and slots is not None:
-        insert_slot_facts(
-            conn, config_hash,
-            [(_rel(s.file), s.line, s.column, s.function, s.function_type, s.slot)
-             for s in slots.sources],
-            [(_rel(f.file), f.line, f.column, f.source, f.target) for f in slots.flows],
-            [(_rel(s.file), s.line, s.column, s.ordinal, s.caller, s.kind, s.slot, s.slot_type, s.reason,
-              s.callee)
-             for s in slots.sites],
-            [(_rel(a.file), a.line, a.column, a.ordinal, a.index, a.value_kind, a.value)
-             for a in slots.arguments],
-            [(_rel(e.file), e.line, e.column, e.slot, e.reason) for e in slots.escapes],
-        )
+        _insert_slot_facts(conn, config_hash, slots, _rel, "")
+        if slots.from_instances is not None:
+            _insert_slot_facts(conn, config_hash, slots.from_instances, _rel, instance_unit)
 
     # Pending dispatch edges (for deferred resolution in post-processing)
     # Dispatch edges (event-loop callbacks, thread starts, timer callbacks)

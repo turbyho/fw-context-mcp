@@ -570,7 +570,8 @@ def _delete_rows_owned_by(
     run removes them.
 
     *keep_instance_edges*: a re-parse keeps the edges of template instances
-    that other units produce (``delete_refs_for_files``).
+    that other units produce (``delete_refs_for_files``), and their slot
+    facts (``delete_slot_facts_for_files``).  A purge deletes both.
     """
     from ._embeddings import stash_embeddings_for_files
     from ._inheritance import delete_inheritance_for_file
@@ -603,7 +604,7 @@ def _delete_rows_owned_by(
     delete_macros_for_files(conn, [fid for fid, _ in files])
     paths = [path for _, path in files if path]
     delete_refs_for_files(conn, config_hash, paths, keep_instance_edges=keep_instance_edges)
-    delete_slot_facts_for_files(conn, config_hash, paths)
+    delete_slot_facts_for_files(conn, config_hash, paths, every_unit=not keep_instance_edges)
     return purged_usrs
 
 

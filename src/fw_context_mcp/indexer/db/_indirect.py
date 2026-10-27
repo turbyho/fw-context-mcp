@@ -72,11 +72,30 @@ def _reached_slots_sql() -> str:
     )
 
 
+# The sites of one unit only, for each call: `s` is a row of slot_sites.
+# WHY: each unit that uses a template instance gives its sites (column
+# `unit`, ``db/_slots.py``), thus one call can have a row from each unit.
+# The rows of the unit with the smallest key stay, and '' (the written code)
+# is the smallest.  The rows of one unit keep their count: the two calls of
+# one macro expansion are two sites.
+# WHY the `+` of `+u.unit`: it keeps the planner off the index of the unit.
+# With no statistics (after the migration, before `PRAGMA optimize`) the
+# planner read that index for MIN, once for each row: 40 000 sites took
+# 51 s.  The index of the file finds the rows of the place.  A row of the
+# written code needs no look: no key is smaller than ''.
+ONE_UNIT_SITES = (
+    "(s.unit = '' OR s.unit = (SELECT MIN(+u.unit) FROM slot_sites u"
+    " WHERE u.config_hash = s.config_hash AND u.file = s.file AND u.line = s.line AND u.col = s.col"
+    " AND u.caller IS s.caller AND u.kind = s.kind AND u.slot = s.slot AND u.slot_type = s.slot_type"
+    " AND u.reason = s.reason AND u.callee = s.callee))"
+)
+
+
 def _sites_filter(slot: str | None, caller: str | None) -> tuple[str, str, list]:
     """The CTE, the WHERE clause and the parameters of the sites of a slot, or of a caller."""
     if slot is not None:
-        return _reached_slots_sql(), "s.slot IN (SELECT slot FROM reached)", [slot]
-    return "", "s.caller = ?", [caller]
+        return _reached_slots_sql(), f"s.slot IN (SELECT slot FROM reached) AND {ONE_UNIT_SITES}", [slot]
+    return "", f"s.caller = ? AND {ONE_UNIT_SITES}", [caller]
 
 
 def indirect_sites(
@@ -85,8 +104,10 @@ def indirect_sites(
 ) -> list[sqlite3.Row]:
     """The indirect calls through *slot* (and the slots its value flows into), or the ones that *caller* makes.
 
-    The order is the place and the ordinal at the place, thus two pages
-    never overlap.
+    The order is the place, the ordinal at the place, the unit and the row:
+    a total order, thus two pages never overlap.  WHY the unit: each unit
+    counts the ordinals of its instance sites, thus two units can show two
+    sites with one place and one ordinal.
     """
     cte, where, params = _sites_filter(slot, caller)
     cte_params = [params[0], config_hash] if slot is not None else []
@@ -97,7 +118,7 @@ def indirect_sites(
             FROM slot_sites s
             LEFT JOIN symbols c ON c.config_hash = s.config_hash AND c.usr = s.caller
             WHERE s.config_hash = ? AND {where}
-            ORDER BY s.file, s.line, s.col, s.ordinal
+            ORDER BY s.file, s.line, s.col, s.ordinal, s.unit, s.id
             LIMIT ? OFFSET ?""",
         (*cte_params, config_hash, *([] if slot is not None else params), limit, offset),
     ).fetchall()
@@ -245,7 +266,7 @@ def stored_places(
             places.extend(conn.execute(
                 """SELECT a.file, a.line FROM slot_arguments a
                    JOIN slot_sites s ON s.config_hash = a.config_hash AND s.file = a.file
-                    AND s.line = a.line AND s.col = a.col AND s.ordinal = a.ordinal
+                    AND s.line = a.line AND s.col = a.col AND s.ordinal = a.ordinal AND s.unit = a.unit
                    WHERE a.config_hash = ? AND a.value_kind = 'function' AND a.value = ? AND a.arg_index = ?
                      AND (s.callee = ? OR EXISTS (
                           SELECT 1 FROM slot_targets t
@@ -268,7 +289,7 @@ def function_stores(
     is.
     """
     return conn.execute(
-        """SELECT so.file, so.line, so.col, so.slot,
+        """SELECT DISTINCT so.file, so.line, so.col, so.slot,
                   (SELECT c.qualified_name FROM symbols c
                    WHERE c.config_hash = so.config_hash AND c.kind IN ({kinds})
                      AND NOT (c.kind = 'lambda' AND c.usr = so.function)
@@ -284,7 +305,9 @@ def function_stores(
 
 def count_function_stores(conn: sqlite3.Connection, config_hash: str, function: str) -> int:
     return int(conn.execute(
-        "SELECT COUNT(*) FROM slot_sources WHERE config_hash = ? AND function = ?", (config_hash, function),
+        "SELECT COUNT(*) FROM (SELECT DISTINCT file, line, col, slot FROM slot_sources"
+        " WHERE config_hash = ? AND function = ?)",
+        (config_hash, function),
     ).fetchone()[0])
 
 

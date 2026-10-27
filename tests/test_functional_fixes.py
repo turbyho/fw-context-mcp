@@ -2,15 +2,15 @@
 
 Covers:
 - F1: incremental embeddings (no full re-analysis on every `fw-context index`)
-- F2: false self-reference in the call graph (bare-call match on definition line)
-- F3: wrong overload resolution (_resolve_method_usr ambiguous -> None, caller class)
+- F2: false self-reference in the call graph (bare-call match on definition line); the
+  source-line scan that made it is gone
+- F3: wrong overload resolution by a name; the name resolution is gone
 - F4: callback(&Class::method) indirect target detection
 - F5: FTS5 syntax errors (`#define`, backslash-quote queries) + graceful fallback
 """
 
 from __future__ import annotations
 
-import logging
 import sqlite3
 from pathlib import Path
 from unittest import mock
@@ -121,168 +121,6 @@ class TestSearchContentFts5GracefulFallback:
         # The first row is the page notice; the file follows it.
         assert result[0]["total"] == 1, result
         assert result[1]["file"].endswith("a.cpp")
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# F3 — overload resolution (_resolve_method_usr)
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-class TestResolveMethodUsr:
-    """Verify ambiguous method names resolve correctly or to None (never wrong)."""
-
-    @pytest.fixture(autouse=True)
-    def _import(self):
-        from fw_context_mcp.indexer.symbols import _resolve_method_usr
-
-        self._resolve = _resolve_method_usr
-
-    def test_exact_name_wins(self):
-        """A bare unqualified name that exists must win."""
-        qn = {"the Mbed project::WDT::wdt_reset": "u_self"}
-        assert self._resolve("wdt_reset", qn) == "u_self"
-
-    def test_single_candidate_suffix(self):
-        """A single ::method candidate resolves even without context."""
-        qn = {"the Mbed project::WDT::wdt_reset": "u_self"}
-        assert self._resolve("wdt_reset", qn) == "u_self"
-
-    def test_caller_class_preferred_for_bare_call(self):
-        """Bare method() inside a class must resolve to a sibling method."""
-        qn = {
-            "the Mbed project::WDT::wdt_reset": "u_self",
-            "other::wdt_reset": "u_other",
-        }
-        result = self._resolve("wdt_reset", qn, caller_qn="the Mbed project::WDT::swdt_check")
-        assert result == "u_self"
-
-    def test_receiver_field_hint_preferred(self):
-        """obj.attach() must prefer the receiver type over the caller class."""
-        qn = {
-            "the Mbed project::WDT::attach": "u_wdt_attach",  # caller-class sibling (WRONG choice)
-            "mbed::Timeout::attach": "u_timeout_attach",
-            "mbed::SerialBase::attach": "u_serial_attach",
-        }
-        result = self._resolve("attach", qn, field_name="_timeout",
-                               caller_qn="the Mbed project::WDT::swdt_check")
-        assert result == "u_timeout_attach"
-
-    def test_ambiguous_returns_none(self):
-        """Ambiguous bare call with no context must return None, not an arbitrary hit."""
-        qn = {"a::attach": "u_a", "b::attach": "u_b"}
-        assert self._resolve("attach", qn) is None
-
-    def test_ambiguous_with_unknown_receiver_returns_none(self):
-        """Field hint that matches no candidate must return None (no wrong edge)."""
-        qn = {"a::attach": "u_a", "b::attach": "u_b"}
-        result = self._resolve("attach", qn, field_name="_something")
-        assert result is None
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# F2 — the source-line fallback (_run_source_line_fallback)
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-class _FakeTU:
-    """Minimal stand-in for a libclang TranslationUnit (spelling only).
-
-    The fallback scans the text that the parse read.  The fixture
-    ``disk_buffers`` makes the path the handle of a file and the bytes on
-    the disk its parsed text: these tests pin the scan, and need no libclang.
-    """
-
-    def __init__(self, path: str):
-        self.spelling = path
-
-    def __getattr__(self, name: str):
-        return None
-
-
-@pytest.fixture
-def disk_buffers(monkeypatch):
-    """Give each _FakeTU handle the bytes of the file on the disk as its parsed text."""
-    from fw_context_mcp.indexer import _parsed_text
-
-    monkeypatch.setattr(_parsed_text, "parsed_bytes", lambda tu, cx_file: Path(cx_file).read_bytes())
-    monkeypatch.setattr(_parsed_text, "file_of_parse", lambda tu, name: name)
-
-
-class TestRunSourceLineFallback:
-    """The scan of the source text: no call edge, and the indirect patterns that stay for now."""
-
-    @pytest.fixture(autouse=True)
-    def _import(self, disk_buffers):
-        from fw_context_mcp.indexer.symbols import _run_source_line_fallback
-
-        self._fallback = _run_source_line_fallback
-
-    def _run(self, source: str, qn_to_usr: dict[str, str]):
-        import os
-        import tempfile
-
-        with tempfile.NamedTemporaryFile("w", suffix=".cpp", delete=False) as f:
-            f.write(source)
-            path = f.name
-        try:
-            refs: list = []
-            pending_dispatches: list = []
-            seen: dict = {}
-            usr_to_qn = {u: q for q, u in qn_to_usr.items()}
-            fn_spans = [("u_self", 1, len(source.splitlines()))]
-            self._fallback(
-                _FakeTU(path), refs, pending_dispatches, seen,
-                fn_spans, qn_to_usr, usr_to_qn,
-                logging.getLogger("test"),
-            )
-            return refs
-        finally:
-            os.unlink(path)
-
-    def test_a_name_in_the_text_gives_no_call_edge(self):
-        """The scan reads text: a bare `name(` or `obj.name(` is no call edge.
-
-        The scan once took the target from the name. It read the definition
-        line, comments and inactive lines too, and its name lookup took the
-        class of the caller. The compiler gives each direct call itself.
-        """
-        src = (
-            "void WDT::wdt_reset(int delay) {\n"
-            "    helper(delay);\n"
-            "    // feed() is not called here\n"
-            "    _timer.start(delay);\n"
-            "    wdt_reset(delay + 1);\n"
-            "}\n"
-        )
-        qn = {
-            "WDT::wdt_reset": "u_self",
-            "WDT::helper": "u_helper",
-            "WDT::feed": "u_feed",
-            "Timer::start": "u_start",
-        }
-        refs = self._run(src, qn)
-
-        assert [r for r in refs if r.ref_kind == "call"] == []
-
-    def test_callback_address_of_method_indirect_via_raw_text(self):
-        """`&Class::method` inside a call arg must emit an indirect ref from the
-        source-line fallback (F4b) — the path that also works when the AST is
-        too degraded for libclang to produce CALL_EXPR cursors."""
-        src = (
-            "void WDT::wdt_reset() {\n"
-            "    _timeout.attach(callback(&WDT::_timeout_interrupt), delay);\n"
-            "}\n"
-        )
-        qn = {"the Mbed project::WDT::wdt_reset": "u_self", "the Mbed project::WDT::_timeout_interrupt": "u_ti"}
-        refs = self._run(src, qn)
-
-        indirect = [
-            r for r in refs
-            if r.ref_kind == "indirect" and r.to_usr == "u_ti" and r.from_usr == "u_self"
-        ]
-        assert indirect, (
-            "&WDT::_timeout_interrupt must be an indirect ref from wdt_reset via raw text"
-        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -518,7 +356,12 @@ class TestBuildEmbeddingsIncremental:
 
 @pytest.mark.libclang
 class TestCallbackTargetIndirectRef:
-    """Verify callback(&Class::method) yields an indirect ref (real libclang)."""
+    """Verify callback(&Class::method) yields an indirect ref (real libclang).
+
+    The parameter is a pointer to a member: a plain function pointer
+    (``void (*cb)()``) made the call an error of the compiler, which only a
+    scan of the tokens read.  That scan is gone; the AST gives the address.
+    """
 
     def test_callback_address_of_method_is_indirect_ref(self, tmpdir):
         from fw_context_mcp.indexer.compile_commands import CompilationUnit
@@ -528,7 +371,7 @@ class TestCallbackTargetIndirectRef:
         src.write_text(
             "class WDT {\n"
             "public:\n"
-            "    void attach(void (*cb)());\n"
+            "    void attach(void (WDT::*cb)());\n"
             "    void wdt_reset();\n"
             "    void _timeout_interrupt();\n"
             "};\n"
@@ -607,95 +450,6 @@ class TestCallWithoutTargetGivesNoGuess:
 # ═══════════════════════════════════════════════════════════════════════════
 # F8 — dispatch bridge detection + deferred resolution
 # ═══════════════════════════════════════════════════════════════════════════
-
-
-class TestDispatchDetectionFallback:
-    """Verify dispatch PendingDispatch creation in source-line fallback."""
-
-    @pytest.fixture(autouse=True)
-    def _import(self, disk_buffers):
-        from fw_context_mcp.indexer.symbols import _run_source_line_fallback
-        self._fallback = _run_source_line_fallback
-
-    def _run(self, source: str, qn_to_usr: dict[str, str]):
-        import tempfile
-        with tempfile.NamedTemporaryFile("w", suffix=".cpp", delete=False) as f:
-            f.write(source)
-            path = f.name
-        refs: list = []
-        pending: list = []
-        seen: dict = {}
-        usr_to_qn = {u: q for q, u in qn_to_usr.items()}
-        fn_spans = [("u_caller", 1, len(source.splitlines()))]
-        self._fallback(
-            _FakeTU(path), refs, pending, seen,
-            fn_spans, qn_to_usr, usr_to_qn,
-            logging.getLogger("test"),
-        )
-        return refs, pending
-
-    def test_dispatch_call_every_creates_pending(self):
-        """EventQueue::call_every with &Class::method → PendingDispatch."""
-        src = (
-            "void ZBLE::ZBLE() {\n"
-            '    _maineventQueue.call_every(1000ms, this, &ZBLE::watch_ble);\n'
-            "}\n"
-        )
-        qn = {
-            "the Mbed project::ZBLE::ZBLE": "u_caller",
-            "events::EventQueue::call_every": "u_call_every",
-            "the Mbed project::ZBLE::watch_ble": "u_watch",
-        }
-        _refs, pending = self._run(src, qn)
-
-        matches = [
-            p for p in pending
-            if p.callee_qn == "events::EventQueue::call_every"
-            and p.target_name == "watch_ble"
-        ]
-        assert matches, (
-            "call_every with &ZBLE::watch_ble must produce a PendingDispatch"
-        )
-
-    def test_dispatch_ignored_for_non_dispatch_method(self):
-        """Regular method with same name as dispatch method but not in map → no PendingDispatch."""
-        src = (
-            "void App::run() {\n"
-            '    _timer.attach(&App::onTick);\n'
-            "}\n"
-        )
-        # "attach" is a dispatch method name but "App::attach" is NOT in the map
-        qn = {
-            "the Mbed project::App::run": "u_caller",
-            "the Mbed project::App::attach": "u_attach",
-            "the Mbed project::App::onTick": "u_tick",
-        }
-        _refs, pending = self._run(src, qn)
-        assert not pending, (
-            "Non-dispatch attach must not create PendingDispatch"
-        )
-
-    def test_thread_start_dispatch(self):
-        """Thread::start with callback → PendingDispatch for mbed-os."""
-        src = (
-            "void App::run() {\n"
-            '    _thread.start(&App::threadLoop);\n'
-            "}\n"
-        )
-        qn = {
-            "the Mbed project::App::run": "u_caller",
-            "rtos::Thread::start": "u_start",
-            "the Mbed project::App::threadLoop": "u_loop",
-        }
-        _refs, pending = self._run(src, qn)
-
-        matches = [
-            p for p in pending
-            if p.callee_qn == "rtos::Thread::start"
-        ]
-        assert matches, (
-            "Thread::start with callback must produce a PendingDispatch"
-        )
 
 
 class TestCallGraphDispatchAndGlobalCtors:

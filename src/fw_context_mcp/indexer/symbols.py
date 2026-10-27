@@ -34,16 +34,12 @@ For each translation unit it produces:
   ``_handle_fn_ptr_as_argument``).  Arguments to dispatch-registration APIs
   are additionally captured via ``PendingDispatch``.
 
-* **Source-line fallback** — embedded C++ (mbed-os, Zephyr) relies heavily on
-  templates.  ``callback(&Class::method, this)`` and ``_timeout.attach(...)``
-  often produce ``UNEXPOSED_EXPR`` or empty CALL_EXPR cursors that libclang
-  cannot resolve.  ``_run_source_line_fallback`` scans raw source text inside
-  known function bodies and emits the missing call edges via regex matching.
-
-* **Conservative disambiguation** — ``_resolve_method_usr`` returns ``None``
-  when candidate methods are ambiguous rather than guessing.  A wrong edge
-  is worse than a missing edge (previously ``_timeout.attach(...)`` was
-  mis-resolved to ``SerialBase::attach``).
+* **No name resolution** — each reference comes from a cursor that names
+  its target.  A scan of the tokens and of the source text once took the
+  target from a name (``&Class::method``); it read comments and the return
+  type of a definition (``Gap &Gap::onShutdown()``), and its true finds were
+  addresses in template bodies, which the slot facts of the template
+  instances now give (``_slots.collect_slot_facts``).
 
 * **Declaration-to-definition promotion** — ``_process_one_symbol`` tracks
   ``seen_usrs`` as ``USR → bool(definition)``.  A forward declaration is
@@ -62,7 +58,7 @@ from functools import cache
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ._dispatch_bridges import _DISPATCH_ENTRY_POINTS, _DISPATCH_METHOD_NAMES, _TYPE_ERASED_ISR_FUNCTIONS
+from ._dispatch_bridges import _DISPATCH_ENTRY_POINTS
 from ._libclang import cindex as cx
 from .compile_commands import CompilationUnit
 from .models import (
@@ -779,108 +775,6 @@ def _extract_macros(tu_cursor: cx.Cursor, resolve_fn, skip_files=None) -> list[M
     return macros
 
 
-def _class_match_score(hint: str, class_part: str) -> int:
-    """Score how well a field-name hint matches a class name.
-
-    Multi-level matching designed for the fallback path where field
-    names use snake_case (``_radio_msg_manager``) but class names use
-    CamelCase (``RadioMsgManager``), or where the field name is a
-    superset of the class name (``_uart_driver`` → ``UART_DRIVER``).
-
-    Returns 0 = no match, 1 = weak (token-level), 2 = good.
-    """
-    if not hint or not class_part:
-        return 0
-    class_lower = class_part.lower()
-
-    if hint in class_lower:
-        return 2
-    if class_lower in hint:
-        return 1
-
-    hint_flat = hint.replace("_", "")
-    if hint_flat and hint_flat in class_lower:
-        return 2
-    if hint_flat and class_lower in hint_flat:
-        return 1
-
-    hint_tokens = [t for t in hint.split("_") if t]
-    if not hint_tokens:
-        return 0
-    match_count = sum(1 for t in hint_tokens if t in class_lower)
-    if match_count == len(hint_tokens):
-        return 2
-    if match_count > 0:
-        return 1
-
-    return 0
-
-
-def _resolve_partial_qn(partial: str, qn_to_usr: dict[str, str]) -> str | None:
-    """Resolve a possibly-partial qualified name (e.g. ``WDT::_timeout_interrupt``)
-    against *qn_to_usr* by exact match, then by ``::<partial>`` suffix match."""
-    usr = qn_to_usr.get(partial)
-    if usr:
-        return usr
-    suffix = f"::{partial}"
-    for qn, u in qn_to_usr.items():
-        if qn.endswith(suffix):
-            return u
-    return None
-
-
-def _resolve_method_usr(
-    method_name: str,
-    qn_to_usr: dict[str, str],
-    field_name: str = "",
-    caller_qn: str = "",
-) -> str | None:
-    """Find USR for *method_name* in *qn_to_usr*.
-
-    Disambiguation order (mirrors C++ scoping rules):
-
-    1. Exact qualified name match.
-    2. Single ``::method_name`` suffix candidate.
-    3. Receiver-class hint from *field_name* — for ``obj.method()`` the
-       receiver's type is authoritative, so a field-name match wins over
-       the caller's class.
-    4. Caller-class match — bare ``method()`` calls inside a class method
-       resolve to sibling methods of the enclosing class (fixes
-       ``wdt_reset()`` inside ``WDT::swdt_check``).
-    5. Ambiguous → ``None``.  Never emit a possibly-wrong edge: previously
-       an arbitrary first candidate was returned, which mis-resolved
-       ``_timeout.attach(...)`` to ``mbed::SerialBase::attach``.
-    """
-    usr = qn_to_usr.get(method_name)
-    if usr:
-        return usr
-    suffix = f"::{method_name}"
-    candidates: list[tuple[str, str]] = [
-        (qn, u) for qn, u in qn_to_usr.items() if qn.endswith(suffix)
-    ]
-    if not candidates:
-        return None
-    if len(candidates) == 1:
-        return candidates[0][1]
-    if field_name:
-        _hint = field_name.lstrip("_").lower()
-        _scored: list[tuple[int, str, str]] = []
-        for qn, u in candidates:
-            _class_part = qn.rsplit("::", 2)[-2] if "::" in qn else ""
-            _score = _class_match_score(_hint, _class_part)
-            _scored.append((_score, qn, u))
-        _scored.sort(key=lambda x: -x[0])
-        if _scored[0][0] > 0:
-            return _scored[0][2]
-    if caller_qn:
-        _caller_class = caller_qn.rsplit("::", 1)[0]
-        if _caller_class:
-            for qn, u in candidates:
-                if qn.rsplit("::", 1)[0] == _caller_class:
-                    return u
-    return None
-
-
 #: The references of one unit, by the key of their site (see ``_claim_ref``).
 _SeenRefs = dict[tuple, Reference]
 
@@ -1171,8 +1065,8 @@ def _lambda_qualified_name(expression: cx.Cursor) -> str:
 
 def _walk_template_instances(
     seeds: dict[str, cx.Cursor], refs: list[Reference], seen_ref: _SeenRefs,
-) -> None:
-    """Walk the bodies of the template instances that the unit uses, and claim their calls.
+) -> list[cx.Cursor]:
+    """Walk the bodies of the template instances that the unit uses, claim their calls, and give the definitions.
 
     WHY: a call in a template body that names a dependent type
     (``device.sample()`` in ``template <class T> int read_twice(T& device)``)
@@ -1195,8 +1089,9 @@ def _walk_template_instances(
     the instance of the unit that owns the header.  An explicit
     specialization is written code, not an instance: the AST walk has it.
 
-    Only calls give an edge here; a function address in an instance body
-    is a later step (the slots of the indirect calls).
+    Only calls give an edge here.  A function address in an instance body
+    is a slot fact: the definitions that the walk gives go to
+    ``_slots.collect_slot_facts``, in the order of the walk.
 
     A body is walked as the AST walk reads it: the calls in a lambda belong
     to the lambda (`_lambda_usr`), and a call of a lambda (``l()``) is an
@@ -1207,6 +1102,7 @@ def _walk_template_instances(
     work = list(seeds.values())
     queued = set(seeds)
     walked: set[str] = set()
+    definitions: list[cx.Cursor] = []
     classes: dict[str, cx.Cursor] = {}
     classes_done: set[str] = set()
     while True:
@@ -1218,7 +1114,7 @@ def _walk_template_instances(
                 for method in class_cursor.type.get_methods():
                     _queue_instance(method, queued, work)
             if not work:
-                return
+                return definitions
         declaration = work.pop()
         definition = declaration.get_definition()
         if definition is None or not definition.is_definition() or not _is_implicit_instance(definition):
@@ -1229,6 +1125,7 @@ def _walk_template_instances(
         if definition_key in walked:
             continue
         walked.add(definition_key)
+        definitions.append(definition)
         parent = definition.semantic_parent
         if parent is not None and parent.kind in _INSTANCE_CLASS_KINDS and _is_implicit_instance(parent):
             classes.setdefault(parent.get_usr(), parent)
@@ -1315,10 +1212,6 @@ def _claim_ref(refs: list[Reference], seen_ref: _SeenRefs, ref: Reference) -> bo
     list the location of the function inside it.  The AST walk is
     preorder, so the enclosing list always claims first.
 
-    The line key (the key without the column) lets ``_claim_text_ref``
-    find an earlier site of its line: the scan of the source text has no
-    column.
-
     Returns True when *ref* is a new reference.
     """
     key = (ref.to_usr, ref.from_file, ref.from_line, ref.from_col, ref.from_usr, ref.ref_kind)
@@ -1335,29 +1228,8 @@ def _claim_ref(refs: list[Reference], seen_ref: _SeenRefs, ref: Reference) -> bo
     seen_ref[claim] = ref
     if ref.slot_index is not None:
         seen_ref.setdefault(("slotted", *line_key), ref)
-    seen_ref.setdefault(("line", *line_key), ref)
     refs.append(ref)
     return True
-
-
-def _claim_text_ref(refs: list[Reference], seen_ref: _SeenRefs, ref: Reference) -> bool:
-    """Add a reference that the scan of the source text found, which has no column.
-
-    A site of the same target, line, caller and kind that an earlier claim
-    found gets the origin of the text, and no second row with column 0.
-    In the index run that earlier claim is one of the scan itself: two of
-    its phases can name one target on one line.  The scan skips each line
-    where the walk found a call or an indirect reference
-    (``_run_source_line_fallback``), thus it does not meet a site of the
-    walk there.
-
-    Returns True when *ref* is a new reference.
-    """
-    known = seen_ref.get(("line", ref.to_usr, ref.from_file, ref.from_line, ref.from_usr, ref.ref_kind))
-    if known is not None:
-        known.origins |= ref.origins
-        return False
-    return _claim_ref(refs, seen_ref, ref)
 
 
 def _emit_fn_ptr_targets(
@@ -1367,7 +1239,6 @@ def _emit_fn_ptr_targets(
     refs: list[Reference],
     skip_usr: str | None = None,
     in_init_list: bool = False,
-    qn_to_usr: dict[str, str] | None = None,
     slot_index: int | None = None,
     expected_type: cx.Type | None = None,
 ) -> None:
@@ -1428,46 +1299,15 @@ def _emit_fn_ptr_targets(
                     origins=RefOrigin.DIRECT,
                 ))
 
-    # Token fallback: when _find_fn_refs_in_expr found no targets in any child
-    # (e.g. UNEXPOSED_EXPR wrapping a member function pointer inside a CALL_EXPR
-    # like callback(&Class::method)), try token-based extraction on the whole expr.
-    # This is the last-resort fallback — the libclang AST is opaque but the raw
-    # token stream still contains the ``&Class::method`` pattern.  We scan for
-    # it via _extract_fn_refs_from_unexposed which does not depend on AST
-    # structure, only on a linear token sequence.
-    if qn_to_usr is not None:
-        any_found = False
-        for child in scanned:
-            if _find_fn_refs_in_expr(child, skip_usr, expected=expected_type):
-                any_found = True
-                break
-        if not any_found:
-            pairs = _extract_fn_refs_from_unexposed(expr_cursor, qn_to_usr)
-            for target_usr, _name, site in pairs:
-                if target_usr == skip_usr or not site.file:
-                    continue
-                # The target came from a name in the tokens: TEXT.
-                _claim_ref(refs, seen_ref, Reference(
-                    to_usr=target_usr,
-                    from_file=site.file.name,
-                    from_line=site.line,
-                    from_usr=caller_usr,
-                    ref_kind="indirect",
-                    slot_index=slot_index,
-                    from_col=site.column,
-                    origins=RefOrigin.TEXT,
-                ))
-
 
 def _build_refs(
     tu: cx.TranslationUnit,
     tu_path_str: str,
-    symbols: list[Symbol],
     resolve_fn,
     anon_usr_to_field: dict[str, str],
     _log,
     skip_files: frozenset[str] | None = None,
-) -> tuple[list[Reference], list[PendingDispatch]]:
+) -> tuple[list[Reference], list[PendingDispatch], list[cx.Cursor]]:
     """Walk the TU AST extracting references and the registrations of dispatch callbacks.
 
     When *skip_files* is a non-empty frozenset, subtrees of already
@@ -1486,28 +1326,15 @@ def _build_refs(
       function's ``end_line`` (which is non-zero only for TU-resident
       definitions), it is popped (we passed the closing brace).
 
-    **Phase 2 — source-line fallback**: after the AST walk,
-    :func:`_run_source_line_fallback` scans raw source text inside known
-    function spans for dispatch calls, type-erased ISR registrations and
-    ``&Class::method``.  It emits indirect edges and pending dispatches,
-    and no call edge.
-
-    Returns (refs, pending_dispatches).
+    Returns (refs, pending_dispatches, instances): *instances* are the
+    definitions of the template instances that the unit walked.
     """
     import logging as _logging
     _log = _logging.getLogger(__name__)
 
-    _callable_kind_strs = frozenset({"function", "method", "constructor", "destructor"})
-    qn_to_usr: dict[str, str] = {}
-    for s in symbols:
-        if s.qualified_name and s.kind in _callable_kind_strs:
-            qn_to_usr[s.qualified_name] = s.usr
-    usr_to_qn: dict[str, str] = {u: q for q, u in qn_to_usr.items()}
-
     refs: list[Reference] = []
     pending_dispatches: list[PendingDispatch] = []
     seen_ref: _SeenRefs = {}
-    _fn_spans: list[tuple[str, int, int]] = []
 
     fn_stack: list[tuple[str, int, str]] = []
     # The caller of each cursor in the body of a lambda, by cursor hash:
@@ -1556,7 +1383,6 @@ def _build_refs(
                     _ext_file = _ext.start.file.name
                     _resolved_file = str(resolve_fn(_ext_file))
                     if _resolved_file == tu_path_str:
-                        _fn_spans.append((cur_fn or '', _ext.start.line, _ext.end.line))
                         fn_stack.append((cur_fn or '', _ext.end.line, tu_path_str))
                     else:
                         # Header-resident definition (inline body in an
@@ -1591,7 +1417,7 @@ def _build_refs(
         _seed_explicit_instantiation(instance_seeds, cursor)
 
         _process_ref_cursor(
-            cursor, cur_fn, refs, pending_dispatches, seen_ref, qn_to_usr, tu_path_str, resolve_fn, _log,
+            cursor, cur_fn, refs, pending_dispatches, seen_ref, tu_path_str, resolve_fn,
             static_init_calls, instance_seeds,
         )
 
@@ -1606,14 +1432,9 @@ def _build_refs(
                 lambda_callers[(node.hash, node.kind.value)] = key
 
     # The calls that only the instances of the templates resolve.
-    _walk_template_instances(instance_seeds, refs, seen_ref)
+    instances = _walk_template_instances(instance_seeds, refs, seen_ref)
 
-    # Source-line scan for dispatch calls and &Class::method (indirect only)
-    _run_source_line_fallback(
-        tu, refs, pending_dispatches, seen_ref, _fn_spans, qn_to_usr, usr_to_qn, _log,
-    )
-
-    return refs, pending_dispatches
+    return refs, pending_dispatches, instances
 
 
 def _is_plain_assignment(cursor: cx.Cursor) -> bool:
@@ -2008,10 +1829,8 @@ def _process_ref_cursor(
     refs: list[Reference],
     pending_dispatches: list[PendingDispatch],
     seen_ref: _SeenRefs,
-    qn_to_usr: dict[str, str],
     tu_path_str: str,
     resolve_fn: Callable[..., object],
-    _log: logging.Logger,
     static_init_calls: set[int],
     instance_seeds: dict[str, cx.Cursor],
 ) -> None:
@@ -2022,10 +1841,8 @@ def _process_ref_cursor(
 
     _handle_direct_refs(cursor, cur_fn, refs, seen_ref, static_init_calls, instance_seeds)
     if cursor.kind == cx.CursorKind.CALL_EXPR:
-        _handle_fn_ptr_as_argument(cursor, cur_fn, refs, pending_dispatches,
-                                   seen_ref, tu_path_str, qn_to_usr, _log)
+        _handle_fn_ptr_as_argument(cursor, cur_fn, refs, pending_dispatches, seen_ref, tu_path_str)
     _handle_fn_ptr_cases(cursor, cur_fn, refs, seen_ref)
-    _handle_token_fallbacks(cursor, cur_fn, refs, seen_ref, qn_to_usr, _log)
 
 
 def _add_ref(refs: list[Reference], seen_ref: _SeenRefs, to_usr: str,
@@ -2115,48 +1932,10 @@ def _handle_runtime_vector(cursor: cx.Cursor, referenced: cx.Cursor | None,
     _claim_ref(refs, seen_ref, found)
 
 
-def _extract_fn_refs_from_unexposed(
-    cursor: cx.Cursor,
-    qn_to_usr: dict[str, str],
-) -> list[tuple[str, str, cx.SourceLocation]]:
-    """Extract ``(USR, rhs_name, site)`` triples from UNEXPOSED_EXPR tokens.
-
-    Parses token stream for ``&Class::method`` patterns and resolves
-    them against *qn_to_usr*.  *site* is the location of the token of the
-    method name: the location that a DECL_REF_EXPR of ``&Class::method``
-    has, thus a claim from the tokens and one from the AST of the same
-    reference get one key.
-    """
-    results: list[tuple[str, str, cx.SourceLocation]] = []
-    try:
-        tokens = list(cursor.get_tokens())
-    except (ValueError, TypeError, RuntimeError, AttributeError):
-        _log.debug("_extract_fn_refs_from_unexposed: get_tokens failed")
-        return []
-    for i, tok in enumerate(tokens):
-        if tok.spelling == "&" and i + 3 < len(tokens):
-            t1, t2, t3 = tokens[i + 1], tokens[i + 2], tokens[i + 3]
-            if (t1.kind.name == "IDENTIFIER" and t2.spelling == "::"
-                    and t3.kind.name == "IDENTIFIER"):
-                partial = f"{t1.spelling}::{t3.spelling}"
-                target_usr = qn_to_usr.get(partial)
-                if not target_usr:
-                    suffix = f"::{partial}"
-                    for qn, usr in qn_to_usr.items():
-                        if qn.endswith(suffix):
-                            target_usr = usr
-                            break
-                if target_usr:
-                    results.append((target_usr, t3.spelling, t3.location))
-    return results
-
-
 def _handle_fn_ptr_as_argument(cursor: cx.Cursor, cur_fn: str | None,
                                refs: list[Reference],
                                pending_dispatches: list[PendingDispatch],
-                               seen_ref: _SeenRefs, tu_path_str: str,
-                               qn_to_usr: dict[str, str],
-                               _log: logging.Logger) -> None:
+                               seen_ref: _SeenRefs, tu_path_str: str) -> None:
     """Function pointers passed as call arguments.
 
     Emits an ``indirect`` reference for every callable target found in the
@@ -2199,23 +1978,6 @@ def _handle_fn_ptr_as_argument(cursor: cx.Cursor, cur_fn: str | None,
 
     for arg in cursor.get_arguments():
         targets = _find_fn_refs_in_expr(arg, direct_callee_usr)
-        # Fallback: token-based extraction for opaque args
-        # (UNEXPOSED_EXPR, unresolved CALL_EXPR like callback(...), etc.)
-        if not targets:
-            for target_usr, name, site in _extract_fn_refs_from_unexposed(arg, qn_to_usr):
-                if target_usr != direct_callee_usr and site.file:
-                    # The target came from a name in the tokens: TEXT.
-                    _add_ref(refs, seen_ref, target_usr, site, cur_fn, "indirect", RefOrigin.TEXT)
-                    if _callee_dispatch_entry_qn is not None:
-                        pending_dispatches.append(PendingDispatch(
-                            callee_qn=_callee_qn,
-                            target_qn_partial="",
-                            target_name=name,
-                            target_usr=target_usr,
-                            file=tu_path_str,
-                            line=loc.line,
-                            caller_usr=cur_fn,
-                        ))
         for target, site in targets:
             raw_usr = target.get_usr()
             target_usr = _code_usr(target)
@@ -2231,7 +1993,7 @@ def _handle_fn_ptr_as_argument(cursor: cx.Cursor, cur_fn: str | None,
                         line=loc.line,
                         caller_usr=cur_fn,
                     ))
-    _emit_fn_ptr_targets(cursor, cur_fn, seen_ref, refs, direct_callee_usr, qn_to_usr=qn_to_usr)
+    _emit_fn_ptr_targets(cursor, cur_fn, seen_ref, refs, direct_callee_usr)
 
 
 def _init_list_is_positional(cursor: cx.Cursor) -> bool:
@@ -2855,245 +2617,6 @@ def _static_init_constructor_calls(var: cx.Cursor) -> set[int]:
     return calls
 
 
-def _handle_token_fallbacks(cursor: cx.Cursor, cur_fn: str | None,
-                            refs: list[Reference],
-                            seen_ref: _SeenRefs, qn_to_usr: dict[str, str],
-                            _log: logging.Logger) -> None:
-    """Token-based detection of ``&Class::method`` that the AST leaves opaque.
-
-    Operates on the raw token stream, not the libclang AST.  Two patterns:
-
-    1. **UNEXPOSED_EXPR**: extracts ``&Class::method`` via
-       ``_extract_fn_refs_from_unexposed`` from any opaque expression node.
-
-    2. **Callback-style indirect targets**: ``&Class::method`` inside a
-       CALL_EXPR argument list.  Emits ``ref_kind='indirect'``.
-
-    WHY no call edge from the tokens: the scan once also read each
-    ``name(`` and ``obj.name(`` token of a CALL_EXPR, and it took the
-    target from the name.  On a clean parse, libclang resolves each
-    non-dependent direct call itself.  Where the AST gave no target, the
-    name gave wrong targets:
-
-    - the method of the class of the caller instead of the method of the
-      receiver;
-    - a symbol of the same name in another class;
-    - with a header in the skip set, a target that changed with the other
-      units of the build.
-
-    Some targets were right: a call on a dependent receiver in a template
-    body, where the name happened to be unique.  A name cannot tell those
-    from the wrong ones; the calls of a template come from its
-    instantiations instead.
-
-    The tokens of a CALL_EXPR in a macro expansion also reach far past the
-    call.  The two patterns here stay until a later step resolves the
-    indirect calls from the assignments to fields, variables and
-    parameters ("slots"), with no names.
-    """
-    if cursor.kind == cx.CursorKind.UNEXPOSED_EXPR:
-        pairs = _extract_fn_refs_from_unexposed(cursor, qn_to_usr)
-        for _target_usr, _rhs_name, site in pairs:
-            if site.file:
-                _add_ref(refs, seen_ref, _target_usr, site, cur_fn, "indirect", RefOrigin.TEXT)
-
-    if cursor.kind == cx.CursorKind.CALL_EXPR:
-        try:
-            tokens = list(cursor.get_tokens())
-        except (ValueError, TypeError, RuntimeError, AttributeError):
-            _log.debug("_handle_token_fallbacks: get_tokens failed")
-            return
-        # Callback-style indirect targets: `&Class::method` passed as a call
-        # argument (e.g. `_timeout.attach(callback(&WDT::_timeout_interrupt), delay)`).
-        # libclang often resolves the outer call (attach) but leaves the
-        # nested `&Class::method` opaque — emit the target as an indirect ref
-        # so find_references / find_all_callers_recursive can see it.
-        for i, tok in enumerate(tokens):
-            if (tok.spelling == "&" and i + 3 < len(tokens)
-                    and tokens[i + 1].kind.name == "IDENTIFIER"
-                    and tokens[i + 2].spelling == "::"
-                    and tokens[i + 3].kind.name == "IDENTIFIER"):
-                partial = f"{tokens[i + 1].spelling}::{tokens[i + 3].spelling}"
-                target_usr = _resolve_partial_qn(partial, qn_to_usr)
-                site = tokens[i + 3].location
-                if target_usr and site.file:
-                    # The site is the name of the method, as in
-                    # _extract_fn_refs_from_unexposed: one key for one reference.
-                    _add_ref(refs, seen_ref, target_usr, site, cur_fn, "indirect", RefOrigin.TEXT)
-
-
-def _run_source_line_fallback(
-    tu: cx.TranslationUnit,
-    refs: list[Reference],
-    pending_dispatches: list[PendingDispatch],
-    seen_ref: _SeenRefs,
-    _fn_spans: list[tuple[str, int, int]],
-    qn_to_usr: dict[str, str],
-    usr_to_qn: dict[str, str],
-    _log,
-) -> None:
-    """Post-processing: scan the source lines of known function bodies for
-    patterns that the AST leaves opaque, and emit indirect references.
-
-    WHY no call edge: the scan once also read ``obj.method(`` and bare
-    ``name(`` on each line without an AST call edge, and it took the target
-    from the name.  It read comments, inactive ``#if`` lines and definition
-    lines too, and the name lookup took the method of the class of the
-    caller or a symbol of the same name in another class.  The compiler
-    gives each direct call that the code makes; a name gives no more.
-
-    Three phases per source line remain until a later step resolves the
-    indirect calls from the assignments, with no names.  They keep their
-    old numbers, which comments and tests use; phase 2 (bare ``name(``) is
-    gone:
-
-    **Phase 1 — dispatch API detection**: for ``obj.method(`` with a method
-    name in ``_DISPATCH_METHOD_NAMES``, scans for ``&Class::callback``
-    arguments and records a ``PendingDispatch``.
-
-    **Phase 3 — type-erased ISR registration**: detects patterns like
-    ``NVIC_SetVector(IRQn, (uint32_t)handler)`` where the integer cast
-    obliterates the function-pointer type.  Uses ``_TYPE_ERASED_ISR_FUNCTIONS``
-    (a registry of known ISR-registration function names mapped to their
-    handler-argument position) and attempts to resolve the handler name
-    through both ``&Class::method`` regex and bare-name lookup.
-
-    **Phase 4 — &Class::method on source text**: a final blanket scan for
-    ``&Class::method`` patterns on raw source text.
-
-    Each phase uses ``seen_ref`` for deduplication — a reference already
-    found by an earlier phase or the AST walk is never re-emitted.
-    """
-    import re as _re
-
-    _tu_file = tu.spelling
-    _lines_with_calls: set[int] = {
-        r.from_line for r in refs
-        if r.ref_kind in ("call", "indirect") and r.from_file == _tu_file
-    }
-    # The text that the parse read, not the disk now: the line numbers below
-    # meet the extents of that parse.  A read of the disk after the parse
-    # scanned a file saved meanwhile, and a file that the build removed
-    # raised FileNotFoundError out of extract_all.  str.splitlines() splits
-    # "\r\n" and "\r" as read_text() with universal newlines did.
-    from ._parsed_text import file_of_parse, parsed_bytes
-
-    _data = parsed_bytes(tu, file_of_parse(tu, _tu_file))
-    _source_lines = _data.decode("utf-8", errors="replace").splitlines() if _data is not None else []
-    for _lineno_0, _line in enumerate(_source_lines):
-        _lineno = _lineno_0 + 1
-        if _lineno in _lines_with_calls:
-            continue
-        _line_fn = None
-        for _fn_usr, _fn_start, _fn_end in _fn_spans:
-            if _fn_start <= _lineno <= _fn_end:
-                _line_fn = _fn_usr
-                break
-        if _line_fn is None:
-            continue
-        _line_qn = usr_to_qn.get(_line_fn or "") or ""
-        # ── Phase 1: dispatch API detection ────────────────────────────
-        # The regex reads ``field.method(`` and ``field->method(``.  It
-        # writes NO call edge: a target taken from the name of the method
-        # is a guess (the class of the caller, a method of another class).
-        # It only finds a dispatch call (``queue.call(&Class::cb)``) and
-        # records a PendingDispatch, until a later step resolves the
-        # indirect calls from the assignments, with no names.
-        for _m in _re.finditer(r'(\w+)(?:\.|->)(\w+)\s*\(', _line):
-            _field_name = _m.group(1)
-            _method_name = _m.group(2)
-            if _method_name not in _DISPATCH_METHOD_NAMES:
-                continue
-            _target_usr = _resolve_method_usr(_method_name, qn_to_usr, _field_name, _line_qn)
-            if _target_usr:
-                # Look up the matched method's QN to check against
-                # _DISPATCH_ENTRY_POINTS (which maps callee QN → entry QN)
-                _dispatch_callee_qn = ""
-                for _dq in _DISPATCH_ENTRY_POINTS:
-                    if qn_to_usr.get(_dq) == _target_usr:
-                        _dispatch_callee_qn = _dq
-                        break
-                if _dispatch_callee_qn:
-                    # Find callback targets in &Class::method arguments
-                    for _cm in _re.finditer(r'&(\w+)::(\w+)', _line):
-                        _partial = f"{_cm.group(1)}::{_cm.group(2)}"
-                        _cb_usr = _resolve_partial_qn(_partial, qn_to_usr)
-                        if _cb_usr:
-                            pending_dispatches.append(PendingDispatch(
-                                callee_qn=_dispatch_callee_qn,
-                                target_qn_partial=_partial,
-                                target_name=_cm.group(2),
-                                target_usr=_cb_usr,
-                                file=_tu_file,
-                                line=_lineno,
-                                caller_usr=_line_fn,
-                            ))
-        # ── Phase 3: Type-erased ISR registration detection ────────────
-        # APIs like NVIC_SetVector(IRQn, (uint32_t)handler) where
-        # libclang cannot see the fn-ptr because of the integer cast.
-        # _TYPE_ERASED_ISR_FUNCTIONS maps known ISR-registration function
-        # names to their handler-argument position (currently unused in
-        # the detection itself — the handler is found by regex, not by
-        # argument indexing).  Two sub-strategies for handler resolution:
-        #   a) ``&Class::method`` pattern in the argument text.
-        #   b) Bare-name lookup of the last identifier in the arg list
-        #      (after stripping parenthesized sub-expressions).
-        for _isr_fn, _arg_pos in _TYPE_ERASED_ISR_FUNCTIONS.items():
-            for _m in _re.finditer(rf'\b{_isr_fn}\s*\(', _line):
-                _call_start = _m.end()
-                _depth = 0
-                _call_end = _call_start
-                for _i in range(_call_start, len(_line)):
-                    if _line[_i] == '(':
-                        _depth += 1
-                    elif _line[_i] == ')':
-                        if _depth == 0:
-                            _call_end = _i
-                            break
-                        _depth -= 1
-                _args_text = _line[_call_start:_call_end]
-                _isr_cm = _re.search(r'&(\w+)::(\w+)', _args_text)
-                if _isr_cm:
-                    _partial = f"{_isr_cm.group(1)}::{_isr_cm.group(2)}"
-                    _handler_usr = _resolve_partial_qn(_partial, qn_to_usr)
-                else:
-                    _cleaned = _re.sub(r'\([^)]*\)', ' ', _args_text)
-                    _ids = _re.findall(r'\b([A-Za-z_]\w*)\b', _cleaned)
-                    if len(_ids) < 2:
-                        continue
-                    _handler_name = _ids[-1]
-                    _handler_usr = _resolve_method_usr(
-                        _handler_name, qn_to_usr, caller_qn=_line_qn,
-                    )
-                if not _handler_usr:
-                    continue
-                _claim_text_ref(refs, seen_ref, Reference(
-                    to_usr=_handler_usr, from_file=_tu_file,
-                    from_line=_lineno, from_usr=_line_fn,
-                    ref_kind="indirect", from_col=0, origins=RefOrigin.TEXT,
-                ))
-        # ── Phase 4: &Class::method on source text ─────────────────────
-        # Blanket scan for ``&Class::method`` patterns on every source
-        # line inside a known function body.  This runs on raw text, not
-        # AST cursors — when a TU is too degraded for libclang to produce
-        # CALL_EXPR cursors (embedded mbed-os builds with unrecoverable
-        # template errors), the AST-based _handle_token_fallbacks cannot
-        # see the empty body, but the source text still has the patterns.
-        for _m in _re.finditer(r'&(\w+)::(\w+)', _line):
-            _partial = f"{_m.group(1)}::{_m.group(2)}"
-            _target_usr = _resolve_partial_qn(_partial, qn_to_usr)
-            if not _target_usr:
-                continue
-            _claim_text_ref(refs, seen_ref, Reference(
-                to_usr=_target_usr, from_file=_tu_file,
-                from_line=_lineno, from_usr=_line_fn, ref_kind="indirect",
-                from_col=0, origins=RefOrigin.TEXT,
-            ))
-
-
-
-
-
 @dataclass
 class ExtractionResult:
     """Result of a single extract_all() call on one translation unit."""
@@ -3162,9 +2685,9 @@ def extract_all(
     Args:
         unit: The translation unit to parse (file path + compiler flags).
         with_refs: When True, also extract call, reference, and member-access
-            edges and embed a source-line token fallback pass for
-            template-obscured expressions.  Inheritance is always extracted
-            regardless of this flag.
+            edges, and the slot facts of the indirect calls (also of the
+            bodies of the template instances).  Inheritance is always
+            extracted regardless of this flag.
         skip_files: Optional set of resolved file paths whose subtrees
             should be skipped.  Passed through to all internal walkers.
             When ``None`` or empty, the native ``walk_preorder`` is used
@@ -3273,13 +2796,13 @@ def extract_all(
         )
         return result
 
-    refs, pending_dispatches = _build_refs(
-        tu, tu_path_str, symbols, _resolve, anon_usr_to_field, _log,
+    refs, pending_dispatches, instances = _build_refs(
+        tu, tu_path_str, _resolve, anon_usr_to_field, _log,
         skip_files=_skip_frozen,
     )
     from ._slots import collect_slot_facts
 
-    slots = collect_slot_facts(tu, _skip_frozen, _resolve)
+    slots = collect_slot_facts(tu, _skip_frozen, _resolve, instances)
 
     _t_total = _time.monotonic() - _t_start
     _t_refwalk = _t_total - _t_parse - _t_symwalk

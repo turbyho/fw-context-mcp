@@ -21,6 +21,7 @@ from __future__ import annotations
 import sqlite3
 
 from ..models import RefOrigin
+from ._indirect import ONE_UNIT_SITES
 from ._owners import delete_ownership_for_build
 from ._schema import _ensure_column
 from ._slots import delete_slot_facts_for_config
@@ -651,7 +652,8 @@ def get_build_stats(conn: sqlite3.Connection, config_hash: str) -> dict:
     # The indirect calls (slot facts) and the call edges that their
     # resolution gives (origins SLOT or TYPE_ONLY).
     indirect_sites = conn.execute(
-        "SELECT COUNT(*) FROM slot_sites WHERE config_hash = ?", (config_hash,)
+        f"SELECT COUNT(*) FROM slot_sites s WHERE s.config_hash = ? AND {ONE_UNIT_SITES}",  # noqa: S608 — a constant
+        (config_hash,),
     ).fetchone()[0]
     indirect_edges = conn.execute(
         "SELECT COUNT(*) FROM refs WHERE config_hash = ? AND ref_kind = 'call' AND (origins & ?) != 0",
