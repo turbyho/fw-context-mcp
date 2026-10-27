@@ -1831,7 +1831,7 @@ def find_wrapper_callers(
         wrapped: dict[str, dict] = {}
         for r in rows:
             caller_qn = r["caller_qname"] or r["caller_name"] or "?"
-            # Extract class from qualified name: "the Mbed project::ZMODEM::start" → "the Mbed project::ZMODEM"
+            # Extract class from qualified name: "app::Transfer::start" → "app::Transfer"
             if "::" in caller_qn:
                 wrapper_class = caller_qn.rsplit("::", 1)[0]
             else:

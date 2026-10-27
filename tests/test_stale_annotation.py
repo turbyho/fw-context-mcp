@@ -133,19 +133,19 @@ class TestCollectResultPaths:
         would leave most of them unchecked.
         """
         result = [{
-            "wrapper_class": "the Mbed project::ZMODEM",
+            "wrapper_class": "app::Transfer",
             "method_count": 2,
             "methods": [
-                {"method": "start", "file": "src/zmodem.cpp", "calls": []},
-                {"method": "stop", "file": "src/zmodem_hal.cpp", "calls": []},
+                {"method": "start", "file": "src/transfer.cpp", "calls": []},
+                {"method": "stop", "file": "src/transfer_hal.cpp", "calls": []},
             ],
         }]
 
         paths = collect_result_paths(result, tmp_path)
 
         assert paths == [
-            str(tmp_path / "src/zmodem.cpp"),
-            str(tmp_path / "src/zmodem_hal.cpp"),
+            str(tmp_path / "src/transfer.cpp"),
+            str(tmp_path / "src/transfer_hal.cpp"),
         ]
 
     def test_the_descent_stops_at_one_level(self, tmp_path: Path):

@@ -25,7 +25,7 @@ class TestAbsPath:
 
     def test_nested_relative(self):
         root = Path("/p")
-        assert _abs_path(root, "lib/modem/zmodem_driver.cpp") == "/p/lib/modem/zmodem_driver.cpp"
+        assert _abs_path(root, "lib/modem/modem_driver.cpp") == "/p/lib/modem/modem_driver.cpp"
 
 
 class TestReadSymbolBody:

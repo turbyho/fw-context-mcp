@@ -28,9 +28,9 @@ to answer: "which functions can be called through this function pointer?"
 Name → USR resolution uses a four-tier match:
 
 1. Exact ``name`` match — ``send`` matches bare name.
-2. Exact ``qualified_name`` match — ``the Mbed project::ZMODEM_DRIVER::send``.
-3. Suffix LIKE on ``qualified_name`` — ``ZMODEM_DRIVER::send`` matches
-   ``the Mbed project::ZMODEM_DRIVER::send``.
+2. Exact ``qualified_name`` match — ``app::ModemDriver::send``.
+3. Suffix LIKE on ``qualified_name`` — ``ModemDriver::send`` matches
+   ``app::ModemDriver::send``.
 4. Plain name fallback — the segment after the last ``::``.
 
 For aggregate types (class, struct, enum), references are stored at
