@@ -37,6 +37,14 @@ class RefOrigin(enum.IntFlag):
       only an instantiation resolves.  The edge is stored on the template
       (caller and target), at the place of the call in the template.  The
       units that found it are in ``ref_producers``.
+    * ``SLOT`` — the resolution of the slot facts (``_slot_resolution``):
+      an indirect call reaches a function that the code puts into its slot
+      or into a slot that flows into it.
+    * ``TYPE_ONLY`` — the same resolution, when the slot does not tell the
+      targets (no slot, or a slot that code out of view can write): each
+      function whose address the build takes and whose type is the type of
+      the call.  A superset: the type is a fact of the compiler, but not
+      each function of the type is a target.
     """
 
     DIRECT = 1
@@ -44,6 +52,8 @@ class RefOrigin(enum.IntFlag):
     ASM = 4
     DISPATCH = 8
     INSTANTIATION = 16
+    SLOT = 32
+    TYPE_ONLY = 64
 
 
 def origins_or_sql(column: str) -> str:
@@ -317,11 +327,19 @@ class SlotSite:
             one place.  The place and the ordinal are the key that an
             argument of the site carries.
         caller: The code key of the code that makes it, or None.
-        kind: "pointer" (a call through a function pointer) or "object"
-            (the ``operator()`` of a callable object).
+        kind: "pointer" (a call through a function pointer), "object" (the
+            ``operator()`` of a callable object), or "address" (a call of
+            an address that is a number: the start of the application from
+            a bootloader, a routine of the ROM; no code of the build is its
+            target).
         slot: The slot that the callee names, or "" (see *reason*).
         slot_type: The type key of the callee.
-        reason: Why no slot is known, when *slot* is "".
+        reason: Why no slot is known, when *slot* is "".  For an "address"
+            site, the source text of the address (`*(uint32_t*)0x08004004`).
+        callee: For an "object" site, the code key of the ``operator()``
+            that the call names: it is a target of the site too (a functor
+            with no wrapper), thus the arguments of the site go into its
+            parameters.  "" for a "pointer" site.
     """
 
     file: str
@@ -333,6 +351,7 @@ class SlotSite:
     slot: str
     slot_type: str
     reason: str = ""
+    callee: str = ""
 
 
 @dataclass(frozen=True)

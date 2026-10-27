@@ -2305,6 +2305,21 @@ place is the place of the expansion.
   template body that names a dependent type (`device.sample()` with
   `T& device`) has a target only in an instance. The edge is stored on the
   template (caller and target), at the place of the call in the template.
+- `"slot"` — an indirect call (through a function pointer, a
+  `std::function` or a converted lambda) reaches a function that the code
+  puts into the slot that it calls through: a field, a variable, a
+  parameter or a return value, also through other slots and other files.
+  The row is a `"call"` at the place of the indirect call.
+- `"type_only"` — an indirect call whose slot does not tell its targets
+  reaches each function of its type whose address the build takes. That
+  is the case when code out of view can write the slot (its address
+  escapes), and when the call names no slot. The set can hold functions
+  that the call never reaches. A slot into which no code of the build puts
+  a function, and which does not escape, gives no edge. A call through a
+  `std::function` or another callable object gets no `"type_only"` edge.
+  A call of an address that is a number (a bootloader that starts the
+  application: `((entry_t)APP_RESET)()`) gets no edge: no code of the
+  build is there.
 
 A site that two analyses find is one row with both names.
 

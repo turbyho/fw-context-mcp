@@ -355,7 +355,9 @@ class TestCppReview:
             for _caller, kind, slot, line in cpp_review["sites"]
         )
         assert (0, "function", "c:@F@h1#I#", 30) in cpp_review["arguments"]
-        assert not any(line == 30 for _f, _slot, line in cpp_review["sources"])
+        # The address of `h1` is taken (a call by type can reach it), and no
+        # parameter of `std::function::operator()` holds it.
+        assert {(f, slot) for f, slot, line in cpp_review["sources"] if line == 30} == {("c:@F@h1#I#", "")}
 
     def test_an_operator_of_a_base_class_makes_a_callable_object(self, cpp_review):
         assert any(kind == "object" and line == 32 for _c, kind, _s, line in cpp_review["sites"])
@@ -400,12 +402,11 @@ class TestCppReview2:
     def test_an_accessor_reads_the_object_that_its_list_filled(self, cpp_review2):
         assert ("c:@F@h1#I#", self.HANDLERS, 6) in cpp_review2["sources"]
         assert ("c:@F@h2#I#", self.HANDLERS, 6) in cpp_review2["sources"]
-        accessor = next(
-            target for source, target, line in cpp_review2["flows"] if source == self.HANDLERS and line == 11
-        )
-        assert accessor.startswith("R|") and "operator[]" in accessor
-        assert ("c:@F@fire#I#&$@S@Chain#", "pointer", accessor, 11) in cpp_review2["sites"]
-        assert ("c:@F@h3#I#", accessor, 12) in cpp_review2["sources"]
+        # The return slot of `operator[]` is one for each `std::array` of the
+        # build: the call reads and writes the slot of the object instead.
+        assert ("c:@F@fire#I#&$@S@Chain#", "pointer", self.HANDLERS, 11) in cpp_review2["sites"]
+        assert ("c:@F@h3#I#", self.HANDLERS, 12) in cpp_review2["sources"]
+        assert not any("operator[]" in target for _s, target, _l in cpp_review2["flows"])
 
     def test_a_range_for_copies_each_element_into_the_loop_variable(self, cpp_review2):
         assert any(
@@ -416,12 +417,46 @@ class TestCppReview2:
     def test_a_temporary_object_has_no_return_slot(self, cpp_review2):
         assert not any(line == 14 and slot for _c, _k, slot, line in cpp_review2["sites"])
 
+    def test_a_method_that_gives_its_own_object_is_no_accessor(self, cpp_review2):
+        """`Chain &add(cb_t)` gives `*this`: the object does not flow into its return slot."""
+        assert not any(target.startswith("R|c:@S@Chain@F@add") for _s, target, _l in cpp_review2["flows"])
+
     def test_a_method_that_gives_a_reference_keeps_its_parameter(self, cpp_review2):
         assert any(
             function == "c:@F@h1#I#" and slot.startswith("P|c:@S@Chain@F@add") and slot.endswith("|0")
             and line == 15
             for function, slot, line in cpp_review2["sources"]
         )
+
+
+def test_a_cast_of_the_callee_keeps_its_slot(tmp_path: Path):
+    """The ESP32 Arduino core calls `((voidFuncPtrArg)handler->fn)(handler->arg)`."""
+    code = (
+        "typedef void (*fn_void_t)(void);\n"
+        "typedef void (*fn_arg_t)(void *);\n"
+        "struct handle { fn_void_t fn; void *arg; };\n"
+        "void isr(struct handle *h) { ((fn_arg_t)h->fn)(h->arg); }\n"
+    )
+    facts = _facts(tmp_path, "cast.c", code)
+    assert ("c:@F@isr", "pointer", "F|c:@S@handle@FI@fn", 4) in facts["sites"]
+
+
+def test_a_jump_to_an_address_is_a_site_with_the_text_of_the_address(tmp_path: Path):
+    """A bootloader starts the application: the site stays, with where it goes."""
+    from fw_context_mcp.indexer._slots import collect_slot_facts
+    from fw_context_mcp.indexer.symbols import _get_index
+
+    src = tmp_path / "boot.c"
+    src.write_text(
+        "typedef void (*entry_t)(void);\n"
+        "#define APP_RESET (*(unsigned int *)0x08004004)\n"
+        "void jump(void) { ((entry_t)APP_RESET)(); }\n"
+        "void jump2(void) { ((entry_t)(*(unsigned int *)0x08004004))(); }\n",
+        encoding="utf-8",
+    )
+    facts = collect_slot_facts(_get_index().parse(str(src), args=["-x", "c"]), None, lambda p: Path(p).resolve())
+    sites = [(s.kind, s.slot, s.reason, s.line) for s in facts.sites if s.file == str(src)]
+    assert sites == [("address", "", "APP_RESET", 3), ("address", "", "(*(unsigned int*)0x08004004)", 4)]
 
 
 def test_a_purged_function_leaves_no_slot_fact(tmp_path: Path):

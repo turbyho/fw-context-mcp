@@ -1,0 +1,11 @@
+{
+  "description": "A lambda converted to a pointer to a function, and a lambda in a std::function member, are the targets of the calls through them.",
+  "units": ["main.cpp"],
+  "compiler": "c++",
+  "present": [
+    ["irq_handler", "setup::<lambda>", 5, "call"],
+    ["Client::finish", "Client::start::<lambda>", 10, "call"]
+  ],
+  "absent": [],
+  "exact": false
+}

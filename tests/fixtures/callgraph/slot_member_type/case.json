@@ -1,0 +1,14 @@
+{
+  "description": "The type of a pointer to a member names its class: a call through a pointer to a member of A does not reach a method of B with the same signature. A noexcept function is a target of a call through a pointer to the same type without noexcept.",
+  "units": ["main.cpp"],
+  "compiler": "c++",
+  "present": [
+    ["take", "A::f", 17, "call"],
+    ["take", "n", 18, "call"],
+    ["take", "plain", 18, "call"]
+  ],
+  "absent": [
+    ["take", "B::h", 17, "call"]
+  ],
+  "exact": false
+}

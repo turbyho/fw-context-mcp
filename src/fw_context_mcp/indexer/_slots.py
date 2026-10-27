@@ -20,7 +20,8 @@ name:
   member initializer, copy of a callable object);
 * a **site**: an indirect call, through a slot.  The ``operator()`` of an
   object that is no closure is a site too: the object can hold any
-  function (``std::function``);
+  function (``std::function``).  A call of an address that is a number
+  (a bootloader that starts the application) is a site of its own kind;
 * an **argument**: a value that a site passes, which goes into a parameter
   of each function that the site reaches (known after the resolution);
 * an **escape**: the address of a slot (or of an element of it) is taken,
@@ -76,6 +77,8 @@ _TYPE_NAMES = frozenset({_K.TYPEDEF_DECL, _K.TYPE_ALIAS_DECL})
 _TYPED_OPERANDS = _CASTS | {_K.COMPOUND_LITERAL_EXPR}
 # C writes a function with no parameters `void (void)`, C++ `void ()`.
 _EMPTY_PARAMETERS = re.compile(r"\(void\)")
+# The exception specification at the end of a function type spelling.
+_EXCEPTION_SPECIFICATION = re.compile(r"\s+(noexcept(\([^)]*\))?|throw\(\))$")
 # The name of an operator (`operator()`, `operator=`, `operator new`), and
 # not a function whose name starts with the word (`operatorSelect`).
 _OPERATOR_NAME = re.compile(r"operator(?![A-Za-z0-9_])")
@@ -250,7 +253,28 @@ def _strip_arrays(type_: cx.Type) -> cx.Type:
 
 
 def _function_type(type_: cx.Type) -> str:
-    return _EMPTY_PARAMETERS.sub("()", type_.get_canonical().spelling)
+    """The type key of a function type: `(void)` as `()`, and with no exception specification.
+
+    WHY no `noexcept`: a pointer to a `noexcept` function converts to a
+    pointer to the same function type without it, thus `void n() noexcept`
+    is a target of a call through `void (*)()`.
+    """
+    return _type_key(type_.get_canonical().spelling)
+
+
+def _type_key(spelling: str) -> str:
+    return _EXCEPTION_SPECIFICATION.sub("", _EMPTY_PARAMETERS.sub("()", spelling))
+
+
+def _member_type(member_pointer: cx.Type) -> str:
+    """The type key of a pointer to a method: `M:` and its type, which names the class (`void (A::*)()`).
+
+    WHY the class: `(a.*m)()` with `void (A::*)()` cannot call `B::h`, which
+    has the same function type.  WHY the spelling of the pointer, and not
+    ``Type.get_class_type()``: libclang 22 crashes in it for a class that is
+    a template parameter (`T::*`, measured in `<functional>`).
+    """
+    return "M:" + _type_key(member_pointer.get_canonical().spelling)
 
 
 def _pointer_type(type_: cx.Type) -> str | None:
@@ -265,7 +289,7 @@ def _pointer_type(type_: cx.Type) -> str | None:
     if type_.kind == _T.MEMBERPOINTER:
         pointee = type_.get_pointee().get_canonical()
         if pointee.kind in _FUNCTION_TYPES:
-            return "M:" + _function_type(pointee)
+            return _member_type(type_)
     if type_.kind in _FUNCTION_TYPES:
         return _function_type(type_)
     return None
@@ -291,12 +315,17 @@ def _decays(array: cx.Cursor, parent: cx.Cursor) -> bool:
     return array_type.kind in _ARRAYS and _points_to(parent.type, array_type.element_type)
 
 
-def _code_type(function: cx.Cursor) -> str:
-    """The type key of a function as a value: `M:` for a method with `this`."""
-    spelling = _function_type(function.type)
+def _code_type(function: cx.Cursor, value: cx.Cursor | None = None) -> str:
+    """The type key of a function as a value.
+
+    A method with `this` is a value as `&A::f` only: the type of *value*
+    (the `&` of it) is the pointer to the member (`_member_type`).
+    """
     if _kind(function) == _K.CXX_METHOD and not function.is_static_method():
-        return "M:" + spelling
-    return spelling
+        if value is not None and value.type.get_canonical().kind == _T.MEMBERPOINTER:
+            return _member_type(value.type)
+        return "M:" + _function_type(function.type)
+    return _function_type(function.type)
 
 
 def _record(type_: cx.Type) -> cx.Cursor | None:
@@ -449,6 +478,13 @@ class _Collector:
         if kind == _K.ARRAY_SUBSCRIPT_EXPR:
             children = list(expression.get_children())
             return self.slot_of(children[0]) if children else (None, "array")
+        if kind in _CASTS:
+            # `((voidFuncPtrArg)handler->fn)(arg)`: a cast from one pointer
+            # to a function to an other keeps the value of the slot.
+            operand = next((c for c in reversed(list(expression.get_children())) if _is_expression(c)), None)
+            if operand is not None and _pointer_type(operand.type) is not None:
+                return self.slot_of(operand)
+            return None, "cast"
         if kind == _K.UNARY_OPERATOR:
             children = list(expression.get_children())
             if children and _pointer_type(children[0].type) is not None \
@@ -464,7 +500,8 @@ class _Collector:
             if function is not None and _kind(function) == _K.CONSTRUCTOR:
                 return None, "temporary"  # `Obj()(8)`: no return slot holds it
             if function is not None:
-                return "R|" + _sym._code_usr(function), ""
+                holder = self.accessor_holder(expression, function)
+                return (holder or "R|" + _sym._code_usr(function)), ""
             return None, "result of an indirect call"
         return None, f"expression {kind}"
 
@@ -630,8 +667,8 @@ class _Collector:
         container gives its elements through a method (`std::array::
         operator[]`), whose body in a template names a field of a dependent
         type, thus no fact connects the field to the method.  The call of
-        the method reads the object (`visit_call`), and the object holds
-        the values of its list.
+        the method reads the object (`accessor_holder`), and the object
+        holds the values of its list.
         """
         list_type = init_list.type.get_canonical()
         if list_type.kind in _ARRAYS:
@@ -733,6 +770,13 @@ class _Collector:
                 file=str(site_file), line=int(site_line), column=int(site_column), ordinal=int(ordinal),
                 index=int(index), value_kind=value[0], value=value[1],
             ))
+            if value[0] == "function":
+                # Its address is taken too: a call that only its type
+                # resolves can reach it (`g_ops->reg(on_done)`).
+                self.facts.sources.append(SlotSource(
+                    file=file, line=line, column=column, function=value[1],
+                    function_type=value[2], slot="",
+                ))
         elif value[0] == "function":
             # The address is taken, and nothing known holds it: only its
             # type tells the calls that can reach it.
@@ -747,7 +791,7 @@ class _Collector:
 
     def add_site(
         self, call: cx.Cursor, place: tuple[str, int, int], caller: str | None,
-        kind: str, slot: str | None, slot_type: str, reason: str,
+        kind: str, slot: str | None, slot_type: str, reason: str, callee: str = "",
     ) -> None:
         ordinal = self._sites_at.get(place, 0)
         self._sites_at[place] = ordinal + 1
@@ -755,7 +799,7 @@ class _Collector:
         self._site_ordinals[(place, *_node_key(call))] = ordinal
         self.facts.sites.append(SlotSite(
             file=place[0], line=place[1], column=place[2], ordinal=ordinal, caller=caller, kind=kind,
-            slot=slot or "", slot_type=slot_type, reason=reason,
+            slot=slot or "", slot_type=slot_type, reason=reason, callee=callee,
         ))
 
     def visit(self, cursor: cx.Cursor, path: list[cx.Cursor], caller: str | None) -> None:
@@ -807,8 +851,12 @@ class _Collector:
                 return
             if _OPERATOR_NAME.match(declaration.spelling):
                 return
+            parent = len(path) - 1
+            while parent >= 0 and _kind(path[parent]) in _TRANSPARENT:
+                parent -= 1
+            value = path[parent] if parent >= 0 and _kind(path[parent]) == _K.UNARY_OPERATOR else None
             self.record(
-                ("function", _sym._code_usr(declaration), _code_type(declaration)), cursor, path, caller,
+                ("function", _sym._code_usr(declaration), _code_type(declaration, value)), cursor, path, caller,
             )
             return
         if kind in (_K.VAR_DECL, _K.PARM_DECL, _K.FIELD_DECL):
@@ -896,13 +944,21 @@ class _Collector:
                 # passes its arguments up (`climb_call`), and the conversion
                 # of a closure passes the lambda up (`climb`): no return
                 # slot of them holds a value.
-                self.record(("slot", "R|" + _sym._code_usr(function), ""), call, path, caller)
-            self.read_through_accessor(call, function, place)
+                returned = self.accessor_holder(call, function) or "R|" + _sym._code_usr(function)
+                self.record(("slot", returned, ""), call, path, caller)
             if _is_object_call(function):
                 target = self.call_object(call, function)
                 slot, why = self.slot_of(target) if target is not None else (None, "implicit object")
                 object_type = self.object_type(target.type) if target is not None else None
-                self.add_site(call, place, caller, "object", slot, object_type or "", why)
+                # The operator() of a template (`std::function`, mbed
+                # `Callback`) is one for all its instances: no argument of the
+                # site goes into its parameters.
+                record = function.semantic_parent
+                own_operator = record is not None and record.specialized_template is None
+                self.add_site(
+                    call, place, caller, "object", slot, object_type or "", why,
+                    callee=_sym._code_usr(function) if own_operator else "",
+                )
             return
         if not _has_callee(call):
             return
@@ -918,28 +974,42 @@ class _Collector:
         if pointer_type is None:
             return
         slot, why = self.slot_of(callee)
+        address = _integer_operand(callee) if not slot else None
+        if address is not None:
+            # A jump to an address that is a number: the start of the
+            # application from a bootloader, a routine of the ROM.  No code
+            # of the build is the target, thus the site gets no target of
+            # its type; the text of the address tells where it goes.
+            self.add_site(call, place, caller, "address", None, pointer_type, _text(address, call))
+            return
         self.add_site(call, place, caller, "pointer", slot, pointer_type, why)
 
-    def read_through_accessor(self, call: cx.Cursor, function: cx.Cursor, place: tuple[str, int, int]) -> None:
-        """A method that gives a slot of its object by reference: the object flows into its return slot.
+    def accessor_holder(self, call: cx.Cursor, function: cx.Cursor) -> str | None:
+        """The slot of the object, when *call* gives an element of it by reference through a template, or None.
 
-        `handlers[i](1)` on a `std::array<cb_t, N>`: the site reads
-        `R|operator[]`, and the values of the list of `handlers` are in the
-        slot of the object (`climb_init_list`).  The return slot is one for
-        each instance of the template, as a field is one for each object of
-        a struct.
+        `handlers[i]` on a `std::array<cb_t, N>`: the body of `operator[]`
+        in the template names a field of a dependent type, thus no fact
+        connects the field to the method, and the return slot of the method
+        is one for all the instances of the template (each `std::array` of
+        the build, of each element type).  The call reads and writes the
+        slot of the object instead, which the initializer list of the
+        object fills (`climb_init_list`).  A method of a class that is no
+        template keeps its return slot: its body gives the flow
+        (`return _cb;`).  A method that gives its own object (`*this`:
+        `std::function::operator=`, `Chain &add(cb)`) gives no element.
         """
+        result = function.result_type.get_canonical()
         if (_kind(function) != _K.CXX_METHOD or function.is_static_method()
-                or function.result_type.get_canonical().kind != _T.LVALUEREFERENCE
-                or self.slot_type(call.type) is None):
-            return
+                or result.kind != _T.LVALUEREFERENCE or self.slot_type(call.type) is None
+                or not _sym._is_implicit_instance(function)):
+            return None
+        record = function.semantic_parent
+        returned_record = _record(result)
+        if (record is not None and returned_record is not None
+                and returned_record.get_usr() == record.get_usr()):
+            return None
         target = self.call_object(call, function)
-        holder = self.slot_of(target)[0] if target is not None else None
-        returned = "R|" + _sym._code_usr(function)
-        if holder and holder != returned:
-            self.facts.flows.append(SlotFlow(
-                file=place[0], line=place[1], column=place[2], source=holder, target=returned,
-            ))
+        return self.slot_of(target)[0] if target is not None else None
 
     @staticmethod
     def call_object(call: cx.Cursor, function: cx.Cursor) -> cx.Cursor | None:
@@ -953,6 +1023,54 @@ class _Collector:
             return None
         bases = list(member.get_children())
         return bases[0] if bases else None
+
+
+def _integer_operand(callee: cx.Cursor) -> cx.Cursor | None:
+    """The integer that a cast of the callee makes a pointer to a function, or None.
+
+    `((void (*)(void))(*(uint32_t *)0x08004004))()`: the operand of the
+    cast is an integer.  A cast from `void *` is not one: a `void *` field
+    can hold a function (its source escaped as "cast to void *").
+    """
+    callee = _unwrap(callee)
+    while _kind(callee) in _CASTS:
+        operand = next((c for c in reversed(list(callee.get_children())) if _is_expression(c)), None)
+        if operand is None:
+            return None
+        if operand.type.get_canonical().kind in _INTEGERS:
+            return operand
+        callee = _unwrap(operand)
+    return None
+
+
+def _text(cursor: cx.Cursor, within: cx.Cursor) -> str:
+    """The source text of *cursor* inside *within*, from its tokens (`*(uint32_t*)0x08004004`, `APP_RESET`).
+
+    WHY inside *within*: the extent of an operand that a macro writes
+    starts in the `#define` (measured, libclang 22), thus its tokens held
+    the definition and the code between it and the call.  The tokens at
+    the call give the name of the macro.
+    """
+    bounds = within.extent
+    if bounds.start.file is None:
+        return ""
+    file = bounds.start.file.name
+    start = cursor.extent.start
+    if start.file is None or start.file.name != file or not bounds.start.offset <= start.offset:
+        # The extent starts in the macro: the text starts where the macro
+        # is used, the place of the expansion.
+        start = cursor.location
+    text = ""
+    for token in cursor.get_tokens():
+        place = token.location
+        if (place.file is None or place.file.name != file
+                or not start.offset <= place.offset < bounds.end.offset):
+            continue
+        spelling = token.spelling
+        if text and (text[-1].isalnum() or text[-1] == "_") and (spelling[0].isalnum() or spelling[0] == "_"):
+            text += " "
+        text += spelling
+    return text
 
 
 def _is_expression(cursor: cx.Cursor) -> bool:

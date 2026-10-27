@@ -1,0 +1,15 @@
+{
+  "description": "A unit stores a function into a slot of an other unit, which calls it; a function pointer passed to an indirect call reaches the parameter of the target, and its call reaches the stored function. A function whose address no code takes is no target.",
+  "units": ["a.c", "b.c"],
+  "compiler": "cc",
+  "present": [
+    ["fire", "on_rx", 4, "call"],
+    ["run", "apply", 5, "call"],
+    ["apply", "on_rx", 6, "call"]
+  ],
+  "absent": [
+    ["fire", "on_tx", 4, "call"],
+    ["apply", "on_tx", 6, "call"]
+  ],
+  "exact": false
+}

@@ -1,0 +1,13 @@
+{
+  "description": "Code out of view can write a slot whose address escapes: the call through it reaches the function stored in it, and each function of its type whose address the code takes. A function whose address no code takes is no target.",
+  "units": ["main.c"],
+  "compiler": "cc",
+  "present": [
+    ["tick", "first", 9, "call"],
+    ["tick", "second", 9, "call"]
+  ],
+  "absent": [
+    ["tick", "never", 9, "call"]
+  ],
+  "exact": false
+}

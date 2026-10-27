@@ -49,7 +49,8 @@ from tests.conftest import operator_environ
 
 NOTICE_KEYS = {"total", "offset", "shown", "more"}
 SIDE_KEYS = {"warning", "info", "error", "_did_you_mean"}
-CALLABLE = ("function", "method", "constructor", "destructor")
+# A lambda is a symbol of its own, and the caller of the calls in its body.
+CALLABLE = ("function", "method", "constructor", "destructor", "lambda")
 
 #: A walk stops here.  The invariant shows on the first pages; a symbol
 #: with thousands of call sites would only cost time.

@@ -51,8 +51,9 @@ def insert_slot_facts(
         [(config_hash, *row) for row in flows],
     )
     conn.executemany(
-        "INSERT INTO slot_sites (config_hash, file, line, col, ordinal, caller, kind, slot, slot_type, reason)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO slot_sites"
+        " (config_hash, file, line, col, ordinal, caller, kind, slot, slot_type, reason, callee)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         [(config_hash, *row) for row in sites],
     )
     conn.executemany(

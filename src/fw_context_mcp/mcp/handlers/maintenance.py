@@ -2469,11 +2469,16 @@ def _reindex_cleanup_deleted_file(
             conn, config_hash, file_id_old, file_path_str,
             db_dir=db_path.parent,
         )
-        return {
+        result = {
             "file": str(target),
             "symbols_removed": symbol_count,
             "action": "deleted",
         }
+        # The file can have put a function into a slot that an other file
+        # calls through: its edges go with it.  A build with no reference
+        # index has no slot facts, thus the step does nothing there.
+        _resolve_slot_edges_locked(conn, config_hash, db_path.parent, result)
+        return result
     except WriteLockTimeout as e:
         return {"error": f"Could not acquire write lock for cleanup of {target}: {e}", "action": "timeout"}
 
@@ -3117,7 +3122,7 @@ def _reindex_graph_phases(
     db_dir: Path,
     result: dict,
 ) -> None:
-    """Rebuild the virtual method overrides, the PageRank scores and the hotspot cache after reindex_file.
+    """Rebuild the overrides, the edges of the indirect calls, PageRank and the hotspot cache after reindex_file.
 
     Runs also with ``with_analysis=False``.  WHY: the re-parse deletes the
     symbols of the translation unit and its headers and inserts them again
@@ -3137,7 +3142,38 @@ def _reindex_graph_phases(
     if total_symbols <= 0:
         return
     _reindex_overrides(conn, config_hash, cfg, db_dir, result)
+    _reindex_slot_edges(conn, config_hash, cfg, db_dir, result)
     _reindex_pagerank(conn, config_hash, cfg, result)
+
+
+def _reindex_slot_edges(
+    conn: sqlite3.Connection,
+    config_hash: str,
+    cfg: Config,
+    db_dir: Path,
+    result: dict,
+) -> None:
+    """Resolve the indirect calls of the build again after reindex_file.
+
+    WHY: the re-parse deletes the references of the file, the call edges of
+    its indirect calls too, and the facts of the file can change the
+    targets of a call in an other file (``indexer/_slot_resolution.py``).
+    Before PageRank, which reads the edges.  Failures are non-fatal.
+    """
+    if not cfg.index.index_refs:
+        return
+    _resolve_slot_edges_locked(conn, config_hash, db_dir, result)
+
+
+def _resolve_slot_edges_locked(conn: sqlite3.Connection, config_hash: str, db_dir: Path, result: dict) -> None:
+    """Run the resolution of the slot facts under the write lock; a failure adds a warning to *result*."""
+    from ...indexer._slot_resolution import resolve_slot_edges
+    from ...indexer.db import write_lock
+    try:
+        with write_lock(db_dir, timeout=60.0), transaction(conn):
+            resolve_slot_edges(conn, config_hash)
+    except (sqlite3.Error, WriteLockTimeout) as exc:
+        result["slot_edges_warning"] = f"Indirect call resolution skipped: {exc}"
 
 
 def _header_coverage_warning(

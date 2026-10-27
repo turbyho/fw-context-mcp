@@ -1,0 +1,10 @@
+{
+  "description": "A method of a class that is no template gives a field by reference: its body gives the flow from the field into its return slot, and the call through the result reaches the function of the field.",
+  "units": ["main.cpp"],
+  "compiler": "c++",
+  "present": [
+    ["use", "handler", 4, "call"]
+  ],
+  "absent": [],
+  "exact": false
+}

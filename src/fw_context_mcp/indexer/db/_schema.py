@@ -506,6 +506,8 @@ _MIGRATION_ADD_COLUMNS = [
     "ALTER TABLE files ADD COLUMN parse_first_error TEXT NOT NULL DEFAULT ''",
     # The name the linker resolves to the symbol (see the column in _SCHEMA).
     "ALTER TABLE symbols ADD COLUMN link_name TEXT NOT NULL DEFAULT ''",
+    # The operator() of an "object" site (see the table in _SCHEMA).
+    "ALTER TABLE slot_sites ADD COLUMN callee TEXT NOT NULL DEFAULT ''",
     # Schema version bump — DO NOT REMOVE. When adding new migration steps after this
     # column, also add a NEW ALTER TABLE … ADD COLUMN _schema_bump_… line. The hash
     # of _MIGRATION_ADD_COLUMNS drives CURRENT_SCHEMA_VERSION.
@@ -952,7 +954,8 @@ CREATE TABLE IF NOT EXISTS slot_flows (
 CREATE INDEX IF NOT EXISTS idx_slot_flows_target ON slot_flows(config_hash, target);
 CREATE INDEX IF NOT EXISTS idx_slot_flows_file   ON slot_flows(config_hash, file);
 -- slot_sites: an indirect call ("pointer": through a function pointer;
--- "object": the operator() of a callable object), its caller and slot.
+-- "object": the operator() of a callable object; "address": a call of an
+-- address that is a number, with its text in reason), its caller and slot.
 -- ordinal: the position of the site among the sites at its place, from 0
 -- (the two calls of `f(x)(y)`, and the calls of one macro expansion, have
 -- one place).
@@ -967,7 +970,8 @@ CREATE TABLE IF NOT EXISTS slot_sites (
     kind         TEXT    NOT NULL,
     slot         TEXT    NOT NULL,
     slot_type    TEXT    NOT NULL,
-    reason       TEXT    NOT NULL DEFAULT ''
+    reason       TEXT    NOT NULL DEFAULT '',
+    callee       TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_slot_sites_slot   ON slot_sites(config_hash, slot);
 CREATE INDEX IF NOT EXISTS idx_slot_sites_caller ON slot_sites(config_hash, caller);

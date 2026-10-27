@@ -1,0 +1,10 @@
+{
+  "description": "A function that the code passes to an indirect call has its address taken: a call through a void pointer cast to its type reaches it by its type.",
+  "units": ["main.c"],
+  "compiler": "cc",
+  "present": [
+    ["fire", "on_done", 7, "call"]
+  ],
+  "absent": [],
+  "exact": false
+}

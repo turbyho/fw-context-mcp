@@ -1,0 +1,10 @@
+{
+  "description": "A bootloader jumps to the reset handler of the application, an address that is a number. No code of the build is the target, thus the call does not reach each function of its type.",
+  "units": ["main.c"],
+  "compiler": "cc",
+  "present": [],
+  "absent": [
+    ["jump", "SysTick_Handler", 4, "call"]
+  ],
+  "exact": false
+}

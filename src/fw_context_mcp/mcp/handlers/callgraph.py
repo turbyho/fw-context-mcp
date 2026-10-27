@@ -599,7 +599,10 @@ def find_callers(
         routine that the flow of control of the file gives); ``"dispatch"``,
         a dispatch bridge;
         ``"instantiation"``, the body of a template instance, stored on the
-        template),
+        template; ``"slot"``, an indirect call reaches a function that the
+        code puts into the slot it calls through; ``"type_only"``, an
+        indirect call whose slot does not tell its targets reaches each
+        function of its type whose address the build takes, a superset),
         caller (enclosing function name), caller_kind (``"function"``,
         ``"method"``, …). Macro fallback puts a dict with ``kind="macro"``,
         ``signature`` (``#define`` free: ``NAME`` or ``NAME(a, b)``),
@@ -1477,6 +1480,10 @@ def find_dead_code(
       site through that pointer resolved.  Unindexed code or a type-erased
       API can still call it.  Treat it as uncertain, and check each hit
       with ``find_indirect_targets`` before you delete anything.
+
+    A call that reaches a function by its type only (origin
+    ``"type_only"`` in ``find_callers``) is a call too: the function is
+    not reported, also when no code really calls it through that pointer.
 
     fw-context records the constructor call of an object at namespace or
     class scope as an ``implicit_construct`` reference, and the

@@ -1685,7 +1685,8 @@ def store_symbols_for_unit(
             [(_rel(s.file), s.line, s.column, s.function, s.function_type, s.slot)
              for s in slots.sources],
             [(_rel(f.file), f.line, f.column, f.source, f.target) for f in slots.flows],
-            [(_rel(s.file), s.line, s.column, s.ordinal, s.caller, s.kind, s.slot, s.slot_type, s.reason)
+            [(_rel(s.file), s.line, s.column, s.ordinal, s.caller, s.kind, s.slot, s.slot_type, s.reason,
+              s.callee)
              for s in slots.sites],
             [(_rel(a.file), a.line, a.column, a.ordinal, a.index, a.value_kind, a.value)
              for a in slots.arguments],

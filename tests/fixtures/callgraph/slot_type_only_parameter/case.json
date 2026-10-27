@@ -1,0 +1,11 @@
+{
+  "description": "A function that a call reaches by its type only gets the arguments of the call from code that the resolution cannot follow: the call through its parameter reaches the functions of the type of the parameter.",
+  "units": ["main.c"],
+  "compiler": "cc",
+  "present": [
+    ["boot", "apply", 8, "call"],
+    ["apply", "leaf", 4, "call"]
+  ],
+  "absent": [],
+  "exact": false
+}

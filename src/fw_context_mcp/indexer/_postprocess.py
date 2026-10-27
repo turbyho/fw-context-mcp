@@ -997,6 +997,30 @@ def _step_resolve_dispatches(conn: sqlite3.Connection, ctx: dict) -> None:
         log.info("Dispatch edges resolved: %d synthetic edges created", resolved)
 
 
+def _step_resolve_slots(conn: sqlite3.Connection, ctx: dict) -> None:
+    """Give each indirect call its targets: the call edges of the slot facts.
+
+    WHY in each run, also an incremental one: a fact of one unit can change
+    the targets of a call in an other unit, thus the step replaces the
+    edges of the whole build (``_slot_resolution``).
+    """
+    from ._slot_resolution import resolve_slot_edges
+
+    # One transaction: a failure leaves the edges of the last run, and not
+    # a delete that the commit of a later step would store alone.  The
+    # commit before it keeps the rows of the steps before (`dispatch_edges`
+    # does not commit) out of its rollback.
+    conn.commit()
+    with transaction(conn):
+        counts = resolve_slot_edges(conn, ctx["config_hash"])
+    log.info(
+        "Slot edges: %d edge(s) for %d indirect call(s): %d by slot, %d by type only, "
+        "%d to an address, %d unresolved",
+        counts["edges"], counts["sites"], counts["slot"], counts["type_only"], counts["address"],
+        counts["unresolved"],
+    )
+
+
 def _needs_macros(ctx: dict) -> bool:
     """Say if the expanded values of the macros can differ from the last run.
 
@@ -1757,6 +1781,7 @@ _STEPS: list[tuple[str, Callable[..., None], Callable[..., bool] | None]] = [
     ("coverage_purge",   _step_purge_files_outside_build, None),
     ("macros",           _step_expand_macros,      lambda c: c["index_macros_expanded"] and c["units"] and _needs_macros(c)),
     ("dispatch_edges",   _step_resolve_dispatches,  lambda c: c["index_refs"]),
+    ("slot_edges",       _step_resolve_slots,       lambda c: c["index_refs"]),
     ("llm_analysis",     _step_llm_analysis,       lambda c: c["analyze_symbols"] and c["llm_config"] is not None and c["llm_config"].enabled),
     ("embeddings",       _step_build_embeddings,   lambda c: c["index_embeddings"] and c["llm_config"] is not None and c["llm_config"].enabled),
     ("overrides",        _step_build_overrides,    lambda c: c["analyze_overrides"]),

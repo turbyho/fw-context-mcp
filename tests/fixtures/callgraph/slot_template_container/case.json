@@ -1,0 +1,16 @@
+{
+  "description": "A call through an element of a std::array reaches the functions of the initializer of that array only: the return slot of operator[] is one for every instance of the template, of each element type.",
+  "units": ["main.cpp"],
+  "compiler": "c++",
+  "present": [
+    ["run", "a1", 8, "call"],
+    ["run", "a2", 8, "call"],
+    ["run", "b1", 9, "call"]
+  ],
+  "absent": [
+    ["run", "b1", 8, "call"],
+    ["run", "a1", 9, "call"],
+    ["run", "a2", 9, "call"]
+  ],
+  "exact": false
+}
