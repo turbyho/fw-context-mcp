@@ -59,6 +59,9 @@ _CASTS = frozenset({
     _K.CXX_CONST_CAST_EXPR, _K.CXX_FUNCTIONAL_CAST_EXPR, _K.CXX_DYNAMIC_CAST_EXPR,
 })
 _ARRAYS = frozenset({_T.CONSTANTARRAY, _T.INCOMPLETEARRAY, _T.VARIABLEARRAY, _T.DEPENDENTSIZEDARRAY})
+# The type of a scalar that can hold a function: a list of it in braces is
+# its one element.
+_SCALAR_POINTERS = frozenset({_T.POINTER, _T.MEMBERPOINTER})
 _FUNCTION_TYPES = frozenset({_T.FUNCTIONPROTO, _T.FUNCTIONNOPROTO})
 _CHARACTERS = frozenset({_T.VOID, _T.CHAR_S, _T.CHAR_U, _T.SCHAR, _T.UCHAR})
 _INTEGERS = frozenset({
@@ -520,12 +523,17 @@ class _Collector:
         while at >= 0:
             parent = path[at]
             kind = _kind(parent)
-            untracked = self.untracked(parent.type) if kind in _TRANSPARENT or kind in _CASTS else None
+            if (kind in _TRANSPARENT or kind in _TYPED_OPERANDS) and parent.type.get_canonical().kind == _T.BOOL:
+                # `bool(f)`, `(bool)f`, `bool b = f`: the truth of the
+                # pointer, as `!f`.  A bool holds no function, thus it is no
+                # slot.
+                return ("none", "conversion to bool")
+            untracked = self.untracked(parent.type) if kind in _TRANSPARENT or kind in _TYPED_OPERANDS else None
             if untracked and _pointer_type(child.type) is None:
                 # A pointer to a slot, not a value of it: `address_taken`
                 # tells if it escapes (`memcpy(&g, &tab[0], n)` only reads).
                 untracked = None
-                if kind in _CASTS or kind == _K.UNEXPOSED_EXPR:
+                if kind in _TYPED_OPERANDS or kind == _K.UNEXPOSED_EXPR:
                     return ("none", "pointer to a slot as an untyped pointer")
             if kind in _TRANSPARENT:
                 if (kind == _K.UNEXPOSED_EXPR and untracked
@@ -533,7 +541,7 @@ class _Collector:
                     return ("escape", "cast to " + untracked)
                 child, at = parent, at - 1
                 continue
-            if kind in _CASTS:
+            if kind in _TYPED_OPERANDS:
                 if untracked:
                     return ("escape", "cast to " + untracked)
                 child, at = parent, at - 1
@@ -563,6 +571,12 @@ class _Collector:
                         slot, why = self.slot_of(children[0])
                         return ("slot", slot) if slot else ("none", "left side: " + why)
                     return ("none", "left side of an assignment")
+                if parent.binary_operator == cx.BinaryOperator.Comma and len(children) == 2:
+                    # `(log(), f)`: the value of a comma is its right side.
+                    if _same(children[1], child):
+                        child, at = parent, at - 1
+                        continue
+                    return ("none", "left side of a comma")
                 return ("none", "operator")
             if kind == _K.COMPOUND_ASSIGNMENT_OPERATOR:
                 return ("none", "compound assignment")
@@ -671,9 +685,14 @@ class _Collector:
         holds the values of its list.
         """
         list_type = init_list.type.get_canonical()
-        if list_type.kind in _ARRAYS:
+        if list_type.kind in _ARRAYS or self.scalar_list_type(init_list, path[:at]) is not None:
+            # An array list: the slot of an element is the slot of the
+            # array.  A pointer in braces (`.one = { f }`, `(cb_t){ f }`):
+            # its one element is the value.
             return None
         if list_type.kind != _T.RECORD:
+            # A dependent type in a template (`S<T> s = { f }`): no field
+            # is known, and the variable is no pointer.
             return ("none", "initializer list")
         usr, _field_type = self.init_list_field(init_list, child)
         if not usr:
@@ -713,13 +732,45 @@ class _Collector:
         return usr, field_type
 
     def init_list_element_type(self, init_list: cx.Cursor, element: cx.Cursor) -> cx.Type | None:
-        """The type of the place that *element* of an initializer list fills."""
+        """The type of the place that *element* of an initializer list fills.
+
+        A pointer in braces (`cb_t a = { w };`) is its one element: the
+        place has the type of the list.
+        """
         list_type = init_list.type.get_canonical()
         if list_type.kind in _ARRAYS:
             return list_type.element_type
         if list_type.kind == _T.RECORD:
             return self.init_list_field(init_list, element)[1]
+        if list_type.kind in _SCALAR_POINTERS:
+            return init_list.type
         return None
+
+    def scalar_list_type(self, init_list: cx.Cursor, ancestors: list[cx.Cursor]) -> cx.Type | None:
+        """The pointer type of a scalar in braces, or None when *init_list* is no such list.
+
+        *ancestors* are the nodes above the list, the nearest last.  WHY
+        the ancestors: libclang gives the list the type `void` when its
+        element needs a conversion of a class (`.cb = { w }` with
+        `Wrap::operator cb_t`).  The place that holds the list tells the
+        type then: a field of a designator, or a position of the enclosing
+        list.
+        """
+        list_type = init_list.type.get_canonical()
+        if list_type.kind in _SCALAR_POINTERS:
+            return init_list.type
+        if list_type.kind != _T.VOID or not ancestors:
+            return None
+        parent = ancestors[-1]
+        place: cx.Type | None = None
+        if _kind(parent) == _K.INIT_LIST_EXPR:
+            place = self.init_list_element_type(parent, init_list)
+        elif (_kind(parent) == _K.UNEXPOSED_EXPR and len(ancestors) >= 2
+                and _kind(ancestors[-2]) == _K.INIT_LIST_EXPR):
+            place = self.init_list_element_type(ancestors[-2], parent)
+        if place is None or place.get_canonical().kind not in _SCALAR_POINTERS:
+            return None
+        return place
 
     def climb_member_initializer(self, constructor: cx.Cursor, child: cx.Cursor) -> _Where:
         children = list(constructor.get_children())
@@ -746,13 +797,18 @@ class _Collector:
 
     def record(
         self, value: tuple[str, str, str], node: cx.Cursor, path: list[cx.Cursor], caller: str | None,
+        climb_from: tuple[cx.Cursor, list[cx.Cursor]] | None = None,
     ) -> None:
-        """Record where *value* goes: ("function", key, type) or ("slot", key, "")."""
+        """Record where *value* goes: ("function", key, type) or ("slot", key, "").
+
+        *climb_from*: the node and its path to climb from, when that is not
+        *node* (`visit_overload_set`).  *node* gives the place of the fact.
+        """
         place = _place(node)
         if place is None:
             return
         file, line, column = place
-        result = self.climb(node, path, caller)
+        result = self.climb(*climb_from, caller) if climb_from else self.climb(node, path, caller)
         if result[0] == "slot":
             for target in (str(key) for key in result[1:]):
                 if value[0] == "function":
@@ -810,6 +866,44 @@ class _Collector:
             self.visit_lambda(cursor, path, caller)
         elif kind == _K.CALL_EXPR:
             self.visit_call(cursor, path, caller)
+        elif kind == _K.INIT_LIST_EXPR:
+            self.visit_init_list(cursor, path, caller)
+
+    def visit_init_list(self, init_list: cx.Cursor, path: list[cx.Cursor], caller: str | None) -> None:
+        """An element that a conversion function makes the function pointer of its place.
+
+        `{ .cb = Wrap(fa) }` converts the `Wrap` by its `operator cb_t`.
+        WHY here: libclang gives the syntactic form of an initializer list,
+        which holds no call of the conversion, thus `visit_call` does not
+        see it (it sees the call in `cb_t g = Wrap(fa);`).  The return slot
+        of the conversion goes into the place.  A record with no conversion
+        to the type of the place, or with more than one, gives no fact.
+        """
+        for element in init_list.get_children():
+            value = element
+            if _kind(element) == _K.UNEXPOSED_EXPR and element.type.get_canonical().kind == _T.VOID:
+                # A designator (`.cb = v`): the value is its last child.
+                children = list(element.get_children())
+                if not children:
+                    continue
+                value = children[-1]
+            # The record first: the type of the place reads the fields of
+            # the list (`_positional_struct_fields`), which costs a pass
+            # over all the elements, thus only a class element may ask.
+            record = _record(value.type)
+            if record is None:
+                continue
+            place_type = self.scalar_list_type(init_list, path) or self.init_list_element_type(init_list, element)
+            wanted = _pointer_type(place_type) if place_type is not None else None
+            if wanted is None:
+                continue
+            conversions = [
+                child for child in record.get_children()
+                if _kind(child) == _K.CONVERSION_FUNCTION and _pointer_type(child.result_type) == wanted
+            ]
+            if len(conversions) == 1:
+                returned = "R|" + _sym._code_usr(conversions[0])
+                self.record(("slot", returned, ""), element, [*path, init_list], caller)
 
     def visit_lambda(self, lambda_: cx.Cursor, path: list[cx.Cursor], caller: str | None) -> None:
         """A lambda is a source; converted to a pointer, it has the type of the pointer.
@@ -838,6 +932,9 @@ class _Collector:
         if declaration is None:
             return
         kind = _kind(declaration)
+        if kind == _K.OVERLOADED_DECL_REF:
+            self.visit_overload_set(cursor, declaration, path, caller)
+            return
         if kind in _ADDRESS_KINDS:
             # The callee of a call is no value (also `(h)(5)`, `(*h)(6)`).
             at = len(path) - 1
@@ -874,6 +971,42 @@ class _Collector:
             # gets as a pointer (`dispatch(fns, n)`, `table[i](x)` in it)
             # reads the values of the slot through the parameter.
             self.record(("slot", slot, ""), cursor, path, caller)
+
+    def visit_overload_set(
+        self, cursor: cx.Cursor, overload_set: cx.Cursor, path: list[cx.Cursor], caller: str | None,
+    ) -> None:
+        """An overloaded name that is an element of an initializer list: the type of its place picks the function.
+
+        WHY only there: libclang gives the syntactic form of an initializer
+        list, thus `{ ov }` and `{ .d = ov }` name the overload set, not the
+        function that the conversion chose, as `g = ov` does.  Elsewhere the
+        set is the callee of a dependent call in a template (`h(x)`), which
+        stores no function.  The pick (`symbols._resolve_overload_set`)
+        gives no function when it is not certain.
+
+        The climb starts at the element: the `&` of `{ &A::m }` has the type
+        of the set, not a pointer type, and would stop it.  The type key
+        comes from the place for the same reason: the `&` gives no member
+        pointer type, and the template of `{ tf<double> }` gives its own
+        dependent type.  The pick made the function fit the place.
+        """
+        at = len(path) - 1
+        element = cursor
+        while at >= 0 and (_kind(path[at]) in _TRANSPARENT or _kind(path[at]) == _K.UNARY_OPERATOR):
+            element = path[at]
+            at -= 1
+        if at < 0 or _kind(path[at]) != _K.INIT_LIST_EXPR:
+            return
+        place_type = self.init_list_element_type(path[at], element)
+        expected = _sym._storage_type(place_type) if place_type is not None else None
+        function_type = _pointer_type(expected) if expected is not None else None
+        if expected is None or function_type is None:
+            return
+        for function in _sym._resolve_overload_set(overload_set, expected):
+            self.record(
+                ("function", _sym._code_usr(function), function_type), cursor, path, caller,
+                climb_from=(element, path[: at + 1]),
+            )
 
     @staticmethod
     def address_taken(reference: cx.Cursor, path: list[cx.Cursor], declaration: cx.Cursor) -> str:
@@ -1156,4 +1289,14 @@ def collect_slot_facts(
         collector.visit(cursor, path, caller)
         stack.append((cursor, _children(cursor), inner))
         path.append(cursor)
-    return collector.facts
+    facts = collector.facts
+    # A macro that expands more than one time at one place
+    # (`FOR_EACH(DEFINE_OPS)`) gives equal facts, because each expansion has
+    # the place of the macro.  A copy adds nothing to the resolution, and
+    # find_indirect_targets would show the place two times.  The sites stay
+    # as they are: the ordinal tells apart two calls at one place.
+    facts.sources = list(dict.fromkeys(facts.sources))
+    facts.flows = list(dict.fromkeys(facts.flows))
+    facts.arguments = list(dict.fromkeys(facts.arguments))
+    facts.escapes = list(dict.fromkeys(facts.escapes))
+    return facts

@@ -11,11 +11,9 @@ For each translation unit it produces:
 * **Inheritance** — C++ base-class edges with access specifier and virtual
   flag for each class/struct definition.
 * **Macros** — ``#define`` name, value, and function-like flag.
-* **Indirect call sites** — locations where a function-pointer field or
-  variable is invoked (``driver.onData(buf, len)``).
-* **FnPointerAssignment** — links an assignment site (``obj.onData = &handler``)
-  to the assigned function, storing the helper-pointer typedef for Phase 3
-  linking of assignments to call sites.
+* **Slot facts** — the indirect calls and where the functions that they
+  reach are stored (``_slots.py``); the step ``slot_edges`` of the
+  post-processing resolves them into call edges.
 * **PendingDispatch** — deferred dispatch-registration patterns (e.g.
   ``EventQueue::call_every``) for synthetic ``ref_kind='dispatch'`` edges.
 
@@ -31,12 +29,10 @@ For each translation unit it produces:
   ``walk_preorder``) to support subtree omission.  The native method is ~3×
   faster and is used when *skip_files* is empty.
 
-* **Three-phase function-pointer resolution** — Phase 1 detects assignments
-  (``_emit_fn_ptr_targets``).  Phase 2 records indirect call sites
-  (``_handle_indirect_invocations``).  Phase 3 links assignments to call
-  sites via the ``fn_ptr_type`` column (performed downstream in the
-  database layer).  Arguments to dispatch-registration APIs are additionally
-  captured via ``PendingDispatch``.
+* **Function pointers** — the walk gives an ``indirect`` reference for each
+  function whose address the code takes (``_emit_fn_ptr_targets``,
+  ``_handle_fn_ptr_as_argument``).  Arguments to dispatch-registration APIs
+  are additionally captured via ``PendingDispatch``.
 
 * **Source-line fallback** — embedded C++ (mbed-os, Zephyr) relies heavily on
   templates.  ``callback(&Class::method, this)`` and ``_timeout.attach(...)``
@@ -61,7 +57,7 @@ import logging
 import re
 import threading
 from collections.abc import Callable, Generator
-from dataclasses import astuple, dataclass, field
+from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -70,8 +66,6 @@ from ._dispatch_bridges import _DISPATCH_ENTRY_POINTS, _DISPATCH_METHOD_NAMES, _
 from ._libclang import cindex as cx
 from .compile_commands import CompilationUnit
 from .models import (
-    FnPointerAssignment,
-    IndirectCallSite,
     InheritanceRecord,
     Macro,
     PendingDispatch,
@@ -618,61 +612,6 @@ def _first_child_unwrapped(cursor: cx.Cursor) -> cx.Cursor | None:
             break
         first = grandkids[0]
     return first
-
-
-def _call_expr_text(cursor: cx.Cursor) -> str:
-    """Extract callee expression text from a CALL_EXPR's token stream.
-
-    Returns everything before the opening ``(``, space-joined.
-    ``driver->onData(buf, len)`` → ``"driver->onData"``
-    ``stored_callback(42)``      → ``"stored_callback"``
-    """
-    parts: list[str] = []
-    try:
-        for tok in cursor.get_tokens():
-            if tok.spelling == "(":
-                break
-            parts.append(tok.spelling)
-    except (ValueError, TypeError, RuntimeError, AttributeError):
-        _log.debug("_call_expr_text: get_tokens failed")
-        return ""
-    return " ".join(parts)
-
-
-def _extract_lhs_field(
-    expr_cursor: cx.Cursor,
-) -> tuple[str | None, str]:
-    """Extract the USR and name of the field or variable on the LHS.
-
-    ``obj->onData = &handler`` returns ``(USR_FIELD_onData, "onData")``.
-    ``global_cb = &handler`` returns ``(USR_VAR_global_cb, "global_cb")``.
-
-    Walks children recursively so it works through ``UNEXPOSED_EXPR``
-    wrappers (common in designated initializers like ``.field = &fn``
-    inside ``INIT_LIST_EXPR``).
-
-    Returns ``(None, "")`` when the LHS is not a recognizable field
-    or variable.
-    """
-    def _walk(c: cx.Cursor) -> tuple[str | None, str]:
-        if c.kind in (cx.CursorKind.MEMBER_REF_EXPR, cx.CursorKind.MEMBER_REF):
-            ref = c.referenced
-            if ref is not None and ref.kind == cx.CursorKind.FIELD_DECL:
-                return (ref.get_usr(), ref.spelling)
-        elif c.kind == cx.CursorKind.DECL_REF_EXPR:
-            ref = c.referenced
-            if ref is not None and ref.kind in (
-                cx.CursorKind.VAR_DECL, cx.CursorKind.PARM_DECL,
-            ):
-                return (ref.get_usr(), ref.spelling)
-        # Recurse into UNEXPOSED_EXPR and other wrappers
-        for grandchild in c.get_children():
-            result = _walk(grandchild)
-            if result[0] is not None:
-                return result
-        return (None, "")
-
-    return _walk(expr_cursor)
 
 
 def _process_one_base_specifier(
@@ -1426,56 +1365,29 @@ def _emit_fn_ptr_targets(
     caller_usr: str | None,
     seen_ref: _SeenRefs,
     refs: list[Reference],
-    fp_assignments: list[FnPointerAssignment],
     skip_usr: str | None = None,
-    lhs_usr: str | None = None,
-    lhs_name: str = "",
-    method: str = "assignment",
+    in_init_list: bool = False,
     qn_to_usr: dict[str, str] | None = None,
     slot_index: int | None = None,
-    lhs_type: str = "",
     expected_type: cx.Type | None = None,
-    stored: frozenset[str] | None = None,
 ) -> None:
-    """Emit indirect refs and FnPointerAssignment records for function pointer assignments.
+    """Emit an indirect reference for each function whose address *expr_cursor* takes.
 
-    *lhs_type* is the type of the storage when the caller already knows
-    it (``_init_list_element_field``); without it the type is read from
-    the child of *expr_cursor* that names *lhs_name*.  *expected_type* is
-    that storage type as a libclang type, for an overload set.  *stored*,
-    when given, holds the USRs of the functions that the storage really
-    receives: only those get an assignment row.
-
-    *slot_index* is the position of *expr_cursor* inside a positional init
-    list, and reaches the stored reference unchanged.  Only the init-list
-    caller sets it; every other caller has no position to give.
+    *expected_type* is the type of the storage, for an overload set.
+    *in_init_list* is True for an element of an initializer list, which
+    is scanned as a whole (see below).  *slot_index* is the position of
+    *expr_cursor* inside a positional init list, and reaches the stored
+    reference unchanged.  Only the init-list caller sets it; every other
+    caller has no position to give.
 
     Walks the children of *expr_cursor* looking for function declarations
-    (including those nested inside unary operators and casts), then records:
-    - An indirect reference via one of the *refs* / *seen_ref* lists.
-    - An ``FnPointerAssignment`` when *lhs_usr* is provided (Phase 3 linking).
+    (including those nested inside unary operators and casts).  Where the
+    address goes, and which calls reach it, is the slot facts
+    (``indexer/_slots.py``).
     """
-    import logging as _logging
-    _log = _logging.getLogger(__name__)
     loc = expr_cursor.location
     if not loc.file:
         return
-
-    # Pre-scan: for assignment/init_list, extract fn_ptr_type from the
-    # LHS field/var (the storage location), not the RHS function.
-    # This ensures fp_assignments.fn_ptr_type uses the function-pointer
-    # typedef (e.g., nrfx_power_usb_event_handler_t), matching the type
-    # stored in indirect_call_sites and enabling the Phase 3 USR join.
-    lhs_fp_type = lhs_type
-    if not lhs_fp_type and method in ("assignment", "init_list") and lhs_name:
-        for _c in expr_cursor.get_children():
-            _lhs_usr, _lhs_name = _extract_lhs_field(_c)
-            if _lhs_name and _lhs_name == lhs_name:
-                try:
-                    lhs_fp_type = _c.type.spelling
-                except (ValueError, TypeError, RuntimeError, AttributeError):
-                    pass
-                break
 
     # The expressions that can hold the function.  WHY the element itself
     # when it is a DECL_REF_EXPR: in C++, libclang gives the element of
@@ -1489,7 +1401,7 @@ def _emit_fn_ptr_targets(
     # scanned as a whole too: the CALL_EXPR branch of the search skips its
     # callee, which a scan of its children took as the stored function.
     if expr_cursor.kind == cx.CursorKind.DECL_REF_EXPR or (
-        method == "init_list" and expr_cursor.kind == cx.CursorKind.CALL_EXPR
+        in_init_list and expr_cursor.kind == cx.CursorKind.CALL_EXPR
     ):
         scanned = [expr_cursor]
     else:
@@ -1515,30 +1427,6 @@ def _emit_fn_ptr_targets(
                     from_col=site.column,
                     origins=RefOrigin.DIRECT,
                 ))
-                # The filter holds the USRs as libclang gives them, thus the
-                # test takes the USR of the cursor, not the one of its template.
-                if ((lhs_usr and lhs_usr != target_usr) or lhs_name) and (
-                    stored is None or target.get_usr() in stored
-                ):
-                    try:
-                        _fp_type = lhs_fp_type or child.type.spelling
-                    except (ValueError, TypeError, RuntimeError, AttributeError):
-                        _log.debug(
-                            "_emit_fn_ptr_targets: type.spelling failed for %s",
-                            target.spelling,
-                        )
-                        _fp_type = ""
-                    fp_assignments.append(FnPointerAssignment(
-                        from_file=loc.file.name,
-                        from_line=loc.line,
-                        lhs_usr=lhs_usr or "",
-                        lhs_name=lhs_name,
-                        rhs_usr=target_usr,
-                        rhs_name=target.spelling,
-                        fn_ptr_type=_fp_type,
-                        method=method,
-                        from_usr=caller_usr,
-                    ))
 
     # Token fallback: when _find_fn_refs_in_expr found no targets in any child
     # (e.g. UNEXPOSED_EXPR wrapping a member function pointer inside a CALL_EXPR
@@ -1555,7 +1443,7 @@ def _emit_fn_ptr_targets(
                 break
         if not any_found:
             pairs = _extract_fn_refs_from_unexposed(expr_cursor, qn_to_usr)
-            for target_usr, rhs_name, site in pairs:
+            for target_usr, _name, site in pairs:
                 if target_usr == skip_usr or not site.file:
                     continue
                 # The target came from a name in the tokens: TEXT.
@@ -1569,19 +1457,9 @@ def _emit_fn_ptr_targets(
                     from_col=site.column,
                     origins=RefOrigin.TEXT,
                 ))
-                if (lhs_usr and lhs_usr != target_usr) or lhs_name:
-                    fp_assignments.append(FnPointerAssignment(
-                        from_file=loc.file.name,
-                        from_line=loc.line,
-                        lhs_usr=lhs_usr or "",
-                        lhs_name=lhs_name,
-                        rhs_usr=target_usr,
-                        rhs_name=rhs_name,
-                        fn_ptr_type="",
-                        method=method,
-                        from_usr=caller_usr,
-                    ))
-def _build_refs_and_fp_assignments(
+
+
+def _build_refs(
     tu: cx.TranslationUnit,
     tu_path_str: str,
     symbols: list[Symbol],
@@ -1589,8 +1467,8 @@ def _build_refs_and_fp_assignments(
     anon_usr_to_field: dict[str, str],
     _log,
     skip_files: frozenset[str] | None = None,
-) -> tuple[list[Reference], list[IndirectCallSite], list[FnPointerAssignment], list[PendingDispatch]]:
-    """Walk the TU AST extracting references, indirect call sites, and function pointer assignments.
+) -> tuple[list[Reference], list[PendingDispatch]]:
+    """Walk the TU AST extracting references and the registrations of dispatch callbacks.
 
     When *skip_files* is a non-empty frozenset, subtrees of already
     processed headers are skipped via :func:`_iter_cursor_skip` —
@@ -1614,7 +1492,7 @@ def _build_refs_and_fp_assignments(
     ``&Class::method``.  It emits indirect edges and pending dispatches,
     and no call edge.
 
-    Returns (refs, indirect_call_sites, fp_assignments, pending_dispatches).
+    Returns (refs, pending_dispatches).
     """
     import logging as _logging
     _log = _logging.getLogger(__name__)
@@ -1627,8 +1505,6 @@ def _build_refs_and_fp_assignments(
     usr_to_qn: dict[str, str] = {u: q for q, u in qn_to_usr.items()}
 
     refs: list[Reference] = []
-    indirect_call_sites: list[IndirectCallSite] = []
-    fp_assignments: list[FnPointerAssignment] = []
     pending_dispatches: list[PendingDispatch] = []
     seen_ref: _SeenRefs = {}
     _fn_spans: list[tuple[str, int, int]] = []
@@ -1715,8 +1591,7 @@ def _build_refs_and_fp_assignments(
         _seed_explicit_instantiation(instance_seeds, cursor)
 
         _process_ref_cursor(
-            cursor, cur_fn, refs, indirect_call_sites, fp_assignments,
-            pending_dispatches, seen_ref, qn_to_usr, tu_path_str, resolve_fn, _log,
+            cursor, cur_fn, refs, pending_dispatches, seen_ref, qn_to_usr, tu_path_str, resolve_fn, _log,
             static_init_calls, instance_seeds,
         )
 
@@ -1735,22 +1610,19 @@ def _build_refs_and_fp_assignments(
 
     # Source-line scan for dispatch calls and &Class::method (indirect only)
     _run_source_line_fallback(
-        tu, refs, fp_assignments, pending_dispatches, seen_ref, _fn_spans, qn_to_usr, usr_to_qn, _log,
+        tu, refs, pending_dispatches, seen_ref, _fn_spans, qn_to_usr, usr_to_qn, _log,
     )
 
-    # indirect_call_sites keep each row: two calls through one pointer on
-    # one line are two call sites (see find_indirect_call_sites in _refs.py).
-    return refs, indirect_call_sites, _distinct_records(fp_assignments), pending_dispatches
+    return refs, pending_dispatches
 
 
 def _is_plain_assignment(cursor: cx.Cursor) -> bool:
     """Tell if the BINARY_OPERATOR *cursor* is ``=``.
 
     WHY: every BINARY_OPERATOR was read as an assignment, thus a comparison
-    such as ``hi2c->XferISR != I2C_Master_ISR_DMA`` became an
-    ``fp_assignments`` row, and the enclosing ``&&`` wrote the same row a
-    second time.  Measured over every index on one machine: 353 such
-    repeated rows of the method ``assignment``.
+    such as ``hi2c->XferISR != I2C_Master_ISR_DMA`` stored a function into
+    the field (measured over every index on one machine: 353 such rows).
+    The slot facts (``_slots.py``) take the left side of ``=`` only.
 
     ``binary_operator`` (binding of libclang 19 and later) reads the AST,
     not the tokens, thus it also answers for an operator that a macro
@@ -1765,34 +1637,6 @@ def _is_plain_assignment(cursor: cx.Cursor) -> bool:
     it.
     """
     return cursor.binary_operator == cx.BinaryOperator.Assign
-
-
-def _distinct_records(records: list[FnPointerAssignment]) -> list[FnPointerAssignment]:
-    """Keep the first of each set of equal records, in the order of the walk.
-
-    WHY: two causes gave rows that were equal in each column, and
-    ``find_indirect_targets`` showed them as rows that a reader cannot tell
-    apart.  Measured over every index on one machine: 617 repeated
-    ``fp_assignments`` rows.
-
-    * The walk reaches one fact more than once.  Each nested CALL_EXPR of
-      ``_in_task = mbed::callback(this, &USBMSD::_in)`` found the same
-      target.
-    * A macro that expands once for each device
-      (``DT_INST_FOREACH_STATUS_OKAY``) assigns the same function to the
-      same field of each instance.  Those are different facts, but the row
-      cannot name the instance: each expansion has the same file, line and
-      field.  One row says all that the rows can say.
-    """
-    seen: set[tuple] = set()
-    distinct: list[FnPointerAssignment] = []
-    for record in records:
-        key = astuple(record)
-        if key in seen:
-            continue
-        seen.add(key)
-        distinct.append(record)
-    return distinct
 
 
 def _is_tentative_definition(cursor: cx.Cursor) -> bool:
@@ -2162,8 +2006,6 @@ def _process_ref_cursor(
     cursor: cx.Cursor,
     cur_fn: str | None,
     refs: list[Reference],
-    indirect_call_sites: list[IndirectCallSite],
-    fp_assignments: list[FnPointerAssignment],
     pending_dispatches: list[PendingDispatch],
     seen_ref: _SeenRefs,
     qn_to_usr: dict[str, str],
@@ -2179,11 +2021,11 @@ def _process_ref_cursor(
         return
 
     _handle_direct_refs(cursor, cur_fn, refs, seen_ref, static_init_calls, instance_seeds)
-    _handle_indirect_invocations(cursor, cur_fn, refs, indirect_call_sites,
-                                 fp_assignments, pending_dispatches, seen_ref, tu_path_str, resolve_fn,
-                                 qn_to_usr, _log)
-    _handle_fn_ptr_cases(cursor, cur_fn, refs, fp_assignments, seen_ref, tu_path_str, _log)
-    _handle_token_fallbacks(cursor, cur_fn, refs, fp_assignments, seen_ref, qn_to_usr, tu_path_str, _log)
+    if cursor.kind == cx.CursorKind.CALL_EXPR:
+        _handle_fn_ptr_as_argument(cursor, cur_fn, refs, pending_dispatches,
+                                   seen_ref, tu_path_str, qn_to_usr, _log)
+    _handle_fn_ptr_cases(cursor, cur_fn, refs, seen_ref)
+    _handle_token_fallbacks(cursor, cur_fn, refs, seen_ref, qn_to_usr, _log)
 
 
 def _add_ref(refs: list[Reference], seen_ref: _SeenRefs, to_usr: str,
@@ -2273,71 +2115,6 @@ def _handle_runtime_vector(cursor: cx.Cursor, referenced: cx.Cursor | None,
     _claim_ref(refs, seen_ref, found)
 
 
-def _handle_indirect_invocations(cursor: cx.Cursor, cur_fn: str | None,
-                                 refs: list[Reference],
-                                 indirect_call_sites: list[IndirectCallSite],
-                                 fp_assignments: list[FnPointerAssignment],
-                                 pending_dispatches: list[PendingDispatch],
-                                 seen_ref: _SeenRefs, tu_path_str: str,
-                                 resolve_fn: Callable[..., object],
-                                 qn_to_usr: dict[str, str],
-                                 _log: logging.Logger) -> None:
-    """Indirect calls: function pointers invoked directly or passed as call arguments.
-
-    Two resolution strategies for indirect invocations:
-
-    1. **Direct callee** — ``cursor.referenced`` resolves to a FIELD_DECL,
-       VAR_DECL, or PARM_DECL whose type is a function pointer.  This
-       covers the common case ``driver.onData(buf, len)`` where libclang
-       resolves ``onData`` directly.  An IndirectCallSite is recorded.
-
-    2. **Callee-expression fallback** — when ``cursor.referenced`` is
-       ``None`` or does not match, the first child of the CALL_EXPR is
-       unwrapped (through ``UNEXPOSED_EXPR`` layers) and its type is
-       checked.  This covers ``stored_callback(42)`` where the callee is
-       a variable rather than a field, and template-wrapped cases.
-       ``_extract_lhs_field`` walks the callee expression to extract the
-       target USR and name.
-
-    After recording the call site, ``_handle_fn_ptr_as_argument`` scans
-    the call arguments for function-pointer targets passed as parameters.
-    """
-    if cursor.kind != cx.CursorKind.CALL_EXPR:
-        return
-    loc = cursor.location
-
-    callee = cursor.referenced
-    if (callee is not None
-            and callee.kind in (cx.CursorKind.FIELD_DECL, cx.CursorKind.VAR_DECL, cx.CursorKind.PARM_DECL)
-            and _is_fn_ptr_type(callee.type)):
-        target_usr = callee.get_usr()
-        if target_usr:
-            indirect_call_sites.append(IndirectCallSite(
-                from_file=loc.file.name, from_line=loc.line, from_usr=cur_fn,
-                expr_text=_call_expr_text(cursor), target_usr=target_usr,
-                target_name=callee.spelling, fn_ptr_type=callee.type.spelling,
-            ))
-    else:
-        callee_expr = _first_child_unwrapped(cursor)
-        if callee_expr is not None and _is_fn_ptr_type(callee_expr.type):
-            target_usr, target_name = _extract_lhs_field(callee_expr)
-            if target_usr:
-                try:
-                    _fn_ptr_spelling = callee_expr.type.spelling
-                except (ValueError, TypeError, RuntimeError, AttributeError):
-                    _log.debug("type.spelling failed for indirect call callee expr")
-                    _fn_ptr_spelling = ""
-                indirect_call_sites.append(IndirectCallSite(
-                    from_file=loc.file.name, from_line=loc.line, from_usr=cur_fn,
-                    expr_text=_call_expr_text(cursor), target_usr=target_usr,
-                    target_name=target_name, fn_ptr_type=_fn_ptr_spelling,
-                ))
-
-    _handle_fn_ptr_as_argument(cursor, cur_fn, refs, fp_assignments, pending_dispatches,
-                               seen_ref, tu_path_str, qn_to_usr, _log)
-
-
-
 def _extract_fn_refs_from_unexposed(
     cursor: cx.Cursor,
     qn_to_usr: dict[str, str],
@@ -2376,7 +2153,6 @@ def _extract_fn_refs_from_unexposed(
 
 def _handle_fn_ptr_as_argument(cursor: cx.Cursor, cur_fn: str | None,
                                refs: list[Reference],
-                               fp_assignments: list[FnPointerAssignment],
                                pending_dispatches: list[PendingDispatch],
                                seen_ref: _SeenRefs, tu_path_str: str,
                                qn_to_usr: dict[str, str],
@@ -2384,13 +2160,10 @@ def _handle_fn_ptr_as_argument(cursor: cx.Cursor, cur_fn: str | None,
     """Function pointers passed as call arguments.
 
     Emits an ``indirect`` reference for every callable target found in the
-    arguments.  When the callee is directly resolvable AND its parameter at
-    the matching index is a function-pointer type, an ``FnPointerAssignment``
-    is also recorded (Phase 3 linking).  The indirect reference is emitted
-    even when the callee cannot be resolved (e.g. ``_timeout.attach(
-    callback(&WDT::_timeout_interrupt), delay)`` where ``attach`` is
-    template-obscured) — previously an unresolved callee meant ``callee_params``
-    was empty and the callback target was silently dropped.
+    arguments, also when the callee cannot be resolved (e.g.
+    ``_timeout.attach(callback(&WDT::_timeout_interrupt), delay)`` where
+    ``attach`` is template-obscured).  The parameter that receives the
+    function is a slot fact (``_slots.py``).
 
     Additionally detects dispatch-registration patterns (e.g. EventQueue::
     call_every with a callback target) and records ``PendingDispatch`` records
@@ -2405,10 +2178,8 @@ def _handle_fn_ptr_as_argument(cursor: cx.Cursor, cur_fn: str | None,
     # the callee through the first child of the CALL_EXPR (the callee expression).
     # E.g. _timeout.attach(...) where attach is a template — the CALL_EXPR
     # doesn't resolve it, but the MEMBER_REF_EXPR child might.
-    callee_expr_text: str = ""
     if direct_callee is None:
         callee_expr = _first_child_unwrapped(cursor)
-        callee_expr_text = _call_expr_text(cursor) if callee_expr else ""
         if callee_expr is not None:
             if callee_expr.kind == cx.CursorKind.MEMBER_REF_EXPR:
                 for child in callee_expr.get_children():
@@ -2425,104 +2196,42 @@ def _handle_fn_ptr_as_argument(cursor: cx.Cursor, cur_fn: str | None,
         if _callee_qn in _DISPATCH_ENTRY_POINTS:
             _callee_dispatch_entry_qn = _DISPATCH_ENTRY_POINTS[_callee_qn]
     # ── End dispatch API detection ──────────────────────────────────────
-    callee_params: list = []
-    if direct_callee is not None:
-        try:
-            callee_params = list(direct_callee.get_arguments())
-        except (ValueError, TypeError, RuntimeError, AttributeError):
-            _log.debug("get_arguments failed for %s", direct_callee.spelling)
-            callee_params = []
-    callee_args = list(cursor.get_arguments())
 
-    def _param_info(i: int, arg: cx.Cursor | None = None) -> tuple[str | None, str]:
-        """Return (param_usr, fn_ptr_type_spelling) for argument index *i*.
-
-        When the callee parameter is a template type (e.g. ``F &&func``),
-        falls back to the argument expression's type — so factory wrappers
-        like ``callback(&func)`` are detected via their return type
-        (e.g. ``Callback<void()>``).
-        """
-        if i >= len(callee_params):
-            return None, ""
-        try:
-            param = callee_params[i]
-        except (ValueError, TypeError, RuntimeError, AttributeError):
-            return None, ""
-        param_usr: str | None = None
-        _fp_type: str = ""
-        if _is_fn_ptr_type(param.type):
-            param_usr = param.get_usr()
-            if param_usr:
-                try:
-                    _fp_type = param.type.spelling
-                except (ValueError, TypeError, RuntimeError, AttributeError):
-                    _fp_type = ""
-                return param_usr, _fp_type
-        if arg is not None:
-            try:
-                arg_type = arg.type.get_canonical()
-                if _is_fn_ptr_type(arg_type):
-                    _fp_type = arg_type.spelling
-                    return None, _fp_type
-            except (ValueError, TypeError, RuntimeError, AttributeError):
-                pass
-        return None, ""
-
-    for i, arg in enumerate(callee_args):
+    for arg in cursor.get_arguments():
         targets = _find_fn_refs_in_expr(arg, direct_callee_usr)
         # Fallback: token-based extraction for opaque args
         # (UNEXPOSED_EXPR, unresolved CALL_EXPR like callback(...), etc.)
         if not targets:
-            unexposed_pairs = _extract_fn_refs_from_unexposed(arg, qn_to_usr)
-            if unexposed_pairs:
-                param_usr, _fp_type = _param_info(i, arg)
-                for target_usr, rhs_name, site in unexposed_pairs:
-                    if target_usr != direct_callee_usr and site.file:
-                        # The target came from a name in the tokens: TEXT.
-                        _add_ref(refs, seen_ref, target_usr, site, cur_fn, "indirect", RefOrigin.TEXT)
-                        fp_assignments.append(FnPointerAssignment(
-                            from_file=loc.file.name, from_line=loc.line,
-                            lhs_usr=param_usr or "",
-                            lhs_name=callee_expr_text or rhs_name,
-                            rhs_usr=target_usr, rhs_name=rhs_name,
-                            fn_ptr_type=_fp_type, method="call_arg",
-                            from_usr=cur_fn,
-                        ))
-                        if _callee_dispatch_entry_qn is not None:
-                            pending_dispatches.append(PendingDispatch(
-                                callee_qn=_callee_qn,
-                                target_qn_partial="",
-                                target_name=rhs_name,
-                                target_usr=target_usr,
-                                file=tu_path_str,
-                                line=loc.line,
-                                caller_usr=cur_fn,
-                            ))
-        if targets:
-            param_usr, _fp_type = _param_info(i, arg)
-            for target, site in targets:
-                raw_usr = target.get_usr()
-                target_usr = _code_usr(target)
-                if raw_usr and raw_usr != direct_callee_usr and site.file:
-                    _add_ref(refs, seen_ref, target_usr, site, cur_fn, "indirect", RefOrigin.DIRECT)
-                    _lhs_name = callee_expr_text or target.spelling
-                    fp_assignments.append(FnPointerAssignment(
-                        from_file=loc.file.name, from_line=loc.line,
-                        lhs_usr=param_usr or "", lhs_name=_lhs_name,
-                        rhs_usr=target_usr, rhs_name=target.spelling,
-                        fn_ptr_type=_fp_type, method="call_arg", from_usr=cur_fn,
-                    ))
+            for target_usr, name, site in _extract_fn_refs_from_unexposed(arg, qn_to_usr):
+                if target_usr != direct_callee_usr and site.file:
+                    # The target came from a name in the tokens: TEXT.
+                    _add_ref(refs, seen_ref, target_usr, site, cur_fn, "indirect", RefOrigin.TEXT)
                     if _callee_dispatch_entry_qn is not None:
                         pending_dispatches.append(PendingDispatch(
                             callee_qn=_callee_qn,
-                            target_qn_partial=_qualified_name(target),
-                            target_name=target.spelling,
+                            target_qn_partial="",
+                            target_name=name,
                             target_usr=target_usr,
                             file=tu_path_str,
                             line=loc.line,
                             caller_usr=cur_fn,
                         ))
-    _emit_fn_ptr_targets(cursor, cur_fn, seen_ref, refs, fp_assignments, direct_callee_usr, qn_to_usr=qn_to_usr)
+        for target, site in targets:
+            raw_usr = target.get_usr()
+            target_usr = _code_usr(target)
+            if raw_usr and raw_usr != direct_callee_usr and site.file:
+                _add_ref(refs, seen_ref, target_usr, site, cur_fn, "indirect", RefOrigin.DIRECT)
+                if _callee_dispatch_entry_qn is not None:
+                    pending_dispatches.append(PendingDispatch(
+                        callee_qn=_callee_qn,
+                        target_qn_partial=_qualified_name(target),
+                        target_name=target.spelling,
+                        target_usr=target_usr,
+                        file=tu_path_str,
+                        line=loc.line,
+                        caller_usr=cur_fn,
+                    ))
+    _emit_fn_ptr_targets(cursor, cur_fn, seen_ref, refs, direct_callee_usr, qn_to_usr=qn_to_usr)
 
 
 def _init_list_is_positional(cursor: cx.Cursor) -> bool:
@@ -2879,7 +2588,7 @@ def _positional_struct_fields(cursor: cx.Cursor) -> list[tuple[str | None, str, 
     ``static struct ops o = { dev_init, dev_cb };`` names no field: the
     position of each element is its field, in the order of the struct.
     The designated path (``_init_list_element_field``) has no name to read
-    there, thus such an element gave no ``fp_assignments`` row at all.
+    there, thus such an element got no field type at all.
 
     The list maps a position to a field only while that is certain, and
     stops at the first doubt.  The elements after the stop keep the old
@@ -2983,284 +2692,6 @@ _RECORD_DECL_KINDS = frozenset({
 })
 
 
-_ADDRESS_TYPE_KINDS = frozenset({
-    cx.TypeKind.POINTER,
-    cx.TypeKind.MEMBERPOINTER,
-    cx.TypeKind.LVALUEREFERENCE,
-    cx.TypeKind.RVALUEREFERENCE,
-    cx.TypeKind.BLOCKPOINTER,
-})
-
-
-# Integer types that can hold the address of a function on the targets
-# of the index: ``uintptr_t`` is ``unsigned int`` on a 32-bit MCU.
-_ADDRESS_INTEGER_KINDS = frozenset({
-    cx.TypeKind.INT, cx.TypeKind.UINT, cx.TypeKind.LONG, cx.TypeKind.ULONG,
-    cx.TypeKind.LONGLONG, cx.TypeKind.ULONGLONG, cx.TypeKind.INT128, cx.TypeKind.UINT128,
-})
-
-
-def _constructor_takes_function(record: cx.Cursor, _depth: int = 0) -> bool:
-    """Tell if the class *record* can be built from a function: a callback wrapper.
-
-    A constructor qualifies when one of its parameters takes a function
-    (``_param_takes_function``).  A copy or move constructor does not:
-    every class template has one, and a test that read them counted
-    ``std::vector`` as a wrapper.  ``Timer() {}`` or a defaulted
-    constructor does not make a class a wrapper either.
-
-    The class template of an implicit instance is read too (see
-    ``_class_and_template``), a template constructor is found also when
-    libclang spells it ``Opt<T>``, and ``using Base::Base;`` brings the
-    constructors of the base.  Measured on 15 classes (mbed-style and
-    hand-written callback templates, std::function, std::vector, a box,
-    a span, plain structs, an inherited constructor): every one sorted as
-    expected.
-    """
-    if _depth > 8:
-        return False
-    for candidate in _class_and_template(record):
-        try:
-            children = list(candidate.get_children())
-        except (ValueError, TypeError, RuntimeError, AttributeError):
-            continue
-        class_params = _template_type_params(candidate)
-        for constructor in children:
-            if not _is_constructor_of(constructor, candidate):
-                continue
-            if constructor.kind == cx.CursorKind.CONSTRUCTOR and (
-                constructor.is_copy_constructor() or constructor.is_move_constructor()
-            ):
-                continue
-            own_params = _template_type_params(constructor)
-            params = [c for c in constructor.get_children() if c.kind == cx.CursorKind.PARM_DECL]
-            if any(_param_takes_function(p.type, own_params, class_params, len(params) == 1)
-                   for p in params):
-                return True
-        if any(c.kind == cx.CursorKind.USING_DECLARATION for c in children):
-            for base in children:
-                if base.kind != cx.CursorKind.CXX_BASE_SPECIFIER or base.referenced is None:
-                    continue
-                definition = base.referenced.get_definition() or base.referenced
-                if _constructor_takes_function(definition, _depth + 1):
-                    return True
-    return False
-
-
-def _template_type_params(cursor: cx.Cursor) -> set[str]:
-    """The names of the template type parameters that *cursor* declares."""
-    try:
-        return {c.spelling for c in cursor.get_children()
-                if c.kind == cx.CursorKind.TEMPLATE_TYPE_PARAMETER}
-    except (ValueError, TypeError, RuntimeError, AttributeError):
-        return set()
-
-
-def _is_constructor_of(child: cx.Cursor, record: cx.Cursor) -> bool:
-    """Tell if *child* is a constructor of *record*, a template constructor included.
-
-    libclang spells a template constructor of a class template with its
-    arguments (``Opt<T>``), thus a match on the bare name missed it.
-    """
-    if child.kind == cx.CursorKind.CONSTRUCTOR:
-        return True
-    if child.kind != cx.CursorKind.FUNCTION_TEMPLATE:
-        return False
-    return child.spelling == record.spelling or child.spelling.startswith(record.spelling + "<")
-
-
-def _param_takes_function(
-    param_type: cx.Type, own_params: set[str], class_params: set[str], single: bool,
-) -> bool:
-    """Tell if a constructor parameter of *param_type* receives a function.
-
-    * a pointer to a function, or a member pointer, also through a
-      reference;
-    * ``F *`` where ``F`` is a template parameter of the class: the
-      hand-written ``template <class F> Callback(F *f)``;
-    * a template parameter of the constructor itself, by value or as a
-      forwarding reference, as its one parameter: ``std::function(F f)``,
-      ``Handler(F &&f)``.  Not ``Span(C &c)`` (an lvalue reference), and
-      not ``vector(It first, It last)`` (two parameters).
-    """
-    try:
-        lvalue = param_type.kind == cx.TypeKind.LVALUEREFERENCE
-        value_type = param_type
-        if value_type.kind in (cx.TypeKind.LVALUEREFERENCE, cx.TypeKind.RVALUEREFERENCE):
-            value_type = value_type.get_pointee()
-        canonical = value_type.get_canonical()
-        if canonical.kind == cx.TypeKind.MEMBERPOINTER:
-            return True
-        if canonical.kind == cx.TypeKind.POINTER:
-            if canonical.get_pointee().get_canonical().kind in (
-                cx.TypeKind.FUNCTIONPROTO, cx.TypeKind.FUNCTIONNOPROTO,
-            ):
-                return True
-            return _bare_type_name(value_type.get_pointee()) in class_params
-        return single and not lvalue and _bare_type_name(value_type) in own_params
-    except (ValueError, TypeError, RuntimeError, AttributeError):
-        return False
-
-
-def _bare_type_name(type_: cx.Type) -> str:
-    """The spelling of *type_* without ``const`` and reference marks."""
-    return type_.spelling.replace("const ", "").replace("&", "").strip()
-
-
-def _class_and_template(record: cx.Cursor) -> list[cx.Cursor]:
-    """*record*, and the class template that it instantiates, when there is one."""
-    candidates = [record]
-    template = record.specialized_template
-    if template is not None:
-        candidates.append(template)
-    return candidates
-
-
-def _stored_functions(
-    value: cx.Cursor, field_type: cx.Type | None, expected: cx.Type | None,
-) -> frozenset[str]:
-    """The USRs of the functions that a field really receives from *value*.
-
-    WHY: a function that the value only mentions was written as stored in
-    the field.  ``{ reg(fa), fb }`` and ``.n = sizeof(&fa)`` gave
-    ``n = fa`` for an ``int n``, and ``.cb = pick(fb)`` gave ``cb = fb``
-    although ``cb`` holds what ``pick`` returns.  A rule over the whole
-    value was too coarse: a call in the condition of
-    ``.cb = is_v2() ? isr_v2 : isr_v1`` then cost both correct rows.
-
-    The search follows the path on which a value reaches the field:
-
-    * wrappers (casts, parentheses, ``&``, ``*``) to the wrapped value;
-    * both branches of ``?:``, never its condition.  GNU ``a ?: b`` comes
-      from libclang as an UNEXPOSED_EXPR and is read as a wrapper, thus
-      only ``b`` counts: a known gap;
-    * the last operand of ``,``;
-    * the elements of a brace list or a compound literal of an array or
-      a scalar.  A struct list gives its own fields instead.
-
-    A call ends the path: the field holds what the call returns.  Two
-    exceptions build a class field from the functions of the arguments:
-
-    * a call of a constructor of the field's class (``Derived(fa)``, also
-      through an inherited constructor);
-    * a call whose type is the field's class when that class has a
-      constructor that takes a function (``.k = callback(fa)``): a
-      callback wrapper.  A plain struct that a factory fills
-      (``.o = make_ops(fa)``) is not built from ``fa``.
-
-    A C++ functional cast (``cb_t(fa)``, ``cb_t{fa}``) is followed when its
-    type can hold an address (a pointer, a member pointer, an integer of
-    at least ``int``), when it builds the field's class, or when it makes
-    a callback wrapper that a non-class field converts back
-    (``.cb = Wrap(fb)``).  ``bool(fa)`` stores no function.  An overload
-    set takes the function that *expected* picks.
-    """
-    try:
-        if field_type is not None and _strip_arrays(field_type).get_canonical().kind == cx.TypeKind.BOOL:
-            # A bool holds no function: ``.has = (bool)fa`` or ``!fa``.
-            return frozenset()
-    except (ValueError, TypeError, RuntimeError, AttributeError):
-        return frozenset()
-    field_class = ""
-    field_wraps = False
-    try:
-        storage = _strip_arrays(field_type) if field_type is not None else None
-        if storage is not None and storage.get_canonical().kind == cx.TypeKind.RECORD:
-            field_class = storage.get_canonical().spelling
-            field_wraps = _constructor_takes_function(storage.get_canonical().get_declaration())
-    except (ValueError, TypeError, RuntimeError, AttributeError):
-        field_class = ""
-
-    def _type_of(node: cx.Cursor) -> cx.Type | None:
-        try:
-            return node.type.get_canonical()
-        except (ValueError, TypeError, RuntimeError, AttributeError):
-            return None
-
-    def _is_field_class(node: cx.Cursor) -> bool:
-        node_type = _type_of(node)
-        return bool(field_class) and node_type is not None and node_type.spelling == field_class
-
-    def _follow_call(node: cx.Cursor) -> bool:
-        ref = node.referenced
-        is_constructor = ref is not None and ref.kind == cx.CursorKind.CONSTRUCTOR
-        if _is_field_class(node):
-            return is_constructor or field_wraps
-        if field_class or not is_constructor:
-            return False
-        # A wrapper that a non-class field converts back: ``.cb = Wrap(fb)``.
-        # libclang shows the syntactic form, the constructor call without
-        # the conversion.
-        node_type = _type_of(node)
-        return node_type is not None and _constructor_takes_function(node_type.get_declaration())
-
-    def _follow_cast(node: cx.Cursor) -> bool:
-        node_type = _type_of(node)
-        if node_type is None:
-            return False
-        if node_type.kind in _ADDRESS_TYPE_KINDS or node_type.kind in _ADDRESS_INTEGER_KINDS:
-            return True
-        if node_type.kind != cx.TypeKind.RECORD:
-            return False
-        if field_class:
-            return _is_field_class(node)
-        return _constructor_takes_function(node_type.get_declaration())
-
-    def _walk(node: cx.Cursor, depth: int) -> set[str]:
-        if depth > 64:
-            return set()
-        kind = node.kind
-        children = list(node.get_children())
-        if kind in (cx.CursorKind.DECL_REF_EXPR, cx.CursorKind.MEMBER_REF_EXPR):
-            ref = node.referenced
-            if ref is None:
-                return set()
-            if ref.kind == cx.CursorKind.OVERLOADED_DECL_REF:
-                if expected is None:
-                    return set()
-                return {d.get_usr() for d in _resolve_overload_set(ref, expected)}
-            return {ref.get_usr()} if ref.kind in _INDIRECT_TARGET_KINDS else set()
-        if kind == cx.CursorKind.CALL_EXPR:
-            if not _follow_call(node):
-                return set()
-            found: set[str] = set()
-            for arg in node.get_arguments():
-                found |= _walk(arg, depth + 1)
-            return found
-        if kind == cx.CursorKind.CXX_FUNCTIONAL_CAST_EXPR:
-            if not children or not _follow_cast(node):
-                return set()
-            return _walk(children[-1], depth + 1)
-        if kind == cx.CursorKind.CXX_NEW_EXPR:
-            # The field holds a pointer to a new object, not a function.
-            return set()
-        if kind in _VALUE_WRAPPERS or kind == cx.CursorKind.COMPOUND_LITERAL_EXPR:
-            return _walk(children[-1], depth + 1) if children else set()
-        if kind == cx.CursorKind.CONDITIONAL_OPERATOR:
-            found = set()
-            for branch in children[1:]:
-                found |= _walk(branch, depth + 1)
-            return found
-        if kind == cx.CursorKind.BINARY_OPERATOR:
-            is_comma = node.binary_operator == cx.BinaryOperator.Comma
-            return _walk(children[-1], depth + 1) if is_comma and children else set()
-        if kind == cx.CursorKind.INIT_LIST_EXPR:
-            try:
-                if _strip_arrays(node.type.get_canonical()).kind == cx.TypeKind.RECORD:
-                    return set()
-            except (ValueError, TypeError, RuntimeError, AttributeError):
-                return set()
-            found = set()
-            for element in children:
-                found |= _walk(element, depth + 1)
-            return found
-        return set()
-
-    if _holds_nested_list(value):
-        return frozenset()
-    return frozenset(_walk(value, 0))
-
-
 _CHAR_TYPE_KINDS = frozenset({
     cx.TypeKind.CHAR_S, cx.TypeKind.CHAR_U, cx.TypeKind.SCHAR, cx.TypeKind.UCHAR,
     cx.TypeKind.WCHAR, cx.TypeKind.CHAR16, cx.TypeKind.CHAR32,
@@ -3323,43 +2754,25 @@ def _field_entry(field_decl: cx.Cursor) -> tuple[str | None, str, str, cx.Type |
 
 
 def _handle_fn_ptr_cases(cursor: cx.Cursor, cur_fn: str | None,
-                        refs: list[Reference],
-                        fp_assignments: list[FnPointerAssignment],
-                        seen_ref: _SeenRefs, tu_path_str: str,
-                        _log: logging.Logger) -> None:
-    """Function pointers in assignments, variable initializers, and init lists.
+                        refs: list[Reference], seen_ref: _SeenRefs) -> None:
+    """The functions whose address an assignment, a variable initializer or an init list takes.
 
-    Three recognised patterns for function-pointer assignments:
-
-    * **Binary assignment** — ``obj.onData = &handler`` or ``global_cb = &fn``.
-      The LHS field/variable is extracted via ``_extract_lhs_field`` and
-      passed to ``_emit_fn_ptr_targets`` for ``FnPointerAssignment`` creation.
-
+    * **Binary operator** — ``obj.onData = &handler``, ``global_cb = &fn``,
+      also a comparison (``cb != &fn``).
     * **Variable initializer** — ``static void (*fp)(int) = &handler``.
-      The variable declaration itself is the LHS; its USR and spelling
-      become the assignment target for Phase 3 linking.
+    * **Init-list member** — ``{.on_data = &handler, .cb = &fallback}``:
+      the type of the field (or of the array element) chooses a function
+      of an overload set, and a positional array list gives the slot
+      number of each element (a vector table).
 
-    * **Init-list member** — ``{.on_data = &handler, .cb = &fallback}``.
-      Each init-list child that assigns a function pointer is processed
-      individually, with the designated field name used as the LHS.
-
-    Does NOT check return value of ``_emit_fn_ptr_targets`` — indirect
-    references are always emitted even when no ``FnPointerAssignment`` is
-    created (i.e. the assigned function has no call site yet).
+    Each gives an ``indirect`` reference.  The slot that receives the
+    function is a slot fact (``_slots.py``).
     """
 
     if cursor.kind == cx.CursorKind.BINARY_OPERATOR:
-        # Only ``=`` assigns.  Another operator, such as ``!=`` or ``&&``,
-        # still gives its indirect references, but it has no left-hand
-        # side that receives the function, thus no assignment row.
-        lhs_usr, lhs_name = (
-            _extract_lhs_field(cursor) if _is_plain_assignment(cursor) else (None, "")
-        )
-        _emit_fn_ptr_targets(cursor, cur_fn, seen_ref, refs, fp_assignments,
-                             lhs_usr=lhs_usr, lhs_name=lhs_name, method="assignment")
+        _emit_fn_ptr_targets(cursor, cur_fn, seen_ref, refs)
     elif cursor.kind == cx.CursorKind.VAR_DECL and _is_fn_ptr_type(cursor.type):
-        _emit_fn_ptr_targets(cursor, cur_fn, seen_ref, refs, fp_assignments,
-                             lhs_usr=cursor.get_usr(), lhs_name=cursor.spelling, method="var_init")
+        _emit_fn_ptr_targets(cursor, cur_fn, seen_ref, refs)
     elif cursor.kind == cx.CursorKind.INIT_LIST_EXPR:
         # libclang gives the children in source order, and for a positional
         # array list that order is the array index — so the enumeration
@@ -3373,21 +2786,13 @@ def _handle_fn_ptr_cases(cursor: cx.Cursor, cur_fn: str | None,
         positional_fields = _positional_struct_fields(cursor)
         for position, child in enumerate(cursor.get_children()):
             if position < len(positional_fields):
-                child_usr, child_name, child_type, field_type = positional_fields[position]
+                field_type = positional_fields[position][3]
             else:
-                child_usr, child_name, child_type, field_type = _init_list_element_field(child)
+                field_type = _init_list_element_field(child)[3]
             storage = (_storage_type(field_type) if field_type is not None else None) or array_storage
-            # The functions that the field really receives.  A function
-            # that the value only mentions gets its indirect reference,
-            # but no assignment row.
-            stored = _stored_functions(child, field_type, storage) if child_name else None
-            if child_name and not stored:
-                child_usr, child_name, child_type = None, "", ""
-            _emit_fn_ptr_targets(child, cur_fn, seen_ref, refs, fp_assignments,
-                                 lhs_usr=child_usr, lhs_name=child_name, method="init_list",
-                                 lhs_type=child_type, expected_type=storage,
-                                 slot_index=position if gives_slots else None,
-                                 stored=stored)
+            _emit_fn_ptr_targets(child, cur_fn, seen_ref, refs, in_init_list=True,
+                                 expected_type=storage,
+                                 slot_index=position if gives_slots else None)
 
 
 # The scopes whose variables have static storage duration and get their
@@ -3452,9 +2857,7 @@ def _static_init_constructor_calls(var: cx.Cursor) -> set[int]:
 
 def _handle_token_fallbacks(cursor: cx.Cursor, cur_fn: str | None,
                             refs: list[Reference],
-                            fp_assignments: list[FnPointerAssignment],
                             seen_ref: _SeenRefs, qn_to_usr: dict[str, str],
-                            tu_path_str: str,
                             _log: logging.Logger) -> None:
     """Token-based detection of ``&Class::method`` that the AST leaves opaque.
 
@@ -3464,8 +2867,7 @@ def _handle_token_fallbacks(cursor: cx.Cursor, cur_fn: str | None,
        ``_extract_fn_refs_from_unexposed`` from any opaque expression node.
 
     2. **Callback-style indirect targets**: ``&Class::method`` inside a
-       CALL_EXPR argument list.  Emits ``ref_kind='indirect'`` and an
-       ``FnPointerAssignment`` with ``method='call_arg'``.
+       CALL_EXPR argument list.  Emits ``ref_kind='indirect'``.
 
     WHY no call edge from the tokens: the scan once also read each
     ``name(`` and ``obj.name(`` token of a CALL_EXPR, and it took the
@@ -3489,8 +2891,6 @@ def _handle_token_fallbacks(cursor: cx.Cursor, cur_fn: str | None,
     indirect calls from the assignments to fields, variables and
     parameters ("slots"), with no names.
     """
-    loc = cursor.location
-
     if cursor.kind == cx.CursorKind.UNEXPOSED_EXPR:
         pairs = _extract_fn_refs_from_unexposed(cursor, qn_to_usr)
         for _target_usr, _rhs_name, site in pairs:
@@ -3520,18 +2920,11 @@ def _handle_token_fallbacks(cursor: cx.Cursor, cur_fn: str | None,
                     # The site is the name of the method, as in
                     # _extract_fn_refs_from_unexposed: one key for one reference.
                     _add_ref(refs, seen_ref, target_usr, site, cur_fn, "indirect", RefOrigin.TEXT)
-                    fp_assignments.append(FnPointerAssignment(
-                        from_file=loc.file.name, from_line=loc.line,
-                        lhs_usr="", lhs_name=tokens[i + 3].spelling,
-                        rhs_usr=target_usr, rhs_name=tokens[i + 3].spelling,
-                        fn_ptr_type="", method="call_arg",
-                        from_usr=cur_fn,
-                    ))
+
 
 def _run_source_line_fallback(
     tu: cx.TranslationUnit,
     refs: list[Reference],
-    fp_assignments: list[FnPointerAssignment],
     pending_dispatches: list[PendingDispatch],
     seen_ref: _SeenRefs,
     _fn_spans: list[tuple[str, int, int]],
@@ -3663,7 +3056,6 @@ def _run_source_line_fallback(
                 if _isr_cm:
                     _partial = f"{_isr_cm.group(1)}::{_isr_cm.group(2)}"
                     _handler_usr = _resolve_partial_qn(_partial, qn_to_usr)
-                    _handler_name = _isr_cm.group(2)
                 else:
                     _cleaned = _re.sub(r'\([^)]*\)', ' ', _args_text)
                     _ids = _re.findall(r'\b([A-Za-z_]\w*)\b', _cleaned)
@@ -3675,18 +3067,11 @@ def _run_source_line_fallback(
                     )
                 if not _handler_usr:
                     continue
-                if _claim_text_ref(refs, seen_ref, Reference(
+                _claim_text_ref(refs, seen_ref, Reference(
                     to_usr=_handler_usr, from_file=_tu_file,
                     from_line=_lineno, from_usr=_line_fn,
                     ref_kind="indirect", from_col=0, origins=RefOrigin.TEXT,
-                )):
-                    fp_assignments.append(FnPointerAssignment(
-                        from_file=_tu_file, from_line=_lineno,
-                        lhs_usr="", lhs_name=_isr_fn,
-                        rhs_usr=_handler_usr, rhs_name=_handler_name,
-                        fn_ptr_type="", method="isr_vec",
-                        from_usr=_line_fn,
-                    ))
+                ))
         # ── Phase 4: &Class::method on source text ─────────────────────
         # Blanket scan for ``&Class::method`` patterns on every source
         # line inside a known function body.  This runs on raw text, not
@@ -3699,18 +3084,11 @@ def _run_source_line_fallback(
             _target_usr = _resolve_partial_qn(_partial, qn_to_usr)
             if not _target_usr:
                 continue
-            if _claim_text_ref(refs, seen_ref, Reference(
+            _claim_text_ref(refs, seen_ref, Reference(
                 to_usr=_target_usr, from_file=_tu_file,
                 from_line=_lineno, from_usr=_line_fn, ref_kind="indirect",
                 from_col=0, origins=RefOrigin.TEXT,
-            )):
-                fp_assignments.append(FnPointerAssignment(
-                    from_file=_tu_file, from_line=_lineno,
-                    lhs_usr="", lhs_name=_m.group(2),
-                    rhs_usr=_target_usr, rhs_name=_m.group(2),
-                    fn_ptr_type="", method="call_arg",
-                    from_usr=_line_fn,
-                ))
+            ))
 
 
 
@@ -3723,8 +3101,6 @@ class ExtractionResult:
     symbols: list = field(default_factory=list)
     references: list = field(default_factory=list)
     inheritance: list = field(default_factory=list)
-    indirect_call_sites: list = field(default_factory=list)
-    fp_assignments: list = field(default_factory=list)
     macros: list = field(default_factory=list)
     pending_dispatches: list = field(default_factory=list)
     # The slot facts of the indirect calls (indexer/_slots.py), or None
@@ -3796,7 +3172,7 @@ def extract_all(
 
     Returns:
         An ``ExtractionResult`` with symbols, references, inheritance,
-        indirect_call_sites, fp_assignments, macros, pending_dispatches,
+        macros, pending_dispatches, the slot facts of the indirect calls,
         and newly_seen_files (the set of all source file paths encountered
         during the symbol walk — used to accumulate the skip set for
         subsequent translation units).
@@ -3892,13 +3268,12 @@ def extract_all(
         _log.info("  parse=%.1fs symwalk=%.1fs syms=%d macros=%d", _t_parse, _t_symwalk, len(symbols), len(macros))
         result = ExtractionResult(
             tu=tu if return_tu else None, symbols=symbols, references=[],
-            inheritance=inheritance, indirect_call_sites=[], fp_assignments=[],
-            macros=macros, newly_seen_files=_newly_seen,
+            inheritance=inheritance, macros=macros, newly_seen_files=_newly_seen,
             parse_errors=parse_errors, parse_fatal=parse_fatal, parse_first_error=parse_first_error,
         )
         return result
 
-    refs, indirect_call_sites, fp_assignments, pending_dispatches = _build_refs_and_fp_assignments(
+    refs, pending_dispatches = _build_refs(
         tu, tu_path_str, symbols, _resolve, anon_usr_to_field, _log,
         skip_files=_skip_frozen,
     )
@@ -3914,8 +3289,7 @@ def extract_all(
     )
     result = ExtractionResult(
         tu=tu if return_tu else None, symbols=symbols, references=refs,
-        inheritance=inheritance, indirect_call_sites=indirect_call_sites,
-        fp_assignments=fp_assignments, macros=macros,
+        inheritance=inheritance, macros=macros,
         pending_dispatches=pending_dispatches, slots=slots, newly_seen_files=_newly_seen,
         parse_errors=parse_errors, parse_fatal=parse_fatal, parse_first_error=parse_first_error,
     )

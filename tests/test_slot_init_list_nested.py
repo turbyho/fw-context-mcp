@@ -1,16 +1,18 @@
-"""An element of an init list assigns the field that it names, and only that one.
+"""An element of an init list fills the field that it names, and only that one.
 
-The extraction read the field of an element with ``_extract_lhs_field``,
-which takes the first field reference anywhere in the element:
+The slot of an element is the field that the element fills (``_slots.py``,
+``climb_init_list``):
 
-* ``.ops = { .init = dev_init }`` wrote ``ops = dev_init`` next to the
-  correct ``init = dev_init``, also when the value was a compound literal
-  ``(struct ops){ ... }`` or ``&(struct ops){ ... }``.
+* ``.ops = { .init = dev_init }`` fills ``init``, not ``ops``, also when
+  the value is a compound literal ``(struct ops){ ... }`` or
+  ``&(struct ops){ ... }``.
 * ``[1] = { .cb = dev_cb }`` and ``{ .init = dev_init }`` inside an array
-  wrote the field twice, once with the type of the struct.
-* ``.ops.init = dev_init`` wrote ``ops = dev_init``, and no ``init`` row.
-* ``.inner.cb = dev_cb`` took its type from the first ``cb`` along the
-  chain, and ``.handlers[2] = dev_cb`` the type of the whole array.
+  fill the field of the struct.
+* ``.ops.init = dev_init`` fills ``init``.
+* ``.inner.cb = dev_cb`` fills the last ``cb`` of the chain, and
+  ``.handlers[2] = dev_cb`` the array.
+* A scalar in braces (``.one = { dev_cb }``, ``(cb_t){ dev_cb }``) is its
+  one element.
 """
 
 from __future__ import annotations
@@ -66,74 +68,75 @@ def _line(text: str) -> int:
     return next(i for i, line in enumerate(SOURCE.splitlines(), 1) if text in line)
 
 
-def _rows(extracted, text: str) -> list[tuple[str, str, str]]:
+def _sources(extracted, text: str) -> set[tuple[str, str]]:
+    """(function, struct::field) of each slot fact on the line of *text*."""
     line = _line(text)
-    return sorted((f.lhs_name, f.rhs_name, f.fn_ptr_type)
-                  for f in extracted.fp_assignments if f.from_line == line)
+    return {
+        (source.function.rsplit("@", 1)[-1], source.slot.removeprefix("F|c:@S@").replace("@FI@", "::"))
+        for source in extracted.slots.sources if source.line == line
+    }
+
+
+INIT = ("dev_init", "ops::init")
+CB = ("dev_cb", "ops::cb")
 
 
 @pytest.mark.libclang
-def test_a_nested_list_gives_its_own_fields_only(extracted):
-    assert _rows(extracted, "static struct device nested") == [
-        ("cb", "dev_cb", "cb_t"), ("init", "dev_init", "init_fn_t"),
-    ]
+def test_a_nested_list_fills_its_own_fields_only(extracted):
+    assert _sources(extracted, "static struct device nested") == {CB, INIT}
 
 
 @pytest.mark.libclang
-@pytest.mark.parametrize(("text", "row"), [
-    ("static struct holder literal", ("init", "dev_init", "init_fn_t")),
-    ("static struct holder pointed", ("cb", "dev_cb", "cb_t")),
-    ("*pointers[]", ("init", "dev_init", "init_fn_t")),
+@pytest.mark.parametrize(("text", "fact"), [
+    ("static struct holder literal", INIT),
+    ("static struct holder pointed", CB),
+    ("*pointers[]", INIT),
 ])
-def test_a_compound_literal_gives_its_own_fields_only(extracted, text, row):
-    assert _rows(extracted, text) == [row]
+def test_a_compound_literal_fills_its_own_fields_only(extracted, text, fact):
+    assert _sources(extracted, text) == {fact}
 
 
 @pytest.mark.libclang
-def test_a_struct_in_an_array_gives_its_field_once(extracted):
-    # { dev_init, dev_cb } gives its two fields by position, { .init = ... } the same init.
-    assert _rows(extracted, "table[]") == [("cb", "dev_cb", "cb_t"), ("init", "dev_init", "init_fn_t")]
-    assert _rows(extracted, "indexed[3]") == [("cb", "dev_cb", "cb_t")]
+def test_a_struct_in_an_array_fills_its_field(extracted):
+    # { dev_init, dev_cb } fills its two fields by position, { .init = ... } the same init.
+    assert _sources(extracted, "table[]") == {CB, INIT}
+    assert _sources(extracted, "indexed[3]") == {CB}
 
 
 @pytest.mark.libclang
-def test_a_chain_of_designators_assigns_its_last_field(extracted):
-    assert _rows(extracted, "static struct device chained") == [
-        ("cb", "dev_cb", "cb_t"), ("init", "dev_init", "init_fn_t"),
-    ]
+def test_a_chain_of_designators_fills_its_last_field(extracted):
+    assert _sources(extracted, "static struct device chained") == {CB, INIT}
 
 
 @pytest.mark.libclang
-def test_a_chain_takes_the_type_of_its_last_field(extracted):
+def test_a_chain_fills_the_last_field_of_the_name(extracted):
     """``.cb.cb``: the first ``cb`` is a struct, the last one the pointer."""
-    assert _rows(extracted, "same_name") == [("cb", "dev_cb", "cb_t")]
+    assert _sources(extracted, "same_name") == {("dev_cb", "inner::cb")}
 
 
 @pytest.mark.libclang
-def test_an_index_after_the_field_gives_the_type_of_one_element(extracted):
-    assert _rows(extracted, "static struct outer element") == [("handlers", "dev_cb", "cb_t")]
+def test_an_index_after_the_field_fills_the_array(extracted):
+    assert _sources(extracted, "static struct outer element") == {("dev_cb", "outer::handlers")}
 
 
 @pytest.mark.libclang
 @pytest.mark.parametrize(("text", "field"), [
-    ("braced_array", "handlers"),
-    ("static struct grid deep =", "h"),
-    ("deep_braced", "h"),
-    ("scalar_braced", "one"),
-    ("scalar_literal", "one"),
-    ("typedef_braced", "h"),
-    ("typedef_indexed", "h"),
+    ("braced_array", "outer::handlers"),
+    ("static struct grid deep =", "grid::h"),
+    ("deep_braced", "grid::h"),
+    ("scalar_braced", "grid::one"),
+    ("scalar_literal", "grid::one"),
+    ("typedef_braced", "typed::h"),
+    ("typedef_indexed", "typed::h"),
 ])
-def test_a_brace_list_that_is_no_struct_still_gives_the_field(extracted, text, field):
+def test_a_brace_list_that_is_no_struct_still_fills_the_field(extracted, text, field):
     """Only a struct gives its own fields: an array or a scalar in braces is this field."""
-    rows = _rows(extracted, text)
-    assert rows and {r[:2] for r in rows} == {(field, "dev_cb")}, rows
-    assert {r[2] for r in rows} == {"cb_t"}, "the type of one element, every array level off"
+    assert _sources(extracted, text) == {("dev_cb", field)}
 
 
 @pytest.mark.libclang
 def test_the_slots_of_the_array_keep_their_references(extracted):
-    """The outer array list knows the slot: the fix must not cost the vector table its slots."""
+    """The outer array list knows the slot: the vector table keeps its slots."""
     line = _line("table[]")
     slots = sorted((r.to_usr.rsplit("@", 1)[-1], r.slot_index) for r in extracted.references
                    if r.from_line == line and r.ref_kind == "indirect")

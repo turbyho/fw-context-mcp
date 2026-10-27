@@ -1221,7 +1221,7 @@ _ENCLOSING_CALLABLE_SQL = """
 def _step_repair_from_usr(conn: sqlite3.Connection, ctx: dict) -> None:
     """Give a caller to each reference that the AST walk left without one.
 
-    ``_build_refs_and_fp_assignments`` tracks the enclosing function on a
+    ``_build_refs`` tracks the enclosing function on a
     stack, and it pops that stack on the line number and on the file of
     each cursor.  Both conditions are heuristics, thus the stack can go
     empty while the walk is still inside a body.  The reference that the

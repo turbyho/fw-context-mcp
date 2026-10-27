@@ -1,10 +1,9 @@
-"""The value of an init-list element is never the field that it assigns.
+"""The value of an init-list element is never the slot that it fills.
 
-An element with no designator got its field from the first variable or
-field access anywhere in its VALUE.  Thus ``{ &cobj.s }`` wrote
-``cobj = s``, and ``{ use_a ? dev_a : dev_b }`` wrote ``use_a = dev_a``
-and ``use_a = dev_b``: rows that name a variable as the receiver of a
-function it never holds.
+An element with no designator must not take its slot from a variable or a
+field access in its VALUE: ``{ &cobj.s }`` does not fill ``cobj``, and
+``{ use_a ? dev_a : dev_b }`` does not fill ``use_a``.  Each element of an
+array list fills the array.
 """
 
 from __future__ import annotations
@@ -41,10 +40,16 @@ def _line(text: str) -> int:
 
 
 @pytest.mark.libclang
-@pytest.mark.parametrize("text", ["through_object[]", "chosen[]"])
-def test_no_row_names_a_variable_of_the_value(extracted, text):
+@pytest.mark.parametrize(("text", "functions"), [
+    ("through_object[]", {"c:@S@C@F@s#I#S"}),
+    ("chosen[]", {"c:v.cpp@F@dev_a#I#", "c:v.cpp@F@dev_b#I#"}),
+])
+def test_each_element_fills_the_array(extracted, text, functions):
     line = _line(text)
-    assert [(f.lhs_name, f.rhs_name) for f in extracted.fp_assignments if f.from_line == line] == []
+    array = "V|c:v.cpp@" + text.removesuffix("[]")
+    assert {(s.function, s.slot) for s in extracted.slots.sources if s.line == line} == {
+        (function, array) for function in functions
+    }
 
 
 @pytest.mark.libclang

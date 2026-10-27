@@ -37,8 +37,7 @@ name from the raw source line.
 WHY source-line fallback: type-erased arguments (``(uint32_t)handler``) are
 invisible to libclang's AST — the function pointer assignment is completely
 hidden.  Without the source-line fallback, ISR registrations in CMSIS, Nordic
-SDK, and STM32 HAL would produce no ``fn_pointer_assignment`` records,
-breaking the indirect-call resolution chain entirely.
+SDK, and STM32 HAL would give no ``indirect`` reference to the handler.
 """
 
 # Map: dispatch-registration API qualified name → dispatch entry point QN.
@@ -73,7 +72,8 @@ _DISPATCH_ENTRY_POINTS: dict[str, str] = {
 # Type-erased ISR registration functions: function name → handler arg index (0‑based).
 # These APIs cast the handler to an integer type so libclang cannot see the
 # function‑pointer assignment.  The source‑line fallback uses this map to
-# extract the handler name from the raw source line and create an fp_assignment.
+# extract the handler name from the raw source line and give it an
+# ``indirect`` reference.
 _TYPE_ERASED_ISR_FUNCTIONS: dict[str, int] = {
     # ── ARM CMSIS / Nordic / STM32 ──────────────────────────────────
     "NVIC_SetVector":      1,   # NVIC_SetVector(IRQn, (uint32_t)handler)

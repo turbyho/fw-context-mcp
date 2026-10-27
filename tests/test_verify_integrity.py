@@ -263,11 +263,12 @@ class TestCleanupCoverage:
         """
         conn = populated_db
         targets = [
-            (t, c) for t, c in _tables_with_any_column(conn, {"file_id", "from_file"})
+            (t, c) for t, c in _tables_with_any_column(conn, {"file_id", "from_file", "file"})
             if t != "files"
         ]
         assert {t for t, _ in targets} >= {
-            "symbols", "macros", "refs", "indirect_call_sites", "fp_assignments",
+            "symbols", "macros", "refs",
+            "slot_sources", "slot_flows", "slot_sites", "slot_arguments", "slot_escapes",
         }, f"schema introspection looks wrong: {targets}"
 
         fid = upsert_file(conn, _HASH, "src/owned.c", "c")

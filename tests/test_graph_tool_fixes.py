@@ -1,7 +1,5 @@
 """Answers of the graph tools: notes, name matching, paths, and info texts.
 
-- ``find_indirect_targets`` keeps the ``_note`` of the ``fn_ptr_type``
-  fallback, and matches ``_`` in a name as itself.
 - ``trace_data_flow`` keeps the ambiguity ``warning`` out of its three paths.
 - ``find_hotspots`` does not claim "no references" after the refs guard
   found some.
@@ -16,8 +14,6 @@ from unittest import mock
 import pytest
 
 from fw_context_mcp.indexer.db import (
-    insert_fp_assignments_batch,
-    insert_indirect_call_sites_batch,
     insert_refs_batch,
     insert_symbols_batch,
     open_db,
@@ -26,7 +22,6 @@ from fw_context_mcp.indexer.db import (
     upsert_file,
     upsert_project,
 )
-from fw_context_mcp.indexer.db._refs import find_indirect_targets as db_find_indirect_targets
 from fw_context_mcp.mcp.handlers import callgraph
 from fw_context_mcp.utils import compute_source_hash
 
@@ -56,19 +51,8 @@ def db(tmp_path):
     insert_symbols_batch(conn, [
         _symbol(fid, "main", "u_main"),
         _symbol(fid, "on_rx_done", "u_on_rx_done"),
-        # A field whose type names no indexed class: the type fallback
-        # fails, and the fn_ptr_type fallback runs.
-        _symbol(fid, "onData", "u_on_data", kind="field", signature="Callback onData"),
     ])
     insert_refs_batch(conn, [(CH, "u_on_rx_done", "src/drv.c", 30, "u_main", "call", None, 0, 1)])
-    insert_fp_assignments_batch(conn, [
-        (CH, "src/drv.c", 40, "u_on_data", "onData", "u_on_rx_done", "on_rx_done",
-         "void (*)(int)", "assignment", "u_main"),
-    ])
-    # A call through ANOTHER pointer of the same type.
-    insert_indirect_call_sites_batch(conn, [
-        (CH, "src/other.c", 77, "u_main", "other_cb(1)", "u_other_cb", "other_cb", "void (*)(int)"),
-    ])
     conn.commit()
     yield conn
     conn.close()
@@ -93,21 +77,6 @@ def _handler_db(tmp_path: Path):
 def _without_stale_warning(rows: list[dict]) -> list[dict]:
     """The indexed files are not on disk, thus each answer leads with a stale warning."""
     return [r for r in rows if not (set(r) == {"warning"} and "stale" in r["warning"])]
-
-
-# ── find_indirect_targets ───────────────────────────────────────────────────
-
-
-def test_an_underscore_in_the_name_matches_itself(db):
-    """``rx_done`` reaches ``on_rx_done`` through the substring match."""
-    rows = db_find_indirect_targets(db, CH, "rx_done")
-
-    assert [r["rhs_name"] for r in rows] == ["on_rx_done"]
-
-
-def test_an_underscore_is_no_wildcard(db):
-    assert db_find_indirect_targets(db, CH, "onXrx") == []
-    assert db_find_indirect_targets(db, CH, "on_rx_donX") == []
 
 
 # ── trace_data_flow ─────────────────────────────────────────────────────────

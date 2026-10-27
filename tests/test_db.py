@@ -1806,7 +1806,7 @@ class TestFilesIsProject:
             clang_args=["-std=c++17"],
         )
         r = extract_all(unit_proj, with_refs=False)
-        syms, refs, inheritance, indirect, fp_assigns, macros = r.symbols, r.references, r.inheritance, r.indirect_call_sites, r.fp_assignments, r.macros
+        syms, refs, inheritance, macros = r.symbols, r.references, r.inheritance, r.macros
         conn.execute("DELETE FROM symbols WHERE config_hash = ?", (config_hash,))
         store_symbols_for_unit(
             conn, unit_proj, config_hash, tmp_path,
@@ -1814,7 +1814,6 @@ class TestFilesIsProject:
             project_patterns=project_patterns,
             pre_parsed=ExtractionResult(
                 symbols=syms, references=refs, inheritance=inheritance,
-                indirect_call_sites=indirect, fp_assignments=fp_assigns,
                 macros=macros,
             ),
         )
@@ -1835,14 +1834,13 @@ class TestFilesIsProject:
             clang_args=["-std=c++17"],
         )
         r = extract_all(unit_vendor, with_refs=False)
-        syms_v, refs_v, inh_v, ind_v, fpa_v, mac_v = r.symbols, r.references, r.inheritance, r.indirect_call_sites, r.fp_assignments, r.macros
+        syms_v, refs_v, inh_v, mac_v = r.symbols, r.references, r.inheritance, r.macros
         store_symbols_for_unit(
             conn, unit_vendor, config_hash, tmp_path,
             vendor_patterns=vendor_patterns,
             project_patterns=project_patterns,
             pre_parsed=ExtractionResult(
                 symbols=syms_v, references=refs_v, inheritance=inh_v,
-                indirect_call_sites=ind_v, fp_assignments=fpa_v,
                 macros=mac_v,
             ),
         )
@@ -1889,14 +1887,13 @@ class TestFilesIsProject:
             clang_args=["-std=c++17"],
         )
         r = extract_all(unit, with_refs=False)
-        syms, refs, inheritance, indirect, fp_assigns, macros = r.symbols, r.references, r.inheritance, r.indirect_call_sites, r.fp_assignments, r.macros
+        syms, refs, inheritance, macros = r.symbols, r.references, r.inheritance, r.macros
         store_symbols_for_unit(
             conn, unit, config_hash, tmp_path,
             vendor_patterns=vendor_patterns,
             project_patterns=project_patterns,
             pre_parsed=ExtractionResult(
                 symbols=syms, references=refs, inheritance=inheritance,
-                indirect_call_sites=indirect, fp_assignments=fp_assigns,
                 macros=macros,
             ),
         )
@@ -1914,24 +1911,29 @@ class TestFilesIsProject:
 
 
 class TestIndirectCallSitesArraySubscript:
-    """Verify that ``extract_all`` detects indirect calls through array subscripts.
+    """Verify that ``extract_all`` gives a slot site for a call through an array element.
 
     Regression test: ``handlers[irq](args)`` (ArraySubscriptExpr callee) was
     not detected because ``cursor.referenced`` is ``None`` for indirect calls
-    through array elements — only direct decl references (field/variable/
-    parameter) were checked.
+    through array elements.  The slot of an element is the slot of the array.
     """
 
-    @pytest.mark.libclang
-    def test_extract_all_detects_array_subscript_call(self, tmp_path):
-        """``handlers[irq](irq)`` should produce an IndirectCallSite."""
+    @staticmethod
+    def _sites(tmp_path, name: str, code: str):
         from fw_context_mcp.indexer.compile_commands import CompilationUnit
         from fw_context_mcp.indexer.symbols import extract_all
 
         src = tmp_path / "src"
         src.mkdir()
-        interrupt_c = src / "interrupt.c"
-        interrupt_c.write_text("""\
+        source = src / name
+        source.write_text(code, encoding="utf-8")
+        unit = CompilationUnit(file=source, directory=src, language="c", clang_args=["-std=c11"])
+        return extract_all(unit, with_refs=True).slots.sites
+
+    @pytest.mark.libclang
+    def test_extract_all_detects_array_subscript_call(self, tmp_path):
+        """``handlers[irq](irq)`` is a site of the slot of ``handlers``."""
+        sites = self._sites(tmp_path, "interrupt.c", """\
 typedef void (*isr_handler_t)(int irq);
 
 static isr_handler_t handlers[32];
@@ -1941,47 +1943,15 @@ void interrupt_dispatch(int irq) {
         handlers[irq](irq);
     }
 }
-""", encoding="utf-8")
-
-        unit = CompilationUnit(
-            file=interrupt_c,
-            directory=src,
-            language="c",
-            clang_args=["-std=c11"],
-        )
-        r = extract_all(
-            unit, with_refs=True,
-        )
-        indirect = r.indirect_call_sites
-
-        # There should be at least one indirect call site for the array call
-        assert len(indirect) >= 1, (
-            f"Expected at least 1 indirect call site for handlers[irq](irq), "
-            f"got {len(indirect)}"
-        )
-
-        # Verify the call site references the handlers array variable
-        handlers_calls = [c for c in indirect if c.target_name == "handlers"]
-        assert len(handlers_calls) == 1, (
-            f"Expected exactly 1 indirect call site targeting 'handlers', "
-            f"got {len(handlers_calls)}: {[(c.target_name, c.from_line) for c in indirect]}"
-        )
-        call = handlers_calls[0]
-        assert "handlers" in call.expr_text
-        assert "interrupt.c" in call.from_file
-        # target_usr should match the USR of the handlers variable
-        assert call.target_usr, "target_usr must not be empty"
+""")
+        assert [(s.line, s.caller, s.kind, s.slot) for s in sites] == [
+            (7, "c:@F@interrupt_dispatch", "pointer", "V|c:interrupt.c@handlers"),
+        ]
 
     @pytest.mark.libclang
     def test_extract_all_detects_struct_array_subscript_call(self, tmp_path):
-        """``obj->callbacks[idx](args)`` should produce an IndirectCallSite."""
-        from fw_context_mcp.indexer.compile_commands import CompilationUnit
-        from fw_context_mcp.indexer.symbols import extract_all
-
-        src = tmp_path / "src"
-        src.mkdir()
-        dispatcher_c = src / "dispatcher.c"
-        dispatcher_c.write_text("""\
+        """``d->callbacks[idx](args)`` is a site of the field ``callbacks``."""
+        sites = self._sites(tmp_path, "dispatcher.c", """\
 typedef void (*event_handler_t)(int event_id);
 
 struct Dispatcher {
@@ -1993,39 +1963,15 @@ void dispatch_event(struct Dispatcher* d, int event_id) {
         d->callbacks[event_id](event_id);
     }
 }
-""", encoding="utf-8")
-
-        unit = CompilationUnit(
-            file=dispatcher_c,
-            directory=src,
-            language="c",
-            clang_args=["-std=c11"],
-        )
-        r = extract_all(
-            unit, with_refs=True,
-        )
-        indirect = r.indirect_call_sites
-
-        callbacks_calls = [c for c in indirect if c.target_name == "callbacks"]
-        assert len(callbacks_calls) == 1, (
-            f"Expected exactly 1 indirect call site targeting 'callbacks', "
-            f"got {len(callbacks_calls)}: {[(c.target_name, c.expr_text) for c in indirect]}"
-        )
-        call = callbacks_calls[0]
-        assert "callbacks" in call.expr_text
-        assert call.target_usr, "target_usr must not be empty"
-        assert "dispatcher.c" in call.from_usr.lower() or "dispatch_event" in call.from_usr
+""")
+        assert [(s.line, s.caller, s.slot) for s in sites] == [
+            (9, "c:@F@dispatch_event", "F|c:@S@Dispatcher@FI@callbacks"),
+        ]
 
     @pytest.mark.libclang
     def test_no_false_positive_on_regular_function_call(self, tmp_path):
-        """Regular function calls should NOT produce indirect call sites."""
-        from fw_context_mcp.indexer.compile_commands import CompilationUnit
-        from fw_context_mcp.indexer.symbols import extract_all
-
-        src = tmp_path / "src"
-        src.mkdir()
-        regular_c = src / "regular.c"
-        regular_c.write_text("""\
+        """Regular function calls give no indirect call site."""
+        sites = self._sites(tmp_path, "regular.c", """\
 void regular_func(int x) {
     (void)x;
 }
@@ -2033,34 +1979,13 @@ void regular_func(int x) {
 void caller(void) {
     regular_func(42);
 }
-""", encoding="utf-8")
-
-        unit = CompilationUnit(
-            file=regular_c,
-            directory=src,
-            language="c",
-            clang_args=["-std=c11"],
-        )
-        r = extract_all(
-            unit, with_refs=True,
-        )
-        indirect = r.indirect_call_sites
-
-        # No indirect call sites for regular function calls
-        assert len(indirect) == 0, (
-            f"Expected 0 indirect call sites for regular function call, got {len(indirect)}"
-        )
+""")
+        assert sites == []
 
     @pytest.mark.libclang
     def test_extract_all_detects_member_call_still_works(self, tmp_path):
-        """``driver->onData(args)`` (member access) should still be detected."""
-        from fw_context_mcp.indexer.compile_commands import CompilationUnit
-        from fw_context_mcp.indexer.symbols import extract_all
-
-        src = tmp_path / "src"
-        src.mkdir()
-        driver_c = src / "driver.c"
-        driver_c.write_text("""\
+        """``driver->onData(args)`` (member access) is a site of the field."""
+        sites = self._sites(tmp_path, "driver.c", """\
 typedef void (*data_handler_t)(const char* data, int len);
 
 struct Driver {
@@ -2072,24 +1997,8 @@ void process_data(struct Driver* driver, const char* data, int len) {
         driver->onData(data, len);
     }
 }
-""", encoding="utf-8")
-
-        unit = CompilationUnit(
-            file=driver_c,
-            directory=src,
-            language="c",
-            clang_args=["-std=c11"],
-        )
-        r = extract_all(
-            unit, with_refs=True,
-        )
-        indirect = r.indirect_call_sites
-
-        ondata_calls = [c for c in indirect if c.target_name == "onData"]
-        assert len(ondata_calls) == 1, (
-            f"Expected exactly 1 indirect call site targeting 'onData', "
-            f"got {len(ondata_calls)}: {[(c.target_name, c.expr_text) for c in indirect]}"
-        )
+""")
+        assert [s.slot for s in sites] == ["F|c:@S@Driver@FI@onData"]
 
 
 class TestHeaderInlineCallableFnStack:
@@ -2166,17 +2075,15 @@ int Store::get() {
 
 
 class TestFnPtrTypeConsistency:
-    """Verify fp_assignments.fn_ptr_type uses the LHS field type (the function
-    pointer typedef), not the RHS function type.  This ensures the Phase 3
-    USR join (fp_assignments.lhs_usr = indirect_call_sites.target_usr) and
-    fn_ptr_type matching work when the same typedef is used for both the
-    struct field and the storage variable through which the callback is
-    invoked."""
+    """The type key of a stored function is the type key of the site that calls it.
+
+    The resolution gives a site the functions of its type when its slot
+    escapes or is unknown, thus a typedef of the field and the plain
+    function type must give one key.
+    """
 
     @pytest.mark.libclang
-    def test_init_list_fn_ptr_type_matches_indirect_call_site(self, tmp_path):
-        """Assigning via designated initializer must store the field's type,
-        not the RHS function's type."""
+    def test_init_list_type_matches_the_site(self, tmp_path):
         from fw_context_mcp.indexer.compile_commands import CompilationUnit
         from fw_context_mcp.indexer.symbols import extract_all
 
@@ -2214,38 +2121,16 @@ void init(void) {
 }
 """, encoding="utf-8")
 
-        unit = CompilationUnit(
-            file=init_c,
-            directory=src,
-            language="c",
-            clang_args=["-std=c11"],
-        )
-        r = extract_all(unit, with_refs=True)
-        fpa = r.fp_assignments
-        ics = r.indirect_call_sites
+        unit = CompilationUnit(file=init_c, directory=src, language="c", clang_args=["-std=c11"])
+        slots = extract_all(unit, with_refs=True).slots
 
-        init_list_fpa = [f for f in fpa if f.method == "init_list"]
-        assert len(init_list_fpa) == 1, (
-            f"Expected 1 init_list fp_assignment, got {len(init_list_fpa)}: "
-            f"{[(f.method, f.lhs_name, f.rhs_name) for f in fpa]}"
-        )
-        assert init_list_fpa[0].rhs_name == "my_handler_cb", (
-            f"Expected rhs_name='my_handler_cb', got '{init_list_fpa[0].rhs_name}'"
-        )
-        assert init_list_fpa[0].fn_ptr_type == "event_handler_t", (
-            f"fn_ptr_type must be the field's typedef 'event_handler_t', "
-            f"got '{init_list_fpa[0].fn_ptr_type}'"
-        )
-
-        stored_calls = [c for c in ics if c.target_name == "stored_handler"]
-        assert len(stored_calls) >= 1, (
-            f"Expected at least 1 indirect call site for stored_handler, "
-            f"got {len(stored_calls)}"
-        )
-        assert stored_calls[0].fn_ptr_type == "event_handler_t", (
-            f"indirect_call_sites.fn_ptr_type must be 'event_handler_t', "
-            f"got '{stored_calls[0].fn_ptr_type}'"
-        )
+        assert [(s.function, s.slot, s.function_type) for s in slots.sources] == [
+            ("c:init.c@F@my_handler_cb", "F|c:@S@config@FI@handler", "void (int)"),
+        ]
+        assert ("F|c:@S@config@FI@handler", "V|c:init.c@stored_handler") in {
+            (f.source, f.target) for f in slots.flows
+        }
+        assert [(s.slot, s.slot_type) for s in slots.sites] == [("V|c:init.c@stored_handler", "void (int)")]
 
 
 class TestMacros:

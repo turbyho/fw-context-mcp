@@ -3010,7 +3010,7 @@ class TestStartupStalenessCheck:
     """Verify the check at the start of the daemon and the fixes for the bg reindex timeout loop.
 
     The ``indexed_project`` fixture uses ``--no-refs --no-analyze``, so a fresh
-    index has empty ``refs``, ``indirect_call_sites``, and ``llm_analysis`` tables.
+    index has empty ``refs``, ``slot_sites``, and ``llm_analysis`` tables.
     These are legitimate detections — the tests verify the check is correct and
     that after filling the data, no false positives remain.
     """
@@ -3816,7 +3816,7 @@ class TestBgReindexEndToEnd:
         try:
             ch = _config_hash(conn)
             conn.execute("DELETE FROM refs WHERE config_hash=?", (ch,))
-            conn.execute("DELETE FROM indirect_call_sites WHERE config_hash=?", (ch,))
+            conn.execute("DELETE FROM slot_sites WHERE config_hash=?", (ch,))
             conn.commit()
             ref_count = conn.execute("SELECT COUNT(*) FROM refs WHERE config_hash=?", (ch,)).fetchone()[0]
             assert ref_count == 0
@@ -4178,11 +4178,11 @@ def _refs_from(conn, config_hash: str, path_suffix: str) -> list:
     ).fetchall()
 
 
-def _ics_from(conn, config_hash: str, path_suffix: str) -> list:
-    """Return every indirect_call_sites row originating in this file."""
+def _sites_from(conn, config_hash: str, path_suffix: str) -> list:
+    """Return every slot_sites row (an indirect call) originating in this file."""
     return conn.execute(
-        "SELECT from_file, from_line, target_name FROM indirect_call_sites "
-        "WHERE config_hash=? AND from_file LIKE ? ORDER BY from_line",
+        "SELECT file AS from_file, line AS from_line, slot FROM slot_sites "
+        "WHERE config_hash=? AND file LIKE ? ORDER BY line",
         (config_hash, f"%{path_suffix}"),
     ).fetchall()
 
@@ -4202,7 +4202,7 @@ class TestHeaderScopedRowCleanup:
 
     Code inside an inline function in a header stores its rows under the
     HEADER's path / file_id.  The cleanup used to delete refs, indirect call
-    sites, function pointer assignments and macros by the *translation
+    sites, function pointer stores and macros by the *translation
     unit's* key only, so nothing removed them:
 
     - a call removed from a header kept its refs row, so ``find_callers``
@@ -4330,7 +4330,7 @@ class TestHeaderScopedRowCleanup:
     def test_repeated_reindex_does_not_pile_up_header_call_sites(self, c_project: Path):
         """A fn-pointer call in a header must not gain a row per reindex. (D5)
 
-        ``indirect_call_sites`` carries no unique constraint — a field can
+        ``slot_sites`` carries no unique constraint — a field can
         legitimately be invoked many times from one line — so nothing stops
         duplicates.  Three reindexes of an unchanged call site must leave the
         row count where it started.
@@ -4370,7 +4370,7 @@ class TestHeaderScopedRowCleanup:
         conn = open_db(db_path)
         try:
             ch = _config_hash(conn)
-            baseline = _ics_from(conn, ch, "fnptr_hdr.h")
+            baseline = _sites_from(conn, ch, "fnptr_hdr.h")
             assert baseline, "seed failed — no indirect call site from the header"
             count_baseline = len(baseline)
             line_baseline = {r["from_line"] for r in baseline}
@@ -4390,7 +4390,7 @@ class TestHeaderScopedRowCleanup:
             conn = open_db(db_path)
             try:
                 ch = _config_hash(conn)
-                rows = _ics_from(conn, ch, "fnptr_hdr.h")
+                rows = _sites_from(conn, ch, "fnptr_hdr.h")
                 assert {r["from_line"] for r in rows} == line_baseline, (
                     f"round {round_no}: the call site moved — the marker comment "
                     f"changed the line count\n{[dict(r) for r in rows]}"

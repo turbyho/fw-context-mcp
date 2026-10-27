@@ -144,11 +144,11 @@ def test_an_address_of_an_instance_is_an_indirect_edge_to_the_template(out_of_li
     assert indirect == {10, 11}
 
 
-def test_an_init_list_keeps_the_assignment_of_an_instance(out_of_line):
-    """The filter of the stored functions holds the USR of the instance: the row must stay."""
+def test_an_init_list_puts_the_template_of_an_instance_into_the_field(out_of_line):
+    """The slot fact names the code key of the instance, which is its template."""
     template = next(s for s in out_of_line.symbols if s.qualified_name == "h")
-    rows = [f for f in out_of_line.fp_assignments if f.from_line == 10]
-    assert [(f.lhs_name, f.rhs_usr) for f in rows] == [("cb", template.usr)]
+    facts = [s for s in out_of_line.slots.sources if s.line == 10]
+    assert [(s.slot.rsplit("@FI@", 1)[-1], s.function) for s in facts] == [("cb", template.usr)]
 
 
 _INSTANCES = """\

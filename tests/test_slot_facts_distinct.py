@@ -1,15 +1,14 @@
-"""One fact gives one fp_assignments row, and only ``=`` gives an assignment row.
+"""One fact gives one slot fact, and only ``=`` puts a function into a slot.
 
 ``find_indirect_targets`` showed rows that were equal in every column.
-The extraction wrote them:
+Three cases wrote them:
 
-* Every BINARY_OPERATOR was read as an assignment.  A comparison such as
-  ``dev->cb != handler_a`` became a row, and the enclosing ``&&`` wrote
-  the same row a second time.
-* Each nested CALL_EXPR of ``reg(wrap((void *)&handler))`` found the same
-  target and wrote the same row.
-* A macro that expands once for each instance gave each expansion the
-  same file and line, thus the same row.
+* A comparison such as ``dev->cb != handler_a`` is no store, and the
+  enclosing ``&&`` must not give a second copy.
+* Each nested CALL_EXPR of ``reg(wrap((void *)&handler))`` reaches the same
+  function, which is one fact.
+* A macro that expands once for each instance gives each expansion the
+  same file and line, thus the same fact.
 """
 
 from __future__ import annotations
@@ -66,21 +65,30 @@ def extracted(tmp_path_factory):
     return extract_all(unit, with_refs=True)
 
 
+# The slot of the field ``cb`` of ``struct device``.
+CB = "F|c:@S@device@FI@cb"
+
+
 def _line(text: str) -> int:
     return next(i for i, line in enumerate(SOURCE.splitlines(), 1) if text in line)
 
 
+def _sources(extracted, line: int) -> list[tuple[str, str]]:
+    return [(s.function, s.slot) for s in extracted.slots.sources if s.line == line]
+
+
 @pytest.mark.libclang
-def test_no_two_rows_are_equal(extracted):
-    rows = [astuple(f) for f in extracted.fp_assignments]
+@pytest.mark.parametrize("facts", ["sources", "flows", "arguments", "escapes"])
+def test_no_two_facts_are_equal(extracted, facts):
+    rows = [astuple(f) for f in getattr(extracted.slots, facts)]
     assert len(rows) == len(set(rows)), [r for r in rows if rows.count(r) > 1]
 
 
 @pytest.mark.libclang
 def test_two_calls_on_one_line_stay_two_call_sites(extracted):
-    """A call site is an invocation: the dedup is for fp_assignments only."""
+    """A call site is an invocation: the dedup is not for the sites."""
     line = _line("dev->cb(1); dev->cb(2);")
-    assert len([s for s in extracted.indirect_call_sites if s.from_line == line]) == 2
+    assert len([s for s in extracted.slots.sites if s.line == line]) == 2
 
 
 def test_the_binding_reads_the_operator_of_a_binary_expression():
@@ -96,8 +104,9 @@ def test_the_binding_reads_the_operator_of_a_binary_expression():
 
 @pytest.mark.libclang
 def test_a_comparison_is_not_an_assignment(extracted):
+    """The address is taken, and it goes into no slot."""
     line = _line("dev->cb != handler_a")
-    assert [f for f in extracted.fp_assignments if f.from_line == line] == []
+    assert sorted(_sources(extracted, line)) == [("c:@F@handler_a", ""), ("c:@F@handler_b", "")]
 
 
 @pytest.mark.libclang
@@ -110,29 +119,25 @@ def test_a_comparison_still_gives_its_indirect_references(extracted):
 
 
 @pytest.mark.libclang
-def test_an_assignment_gives_one_row(extracted):
+def test_an_assignment_gives_one_fact(extracted):
     line = _line("dev->cb = handler_a;")
-    rows = [f for f in extracted.fp_assignments if f.from_line == line]
-    assert [(f.lhs_name, f.rhs_name, f.method) for f in rows] == [("cb", "handler_a", "assignment")]
+    assert _sources(extracted, line) == [("c:@F@handler_a", CB)]
 
 
 @pytest.mark.libclang
 def test_an_assignment_inside_a_macro_is_kept(extracted):
     """The operator comes from the AST, thus a macro that expands to ``=`` still assigns."""
     line = _line("SET_CB(dev, handler_b);")
-    rows = [f for f in extracted.fp_assignments if f.from_line == line]
-    assert [(f.lhs_name, f.rhs_name) for f in rows] == [("cb", "handler_b")]
+    assert _sources(extracted, line) == [("c:@F@handler_b", CB)]
 
 
 @pytest.mark.libclang
-def test_a_macro_that_expands_twice_on_one_line_gives_one_row(extracted):
+def test_a_macro_that_expands_twice_on_one_line_gives_one_fact(extracted):
     line = _line("FOR_EACH(DEFINE_OPS)")
-    rows = [f for f in extracted.fp_assignments if f.from_line == line and f.lhs_name == "init"]
-    assert len(rows) == 1, rows
+    assert [slot for _, slot in _sources(extracted, line)] == ["F|c:@S@ops@FI@init"]
 
 
 @pytest.mark.libclang
-def test_nested_calls_that_reach_one_target_give_one_row(extracted):
+def test_nested_calls_that_reach_one_target_give_one_fact(extracted):
     line = _line("reg(wrap(")
-    rows = [f for f in extracted.fp_assignments if f.from_line == line]
-    assert len(rows) == 1, rows
+    assert _sources(extracted, line) == [("c:@F@handler_a", "")]

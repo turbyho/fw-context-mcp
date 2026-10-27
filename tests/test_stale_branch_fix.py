@@ -14,11 +14,10 @@ from pathlib import Path
 
 from fw_context_mcp.indexer.db import (
     delete_overrides_for_file,
-    insert_fp_assignments_batch,
-    insert_indirect_call_sites_batch,
     insert_inheritance_batch,
     insert_overrides_batch,
     insert_refs_batch,
+    insert_slot_facts,
     insert_symbols_batch,
     open_db,
     purge_file_records,
@@ -67,8 +66,8 @@ class TestPurgeFileRecords:
     """Unit tests for purge_file_records — WP1 core function."""
 
     def test_purge_removes_all_table_rows(self, tmp_path: Path):
-        """Symbols, macros, inheritance, overrides, refs, indirect_call_sites,
-        fp_assignments, and files rows are gone after purge."""
+        """Symbols, macros, inheritance, overrides, refs, slot facts and
+        files rows are gone after purge."""
         conn = _shell_db(tmp_path)
         ch = "CCCC" * 8
 
@@ -120,16 +119,15 @@ class TestPurgeFileRecords:
             [(ch, usr2, "src/a.c", 3, usr1, "call", None, 0, 1)],
         )
 
-        # Insert indirect call site
-        insert_indirect_call_sites_batch(
-            conn,
-            [(ch, "src/a.c", 4, usr1, "fp()", usr2, "func_b", "void(*)()")],
-        )
-
-        # Insert fp_assignments
-        insert_fp_assignments_batch(
-            conn,
-            [(ch, "src/a.c", 5, "c:@F@field", "field", usr2, "func_b", "void(*)()", "assignment", usr1)],
+        # The slot facts of src/a.c: func_b goes into a field, and func_a
+        # calls through the field.
+        insert_slot_facts(
+            conn, ch,
+            [("src/a.c", 5, 1, usr2, "void ()", "F|c:@F@field")],
+            [],
+            [("src/a.c", 4, 1, 0, usr1, "pointer", "F|c:@F@field", "void ()", "", "")],
+            [],
+            [],
         )
 
         conn.commit()
@@ -160,13 +158,9 @@ class TestPurgeFileRecords:
         refs = conn.execute("SELECT COUNT(*) FROM refs").fetchone()[0]
         assert refs == 0
 
-        # indirect_call_sites gone (dangling incoming ref cleanup)
-        ics = conn.execute("SELECT COUNT(*) FROM indirect_call_sites").fetchone()[0]
-        assert ics == 0
-
-        # fp_assignments gone
-        fpa = conn.execute("SELECT COUNT(*) FROM fp_assignments").fetchone()[0]
-        assert fpa == 0
+        # The slot facts of the file are gone
+        assert conn.execute("SELECT COUNT(*) FROM slot_sources").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM slot_sites").fetchone()[0] == 0
 
         # files row gone
         files_left = {r["id"] for r in conn.execute("SELECT id FROM files").fetchall()}
@@ -252,11 +246,16 @@ class TestDeleteDanglingIncomingRefs:
         # Insert edges from surviving file → dead symbols
         insert_refs_batch(conn, [(ch, usr_dead1, "src/surviving.c", 1, usr_surv, "call", None, 0, 1)])
         insert_refs_batch(conn, [(ch, "c:@F@unrelated", "src/surviving.c", 11, usr_surv, "call", None, 0, 1)])
-        insert_indirect_call_sites_batch(
-            conn, [(ch, "src/surviving.c", 2, usr_surv, "fp()", usr_dead2, "dead2", "void(*)()")]
-        )
-        insert_fp_assignments_batch(
-            conn, [(ch, "src/surviving.c", 3, usr_dead1, "dead1_field", usr_dead2, "dead2", "void(*)()", "assignment", usr_surv)]
+        # Slot facts of the surviving file that name the dead functions: dead2
+        # goes into a field, and dead1 is the argument of an indirect call.
+        # The call site itself names no dead function and stays.
+        insert_slot_facts(
+            conn, ch,
+            [("src/surviving.c", 3, 1, usr_dead2, "void ()", "F|c:@F@field")],
+            [],
+            [("src/surviving.c", 2, 1, 0, usr_surv, "pointer", "F|c:@F@field", "void ()", "", "")],
+            [("src/surviving.c", 2, 1, 0, 0, "function", usr_dead1)],
+            [],
         )
         conn.commit()
 
@@ -271,13 +270,11 @@ class TestDeleteDanglingIncomingRefs:
         assert usr_dead1 not in ref_usrs
         assert "c:@F@unrelated" in ref_usrs  # unrelated survives
 
-        # indirect_call_sites to dead symbols gone
-        ics = conn.execute("SELECT * FROM indirect_call_sites").fetchall()
-        assert len(ics) == 0
-
-        # fp_assignments referencing dead symbols gone
-        fpa = conn.execute("SELECT * FROM fp_assignments").fetchall()
-        assert len(fpa) == 0
+        # The slot facts that name a dead function are gone
+        assert conn.execute("SELECT COUNT(*) FROM slot_sources").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM slot_arguments").fetchone()[0] == 0
+        # The call site of the surviving function stays
+        assert conn.execute("SELECT COUNT(*) FROM slot_sites").fetchone()[0] == 1
 
         conn.close()
 

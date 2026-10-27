@@ -30,10 +30,7 @@ def chunked(items: Sequence[T], size: int = MAX_BOUND_PARAMS) -> list[list[T]]:
     one config_hash.
 
     Pass a smaller *size* when ONE statement in the loop binds each item MORE
-    THAN ONE TIME.  _delete_dangling_incoming_refs runs five statements per
-    batch; four of them bind each item one time, and the fifth matches
-    fp_assignments on lhs_usr and on rhs_usr.  That one statement sets the
-    limit, so its 400 keeps 1 + 2 * 400 below 999.
+    THAN ONE TIME: that statement sets the limit for the whole batch.
 
     Generic on purpose: the callers pass list[int] and list[str], and the
     project asks for precise types.

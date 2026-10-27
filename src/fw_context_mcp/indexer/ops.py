@@ -9,15 +9,15 @@ Three code paths share this module:
 Pipeline, per TU (``store_symbols_for_unit``):
   1. Parse with libclang (or use caller-supplied *pre_parsed* to avoid
      double parsing when the caller already parsed outside the write lock)
-  2. Delete old symbols, refs, inheritance, indirect call sites,
-     function-pointer assignments, and macro rows for this TU
+  2. Delete old symbols, refs, inheritance, slot facts, and macro rows
+     for this TU
   3. Insert new symbol rows — compute ``is_project`` from vendor/project
      LIKE patterns, extract function bodies from the text that the parse
      read, via cached reads
   4. Detect symbols that moved between files without content changes —
      preserve LLM analysis by updating file_id instead of re-inserting
-  5. Insert refs, indirect call sites, function-pointer assignments,
-     pending dispatch edges, and inheritance rows
+  5. Insert refs, the slot facts of the indirect calls, pending
+     dispatch edges, and inheritance rows
   6. Store macro definitions (per-TU replacement)
   7. Fill ``files.content`` with ``#ifdef``-filtered text — tokenize the
      TU to find which lines are active for the build configuration
@@ -70,8 +70,6 @@ if TYPE_CHECKING:
 
 from fw_context_mcp.indexer.db import (
     get_file_mtimes,
-    insert_fp_assignments_batch,
-    insert_indirect_call_sites_batch,
     insert_inheritance_batch,
     insert_macros_batch,
     insert_refs_batch,
@@ -1431,8 +1429,6 @@ def store_symbols_for_unit(
         syms = result.symbols
         refs = result.references
         inheritance = result.inheritance
-        indirect_call_sites = result.indirect_call_sites
-        fp_assignments = result.fp_assignments
         macros = result.macros
         pending_dispatches = result.pending_dispatches
         slots = result.slots
@@ -1464,8 +1460,6 @@ def store_symbols_for_unit(
             syms = result.symbols
             refs = result.references
             inheritance = result.inheritance
-            indirect_call_sites = result.indirect_call_sites
-            fp_assignments = result.fp_assignments
             macros = result.macros
             pending_dispatches = getattr(result, 'pending_dispatches', [])
             slots = result.slots
@@ -1643,42 +1637,6 @@ def store_symbols_for_unit(
         if listing is not None:
             link_ref_producers(conn, ref_rows, listing)
         refs_added = len(ref_rows)
-
-    # Indirect call sites (function pointer invocations)
-    if index_refs and indirect_call_sites:
-        ics_rows = [
-            (
-                config_hash,
-                _rel(ics.from_file),
-                ics.from_line,
-                ics.from_usr,
-                ics.expr_text,
-                ics.target_usr,
-                ics.target_name,
-                ics.fn_ptr_type,
-            )
-            for ics in indirect_call_sites
-        ]
-        insert_indirect_call_sites_batch(conn, ics_rows)
-
-    # Function pointer assignments (Phase 3 — links assignments to call sites)
-    if index_refs and fp_assignments:
-        fpa_rows = [
-            (
-                config_hash,
-                _rel(fpa.from_file),
-                fpa.from_line,
-                fpa.lhs_usr,
-                fpa.lhs_name,
-                fpa.rhs_usr,
-                fpa.rhs_name,
-                fpa.fn_ptr_type,
-                fpa.method,
-                fpa.from_usr,
-            )
-            for fpa in fp_assignments
-        ]
-        insert_fp_assignments_batch(conn, fpa_rows)
 
     # The slot facts of the indirect calls (indexer/_slots.py).  Phase 5b
     # resolves them over all the units of the build.

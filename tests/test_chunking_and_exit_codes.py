@@ -15,12 +15,9 @@ class TestChunked:
         assert len(chunked(list(range(1000)))[0]) == MAX_BOUND_PARAMS
 
     def test_chunked_respects_a_smaller_size(self):
-        """The 400 in _delete_dangling_incoming_refs is deliberate.
+        """A statement that binds each item twice needs a smaller size.
 
-        One of its five statements matches fp_assignments on lhs_usr AND on
-        rhs_usr, so it binds each item twice.  1 + 2 * 500 is 1001, above the
-        999 that SQLite before 3.32 accepts.  A consolidation onto the
-        default would have introduced that defect.
+        1 + 2 * 500 is 1001, above the 999 that SQLite before 3.32 accepts.
         """
         batches = chunked(list(range(1000)), 400)
 

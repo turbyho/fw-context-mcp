@@ -874,58 +874,6 @@ CREATE TABLE IF NOT EXISTS ref_producers (
 CREATE INDEX IF NOT EXISTS idx_ref_producers_unit
     ON ref_producers(config_hash, unit_path, unit_flags_hash);
 
--- ── indirect_call_sites: function pointer invocation tracking ───────────
--- Records every call through a function pointer (driver.onData(buf, len)).
--- Unlike refs, the callee is a FIELD_DECL or VAR_DECL — the actual function
--- called is resolved later by joining with fp_assignments (Phase 3).
--- Why a separate table: the callee has a different USR domain (field/variable)
--- than direct calls (function/method).  Mixing them in refs would require
--- nullable fields and complicate every query.
--- expr_text stores the source-code expression (e.g. "driver.onData") so
--- callers can see HOW the pointer was invoked.
--- fn_ptr_type stores the function pointer type string — used by Phase 3c
--- fallback when exact USR matching fails.
-CREATE TABLE IF NOT EXISTS indirect_call_sites (
-    id           INTEGER PRIMARY KEY,
-    config_hash  TEXT    NOT NULL,
-    from_file    TEXT    NOT NULL,
-    from_line    INTEGER NOT NULL,
-    from_usr     TEXT,
-    expr_text    TEXT    NOT NULL DEFAULT '',
-    target_usr   TEXT    NOT NULL,
-    target_name  TEXT    NOT NULL DEFAULT '',
-    fn_ptr_type  TEXT    NOT NULL DEFAULT ''
-);
-CREATE INDEX IF NOT EXISTS idx_ics_config_target ON indirect_call_sites(config_hash, target_usr);
-CREATE INDEX IF NOT EXISTS idx_ics_config_file   ON indirect_call_sites(config_hash, from_file);
-CREATE INDEX IF NOT EXISTS idx_ics_config_usr    ON indirect_call_sites(config_hash, from_usr);
-
--- ── fp_assignments: function pointer assignment records ─────────────────
--- Records both sides of "field = &function" so the linking phase can
--- connect fp_assignments.lhs_usr = indirect_call_sites.target_usr.
--- Why lhs and rhs columns: the LHS is the field/variable receiving the
--- pointer; the RHS is the function being assigned.  Both are needed for
--- the Phase 3 resolution: "which functions can be called through this field?"
--- method stores the assignment type: assignment, call_arg, var_init, init_list.
--- This distinction matters because call_arg assignments (callback(&fn, obj))
--- are resolved differently than direct assignments (field = &fn).
-CREATE TABLE IF NOT EXISTS fp_assignments (
-    id           INTEGER PRIMARY KEY,
-    config_hash  TEXT    NOT NULL,
-    from_file    TEXT    NOT NULL,
-    from_line    INTEGER NOT NULL,
-    lhs_usr      TEXT    NOT NULL,
-    lhs_name     TEXT    NOT NULL DEFAULT '',
-    rhs_usr      TEXT    NOT NULL,
-    rhs_name     TEXT    NOT NULL DEFAULT '',
-    fn_ptr_type  TEXT    NOT NULL DEFAULT '',
-    method       TEXT    NOT NULL,
-    from_usr     TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_fpa_config_lhs ON fp_assignments(config_hash, lhs_usr);
-CREATE INDEX IF NOT EXISTS idx_fpa_config_rhs ON fp_assignments(config_hash, rhs_usr);
-CREATE INDEX IF NOT EXISTS idx_fpa_config_file ON fp_assignments(config_hash, from_file);
-
 -- ── slot_*: the slot facts of the indirect calls (indexer/_slots.py) ─────
 -- A slot holds a function: a field `F|<USR>`, a variable `V|<USR>`, a
 -- parameter `P|<code key>|<index>`, a return value `R|<code key>`.  The
@@ -1470,6 +1418,10 @@ def _run_data_migrations(conn: sqlite3.Connection) -> None:
     # bulk indexing but not recreated due to a crash.  Rebuilding here
     # guarantees a fresh, consistent FTS index on every open.
     conn.execute("DROP TABLE IF EXISTS file_analysis")
+    # The indirect calls and the function pointer stores of an index before
+    # the slot facts.  No code reads them, and their rows only take space.
+    conn.execute("DROP TABLE IF EXISTS indirect_call_sites")
+    conn.execute("DROP TABLE IF EXISTS fp_assignments")
     from fw_context_mcp.indexer.db import rebuild_fts
 
     rebuild_fts(conn)

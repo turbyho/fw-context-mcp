@@ -52,9 +52,8 @@ must be cleaned across 8+ tables.  The order is not arbitrary:
   3. **Vector embeddings** — vec_symbols rows referencing symbol IDs.
   4. **Macros** — macros for the file (FTS triggers clean the index).
   5. **Symbols** — the core symbol rows (FTS triggers clean the index).
-  6. **References, indirect call sites, fp_assignments** — use
-     file_path, not USR, so they are cleaned last (the USRs they
-     referenced are already gone).
+  6. **References and slot facts** — use file_path, not USR, so they
+     are cleaned last (the USRs they referenced are already gone).
   7. **File record** — the ``files`` row itself, deleted last so all
      ``file_id`` foreign-key references are already cleared.
 """
@@ -502,10 +501,7 @@ def _delete_dangling_incoming_refs(conn: sqlite3.Connection, config_hash: str, p
     two are also called from the reindex/reuse path where the file is being
     RE-PARSED, not deleted.
     """
-    # 400, not the default 500: the fp_assignments statement below binds
-    # each item TWICE (lhs_usr and rhs_usr), so 1 + 2 * 500 would be 1001 and
-    # exceed the limit on SQLite before 3.32.  See chunked().
-    for batch in chunked(purged_usrs, 400):
+    for batch in chunked(purged_usrs):
         ph = ",".join("?" * len(batch))
         conn.execute(
             f"DELETE FROM inheritance WHERE config_hash = ? AND base_usr IN ({ph})",
@@ -518,14 +514,6 @@ def _delete_dangling_incoming_refs(conn: sqlite3.Connection, config_hash: str, p
         conn.execute(
             f"DELETE FROM refs WHERE config_hash = ? AND to_usr IN ({ph})",
             (config_hash, *batch),
-        )
-        conn.execute(
-            f"DELETE FROM indirect_call_sites WHERE config_hash = ? AND target_usr IN ({ph})",
-            (config_hash, *batch),
-        )
-        conn.execute(
-            f"DELETE FROM fp_assignments WHERE config_hash = ? AND (lhs_usr IN ({ph}) OR rhs_usr IN ({ph}))",
-            (config_hash, *batch, *batch),
         )
         # A slot fact names a function by its code key, which is the USR of
         # its symbol (or the key of a lambda symbol).
@@ -550,8 +538,8 @@ def _delete_rows_owned_by(
     """Delete every row OWNED by *files*; return the USRs that were removed.
 
     "Owned" means the row's own file is one of *files*: its symbols, macros,
-    inheritance edges, embeddings, LLM analysis, vectors, and the references /
-    call sites / function pointer assignments that ORIGINATE in it.
+    inheritance edges, embeddings, LLM analysis, vectors, and the references
+    and slot facts that ORIGINATE in it.
 
     Deliberately NOT touched, because the two callers need different things:
 
@@ -586,11 +574,7 @@ def _delete_rows_owned_by(
     """
     from ._embeddings import stash_embeddings_for_files
     from ._inheritance import delete_inheritance_for_file
-    from ._refs import (
-        delete_fp_assignments_for_files,
-        delete_indirect_call_sites_for_files,
-        delete_refs_for_files,
-    )
+    from ._refs import delete_refs_for_files
     from ._slots import delete_slot_facts_for_files
     from ._symbols import delete_macros_for_files
 
@@ -619,8 +603,6 @@ def _delete_rows_owned_by(
     delete_macros_for_files(conn, [fid for fid, _ in files])
     paths = [path for _, path in files if path]
     delete_refs_for_files(conn, config_hash, paths, keep_instance_edges=keep_instance_edges)
-    delete_indirect_call_sites_for_files(conn, config_hash, paths)
-    delete_fp_assignments_for_files(conn, config_hash, paths)
     delete_slot_facts_for_files(conn, config_hash, paths)
     return purged_usrs
 

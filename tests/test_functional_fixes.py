@@ -226,17 +226,16 @@ class TestRunSourceLineFallback:
             path = f.name
         try:
             refs: list = []
-            fp_assignments: list = []
             pending_dispatches: list = []
             seen: dict = {}
             usr_to_qn = {u: q for q, u in qn_to_usr.items()}
             fn_spans = [("u_self", 1, len(source.splitlines()))]
             self._fallback(
-                _FakeTU(path), refs, fp_assignments, pending_dispatches, seen,
+                _FakeTU(path), refs, pending_dispatches, seen,
                 fn_spans, qn_to_usr, usr_to_qn,
                 logging.getLogger("test"),
             )
-            return refs, fp_assignments
+            return refs
         finally:
             os.unlink(path)
 
@@ -261,7 +260,7 @@ class TestRunSourceLineFallback:
             "WDT::feed": "u_feed",
             "Timer::start": "u_start",
         }
-        refs, _fp = self._run(src, qn)
+        refs = self._run(src, qn)
 
         assert [r for r in refs if r.ref_kind == "call"] == []
 
@@ -275,7 +274,7 @@ class TestRunSourceLineFallback:
             "}\n"
         )
         qn = {"the Mbed project::WDT::wdt_reset": "u_self", "the Mbed project::WDT::_timeout_interrupt": "u_ti"}
-        refs, fp_assignments = self._run(src, qn)
+        refs = self._run(src, qn)
 
         indirect = [
             r for r in refs
@@ -283,13 +282,6 @@ class TestRunSourceLineFallback:
         ]
         assert indirect, (
             "&WDT::_timeout_interrupt must be an indirect ref from wdt_reset via raw text"
-        )
-        fpa_matches = [
-            f for f in fp_assignments
-            if f.rhs_usr == "u_ti" and f.method == "call_arg"
-        ]
-        assert fpa_matches, (
-            "&WDT::_timeout_interrupt must also create an FnPointerAssignment via raw text"
         )
 
 
@@ -631,17 +623,16 @@ class TestDispatchDetectionFallback:
             f.write(source)
             path = f.name
         refs: list = []
-        fp_assignments: list = []
         pending: list = []
         seen: dict = {}
         usr_to_qn = {u: q for q, u in qn_to_usr.items()}
         fn_spans = [("u_caller", 1, len(source.splitlines()))]
         self._fallback(
-            _FakeTU(path), refs, fp_assignments, pending, seen,
+            _FakeTU(path), refs, pending, seen,
             fn_spans, qn_to_usr, usr_to_qn,
             logging.getLogger("test"),
         )
-        return refs, fp_assignments, pending
+        return refs, pending
 
     def test_dispatch_call_every_creates_pending(self):
         """EventQueue::call_every with &Class::method → PendingDispatch."""
@@ -655,7 +646,7 @@ class TestDispatchDetectionFallback:
             "events::EventQueue::call_every": "u_call_every",
             "the Mbed project::ZBLE::watch_ble": "u_watch",
         }
-        _refs, _fpa, pending = self._run(src, qn)
+        _refs, pending = self._run(src, qn)
 
         matches = [
             p for p in pending
@@ -679,7 +670,7 @@ class TestDispatchDetectionFallback:
             "the Mbed project::App::attach": "u_attach",
             "the Mbed project::App::onTick": "u_tick",
         }
-        _refs, _fpa, pending = self._run(src, qn)
+        _refs, pending = self._run(src, qn)
         assert not pending, (
             "Non-dispatch attach must not create PendingDispatch"
         )
@@ -696,7 +687,7 @@ class TestDispatchDetectionFallback:
             "rtos::Thread::start": "u_start",
             "the Mbed project::App::threadLoop": "u_loop",
         }
-        _refs, _fpa, pending = self._run(src, qn)
+        _refs, pending = self._run(src, qn)
 
         matches = [
             p for p in pending
