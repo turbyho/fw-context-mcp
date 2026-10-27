@@ -448,6 +448,11 @@ class Symbol:
             `weak` (`__attribute__((weak))`, `[[gnu::weak]]`, through a
             macro too), thus the object file defines the symbol weakly.
             `#pragma weak` is not seen: libclang does not give it.
+        is_tentative: A C tentative definition (C11 6.9.2): a file-scope
+            object with no initializer and no ``extern`` (`int g_x;`).  It
+            is a definition, but a definition with an initializer of the
+            same object in another unit wins over it, as the linker merges
+            a common symbol (``-fcommon``) into it.
     """
     name: str
     qualified_name: str      # namespace::Class::method
@@ -469,3 +474,4 @@ class Symbol:
     source: str = ""        # function/method body text (from libclang extent, only for is_definition=True)
     link_name: str = ""      # the name the linker resolves (external linkage only)
     is_weak: bool = False    # a declaration of the TU makes it weak (`_weak_usrs`)
+    is_tentative: bool = False  # a C tentative definition (`int g_x;` at file scope)

@@ -193,10 +193,11 @@ def insert_symbols_batch(
                qualified_name, kind, line, col, end_line, is_definition,
                signature, docstring, enum_value, is_virtual, is_pure_virtual,
                parent_usr, is_template, template_usr, is_project, pagerank, source,
-               is_weak[, link_name])
+               is_weak[, link_name[, is_tentative]])
 
-    A row without the last value has no link name: a writer of symbols that
-    no linker resolves (a type, a test fixture) leaves it out.
+    A row without ``link_name`` has no link name: a writer of symbols that
+    no linker resolves (a type, a test fixture) leaves it out.  A row
+    without ``is_tentative`` is no tentative definition.
 
     Returns count of rows inserted or upgraded to definition.
 
@@ -221,6 +222,11 @@ def insert_symbols_batch(
         file and the strong one of the project are one USR, and the units
         come in the order of their paths, thus the stub can come first.
         The row keeps one definition, thus the stub is not in the index.
+      • A **tentative definition** (`int g_x;` at file scope in C) gives
+        way to a definition of one strength with an initializer
+        (`int g_x = 5;`), as the linker merges a common symbol into it.
+        Before, the row of the unit that came first won, by the order of
+        the paths.
       • Two declarations for the same USR (e.g. from two headers), or two
         definitions of one strength, keep whichever arrived first.
 
@@ -228,14 +234,16 @@ def insert_symbols_batch(
     would overwrite ``is_definition`` back to 0 — breaking the call graph.
     """
 
-    full = [row if len(row) == 25 else (*row, "") for row in rows]
+    # The two last values are optional: (link_name, is_tentative).
+    defaults = ("", 0)
+    full = [(*row, *defaults[len(row) - 24:]) for row in rows]
     cur = conn.executemany(
         """INSERT INTO symbols
            (config_hash, file_id, file_path, name_tokens, usr, name, qualified_name, kind,
             line, col, end_line, is_definition, signature, docstring, enum_value,
             is_virtual, is_pure_virtual, parent_usr, is_template, template_usr, is_project, pagerank, source,
-            is_weak, link_name)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            is_weak, link_name, is_tentative)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(config_hash, usr) DO UPDATE SET
                file_id       = excluded.file_id,
                file_path     = excluded.file_path,
@@ -256,9 +264,12 @@ def insert_symbols_batch(
                pagerank      = excluded.pagerank,
                source        = excluded.source,
                is_weak       = excluded.is_weak,
-               link_name     = excluded.link_name
+               link_name     = excluded.link_name,
+               is_tentative  = excluded.is_tentative
            WHERE excluded.is_definition = 1 AND (
                symbols.is_definition = 0 OR (symbols.is_weak = 1 AND excluded.is_weak = 0)
+               OR (symbols.is_tentative = 1 AND excluded.is_tentative = 0
+                   AND excluded.is_weak <= symbols.is_weak)
            )""",
         full,
     )

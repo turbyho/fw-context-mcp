@@ -1008,6 +1008,9 @@ def _store_symbol_rows(
                 # definition of the same link name before this one.
                 int(s.is_weak),
                 s.link_name,
+                # `int g_x;` at file scope in C: a definition with an
+                # initializer in another unit wins over it.
+                int(s.is_tentative),
             )
         )
     # Batch insert — a single SQL statement for all symbols in the TU

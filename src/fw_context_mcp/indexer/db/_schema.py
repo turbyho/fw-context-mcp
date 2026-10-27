@@ -508,6 +508,8 @@ _MIGRATION_ADD_COLUMNS = [
     "ALTER TABLE symbols ADD COLUMN link_name TEXT NOT NULL DEFAULT ''",
     # The operator() of an "object" site (see the table in _SCHEMA).
     "ALTER TABLE slot_sites ADD COLUMN callee TEXT NOT NULL DEFAULT ''",
+    # A C tentative definition (see the column in _SCHEMA).
+    "ALTER TABLE symbols ADD COLUMN is_tentative INTEGER NOT NULL DEFAULT 0",
     # Schema version bump — DO NOT REMOVE. When adding new migration steps after this
     # column, also add a NEW ALTER TABLE … ADD COLUMN _schema_bump_… line. The hash
     # of _MIGRATION_ADD_COLUMNS drives CURRENT_SCHEMA_VERSION.
@@ -635,6 +637,10 @@ CREATE TABLE IF NOT EXISTS symbols (
     -- defines them weakly and an RTOS defines them properly, and both
     -- looked equally good.
     is_weak        INTEGER NOT NULL DEFAULT 0,
+    -- 1 for a C tentative definition (`int g_x;` at file scope, C11
+    -- 6.9.2): a definition with an initializer of the same symbol in an
+    -- other unit takes its row (insert_symbols_batch).
+    is_tentative   INTEGER NOT NULL DEFAULT 0,
     signature      TEXT    NOT NULL DEFAULT '',
     docstring      TEXT    NOT NULL DEFAULT '',
     is_virtual     INTEGER NOT NULL DEFAULT 0,

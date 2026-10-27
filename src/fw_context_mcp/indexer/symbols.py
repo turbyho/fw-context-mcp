@@ -1795,6 +1795,29 @@ def _distinct_records(records: list[FnPointerAssignment]) -> list[FnPointerAssig
     return distinct
 
 
+def _is_tentative_definition(cursor: cx.Cursor) -> bool:
+    """Tell if *cursor* is a C tentative definition: `static cb_t g_cb;`, `cb_t b;` at file scope.
+
+    C11 6.9.2: a file-scope object with no initializer and no ``extern``
+    is a tentative definition, and the end of the unit makes it a
+    definition when the unit has no other one.  libclang 22 reports it as
+    no definition (measured: ``is_definition()`` is False, and
+    ``get_definition()`` is None), thus the walk dropped each such
+    variable: a function pointer that firmware fills at run time
+    (`static cb_t g_cb;`) was no symbol, and no tool could name it.  In
+    C++ such a declaration is a definition already, and a declaration
+    with ``extern`` or in a class is not one.
+    """
+    if cursor.kind != cx.CursorKind.VAR_DECL:
+        return False
+    parent = cursor.semantic_parent
+    if parent is None or parent.kind != cx.CursorKind.TRANSLATION_UNIT:
+        return False
+    if cursor.storage_class == cx.StorageClass.EXTERN:
+        return False
+    return cursor.get_definition() is None
+
+
 def _process_one_symbol(
     cursor: cx.Cursor,
     symbols: list[Symbol],
@@ -1834,7 +1857,8 @@ def _process_one_symbol(
     if not loc.file:
         return False
 
-    is_def = cursor.is_definition()
+    is_tentative = not cursor.is_definition() and _is_tentative_definition(cursor)
+    is_def = cursor.is_definition() or is_tentative
     if not is_def and cursor.kind not in _DECL_KINDS:
         return False
 
@@ -1965,6 +1989,7 @@ def _process_one_symbol(
         is_template=is_template,
         template_usr=template_usr,
         link_name=_link_name(cursor),
+        is_tentative=is_tentative,
     ))
 
     if cursor.kind in (cx.CursorKind.CLASS_DECL, cx.CursorKind.STRUCT_DECL) and is_def:
