@@ -42,9 +42,8 @@ Private helper functions provide reusable building blocks:
   - _within_root          — a LABEL on a candidate row, not a guard: it
                             says whether a file of the index sits inside
                             the project or in the SDK beside it
-  - _collect_*            — callers, callees, indirect calls, enum
-                            constants, override metadata, and Phase 3
-                            resolution info
+  - _collect_*            — callers, callees, indirect call sites and
+                            targets, enum constants, override metadata
 """
 
 from __future__ import annotations
@@ -59,9 +58,8 @@ from typing import Annotated
 from pydantic import Field
 
 from ...indexer import db as index_db
+from ...indexer.db import _indirect as indirect_db
 from ...indexer.db import (
-    count_indirect_call_site_matches,
-    find_indirect_call_sites,
     get_llm_analysis_for_symbol,
     get_overrides_for_method,
     lookup_macro,
@@ -84,6 +82,7 @@ from ..shared.context import _normalize_file_path_query
 from ..shared.paging import call_text, clamp_offset, page_hint, page_notice, past_end_info, selector_args
 from ..shared.stale import _file_differs
 from ..shared.variants import IMAGE_DESCRIPTION, VARIANT_DESCRIPTION
+from . import _indirect_rows as indirect_rows
 from ._base import BaseHandler
 
 log = logging.getLogger(__name__)
@@ -1331,8 +1330,20 @@ def _collect_callees(
 # The kinds for which _collect_indirect_calls gives the call sites THROUGH
 # the symbol (a function pointer), and the kinds for which it gives the
 # indirect calls made BY the symbol.
-_POINTER_KINDS = ("field", "variable", "varglobal", "varlocal")
-_CODE_KINDS = ("function", "method", "lambda")
+_POINTER_KINDS = indirect_db.POINTER_KINDS
+_CODE_KINDS = indirect_db.CODE_KINDS
+# The functions that get_symbol_context shows for a function pointer.
+_TARGETS_SHOWN = 50
+
+
+def _sites_filter(row: sqlite3.Row, symbol_usr: str) -> tuple[str | None, str | None] | None:
+    """The filter of the indirect call sites of the symbol: (its slot, None) or (None, it as the caller); None for no such site."""
+    slot = indirect_db.slot_key(symbol_usr, row["kind"])
+    if slot is not None:
+        return slot, None
+    if row["kind"] in _CODE_KINDS:
+        return None, symbol_usr
+    return None
 
 
 def _list_totals(
@@ -1341,9 +1352,10 @@ def _list_totals(
     """Count each list of get_symbol_context, on the conditions of its collector.
 
     WHY: each list is cut — callers at ``_CALLERS_SHOWN``, callees at
-    ``_CALLEES_SHOWN``, indirect call sites at ``_INDIRECT_SHOWN`` — and a
-    cut list used to read as the whole truth.  A count beside each list
-    tells the reader that a tool that pages it has more.
+    ``_CALLEES_SHOWN``, indirect call sites at ``_INDIRECT_SHOWN``,
+    indirect targets at ``_TARGETS_SHOWN`` — and a cut list used to read
+    as the whole truth.  A count beside each list tells the reader that a
+    tool that pages it has more.
     """
     callers = count_refs_for_symbol(
         conn, config_hash, symbol_usr, row["kind"], ref_kind=["call", "indirect", "implicit_construct"],
@@ -1354,17 +1366,14 @@ def _list_totals(
            )""",
         (symbol_usr, config_hash),
     ).fetchone()[0])
-    indirect = 0
-    if row["kind"] in _POINTER_KINDS:
-        indirect = count_indirect_call_site_matches(
-            conn, config_hash, row["qualified_name"] or row["name"],
-        )
-    elif row["kind"] in _CODE_KINDS:
-        indirect = int(conn.execute(
-            "SELECT COUNT(*) FROM indirect_call_sites WHERE config_hash = ? AND from_usr = ?",
-            (config_hash, symbol_usr),
-        ).fetchone()[0])
-    return {"callers": callers, "callees": callees, "indirect_call_sites": indirect}
+    where = _sites_filter(row, symbol_usr)
+    indirect = (
+        indirect_db.count_indirect_sites(conn, config_hash, slot=where[0], caller=where[1])
+        if where is not None else 0
+    )
+    slot = indirect_db.slot_key(symbol_usr, row["kind"])
+    targets = indirect_db.count_slot_targets(conn, config_hash, slot) if slot is not None else 0
+    return {"callers": callers, "callees": callees, "indirect_call_sites": indirect, "indirect_targets": targets}
 
 
 def _list_hints(
@@ -1381,15 +1390,15 @@ def _list_hints(
     tools = {
         "callers": f"{call_text('find_callers', name, **selectors)} pages the callers.",
         "callees": f"{call_text('find_callees_recursive', name, max_depth=1, **selectors)} pages the callees.",
-    }
-    if row["kind"] in _POINTER_KINDS:
-        tools["indirect_call_sites"] = (
+        "indirect_call_sites": (
             f"{call_text('find_indirect_call_sites', name, **selectors)} pages the call sites."
-        )
+        ),
+        "indirect_targets": f"{call_text('find_indirect_targets', name, **selectors)} pages the targets.",
+    }
     return {
         f"{key}_hint": text
         for key, text in tools.items()
-        if totals[key] > shown[key]
+        if totals[key] > shown.get(key, 0)
     }
 
 
@@ -1400,118 +1409,42 @@ def _collect_indirect_calls(
     symbol_usr: str,
     root: Path,
 ) -> list[dict]:
-    """Return indirect call sites for a symbol — dual-purpose by symbol kind.
+    """Return the indirect call sites of a symbol, in the rows of ``find_indirect_call_sites``.
 
-    For **field/variable** kinds (function-pointer fields): returns call sites
-    where this field is actually invoked (e.g. ``driver.onData(buf, len)``).
-    Uses ``find_indirect_call_sites`` which queries the Phase 3 link table.
-
-    For **function/method** kinds: returns indirect call sites made BY this
-    function — calls through function pointers that originate inside this
-    function's body (e.g. ``stored_callback(42)`` inside ``dispatch_event``).
-
-    Returns an empty list for all other kinds (enum, class, struct, etc.).
+    For a **field or variable** (a function pointer): the calls through it,
+    also through a copy of its value (``driver.onData(buf, len)``).  For a
+    **function, method or lambda**: the indirect calls that it makes.  An
+    empty list for each other kind.
     """
-    kind = row["kind"]
-    if kind in _POINTER_KINDS:
-        ics_rows = find_indirect_call_sites(
-            conn, config_hash, row["qualified_name"] or row["name"], limit=_INDIRECT_SHOWN
-        )
-        return [
-            {
-                "file": abs_path(root, r["from_file"]),
-                "line": r["from_line"],
-                "expr_text": r["expr_text"],
-                "fn_ptr_type": r["fn_ptr_type"],
-                "caller": r["caller_qname"] or r["caller_name"] or "<file scope>",
-            }
-            for r in ics_rows
-        ]
-    if kind in _CODE_KINDS:
-        ics_rows = conn.execute(
-            """SELECT ics.*, caller.name AS caller_name,
-                      caller.qualified_name AS caller_qname,
-                      caller.kind AS caller_kind
-               FROM indirect_call_sites ics
-               LEFT JOIN symbols caller
-                 ON caller.config_hash = ics.config_hash
-                AND caller.usr = ics.from_usr
-               WHERE ics.config_hash = ? AND ics.from_usr = ?
-               ORDER BY ics.from_file, ics.from_line, ics.id
-               LIMIT ?""",
-            (config_hash, symbol_usr, _INDIRECT_SHOWN),
-        ).fetchall()
-        return [
-            {
-                "file": abs_path(root, r["from_file"]),
-                "line": r["from_line"],
-                "expr_text": r["expr_text"],
-                "fn_ptr_type": r["fn_ptr_type"],
-                "caller": r["caller_qname"] or r["caller_name"] or "<file scope>",
-            }
-            for r in ics_rows
-        ]
-    return []
+    where = _sites_filter(row, symbol_usr)
+    if where is None:
+        return []
+    sites = indirect_db.indirect_sites(
+        conn, config_hash, slot=where[0], caller=where[1], limit=_INDIRECT_SHOWN,
+    )
+    return [indirect_rows.site_row(conn, config_hash, root, site) for site in sites]
 
 
-def _collect_resolution_info(
+def _collect_indirect_targets(
     conn: sqlite3.Connection,
     config_hash: str,
     row: sqlite3.Row,
     symbol_usr: str,
-    indirect_call_total: int,
-) -> dict | None:
-    """Build Phase 3 resolution metadata for function-pointer symbols.
+    root: Path,
+) -> tuple[list[dict], bool] | None:
+    """The functions that a function pointer can hold, and if code out of view can write it; None for an other kind.
 
-    Phase 3 links function-pointer *assignments* (who is attached to this
-    field?) with *call sites* (where is this field actually invoked?).  When
-    both sides are populated the resolution is "fully resolved" — the LLM
-    (and the user) can trace the data flow from registration through
-    invocation.  When one side is missing, the `note` explains why
-    (assignments in unindexed code, type-erased API, etc.).
-
-    Returns ``None`` when the symbol is not a function-pointer-bearing
-    field/variable (kinds other than field/variable/varglobal/varlocal)
-    OR when neither assignments nor call sites exist — no need to emit
-    empty resolution metadata.
+    The rows are the rows of ``find_indirect_targets``: each function, and
+    where the code stored it.
     """
-    kind = row["kind"]
-    if kind not in ("field", "variable", "varglobal", "varlocal"):
+    slot = indirect_db.slot_key(symbol_usr, row["kind"])
+    if slot is None:
         return None
-    assign_count = conn.execute(
-        "SELECT COUNT(*) FROM fp_assignments WHERE config_hash = ? AND lhs_usr = ?",
-        (config_hash, symbol_usr),
-    ).fetchone()[0]
-    # The count of every call site, not the length of the cut list: the
-    # note and the answer must agree with indirect_call_sites_total.
-    ics_count = indirect_call_total
-    if assign_count == 0 and ics_count == 0:
-        return None
-    resolved = assign_count > 0 and ics_count > 0
-    note_parts: list[str] = []
-    if assign_count > 0:
-        note_parts.append(f"{assign_count} function(s) assigned")
-    else:
-        note_parts.append("no assignments found")
-    if ics_count > 0:
-        note_parts.append(f"{ics_count} call site(s)")
-    else:
-        note_parts.append("no call sites found")
-    if resolved:
-        note_parts.append("fully resolved")
-    else:
-        note_parts.append(
-            "not fully resolved — "
-            + ("assignment may be in unindexed code or through type-erased API"
-               if assign_count == 0
-               else "call sites may be in unindexed code")
-        )
-    return {
-        "assignments_found": assign_count,
-        "call_sites_found": ics_count,
-        "resolved": resolved,
-        "note": "; ".join(note_parts),
-    }
+    targets = indirect_db.slot_targets(conn, config_hash, slot, limit=_TARGETS_SHOWN)
+    return (
+        [indirect_rows.target_row(conn, config_hash, root, slot, target) for target in targets],
+        indirect_db.slot_escapes(conn, config_hash, slot),
+    )
 
 
 # The constants of one enum that get_source and get_symbol_context show.
@@ -1654,18 +1587,20 @@ def get_symbol_context(
         its column and its ``origins`` as in ``find_callers``),
         callees (list, max 100 — one row for each callee and kind of
         reference), source (body text),
-        indirect_call_sites (list, max 200 — for a field/variable symbol,
-        where the function pointer is invoked; for a function/method, the
-        calls through function pointers that it makes).
-        ``callers_total``, ``callees_total`` and
-        ``indirect_call_sites_total`` count each whole list.  When a list
-        is cut, ``callers_hint``, ``callees_hint`` or
-        ``indirect_call_sites_hint`` names the tool that pages it.
-        For field and variable symbols that have function pointer type,
-        also includes ``resolution``: {assignments_found, call_sites_found,
-        resolved, note} indicating whether assignments and call sites are
-        linked (Phase 3).  ``resolved=False`` with a note when parts are
-        missing — LLM can detect uncertainty.
+        indirect_call_sites (list, max 200, the rows of
+        ``find_indirect_call_sites`` — for a field/variable symbol, the
+        calls through the function pointer; for a function, method or
+        lambda, the indirect calls that it makes).  For a field or a
+        variable also ``indirect_targets`` (list, max 50, the rows of
+        ``find_indirect_targets``: each function it can hold, and where the
+        code stored it), and ``slot_escapes`` (True) when code out of view
+        can write it: a call through it then also reaches each function of
+        its type.
+        ``callers_total``, ``callees_total``, ``indirect_call_sites_total``
+        and ``indirect_targets_total`` count each whole list.  When a list
+        is cut, ``callers_hint``, ``callees_hint``,
+        ``indirect_call_sites_hint`` or ``indirect_targets_hint`` names the
+        tool that pages it.
         For an enum also returns constants (at most 200), constants_total and,
         when the list is cut, constants_hint; for an enum constant, enum_value.
         For macros returns ``kind="macro"``, ``signature`` (``#define NAME``
@@ -1746,11 +1681,9 @@ def get_symbol_context(
         # and indirect calls made BY functions/methods.
         indirect_calls_list = _collect_indirect_calls(conn, config_hash, row, symbol_usr, root)
 
-        # Resolution info — for function pointer fields/variables
+        # The functions that a function pointer field or variable can hold.
         totals = _list_totals(conn, config_hash, row, symbol_usr)
-        resolution = _collect_resolution_info(
-            conn, config_hash, row, symbol_usr, totals["indirect_call_sites"],
-        )
+        resolution = _collect_indirect_targets(conn, config_hash, row, symbol_usr, root)
 
         # For enums, collect all constants with their values
         enum_constants = _collect_enum_constants(conn, config_hash, row)
@@ -1799,16 +1732,21 @@ def get_symbol_context(
         "indirect_call_sites_total": totals["indirect_call_sites"],
         "docstring": row["docstring"] or "",
     }
+    if resolution is not None:
+        targets, escapes = resolution
+        result["indirect_targets"] = targets
+        result["indirect_targets_total"] = totals["indirect_targets"]
+        if escapes:
+            result["slot_escapes"] = True
     result.update(_list_hints(row, {
         "callers": len(callers_list),
         "callees": len(callees_list),
         "indirect_call_sites": len(indirect_calls_list),
+        "indirect_targets": len(resolution[0]) if resolution is not None else 0,
     }, totals, selector_args(project_root, variant, image)))
     # Every part of this answer — body, callers, callees — is about the one
     # symbol named here, and these keys say which one that is.
     result.update(ambiguity)
-    if resolution:
-        result["resolution"] = resolution
     if row["template_usr"]:
         result["template_usr"] = row["template_usr"]
     if row["parent_usr"]:

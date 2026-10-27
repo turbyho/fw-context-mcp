@@ -947,6 +947,7 @@ CREATE TABLE IF NOT EXISTS slot_sources (
 );
 CREATE INDEX IF NOT EXISTS idx_slot_sources_slot ON slot_sources(config_hash, slot);
 CREATE INDEX IF NOT EXISTS idx_slot_sources_file ON slot_sources(config_hash, file);
+CREATE INDEX IF NOT EXISTS idx_slot_sources_function ON slot_sources(config_hash, function);
 -- slot_flows: the value of one slot goes into another.
 CREATE TABLE IF NOT EXISTS slot_flows (
     id           INTEGER PRIMARY KEY,
@@ -958,6 +959,7 @@ CREATE TABLE IF NOT EXISTS slot_flows (
     target       TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_slot_flows_target ON slot_flows(config_hash, target);
+CREATE INDEX IF NOT EXISTS idx_slot_flows_source ON slot_flows(config_hash, source);
 CREATE INDEX IF NOT EXISTS idx_slot_flows_file   ON slot_flows(config_hash, file);
 -- slot_sites: an indirect call ("pointer": through a function pointer;
 -- "object": the operator() of a callable object; "address": a call of an
@@ -997,6 +999,7 @@ CREATE TABLE IF NOT EXISTS slot_arguments (
     value        TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_slot_arguments_file ON slot_arguments(config_hash, file);
+CREATE INDEX IF NOT EXISTS idx_slot_arguments_value ON slot_arguments(config_hash, value);
 -- slot_escapes: code that the AST does not show can write the slot.
 CREATE TABLE IF NOT EXISTS slot_escapes (
     id           INTEGER PRIMARY KEY,
@@ -1009,6 +1012,25 @@ CREATE TABLE IF NOT EXISTS slot_escapes (
 );
 CREATE INDEX IF NOT EXISTS idx_slot_escapes_slot ON slot_escapes(config_hash, slot);
 CREATE INDEX IF NOT EXISTS idx_slot_escapes_file ON slot_escapes(config_hash, file);
+-- slot_targets: the result of the resolution (indexer/_slot_resolution.py):
+-- each function that reaches a slot, one row for each slot that gives it
+-- (via), '' for a source of the slot itself; a tool follows them back to
+-- the places where the code stored the function.  slot_escaped: each slot
+-- that code out of view can write.  The step slot_edges replaces both for
+-- the whole build at each run, with the call edges.
+CREATE TABLE IF NOT EXISTS slot_targets (
+    config_hash  TEXT    NOT NULL,
+    slot         TEXT    NOT NULL,
+    function     TEXT    NOT NULL,
+    via          TEXT    NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_slot_targets_slot     ON slot_targets(config_hash, slot);
+CREATE INDEX IF NOT EXISTS idx_slot_targets_function ON slot_targets(config_hash, function);
+CREATE TABLE IF NOT EXISTS slot_escaped (
+    config_hash  TEXT    NOT NULL,
+    slot         TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_slot_escaped_slot ON slot_escaped(config_hash, slot);
 
 -- ── embeddings: semantic search vectors ─────────────────────────────────
 -- Stored as BLOB of float32 values packed with struct.pack('f', ...).

@@ -33,7 +33,7 @@ from fw_context_mcp.indexer.db import (
     upsert_project,
 )
 from fw_context_mcp.utils import compute_source_hash
-from tests._paging import assert_whole_and_once, notice, walk_pages, with_project
+from tests._paging import assert_whole_and_once
 
 CH = "hash-deadbeef"
 PROJECT_ID = "proj-indirect"
@@ -155,42 +155,3 @@ class TestTargets:
 
         assert _TARGET_ORDER.endswith("fpa.id, ics.id"), _TARGET_ORDER
 
-
-class TestHandlers:
-    def test_the_call_sites_walk_through_the_handler(self, project):
-        from fw_context_mcp.mcp.handlers.callgraph import find_indirect_call_sites as tool
-
-        seen, total = walk_pages(
-            lambda offset: tool("on_data", project_root=str(project), limit=3, offset=offset),
-            lambda r: (r["line"], r["expr_text"]),
-        )
-        assert total == CALL_LINES * CALLS_PER_LINE
-        assert_whole_and_once(seen, total)
-
-    def test_the_targets_walk_through_the_handler(self, project):
-        from fw_context_mcp.mcp.handlers.callgraph import find_indirect_targets as tool
-
-        seen, total = walk_pages(
-            lambda offset: tool("on_data", project_root=str(project), limit=7, offset=offset),
-            lambda r: (r["rhs_name"], r["call_line"], r["call_expr_text"]),
-        )
-        assert total == ASSIGNED * CALL_LINES * CALLS_PER_LINE
-        assert_whole_and_once(seen, total)
-
-    def test_the_hint_names_the_next_call(self, project):
-        from fw_context_mcp.mcp.handlers.callgraph import find_indirect_call_sites as tool
-
-        rows = tool("on_data", project_root=str(project), limit=3)
-        assert notice(rows)["hint"] == (
-            with_project("find_indirect_call_sites('on_data', offset=3) reads the next page.", project)
-        )
-
-    @pytest.mark.parametrize(("tool_name", "thing", "total"), [
-        ("find_indirect_call_sites", "indirect call site", CALL_LINES * CALLS_PER_LINE),
-        ("find_indirect_targets", "assignment", ASSIGNED * CALL_LINES * CALLS_PER_LINE),
-    ])
-    def test_a_page_after_the_end_names_the_total(self, project, tool_name, thing, total):
-        from fw_context_mcp.mcp.handlers import callgraph
-
-        rows = getattr(callgraph, tool_name)("on_data", project_root=str(project), offset=900)
-        assert rows == [{"info": f"No {thing} at offset 900; the answer holds {total}."}]

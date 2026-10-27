@@ -24,6 +24,10 @@ __all__ = [
 SLOT_TABLES: tuple[str, ...] = (
     "slot_sources", "slot_flows", "slot_sites", "slot_arguments", "slot_escapes",
 )
+# The result of the resolution of the build: no row belongs to a file, thus
+# the resolution replaces them at each run and a purge of the build deletes
+# them.
+RESOLUTION_TABLES: tuple[str, ...] = ("slot_targets", "slot_escaped")
 
 
 def insert_slot_facts(
@@ -87,6 +91,6 @@ def delete_slot_facts_for_files(
 
 
 def delete_slot_facts_for_config(conn: sqlite3.Connection, config_hash: str) -> None:
-    """Delete every slot fact of the build *config_hash*."""
-    for table in SLOT_TABLES:
+    """Delete every slot fact of the build *config_hash*, and the result of its resolution."""
+    for table in (*SLOT_TABLES, *RESOLUTION_TABLES):
         conn.execute(f"DELETE FROM {table} WHERE config_hash = ?", (config_hash,))

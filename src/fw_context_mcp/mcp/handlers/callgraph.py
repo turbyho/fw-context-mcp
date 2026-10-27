@@ -40,10 +40,12 @@ functions fall back to the macro table. Raw FTS5 results are filtered to
 exclude matches inside C/C++ comments (FTS5 indexes comment content but
 only active-code references are meaningful).
 
-**Function pointer phases:** The ``refs`` table stores Phase 1 assignments
-(``driver.onData = &handler``). Phase 3 call sites (``driver.onData(buf, len)``)
-are stored in the ``indirect_calls`` table. ``find_indirect_targets`` links
-them via the field's USR, producing a complete assignment-to-invocation trace.
+**Indirect calls:** the walk records the slot facts of each unit, and the
+step ``slot_edges`` resolves them over the build (``indexer/_slots.py``,
+``indexer/_slot_resolution.py``): a call edge of origin ``slot`` or
+``type_only`` for each target, and the targets of each slot.
+``find_indirect_call_sites`` and ``find_indirect_targets`` read them
+(``indexer/db/_indirect.py``); no answer matches a name.
 """
 
 from __future__ import annotations
@@ -58,35 +60,30 @@ from pydantic import Field
 
 from ...indexer import db as index_db
 from ...indexer.compile_commands import compile_directory
+from ...indexer.db import _indirect as indirect_db
 from ...indexer.db import (
-    count_fp_assignments,
-    count_indirect_call_site_matches,
-    count_indirect_call_sites,
-    count_indirect_target_matches,
     count_refs,
     find_macro_refs,
     find_refs_with_candidates,
     lookup_macro,
 )
-from ...indexer.db import (
-    find_indirect_call_sites as query_indirect_call_sites,
-)
-from ...indexer.db import (
-    find_indirect_targets as query_indirect_targets,
-)
 from ...indexer.db._resolve import ambiguity_notice, candidate_labels, count_candidates
 from ...indexer.intlist import read_isr_registrations
-from ...indexer.models import origin_names
+from ...indexer.models import RefOrigin, origin_names
 from ...utils import abs_path
 from ...utils import escape_like as _escape_like
 from ...utils import format_number_ranges as _as_ranges
 from ...utils import macro_signature as _macro_signature
 from ..shared.paging import clamp_offset, page_hint, page_notice, past_end_info, selector_args
 from ..shared.variants import IMAGE_DESCRIPTION, VARIANT_DESCRIPTION
+from . import _indirect_rows as indirect_rows
 from ._base import BaseHandler, DbContext
 from .source import _lookup_definition
 
 log = logging.getLogger(__name__)
+
+# The origins of the call edges of the slot resolution.
+_INDIRECT_ORIGINS = int(RefOrigin.SLOT | RefOrigin.TYPE_ONLY)
 
 def _resolve_virtual_callers(conn, config_hash: str, usr: str, root, ref_kind: list[str] | None,
                             limit: int = 50,
@@ -718,38 +715,39 @@ def find_references(
 
 # ── moved from server.py ──
 def find_indirect_call_sites(
-    name: Annotated[str, Field(description="Name of the function pointer field or variable to find call sites of. E.g. 'onData' finds all calls through Driver::onData.", min_length=1)],
+    name: Annotated[str, Field(description="A function pointer field or variable (the calls through it), or a function (the indirect calls it makes). E.g. 'onData'.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root directory. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum results (default 50, max 200).", ge=1)] = 50,
     offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a long answer.", ge=0)] = 0,
     variant: Annotated[str | None, Field(description=VARIANT_DESCRIPTION)] = None,
     image: Annotated[str | None, Field(description=IMAGE_DESCRIPTION)] = None,
 ) -> list[dict]:
-    """Find indirect call sites where a C/C++ function pointer field or
-    variable is invoked. libclang-powered: resolves calls through
-    function pointers (e.g. ``driver.onData(buf, len)``), which
-    text-based search cannot detect.
+    """Find the indirect calls through a C/C++ function pointer field or
+    variable, or the indirect calls that a function makes, with the
+    functions that each call reaches.
 
-    Returns locations where a function pointer is called through a field
-    access (``driver.onData(buf, len)``) or variable dereference
-    (``stored_callback(42)``).
+    An indirect call goes through a slot: a field, a variable, a
+    parameter or the return value of a function that holds a function
+    (``driver.onData(buf, len)``, ``g_cb(42)``, ``handlers[i](x)``), or the
+    ``operator()`` of a ``std::function`` or another callable object.
+    For a field or a variable, the answer holds each call through it, also
+    through a copy of its value (``cb_t f = dev->on_rx; f(1);``).
 
     Read-only. No side effects. Use this to answer "where is this function
-    pointer invoked?" as opposed to ``find_callers`` which answers "who
-    calls this function?" and ``find_references`` which answers "where is
-    this symbol read or assigned?"
-
-    For the reverse query — which functions are assigned to a given field
-    or parameter — use ``find_indirect_targets``.
+    pointer invoked, and what does it call?" as opposed to
+    ``find_callers`` which answers "who calls this function?" (an indirect
+    call that reaches it is a ``"call"`` row there, origin ``"slot"`` or
+    ``"type_only"``).  For the functions that a pointer can hold, and
+    where the code stores them, use ``find_indirect_targets``.
 
     Requires the reference index (``fw-context index`` — refs on by default).
 
     Args:
-        name: Name of the function pointer field or variable.
-            E.g. ``"onData"`` finds every call through a field named
-            ``onData``.  Uses three-tier resolution: exact name, exact
-            qualified, suffix LIKE; a function pointer parameter matches
-            by its exact name.
+        name: A function pointer field or variable, or a function, method
+            or lambda.  Resolved as every symbol tool resolves a name
+            (qualified name, bare name, suffix); a name of several symbols
+            answers for each of them.  A parameter is no symbol: ask with
+            its function.
         project_root: Project root directory. Auto-detected if omitted.
         limit: Maximum results (default 50, max 200).
         offset: Skip this many results. Reads the next page; the page
@@ -764,10 +762,22 @@ def find_indirect_call_sites(
             image name.
 
     Returns:
-        list of dicts, each with: file, line, expr_text (the callee
-        expression, e.g. ``"driver.onData"``), target_usr, target_name,
-        fn_ptr_type (the function pointer type signature), caller
-        (enclosing function name), caller_kind.
+        list of dicts, one per call site, each with: file, line, col,
+        caller, caller_kind, kind (``"pointer"``: through a function
+        pointer; ``"object"``: the ``operator()`` of a callable object;
+        ``"address"``: a call of an address that is a number, such as a
+        bootloader that starts the application), slot (the field,
+        variable, ``parameter N of f`` or ``return of f`` that the call
+        goes through; "" when the call names none), type, targets_total
+        and targets (at most 10: ``{name, origin}``, origin ``"slot"`` or
+        ``"type_only"``).  An ``"address"`` row has ``address`` (the text
+        of the address) and no target: no code of the build is there.
+        ``no_slot`` says why a call names no slot; ``slot_escapes`` marks a
+        slot that code out of view can write.  Both reach the functions of
+        their type: origin ``"type_only"``, a superset.
+
+        When *name* matches several symbols, a ``warning`` dict names them
+        and each row carries ``target_qualified_name``.
 
         The page notice ``{total, offset, shown, more, hint}`` comes
         before the rows of the answer.  ``total`` counts every row of the whole answer.  When
@@ -783,89 +793,104 @@ def find_indirect_call_sites(
     except RuntimeError as e:
         return [{"error": str(e)}]
     root = db.root
+    selectors = selector_args(project_root, variant, image)
 
     def _query(conn, config_hash):
         # Runs under the executor lock on the single shared connection;
         # must not open its own connection.  Timeout is enforced by
         # _wrap_tool (300 s + interrupt), not here.
-        # Check that Phase 2 indirect call sites exist at all in this index.
-        # Older indexes predating Phase 2 will have zero call sites,
-        # and reporting "not found" for every query would be misleading.
-        if count_indirect_call_sites(conn, config_hash) == 0:
-            return [{"info": (
-                "No indirect call sites indexed. Re-run 'fw-context index' "
-                "to populate the table (added in Phase 2)."
-            )}]
+        found = _indirect_candidates(conn, config_hash, name)
+        if isinstance(found, dict):
+            return [found]
+        candidates, labels = found
+        tagged = len(candidates) > 1
+        parts: list[indirect_rows.Part] = []
+        for candidate, label in zip(candidates, labels, strict=True):
+            slot = indirect_db.slot_key(candidate.usr, candidate.kind)
+            where = {"slot": slot} if slot is not None else {"caller": candidate.usr}
 
+            def fetch(page_limit: int, page_offset: int, where=where, label=label) -> list[dict]:
+                sites = indirect_db.indirect_sites(conn, config_hash, limit=page_limit, offset=page_offset, **where)
+                return [
+                    {
+                        **indirect_rows.site_row(conn, config_hash, root, site),
+                        **({"target_qualified_name": label} if tagged else {}),
+                    }
+                    for site in sites
+                ]
+
+            parts.append((indirect_db.count_indirect_sites(conn, config_hash, **where), fetch))
         clamped_limit = max(1, min(limit, 200))
         skip = clamp_offset(offset)
-        rows = query_indirect_call_sites(
-            conn, config_hash, name, limit=clamped_limit, offset=skip,
-        )
-        total = count_indirect_call_site_matches(conn, config_hash, name)
+        total = sum(count for count, _fetch in parts)
+        rows = indirect_rows.page_parts(parts, clamped_limit, skip)
         if not rows:
             if skip and total:
                 return [past_end_info("indirect call site", skip, total)]
-            return [{"info": f"No indirect call sites found for '{name}'."}]
-
-        sites = [
-            {
-                "file": abs_path(root, r["from_file"]),
-                "line": r["from_line"],
-                "expr_text": r["expr_text"],
-                "target_usr": r["target_usr"],
-                "target_name": r["target_name"],
-                "fn_ptr_type": r["fn_ptr_type"],
-                "caller": r["caller_qname"] or r["caller_name"] or "<file scope>",
-                "caller_kind": r["caller_kind"],
-            }
-            for r in rows
-        ]
-        notice = page_notice(
-            total, skip, len(sites),
-            hint=page_hint("find_indirect_call_sites", name, **selector_args(project_root, variant, image), next_offset=skip + len(sites)),
-        )
-        return [notice, *sites]
+            return [{"info": f"No indirect call through or in '{name}'."}]
+        answer: list[dict] = [page_notice(
+            total, skip, len(rows),
+            hint=page_hint("find_indirect_call_sites", name, **selectors, next_offset=skip + len(rows)),
+        ), *rows]
+        if tagged:
+            answer.insert(0, ambiguity_notice(
+                name, labels, "indirect call sites", count_candidates(conn, config_hash, name),
+            ))
+        return answer
 
     return db.execute_scoped(_query)
 
+
+def _indirect_candidates(conn, config_hash: str, name: str) -> tuple[list, list[str]] | dict:
+    """The symbols that *name* means and that an indirect call can concern, with their labels; or the answer dict.
+
+    A field or a variable holds a function; a function, method or lambda
+    makes calls and can be a target.  Each other kind (a type, a macro)
+    has no indirect call.
+    """
+    from ...indexer.db._resolve import resolve_candidates
+
+    candidates = resolve_candidates(conn, config_hash, name)
+    if not candidates:
+        return {"error": f"Symbol not found: {name}"}
+    wanted = [c for c in candidates if c.kind in indirect_db.POINTER_KINDS or c.kind in indirect_db.CODE_KINDS]
+    if not wanted:
+        kinds = ", ".join(sorted({str(c.kind) for c in candidates}))
+        return {"info": (
+            f"'{name}' is a {kinds}: name a function pointer field or variable, or a function, "
+            "method or lambda."
+        )}
+    return wanted, candidate_labels(wanted)
+
+
 # ── moved from server.py ──
 def find_indirect_targets(
-    name: Annotated[str, Field(description="Name of the function pointer field, variable, or parameter. "
-        "E.g. 'onData' — returns functions assigned to Driver::onData.", min_length=1)],
+    name: Annotated[str, Field(description="A function pointer field or variable (the functions it can hold), or a function (where the code stores its address, and the indirect calls that reach it). E.g. 'onData'.", min_length=1)],
     project_root: Annotated[str | None, Field(description="Project root. Auto-detected if omitted.")] = None,
     limit: Annotated[int, Field(description="Maximum results (default 50, max 200).", ge=1)] = 50,
     offset: Annotated[int, Field(description="Skip this many results. Reads the next page of a long answer.", ge=0)] = 0,
     variant: Annotated[str | None, Field(description=VARIANT_DESCRIPTION)] = None,
     image: Annotated[str | None, Field(description=IMAGE_DESCRIPTION)] = None,
 ) -> list[dict]:
-    """Find functions assigned to a C/C++ function pointer field or
-    variable. libclang-powered: links assignment sites to call sites
-    via the field's unique symbol reference, which text-based search
-    cannot resolve.
+    """Find the functions that a C/C++ function pointer field or variable
+    can hold, and where the code stores each of them; or, for a function,
+    where the code stores its address and which indirect calls reach it.
 
-    Links assignment sites (``driver.onData = &handler``) to call
-    sites (``driver.onData(buf, len)``) via the field's USR.
+    The answer comes from the data flow of the build, not from names: a
+    function reaches a field when the code stores it there, or stores it
+    in a slot whose value flows there (an argument of ``set_cb(h)`` into
+    the parameter, the parameter into the field), in any file of the
+    build.
 
-    Returns each function that could be invoked through the named function
-    pointer, showing both the assignment location and the call site(s).
-    When a function is assigned but no call site is found, ``call_file``
-    and ``call_line`` are ``null`` — the assignment exists but the
-    invocation may be in unindexed code.
-
-    For the reverse query — where is this field or parameter called — use
-    ``find_indirect_call_sites``.
+    For the calls through the pointer, use ``find_indirect_call_sites``.
 
     Read-only. No side effects. Requires the reference index
     (``fw-context index`` — refs on by default).
 
     Args:
-        name: Name of the function pointer field, variable, or parameter.
-            E.g. ``"onData"`` finds every function assigned to a field
-            named ``onData``.  Matches the pointer by exact name, exact
-            qualified name, or ``::name`` suffix.  It also matches the
-            ASSIGNED function by exact name or substring, thus a row can be
-            an assignment of a function whose name holds *name*.
+        name: A function pointer field or variable, or a function, method
+            or lambda.  Resolved as every symbol tool resolves a name; a
+            name of several symbols answers for each of them.
         project_root: Project root directory. Auto-detected if omitted.
         limit: Maximum results (default 50, max 200).
         offset: Skip this many results. Reads the next page; the page
@@ -880,19 +905,28 @@ def find_indirect_targets(
             image name.
 
     Returns:
-        list of dicts, each with: rhs_name (assigned function),
-        rhs_qname, fn_ptr_type, method (assignment/call_arg/var_init/
-        init_list), assign_file, assign_line, assign_caller,
-        call_file, call_line, call_expr_text.
+        For a field or a variable, one dict per function: function, kind,
+        file and line (the definition), origin (``"slot"``), stored_file
+        and stored_line (the first place that stores it), stored_places
+        (the places of every way to the slot), and stored_in (a list) when
+        the code stored it in another slot whose value flows here
+        (``["parameter 0 of set_cb"]``).  ``stored_places_capped`` (True)
+        marks a count that the walk back cut.  A ``warning`` dict comes
+        first when code out of view can write the
+        slot: a call through it also reaches each function of its type
+        (``find_indirect_call_sites`` lists them, origin ``"type_only"``).
+        It comes also when no code of the build stores a function into
+        the slot (a library out of the build fills it), with an ``info``
+        dict instead of the rows.
 
-        An entry can carry ``_note`` (str) when the callee is
-        template-obscured: the call site is then missing, or comes from
-        the type-based fallback.  ``_note`` also marks a call site that
-        the ``fn_ptr_type`` fallback found: a call through another pointer
-        of the same type.  A ``call_expr_text`` of ``"<inferred via
-        class hierarchy>"`` marks a call site that a fallback found, not
-        the field's USR.  Read both before you act on ``call_file`` and
-        ``call_line``.
+        For a function, rows with ``relation``: ``"stored"`` (file, line,
+        col, slot that receives the address, "" when none is known, and
+        context, the code that stores it) and ``"called"`` (file, line,
+        col, caller, caller_kind, origin: an indirect call that reaches
+        it).
+
+        When *name* matches several symbols, a ``warning`` dict names them
+        and each row carries ``target_qualified_name``.
 
         The page notice ``{total, offset, shown, more, hint}`` comes
         before the rows of the answer.  ``total`` counts every row of the whole answer.  When
@@ -908,74 +942,117 @@ def find_indirect_targets(
     except RuntimeError as e:
         return [{"error": str(e)}]
     root = db.root
+    selectors = selector_args(project_root, variant, image)
 
     def _query(conn, config_hash):
         # Runs under the executor lock on the single shared connection;
         # must not open its own connection.  Timeout is enforced by
         # _wrap_tool (300 s + interrupt), not here.
-        # Check that Phase 3 function-pointer assignments exist.
-        # Older indexes predating Phase 3 will have zero entries.
-        if count_fp_assignments(conn, config_hash) == 0:
-            return [{"info": (
-                "No function pointer assignments indexed. Re-run "
-                "'fw-context index' to populate the table (added in Phase 3)."
-            )}]
+        found = _indirect_candidates(conn, config_hash, name)
+        if isinstance(found, dict):
+            return [found]
+        candidates, labels = found
+        tagged = len(candidates) > 1
+        tag = (lambda label: {"target_qualified_name": label}) if tagged else (lambda label: {})
+        parts: list[indirect_rows.Part] = []
+        escaped: list[str] = []
+        for candidate, label in zip(candidates, labels, strict=True):
+            slot = indirect_db.slot_key(candidate.usr, candidate.kind)
+            if slot is not None:
+                if indirect_db.slot_escapes(conn, config_hash, slot):
+                    escaped.append(label)
 
+                def fetch_targets(page_limit: int, page_offset: int, slot=slot, label=label) -> list[dict]:
+                    targets = indirect_db.slot_targets(conn, config_hash, slot, limit=page_limit, offset=page_offset)
+                    return [
+                        {**indirect_rows.target_row(conn, config_hash, root, slot, target), **tag(label)}
+                        for target in targets
+                    ]
+
+                parts.append((indirect_db.count_slot_targets(conn, config_hash, slot), fetch_targets))
+                continue
+            usr = candidate.usr
+
+            def fetch_stores(page_limit: int, page_offset: int, usr=usr, label=label) -> list[dict]:
+                stores = indirect_db.function_stores(conn, config_hash, usr, limit=page_limit, offset=page_offset)
+                return [
+                    {
+                        "relation": "stored",
+                        "file": abs_path(root, store["file"]),
+                        "line": store["line"],
+                        "col": store["col"],
+                        "slot": indirect_db.describe_slot(conn, config_hash, store["slot"]),
+                        "context": store["context"] or "<file scope>",
+                        **tag(label),
+                    }
+                    for store in stores
+                ]
+
+            def fetch_calls(page_limit: int, page_offset: int, usr=usr, label=label) -> list[dict]:
+                calls, _total = indirect_db.function_calls_by_slot(
+                    conn, config_hash, usr, limit=page_limit, offset=page_offset,
+                )
+                return [
+                    {
+                        "relation": "called",
+                        "file": abs_path(root, call["from_file"]),
+                        "line": call["from_line"],
+                        "col": call["from_col"],
+                        "caller": call["caller_qname"] or call["caller_name"] or "<file scope>",
+                        "caller_kind": call["caller_kind"],
+                        "origin": origin_names(call["origins"] & _INDIRECT_ORIGINS)[0],
+                        **tag(label),
+                    }
+                    for call in calls
+                ]
+
+            parts.append((indirect_db.count_function_stores(conn, config_hash, usr), fetch_stores))
+            parts.append((indirect_db.function_calls_by_slot(conn, config_hash, usr, limit=0)[1], fetch_calls))
         clamped_limit = max(1, min(limit, 200))
         skip = clamp_offset(offset)
-        rows = query_indirect_targets(conn, config_hash, name, limit=clamped_limit, offset=skip)
-        total = count_indirect_target_matches(conn, config_hash, name)
+        total = sum(count for count, _fetch in parts)
+        rows = indirect_rows.page_parts(parts, clamped_limit, skip)
+        escape_warning = {"warning": (
+            f"Code out of view can write {', '.join(escaped)} (its address escapes, or a slot "
+            "that escapes flows into it): a call through it also reaches each function of its "
+            "type whose address the build takes. find_indirect_call_sites lists those targets "
+            "with origin 'type_only'."
+        )} if escaped else None
         if not rows:
             if skip and total:
-                return [past_end_info("assignment", skip, total)]
-            return [{"info": f"No functions assigned to '{name}'."}]
-
-        results: list[dict] = [page_notice(
+                return [past_end_info("indirect target", skip, total)]
+            # A slot that a library out of the build fills (`hal_register(&cb)`)
+            # has no target of its own: the escape is the answer, and not
+            # "nothing reaches it".
+            sentences = []
+            if any(indirect_db.slot_key(c.usr, c.kind) is not None for c in candidates):
+                sentences.append(
+                    f"No code of the build stores a function into '{name}'. A variable of a struct "
+                    "type is no slot: ask about its fields."
+                )
+            if any(indirect_db.slot_key(c.usr, c.kind) is None for c in candidates):
+                sentences.append(
+                    f"No code of the build takes the address of '{name}', and no indirect call reaches it."
+                )
+            empty: list[dict] = [{"info": " ".join(sentences)}]
+            if escape_warning:
+                empty.insert(0, escape_warning)
+            if tagged:
+                empty.insert(0, ambiguity_notice(
+                    name, labels, "indirect targets", count_candidates(conn, config_hash, name),
+                ))
+            return empty
+        answer: list[dict] = [page_notice(
             total, skip, len(rows),
-            hint=page_hint("find_indirect_targets", name, **selector_args(project_root, variant, image), next_offset=skip + len(rows)),
-        )]
-        for r in rows:
-            call_expr_text: str | None = str(r["call_expr_text"]) if r["call_expr_text"] else None
-            entry: dict = {
-                "rhs_name": str(r["rhs_name"] or ""),
-                "rhs_qname": str(r["rhs_qname"] or r["rhs_name"] or ""),
-                "fn_ptr_type": str(r["fn_ptr_type"] or ""),
-                "method": str(r["method"] or ""),
-                "assign_file": abs_path(root, str(r["assign_file"] or "")),
-                "assign_line": r["assign_line"],
-                "assign_caller": str(r["assign_caller"] or "<file scope>"),
-                "call_file": abs_path(root, str(r["call_file"])) if r["call_file"] else None,
-                "call_line": r["call_line"],
-                "call_expr_text": call_expr_text,
-            }
-            lhs_name = str(r["lhs_name"] or "")
-            if lhs_name and not r["lhs_usr"]:
-                # Template-obscured callback: libclang could not resolve the
-                # concrete callee type (e.g., _timeout.attach(&handler)).
-                # The call-site resolver uses a type-based fallback — when
-                # the receiver class's method signature matches a known
-                # handler type, the call site is attributed to that method.
-                if not r["call_file"]:
-                    lhs_display = lhs_name.strip()
-                    entry["_note"] = (
-                        f"Direct call site not resolved — the callee "
-                        f"({lhs_display}) is template-obscured. "
-                        "The function pointer is likely stored and invoked "
-                        "asynchronously (e.g. Timeout/Ticker callback). "
-                        "Use find_indirect_call_sites on the receiver class "
-                        "to find the actual invocation site."
-                    )
-                else:
-                    entry["_note"] = (
-                        "Call site resolved via type-based fallback "
-                        "(template-obscured callback → receiver class handler)."
-                    )
-            if "_note" not in entry and r.get("_note"):
-                # The fn_ptr_type fallback of the DB layer: a call site of
-                # another pointer with the same type, not of this one.
-                entry["_note"] = str(r["_note"])
-            results.append(entry)
-        return results
+            hint=page_hint("find_indirect_targets", name, **selectors, next_offset=skip + len(rows)),
+        ), *rows]
+        if escape_warning:
+            answer.insert(0, escape_warning)
+        if tagged:
+            answer.insert(0, ambiguity_notice(
+                name, labels, "indirect targets", count_candidates(conn, config_hash, name),
+            ))
+        return answer
 
     return db.execute_scoped(_query)
 

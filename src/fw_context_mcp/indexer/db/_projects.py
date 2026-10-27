@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import sqlite3
 
+from ..models import RefOrigin
 from ._owners import delete_ownership_for_build
 from ._schema import _ensure_column
 from ._slots import delete_slot_facts_for_config
@@ -649,11 +650,14 @@ def get_build_stats(conn: sqlite3.Connection, config_hash: str) -> dict:
         (config_hash,),
     ).fetchone()[0]
 
+    # The indirect calls (slot facts) and the call edges that their
+    # resolution gives (origins SLOT or TYPE_ONLY).
     indirect_sites = conn.execute(
-        "SELECT COUNT(*) FROM indirect_call_sites WHERE config_hash = ?", (config_hash,)
+        "SELECT COUNT(*) FROM slot_sites WHERE config_hash = ?", (config_hash,)
     ).fetchone()[0]
-    fp_assignments = conn.execute(
-        "SELECT COUNT(*) FROM fp_assignments WHERE config_hash = ?", (config_hash,)
+    indirect_edges = conn.execute(
+        "SELECT COUNT(*) FROM refs WHERE config_hash = ? AND ref_kind = 'call' AND (origins & ?) != 0",
+        (config_hash, int(RefOrigin.SLOT | RefOrigin.TYPE_ONLY)),
     ).fetchone()[0]
 
     result: dict = dict(config)
@@ -673,6 +677,6 @@ def get_build_stats(conn: sqlite3.Connection, config_hash: str) -> dict:
     result["pagerank_coverage"] = pagerank
     result["embedding_count"] = embeddings
     result["indirect_call_sites"] = indirect_sites
-    result["fp_assignments"] = fp_assignments
+    result["indirect_call_edges"] = indirect_edges
 
     return result

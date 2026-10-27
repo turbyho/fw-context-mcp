@@ -110,19 +110,6 @@ def test_an_underscore_is_no_wildcard(db):
     assert db_find_indirect_targets(db, CH, "on_rx_donX") == []
 
 
-def test_the_fn_ptr_type_note_reaches_the_answer(db, tmp_path):
-    from tests._paging import answers
-
-    with _handler_db(tmp_path):
-        rows = answers(_without_stale_warning(
-            callgraph.find_indirect_targets(name="onData", project_root=str(tmp_path))
-        ))
-
-    assert len(rows) == 1, rows
-    assert rows[0]["call_line"] == 77
-    assert "fn_ptr_type" in rows[0]["_note"]
-
-
 # ── trace_data_flow ─────────────────────────────────────────────────────────
 
 

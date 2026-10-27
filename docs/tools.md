@@ -396,7 +396,7 @@ Files:          896
 References:     81203
 Macros:         7012
 Indirect calls: 156
-FP assignments: 89
+Indirect edges: 412
 Overrides:      42
 Hotspot cache:  20
 PageRank cov:   29464 / 29464 symbols
@@ -2130,27 +2130,31 @@ Output: {"name": "modem_connect", "kind": "function",
            {"name": "pdp_activate", "kind": "function", "file": "/path/src/net.c"}
          ],
          "indirect_call_sites": [],
-         "callers_total": 2, "callees_total": 3, "indirect_call_sites_total": 0,
-         "resolution": null}
+         "callers_total": 2, "callees_total": 3, "indirect_call_sites_total": 0}
 ```
 
-For function pointer fields the output includes call sites and resolution:
+For a function pointer field or variable, the output includes the calls
+through it and the functions that it can hold:
 
 ```
 Input:  {"name": "onData", "project_root?": "/path/to/project"}
 Output: {"name": "onData", "kind": "field",
          "indirect_call_sites": [
-           {"file": "/path/src/main.c", "line": 16,
-            "expr_text": "drv . onData",
-            "fn_ptr_type": "void (*)(unsigned char *, int)",
-            "caller": "test_assign"}
+           {"file": "/path/src/main.c", "line": 16, "col": 5,
+            "caller": "test_assign", "caller_kind": "function",
+            "kind": "pointer", "slot": "Driver::onData",
+            "type": "void (unsigned char *, int)",
+            "targets_total": 1,
+            "targets": [{"name": "on_rx", "origin": "slot"}]}
          ],
-         "resolution": {
-           "assignments_found": 1,
-           "call_sites_found": 1,
-           "resolved": true,
-           "note": "1 function(s) assigned; 1 call site(s); fully resolved"
-         }}
+         "indirect_call_sites_total": 1,
+         "indirect_targets": [
+           {"function": "on_rx", "kind": "function",
+            "file": "/path/src/main.c", "line": 4, "origin": "slot",
+            "stored_file": "/path/src/main.c", "stored_line": 12,
+            "stored_places": 1}
+         ],
+         "indirect_targets_total": 1}
 ```
 
 This tool is designed as one-shot LLM context. This tool answers "what
@@ -2161,21 +2165,21 @@ a maximum:
 |------|---------|--------------------|
 | `callers` | 50 `call` and `indirect` references, each with its line, column and `origins` | `find_callers` |
 | `callees` | 100 rows, one for each callee and kind of reference | `find_callees_recursive` with `max_depth=1` |
-| `indirect_call_sites` | 200 entries | `find_indirect_call_sites`, for a field or a variable |
+| `indirect_call_sites` | 200 rows of `find_indirect_call_sites` | `find_indirect_call_sites` |
+| `indirect_targets` | 50 rows of `find_indirect_targets`, for a field or a variable | `find_indirect_targets` |
 
-`callers_total`, `callees_total`, and `indirect_call_sites_total` count
-each whole list. When the maximum cuts a list, `callers_hint`,
-`callees_hint`, or `indirect_call_sites_hint` names the tool that pages
-it. `indirect_call_sites_hint` is there only for a field or a variable.
-The hint names no offset: the paged tool counts a wider set, thus its
-pages do not continue the list row for row.
+`callers_total`, `callees_total`, `indirect_call_sites_total` and
+`indirect_targets_total` count each whole list. When the maximum cuts a
+list, `callers_hint`, `callees_hint`, `indirect_call_sites_hint` or
+`indirect_targets_hint` names the tool that pages it. The hint names no
+offset: the paged tool counts a wider set, thus its pages do not continue
+the list row for row.
 
-For a field or variable symbol that has a function pointer type, the
-result also includes a `resolution` block:
-`{assignments_found, call_sites_found, resolved, note}`. This block
-indicates whether the assignments and the call sites are linked (Phase 3).
-When the data is incomplete, `resolved` is `false`, with an explanatory
-note. The LLM can detect the uncertainty from this signal.
+`indirect_call_sites` holds, for a field or a variable, the calls through
+it (also through a copy of its value), and for a function, a method or a
+lambda, the indirect calls that it makes. `slot_escapes: true` marks a
+field or a variable that code out of view can write: a call through it
+also reaches each function of its type.
 
 For enums, the result includes a `constants` array, with the member
 constants and their values, in the same shape as `get_source`: at most
@@ -2376,10 +2380,11 @@ references a function through any of these patterns:
 `callback(&Class::method, this)`, `driver.onData = &handleData`,
 `void (*fp)(int) = &handler`, or `{.on_data = &handler}`.
 
-For the invocation side — where fw-context actually calls the stored
-pointer — use `find_indirect_call_sites`. For linking assignments to call
-sites — which specific functions can run at a given call site — use
-`find_indirect_targets`.
+A call through a pointer that reaches the function is a `"call"` row at
+the place of the call, with origin `"slot"` or `"type_only"`. For the
+calls through one pointer, and the functions that each reaches, use
+`find_indirect_call_sites`. For the functions that one pointer can hold,
+and where the code stores them, use `find_indirect_targets`.
 
 **Ambiguous name.** When the name matches more than one symbol, such as
 two classes with a method of the same name, the answer holds the call
@@ -2528,7 +2533,7 @@ Output: [
   {"name": "handler_timeout", "kind": "function", "file": "/path/src/main.c",
    "signature": "void handler_timeout()", "line": 25,
    "status": "possibly_dead",
-   "reason": "assigned as function pointer but call sites unresolved",
+   "reason": "its address is taken, but no call of the build reaches it",
    "indirect_refs": "/path/src/main.c:60"},
   …
 ]
@@ -2537,12 +2542,15 @@ Output: [
 **`"dead"`** — no references at all (neither calls nor function pointer
 assignments). Likely unused.
 
-**`"possibly_dead"`**: code assigns the function to a function pointer
-(`ref_kind="indirect"`), but fw-context did not resolve a call site
-through that pointer. This means the function **might** run through
+**`"possibly_dead"`**: code takes the address of the function
+(`ref_kind="indirect"`), but no call of the build reaches it: no indirect
+call has it as a target. This means the function **might** run through
 unindexed code, or through a type-erased API. Treat this result as
 uncertain, not as confirmed dead code. Verify each result with
-`find_indirect_targets`, before you delete the function.
+`find_indirect_targets`, which names each place that stores its address,
+before you delete the function. A function that an indirect call reaches
+by its type only (origin `"type_only"`) has a call, thus it is not
+reported, also when no code really calls it.
 
 Each row also holds `qualified_name`. `file` is absolute, and `line` is
 the line of the definition.
@@ -2623,74 +2631,97 @@ total. No match gives one `info` dict.
 
 #### `find_indirect_call_sites`
 
-Find indirect call sites where a function pointer field or variable is invoked.
+Find the indirect calls through a function pointer field or variable, or
+the indirect calls that a function makes, with the functions that each
+call reaches.
 
 ```
 Input:  {"name": "onData", "project_root?": "/path/to/project", "limit?": 50, "offset?": 0}
 Output: [{"total": 1, "offset": 0, "shown": 1, "more": false},
-         {"file": "/path/src/main.c", "line": 36, "expr_text": "drv . onData",
-          "target_usr": "c:@S@Driver@FI@onData", "target_name": "onData",
-          "fn_ptr_type": "void (*)(unsigned char *, int)",
-          "caller": "test_assign", "caller_kind": "function"}]
+         {"file": "/path/src/main.c", "line": 16, "col": 5,
+          "caller": "test_assign", "caller_kind": "function",
+          "kind": "pointer", "slot": "Driver::onData",
+          "type": "void (unsigned char *, int)",
+          "targets_total": 1,
+          "targets": [{"name": "handler_data", "origin": "slot"}]}]
 ```
 
-Returns locations where code calls a function pointer, through a field
-access (`driver.onData(buf, len)`) or a variable (`stored_callback(42)`).
-Use this tool to answer *"where does code invoke this function pointer?"*
-Combine this tool with `find_indirect_targets`, to answer *"which
-functions are assigned to this field?"*
+An indirect call goes through a slot: a field, a variable, a parameter or
+the return value of a function that holds a function
+(`driver.onData(buf, len)`, `g_cb(42)`, `handlers[i](x)`), or the
+`operator()` of a `std::function` or of another callable object. For a
+field or a variable, the answer holds each call through it, also through a
+copy of its value (`cb_t f = drv->onData; f(1);`). For a function, a
+method or a lambda, it holds the indirect calls that the code makes. A
+parameter is no symbol: ask with its function.
 
-Uses three-tier name resolution: exact name, exact qualified, suffix LIKE.
+Each row:
+
+- `kind` — `"pointer"` (a call through a function pointer), `"object"`
+  (the `operator()` of a callable object), or `"address"`: a call of an
+  address that is a number, such as a bootloader that starts the
+  application (`((entry_t)APP_RESET)()`). An `"address"` row holds
+  `address`, the text of the address, and no target: no code of the build
+  is there.
+- `slot` — what the call goes through, as a reader names it
+  (`Driver::onData`, `parameter 0 of attach`, `return of pick`), or `""`
+  when the call names none; `no_slot` then says why.
+- `targets` (at most 10) and `targets_total` — the functions that the call
+  reaches, the `"call"` edges of `find_callers`. `origin` is `"slot"` (the
+  code puts the function into this slot, or into one that flows into it)
+  or `"type_only"` (each function of the type of the call whose address
+  the build takes: a call with no slot, or through a slot that code out of
+  view can write, which `slot_escapes: true` marks).
+
+The name resolves as in every symbol tool. A name of several symbols
+answers for each of them: a `warning` row names them, and each row carries
+`target_qualified_name`.
 
 `limit` (max 200) is the size of one page. `total` counts every call site
-that matches. A page after the last call site gives one `info` dict that
+of the answer. A page after the last call site gives one `info` dict that
 names the total. `find_indirect_targets` pages in the same way.
 
 #### `find_indirect_targets`
 
-Find functions assigned to a function pointer field, variable, or parameter.
+Find the functions that a function pointer field or variable can hold,
+and where the code stores each of them; or, for a function, where the code
+stores its address and which indirect calls reach it.
 
 ```
 Input:  {"name": "onData", "project_root?": "/path/to/project", "limit?": 50, "offset?": 0}
 Output: [{"total": 1, "offset": 0, "shown": 1, "more": false},
-         {"rhs_name": "handler_data", "rhs_qname": "handler_data",
-          "fn_ptr_type": "void (*)(unsigned char *, int)",
-          "method": "assignment",
-          "assign_file": "/path/src/main.c", "assign_line": 14,
-          "assign_caller": "test_assign",
-          "call_file": "/path/src/main.c", "call_line": 16,
-          "call_expr_text": "drv . onData"}]
+         {"function": "handler_data", "kind": "function",
+          "file": "/path/src/handlers.c", "line": 4, "origin": "slot",
+          "stored_file": "/path/src/main.c", "stored_line": 14,
+          "stored_places": 1, "stored_in": ["parameter 0 of drv_set_rx"]}]
 ```
 
-Links assignment sites (`driver.onData = &handler`) to call sites
-(`driver.onData(buf, len)`) via the field's USR. Shows the execution
-flow: *code assigns handler to onData at line 14, and code calls onData
-at line 16, so handler might run at that call site.*
+The answer comes from the data flow of the build, not from names: a
+function reaches a field when the code stores it there, or stores it in a
+slot whose value flows there — an argument of `drv_set_rx(handler_data)`
+into the parameter, the parameter into the field — in any file of the
+build. `stored_file` and `stored_line` are the first place that stores the
+function, `stored_places` counts the places of every way to the field
+(`set1(ev); set2(ev);` gives two), and `stored_in` lists the slots that
+the code stored it in, when one of them is not the queried one.
 
-When code assigns a function, but fw-context finds no call site,
-`call_file` and `call_line` are `null`. The assignment exists, but the
-invocation might be in unindexed code. The `method` field indicates how
-fw-context detected the assignment: `"assignment"` for a direct field
-assignment, `"call_arg"` for a value passed as a callback argument,
-`"var_init"` for a variable initializer, or `"init_list"` for a struct or
-array designated initializer.
+A leading `warning` row says when code out of view can write the field or
+the variable (its address escapes): a call through it also reaches each
+function of its type, which `find_indirect_call_sites` lists with origin
+`"type_only"`. The warning comes also when no code of the build stores a
+function into it, followed by an `info` row: a callback that a library out
+of the build registers (`hal_register(&hal_cb)`). A variable of a struct
+type is no slot: ask about its fields.
 
-**Name matching.** `name` matches the pointer by exact name, exact
-qualified name, or `::name` suffix, and a parameter by its name. `name`
-also matches the ASSIGNED function, by exact name or substring. Thus a
-row can be an assignment of a function whose name holds `name`, to a
-pointer with another name. Read `rhs_name` and the call site before you
-act on such a row. `_` and `%` in `name` match themselves, not any
-character.
+For a function, each row has `relation`:
 
-**Inferred call sites.** When the pointer has no call site of its own,
-fw-context tries fallbacks. An entry that one of them filled carries
-`_note`, or `call_expr_text: "<inferred via class hierarchy>"`. The
-`fn_ptr_type` fallback gives a call through another pointer of the same
-type: a candidate, not a proof.
+- `"stored"` — `file`, `line`, `col`: a place that takes the address of
+  the function; `slot`: the slot that receives it (`""` when none is
+  known); `context`: the code that stores it.
+- `"called"` — `file`, `line`, `col`, `caller`, `caller_kind`, `origin`:
+  an indirect call that reaches the function.
 
-For the reverse query — where does code call this field — use
-`find_indirect_call_sites`.
+For the calls through a pointer, use `find_indirect_call_sites`.
 
 #### `trace_data_flow`
 

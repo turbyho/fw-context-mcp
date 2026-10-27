@@ -234,7 +234,7 @@ def cmd_db_stats(args: argparse.Namespace) -> int:
     print(f"References:     {stats['reference_count']}")
     print(f"Macros:         {stats['macro_count']}")
     print(f"Indirect calls: {stats['indirect_call_sites']}")
-    print(f"FP assignments: {stats['fp_assignments']}")
+    print(f"Indirect edges: {stats['indirect_call_edges']}")
     print(f"Overrides:      {stats['override_count']}")
     print(f"Hotspot cache:  {stats['hotspot_cache_entries']}")
     print(f"PageRank cov:   {stats['pagerank_coverage']} / {stats['symbol_total']} symbols")

@@ -668,7 +668,7 @@ mcp = FastMCP(
         '• WHICH FILES a topic touches ______ → search_content (e.g. "extern C", "SELF_TEST")\n'
         "• Read a file, or a window of it ____ → read_file (line_numbers, start_line, end_line)\n"
         "• Read function body + callers/callees → get_symbol_context (preferred) / get_source\n"
-        "• Function pointer assignments/calls _ → find_indirect_call_sites / find_indirect_targets\n"
+        "• Function pointer calls/targets ____ → find_indirect_call_sites / find_indirect_targets\n"
         "• Interrupt handler of each vector __ → get_vector_table (ISRs have no caller)\n"
         "• Natural-language question ________ → smart_search (slow, thorough)\n\n"
         "IMPORTANT: search_code searches symbol NAMES (what the code IS).\n"
@@ -988,12 +988,10 @@ mcp = FastMCP(
         "   in one call. Replaces lookup_symbol + find_callers + a list of direct callees.\n"
         '2. If get_symbol_context callers are empty → search_bodies("name") and\n'
         '   find_indirect_targets("name") (function pointers, callbacks, ISRs\n'
-        "   invisible to the call graph): it gives each function pointer that\n"
-        "   the function is assigned to, and the call sites of that pointer.\n"
-        "   Read rhs_name: the tool also matches a part of a function name,\n"
-        "   thus a row can be a different function.  find_indirect_call_sites\n"
-        "   takes the name of the POINTER (a field, variable or parameter),\n"
-        "   not the name of the function.\n"
+        "   invisible to the call graph): it gives each place that stores the\n"
+        "   address of the function, and each indirect call that reaches it.\n"
+        "   find_indirect_call_sites takes a POINTER (a field or a variable:\n"
+        "   the calls through it) or a function (the indirect calls it makes).\n"
         "3. find_all_callers_recursive() → transitive upstream impact (full call tree).\n"
         "4. find_callees_recursive() → transitive downstream check.\n"
         "   After a logic change, verify compatibility with everything this function\n"

@@ -116,7 +116,7 @@ def check_structural_staleness(
         if ref_count == 0:
             reasons.append("refs missing")
             ics_count = conn.execute(
-                "SELECT COUNT(*) FROM indirect_call_sites WHERE config_hash=?",
+                "SELECT COUNT(*) FROM slot_sites WHERE config_hash=?",
                 (config_hash,),
             ).fetchone()[0]
             if ics_count == 0:
@@ -1129,9 +1129,9 @@ EMPTY_RESULT_NEW_SOURCE_MESSAGE = (
 # wins, because a record that holds two of them names the same file twice.
 _PRIMARY_PATH_KEYS = ("file", "file_path", "source_file")
 # Keys of records that name more than one file.  ``find_indirect_targets``
-# gives the assignment site and the call site, and they are different files,
-# thus both must be checked.
-_EXTRA_PATH_KEYS = ("assign_file", "call_file")
+# gives the definition of a function and the place that stored it, and they
+# can be different files, thus both must be checked.
+_EXTRA_PATH_KEYS = ("stored_file",)
 
 
 def collect_result_paths(result, root: Path, *, _nested: bool = False) -> list[str]:
@@ -1149,7 +1149,7 @@ def collect_result_paths(result, root: Path, *, _nested: bool = False) -> list[s
     * ``file_path`` — ``find_dead_code``, ``find_hotspots``,
       ``find_all_callers_recursive``, ``find_callees_recursive``
     * ``source_file`` — ``trace_data_flow``
-    * ``assign_file`` + ``call_file`` — ``find_indirect_targets``
+    * ``file`` + ``stored_file`` — ``find_indirect_targets``
 
     Args:
         result: A record, or a list of records.

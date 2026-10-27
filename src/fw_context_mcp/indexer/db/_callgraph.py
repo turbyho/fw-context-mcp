@@ -942,17 +942,10 @@ def count_dead_code(
                   WHERE config_hash = ? AND ref_kind = 'indirect'
               )
               AND s.usr NOT IN (
-                  SELECT fpa.rhs_usr FROM fp_assignments fpa
-                  JOIN indirect_call_sites ics
-                    ON ics.target_usr = fpa.lhs_usr
-                   AND ics.config_hash = fpa.config_hash
-                  WHERE fpa.config_hash = ?
-              )
-              AND s.usr NOT IN (
                   SELECT to_usr FROM refs WHERE config_hash = ? AND ref_kind = 'call'
               )
               {path_clause} {project_only_clause}""",
-        [config_hash, config_hash, config_hash, config_hash, *exclude_params],
+        [config_hash, config_hash, config_hash, *exclude_params],
     ).fetchone()
     return (dead[0] if dead else 0) + (possibly[0] if possibly else 0)
 
@@ -974,12 +967,13 @@ def find_dead_code(
     from known entry points for transitive dead-code analysis.
 
     **Category 2 — "possibly_dead"**: the symbol has ``ref_kind='indirect'``
-    entries (function pointer assignments) but no resolved call site via
-    the ``fp_assignments → indirect_call_sites`` join.  This means the
-    function IS assigned to a function pointer somewhere, but the
-    invocation path is unknown — it may be called through unindexed code,
-    a type-erased API, or an interrupt vector table entry the indexer
-    could not resolve.  Treat these as uncertain.
+    entries (the code takes its address) but no ``call`` edge.  The
+    resolution of the indirect calls gives each target a ``call`` edge of
+    origin ``slot`` or ``type_only`` (``indexer/_slot_resolution.py``),
+    thus no indirect call of the build reaches this function: it can be
+    called from code out of the build, through a type-erased API, or from
+    an interrupt vector table that the indexer could not read.  Treat
+    these as uncertain.
 
     Why two categories: flagging all indirect-only targets as "dead" would
     produce false positives for ISR handlers, callback registrations, and
@@ -1046,22 +1040,12 @@ def find_dead_code(
             }
         )
 
-    # Category 2: possibly dead — indirect refs exist but no resolved call site.
-    # A symbol is possibly dead when it has ref_kind='indirect' entries
-    # (function pointer assignments) but is NOT found as a resolved target
-    # via fp_assignments → indirect_call_sites linking.
+    # Category 2: possibly dead — the address is taken (ref_kind='indirect'),
+    # and no call edge reaches the symbol: no indirect call of the build
+    # has it as a target.
     remaining_slots = reach - len(results)
     if remaining_slots > 0:
-        possibly_params: list[object] = (
-            [
-                config_hash,
-                config_hash,
-                config_hash,
-                config_hash,
-            ]
-            + exclude_params
-            + [remaining_slots]
-        )
+        possibly_params: list[object] = [config_hash, config_hash, config_hash, *exclude_params, remaining_slots]
         possibly_rows = conn.execute(
             f"""SELECT s.name, s.qualified_name, s.kind, s.file_path,
                       s.signature, s.line, s.usr,
@@ -1075,20 +1059,12 @@ def find_dead_code(
                WHERE s.config_hash = ?
                  AND s.is_definition = 1
                  AND s.kind IN ('function', 'method', 'constructor', 'destructor')
-                 -- has indirect refs
+                 -- its address is taken
                  AND s.usr IN (
                      SELECT DISTINCT to_usr FROM refs
                      WHERE config_hash = ? AND ref_kind = 'indirect'
                  )
-                 -- but NOT in fp_assignments that link to a call site
-                 AND s.usr NOT IN (
-                     SELECT fpa.rhs_usr FROM fp_assignments fpa
-                     JOIN indirect_call_sites ics
-                       ON ics.target_usr = fpa.lhs_usr
-                      AND ics.config_hash = fpa.config_hash
-                     WHERE fpa.config_hash = ?
-                 )
-                 -- exclude truly dead (already covered)
+                 -- and no call edge, direct or of the indirect calls
                  AND s.usr NOT IN (
                      SELECT to_usr FROM refs WHERE config_hash = ? AND ref_kind = 'call'
                  )
@@ -1110,7 +1086,7 @@ def find_dead_code(
                     "signature": r["signature"],
                     "line": r["line"],
                     "status": "possibly_dead",
-                    "reason": "assigned as function pointer but call sites unresolved",
+                    "reason": "its address is taken, but no call of the build reaches it",
                     "indirect_refs": r["indirect_sites"] or "",
                 }
             )
@@ -1253,16 +1229,19 @@ def _callers_that_call_through_a_pointer(
     conn: sqlite3.Connection,
     config_hash: str,
 ) -> set[str]:
-    """Return the USR of every function that holds an indirect call site.
+    """Return the code key of every function that holds an indirect call site.
 
-    Read in one query and answered from memory afterwards, because the
-    question is asked once for each slot and a generated table has hundreds.
-    Measured on a Zephyr index: 148 functions for one build, so the set is
-    small enough to hold.
+    A call through a function pointer or a callable object (``slot_sites``
+    of kind "pointer" or "object"); a jump to an address that is a number
+    dispatches to no function of the build.  Read in one query and
+    answered from memory afterwards, because the question is asked once
+    for each slot and a generated table has hundreds.  Measured on a
+    Zephyr index: 148 functions for one build, so the set is small enough
+    to hold.
     """
     rows = conn.execute(
-        """SELECT DISTINCT from_usr FROM indirect_call_sites
-           WHERE config_hash = ? AND from_usr IS NOT NULL""",
+        """SELECT DISTINCT caller FROM slot_sites
+           WHERE config_hash = ? AND caller IS NOT NULL AND kind IN ('pointer', 'object')""",
         (config_hash,),
     ).fetchall()
     return {str(row[0]) for row in rows}

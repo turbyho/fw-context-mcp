@@ -106,23 +106,24 @@ class TestCollectResultPaths:
     def test_reads_both_paths_of_an_indirect_target(self, tmp_path: Path):
         """find_indirect_targets names two different files in one record.
 
-        The assignment site and the call site are separate places, thus a
-        first-match-wins rule would check only one of them.
+        The definition of the function and the place that stored it are
+        separate places, thus a first-match-wins rule would check only one
+        of them.
         """
         record = {
-            "rhs_name": "on_rx",
-            "assign_file": "src/setup.c",
-            "call_file": "src/isr.c",
+            "function": "on_rx",
+            "file": "src/isr.c",
+            "stored_file": "src/setup.c",
         }
         assert collect_result_paths(record, tmp_path) == [
-            str(tmp_path / "src/setup.c"),
             str(tmp_path / "src/isr.c"),
+            str(tmp_path / "src/setup.c"),
         ]
 
-    def test_a_null_call_file_is_skipped(self, tmp_path: Path):
-        """find_indirect_targets gives call_file=None with no call site."""
-        record = {"assign_file": "src/setup.c", "call_file": None}
-        assert collect_result_paths(record, tmp_path) == [str(tmp_path / "src/setup.c")]
+    def test_a_null_stored_file_is_skipped(self, tmp_path: Path):
+        """find_indirect_targets gives stored_file=None when no place is known."""
+        record = {"file": "src/isr.c", "stored_file": None}
+        assert collect_result_paths(record, tmp_path) == [str(tmp_path / "src/isr.c")]
 
     def test_reads_paths_from_a_nested_record_list(self, tmp_path: Path):
         """find_wrapper_callers keeps its paths one level down, in methods.

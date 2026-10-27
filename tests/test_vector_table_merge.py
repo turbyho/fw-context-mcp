@@ -14,9 +14,9 @@ import pytest
 import fw_context_mcp  # noqa: F401  — must precede sqlite3
 from fw_context_mcp.indexer.db import (
     get_vector_table,
-    insert_indirect_call_sites_batch,
     insert_macros_batch,
     insert_refs_batch,
+    insert_slot_facts,
     insert_symbols_batch,
     open_db,
     transaction,
@@ -92,11 +92,15 @@ def _c_table(conn, table_name, slots, table_file="isr_tables.c",
 
 def _calls_through_pointer(conn, name):
     """Record that *name* holds an indirect call site."""
+    _site(conn, f"c:@F@{name}", "handlers.c", 101)
+
+
+def _site(conn, caller, file, line):
+    """A call through a function pointer at *file*:*line*, in *caller* (a fact of ``slot_sites``)."""
     with transaction(conn):
-        insert_indirect_call_sites_batch(conn, [
-            (CONFIG, "handlers.c", 101, f"c:@F@{name}", "handler()",
-             "c:@F@slot", "handler", "void (*)(void)"),
-        ])
+        insert_slot_facts(conn, CONFIG, [], [], [
+            (file, line, 1, 0, caller, "pointer", "V|c:@slot", "void ()", "", ""),
+        ], [], [])
 
 
 def _aliases_default(conn, *names, table_file="startup.S"):
@@ -301,10 +305,7 @@ def test_an_unhandled_stub_is_not_relabelled_as_a_dispatcher(tmp_path):
                 (CONFIG, "asm:Default_Handler", "startup.S", 70,
                  "asm:Stub_Handler", "alias", None, 0, 1),
             ])
-            insert_indirect_call_sites_batch(conn, [
-                (CONFIG, "startup.S", 91, "asm:Stub_Handler", "p()",
-                 "c:@p", "p", "void (*)(void)"),
-            ])
+        _site(conn, "asm:Stub_Handler", "startup.S", 91)
 
         rows = get_vector_table(conn, CONFIG)
         assert {r["status"] for r in rows} == {"unhandled"}

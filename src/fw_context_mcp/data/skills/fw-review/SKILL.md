@@ -100,7 +100,7 @@ including those added dynamically.
 ## Phase 1: Structural verification
 For each symbol, verify impact through the call graph and type system.
 
-**Per function/method:** `get_symbol_context(name)` → body, callers, callees, LLM analysis in one call. Then `find_all_callers_recursive()` for the full upstream tree. If empty, fall back: `search_bodies` + `search_content` + `find_indirect_targets(name)` (function pointers, callbacks, ISRs invisible to call graph). `find_indirect_targets` gives each function pointer that the function is assigned to, and the call sites of that pointer. It also matches a part of a function name, thus read `rhs_name` of each row. `find_indirect_call_sites` takes the name of the POINTER (a field, variable or parameter), not the name of the function.
+**Per function/method:** `get_symbol_context(name)` → body, callers, callees, LLM analysis in one call. Then `find_all_callers_recursive()` for the full upstream tree. If empty, fall back: `search_bodies` + `search_content` + `find_indirect_targets(name)` (function pointers, callbacks, ISRs invisible to call graph). `find_indirect_targets` gives each place that stores the address of the function, and each indirect call that reaches it. `find_indirect_call_sites` takes a POINTER (a field or a variable: the calls through it) or a function (the indirect calls it makes).
 **Per class/struct:** `get_inheritance_chain(transitive=True)` → `get_method_overrides` → `get_class_members` → `find_wrapper_callers` → `get_template_instances`.
 **Per enum:** `find_references` on each changed/removed constant → `lookup_symbol` to verify new values.
 **Per preprocessor change:** `search_content` (NOT `search_bodies` — preprocessor is file-scope).
@@ -220,7 +220,7 @@ Set `project_only=False` — vendor code MUST be searched.
 | Natural language | `smart_search` (slow, uses Ollama) |
 | Full context (body+callers+callees) | `get_symbol_context(name)` — preferred over `get_source`+`find_callers` |
 | Who calls this? | `find_callers` → if empty: `search_bodies` |
-| Function pointer assignments/calls | `find_indirect_call_sites(field)` / `find_indirect_targets(field)` |
+| Function pointer calls and targets | `find_indirect_call_sites(field)` / `find_indirect_targets(field)` |
 | Full call tree | `find_all_callers_recursive` / `find_callees_recursive` |
 | All references | `find_references` |
 | Cross-module data flow | `trace_data_flow(type, target)` |

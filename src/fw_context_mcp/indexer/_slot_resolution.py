@@ -78,9 +78,16 @@ class _Slots:
     targets: defaultdict[str, set[str]] = field(default_factory=lambda: defaultdict(set))
     flows: defaultdict[str, set[str]] = field(default_factory=lambda: defaultdict(set))
     escaped: set[str] = field(default_factory=set)
+    # (slot, function) → each slot that gives the function to the slot, and
+    # "" for a source of the slot itself.  The tools follow them back to the
+    # places where the code stored the function (``slot_targets.via``).
+    # WHY each one and not the first: `set1(ev); set2(ev);` stores one
+    # function on two paths, and a reader must see the two places.
+    via: defaultdict[tuple[str, str], set[str]] = field(default_factory=lambda: defaultdict(set))
     _changed: list[str] = field(default_factory=list)
 
     def add_source(self, slot: str, function: str) -> None:
+        self.via[(slot, function)].add("")
         if function not in self.targets[slot]:
             self.targets[slot].add(function)
             self._changed.append(slot)
@@ -103,6 +110,8 @@ class _Slots:
             escaped = slot in self.escaped
             for successor in self.flows.get(slot, ()):
                 known = self.targets[successor]
+                for function in targets:
+                    self.via[(successor, function)].add(slot)
                 if not targets <= known:
                     known |= targets
                     self._changed.append(successor)
@@ -247,4 +256,29 @@ def resolve_slot_edges(conn: sqlite3.Connection, config_hash: str) -> dict[str, 
     if rows:
         insert_refs_batch(conn, rows)
     counts["edges"] = len(rows)
+    _store_targets(conn, config_hash, slots)
     return counts
+
+
+def _store_targets(conn: sqlite3.Connection, config_hash: str, slots: _Slots) -> None:
+    """Replace the targets and the escapes of each slot of the build (tables ``slot_targets``, ``slot_escaped``).
+
+    WHY stored: the tools that answer about one slot (``find_indirect_targets``,
+    ``get_symbol_context``) read the same answer that gave the call edges,
+    and need not resolve the whole build at each query.
+    """
+    conn.execute("DELETE FROM slot_targets WHERE config_hash = ?", (config_hash,))
+    conn.execute("DELETE FROM slot_escaped WHERE config_hash = ?", (config_hash,))
+    conn.executemany(
+        "INSERT INTO slot_targets (config_hash, slot, function, via) VALUES (?,?,?,?)",
+        [
+            (config_hash, slot, function, via)
+            for slot, functions in slots.targets.items()
+            for function in functions
+            for via in sorted(slots.via.get((slot, function)) or {""})
+        ],
+    )
+    conn.executemany(
+        "INSERT INTO slot_escaped (config_hash, slot) VALUES (?,?)",
+        [(config_hash, slot) for slot in slots.escaped],
+    )
