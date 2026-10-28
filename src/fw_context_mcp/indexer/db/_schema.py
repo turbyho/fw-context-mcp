@@ -149,7 +149,16 @@ __all__ = [
 #      of the slot tables).  Before it, 47 of 67 references that only the
 #      text gave were false (a return type on a definition line, commented
 #      code), and an address in a template body had no slot fact.
-CURRENT_ROW_FORMAT = "fw-context-rows/11"
+# /12 — the table `overrides` comes from the compiler, and the parse of a
+#      unit writes the rows of its methods.  A slot fact follows a function
+#      that the code stores as an integer or a `void *` (the place is the
+#      slot), and a slot that code out of the build writes escapes
+#      (OUTSIDE).  Before it, a match of names and of signature text gave
+#      `overrides`: an override through a type alias, or of a member of a
+#      class template instance, had no row.  A cast to an integer or to
+#      `void *` was an escape, thus each call of the read value got every
+#      function of its type.
+CURRENT_ROW_FORMAT = "fw-context-rows/12"
 
 # The config-hash format that was current when CURRENT_ROW_FORMAT last moved.
 #
@@ -164,7 +173,7 @@ CURRENT_ROW_FORMAT = "fw-context-rows/11"
 # the build, thus a plain `fw-context index` writes every file and every
 # body again.  The two must therefore move together, and
 # `test_row_format_invalidation.py` fails when only one of them does.
-ROW_FORMAT_PAIRED_WITH = "fw-context-cc/13"
+ROW_FORMAT_PAIRED_WITH = "fw-context-cc/14"
 
 
 def _row_format_number(value: str) -> int | None:
@@ -243,6 +252,10 @@ _ROW_FORMAT_FAULTS: tuple[tuple[int, str], ...] = (
          "type on a definition line, commented code), and an address that "
          "a template body takes has no slot fact, thus its indirect calls "
          "have no edge"),
+    (11, "the method overrides came from a match of names and signature "
+         "text, thus an override through a type alias or of a template "
+         "instance member is missing, and a function pointer cast to an "
+         "integer or void * gave each indirect call of its type an edge to it"),
 )
 
 
@@ -1075,9 +1088,9 @@ CREATE INDEX IF NOT EXISTS idx_inheritance_derived ON inheritance(config_hash, d
 CREATE INDEX IF NOT EXISTS idx_inheritance_base    ON inheritance(config_hash, base_usr);
 
 -- ── overrides: virtual method dispatch tracking ─────────────────────────
--- Each row records that derived_usr overrides base_usr.  Built as a
--- post-processing step after inheritance chains are indexed — the indexer
--- walks each class hierarchy and matches methods by name + signature.
+-- Each row records that derived_usr overrides base_usr.  The parse of a
+-- unit writes the rows of its virtual methods from the record of the
+-- compiler (indexer/_overrides.py); each ancestor gets a row.
 -- Why a separate table from inheritance: inheritance is a class-level
 -- relationship; overrides is a method-level relationship.  Mixing them
 -- would require nullable columns and make both queries slower.

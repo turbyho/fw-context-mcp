@@ -321,7 +321,6 @@ def indexed_repo(repo: Path, tmp_path_factory):
         index_refs=False,
         index_embeddings=False,
         analyze_symbols=False,
-        analyze_overrides=False,
     )
     return repo
 
@@ -681,8 +680,7 @@ class TestTheRecordedHead:
             db_path=index_dir / "0123456789abcdef0123456789abcdef" / "index.db",
             project_root=indexed_repo,
             project_id="0123456789abcdef0123456789abcdef",
-            index_refs=False, index_embeddings=False, analyze_symbols=False,
-            analyze_overrides=False, record_git=False,
+            index_refs=False, index_embeddings=False, analyze_symbols=False, record_git=False,
         )
         state = get_project_status(project_root=str(indexed_repo))
         assert "branch: main" in state["description"]

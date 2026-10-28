@@ -262,8 +262,9 @@ class TestC:
         assert ("c:@F@fire", "pointer", "V|c:fp.c@g_cb", 7) in c_facts["sites"]
         assert ("c:@F@load", "pointer", "F|c:@S@dev@FI@on_rx", 8) in c_facts["sites"]
 
-    def test_an_address_cast_to_void_pointer_has_no_slot(self, c_facts):
-        assert ("c:@F@read_flash", "", 15) in c_facts["sources"]
+    def test_an_address_cast_to_void_pointer_goes_into_its_place(self, c_facts):
+        """`void *p = (void *)read_flash;`: the place holds the function, a cast back reads it."""
+        assert ("c:@F@read_flash", "V|c:fp.c@424@F@init@p", 15) in c_facts["sources"]
 
     def test_the_address_of_a_slot_escapes(self, c_facts):
         assert ("V|c:fp.c@g_cb", "address taken", 17) in c_facts["escapes"]

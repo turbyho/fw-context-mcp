@@ -46,7 +46,7 @@ def _run(tmp_path: Path, monkeypatch, *, fail_step: str | None, source: str = ""
                   encoding="utf-8")
     db_path = tmp_path / "index" / "pid" / "index.db"
     run(compile_commands=cc, db_path=db_path, project_root=root, project_id="pid",
-        index_refs=False, index_embeddings=False, analyze_symbols=False, analyze_overrides=False)
+        index_refs=False, index_embeddings=False, analyze_symbols=False)
     conn = open_db(db_path, skip_integrity_check=True)
     try:
         return db_path, conn.execute("SELECT manifest_verification FROM build_configs").fetchone()[0]
@@ -173,7 +173,7 @@ def test_a_run_with_ollama_down_ends_and_stamps_partial(tmp_path, monkeypatch):
     llm.enabled = True
 
     run(compile_commands=cc, db_path=db_path, project_root=root, project_id="pid", index_refs=False,
-        index_embeddings=True, analyze_symbols=False, analyze_overrides=False, llm_config=llm)
+        index_embeddings=True, analyze_symbols=False, llm_config=llm)
 
     conn = open_db(db_path, skip_integrity_check=True)
     try:

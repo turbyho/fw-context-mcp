@@ -13,15 +13,15 @@ after the full symbol table is available:
 
 2. **Dependency ordering.**  Steps have strict dependencies:
    FTS5 rebuilding must see the final symbol set, PageRank needs the
-   complete call graph, and override detection needs the inheritance
-   graph.  A data-driven pipeline (``_STEPS``) ensures correct ordering
+   complete call graph, and the resolution of the indirect calls needs
+   the slot facts of each unit.  A data-driven pipeline (``_STEPS``) ensures correct ordering
    and skips optional phases based on user configuration.
 
 3. **Idempotency for resilience.**  If a step fails mid-way, the next
    reindex run can pick up where it left off — a step with output for
    each symbol (embeddings, LLM analysis) keeps the rows that are still
-   valid.  The three steps that derive one result from the whole graph
-   (PageRank, the hotspot cache, the overrides) compute it again in each
+   valid.  The steps that derive one result from the whole graph
+   (the slot edges, PageRank, the hotspot cache) compute it again in each
    run: an incremental run changes their input, and a "skip when rows
    exist" check then keeps a stale result.
 
@@ -41,17 +41,15 @@ after the full symbol table is available:
    event-loop registrations (``call_every``, ``k_work_submit``, etc.)
 8. **Embeddings** — compute vector embeddings for semantic search
 9. **LLM analysis** — generate natural-language symbol explanations
-10. **Override graph** — build the virtual-method override map
-11. **PageRank + hotspot cache** — compute call-graph centrality
+10. **PageRank + hotspot cache** — compute call-graph centrality
     and pre-aggregate caller counts
-12. **Finalize manifest** — stamp build config with verification status
-13. **Cleanup old builds** — delete data from previous indexing runs
+11. **Finalize manifest** — stamp build config with verification status
+12. **Cleanup old builds** — delete data from previous indexing runs
     (unless a reindex is paused)
-14. **WAL checkpoint** — flush SQLite write-ahead log to disk
+13. **WAL checkpoint** — flush SQLite write-ahead log to disk
 
-Two functions are also used before the pipeline during TU-parallel
-parsing: ``_extract_param_types`` for override matching and
-``_normalize_type_namespaces`` for cross-namespace override detection.
+The virtual-method override map is no step: the parse of each unit gives
+it from the compiler (``_overrides.py``).
 """
 
 from __future__ import annotations
@@ -61,7 +59,6 @@ import os
 import sqlite3
 import time
 import tomllib
-from collections import deque
 from collections.abc import Callable, Collection, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
@@ -92,310 +89,9 @@ from .manifest import _is_generated_header
 
 log = logging.getLogger(__name__)
 
-# C++ type qualifiers that are NOT parameter names during signature parsing.
-_CPP_TYPE_QUALIFIERS: frozenset[str] = frozenset({"const", "volatile", "constexpr", "noexcept"})
-
-
-def _extract_param_types(signature: str) -> str:
-    """Extract the parameter type list from a C/C++ function signature.
-
-    Strips parameter names, default values, and whitespace to produce a
-    normalized string suitable for override comparison.
-
-    This is used during virtual-method override detection: a derived-class
-    method ``Derived::write(const uint8_t *data, size_t len)`` overrides
-    ``Base::write(const uint8_t *buf, size_t sz)`` when both normalize to
-    the same type list ``"const uint8_t *,size_t"``.  Parameter names are
-    irrelevant for override semantics — only types matter.
-
-    Examples:
-        "int read(char *buf, size_t len)" → "char *,size_t"
-        "void write(const uint8_t *data, size_t len)" → "const uint8_t *,size_t"
-        "void reset()" → ""
-        "void set(int)" → "int"
-
-    **Limitations:**
-
-    - Does **not** parse string literals or comments — a comma inside
-      ``printf("hello, world")`` is treated as a parameter separator.
-    - Does **not** resolve template aliases — ``std::vector<int>`` and
-      ``VectorInt`` (where ``VectorInt = std::vector<int>``) are seen as
-      different types.
-    - **False negatives** (missing override edges) are possible; **false
-      positives** (incorrect override edges) are extremely unlikely
-      because both the derived AND base method signatures would need to
-      contain the same ambiguous pattern.
-    """
-    # Find the outermost parentheses — use a depth counter rather than a
-    # regex because C++ parameter lists can contain nested parentheses
-    # (function pointers, lambdas, template args with > and <).
-    paren_start = signature.find("(")
-    if paren_start == -1:
-        return ""
-    paren_depth = 0
-    paren_end = paren_start
-    for i in range(paren_start, len(signature)):
-        if signature[i] == "(":
-            paren_depth += 1
-        elif signature[i] == ")":
-            paren_depth -= 1
-            if paren_depth == 0:
-                paren_end = i
-                break
-    params_str = signature[paren_start + 1 : paren_end].strip()
-    if not params_str:
-        return ""
-    # In C++, foo(void) and foo() are semantically identical for
-    # override purposes — both mean "no parameters".  Normalize
-    # both to empty so they match during comparison.
-    if params_str == "void":
-        return ""
-
-    # Split by top-level commas, strip parameter names (keep only types)
-    # Depth tracking handles nested angle brackets, parentheses, braces,
-    # and square brackets so that commas inside template arguments
-    # (e.g. map<int,string>) or function-pointer types are NOT treated
-    # as parameter separators.
-    parts: list[str] = []
-    depth = 0
-    current: list[str] = []
-    for ch in params_str:
-        if ch == "," and depth == 0:
-            parts.append("".join(current).strip())
-            current = []
-        else:
-            if ch in "<({[":
-                depth += 1
-            elif ch in ">)}]":
-                depth -= 1
-            current.append(ch)
-    if current:
-        parts.append("".join(current).strip())
-
-    # For each parameter, extract the type by removing the parameter name
-    # and any trailing default value.
-
-    # The algorithm strips the last identifier token from each parameter
-    # *unless* that token is a C++ type qualifier (const, volatile, etc.).
-    # Pointer/reference markers (*, &) that precede the parameter name
-    # are kept because they belong to the type.  This handles both
-    # "int x" → "int" and "int *x" → "int *".
-    normalized: list[str] = []
-    for param in parts:
-        param = param.strip()
-        if not param:
-            continue
-        # Remove default value (everything after '=').
-        # Must be done before name stripping because default values
-        # can themselves contain identifier-like strings,
-        # e.g. "int x = DEFAULT_X" — we first strip "= DEFAULT_X",
-        # then remove "x" from the remaining "int x".
-        eq_idx = param.find("=")
-        if eq_idx != -1:
-            param = param[:eq_idx].strip()
-        # Remove parameter name from the end.
-        # The parameter name is the last identifier — it may be preceded by
-        # pointer/reference markers (*, &, &&) that belong to the type.
-        tokens = param.split()
-        if len(tokens) >= 2:
-            last = tokens[-1]
-            # Strip leading pointer/reference markers from the last token
-            stripped = last.lstrip("*&")
-            # If what remains is a pure identifier (alphanumeric + underscores),
-            # it's the parameter name — remove it, keeping any pointer/ref prefix
-            # on the type.  But C++ type qualifiers (const, volatile, etc.) are
-            # NOT parameter names — keep them.
-            if stripped and stripped.replace("_", "").isalnum() and stripped not in _CPP_TYPE_QUALIFIERS:
-                ptr_prefix = last[: len(last) - len(stripped)]
-                if ptr_prefix:
-                    # Pointer/ref on the name token (e.g. "*buf") — move markers
-                    # to the type by keeping them as a separate token
-                    tokens[-1] = ptr_prefix
-                else:
-                    # Pure name — drop the last token
-                    tokens = tokens[:-1]
-        param = " ".join(tokens).strip()
-        normalized.append(param)
-
-    return ",".join(normalized)
-
-
-def _normalize_type_namespaces(param_types: str) -> str:
-    """Strip namespace prefixes from all type tokens in a parameter list.
-
-    ``const ble::ConnectionCompleteEvent &`` → ``const ConnectionCompleteEvent &``
-    ``std::vector<int>`` → ``vector<int>``
-
-    Used as a fallback in override detection when exact type-matching
-    fails.  Cross-namespace overrides are common in firmware codebases
-    where a derived class in namespace ``app`` overrides a base-class
-    method whose signature uses types from a vendor namespace (``ble::``,
-    ``mbed::``).  By stripping the namespace prefix from every type
-    token, ``ble::ConnectionCompleteEvent`` and ``ConnectionCompleteEvent``
-    (when the derived class imports the symbol) are treated as equivalent.
-    """
-    if not param_types:
-        return ""
-    parts = param_types.split(",")
-    normalized: list[str] = []
-    for part in parts:
-        tokens = part.strip().split()
-        stripped: list[str] = []
-        for t in tokens:
-            if "::" in t:
-                t = t.rsplit("::", 1)[-1]
-            stripped.append(t)
-        normalized.append(" ".join(stripped))
-    return ",".join(normalized)
-
-
 # ═══════════════════════════════════════════════════════════════
 # SECTION: Post-processing pipeline (→ postprocessor.py)
 # ═══════════════════════════════════════════════════════════════
-
-def _replace_overrides(
-    conn, config_hash: str, rows: list[tuple[str, str, str]], db_dir: Path, *, write_lock_held: bool
-) -> None:
-    """Replace all override rows of the config with *rows*.
-
-    The delete and the insert are in one transaction: a reader never sees
-    the graph removed and not yet written again.
-    """
-    from .db import insert_overrides_batch
-
-    with write_lock(db_dir, timeout=5.0) if not write_lock_held else nullcontext():
-        with transaction(conn):
-            conn.execute("DELETE FROM overrides WHERE config_hash = ?", (config_hash,))
-            insert_overrides_batch(conn, rows)
-
-
-def _build_overrides(
-    conn, config_hash: str, db_dir: Path, *, write_lock_held: bool = False
-) -> None:
-    """Build the method override graph by matching virtual methods to their
-    base-class counterparts through the inheritance chain.
-
-    Pure post-processing — walks the inheritance graph already stored in
-    the ``inheritance`` table and matches methods by name.  Parameter-type
-    comparison provides a basic guard against accidental name collisions
-    (overloads, not overrides).
-
-    Each call builds the graph of the config again and replaces all its
-    rows.  A re-parse of a file keeps the ``overrides`` rows, because they
-    key on USRs.  Thus a "skip when rows exist" check kept an override of
-    a method that the source no longer has, and did not add an override
-    that the source added, until a run with ``--force``.  The build takes
-    at most 0.1 s on an index of 60 000 symbols.
-    """
-    # Phase 1: collect all virtual/pure-virtual project methods with parent class info.
-    # Single table scan groups by parent_usr for efficient batch processing in Phase 2.
-    with transaction(conn):
-        virtual_rows = conn.execute(
-            """SELECT s.usr, s.name, s.qualified_name, s.signature,
-                      s.parent_usr, s.kind
-               FROM symbols s
-               WHERE s.config_hash = ?
-                 AND s.is_definition = 1
-                 AND (s.is_virtual = 1 OR s.is_pure_virtual = 1)
-                 AND s.kind IN ('method', 'destructor')
-                 AND s.parent_usr != ''
-               ORDER BY s.parent_usr, s.name""",
-            (config_hash,),
-        ).fetchall()
-
-    if not virtual_rows:
-        # The rows of an earlier run must go too.
-        _replace_overrides(conn, config_hash, [], db_dir, write_lock_held=write_lock_held)
-        log.info("No virtual methods found — no override relationships")
-        return
-
-    # Phase 2: for each virtual method, walk the inheritance chain up and
-    # find base-class methods with the same name.
-    # Build parent→bases lookup cache for efficiency.
-    parent_to_bases: dict[str, list[str]] = {}
-
-    def _get_bases_recursive(parent_usr: str, visited: set | None = None) -> list[str]:
-        """BFS up the inheritance chain — return all ancestor USRs."""
-        if visited is None:
-            visited = set()
-        if parent_usr in parent_to_bases:
-            return parent_to_bases[parent_usr]
-        bases: list[str] = []
-        queue: deque[str] = deque([parent_usr])
-        while queue:
-            # Process in levels: batch-fetch edges for all nodes at this depth
-            level = list(queue)
-            queue.clear()
-            visited.update(level)
-            placeholders = ",".join("?" * len(level))
-            rows = conn.execute(
-                f"""SELECT derived_usr, base_usr FROM inheritance
-                   WHERE config_hash = ? AND derived_usr IN ({placeholders})""",
-                (config_hash, *level),
-            ).fetchall()
-            for r in rows:
-                base = r["base_usr"]
-                if base not in visited:
-                    bases.append(base)
-                    queue.append(base)
-        parent_to_bases[parent_usr] = bases
-        return bases
-
-    # Phase 3: resolve overrides
-    override_rows: list[tuple[str, str, str]] = []
-    skipped_no_base = 0
-    skipped_no_match = 0
-
-    for vrow in virtual_rows:
-        base_usrs = _get_bases_recursive(vrow["parent_usr"])
-        if not base_usrs:
-            skipped_no_base += 1
-            continue
-
-        # Find virtual methods with the same name in any base class.
-        # Only virtual/pure-virtual base methods can be overridden — non-virtual
-        # methods with the same signature are *hidden*, not overridden.
-        placeholders = ",".join("?" * len(base_usrs))
-        base_methods = conn.execute(
-            f"""SELECT usr, signature, parent_usr, qualified_name
-                FROM symbols
-                WHERE config_hash = ?
-                  AND name = ?
-                  AND kind IN ('method', 'destructor')
-                  AND (is_virtual OR is_pure_virtual)
-                  AND parent_usr IN ({placeholders})
-                ORDER BY qualified_name""",
-            (config_hash, vrow["name"], *base_usrs),
-        ).fetchall()
-
-        if not base_methods:
-            skipped_no_match += 1
-            continue
-
-        # Compare parameter types to filter out accidental name collisions
-        derived_params = _extract_param_types(vrow["signature"] or "")
-        for bm in base_methods:
-            base_params = _extract_param_types(bm["signature"] or "")
-            # Phase 1: exact type match (fast path, handles 95 %+ of cases)
-            if derived_params == base_params:
-                override_rows.append((config_hash, vrow["usr"], bm["usr"]))
-                continue
-            # Phase 2: namespace-normalized match (handles cross-namespace overrides)
-            derived_norm = _normalize_type_namespaces(derived_params)
-            base_norm = _normalize_type_namespaces(base_params)
-            if derived_norm == base_norm:
-                override_rows.append((config_hash, vrow["usr"], bm["usr"]))
-
-    _replace_overrides(conn, config_hash, override_rows, db_dir, write_lock_held=write_lock_held)
-
-    log.info(
-        "Overrides stored: %d relationships (%d virtual, %d no-base, %d no-match)",
-        len(override_rows),
-        len(virtual_rows),
-        skipped_no_base,
-        skipped_no_match,
-    )
-
 
 #: Clears only the scores that are not 0.  Each UPDATE of a symbols row
 #: fires the trigger ``symbols_au``, which tokenizes the row again into
@@ -566,8 +262,8 @@ def _build_hotspot_cache(conn, config_hash: str, *,
 def _step_purge_missing_files(conn: sqlite3.Connection, ctx: dict) -> None:
     """Purge ghost records of files that no longer exist on disk.
 
-    Runs first in the pipeline so FTS, embeddings, overrides, and PageRank
-    are not built on ghost nodes that are deleted moments later.
+    Runs first in the pipeline so FTS, embeddings, the slot edges, and
+    PageRank are not built on ghost nodes that are deleted moments later.
 
     Uses a ThreadPoolExecutor for parallel ``os.path.exists()`` checks
     because file-existence is I/O-bound — the GIL does not block it and
@@ -1151,21 +847,6 @@ def _step_llm_analysis(conn: sqlite3.Connection, ctx: dict) -> None:
         force_llm_marker.mark_unfinished(ctx["db_dir"])
     if cc:
         cc.close()
-    conn.commit()
-
-
-def _step_build_overrides(conn: sqlite3.Connection, ctx: dict) -> None:
-    """Build the virtual-method override graph from the inheritance table.
-
-    Resolves which derived-class methods override which base-class
-    virtual methods.  Used by ``get_method_overrides`` and the
-    ``find_callers`` tool (to find callers through base-class pointers).
-
-    The step builds the graph in each run, not only with ``--force``: an
-    incremental run can change it too (see ``_build_overrides``).
-    """
-    config_hash = ctx["config_hash"]
-    _build_overrides(conn, config_hash, ctx["db_dir"])
     conn.commit()
 
 
@@ -1784,7 +1465,6 @@ _STEPS: list[tuple[str, Callable[..., None], Callable[..., bool] | None]] = [
     ("slot_edges",       _step_resolve_slots,       lambda c: c["index_refs"]),
     ("llm_analysis",     _step_llm_analysis,       lambda c: c["analyze_symbols"] and c["llm_config"] is not None and c["llm_config"].enabled),
     ("embeddings",       _step_build_embeddings,   lambda c: c["index_embeddings"] and c["llm_config"] is not None and c["llm_config"].enabled),
-    ("overrides",        _step_build_overrides,    lambda c: c["analyze_overrides"]),
     ("repair_from_usr",  _step_repair_from_usr,    lambda c: c["index_refs"]),
     ("pagerank_hotspot", _step_pagerank_hotspot,   lambda c: c["index_refs"]),
     ("verify_integrity", _step_verify_integrity,   None),
@@ -1816,7 +1496,6 @@ def _run_postprocess(
     index_embeddings: bool,
     index_macros_expanded: bool,
     analyze_symbols: bool,
-    analyze_overrides: bool,
     analyze_vendor: bool,
     llm_config=None,
     cache_server_config=None,
@@ -1873,7 +1552,6 @@ def _run_postprocess(
         "index_embeddings": index_embeddings,
         "index_macros_expanded": index_macros_expanded,
         "analyze_symbols": analyze_symbols,
-        "analyze_overrides": analyze_overrides,
         "analyze_vendor": analyze_vendor,
         "llm_config": llm_config,
         "cache_server_config": cache_server_config,

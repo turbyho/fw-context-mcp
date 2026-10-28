@@ -236,11 +236,11 @@ def test_a_string_an_unnamed_bit_field_and_a_void_pointer_keep_the_positions(c_r
     ("struct pops nested_pointer", {("dev_init", "init"), ("fa", "cb"), ("fb", "cb")}),
     ("struct counted c =", {("fa", "reg|0"), ("fb", "cb")}),
     ("struct counted mentioned_by_size", {("fb", "cb")}),
-    ("struct counted cast_address", {("fa", ""), ("fb", "cb")}),
+    ("struct counted cast_address", {("fa", "n"), ("fb", "cb")}),
     ("struct counted d =", {("fa", "reg|0"), ("fb", "pick|0")}),
 ])
 def test_a_field_gets_a_function_only_when_it_stores_it(c_rows, text, facts):
-    """A call takes its arguments, a nested struct fills its own fields, and an int holds no function."""
+    """A call takes its arguments, a nested struct fills its own fields, and an int holds a cast address."""
     assert _sources(c_rows, C_SOURCE, text) == facts
 
 
@@ -255,9 +255,9 @@ def test_brace_elision_by_a_literal_gives_no_wrong_slot(c_rows, text, truth):
 
 
 @pytest.mark.libclang
-def test_a_conditional_cast_address_goes_into_no_slot(c_rows):
-    """``(long)fa`` in an integer field: only the type of ``fa`` tells its calls."""
-    assert _sources(c_rows, C_SOURCE, "struct counted chosen") == {("fa", ""), ("fb", "cb")}
+def test_a_conditional_cast_address_goes_into_its_integer_field(c_rows):
+    """``(long)fa`` in an integer field: the field holds it, and a cast back reads it."""
+    assert _sources(c_rows, C_SOURCE, "struct counted chosen") == {("fa", "n"), ("fb", "cb")}
 
 
 @pytest.mark.libclang

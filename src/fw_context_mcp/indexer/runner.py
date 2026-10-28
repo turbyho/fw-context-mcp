@@ -43,7 +43,6 @@ from ._embedding import (
 from ._llm_analysis import ContextChoice, _fetch_callees, _fetch_referencers
 from ._postprocess import (
     _build_hotspot_cache,
-    _build_overrides,
     _build_pagerank,
     _run_postprocess,
 )
@@ -87,7 +86,6 @@ log = logging.getLogger(__name__)
 __all__ = [
     "_build_embeddings",
     "_build_hotspot_cache",
-    "_build_overrides",
     "_build_pagerank",
     "_chunk_body",
     "_cleanup_orphaned_cc_artifacts",
@@ -688,7 +686,6 @@ def run(
     index_refs: bool = False,
     index_embeddings: bool = False,
     analyze_symbols: bool = False,
-    analyze_overrides: bool = True,
     project_root: Path | None = None,
     project_id: str | None = None,
     llm_config=None,
@@ -740,9 +737,6 @@ def run(
             definition symbols using Ollama after indexing.
         analyze_symbols: When True, generate structured LLM analysis
             (summary, inputs, outputs) for project symbols via Ollama.
-        analyze_overrides: When True (default), build the method override
-            graph by matching virtual methods across the inheritance chain.
-            Runs entirely on the local index — no LLM needed.
         project_root: Root directory of the project.  Used to resolve relative
             paths and derive defaults.  Defaults to the parent of
             ``compile_commands``.
@@ -1424,7 +1418,6 @@ def run(
         index_embeddings=index_embeddings,
         index_macros_expanded=index_macros_expanded,
         analyze_symbols=analyze_symbols,
-        analyze_overrides=analyze_overrides,
         analyze_vendor=_analyze_vendor,
         llm_config=llm_config,
         cache_server_config=cache_server_config,

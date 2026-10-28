@@ -40,9 +40,8 @@ Key decisions
 * Shared headers (included by multiple TUs) are claimed by exactly one
   TU per run via ``skip_files`` — the first TU to walk a header owns
   its rows, and later TUs skip its subtree entirely.
-* Overrides are rebuilt from scratch in post-processing by
-  ``_build_overrides`` because the override graph depends on the full
-  set of indexed classes.
+* The overrides of the methods of a unit come from the compiler
+  (``_overrides.py``) and go with the symbols of their file.
 """
 
 from __future__ import annotations

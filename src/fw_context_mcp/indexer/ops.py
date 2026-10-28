@@ -74,6 +74,7 @@ from fw_context_mcp.indexer.db import (
     get_file_mtimes,
     insert_inheritance_batch,
     insert_macros_batch,
+    insert_overrides_batch,
     insert_refs_batch,
     insert_slot_facts,
     insert_symbols_batch,
@@ -1448,6 +1449,7 @@ def store_symbols_for_unit(
         syms = result.symbols
         refs = result.references
         inheritance = result.inheritance
+        overrides = result.overrides
         macros = result.macros
         pending_dispatches = result.pending_dispatches
         slots = result.slots
@@ -1479,6 +1481,7 @@ def store_symbols_for_unit(
             syms = result.symbols
             refs = result.references
             inheritance = result.inheritance
+            overrides = result.overrides
             macros = result.macros
             pending_dispatches = getattr(result, 'pending_dispatches', [])
             slots = result.slots
@@ -1711,6 +1714,12 @@ def store_symbols_for_unit(
     if inheritance:
         inheritance_rows = [(config_hash, i.derived_usr, i.base_usr, i.access, int(i.is_virtual)) for i in inheritance]
         insert_inheritance_batch(conn, inheritance_rows)
+
+    # Overrides, from the compiler (indexer/_overrides.py).  The rows of
+    # the methods of the owned files went with their symbols
+    # (``_delete_rows_owned_by``).
+    if overrides:
+        insert_overrides_batch(conn, [(config_hash, derived, base) for derived, base in overrides])
 
     # Macros
     _t_macros = time.monotonic()

@@ -2908,7 +2908,6 @@ int sensor_read(void) {
                 index_refs=False,
                 index_embeddings=False,
                 analyze_symbols=False,
-                analyze_overrides=False,
             )
             print(f"  New config_hash: {config_hash_new[:16]}…")
 
@@ -2966,7 +2965,6 @@ int sensor_read(void) {
                 index_refs=False,
                 index_embeddings=False,
                 analyze_symbols=False,
-                analyze_overrides=False,
             )
             print(f"  New config_hash: {config_hash_new[:16]}…")
 
@@ -3048,7 +3046,6 @@ class TestStartupStalenessCheck:
                 index_refs=True,
                 index_embeddings=False,
                 analyze_symbols=False,
-                analyze_overrides=False,
             )
         finally:
             _os.environ.pop("FW_CONTEXT_FORCE_REFINDEX", None)
@@ -3089,7 +3086,6 @@ class TestStartupStalenessCheck:
                 index_refs=True,
                 index_embeddings=False,
                 analyze_symbols=False,
-                analyze_overrides=False,
             )
         finally:
             _os.environ.pop("FW_CONTEXT_FORCE_REFINDEX", None)
@@ -3329,7 +3325,6 @@ class TestTheDecisionIsByHash:
             index_refs=index_refs,
             index_embeddings=False,
             analyze_symbols=False,
-            analyze_overrides=False,
         )
 
     def test_a_save_after_the_parse_is_seen_by_the_next_run(self, indexed_project: Path, monkeypatch):
@@ -3808,7 +3803,6 @@ class TestBgReindexEndToEnd:
             index_refs=True,
             index_embeddings=False,
             analyze_symbols=False,
-            analyze_overrides=False,
         )
 
         # ── Step 1: Delete refs (simulate db corruption or pre-refs index) ──
@@ -3842,7 +3836,6 @@ class TestBgReindexEndToEnd:
                 index_refs=True,
                 index_embeddings=False,
                 analyze_symbols=False,
-                analyze_overrides=False,
             )
         finally:
             del _os.environ["FW_CONTEXT_FORCE_REFINDEX"]

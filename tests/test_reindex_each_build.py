@@ -58,7 +58,7 @@ def two_builds(tmp_path: Path):
         cc.write_text(json.dumps(_units(root, files, define)), encoding="utf-8")
         run(
             compile_commands=cc, db_path=db_path, project_root=root, project_id=PROJECT_ID,
-            index_refs=False, index_embeddings=False, analyze_symbols=False, analyze_overrides=False,
+            index_refs=False, index_embeddings=False, analyze_symbols=False,
             variant=variant,
         )
     return root, db_path

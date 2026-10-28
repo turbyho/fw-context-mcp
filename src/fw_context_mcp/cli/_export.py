@@ -275,7 +275,6 @@ def _analyze_builds(
     """
     from ..indexer import _force_llm_marker as force_llm_marker
     from ..indexer._llm_analysis import ContextChoice, _build_llm_analysis
-    from ..indexer._postprocess import _build_overrides
     from ..indexer.db import open_db, set_analyze_vendor
     from ._builds import label, selected_builds
 
@@ -336,7 +335,6 @@ def _analyze_builds(
             )
             if force_llm and not finished:
                 force_llm_marker.mark_unfinished(db_path.parent)
-            _build_overrides(conn, config_hash, db_path.parent)
             conn.commit()
 
             # Update stored analyze_vendor so get_project_status reports

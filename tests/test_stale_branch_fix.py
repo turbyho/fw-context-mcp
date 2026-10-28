@@ -508,7 +508,6 @@ int extra_func(void) { return 42; }
             index_refs=False,
             index_embeddings=False,
             analyze_symbols=False,
-            analyze_overrides=False,
             purge_max_missing_percent=100,
         )
 

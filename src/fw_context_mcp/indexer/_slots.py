@@ -25,8 +25,17 @@ name:
 * an **argument**: a value that a site passes, which goes into a parameter
   of each function that the site reaches (known after the resolution);
 * an **escape**: the address of a slot (or of an element of it) is taken,
-  or a slot value is cast to an integer or to ``void *``: code that the
-  tree does not show can write it.
+  a slot value is cast to an integer or to ``void *`` and no known place
+  holds it, or the slot is a variable or a return that the unit does not
+  define (``OUTSIDE``): code that the tree does not show can write it.
+
+A cast to an integer or to ``void *`` does not stop a value: the place
+that holds the integer or the ``void *`` is the slot, and a cast back
+reads it (``_Collector.climb``, ``visit_untyped_cast``).  A copy of a
+``void *`` place carries the value on (``visit_reference``); a copy of an
+integer place does not.  No integer place escapes: what code out of the
+build writes into it (a linker symbol, a routine of the ROM, a read of the
+flash) is a number, not a function of the build.
 
 The resolution over all the units of a build is ``_slot_resolution``
 (phase 5b).  The model and its measurement: probe s3 of the call edge plan.
@@ -90,6 +99,11 @@ _COMPARISONS = frozenset({_B.Cmp, _B.LT, _B.GT, _B.LE, _B.GE, _B.EQ, _B.NE, _B.L
 # What a pointer to a slot can do (`_Collector.address_taken`).
 _ADDRESS_WRITABLE = "writable"
 _ADDRESS_READ_ONLY = "read only"
+# The reason of an escape that holds only when the build has no definition
+# of the variable or of the function of the slot (``_defined_outside``):
+# code out of the build writes it.  The resolution checks the definition
+# over all the units (``_slot_resolution``).
+OUTSIDE = "defined out of the unit"
 # Where a value goes (`_Collector.climb`): ("slot", key), ("argument",
 # file, line, column, ordinal, index), ("escape", why) or ("none", why).
 _Where = tuple[str | int, ...]
@@ -307,6 +321,28 @@ def _pointer_type(type_: cx.Type) -> str | None:
     return None
 
 
+def _table_pointer_type(type_: cx.Type) -> str | None:
+    """The function type of a pointer to a table of pointers to functions (`act_t *`, `act_t *sets[4]`), or None.
+
+    WHY: a state machine keeps its tables of actions in a table of
+    pointers (`sets[SLAVE] = slave_actions;`) and calls through a copy
+    (`act_t *set = sets[i]; (*set[j])(ccb);`).  The slot of such a pointer
+    holds the functions of the table that it points to, as the slot of an
+    array holds the functions of its elements.  The write of `sets[i]` gave
+    a flow, but the read was no slot fact, thus the actions had no caller.
+    """
+    current = _strip_arrays(type_)
+    for _ in range(4):
+        if current.kind != _T.POINTER:
+            return None
+        pointee = current.get_pointee().get_canonical()
+        found = _pointer_type(pointee)
+        if found is not None and pointee.kind not in _FUNCTION_TYPES:
+            return found
+        current = _strip_arrays(pointee)
+    return None
+
+
 def _points_to(pointer: cx.Type, target: cx.Type) -> bool:
     """*pointer* is a pointer to *target*.
 
@@ -349,7 +385,9 @@ def _record(type_: cx.Type) -> cx.Cursor | None:
     declaration = type_.get_declaration()
     if _kind(declaration) is None or declaration.kind == _K.NO_DECL_FOUND:
         return None
-    return declaration
+    # The definition: the type gives its first declaration, which can be a
+    # forward declaration with no member (`struct ops;` in a header).
+    return declaration.get_definition() or declaration
 
 
 class _Collector:
@@ -379,6 +417,14 @@ class _Collector:
         # two.
         self._sites_like: dict[tuple, list[int]] = {}
         self._walk_sites_like: dict[tuple, int] = {}
+
+    def note_outside(self, expression: cx.Cursor, slot: str) -> None:
+        """Record that code out of the build can write *slot*, when *expression* reads a declaration the unit does not define."""
+        place = _place(expression)
+        if place is not None and _defined_outside(expression):
+            self._out().escapes.append(SlotEscape(
+                file=place[0], line=place[1], column=place[2], slot=slot, reason=OUTSIDE,
+            ))
 
     def start_walk(self, instance: bool) -> None:
         """Start one walk: the written code of the unit, or the body of one instance."""
@@ -437,7 +483,7 @@ class _Collector:
         return "W:" + declaration.get_usr()
 
     def slot_type(self, type_: cx.Type) -> str | None:
-        return _pointer_type(type_) or self.object_type(type_)
+        return _pointer_type(type_) or _table_pointer_type(type_) or self.object_type(type_)
 
     def member_usr(self, declaration: cx.Cursor) -> str:
         """The USR of *declaration*, or of the template member that it instantiates.
@@ -554,9 +600,12 @@ class _Collector:
             return self.slot_of(children[0]) if children else (None, "array")
         if kind in _CASTS:
             # `((voidFuncPtrArg)handler->fn)(arg)`: a cast from one pointer
-            # to a function to an other keeps the value of the slot.
-            operand = next((c for c in reversed(list(expression.get_children())) if _is_expression(c)), None)
-            if operand is not None and _pointer_type(operand.type) is not None:
+            # to a function to an other keeps the value of the slot.  A cast
+            # from an integer or from `void *` (`((cb_t) h->handler)(x)`)
+            # reads the place that holds the function as that type.
+            operand = _cast_operand(expression)
+            if operand is not None and (_pointer_type(operand.type) is not None
+                                        or self.untracked(operand.type) is not None):
                 return self.slot_of(operand)
             return None, "cast"
         if kind == _K.UNARY_OPERATOR:
@@ -582,15 +631,33 @@ class _Collector:
     # ---- where a value goes ---------------------------------------------
 
     def climb(
-        self, node: cx.Cursor, path: list[cx.Cursor], caller: str | None,
+        self, node: cx.Cursor, path: list[cx.Cursor], caller: str | None, untyped: str | None = None,
     ) -> _Where:
         """Follow a value up the tree to the place that stores it.
 
         ('slot', key[, key of the object]) | ('argument', site place,
         ordinal, index) | ('escape', why) | ('none', why).
+
+        A cast to an integer or to `void *` does not stop the value: the
+        place that holds the integer (`h->handler = (uint32_t) cb;`, a
+        `void *` field of a context) is the slot of the function, and a cast
+        back (`(cb_t) h->handler`) reads it (``visit_untyped_cast``).  WHY a
+        slot and not an escape: an escape gave each call of the read value
+        every function of its type, also the jump of a bootloader to an
+        address in flash, which holds no function of the build.  When no
+        known place holds the value, it escapes as before.
+
+        *untyped*: the value is untyped from the start, a read of a
+        `void *` place (``visit_reference``).
         """
         child = node
         at = len(path) - 1
+
+        def done(result: _Where) -> _Where:
+            if untyped and result[0] not in ("slot", "argument"):
+                return ("escape", "cast to " + untyped)
+            return result
+
         while at >= 0:
             parent = path[at]
             kind = _kind(parent)
@@ -598,23 +665,24 @@ class _Collector:
                 # `bool(f)`, `(bool)f`, `bool b = f`: the truth of the
                 # pointer, as `!f`.  A bool holds no function, thus it is no
                 # slot.
-                return ("none", "conversion to bool")
+                return done(("none", "conversion to bool"))
             untracked = self.untracked(parent.type) if kind in _TRANSPARENT or kind in _TYPED_OPERANDS else None
-            if untracked and _pointer_type(child.type) is None:
-                # A pointer to a slot, not a value of it: `address_taken`
+            if untracked and _pointer_type(child.type) is None and untyped is None:
+                # A pointer to a slot, not a value of it (a value that an
+                # earlier cast made untyped goes on): `address_taken`
                 # tells if it escapes (`memcpy(&g, &tab[0], n)` only reads).
                 untracked = None
                 if kind in _TYPED_OPERANDS or kind == _K.UNEXPOSED_EXPR:
-                    return ("none", "pointer to a slot as an untyped pointer")
+                    return done(("none", "pointer to a slot as an untyped pointer"))
             if kind in _TRANSPARENT:
                 if (kind == _K.UNEXPOSED_EXPR and untracked
                         and child.type.get_canonical().kind != _T.RECORD):
-                    return ("escape", "cast to " + untracked)
+                    untyped = untracked
                 child, at = parent, at - 1
                 continue
             if kind in _TYPED_OPERANDS:
                 if untracked:
-                    return ("escape", "cast to " + untracked)
+                    untyped = untracked
                 child, at = parent, at - 1
                 continue
             if kind == _K.UNARY_OPERATOR:
@@ -622,11 +690,11 @@ class _Collector:
                 if parent_type.kind in (_T.POINTER, _T.MEMBERPOINTER) or parent_type.kind in _FUNCTION_TYPES:
                     child, at = parent, at - 1
                     continue
-                return ("none", "unary operator")
+                return done(("none", "unary operator"))
             if kind == _K.CONDITIONAL_OPERATOR:
                 children = list(parent.get_children())
                 if children and _same(children[0], child):
-                    return ("none", "condition")
+                    return done(("none", "condition"))
                 child, at = parent, at - 1
                 continue
             if kind == _K.ARRAY_SUBSCRIPT_EXPR:
@@ -634,54 +702,54 @@ class _Collector:
                 if children and _same(children[0], child):
                     child, at = parent, at - 1
                     continue
-                return ("none", "index")
+                return done(("none", "index"))
             if kind == _K.BINARY_OPERATOR:
                 children = list(parent.get_children())
                 if _sym._is_plain_assignment(parent) and len(children) == 2:
                     if _same(children[1], child):
                         slot, why = self.slot_of(children[0])
-                        return ("slot", slot) if slot else ("none", "left side: " + why)
-                    return ("none", "left side of an assignment")
+                        return done(("slot", slot) if slot else ("none", "left side: " + why))
+                    return done(("none", "left side of an assignment"))
                 if parent.binary_operator == cx.BinaryOperator.Comma and len(children) == 2:
                     # `(log(), f)`: the value of a comma is its right side.
                     if _same(children[1], child):
                         child, at = parent, at - 1
                         continue
-                    return ("none", "left side of a comma")
-                return ("none", "operator")
+                    return done(("none", "left side of a comma"))
+                return done(("none", "operator"))
             if kind == _K.COMPOUND_ASSIGNMENT_OPERATOR:
-                return ("none", "compound assignment")
+                return done(("none", "compound assignment"))
             if kind == _K.CALL_EXPR:
                 result = self.climb_call(parent, child)
                 if result is None:
                     child, at = parent, at - 1
                     continue
-                return result
+                return done(result)
             if kind in (_K.VAR_DECL, _K.FIELD_DECL, _K.PARM_DECL):
                 # A PARM_DECL holds its default argument
                 # (`void attach(cb_t cb = default_isr)`).
                 slot = self.declaration_slot(parent)
-                return ("slot", slot) if slot else ("none", str(kind))
+                return done(("slot", slot) if slot else ("none", str(kind)))
             if kind == _K.INIT_LIST_EXPR:
                 result = self.climb_init_list(parent, child, path, at)
                 if result is None:
                     child, at = parent, at - 1
                     continue
-                return result
+                return done(result)
             if kind == _K.RETURN_STMT:
-                return ("slot", "R|" + caller) if caller else ("none", "return outside code")
+                return done(("slot", "R|" + caller) if caller else ("none", "return outside code"))
             if kind == _K.CONSTRUCTOR:
-                return self.climb_member_initializer(parent, child)
+                return done(self.climb_member_initializer(parent, child))
             if kind == _K.MEMBER_REF_EXPR:
                 call = _closure_conversion_call(path, at)
                 if call is None:
-                    return ("none", "base of a member")
+                    return done(("none", "base of a member"))
                 child, at = call, at - 2
                 continue
             if kind == _K.CXX_FOR_RANGE_STMT:
-                return self.climb_range_for(parent, child)
-            return ("none", f"statement {kind}")
-        return ("none", "top")
+                return done(self.climb_range_for(parent, child))
+            return done(("none", f"statement {kind}"))
+        return done(("none", "top"))
 
     def climb_range_for(self, loop: cx.Cursor, child: cx.Cursor) -> _Where:
         """`for (cb_t cb : g_tab)`: each element of the range goes into the loop variable.
@@ -690,11 +758,10 @@ class _Collector:
         does, but it is an alias of an element: a write through it is not
         seen (a known gap of phase 5a, as each reference to a slot).
         """
-        children = list(loop.get_children())
-        at = next((i for i, c in enumerate(children) if _kind(c) == _K.VAR_DECL), None)
-        if at is None or at + 1 >= len(children) or not _same(children[at + 1], child):
+        if not _is_range(loop, child):
             return ("none", "range for")
-        slot = self.declaration_slot(children[at])
+        variable = next(c for c in loop.get_children() if _kind(c) == _K.VAR_DECL)
+        slot = self.declaration_slot(variable)
         return ("slot", slot) if slot else ("none", "range for")
 
     def climb_call(self, call: cx.Cursor, child: cx.Cursor) -> _Where | None:
@@ -868,18 +935,31 @@ class _Collector:
 
     def record(
         self, value: tuple[str, str, str], node: cx.Cursor, path: list[cx.Cursor], caller: str | None,
-        climb_from: tuple[cx.Cursor, list[cx.Cursor]] | None = None,
-    ) -> None:
+        climb_from: tuple[cx.Cursor, list[cx.Cursor]] | None = None, untyped: str | None = None,
+    ) -> _Where | None:
         """Record where *value* goes: ("function", key, type) or ("slot", key, "").
 
         *climb_from*: the node and its path to climb from, when that is not
         *node* (`visit_overload_set`).  *node* gives the place of the fact.
+        *untyped*: *value* is the slot of a `void *` place.  Only a place
+        or an argument that takes it gives a fact: a read of such a place
+        is in many expressions, and an escape of each one (`if (p)`, `p ==
+        NULL`) adds rows and no edge.
+
+        Gives where the value goes (``climb``), or None when *node* has no
+        place: the caller adds an escape of the read only when the value
+        goes on (``_carries``).
         """
         place = _place(node)
         if place is None:
-            return
+            return None
         file, line, column = place
-        result = self.climb(*climb_from, caller) if climb_from else self.climb(node, path, caller)
+        if climb_from:
+            result = self.climb(*climb_from, caller)
+        else:
+            result = self.climb(node, path, caller, untyped)
+        if untyped and not _carries(result):
+            return result
         if result[0] == "slot":
             for target in (str(key) for key in result[1:]):
                 if value[0] == "function":
@@ -917,6 +997,7 @@ class _Collector:
             self._out().escapes.append(SlotEscape(
                 file=file, line=line, column=column, slot=value[1], reason=str(result[1]),
             ))
+        return result
 
     def add_site(
         self, call: cx.Cursor, place: tuple[str, int, int], caller: str | None,
@@ -952,6 +1033,86 @@ class _Collector:
             self.visit_call(cursor, path, caller)
         elif kind == _K.INIT_LIST_EXPR:
             self.visit_init_list(cursor, path, caller)
+        elif kind in _CASTS:
+            self.visit_untyped_cast(cursor, path, caller)
+
+    def visit_untyped_cast(self, cast: cx.Cursor, path: list[cx.Cursor], caller: str | None) -> None:
+        """A pointer to a function that a cast reads from an integer or a `void *` place: a flow from the place.
+
+        `h->handler = (uint32_t) cb;` stores the function in the place
+        `h->handler` (``climb`` goes on past the cast), and `cb_t f = (cb_t)
+        h->handler; f(x);` reads it back: the flow `h->handler` → `f` gives
+        `f` the functions that the code stored there.  A cast of an integer
+        that no place holds (`(entry_t) *(uint32_t *)0x08004004`, the jump
+        of a bootloader) reads no slot and gives no fact.
+
+        The type of the place decides, not the type of the operand: casts
+        can follow each other (`(entry_t)(void *) APP_ENTRY` reads an
+        integer place, `(cb_t)(uintptr_t) tbl[2]` a `void *` place).  A
+        place of a function pointer type is read by ``visit_reference`` and
+        ``visit_call``, which follow the value through the casts.
+
+        A `void *` place gets its ``OUTSIDE`` escape here: the cast back
+        is the read that can call what code out of the build wrote.  A
+        `void *` variable, field, element of an array, parameter or return
+        is read by ``visit_reference`` and ``visit_call`` too, which give
+        the same flow: this visit records the flow only for the places that
+        they do not read (an integer, an element through a pointer: `pp[2]`,
+        `get()[2]`), and else would give each fact two times.  An integer
+        place gets no ``OUTSIDE`` escape (module docstring).
+        """
+        if _pointer_type(cast.type) is None:
+            return
+        operand = _cast_operand(cast)
+        if operand is None or self.untracked(operand.type) is None:
+            return
+        held = self.held_value(operand)
+        place_type = self.untracked(held.type)
+        slot, _why = self.slot_of(held)
+        if not slot or place_type is None:
+            return
+        if place_type == "void *":
+            self.note_outside(held, slot)
+            if self.reads_void_place(held):
+                return
+        self.record(("slot", slot, ""), cast, path, caller)
+
+    def held_value(self, expression: cx.Cursor) -> cx.Cursor:
+        """The expression under the casts of *expression* that ``slot_of`` goes through: its type is the type of the place."""
+        expression = _unwrap(expression)
+        while _kind(expression) in _CASTS:
+            operand = _cast_operand(expression)
+            if operand is None or (_pointer_type(operand.type) is None and self.untracked(operand.type) is None):
+                break
+            expression = _unwrap(operand)
+        return expression
+
+    def reads_void_place(self, operand: cx.Cursor) -> bool:
+        """Tell if ``visit_reference`` or ``visit_call`` reads *operand*, a `void *` value, as a place."""
+        operand = _unwrap(operand)
+        while _kind(operand) == _K.ARRAY_SUBSCRIPT_EXPR:
+            # An element of a `void *` array (`tbl[2]`): ``visit_reference``
+            # reads it at the array.  An element through a pointer (`pp[2]`
+            # with `void **pp`, `get()[2]`) is no place that it or
+            # ``visit_call`` reads.
+            children = list(operand.get_children())
+            if not children:
+                return False
+            operand = _unwrap(children[0])
+            if _kind(operand) == _K.ARRAY_SUBSCRIPT_EXPR:
+                continue  # `t[1][2]`
+            if _kind(operand) not in _REFERENCE_EXPRESSIONS or operand.type.get_canonical().kind not in _ARRAYS:
+                return False
+        kind = _kind(operand)
+        if kind in _REFERENCE_EXPRESSIONS:
+            declaration = operand.referenced
+            return (declaration is not None and _kind(declaration) in (_K.VAR_DECL, _K.PARM_DECL, _K.FIELD_DECL)
+                    and self.untracked(_strip_arrays(declaration.type)) == "void *")
+        if kind == _K.CALL_EXPR:
+            function = _direct_function(operand)
+            return (function is not None and _kind(function) != _K.CONSTRUCTOR
+                    and not _is_closure_conversion(function))
+        return False
 
     def visit_init_list(self, init_list: cx.Cursor, path: list[cx.Cursor], caller: str | None) -> None:
         """An element that a conversion function makes the function pointer of its place.
@@ -1041,20 +1202,50 @@ class _Collector:
             )
             return
         if kind in (_K.VAR_DECL, _K.PARM_DECL, _K.FIELD_DECL):
+            # A `void *` place can hold a function that a cast stored
+            # (``climb``): a copy of it (`void *p = c.user;`, `x->arg = arg`,
+            # `return c.user;`) carries the function on.  WHY not an
+            # integer place: each `int a = b;` and each integer argument
+            # gave a flow, 300 times the flows of a project (measured: 215
+            # to 65 121 on 215 units, 1 166 with `void *` only).  A chain of
+            # integer copies (`uint32_t` parameter into a table) is a known
+            # gap; the store and the cast back of one place stay.
+            # An element of a `void *` array (`void *tbl[4]`) is a `void *`
+            # place too: `void *x = tbl[0];` carries the function on.
+            untyped = None
+            array = False
             if self.slot_type(declaration.type) is None:
-                return
+                untyped = self.untracked(_strip_arrays(declaration.type))
+                if untyped != "void *":
+                    return
+                array = declaration.type.get_canonical().kind in _ARRAYS
             slot = self.declaration_slot(declaration)
             place = _place(cursor)
             if not slot or place is None:
                 return
+            # A `void *` place escapes as a typed slot does: a write through
+            # a pointer to it (`q_recv(&msg)`) or code out of the build
+            # (`extern void *opaque`) can store a function there.
             if self.address_taken(cursor, path, declaration) == _ADDRESS_WRITABLE:
                 self._out().escapes.append(SlotEscape(
                     file=place[0], line=place[1], column=place[2], slot=slot, reason="address taken",
                 ))
+            if array and not _reads_element(cursor, path):
+                # The array itself (`memset(tbl, 0, n)`, `run(a)` with `void
+                # *a[]`) is a pointer to the place, not a value that it holds:
+                # ``climb`` follows a `void *` value through each conversion,
+                # and would carry the pointer on as a function.
+                return
             # A pointer to the slot flows on too: a table that a function
             # gets as a pointer (`dispatch(fns, n)`, `table[i](x)` in it)
             # reads the values of the slot through the parameter.
-            self.record(("slot", slot, ""), cursor, path, caller)
+            result = self.record(("slot", slot, ""), cursor, path, caller, untyped=untyped)
+            # A call reads a typed slot (`g_cb(1)`), which ``record`` does not
+            # see.  A `void *` place is read by a copy, or by a cast back
+            # (``visit_untyped_cast``): an other read (`if (p)`, `p == NULL`)
+            # adds a row and no edge.
+            if untyped is None or _carries(result):
+                self.note_outside(cursor, slot)
 
     def visit_overload_set(
         self, cursor: cx.Cursor, overload_set: cx.Cursor, path: list[cx.Cursor], caller: str | None,
@@ -1162,7 +1353,20 @@ class _Collector:
                 # of a closure passes the lambda up (`climb`): no return
                 # slot of them holds a value.
                 returned = self.accessor_holder(call, function) or "R|" + _sym._code_usr(function)
+                self.note_outside(call, returned)
                 self.record(("slot", returned, ""), call, path, caller)
+            elif (_kind(function) != _K.CONSTRUCTOR and not _is_closure_conversion(function)
+                    and (untyped := self.untracked(call.type)) == "void *"):
+                # A `void *` that a function gives (`void *u =
+                # get_user(c);`) can hold a function that a cast stored: its
+                # return slot flows on as a read of a place.  Not an integer,
+                # for the reason of ``visit_reference``.  Its ``OUTSIDE``
+                # escape only when the value goes on: each `memcpy(d, s, n);`
+                # gave a row and no edge.  A cast back of the call gives it
+                # (``visit_untyped_cast``).
+                returned = "R|" + _sym._code_usr(function)
+                if _carries(self.record(("slot", returned, ""), call, path, caller, untyped=untyped)):
+                    self.note_outside(call, returned)
             if _is_object_call(function):
                 target = self.call_object(call, function)
                 slot, why = self.slot_of(target) if target is not None else (None, "implicit object")
@@ -1199,6 +1403,8 @@ class _Collector:
             # its type; the text of the address tells where it goes.
             self.add_site(call, place, caller, "address", None, pointer_type, _text(address, call))
             return
+        # The read of the callee records its ``OUTSIDE`` escape
+        # (``visit_reference``, ``visit_call``, ``visit_untyped_cast``).
         self.add_site(call, place, caller, "pointer", slot, pointer_type, why)
 
     def accessor_holder(self, call: cx.Cursor, function: cx.Cursor) -> str | None:
@@ -1246,18 +1452,103 @@ def _integer_operand(callee: cx.Cursor) -> cx.Cursor | None:
     """The integer that a cast of the callee makes a pointer to a function, or None.
 
     `((void (*)(void))(*(uint32_t *)0x08004004))()`: the operand of the
-    cast is an integer.  A cast from `void *` is not one: a `void *` field
-    can hold a function (its source escaped as "cast to void *").
+    cast is an integer that names no slot.  ``visit_call`` asks for it
+    only when the callee has no slot: an integer that a place holds
+    (`((cb_t) h->handler)(x)`) is the slot of that place
+    (``_Collector.slot_of``).  A cast from `void *` is not one: a `void *`
+    field can hold a function.
     """
     callee = _unwrap(callee)
     while _kind(callee) in _CASTS:
-        operand = next((c for c in reversed(list(callee.get_children())) if _is_expression(c)), None)
+        operand = _cast_operand(callee)
         if operand is None:
             return None
         if operand.type.get_canonical().kind in _INTEGERS:
             return operand
         callee = _unwrap(operand)
     return None
+
+
+def _defined_outside(expression: cx.Cursor) -> bool:
+    """Tell if the value of *expression* comes from a declaration that the unit does not define.
+
+    An `extern` variable with no definition in the unit (`extern void
+    *opaque;`), an element of one, and the call of a function with no body
+    in the unit (a library that the build links).  The definition can be in
+    an other unit of the build, thus the fact is a candidate: the
+    resolution keeps it only when the index has no definition
+    (``OUTSIDE``).
+    """
+    expression = _unwrap(expression)
+    while _kind(expression) in (_K.ARRAY_SUBSCRIPT_EXPR, _K.UNARY_OPERATOR) or _kind(expression) in _CASTS:
+        children = [c for c in expression.get_children() if _is_expression(c)]
+        if not children:
+            return False
+        expression = _unwrap(children[0] if _kind(expression) == _K.ARRAY_SUBSCRIPT_EXPR else children[-1])
+    kind = _kind(expression)
+    if kind in _REFERENCE_EXPRESSIONS:
+        declaration = expression.referenced
+        return (declaration is not None and _kind(declaration) == _K.VAR_DECL
+                and declaration.storage_class == cx.StorageClass.EXTERN
+                and declaration.get_definition() is None)
+    if kind == _K.CALL_EXPR:
+        # A pure virtual method has no body by design: the call reaches an
+        # override, whose return the override flows give (``_slot_resolution``).
+        function = _direct_function(expression)
+        return (function is not None and _kind(function) != _K.CONSTRUCTOR
+                and not function.is_pure_virtual_method()
+                and function.get_definition() is None)
+    return False
+
+
+def _is_range(loop: cx.Cursor, child: cx.Cursor) -> bool:
+    """Tell if *child* is the range of the range-for *loop* (`tbl` in `for (void *p : tbl)`), not its body."""
+    children = list(loop.get_children())
+    at = next((i for i, c in enumerate(children) if _kind(c) == _K.VAR_DECL), None)
+    return at is not None and at + 1 < len(children) and _same(children[at + 1], child)
+
+
+def _reads_element(reference: cx.Cursor, path: list[cx.Cursor]) -> bool:
+    """Tell if *reference*, an array, is read as an element (`tbl[i]`, `*tbl`, `t[i][j]`, `for (void *p : tbl)`).
+
+    WHY not ``climb``: it follows the decay of the array and each
+    subscript the same way, thus it cannot tell an element from a row or
+    from the array itself.  The first node above the subscripts and the
+    dereferences that is not an array is the element.  A pointer to an
+    element (`get(&tbl[1])`) goes on as the pointer to a scalar place does
+    (`get(&p)`), with the escape of ``address_taken``.
+    """
+    child = reference
+    at = len(path) - 1
+    while at >= 0:
+        parent = path[at]
+        kind = _kind(parent)
+        if kind == _K.CXX_FOR_RANGE_STMT:
+            # Each element goes into the loop variable (``climb_range_for``).
+            return _is_range(parent, child)
+        if kind == _K.ARRAY_SUBSCRIPT_EXPR:
+            children = list(parent.get_children())
+            if not children or not _same(children[0], child):
+                return False  # the array is not the base
+        elif kind == _K.UNARY_OPERATOR:
+            if not _points_to(child.type, parent.type):
+                return False  # `&tbl`, `!tbl`: no element
+        elif kind not in _TRANSPARENT:
+            return False
+        if kind not in _TRANSPARENT and parent.type.get_canonical().kind not in _ARRAYS:
+            return True
+        child, at = parent, at - 1
+    return False
+
+
+def _carries(result: _Where | None) -> bool:
+    """Tell if a value that ``record`` followed goes into a place or into an argument of a site."""
+    return result is not None and result[0] in ("slot", "argument")
+
+
+def _cast_operand(cast: cx.Cursor) -> cx.Cursor | None:
+    """The operand of *cast*: its last expression child (an expression before it belongs to the type)."""
+    return next((c for c in reversed(list(cast.get_children())) if _is_expression(c)), None)
 
 
 def _text(cursor: cx.Cursor, within: cx.Cursor) -> str:

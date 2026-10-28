@@ -140,4 +140,5 @@ def test_a_macro_that_expands_twice_on_one_line_gives_one_fact(extracted):
 @pytest.mark.libclang
 def test_nested_calls_that_reach_one_target_give_one_fact(extracted):
     line = _line("reg(wrap(")
-    assert _sources(extracted, line) == [("c:@F@handler_a", "")]
+    # `wrap(void *)`: the parameter holds the function.
+    assert _sources(extracted, line) == [("c:@F@handler_a", "P|c:@F@wrap|0")]

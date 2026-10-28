@@ -52,6 +52,7 @@ from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 
+from ._slots import OUTSIDE
 from .models import RefOrigin
 
 log = logging.getLogger(__name__)
@@ -123,6 +124,43 @@ class _Slots:
                     self._changed.append(successor)
 
 
+def _add_override_flows(conn: sqlite3.Connection, config_hash: str, slots: _Slots) -> None:
+    """The flows of a virtual call: a parameter of a base method into the parameter of each override, and back.
+
+    WHY: a call through a base class (`queue->post(cb)` on an interface) is
+    a direct call of the base method, thus its argument goes into a
+    parameter of the base method.  The body that runs is an override, and
+    it reads its own parameter.  Without the flow a function that an
+    interface receives reached no call.  The return value of an override
+    is the value of the call of the base method.  The relation is a fact of
+    the compiler (``overrides``, built before this step).  A parameter
+    slot exists for each parameter that a fact names, thus each pair maps
+    the indexes that the facts of the base or of the override hold.
+    """
+    pairs = conn.execute(
+        "SELECT base_usr, derived_usr FROM overrides WHERE config_hash = ?", (config_hash,),
+    ).fetchall()
+    if not pairs:
+        return
+    indexes: defaultdict[str, set[str]] = defaultdict(set)
+    known = set(slots.flows) | {target for targets in slots.flows.values() for target in targets} | set(slots.targets)
+    for row in conn.execute(
+        "SELECT slot FROM slot_sites WHERE config_hash = ? AND slot LIKE 'P|%'"
+        " UNION SELECT value FROM slot_arguments WHERE config_hash = ? AND value_kind = 'slot' AND value LIKE 'P|%'",
+        (config_hash, config_hash),
+    ):
+        known.add(row[0])
+    for slot in known:
+        if slot.startswith("P|"):
+            code, _, index = slot[2:].rpartition("|")
+            indexes[code].add(index)
+    for row in pairs:
+        base, derived = row["base_usr"], row["derived_usr"]
+        for index in indexes.get(base, set()) | indexes.get(derived, set()):
+            slots.add_flow(f"P|{base}|{index}", f"P|{derived}|{index}")
+        slots.add_flow(f"R|{derived}", f"R|{base}")
+
+
 def _load(conn: sqlite3.Connection, config_hash: str) -> tuple[_Slots, dict[str, set[str]], list[_Site], dict]:
     """Read the slot facts of the build: the graph, the functions of each type, the sites, the arguments."""
     slots = _Slots()
@@ -136,7 +174,17 @@ def _load(conn: sqlite3.Connection, config_hash: str) -> tuple[_Slots, dict[str,
             by_type[row["function_type"]].add(row["function"])
     for row in conn.execute("SELECT source, target FROM slot_flows WHERE config_hash = ?", (config_hash,)):
         slots.add_flow(row["source"], row["target"])
-    for row in conn.execute("SELECT slot FROM slot_escapes WHERE config_hash = ?", (config_hash,)):
+    _add_override_flows(conn, config_hash, slots)
+    # An escape "defined out of the unit" holds only when no unit of the
+    # build defines the variable or the function of the slot.
+    defined = {
+        row[0] for row in conn.execute(
+            "SELECT usr FROM symbols WHERE config_hash = ? AND is_definition = 1", (config_hash,),
+        )
+    }
+    for row in conn.execute("SELECT slot, reason FROM slot_escapes WHERE config_hash = ?", (config_hash,)):
+        if row["reason"] == OUTSIDE and row["slot"][2:] in defined:
+            continue
         slots.escape(row["slot"])
     sites = [
         _Site(

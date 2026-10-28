@@ -1323,7 +1323,6 @@ def _build_run_kwargs(
             if getattr(args, "no_analyze", False)
             else force_llm or getattr(args, "analyze", False) or cfg.llm.analyze_symbols
         ),
-        analyze_overrides=True,
         project_root=project_root,
         project_id=project_id,
         llm_config=cfg.llm,

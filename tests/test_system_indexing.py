@@ -1270,7 +1270,6 @@ int extra_init(void) {
             index_refs=False,
             index_embeddings=False,
             analyze_symbols=False,
-            analyze_overrides=False,
             purge_max_missing_percent=100,
         )
         print(f"  Config hash: before={config_hash_before[:16]}… after={config_hash_after[:16]}…")

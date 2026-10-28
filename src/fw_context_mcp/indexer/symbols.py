@@ -60,6 +60,7 @@ from typing import TYPE_CHECKING
 
 from ._dispatch_bridges import _DISPATCH_ENTRY_POINTS
 from ._libclang import cindex as cx
+from ._overrides import VIRTUAL_METHOD_KINDS, extract_overrides
 from .compile_commands import CompilationUnit
 from .models import (
     InheritanceRecord,
@@ -2385,7 +2386,13 @@ def _positional_struct_fields(cursor: cx.Cursor) -> list[tuple[str | None, str, 
         list_type = cursor.type.get_canonical()
         if list_type.kind != cx.TypeKind.RECORD or not _init_list_is_positional(cursor):
             return []
+        # The definition, not the first declaration: a C header declares an
+        # opaque type (`typedef struct ops ops_t;`) and an other header
+        # defines it.  The declaration of the type is the first one, which
+        # has no member, thus such a list mapped no field (measured: the
+        # cipher tables of an SDK, 50 functions with no slot).
         record = list_type.get_declaration()
+        record = record.get_definition() or record
         members = list(record.get_children())
         elements = list(cursor.get_children())
         template = record.specialized_template
@@ -2626,6 +2633,9 @@ class ExtractionResult:
     inheritance: list = field(default_factory=list)
     macros: list = field(default_factory=list)
     pending_dispatches: list = field(default_factory=list)
+    # (derived USR, base USR) of each virtual method that a method of the
+    # unit overrides, from the compiler (indexer/_overrides.py).
+    overrides: list[tuple[str, str]] = field(default_factory=list)
     # The slot facts of the indirect calls (indexer/_slots.py), or None
     # when the references are not extracted.
     slots: SlotFacts | None = None
@@ -2736,6 +2746,8 @@ def extract_all(
     symbols: list[Symbol] = []
     seen_usrs: dict[str, bool] = {}  # USR → is_definition (allows decl→def promotion)
     class_cursors: list[cx.Cursor] = []  # class/struct def cursors for inheritance extraction
+    # The virtual methods of the walk, also of a class template.
+    virtual_methods: list[cx.Cursor] = []
 
     # Pre-scan: map anonymous struct/union USRs to their field names
     # (e.g. struct { ... } _radio_cmd;  →  anon_usr → "_radio_cmd")
@@ -2770,6 +2782,8 @@ def extract_all(
             continue
         if cursor.kind not in _SYMBOL_KINDS:
             continue
+        if cursor.kind in VIRTUAL_METHOD_KINDS and cursor.is_virtual_method():
+            virtual_methods.append(cursor)
         _process_one_symbol(cursor, symbols, seen_usrs, class_cursors, anon_usr_to_field, _log)
 
     # Weakness is a fact of the object file: any declaration of the TU,
@@ -2783,6 +2797,8 @@ def extract_all(
 
     # --- Inheritance: examine base specifiers of collected class cursors ---
     inheritance = _extract_inheritance(class_cursors)
+    # --- Overrides: the record of the compiler for each virtual method ---
+    overrides = extract_overrides(virtual_methods, _code_usr)
 
     # --- Macro definitions (#define) ---
     macros = _extract_macros(tu.cursor, _resolve, skip_files=_skip_frozen)
@@ -2791,7 +2807,7 @@ def extract_all(
         _log.info("  parse=%.1fs symwalk=%.1fs syms=%d macros=%d", _t_parse, _t_symwalk, len(symbols), len(macros))
         result = ExtractionResult(
             tu=tu if return_tu else None, symbols=symbols, references=[],
-            inheritance=inheritance, macros=macros, newly_seen_files=_newly_seen,
+            inheritance=inheritance, macros=macros, overrides=overrides, newly_seen_files=_newly_seen,
             parse_errors=parse_errors, parse_fatal=parse_fatal, parse_first_error=parse_first_error,
         )
         return result
@@ -2812,7 +2828,7 @@ def extract_all(
     )
     result = ExtractionResult(
         tu=tu if return_tu else None, symbols=symbols, references=refs,
-        inheritance=inheritance, macros=macros,
+        inheritance=inheritance, macros=macros, overrides=overrides,
         pending_dispatches=pending_dispatches, slots=slots, newly_seen_files=_newly_seen,
         parse_errors=parse_errors, parse_fatal=parse_fatal, parse_first_error=parse_first_error,
     )

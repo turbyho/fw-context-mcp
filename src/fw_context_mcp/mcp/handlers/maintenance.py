@@ -2942,32 +2942,6 @@ def _reindex_llm_analysis(
         result["analysis_warning"] = f"LLM analysis skipped: {exc}"
 
 
-def _reindex_overrides(
-    conn: sqlite3.Connection,
-    config_hash: str,
-    cfg: Config,
-    db_dir: Path,
-    result: dict,
-) -> None:
-    """Rebuild virtual method override relationships after reindex.
-
-    Only runs when ``cfg.index.index_refs`` is True (reference indexing
-    must be enabled).  The override table maps virtual methods to their
-    overrides in derived classes and is used by ``get_method_overrides``.
-
-    Failures are non-fatal — an ``overrides_warning`` key is added to
-    the result dict.
-    """
-    if not cfg.index.index_refs:
-        return
-    try:
-        from ...indexer.runner import _build_overrides
-        _build_overrides(conn, config_hash, db_dir, write_lock_held=False)
-        conn.commit()
-    except (sqlite3.Error, RuntimeError) as exc:
-        result["overrides_warning"] = f"Override analysis skipped: {exc}"
-
-
 def _reindex_pagerank(
     conn: sqlite3.Connection,
     config_hash: str,
@@ -3122,7 +3096,7 @@ def _reindex_graph_phases(
     db_dir: Path,
     result: dict,
 ) -> None:
-    """Rebuild the overrides, the edges of the indirect calls, PageRank and the hotspot cache after reindex_file.
+    """Rebuild the edges of the indirect calls, PageRank and the hotspot cache after reindex_file.
 
     Runs also with ``with_analysis=False``.  WHY: the re-parse deletes the
     symbols of the translation unit and its headers and inserts them again
@@ -3132,8 +3106,9 @@ def _reindex_graph_phases(
     was not in ``find_hotspots``, and nothing reported it.  No status can
     see a missing score, because many symbols have PageRank 0 in a
     complete index.  The phases need no model, and they are fast: at most
-    2 s for PageRank and the hotspot cache and 0.1 s for the overrides on
-    an index of 60 000 symbols (``indexer/_postprocess.py``).
+    2 s for PageRank and the hotspot cache on an index of 60 000 symbols
+    (``indexer/_postprocess.py``).  The re-parse writes the overrides of
+    the unit (``indexer/_overrides.py``).
 
     Each phase is independent — a failure in one adds its warning to
     *result* and does not stop the other.  Skipped when
@@ -3141,7 +3116,6 @@ def _reindex_graph_phases(
     """
     if total_symbols <= 0:
         return
-    _reindex_overrides(conn, config_hash, cfg, db_dir, result)
     _reindex_slot_edges(conn, config_hash, cfg, db_dir, result)
     _reindex_pagerank(conn, config_hash, cfg, result)
 
@@ -3232,7 +3206,7 @@ def reindex_file(
     with_analysis: Annotated[
         bool,
         Field(
-            description="When True (default), also regenerates the LLM symbol analysis and the embeddings — slower, because the two need a model. Set False for a fast update: the tool skips the two, and get_project_status then reports the symbols that wait for them. The method overrides, the PageRank scores and the hotspot cache are rebuilt in the two modes when reference indexing is on (`[index] index_refs`)."
+            description="When True (default), also regenerates the LLM symbol analysis and the embeddings — slower, because the two need a model. Set False for a fast update: the tool skips the two, and get_project_status then reports the symbols that wait for them. In the two modes, the tool resolves the indirect calls again and rebuilds the PageRank scores and the hotspot cache when reference indexing is on (`[index] index_refs`)."
         ),
     ] = True,
 ) -> dict:
@@ -3299,7 +3273,7 @@ def reindex_file(
         plus when they apply: skipped_tus and skipped_count (units that
         failed to parse), warning (header coverage), analysis_updated and
         embeddings_updated (counts for the whole build, not this file), and
-        analysis_warning, overrides_warning, pagerank_warning, or
+        analysis_warning, slot_edges_warning, pagerank_warning, or
         embedding_warning when a phase failed, or ``error`` when the
         re-parse of that build failed.
 

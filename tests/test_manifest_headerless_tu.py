@@ -55,7 +55,6 @@ def indexed(tmp_path: Path, monkeypatch) -> tuple[Path, Path, str]:
         index_refs=False,
         index_embeddings=False,
         analyze_symbols=False,
-        analyze_overrides=False,
     )
     return root, db_path, config_hash
 

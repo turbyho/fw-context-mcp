@@ -252,7 +252,7 @@ def test_search_of_a_project_of_one_build_needs_no_option(tmp_path, capsys):
     cc.write_text(json.dumps(_units(root, ["src/only_a.c"], "BOARD_A")), encoding="utf-8")
     run(
         compile_commands=cc, db_path=index_dir / PROJECT_ID / "index.db", project_root=root, project_id=PROJECT_ID,
-        index_refs=False, index_embeddings=False, analyze_symbols=False, analyze_overrides=False,
+        index_refs=False, index_embeddings=False, analyze_symbols=False,
     )
 
     assert _search(root, "only_a_value") == 0

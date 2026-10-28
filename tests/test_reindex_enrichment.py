@@ -79,7 +79,7 @@ def one_build(tmp_path: Path, monkeypatch):
     db_path = index_dir / PROJECT_ID / "index.db"
     run(
         compile_commands=cc, db_path=db_path, project_root=root, project_id=PROJECT_ID,
-        index_refs=True, index_embeddings=False, analyze_symbols=False, analyze_overrides=False,
+        index_refs=True, index_embeddings=False, analyze_symbols=False,
     )
     conn = open_db(db_path, skip_integrity_check=True)
     try:
@@ -161,7 +161,7 @@ def test_an_index_run_embeds_only_the_symbols_whose_text_changed(one_build, monk
     run(
         compile_commands=root / "compile_commands.json", db_path=db_path, project_root=root,
         project_id=PROJECT_ID, index_refs=True, index_embeddings=True, analyze_symbols=False,
-        analyze_overrides=False, llm_config=LLMConfig(embed_model="fake-embedder", analyze_symbols=False),
+        llm_config=LLMConfig(embed_model="fake-embedder", analyze_symbols=False),
     )
 
     # The description starts with "<kind> <name>, ..." (_rebuild_desc_rows).
@@ -202,8 +202,7 @@ def test_a_forced_run_embeds_each_symbol_again(one_build, monkeypatch):
 
     run(
         compile_commands=root / "compile_commands.json", db_path=db_path, project_root=root,
-        project_id=PROJECT_ID, index_refs=True, index_embeddings=True, analyze_symbols=False,
-        analyze_overrides=False, force=True,
+        project_id=PROJECT_ID, index_refs=True, index_embeddings=True, analyze_symbols=False, force=True,
         llm_config=LLMConfig(embed_model="fake-embedder", analyze_symbols=False),
     )
 

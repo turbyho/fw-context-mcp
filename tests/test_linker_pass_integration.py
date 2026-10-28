@@ -94,7 +94,6 @@ def _index(project: Path, db_path: Path) -> str:
         index_refs=False,
         index_embeddings=False,
         analyze_symbols=False,
-        analyze_overrides=False,
     )
 
 

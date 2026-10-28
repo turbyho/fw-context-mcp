@@ -538,8 +538,10 @@ def _delete_rows_owned_by(
     """Delete every row OWNED by *files*; return the USRs that were removed.
 
     "Owned" means the row's own file is one of *files*: its symbols, macros,
-    inheritance edges, embeddings, LLM analysis, vectors, and the references
-    and slot facts that ORIGINATE in it.
+    inheritance edges, the overrides of its methods, embeddings, LLM
+    analysis, vectors, and the references and slot facts that ORIGINATE in
+    it.  The parse of a unit writes the overrides again
+    (``indexer/_overrides.py``); a file that left the build loses them.
 
     Deliberately NOT touched, because the two callers need different things:
 
@@ -549,11 +551,6 @@ def _delete_rows_owned_by(
       call :func:`_delete_dangling_incoming_refs` afterwards with the returned
       USRs.
     - **The ``files`` rows themselves.** A re-parse reuses them.
-    - **``overrides``.** They key on ``derived_usr``, not on a symbol id, so
-      a re-parse does not break the key.  The overrides step of the index
-      run builds the whole graph again from the parsed source.  Deleting
-      them here would lose them for good when ``analyze_overrides`` is off
-      and nothing builds them again.
 
     Order is forced: inheritance resolves USR through ``symbols``, and the
     embedding / analysis deletes select by ``symbol_id``, so both must run
@@ -574,7 +571,7 @@ def _delete_rows_owned_by(
     facts (``delete_slot_facts_for_files``).  A purge deletes both.
     """
     from ._embeddings import stash_embeddings_for_files
-    from ._inheritance import delete_inheritance_for_file
+    from ._inheritance import delete_inheritance_for_file, delete_overrides_for_file
     from ._refs import delete_refs_for_files
     from ._slots import delete_slot_facts_for_files
     from ._symbols import delete_macros_for_files
@@ -590,6 +587,7 @@ def _delete_rows_owned_by(
             ).fetchall()
         )
         delete_inheritance_for_file(conn, config_hash, file_id)
+        delete_overrides_for_file(conn, config_hash, file_id)
         selector = "(SELECT id FROM symbols WHERE file_id = ?)"
         # Explicit rather than relying on ON DELETE CASCADE, so the order
         # holds even if a future schema defers the constraint.
@@ -659,7 +657,6 @@ def purge_file_records(
     Returns the number of symbols removed.
     """
     from ._connection import transaction
-    from ._inheritance import delete_overrides_for_file
     from ._locking import write_lock
 
     lock = (
@@ -670,10 +667,10 @@ def purge_file_records(
     tx = transaction(conn) if not transaction_held else nullcontext()
     with lock, tx:
         purged_usrs = _delete_rows_owned_by(conn, config_hash, [(file_id, file_path)])
-        # The file is gone for good, so three things the re-parse path keeps
-        # must also go: overrides recorded for its methods, edges from
-        # SURVIVING files that point at its USRs, and the files row.
-        delete_overrides_for_file(conn, config_hash, file_id)
+        # The file is gone for good, so two things the re-parse path keeps
+        # must also go: edges from SURVIVING files that point at its USRs,
+        # and the files row.  The overrides of its methods went with its
+        # symbols.
         if purged_usrs:
             _delete_dangling_incoming_refs(conn, config_hash, purged_usrs)
         conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
@@ -698,7 +695,6 @@ def purge_missing_files_batch(
     Returns the total number of symbols removed.
     """
     from ._connection import transaction
-    from ._inheritance import delete_overrides_for_file
     from ._locking import write_lock
 
     lock = (
@@ -709,8 +705,6 @@ def purge_missing_files_batch(
     tx = transaction(conn) if not transaction_held else nullcontext()
     with lock, tx:
         purged_usrs = _delete_rows_owned_by(conn, config_hash, list(files))
-        for file_id, _ in files:
-            delete_overrides_for_file(conn, config_hash, file_id)
         # One pass over the union of every purged USR, so an edge between two
         # files that both left the build is not looked up twice.
         if purged_usrs:

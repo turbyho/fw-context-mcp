@@ -19,7 +19,7 @@ Build or update the symbol index from `compile_commands.json`.
 > `--build` to force a clean build and a full re-index when needed, for
 > example after an SDK update or a build system change. Use `--force` to
 > skip the hash checks and force a re-index of all files, embeddings,
-> overrides, and caches, without rebuilding, for example after a schema
+> and caches, without rebuilding, for example after a schema
 > change or a tool update. `--force` keeps the LLM analysis: it comes
 > from the cache. Use `--force-llm` to make the analysis again. That
 > takes much longer than an index run.
@@ -84,7 +84,7 @@ fw-context index --vendor-paths sdk third_party --project-paths src lib
 | `--analyze-vendor` | `[llm] analyze_vendor` (`false`) | Also analyze the vendor and SDK code |
 | `--no-analyze-vendor` | off | Skip the analysis of the vendor and SDK code. Wins over `--analyze-vendor` and the config. |
 | `--background` | off | The mode of the file-watcher daemon. The run does not rebuild a stale `compile_commands.json`, does not repair it, and prunes no registry rows. It builds only when the backend can build on its own. |
-| `--force` | off | Force re-index of all files, embeddings, overrides, PageRank, and hotspot cache (skips the hash checks). The LLM analysis comes from the cache. |
+| `--force` | off | Force re-index of all files, embeddings, PageRank, and hotspot cache (skips the hash checks). The LLM analysis comes from the cache. |
 | `--llm <profile>` | the profile of the project | The LLM profile of the analysis of this run. Without it, the command asks at its start on a terminal when two profiles or more can run. See [The LLM profile of one run](#the-llm-profile-of-one-run). |
 | `--force-llm` | off | Make the LLM analysis of each symbol again. The analyses of the caches from before the command do not apply, and the new ones replace the entries of the local cache, and of the cache server when the token has `can_overwrite`. It turns on the analysis. With `--no-analyze`, the command stops with an error. A command that stops, or that does not reach each symbol (Ollama did not answer), leaves the old analyses of the symbols that it did not reach. The next `--force-llm` with the same chat model continues from the time of the first command: the file `force_llm.json` of the index keeps it until a command reaches each symbol. Needs Ollama 0.30.1 or later. |
 | `--variant NAME` | all variants | Restrict indexing to one build variant (name from `[[build.variants]]`) |
@@ -2998,9 +2998,12 @@ use `get_class_members` or `lookup_symbol`. A related `file` can be
 changed after the last index run, the dict adds `stale: true` and a
 `stale_warning`. On failure, the dict holds `error`.
 
-Uses the `overrides` table, which fw-context builds during indexing. A
-parameter-type comparison filters out accidental name collisions, such as
-overloads that are not overrides. For a non-virtual method, or a method
+Uses the `overrides` table. The compiler records each override when
+fw-context parses a translation unit, thus an override that writes a type
+through an alias, and an override of a method of a class template
+instance, are in it. An overload that is not an override is not. A method
+of a class template whose base depends on a template parameter has no
+row. For a non-virtual method, or a method
 whose class has no ancestors, both `overrides` and `overridden_by` are
 empty lists.
 
@@ -3561,7 +3564,7 @@ absent otherwise, never `null`:
 - `warning` — a header went through one translation unit.
 - `analysis_updated` and `embeddings_updated` — counts for the whole
   build, not only for this file.
-- `analysis_warning`, `overrides_warning`, `pagerank_warning`,
+- `analysis_warning`, `slot_edges_warning`, `pagerank_warning`,
   `embedding_warning` — a phase failed. `analysis_warning` also tells an
   LLM analysis that is not complete: a symbol that the model did not
   answer for, or an API model whose context is not known (see
@@ -3575,9 +3578,10 @@ file, `builds_without_file` names the builds that do not hold it. On
 failure, the dict holds `error`, and can also hold `skipped_tus` or
 `action`.
 
-When reference indexing is on (`[index] index_refs`), the tool rebuilds
-the method override relationships, the PageRank scores and the hotspot
-cache of each build that it re-parses. It does this with and without
+When reference indexing is on (`[index] index_refs`), the tool resolves
+the indirect calls again, and rebuilds the PageRank scores and the hotspot
+cache of each build that it re-parses. The re-parse writes the method
+override relationships of the file. It does this with and without
 `with_analysis`. When `with_analysis=True` (the default) and the LLM is on
 (`[llm] enabled`), it also regenerates the LLM symbol analysis and the
 embeddings of the symbols that the re-parse inserted, also the symbols of

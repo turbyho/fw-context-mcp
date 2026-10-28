@@ -48,7 +48,7 @@ def project(request, tmp_path, monkeypatch) -> Path:
     cc.write_text(json.dumps([{"directory": str(root), "file": "main.c", "arguments": ["cc", "-c", "main.c"]}]),
                   encoding="utf-8")
     run(compile_commands=cc, db_path=index_dir / PID / "index.db", project_root=root, project_id=PID,
-        index_refs=False, index_embeddings=False, analyze_symbols=False, analyze_overrides=False)
+        index_refs=False, index_embeddings=False, analyze_symbols=False)
     return root
 
 

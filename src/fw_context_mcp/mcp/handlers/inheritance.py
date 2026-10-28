@@ -583,9 +583,10 @@ def get_method_overrides(
     dispatch across translation units.
 
     Shows what base-class method this method overrides, and what derived-class
-    methods override this one.  Built from the ``overrides`` table which is
-    populated during ``fw-context index`` via post-processing of the inheritance
-    graph and virtual method signatures.
+    methods override this one.  Built from the ``overrides`` table: the
+    compiler records each override when ``fw-context index`` parses a
+    translation unit, thus an alias of a parameter type and a base that is
+    an instance of a class template do not hide one.
 
     For class-level inheritance, use ``get_inheritance_chain``.  For symbol
     details, use ``get_symbol_context``.
