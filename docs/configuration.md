@@ -80,7 +80,7 @@ fw-context stops with an error when one of the three files has one of these prob
   - each key of `[build]` except `timeout` and `clean`, and each key of a `[[build.variants]]` table
   - `[llm]` `profile`, `embed_profile`, `embed_model`, `embed_dim`, `embed_query_prompt`, `embed_doc_prompt` and `debug_log`
   - `provider`, `model`, `url`, `api_key_env` and `embed_context` of an LLM profile (`[llm.profiles.<name>]`)
-  - `[cache_server] url` and `[call_graph] dispatch_bridges`
+  - `[cache_server] url`
 - A `[[build.variants]]` table has no `name`.
 - A URL is not valid, for example `url = "http://[::1"` in an LLM profile.
 - A problem of the LLM profiles:
@@ -94,7 +94,7 @@ fw-context stops with an error when one of the three files has one of these prob
 
 The error names the file and the key, but not the value, because a value can be a secret. `fw-context status` gives exit code 1, and the MCP status tools give the status `config_error`. fw-context does not use the default value in place of these values: a default gives answers about other data, or sends the source code to a different place.
 
-A value of the wrong type in a different key gives a warning: for example a timeout, a limit or a switch (`timeout = "x"`, `enabled = "flase"`). In an LLM profile, these keys are `timeout`, `stream`, `num_ctx`, `keep_alive`, `auto_pull`, `max_concurrent` and `context`. A section `[updates]` that is not a table gives a warning too. fw-context then uses the value of a lower file, or the default of the key, and the tools work. Each command writes the warning to the log one time (a CLI command to stderr), `fw-context doctor` shows it, and the MCP status tools give it in the list `config_warnings`.
+A value of the wrong type in a different key gives a warning: for example a timeout, a limit or a switch (`timeout = "x"`, `enabled = "flase"`). In an LLM profile, these keys are `timeout`, `stream`, `num_ctx`, `keep_alive`, `auto_pull`, `max_concurrent` and `context`. A section `[updates]` that is not a table gives a warning too. fw-context then uses the value of a lower file, or the default of the key, and the tools work. A `[[call_graph.sdk]]` table that is not a rule, and the removed key `[call_graph] dispatch_bridges`, give a warning too: fw-context leaves them out (see [`[call_graph]`](#call_graph--the-sdk-model)). Each command writes the warning to the log one time (a CLI command to stderr), `fw-context doctor` shows it, and the MCP status tools give it in the list `config_warnings`.
 
 An older form of a value still works: a string that holds a number (`num_ctx = "4096"`), and `"yes"`, `"no"`, `"on"`, `"off"`, `"1"` and `"0"` for a switch. A key of a `[[build.variants]]` table goes to the build as it is, thus it must have the TOML type.
 
@@ -559,17 +559,61 @@ To use one of these profiles in a project, set `[llm] profile = "<name>"` in `.f
 | `name` | *(directory name)* | project | A readable project name. fw-context shows this name in `fw-context list` and in status output. |
 | `id` | *(none)* | project | The unique ID of the project (32 hexadecimal characters). `fw-context init` writes it to `config.toml`, thus git shares it with the team. Without an ID, the project is not initialized, and the index of the project is lost. |
 
-### `[call_graph]` — Dispatch bridges
+### `[call_graph]` — The SDK model
 
-| Key | Default | Scope | Description |
-|-----|---------|-------|-------------|
-| `dispatch_bridges` | *(built-in list)* | project | A table that maps a registration API to its dispatch entry point, for example `events::EventQueue::call_every` to `events::EventQueue::dispatch_forever`. For each call of the API, the call graph gets an edge from the entry point to the callback that the call gives. The built-in list covers Mbed OS, Zephyr, FreeRTOS, ESP-IDF and the STM32 HAL. An entry can only change the entry point of an API of the built-in list: the indexer records the calls of these APIs only, thus a key that is not in the list gives no edge. fw-context reads this key only from `.fw-context/config.toml` of the project. |
+Some SDKs start a registered function from data that no C code reads. A
+FreeRTOS task starts from a stack frame that the port writes as integers,
+and a library of the ESP32 Arduino core has no source. Such a function has
+no caller in the code. The SDK model gives the missing step. The built-in
+rules cover FreeRTOS, ESP-IDF, lwIP, Zephyr threads and CMSIS
+(`NVIC_SetVector`, the RTX `osThreadNew`). Each `[[call_graph.sdk]]` table
+adds a rule. fw-context reads the rules only from `.fw-context/config.toml`
+of the project, at each index run and at each `reindex_file`. A rule in
+`local.toml` or in the global config gives a warning, and fw-context does
+not use it: move it to `config.toml`.
+
+A rule has one of two shapes:
+
+- A call: `function` runs the function in its parameter `param` (counted
+  from 0), or in the field `field` (`"record::field"`). The call graph gets
+  an edge from `function` to each function that the code puts there
+  (origin `"sdk"`). The rule applies only when the build has no body of
+  `function`, because a body that calls the slot in C gives the edge from
+  the real caller. Set `outside_c = true` when the start is out of C
+  (assembly, hardware): the rule then applies also with a body.
+- A flow: code out of the AST gives the value of the slot `from` to the
+  slot `to`, and C code calls through `to`. Zephyr writes the entry of a
+  thread into a stack frame in `arch_new_thread`, and `z_thread_entry`
+  calls it. Each slot is `{ function = "f", param = 0 }` or
+  `{ field = "record::f" }`. The edge comes from the C code that calls
+  through `to` (origin `"slot"`).
+
+| Key | Description |
+|-----|-------------|
+| `sdk` | The name of the SDK, a text that is not empty. |
+| `entry` | What starts the function, for example `"the my-rtos scheduler"`. The tools show it with the edge. |
+| `function`, `param` or `field`, `outside_c` | A call rule. `outside_c` is optional (default `false`). |
+| `from`, `to` | A flow rule. |
 
 ```toml
-[call_graph.dispatch_bridges]
-# The callbacks of call_every run in the thread of my_app::event_loop.
-"events::EventQueue::call_every" = "my_app::event_loop"
+[[call_graph.sdk]]
+sdk = "my-rtos"
+entry = "the my-rtos scheduler"
+function = "task_create"
+param = 0
+outside_c = true
+
+[[call_graph.sdk]]
+sdk = "my-rtos"
+entry = "the my-rtos scheduler"
+from = { function = "port_new_task", param = 1 }
+to = { function = "task_trampoline", param = 0 }
 ```
+
+A table that is not a rule gives a warning, and the other rules apply.
+`fw-context doctor --fix --only config` removes it. The old key
+`[call_graph] dispatch_bridges` is removed: it gives a warning, and the
+indexer does not read it.
 
 ### `[cache_server]` — Shared LLM Analysis Cache
 

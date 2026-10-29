@@ -1098,10 +1098,8 @@ def run(
 
     # An earlier run of this build that stored rows and stopped: its units
     # read as unchanged now (the checkpoint below), and the post-processing
-    # must still run for them.  The units whose dispatch edges it lost are
-    # parsed again — see _run_marker.
+    # must still run for them — see _run_marker.
     pending_run = _run_marker.is_pending(db_path.parent, config_hash)
-    marker_units = set(_run_marker.units_to_parse(db_path.parent, config_hash))
 
     # Every unit is decided before the first parse: hashes only, no write.
     # A file whose listing changed is parsed in each of its listings, and
@@ -1118,7 +1116,7 @@ def run(
         clear_embedding_stash(conn)
     decisions = decide_units(
         units, project_root, existing_files, manifest_lookup,
-        header_stale_tus | marker_units,
+        header_stale_tus,
         force=force, hash_cache=header_hash_cache, header_table=manifest_header_table,
         transient_defines=transient_defines, claims_recorded=ownership.recorded,
     )
@@ -1153,15 +1151,14 @@ def run(
         log.info("%d file(s) had rows and no owner; their first includer claims them", len(unowned))
 
     # This run writes the marker before its first row, and removes it after
-    # its own post-processing.  The units of an earlier marker stay in it
-    # until this run parses them.
+    # its own post-processing.
     #
     # A listing that left the build can set a later listing to parsed in the
     # loop (_settle_left), thus its presence writes the marker too.  The
     # other hand-overs happen after a parse, and the marker is there then.
     marker_written = pending_run or bool(left_at) or any(not decision.unchanged for decision in decisions)
     if marker_written:
-        _run_marker.mark_pending(db_path.parent, config_hash, marker_units)
+        _run_marker.mark_pending(db_path.parent, config_hash)
     last_checkpoint = time.monotonic()
 
     log.info("", extra={"phase": f"Parsing ({len(units)} TUs)"})
@@ -1274,12 +1271,6 @@ def run(
                 # Only a re-parsed TU may refresh its manifest entry — its
                 # symbols now match the headers it just read.
                 reparsed_tus[tu_key] = hashes[0]
-                # Its dispatch edges wait in a TEMP table for the post-
-                # processing, and a stop loses them: the marker names it.
-                unit_path = _normalize_file_path(str(unit.file.resolve()), project_root)
-                marker_units.discard(unit_path)
-                if index_refs and getattr(parsed_data, "pending_dispatches", None):
-                    marker_units.add(unit_path)
                 # An empty list too: a TU with no recorded header still gets
                 # its entry, with its source hash.  Without one, the entry of
                 # the preliminary manifest stayed, with an empty source hash,
@@ -1314,7 +1305,6 @@ def run(
             # A manual operation that took the index wrote its own manifest;
             # a checkpoint after it would overwrite that.  Give up first.
             raise_if_superseded(db_path.parent)
-            _run_marker.mark_pending(db_path.parent, config_hash, marker_units)
             _checkpoint_manifest(
                 manifest=manifest, units=units, project_root=project_root,
                 db_dir=db_path.parent, compile_commands=compile_commands, updated=updated,
@@ -1391,12 +1381,6 @@ def run(
     uncovered_paths = set(asm.paths) if asm is not None else set()
     if linker is not None:
         uncovered_paths |= linker.paths
-    # The manifest step writes the full manifest before the dispatch step
-    # resolves the edges, and the macros step between them runs for minutes:
-    # the marker names each unit whose edges wait, not only the ones of the
-    # last checkpoint.
-    if marker_written:
-        _run_marker.mark_pending(db_path.parent, config_hash, marker_units)
     _run_postprocess(
         asm_paths=uncovered_paths,
         conn=conn,

@@ -870,14 +870,14 @@ CREATE TABLE IF NOT EXISTS refs (
     -- two rows, and so do two IRQs that one line gives the same handler.
     slot_index   INTEGER,
     -- The column of the site, counted from 1 as libclang counts it, or 0
-    -- when the producer has no column (the assembly reader, the scan of
-    -- the source text, a dispatch bridge).  It separates two calls on one
-    -- line.  In a macro expansion it is the column of the expansion.
+    -- when the producer has no column (the assembly reader).  It separates
+    -- two calls on one line.  In a macro expansion it is the column of the
+    -- expansion.
     from_col     INTEGER NOT NULL DEFAULT 0,
     -- The analyses that found the site: a set of models.RefOrigin bits
-    -- (1 the AST walk, 2 a name in the tokens or the text, 4 the assembly
-    -- reader, 8 a dispatch bridge, 16 the body of a template instance).  0
-    -- only in a row of an older version.
+    -- (1 the AST walk, 4 the assembly reader, 8 a rule of the SDK model,
+    -- 16 the body of a template instance, 32 the slot resolution, 64 the
+    -- type only).  0 only in a row of an older version.
     origins      INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_refs_to_usr   ON refs(config_hash, to_usr);
@@ -1019,6 +1019,25 @@ CREATE TABLE IF NOT EXISTS slot_escaped (
     slot         TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_slot_escaped_slot ON slot_escaped(config_hash, slot);
+-- sdk_links: the rules of the SDK model (indexer/_sdk_model.py) that apply
+-- to the build.  kind 'flow': code out of the AST gives the value of slot
+-- to the slot target.  kind 'call': the function target runs the function
+-- in slot, and the edge stands at file, line, col (its declaration).  entry
+-- is the concept that starts the function (the scheduler, an interrupt).
+-- The step slot_edges replaces the rows of the build at each run.
+CREATE TABLE IF NOT EXISTS sdk_links (
+    config_hash  TEXT    NOT NULL,
+    kind         TEXT    NOT NULL,
+    slot         TEXT    NOT NULL,
+    target       TEXT    NOT NULL,
+    entry        TEXT    NOT NULL,
+    sdk          TEXT    NOT NULL,
+    file         TEXT    NOT NULL DEFAULT '',
+    line         INTEGER NOT NULL DEFAULT 0,
+    col          INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_sdk_links_slot   ON sdk_links(config_hash, slot);
+CREATE INDEX IF NOT EXISTS idx_sdk_links_target ON sdk_links(config_hash, target);
 
 -- ── embeddings: semantic search vectors ─────────────────────────────────
 -- Stored as BLOB of float32 values packed with struct.pack('f', ...).

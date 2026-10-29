@@ -18,6 +18,11 @@ code that makes the call, at the place of the call:
   function whose address the build takes and whose type is the type of the
   call is a target too.  That is the case for a site with no slot, and for
   a slot that code out of view can write (an escape flows into it).
+* origin ``SDK``: a rule of the SDK model (``_sdk_model``, table
+  ``sdk_links``) says that a function of an SDK runs the function in a
+  slot, and no C code of the build does.  The edge goes from that function,
+  at its declaration.  A "flow" rule of the model is a flow of the graph:
+  the edge that it gives comes from a site, with origin ``SLOT``.
 
 A slot that no source reaches and that does not escape gets no target: no
 code of the build puts a function into it.  WHY not the functions of its
@@ -57,7 +62,7 @@ from .models import RefOrigin
 
 log = logging.getLogger(__name__)
 
-_ORIGINS = int(RefOrigin.SLOT | RefOrigin.TYPE_ONLY)
+_ORIGINS = int(RefOrigin.SLOT | RefOrigin.TYPE_ONLY | RefOrigin.SDK)
 # A site: its place (file, line, column), its ordinal at the place, and the
 # unit of a fact of a template instance ('' for the written code).  WHY the
 # unit: two units give the sites of an instance at one place, each with its
@@ -73,6 +78,17 @@ class _Site:
     slot: str
     slot_type: str
     callee: str
+
+
+@dataclass(frozen=True)
+class _SdkCall:
+    """A "call" link of the SDK model: *caller* runs the function in *slot*."""
+
+    slot: str
+    caller: str
+    file: str
+    line: int
+    col: int
 
 
 @dataclass
@@ -161,8 +177,14 @@ def _add_override_flows(conn: sqlite3.Connection, config_hash: str, slots: _Slot
         slots.add_flow(f"R|{derived}", f"R|{base}")
 
 
-def _load(conn: sqlite3.Connection, config_hash: str) -> tuple[_Slots, dict[str, set[str]], list[_Site], dict]:
-    """Read the slot facts of the build: the graph, the functions of each type, the sites, the arguments."""
+def _load(
+    conn: sqlite3.Connection, config_hash: str,
+) -> tuple[_Slots, dict[str, set[str]], list[_Site], dict, list[_SdkCall]]:
+    """Read the slot facts of the build: the graph, the functions of each type, the sites, the arguments.
+
+    The links of the SDK model come with them: a "flow" link is a flow of
+    the graph, and a "call" link is a call of a slot with no site.
+    """
     slots = _Slots()
     by_type: dict[str, set[str]] = defaultdict(set)
     for row in conn.execute(
@@ -175,6 +197,16 @@ def _load(conn: sqlite3.Connection, config_hash: str) -> tuple[_Slots, dict[str,
     for row in conn.execute("SELECT source, target FROM slot_flows WHERE config_hash = ?", (config_hash,)):
         slots.add_flow(row["source"], row["target"])
     _add_override_flows(conn, config_hash, slots)
+    calls: list[_SdkCall] = []
+    for row in conn.execute(
+        "SELECT kind, slot, target, file, line, col FROM sdk_links WHERE config_hash = ?"
+        " ORDER BY kind, slot, target",
+        (config_hash,),
+    ):
+        if row["kind"] == "flow":
+            slots.add_flow(row["slot"], row["target"])
+        else:
+            calls.append(_SdkCall(row["slot"], row["target"], row["file"], row["line"], row["col"]))
     # An escape "defined out of the unit" holds only when no unit of the
     # build defines the variable or the function of the slot.
     defined = {
@@ -205,7 +237,7 @@ def _load(conn: sqlite3.Connection, config_hash: str) -> tuple[_Slots, dict[str,
     ):
         key = (row["file"], row["line"], row["col"], row["ordinal"], row["unit"])
         arguments[key].append((row["arg_index"], row["value_kind"], row["value"]))
-    return slots, by_type, sites, arguments
+    return slots, by_type, sites, arguments, calls
 
 
 def _slot_targets(site: _Site, slots: _Slots) -> set[str]:
@@ -264,13 +296,54 @@ def _pass_arguments(
             return
 
 
+def _reach(start: str, slots: _Slots) -> set[str]:
+    """The slots that *start* flows into, directly or through other slots (not *start* itself)."""
+    reached: set[str] = set()
+    pending = [start]
+    while pending:
+        for successor in slots.flows.get(pending.pop(), ()):
+            if successor not in reached:
+                reached.add(successor)
+                pending.append(successor)
+    reached.discard(start)
+    return reached
+
+
+def _sdk_edges(config_hash: str, calls: list[_SdkCall], slots: _Slots) -> list[tuple]:
+    """The ``SDK`` edges of the "call" links: from the caller of the link to each target of its slot.
+
+    A link whose slot flows into the slot of an inner link gives no edge.
+    WHY: a flow gives each target on, thus the inner link has the targets
+    too, and its function is the one that runs them.  ESP-IDF declares
+    `xTaskCreate` as an inline wrapper of `xTaskCreatePinnedToCore`: the
+    wrapper gives no second caller.  A link is inner only when its slot
+    does not flow back: a slot that flows back to itself (`reg(f)` stores
+    `f`, and `reg(saved)` registers it again), and two links whose slots
+    flow into each other, give their edges, because no one of them runs
+    the targets in place of the other.  An outer link whose slot flows into
+    two inner links gives an edge from each of them: each is a path.
+    """
+    linked = {call.slot for call in calls}
+    reach = {slot: _reach(slot, slots) for slot in linked}
+    rows: list[tuple] = []
+    for call in calls:
+        if any(call.slot not in reach[other] for other in reach[call.slot] & linked):
+            continue
+        for target in sorted(slots.targets.get(call.slot, ())):
+            rows.append((
+                config_hash, target, call.file, call.line, call.caller, "call", None, call.col, int(RefOrigin.SDK),
+            ))
+    return rows
+
+
 def resolve_slot_edges(conn: sqlite3.Connection, config_hash: str) -> dict[str, int]:
     """Replace the call edges of the slot resolution of the build *config_hash*.
 
     The edges of the last run go first, because a fact of any unit can
     change the targets of any site.  A row that an other analysis also
-    found keeps its row and loses the two bits only.  Gives the counts of
-    the sites and the edges, for the log.
+    found keeps its row and loses the bits of this resolution only.  Gives
+    the counts of the sites and the edges, for the log: ``edges`` counts
+    the edges of the sites, ``sdk`` the edges of the SDK model.
     """
     from .db import insert_refs_batch
 
@@ -282,7 +355,7 @@ def resolve_slot_edges(conn: sqlite3.Connection, config_hash: str) -> dict[str, 
         "UPDATE refs SET origins = origins & ? WHERE config_hash = ? AND origins & ?",
         (~_ORIGINS, config_hash, _ORIGINS),
     )
-    slots, by_type, sites, arguments = _load(conn, config_hash)
+    slots, by_type, sites, arguments, calls = _load(conn, config_hash)
     _pass_arguments(sites, slots, arguments, by_type)
 
     # The counts of the log see one copy of each site, as the readers do
@@ -316,9 +389,11 @@ def resolve_slot_edges(conn: sqlite3.Connection, config_hash: str) -> dict[str, 
             counts["type_only"] += 1
         else:
             counts["unresolved"] += 1
-    if rows:
-        insert_refs_batch(conn, rows)
     counts["edges"] = len(set(rows))
+    sdk_rows = _sdk_edges(config_hash, calls, slots)
+    counts["sdk"] = len(set(sdk_rows))
+    if rows or sdk_rows:
+        insert_refs_batch(conn, rows + sdk_rows)
     _store_targets(conn, config_hash, slots)
     return counts
 

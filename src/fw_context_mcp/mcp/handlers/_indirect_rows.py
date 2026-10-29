@@ -19,6 +19,20 @@ from ...utils import abs_path
 SITE_TARGETS_SHOWN = 10
 
 
+def entry_field(conn: sqlite3.Connection, config_hash: str, edge: sqlite3.Row) -> dict:
+    """``{"entry": ...}`` for a caller row of an edge that a rule of the SDK model gives, else ``{}``.
+
+    *edge* is a row of ``refs`` with ``origins``, ``from_usr``,
+    ``from_file``, ``from_line``, ``from_col`` and ``to_usr``.  WHY no key
+    for the other edges: the field tells what starts the target (the
+    scheduler, an interrupt), and a plain call has no such thing.
+    """
+    entry = indirect_db.sdk_entry(conn, config_hash, (
+        edge["origins"], edge["from_usr"], edge["from_file"], edge["from_line"], edge["from_col"], edge["to_usr"],
+    ))
+    return {"entry": entry} if entry else {}
+
+
 def site_row(conn: sqlite3.Connection, config_hash: str, root: Path, site: sqlite3.Row) -> dict:
     """One indirect call site: its place, its caller, its slot and the functions it reaches.
 

@@ -2163,7 +2163,7 @@ a maximum:
 
 | List | Maximum | Tool that pages it |
 |------|---------|--------------------|
-| `callers` | 50 `call` and `indirect` references, each with its line, column and `origins` | `find_callers` |
+| `callers` | 50 `call` and `indirect` references, each with its line, column, `origins` and `entry` (as in `find_callers`) | `find_callers` |
 | `callees` | 100 rows, one for each callee and kind of reference | `find_callees_recursive` with `max_depth=1` |
 | `indirect_call_sites` | 200 rows of `find_indirect_call_sites` | `find_indirect_call_sites` |
 | `indirect_targets` | 50 rows of `find_indirect_targets`, for a field or a variable | `find_indirect_targets` |
@@ -2292,8 +2292,8 @@ Each row is one reference site of one caller. `line` and `col` are the
 place of the site, thus two calls on one line are two rows. For an
 indirect reference, the place is the name of the function (`f` in
 `reg(f)`, `tick` in `&WDT::tick`), not the start of the call. `col` is 0
-when the index has no column for the site (an assembly vector table, a
-dispatch bridge). In a macro expansion, the
+when the index has no column for the site (an assembly vector table). In
+a macro expansion, the
 place is the place of the expansion.
 
 `origins` lists the analyses that found the site:
@@ -2301,7 +2301,18 @@ place is the place of the expansion.
 - `"direct"` — the AST of the compiler names the target.
 - `"asm"` — the assembly reader (a vector table slot, an alias, a call
   or jump instruction, control that falls into another routine).
-- `"dispatch"` — a dispatch bridge, such as `EventQueue::call_every`.
+- `"sdk"` — a rule of the SDK model: a function of an SDK runs the
+  function that a registration puts into its slot, and no C code of the
+  build does. A FreeRTOS task starts from a stack frame that the port
+  writes, and a library of the ESP32 Arduino core has no source. The row
+  is a `"call"` from the registration function (`xTaskCreate`) at its
+  declaration. The row also has `entry`: what starts the function, for
+  example `"the FreeRTOS scheduler (vTaskStartScheduler)"`. A `"slot"`
+  row has `entry` too when the target came to the site through the slot
+  of a rule (a Zephyr thread, which `z_thread_entry` calls). A plain C
+  call of `z_thread_entry` gives no `entry`. The built-in rules
+  cover FreeRTOS, ESP-IDF, lwIP, Zephyr threads and CMSIS;
+  `[[call_graph.sdk]]` adds rules (see the configuration).
 - `"instantiation"` — the body of a template instance. A call in a
   template body that names a dependent type (`device.sample()` with
   `T& device`) has a target only in an instance. The edge is stored on the
@@ -2433,14 +2444,14 @@ Output: [{"kind": "macro", "name": "CONFIG_BUFFER_SIZE", "file": "…", "line": 
 arguments, assignments, initializers, or init lists),
 `"implicit_construct"` (the constructor that the compiler selects for an
 object at namespace or class scope; a local object, a new-expression and a
-member initializer give a `"call"`), `"dispatch"` (a synthetic
-edge from a dispatch bridge, such as `EventQueue::call_every`), `"macro_use"` (macro usage
+member initializer give a `"call"`), `"macro_use"` (macro usage
 in file), `"vector"` (a slot of an assembly vector table names the
 symbol; `file` and `line` are the table entry), `"vector_data"` (a slot
 holds an address computed from the symbol, such as the initial stack
 pointer), `"runtime_vector"` (a `NVIC_SetVector` call installs the symbol
 into a slot at run time), `"alias"` (`.thumb_set`: another assembly name
-for the symbol).
+for the symbol). A row of an edge of the SDK model also has `entry`, as
+in `find_callers`.
 
 #### `find_call_path`
 
@@ -2716,7 +2727,9 @@ For a function, each row has `relation`:
   the function; `slot`: the slot that receives it (`""` when none is
   known); `context`: the code that stores it.
 - `"called"` — `file`, `line`, `col`, `caller`, `caller_kind`, `origin`:
-  an indirect call that reaches the function.
+  an indirect call that reaches the function. The origin `"sdk"` is a
+  function of an SDK that runs it (see `find_callers`), and `entry` then
+  tells what starts it.
 
 For the calls through a pointer, use `find_indirect_call_sites`.
 

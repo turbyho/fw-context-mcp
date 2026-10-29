@@ -8,17 +8,22 @@ from fw_context_mcp.indexer import _run_marker
 from fw_context_mcp.utils import _owner_tag, owner_token, remove_stale_tmp
 
 
-def test_no_marker_means_nothing_to_parse(tmp_path: Path):
+def test_no_marker_means_no_pending_run(tmp_path: Path):
     assert not _run_marker.is_pending(tmp_path, "cafe")
-    assert _run_marker.units_to_parse(tmp_path, "cafe") == frozenset()
 
 
-def test_the_marker_holds_the_units_to_parse(tmp_path: Path):
-    _run_marker.mark_pending(tmp_path, "cafe", {"src/b.cpp", "src/a.cpp"})
+def test_the_marker_tells_a_pending_run_of_its_build(tmp_path: Path):
+    _run_marker.mark_pending(tmp_path, "cafe")
 
     assert _run_marker.is_pending(tmp_path, "cafe")
-    assert _run_marker.units_to_parse(tmp_path, "cafe") == frozenset({"src/a.cpp", "src/b.cpp"})
     assert not _run_marker.is_pending(tmp_path, "beef"), "each build has its own marker"
+
+
+def test_a_marker_of_an_older_version_still_counts(tmp_path: Path):
+    """An older marker holds a list of units; only the file counts now."""
+    _run_marker.marker_path(tmp_path, "cafe").write_text('{"parse": ["src/a.cpp"]}', encoding="utf-8")
+
+    assert _run_marker.is_pending(tmp_path, "cafe")
 
 
 def test_clear_removes_the_marker(tmp_path: Path):

@@ -29,10 +29,11 @@ __all__ = [
 SLOT_TABLES: tuple[str, ...] = (
     "slot_sources", "slot_flows", "slot_sites", "slot_arguments", "slot_escapes",
 )
-# The result of the resolution of the build: no row belongs to a file, thus
+# The result of the resolution of the build, and the rules of the SDK model
+# that apply to it: no row belongs to a file, thus
 # the resolution replaces them at each run and a purge of the build deletes
 # them.
-RESOLUTION_TABLES: tuple[str, ...] = ("slot_targets", "slot_escaped")
+RESOLUTION_TABLES: tuple[str, ...] = ("slot_targets", "slot_escaped", "sdk_links")
 
 
 def slot_unit_key(listing: tuple[str, str]) -> str:

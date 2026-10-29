@@ -539,8 +539,10 @@ def _delete_rows_owned_by(
 
     "Owned" means the row's own file is one of *files*: its symbols, macros,
     inheritance edges, the overrides of its methods, embeddings, LLM
-    analysis, vectors, and the references and slot facts that ORIGINATE in
-    it.  The parse of a unit writes the overrides again
+    analysis, vectors, the references and slot facts that ORIGINATE in it,
+    and the links of the SDK model that stand at a declaration in it (the
+    step ``slot_edges`` writes the links of the build again, as the parse
+    writes the references).  The parse of a unit writes the overrides again
     (``indexer/_overrides.py``); a file that left the build loses them.
 
     Deliberately NOT touched, because the two callers need different things:
@@ -603,6 +605,9 @@ def _delete_rows_owned_by(
     paths = [path for _, path in files if path]
     delete_refs_for_files(conn, config_hash, paths, keep_instance_edges=keep_instance_edges)
     delete_slot_facts_for_files(conn, config_hash, paths, every_unit=not keep_instance_edges)
+    conn.executemany(
+        "DELETE FROM sdk_links WHERE config_hash = ? AND file = ?", [(config_hash, path) for path in paths],
+    )
     return purged_usrs
 
 

@@ -8,7 +8,7 @@ after the full symbol table is available:
 **Why post-processing is separate from parsing**
 
 1. **Global knowledge required.**  The inheritance graph, the call graph
-   and the dispatch edges need the complete symbol table —
+   and the edges of the indirect calls need the complete symbol table —
    they cannot work on a single TU at a time.
 
 2. **Dependency ordering.**  Steps have strict dependencies:
@@ -37,8 +37,9 @@ after the full symbol table is available:
    reindex tracking
 6. **Macro expansion** — resolve ``#define`` values via libclang
    preprocessing
-7. **Dispatch edges** — create synthetic call-graph edges from
-   event-loop registrations (``call_every``, ``k_work_submit``, etc.)
+7. **Slot edges** — give each indirect call its targets, with the rules
+   of the SDK model (a task that the scheduler starts, a callback of a
+   library without source)
 8. **Embeddings** — compute vector embeddings for semantic search
 9. **LLM analysis** — generate natural-language symbol explanations
 10. **PageRank + hotspot cache** — compute call-graph centrality
@@ -58,7 +59,6 @@ import logging
 import os
 import sqlite3
 import time
-import tomllib
 from collections.abc import Callable, Collection, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
@@ -67,7 +67,6 @@ from pathlib import Path
 from ..mcp.shared.pid_file import PidFile
 from ..utils import SAFE_EXCEPT, is_fatal
 from . import _force_llm_marker as force_llm_marker
-from ._dispatch_bridges import _DISPATCH_ENTRY_POINTS
 from ._embedding import _build_embeddings
 from ._llm_analysis import ContextChoice, _build_llm_analysis
 from ._manifest_updater import _backfill_header_source_hashes, _update_manifest_after_index
@@ -564,156 +563,32 @@ def _step_purge_files_outside_build(conn: sqlite3.Connection, ctx: dict) -> None
     )
 
 
-def _resolve_matching_usr(
-    conn: sqlite3.Connection, config_hash: str, name: str
-) -> str | None:
-    """Look up a symbol's USR by name, preferring definitions.
-
-    Used by dispatch-edge resolution when the pending-dispatch table
-    stores a symbol by qualified name rather than USR (the USR may not
-    have been known at registration time because it was from a different
-    TU).  Three-tier matching handles the common name-ambiguity cases:
-
-    1. Exact ``name`` match (e.g. ``"main"``)
-    2. Exact ``qualified_name`` match (e.g. ``"app::main"``)
-    3. Suffix LIKE match on qualified name (e.g. ``"%::EventHandler::process"``)
-
-    When multiple USRs exist for the same name, tie-breaking uses three
-    criteria in descending priority:
-
-    1. **is_definition** — the definition is the "real" symbol; a
-       declaration-only entry may exist from a forward-declaration header.
-    2. **ref_count** — incoming references indicate the symbol is actively
-       used, so it is more likely to be the intended target.
-    3. **out_count** — outgoing references indicate the symbol has a body
-       (there are calls inside it), so it is not a stub or declaration.
-    """
-    esc_name = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    suffix_pattern = f"%::{esc_name}"
-    row = conn.execute(
-        """SELECT s.usr,
-                  COUNT(r_in.rowid) AS ref_count,
-                  COUNT(r_out.rowid) AS out_count
-           FROM symbols s
-           LEFT JOIN refs r_in ON r_in.to_usr = s.usr AND r_in.config_hash = s.config_hash
-           LEFT JOIN refs r_out ON r_out.from_usr = s.usr AND r_out.config_hash = s.config_hash
-           WHERE s.config_hash = ?
-             AND (s.name = ? OR s.qualified_name = ? OR s.qualified_name LIKE ? ESCAPE '\\')
-           GROUP BY s.usr
-           ORDER BY s.is_definition DESC, ref_count DESC, out_count DESC
-           LIMIT 1""",
-        (config_hash, name, name, suffix_pattern),
-    ).fetchone()
-    return row["usr"] if row else None
-
-
-def _step_resolve_dispatches(conn: sqlite3.Connection, ctx: dict) -> None:
-    """Resolve pending dispatch edges into ref_kind='dispatch' references.
-
-    Reads the `_pending_dispatch` temp table populated during indexing,
-    resolves the dispatch entry point and callback target USRs, and
-    inserts synthetic dispatch edges into the refs table.
-
-    **How dispatch bridging works:**  When the indexer encounters a
-    registration call like ``event_queue.call_every(1000, &MyClass::tick)``,
-    it records the callee qualified name (``EventQueue::call_every``) and
-    the callback target in ``_pending_dispatch``.  This step matches
-    ``call_every`` to a known *dispatch entry point*
-    (``EventQueue::dispatch_forever``) and creates an edge from the
-    entry point to ``MyClass::tick``.  The entry point acts as a bridge
-    node — subsequent call-graph tools can walk from ``main`` through
-    ``dispatch_forever`` to all registered callbacks.
-
-    User-defined dispatch bridges (in ``config.toml``) override or extend
-    the built-in map.  This allows support for custom RTOS dispatch
-    primitives without modifying the source code.
-    """
-    config_hash = ctx["config_hash"]
-    try:
-        rows = conn.execute(
-            "SELECT * FROM _pending_dispatch WHERE config_hash = ?",
-            (config_hash,),
-        ).fetchall()
-    except sqlite3.OperationalError:
-        return
-    if not rows:
-        return
-
-    # ── Merge user-defined dispatch bridges from project TOML config ──
-    _dispatch_map = dict(_DISPATCH_ENTRY_POINTS)
-    project_root = ctx.get("project_root")
-    if project_root is not None:
-        try:
-            _config_path = Path(project_root) / ".fw-context" / "config.toml"
-            if _config_path.exists():
-                _cfg = tomllib.loads(_config_path.read_text())
-                _user_bridges = _cfg.get("call_graph", {}).get("dispatch_bridges", {})
-                if isinstance(_user_bridges, dict):
-                    _dispatch_map.update(_user_bridges)
-        except (OSError, KeyError, ValueError) as e:
-            log.warning("Failed to load dispatch_bridges from %s: %s", _config_path, e)
-        except Exception as e:
-            # A stop of the run (SIGTERM under the index lock) must not vanish here.
-            if is_fatal(e):
-                raise
-            log.exception("Unexpected error loading dispatch_bridges from %s", _config_path)
-
-    from .db import insert_refs_batch
-    from .models import RefOrigin
-
-    edges: list[tuple] = []
-    for r in rows:
-        callee_qn = r["callee_qn"]
-        entry_qn = _dispatch_map.get(callee_qn)
-        if not entry_qn:
-            continue
-        entry_usr = _resolve_matching_usr(conn, config_hash, entry_qn)
-        if not entry_usr:
-            continue
-
-        target_usr = r["target_usr"] or ""
-        if not target_usr:
-            target_qn = r["target_qn_partial"] or ""
-            if target_qn:
-                target_usr = _resolve_matching_usr(conn, config_hash, target_qn) or ""
-
-        if not target_usr:
-            continue
-
-        # Column 0: a pending dispatch records the line of its call only.
-        edges.append((
-            config_hash, target_usr, r["file"], r["line"], entry_usr,
-            "dispatch", None, 0, int(RefOrigin.DISPATCH),
-        ))
-
-    if edges:
-        insert_refs_batch(conn, edges)
-    resolved = len(edges)
-    if resolved:
-        log.info("Dispatch edges resolved: %d synthetic edges created", resolved)
-
-
 def _step_resolve_slots(conn: sqlite3.Connection, ctx: dict) -> None:
-    """Give each indirect call its targets: the call edges of the slot facts.
+    """Give each indirect call its targets: the call edges of the slot facts and of the SDK model.
 
     WHY in each run, also an incremental one: a fact of one unit can change
     the targets of a call in an other unit, thus the step replaces the
-    edges of the whole build (``_slot_resolution``).
+    edges of the whole build (``_slot_resolution``).  The rules of the SDK
+    model (``_sdk_model``) name symbols of the build, thus the step writes
+    their links again first.
     """
+    from ._sdk_model import project_rules, write_links
     from ._slot_resolution import resolve_slot_edges
 
+    rules = project_rules(ctx.get("project_root"))
     # One transaction: a failure leaves the edges of the last run, and not
     # a delete that the commit of a later step would store alone.  The
-    # commit before it keeps the rows of the steps before (`dispatch_edges`
-    # does not commit) out of its rollback.
+    # commit before it keeps the rows of the steps before out of its
+    # rollback.
     conn.commit()
     with transaction(conn):
+        write_links(conn, ctx["config_hash"], rules)
         counts = resolve_slot_edges(conn, ctx["config_hash"])
     log.info(
         "Slot edges: %d edge(s) for %d indirect call(s): %d by slot, %d by type only, "
-        "%d to an address, %d unresolved",
+        "%d to an address, %d unresolved; %d edge(s) of an SDK rule",
         counts["edges"], counts["sites"], counts["slot"], counts["type_only"], counts["address"],
-        counts["unresolved"],
+        counts["unresolved"], counts["sdk"],
     )
 
 
@@ -981,7 +856,7 @@ def _step_repair_from_usr(conn: sqlite3.Connection, ctx: dict) -> None:
 def _step_pagerank_hotspot(conn: sqlite3.Connection, ctx: dict) -> None:
     """Compute PageRank scores and build the hotspot cache from the call graph.
 
-    Runs after every step that writes call edges (dispatch, caller repair)
+    Runs after every step that writes call edges (slot edges, caller repair)
     to see the complete call graph.
     Two outputs are computed sequentially from the same call-graph data:
     PageRank scores (centrality) and the pre-aggregated hotspot cache
@@ -1392,7 +1267,7 @@ def _step_wal_checkpoint(conn: sqlite3.Connection, ctx: dict) -> None:
 #    hashed.  Otherwise the first run stores a hash without summaries, the
 #    analysis step fills them, and the NEXT run re-embeds every analyzed
 #    symbol (a spurious full re-embed on every run that follows analysis).
-#  • dispatch_edges and repair_from_usr MUST run before pagerank_hotspot —
+#  • slot_edges and repair_from_usr MUST run before pagerank_hotspot —
 #    PageRank needs the complete call graph.
 #  • verify_integrity MUST run before finalize_manifest and cleanup_old.
 #    Before finalize so a failing index is never stamped "full"; before
@@ -1461,7 +1336,6 @@ _STEPS: list[tuple[str, Callable[..., None], Callable[..., bool] | None]] = [
     ("generated_flag",   _step_reconcile_generated, None),
     ("coverage_purge",   _step_purge_files_outside_build, None),
     ("macros",           _step_expand_macros,      lambda c: c["index_macros_expanded"] and c["units"] and _needs_macros(c)),
-    ("dispatch_edges",   _step_resolve_dispatches,  lambda c: c["index_refs"]),
     ("slot_edges",       _step_resolve_slots,       lambda c: c["index_refs"]),
     ("llm_analysis",     _step_llm_analysis,       lambda c: c["analyze_symbols"] and c["llm_config"] is not None and c["llm_config"].enabled),
     ("embeddings",       _step_build_embeddings,   lambda c: c["index_embeddings"] and c["llm_config"] is not None and c["llm_config"].enabled),

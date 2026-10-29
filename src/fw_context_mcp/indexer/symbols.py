@@ -14,8 +14,6 @@ For each translation unit it produces:
 * **Slot facts** — the indirect calls and where the functions that they
   reach are stored (``_slots.py``); the step ``slot_edges`` of the
   post-processing resolves them into call edges.
-* **PendingDispatch** — deferred dispatch-registration patterns (e.g.
-  ``EventQueue::call_every``) for synthetic ``ref_kind='dispatch'`` edges.
 
 **Key design decisions:**
 
@@ -31,8 +29,9 @@ For each translation unit it produces:
 
 * **Function pointers** — the walk gives an ``indirect`` reference for each
   function whose address the code takes (``_emit_fn_ptr_targets``,
-  ``_handle_fn_ptr_as_argument``).  Arguments to dispatch-registration APIs
-  are additionally captured via ``PendingDispatch``.
+  ``_handle_fn_ptr_as_argument``).  What runs a function that an SDK
+  registers is a rule of the SDK model (``_sdk_model.py``), which the
+  post-processing applies to the slot facts.
 
 * **No name resolution** — each reference comes from a cursor that names
   its target.  A scan of the tokens and of the source text once took the
@@ -58,14 +57,12 @@ from functools import cache
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ._dispatch_bridges import _DISPATCH_ENTRY_POINTS
 from ._libclang import cindex as cx
 from ._overrides import VIRTUAL_METHOD_KINDS, extract_overrides
 from .compile_commands import CompilationUnit
 from .models import (
     InheritanceRecord,
     Macro,
-    PendingDispatch,
     Reference,
     RefOrigin,
     Symbol,
@@ -1308,8 +1305,8 @@ def _build_refs(
     anon_usr_to_field: dict[str, str],
     _log,
     skip_files: frozenset[str] | None = None,
-) -> tuple[list[Reference], list[PendingDispatch], list[cx.Cursor]]:
-    """Walk the TU AST extracting references and the registrations of dispatch callbacks.
+) -> tuple[list[Reference], list[cx.Cursor]]:
+    """Walk the TU AST extracting references.
 
     When *skip_files* is a non-empty frozenset, subtrees of already
     processed headers are skipped via :func:`_iter_cursor_skip` —
@@ -1327,14 +1324,13 @@ def _build_refs(
       function's ``end_line`` (which is non-zero only for TU-resident
       definitions), it is popped (we passed the closing brace).
 
-    Returns (refs, pending_dispatches, instances): *instances* are the
+    Returns (refs, instances): *instances* are the
     definitions of the template instances that the unit walked.
     """
     import logging as _logging
     _log = _logging.getLogger(__name__)
 
     refs: list[Reference] = []
-    pending_dispatches: list[PendingDispatch] = []
     seen_ref: _SeenRefs = {}
 
     fn_stack: list[tuple[str, int, str]] = []
@@ -1418,8 +1414,7 @@ def _build_refs(
         _seed_explicit_instantiation(instance_seeds, cursor)
 
         _process_ref_cursor(
-            cursor, cur_fn, refs, pending_dispatches, seen_ref, tu_path_str, resolve_fn,
-            static_init_calls, instance_seeds,
+            cursor, cur_fn, refs, seen_ref, resolve_fn, static_init_calls, instance_seeds,
         )
 
         # The body of a lambda is code of the lambda: the calls in it are
@@ -1435,7 +1430,7 @@ def _build_refs(
     # The calls that only the instances of the templates resolve.
     instances = _walk_template_instances(instance_seeds, refs, seen_ref)
 
-    return refs, pending_dispatches, instances
+    return refs, instances
 
 
 def _is_plain_assignment(cursor: cx.Cursor) -> bool:
@@ -1828,9 +1823,7 @@ def _process_ref_cursor(
     cursor: cx.Cursor,
     cur_fn: str | None,
     refs: list[Reference],
-    pending_dispatches: list[PendingDispatch],
     seen_ref: _SeenRefs,
-    tu_path_str: str,
     resolve_fn: Callable[..., object],
     static_init_calls: set[int],
     instance_seeds: dict[str, cx.Cursor],
@@ -1842,7 +1835,7 @@ def _process_ref_cursor(
 
     _handle_direct_refs(cursor, cur_fn, refs, seen_ref, static_init_calls, instance_seeds)
     if cursor.kind == cx.CursorKind.CALL_EXPR:
-        _handle_fn_ptr_as_argument(cursor, cur_fn, refs, pending_dispatches, seen_ref, tu_path_str)
+        _handle_fn_ptr_as_argument(cursor, cur_fn, refs, seen_ref)
     _handle_fn_ptr_cases(cursor, cur_fn, refs, seen_ref)
 
 
@@ -1934,9 +1927,7 @@ def _handle_runtime_vector(cursor: cx.Cursor, referenced: cx.Cursor | None,
 
 
 def _handle_fn_ptr_as_argument(cursor: cx.Cursor, cur_fn: str | None,
-                               refs: list[Reference],
-                               pending_dispatches: list[PendingDispatch],
-                               seen_ref: _SeenRefs, tu_path_str: str) -> None:
+                               refs: list[Reference], seen_ref: _SeenRefs) -> None:
     """Function pointers passed as call arguments.
 
     Emits an ``indirect`` reference for every callable target found in the
@@ -1944,38 +1935,9 @@ def _handle_fn_ptr_as_argument(cursor: cx.Cursor, cur_fn: str | None,
     ``_timeout.attach(callback(&WDT::_timeout_interrupt), delay)`` where
     ``attach`` is template-obscured).  The parameter that receives the
     function is a slot fact (``_slots.py``).
-
-    Additionally detects dispatch-registration patterns (e.g. EventQueue::
-    call_every with a callback target) and records ``PendingDispatch`` records
-    for deferred resolution into ``ref_kind='dispatch'`` synthetic edges.
     """
-    loc = cursor.location
     direct_callee = cursor.referenced
     direct_callee_usr = direct_callee.get_usr() if direct_callee else None
-
-    # ── Fallback callee resolution via callee expression ────────────────
-    # When cursor.referenced is None (template-obscured), try to resolve
-    # the callee through the first child of the CALL_EXPR (the callee expression).
-    # E.g. _timeout.attach(...) where attach is a template — the CALL_EXPR
-    # doesn't resolve it, but the MEMBER_REF_EXPR child might.
-    if direct_callee is None:
-        callee_expr = _first_child_unwrapped(cursor)
-        if callee_expr is not None:
-            if callee_expr.kind == cx.CursorKind.MEMBER_REF_EXPR:
-                for child in callee_expr.get_children():
-                    if child.kind in _CALLABLE_KINDS:
-                        direct_callee = child
-                        break
-            elif callee_expr.referenced is not None:
-                direct_callee = callee_expr.referenced
-
-    # ── Dispatch API detection ──────────────────────────────────────────
-    _callee_dispatch_entry_qn: str | None = None
-    if direct_callee is not None:
-        _callee_qn = _qualified_name(direct_callee)
-        if _callee_qn in _DISPATCH_ENTRY_POINTS:
-            _callee_dispatch_entry_qn = _DISPATCH_ENTRY_POINTS[_callee_qn]
-    # ── End dispatch API detection ──────────────────────────────────────
 
     for arg in cursor.get_arguments():
         targets = _find_fn_refs_in_expr(arg, direct_callee_usr)
@@ -1984,16 +1946,6 @@ def _handle_fn_ptr_as_argument(cursor: cx.Cursor, cur_fn: str | None,
             target_usr = _code_usr(target)
             if raw_usr and raw_usr != direct_callee_usr and site.file:
                 _add_ref(refs, seen_ref, target_usr, site, cur_fn, "indirect", RefOrigin.DIRECT)
-                if _callee_dispatch_entry_qn is not None:
-                    pending_dispatches.append(PendingDispatch(
-                        callee_qn=_callee_qn,
-                        target_qn_partial=_qualified_name(target),
-                        target_name=target.spelling,
-                        target_usr=target_usr,
-                        file=tu_path_str,
-                        line=loc.line,
-                        caller_usr=cur_fn,
-                    ))
     _emit_fn_ptr_targets(cursor, cur_fn, seen_ref, refs, direct_callee_usr)
 
 
@@ -2632,7 +2584,6 @@ class ExtractionResult:
     references: list = field(default_factory=list)
     inheritance: list = field(default_factory=list)
     macros: list = field(default_factory=list)
-    pending_dispatches: list = field(default_factory=list)
     # (derived USR, base USR) of each virtual method that a method of the
     # unit overrides, from the compiler (indexer/_overrides.py).
     overrides: list[tuple[str, str]] = field(default_factory=list)
@@ -2705,7 +2656,7 @@ def extract_all(
 
     Returns:
         An ``ExtractionResult`` with symbols, references, inheritance,
-        macros, pending_dispatches, the slot facts of the indirect calls,
+        macros, the slot facts of the indirect calls,
         and newly_seen_files (the set of all source file paths encountered
         during the symbol walk — used to accumulate the skip set for
         subsequent translation units).
@@ -2812,7 +2763,7 @@ def extract_all(
         )
         return result
 
-    refs, pending_dispatches, instances = _build_refs(
+    refs, instances = _build_refs(
         tu, tu_path_str, _resolve, anon_usr_to_field, _log,
         skip_files=_skip_frozen,
     )
@@ -2829,7 +2780,7 @@ def extract_all(
     result = ExtractionResult(
         tu=tu if return_tu else None, symbols=symbols, references=refs,
         inheritance=inheritance, macros=macros, overrides=overrides,
-        pending_dispatches=pending_dispatches, slots=slots, newly_seen_files=_newly_seen,
+        slots=slots, newly_seen_files=_newly_seen,
         parse_errors=parse_errors, parse_fatal=parse_fatal, parse_first_error=parse_first_error,
     )
     return result

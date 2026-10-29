@@ -62,7 +62,6 @@ WRONG = [
     ('[llm]\nollama_url = "http://localhost:11434"', "[llm] ollama_url is a key of an LLM profile now: move it to "),
     # A profile names the server that gets the source code: a committed file cannot hold one.
     ('[llm.profiles.p]\nprovider = "ollama"\nmodel = "m"', "[llm.profiles] is in the global config only"),
-    ('[call_graph]\ndispatch_bridges = { "a" = 1 }', "[call_graph] dispatch_bridges must be a table of strings"),
     ('llm = "x"', "'llm' must be a table ([llm]), not a string"),
     ('[[build.variants]]\ndescription = "x"', "[[build.variants]] entry 1 must have a name"),
     ("[build]\nvariants = [3]", "[[build.variants]] entry 1 must be a table, not an integer"),
@@ -89,6 +88,30 @@ TUNING = [
     ('[updates]\ncheck = 3', "[updates] check must be true or false, not an integer"),
     ('[llm]\nreranker_model = 5', "[llm] reranker_model must be a string, not an integer"),
     ('[build]\ntimeout = "x"', "[build] timeout must be a number, not a string that holds no number"),
+    # A wrong rule of the SDK model loses only its own edges.
+    ('[call_graph]\ndispatch_bridges = { "a" = "b" }',
+     "[call_graph] dispatch_bridges is removed: write each rule as [[call_graph.sdk]]"),
+    ("[call_graph]\nsdk = 3", "[[call_graph.sdk]] must be an array of tables"),
+    ('[[call_graph.sdk]]\nsdk = "x"\nentry = "e"\nfunction = "f"',
+     "[[call_graph.sdk]] number 1: give 'param' or 'field', not the two and not neither"),
+    ('[[call_graph.sdk]]\nsdk = "x"\nentry = "e"\nfunction = "f"\nparam = -1',
+     "[[call_graph.sdk]] number 1: 'param' must be an integer of 0 or more"),
+    ('[[call_graph.sdk]]\nsdk = "x"\nentry = "e"\nfrom = { field = "a::b" }',
+     "[[call_graph.sdk]] number 1: a rule holds 'sdk', 'entry' and either 'from' and 'to'"),
+    ('[[call_graph.sdk]]\nsdk = "x"\nentry = "e"\nfrom = { field = "a::b" }\nto = { function = "f" }',
+     "[[call_graph.sdk]] number 1 'to' must hold 'function' and 'param', or 'field' only"),
+    ('[[call_graph.sdk]]\nentry = "e"\nfunction = "f"\nparam = 0',
+     "[[call_graph.sdk]] number 1: 'sdk' must be a text that is not empty"),
+    ('[[call_graph.sdk]]\nsdk = " "\nentry = "e"\nfunction = "f"\nparam = 0',
+     "[[call_graph.sdk]] number 1: 'sdk' must be a text that is not empty"),
+    ('[[call_graph.sdk]]\nsdk = "x"\nentry = "e"\nfunction = "f"\nparam = true',
+     "[[call_graph.sdk]] number 1: 'param' must be an integer of 0 or more"),
+    ('[[call_graph.sdk]]\nsdk = "x"\nentry = "e"\nfunction = "f"\nparam = 0\noutside_c = 1',
+     "[[call_graph.sdk]] number 1: 'outside_c' must be true or false"),
+    ('[[call_graph.sdk]]\nsdk = "x"\nentry = "e"\nfunction = "f"\nparam = 0\nslot = 1',
+     "[[call_graph.sdk]] number 1: a rule holds 'sdk', 'entry' and either 'from' and 'to'"),
+    ('[[call_graph.sdk]]\nsdk = "x"\nentry = "e"\nfrom = { field = "a::b", param = 1 }\nto = { field = "c::d" }',
+     "[[call_graph.sdk]] number 1 'from' must hold 'function' and 'param', or 'field' only"),
 ]
 
 #: The first lines of an Ollama profile of the global config.  A wrong
@@ -257,6 +280,65 @@ class TestRemoval:
         assert not report.failures
         load(root)
         assert not (config.parent / "config.toml.bak").exists(), "config.toml has git"
+
+    def test_a_rule_of_the_sdk_model_in_local_toml_must_move(self, tmp_path, home):
+        """The indexer reads the rules only from config.toml: the fix does not delete a rule that the user wrote."""
+        from fw_context_mcp.housekeeping import remove_unusable_values
+
+        text = '[[call_graph.sdk]]\nsdk = "x"\nentry = "e"\nfunction = "start"\nparam = 0\n'
+        root = _project(tmp_path, local=text)
+
+        cfg = load(root)
+        report = remove_unusable_values(root)
+
+        message = "[[call_graph.sdk]] is read only from .fw-context/config.toml of the project: move the rules there"
+        assert cfg.config_warnings == [f"{root / '.fw-context' / 'local.toml'}: {message}"]
+        assert (root / ".fw-context" / "local.toml").read_text(encoding="utf-8") == text
+        assert [reason.split(".")[0] for _, reason in report.failures] == [message.split(".")[0]]
+
+    def test_a_rule_of_the_sdk_model_in_config_toml_gives_no_warning(self, tmp_path, home):
+        root = _project(tmp_path, '[[call_graph.sdk]]\nsdk = "x"\nentry = "e"\nfunction = "start"\nparam = 0\n')
+
+        assert load(root).config_warnings == []
+
+    def test_a_rule_in_the_config_of_a_project_in_the_home_directory_gives_no_warning(self, tmp_path, home):
+        """In the home directory, config.toml of the project is the global config: the indexer reads its rules."""
+        from fw_context_mcp.housekeeping import remove_unusable_values
+
+        home.write_text('[[call_graph.sdk]]\nsdk = "x"\nentry = "e"\nfunction = "start"\nparam = 0\n', encoding="utf-8")
+        root = tmp_path / "dotfiles"
+        (root / ".git").mkdir(parents=True)
+        (root / ".fw-context").symlink_to(home.parent, target_is_directory=True)
+
+        assert load(root).config_warnings == []
+        assert not remove_unusable_values(root, dry_run=True).failures
+
+    def test_two_wrong_rules_give_two_warnings(self, tmp_path, home):
+        """The load removes the two tables from its copy, the last one first."""
+        bad = '[[call_graph.sdk]]\nsdk = "x"\nentry = "e"\nfunction = "f"\n\n'
+        good = '[[call_graph.sdk]]\nsdk = "x"\nentry = "e"\nfunction = "start"\nparam = 0\n\n'
+        root = _project(tmp_path, bad + good + bad)
+
+        cfg = load(root)
+
+        assert [warning.split(": ", 1)[1].split(":")[0] for warning in cfg.config_warnings] == [
+            "[[call_graph.sdk]] number 1", "[[call_graph.sdk]] number 3",
+        ]
+
+    def test_a_wrong_rule_of_the_sdk_model_goes_and_the_other_rules_stay(self, tmp_path, home):
+        from fw_context_mcp.housekeeping import remove_unusable_values
+
+        good = '[[call_graph.sdk]]\nsdk = "x"\nentry = "e"\nfunction = "start"\nparam = 0\n\n'
+        text = good + '[[call_graph.sdk]]\nsdk = "x"\nentry = "e"\nfunction = "f"\n\n' + good
+        root = _project(tmp_path, text)
+
+        report = remove_unusable_values(root)
+
+        rules = tomllib.loads((root / ".fw-context" / "config.toml").read_text(encoding="utf-8"))["call_graph"]["sdk"]
+        assert [rule.get("param") for rule in rules] == [0, 0]
+        assert [label for _, label in report.removed_keys] == [
+            "[[call_graph.sdk]] number 2: give 'param' or 'field', not the two and not neither",
+        ]
 
     def test_local_toml_gets_a_copy_of_its_old_text(self, tmp_path, home):
         from fw_context_mcp.housekeeping import remove_unusable_values

@@ -50,6 +50,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from ..indexer._sdk_model import rules_from_config
 from ..indexer.build import BuildConfig, BuildImage, BuildVariant
 from ..indexer.config_hash import DEFAULT_TRANSIENT_DEFINES
 from ..utils import fw_context_home
@@ -331,15 +332,32 @@ _PROJECT_DEFAULTS_TEMPLATE = """\
 # index_embeddings = false
 
 [call_graph]
-# dispatch_bridges: map a registration API to its dispatch entry point
-#   (EventQueue, work queues, thread starts, timers). The call graph gets
-#   an edge from the entry point to each callback of the API.
-#   The built-in list covers Mbed OS, Zephyr, FreeRTOS, ESP-IDF and the
-#   STM32 HAL. An entry can only change the entry point of an API of the
-#   built-in list: the indexer records the calls of these APIs only.
+# [[call_graph.sdk]]: a rule of the SDK model. It tells what runs a function
+#   that an SDK registers, when no C code of the build calls it (a task that
+#   the port starts from a stack frame, a callback of a library without
+#   source). The built-in rules cover FreeRTOS, ESP-IDF, lwIP, Zephyr
+#   threads and CMSIS. A rule of the project adds to them.
 #
-# [call_graph.dispatch_bridges]
-# "events::EventQueue::call_every" = "my_app::event_loop"
+#   A call: `function` runs the function in its parameter `param` (from 0),
+#   or in the field `field` ("record::field"). The edge goes from
+#   `function` to each function of the slot. Without `outside_c = true`
+#   the rule applies only when the build has no body of `function`.
+#
+# [[call_graph.sdk]]
+# sdk = "my-rtos"
+# entry = "the my-rtos scheduler"
+# function = "task_create"
+# param = 0
+# outside_c = true
+#
+#   A flow: code out of the AST gives the value of one slot to an other
+#   slot, and C code calls through the second one.
+#
+# [[call_graph.sdk]]
+# sdk = "my-rtos"
+# entry = "the my-rtos scheduler"
+# from = { function = "port_new_task", param = 1 }
+# to = { function = "task_trampoline", param = 0 }
 
 # The LLM profiles are in the global config (~/.fw-context/config.toml).
 # Select the profile of this project, and local paths, in local.toml (gitignored).
@@ -1361,7 +1379,7 @@ class ValueProblem:
     critical: bool = True
 
 
-def config_value_problems(layer: dict, *, global_file: bool = True) -> list[ValueProblem]:
+def config_value_problems(layer: dict, *, global_file: bool = True, project_file: bool = False) -> list[ValueProblem]:
     """Return each value of one config file that ``load`` cannot use, in the order of the file.
 
     *layer* is the parsed TOML of one file.  The types come from the field
@@ -1376,6 +1394,9 @@ def config_value_problems(layer: dict, *, global_file: bool = True) -> list[Valu
     code.  A committed ``config.toml`` could otherwise send it to a host
     that the repository selects; now it can only select a profile of the
     user.
+
+    *project_file* is True for ``config.toml`` of a project: the only file
+    that the indexer reads the rules ``[[call_graph.sdk]]`` from.
 
     WHY a list and not the first problem: ``fw-context doctor`` shows each
     value, and ``doctor --fix --only config`` removes each one in one run.  The message
@@ -1416,9 +1437,42 @@ def config_value_problems(layer: dict, *, global_file: bool = True) -> list[Valu
     if isinstance(build, dict) and "variants" in build:
         _variant_problems(build["variants"], problems, check)
     graph = layer.get("call_graph")
-    if isinstance(graph, dict) and "dispatch_bridges" in graph:
-        check(("call_graph", "dispatch_bridges"), "[call_graph] dispatch_bridges", graph["dispatch_bridges"], "str_table")
+    if isinstance(graph, dict):
+        _call_graph_problems(graph, problems, project_file=project_file)
     return problems
+
+
+def _call_graph_problems(graph: dict, problems: list[ValueProblem], *, project_file: bool) -> None:
+    """Add the problems of ``[call_graph]`` to *problems*: a removed key, and a table that is not a rule.
+
+    Each one is a warning (*critical* False).  WHY: a wrong rule loses only
+    its own edges, and the indexer uses the other rules
+    (``indexer/_sdk_model.project_rules``).  ``dispatch_bridges`` mapped an
+    API to an entry point; the SDK model replaced it, and the indexer does
+    not read it.  The indexer reads the rules only from ``config.toml`` of
+    the project, thus a rule in an other file is a problem that the user
+    must move (not *removable*): the fix must not delete a rule that the
+    user wrote.
+    """
+    if "sdk" in graph and not project_file:
+        problems.append(ValueProblem(
+            ("call_graph", "sdk"),
+            "[[call_graph.sdk]] is read only from .fw-context/config.toml of the project: move the rules there",
+            removable=False, critical=False,
+        ))
+    if "dispatch_bridges" in graph:
+        problems.append(ValueProblem(
+            ("call_graph", "dispatch_bridges"),
+            "[call_graph] dispatch_bridges is removed: write each rule as [[call_graph.sdk]]",
+            critical=False,
+        ))
+    if "sdk" in graph and project_file:
+        _rules, messages = rules_from_config(graph["sdk"])
+        problems.extend(
+            ValueProblem(("call_graph", "sdk") if position is None else ("call_graph", "sdk", position), message,
+                         critical=False)
+            for position, message in messages
+        )
 
 
 def _ollama_profile_problems(llm: dict, problems: list[ValueProblem], *, global_file: bool) -> None:
@@ -1725,7 +1779,7 @@ def _toml_type(value: object, conv: str = "", *, strict: bool = False) -> str:
 _value_warned: set[tuple[Path, str]] = set()
 
 
-def _check_layer(layer: dict, path: Path, warnings: list[str], *, global_file: bool) -> None:
+def _check_layer(layer: dict, path: Path, warnings: list[str], *, global_file: bool, project_file: bool) -> None:
     """Raise ``ConfigError`` for the first critical value of one config file that ``load`` cannot use.
 
     A value of a key of ``_TUNING_KEYS`` is removed from *layer* instead:
@@ -1741,18 +1795,23 @@ def _check_layer(layer: dict, path: Path, warnings: list[str], *, global_file: b
     default.  ``urlparse`` raised ``ValueError`` for ``"http://[::1"``, and
     that stopped the MCP server before its tools were there.
     """
-    problems = config_value_problems(layer, global_file=global_file)
+    problems = config_value_problems(layer, global_file=global_file, project_file=project_file)
     critical = [problem for problem in problems if problem.critical]
     if critical:
         more = f" (and {len(critical) - 1} more)" if len(critical) > 1 else ""
         raise ConfigError(path, critical[0].message + more, removable=all(p.removable for p in critical), values=True)
-    for problem in problems:
-        # A key of _TUNING_KEYS, or the section [updates].
+    # The last place first: a removed table of an array moves the position
+    # of each table after it (two wrong rules of [[call_graph.sdk]]).
+    # Two places of one sort are keys of one table or positions in one
+    # array, never a key and a position (see housekeeping).
+    for problem in sorted(problems, key=lambda problem: problem.keys, reverse=True):
+        # A key of _TUNING_KEYS, the section [updates], or [call_graph].
         # The value can be nested, for example ("llm", "profiles", name, key).
         table = layer
         for key in problem.keys[:-1]:
             table = table[key]
         table.pop(problem.keys[-1])
+    for problem in problems:
         warnings.append(f"{path}: {problem.message}")
         if (path, problem.message) not in _value_warned:
             _value_warned.add((path, problem.message))
@@ -1762,7 +1821,11 @@ def _check_layer(layer: dict, path: Path, warnings: list[str], *, global_file: b
             # caller in `config_warnings`.
             # The list of the models has no lower file or default: the value
             # is only not used (config._model_list).
-            in_list = problem.keys[:2] in (("llm", "models"), ("llm", "embed_models"))
+            # A rule of the SDK model, and the removed key dispatch_bridges,
+            # have none either: the indexer leaves them out.
+            in_list = problem.keys[:2] in (
+                ("llm", "models"), ("llm", "embed_models"), ("call_graph", "sdk"), ("call_graph", "dispatch_bridges"),
+            )
             log.warning(
                 "%s: %s. %s %s",
                 path, problem.message,
@@ -2040,6 +2103,20 @@ def _warn_project_updates_once(layer: dict, path: Path) -> None:
         "or set FW_CONTEXT_NO_UPDATE_CHECK=1.",
         path, _GLOBAL_CONFIG_PATH,
     )
+
+
+def _is_the_same_file(path: Path, other: Path) -> bool:
+    """Say if *path* and *other* are one file.
+
+    ``os.path.samefile`` also sees a link, and two spellings on a file
+    system that ignores the case.  A path that is not there, or that
+    cannot be examined, gives False: the read of that path then fails
+    too, and reports it, thus the global config is not changed twice.
+    """
+    try:
+        return os.path.samefile(path, other)
+    except OSError:
+        return False
 
 
 def _mtime_signature(paths: tuple[Path | None, ...]) -> tuple[float | None, ...]:
@@ -2324,7 +2401,13 @@ def load(project_root: Path | None = None) -> Config:
     # creates it from template if missing).
     data = read_config_file(global_path)
     warnings: list[str] = []
-    _check_layer(data, global_path, warnings, global_file=True)
+    # In the home directory (a dotfiles repository makes it a git root),
+    # config.toml of the project is the global config: it then holds the
+    # rules of the SDK model that the indexer reads (_sdk_model).
+    _check_layer(
+        data, global_path, warnings, global_file=True,
+        project_file=proj_path is not None and _is_the_same_file(global_path, proj_path),
+    )
     # The file that sets each of the two selection keys last: an error names it.
     selected_in = {key: global_path for key in ("profile", "embed_profile") if key in (data.get("llm") or {})}
     _drop_retired_keys(data, global_path)
@@ -2337,7 +2420,7 @@ def load(project_root: Path | None = None) -> Config:
         # Uses _deep_merge so nested sections accumulate — [index] keys
         # from global and project config coexist.
         proj_data = read_config_file(proj_path)
-        _check_layer(proj_data, proj_path, warnings, global_file=False)
+        _check_layer(proj_data, proj_path, warnings, global_file=False, project_file=True)
         _drop_retired_keys(proj_data, proj_path)
         _drop_selection_keys(proj_data, proj_path)
         _warn_project_updates_once(proj_data, proj_path)
@@ -2349,7 +2432,7 @@ def load(project_root: Path | None = None) -> Config:
         # Phase 3: deep-merge local config (gitignored, per-developer).
         # This is the last merge — local.toml values have highest precedence.
         local_data = read_config_file(local_path)
-        _check_layer(local_data, local_path, warnings, global_file=False)
+        _check_layer(local_data, local_path, warnings, global_file=False, project_file=False)
         _drop_retired_keys(local_data, local_path)
         _drop_selection_keys(local_data, local_path)
         _warn_project_updates_once(local_data, local_path)

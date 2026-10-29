@@ -20,11 +20,10 @@ Python BFS with a visited set (``seen`` dict) guarantees O(V+E) traversal
 with explicit depth and node-expansion limits.
 
 The bidirectional variant was added when unidirectional BFS hit the
-depth limit on wide dispatch patterns.  Expanding forward from source
-AND reverse from target simultaneously halves the effective search depth
-(O(b^(d/2)) instead of O(b^d)), so large fan-out nodes like
-``dispatch_forever`` (with thousands of event handlers) no longer
-dominate the search.
+depth limit on nodes of a wide fan-out (an event loop that calls
+thousands of handlers).  Expanding forward from source AND reverse from
+target simultaneously halves the effective search depth (O(b^(d/2))
+instead of O(b^d)), so such a node no longer dominates the search.
 
 **Recursive CTE for transitive queries**
 
@@ -59,7 +58,9 @@ any call-path query that can reach ``main``.
 - ``indirect`` — function pointer assignment (``driver.onData = &handler``).
 - ``implicit_construct`` — constructor of an object at namespace or class
   scope (a global, a file-scope static, a static data member).
-- ``dispatch`` — synthetic edge through event loop / thread start.
+- A call edge with the origin ``sdk`` comes from a rule of the SDK model:
+  a function of an SDK runs a registered function (a task, a callback of a
+  library without source).
 """
 
 from __future__ import annotations
@@ -497,7 +498,7 @@ def search_call_paths(
                               ) AS callee_name
                        FROM refs r
                        WHERE r.config_hash = ? AND r.from_usr = ?
-                         AND r.ref_kind IN ('call', 'indirect', 'implicit_construct', 'dispatch')
+                         AND r.ref_kind IN ('call', 'indirect', 'implicit_construct')
                        GROUP BY r.to_usr
                        ORDER BY r.to_usr""",
                     (config_hash, usr),
@@ -525,7 +526,7 @@ def search_call_paths(
                        FROM refs r
                        WHERE r.config_hash = ? AND r.to_usr = ?
                          AND r.from_usr IS NOT NULL
-                         AND r.ref_kind IN ('call', 'indirect', 'implicit_construct', 'dispatch')
+                         AND r.ref_kind IN ('call', 'indirect', 'implicit_construct')
                        GROUP BY r.from_usr
                        ORDER BY r.from_usr""",
                     (config_hash, usr),
@@ -610,8 +611,8 @@ def search_call_paths(
 
     # ── Bidirectional BFS — expands forward from source AND reverse from target
     # simultaneously.  Halves the effective search depth (O(b^(d/2)) vs O(b^d))
-    # so large fan-out nodes (e.g. dispatch_forever with thousands of event
-    # handlers) no longer dominate the search. ──
+    # so large fan-out nodes (an event loop with thousands of handlers) no
+    # longer dominate the search. ──
     f_dist: dict[str, int] = {}     # usr → distance from source
     f_chain: dict[str, str] = {}    # usr → chain string from source
     r_dist: dict[str, int] = {}     # usr → distance to target (reverse)
@@ -803,7 +804,7 @@ def walk_recursive(
 
     alias_pairs = _get_alias_pairs(conn, config_hash)
     alias_cte, _alias_params = _build_alias_temp_table(conn, alias_pairs)
-    edge_kinds = "ref_kind IN ('call', 'indirect', 'implicit_construct', 'dispatch')"
+    edge_kinds = "ref_kind IN ('call', 'indirect', 'implicit_construct')"
     alias_join = (
         f"UNION ALL {sql['alias']} WHERE r.config_hash = ? AND r.{edge_kinds}"
         if alias_cte

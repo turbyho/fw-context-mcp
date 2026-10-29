@@ -367,7 +367,7 @@ def refs_for_symbol(
     kind_filter, kind_params = _build_kind_filter(ref_kind)
 
     _SELECT = """SELECT r.from_file, r.from_line, r.ref_kind,
-                        r.from_usr, {col} AS from_col, {origins} AS origins,
+                        r.from_usr, r.to_usr, {col} AS from_col, {origins} AS origins,
                         caller.name           AS caller_name,
                         caller.qualified_name AS caller_qname,
                         caller.kind           AS caller_kind,

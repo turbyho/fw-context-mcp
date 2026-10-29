@@ -2477,7 +2477,7 @@ def _reindex_cleanup_deleted_file(
         # The file can have put a function into a slot that an other file
         # calls through: its edges go with it.  A build with no reference
         # index has no slot facts, thus the step does nothing there.
-        _resolve_slot_edges_locked(conn, config_hash, db_path.parent, result)
+        _resolve_slot_edges_locked(conn, config_hash, db_path.parent, root, result)
         return result
     except WriteLockTimeout as e:
         return {"error": f"Could not acquire write lock for cleanup of {target}: {e}", "action": "timeout"}
@@ -3094,6 +3094,7 @@ def _reindex_graph_phases(
     cfg: Config,
     total_symbols: int,
     db_dir: Path,
+    root: Path,
     result: dict,
 ) -> None:
     """Rebuild the edges of the indirect calls, PageRank and the hotspot cache after reindex_file.
@@ -3116,7 +3117,7 @@ def _reindex_graph_phases(
     """
     if total_symbols <= 0:
         return
-    _reindex_slot_edges(conn, config_hash, cfg, db_dir, result)
+    _reindex_slot_edges(conn, config_hash, cfg, db_dir, root, result)
     _reindex_pagerank(conn, config_hash, cfg, result)
 
 
@@ -3125,6 +3126,7 @@ def _reindex_slot_edges(
     config_hash: str,
     cfg: Config,
     db_dir: Path,
+    root: Path,
     result: dict,
 ) -> None:
     """Resolve the indirect calls of the build again after reindex_file.
@@ -3136,15 +3138,25 @@ def _reindex_slot_edges(
     """
     if not cfg.index.index_refs:
         return
-    _resolve_slot_edges_locked(conn, config_hash, db_dir, result)
+    _resolve_slot_edges_locked(conn, config_hash, db_dir, root, result)
 
 
-def _resolve_slot_edges_locked(conn: sqlite3.Connection, config_hash: str, db_dir: Path, result: dict) -> None:
-    """Run the resolution of the slot facts under the write lock; a failure adds a warning to *result*."""
+def _resolve_slot_edges_locked(
+    conn: sqlite3.Connection, config_hash: str, db_dir: Path, root: Path, result: dict,
+) -> None:
+    """Run the resolution of the slot facts under the write lock; a failure adds a warning to *result*.
+
+    The links of the SDK model come first, as in an index run: a rule
+    names symbols, and the file can add one, remove one, or hold the
+    declaration where an edge of a rule stands.
+    """
+    from ...indexer._sdk_model import project_rules, write_links
     from ...indexer._slot_resolution import resolve_slot_edges
     from ...indexer.db import write_lock
+    rules = project_rules(root)
     try:
         with write_lock(db_dir, timeout=60.0), transaction(conn):
+            write_links(conn, config_hash, rules)
             resolve_slot_edges(conn, config_hash)
     except (sqlite3.Error, WriteLockTimeout) as exc:
         result["slot_edges_warning"] = f"Indirect call resolution skipped: {exc}"
@@ -3505,7 +3517,7 @@ def _reindex_one_build(
         result["warning"] = coverage_warning
 
     try:
-        _reindex_graph_phases(conn, config_hash, cfg, total_symbols, db_path.parent, result)
+        _reindex_graph_phases(conn, config_hash, cfg, total_symbols, db_path.parent, root, result)
         if not with_analysis:
             return result
         return _reindex_post_write_phases(

@@ -448,12 +448,12 @@ class TestCallWithoutTargetGivesNoGuess:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# F8 — dispatch bridge detection + deferred resolution
+# F8 — the call graph goes through an edge of the SDK model and global ctors
 # ═══════════════════════════════════════════════════════════════════════════
 
 
 class TestCallGraphDispatchAndGlobalCtors:
-    """Verify find_call_path traverses implicit_construct and dispatch edges."""
+    """Verify find_call_path traverses implicit_construct edges and call edges of the SDK model."""
 
     @pytest.fixture(autouse=True)
     def _import(self):
@@ -502,8 +502,8 @@ class TestCallGraphDispatchAndGlobalCtors:
         _sym_data = [
             ("main",     "main",               "function",      "src/main.cpp",    1, "u_main", 1),
             ("run",      "App::run",           "method",        "src/app.cpp",    10, "u_run", 1),
-            ("ZBLE_ctor","the Mbed project::ZBLE::ZBLE",   "constructor",   "src/zble.cpp",   20, "u_zble_ctor", 1),
-            ("watch_ble","the Mbed project::ZBLE::watch_ble","method",      "src/zble.cpp",   25, "u_watch_ble", 1),
+            ("Ble",      "Ble::Ble",           "constructor",   "src/ble.cpp",    20, "u_ble_ctor", 1),
+            ("watch_ble","Ble::watch_ble",     "method",        "src/ble.cpp",    25, "u_watch_ble", 1),
             ("dispatch_forever", "events::EventQueue::dispatch_forever", "method",
              "vendor/EventQueue.cpp", 100, "u_dispatch_forever", 0),
             ("call_every","events::EventQueue::call_every", "method",
@@ -517,35 +517,34 @@ class TestCallGraphDispatchAndGlobalCtors:
         ]
         insert_symbols_batch(conn, sym_rows)
 
-        # Refs: (to_usr, from_file, from_line, from_usr, ref_kind)
+        # Refs: (to_usr, from_file, from_line, from_usr, ref_kind, origins)
         refs_data = [
             # main → dispatch_forever (event loop)
-            ("u_dispatch_forever", "src/main.cpp",   2,  "u_main",              "call"),
+            ("u_dispatch_forever", "src/main.cpp",   2,  "u_main",              "call", 1),
             # main → run
-            ("u_run",              "src/main.cpp",   3,  "u_main",              "call"),
-            # SYNTHETIC: dispatch_forever → watch_ble (dispatch bridge)
-            ("u_watch_ble",        "src/zble.cpp",  26,  "u_dispatch_forever",  "dispatch"),
+            ("u_run",              "src/main.cpp",   3,  "u_main",              "call", 1),
+            # An edge of the SDK model: dispatch_forever → watch_ble
+            ("u_watch_ble",        "src/ble.cpp",   26,  "u_dispatch_forever",  "call", 8),
             # watch_ble → swdt_check
-            ("u_swdt_check",       "src/zble.cpp",  27,  "u_watch_ble",         "call"),
+            ("u_swdt_check",       "src/ble.cpp",   27,  "u_watch_ble",         "call", 1),
             # swdt_check → wdt_reset
-            ("u_wdt_reset",       "src/wdt.cpp",   46,  "u_swdt_check",        "call"),
-            # File-scope implicit_construct: ZBLE global object ctor
-            ("u_zble_ctor",        "src/zble.cpp",  20,  None,                  "implicit_construct"),
-            # ZBLE ctor → watch_ble (method called from ctor body)
-            ("u_watch_ble",        "src/zble.cpp",  22,  "u_zble_ctor",         "call"),
+            ("u_wdt_reset",       "src/wdt.cpp",   46,  "u_swdt_check",        "call", 1),
+            # File-scope implicit_construct: Ble global object ctor
+            ("u_ble_ctor",         "src/ble.cpp",   20,  None,                  "implicit_construct", 1),
+            # Ble ctor → watch_ble (method called from ctor body)
+            ("u_watch_ble",        "src/ble.cpp",   22,  "u_ble_ctor",          "call", 1),
         ]
         ref_rows = [
-            # The trailing None is slot_index, which only a vector table
-            # slot carries.
-            (CH, to_usr, fp, line, from_usr, rk, None, 0, 1)
-            for to_usr, fp, line, from_usr, rk in refs_data
+            # The None is slot_index, which only a vector table slot carries.
+            (CH, to_usr, fp, line, from_usr, rk, None, 0, origins)
+            for to_usr, fp, line, from_usr, rk, origins in refs_data
         ]
         insert_refs_batch(conn, ref_rows)
 
         return conn, CH
 
-    def test_call_path_through_dispatch_edge(self):
-        """find_call_path(main → wdt_reset) returns paths through dispatch edge."""
+    def test_call_path_through_an_sdk_edge(self):
+        """find_call_path(main → wdt_reset) returns paths through an edge of the SDK model."""
         conn, ch = self._build_db()
         try:
             paths = self._find_call_path(conn, ch, "main", "wdt_reset", max_depth=8)
@@ -563,25 +562,24 @@ class TestCallGraphDispatchAndGlobalCtors:
         finally:
             conn.close()
 
-    def test_call_path_main_to_watch_ble_only_dispatch(self):
+    def test_call_path_main_to_watch_ble_only_sdk_edge(self):
         """find_call_path(main → watch_ble) when no implicit_construct path exists."""
         conn, ch = self._build_db()
         try:
-            # Remove the implicit_construct edge so only dispatch path works
+            # Remove the implicit_construct edge so only the SDK edge path works
             from fw_context_mcp.indexer.db import delete_refs_for_files
-            delete_refs_for_files(conn, ch, ["src/zble.cpp"])
-            # Re-add only the dispatch and direct call edges (no implicit_construct)
+            delete_refs_for_files(conn, ch, ["src/ble.cpp"])
+            # Re-add only the SDK edge and the direct call edges (no implicit_construct)
             from fw_context_mcp.indexer.db import insert_refs_batch
             insert_refs_batch(conn, [
                 (ch, "u_dispatch_forever", "src/main.cpp", 2, "u_main", "call", None, 0, 1),
-                (ch, "u_watch_ble", "src/zble.cpp", 26, "u_dispatch_forever",
-                 "dispatch", None, 0, 1),
-                (ch, "u_swdt_check", "src/zble.cpp", 27, "u_watch_ble", "call", None, 0, 1),
+                (ch, "u_watch_ble", "src/ble.cpp", 26, "u_dispatch_forever", "call", None, 0, 8),
+                (ch, "u_swdt_check", "src/ble.cpp", 27, "u_watch_ble", "call", None, 0, 1),
                 (ch, "u_wdt_reset", "src/wdt.cpp", 46, "u_swdt_check", "call", None, 0, 1),
             ])
             paths = self._find_call_path(conn, ch, "main", "watch_ble", max_depth=6)
             assert paths, (
-                "main → dispatch_forever → (dispatch) → watch_ble must exist"
+                "main → dispatch_forever → (SDK edge) → watch_ble must exist"
             )
             chains = [p["chain"] for p in paths]
             assert any("dispatch_forever" in c for c in chains), (
@@ -591,12 +589,12 @@ class TestCallGraphDispatchAndGlobalCtors:
             conn.close()
 
     def test_call_path_through_implicit_construct(self):
-        """find_call_path(main → watch_ble) returns shortest path (dispatch or global ctor)."""
+        """find_call_path(main → watch_ble) returns shortest path (SDK edge or global ctor)."""
         conn, ch = self._build_db()
         try:
             paths = self._find_call_path(conn, ch, "main", "watch_ble", max_depth=6)
             assert paths, (
-                "main → watch_ble path must exist (via dispatch or global ctors)"
+                "main → watch_ble path must exist (via the SDK edge or global ctors)"
             )
             chains = [p["chain"] for p in paths]
             assert any(
@@ -608,7 +606,7 @@ class TestCallGraphDispatchAndGlobalCtors:
             conn.close()
 
     def test_all_callers_recursive_includes_main(self):
-        """find_all_callers_recursive(wdt_reset) includes main via dispatch."""
+        """find_all_callers_recursive(wdt_reset) includes main via the SDK edge."""
         conn, ch = self._build_db()
         try:
             callers = self._find_all_callers_recursive(conn, ch, "wdt_reset", max_depth=6)
@@ -622,8 +620,8 @@ class TestCallGraphDispatchAndGlobalCtors:
         finally:
             conn.close()
 
-    def test_callees_recursive_includes_dispatch(self):
-        """find_callees_recursive(main) includes wdt_reset via dispatch."""
+    def test_callees_recursive_includes_the_sdk_edge(self):
+        """find_callees_recursive(main) includes wdt_reset via the SDK edge."""
         conn, ch = self._build_db()
         try:
             callees = self._find_callees_recursive(conn, ch, "main", max_depth=8, limit=50)

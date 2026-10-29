@@ -16,8 +16,8 @@ Pipeline, per TU (``store_symbols_for_unit``):
      read, via cached reads
   4. Detect symbols that moved between files without content changes —
      preserve LLM analysis by updating file_id instead of re-inserting
-  5. Insert refs, the slot facts of the indirect calls, pending
-     dispatch edges, and inheritance rows
+  5. Insert refs, the slot facts of the indirect calls, and inheritance
+     rows
   6. Store macro definitions (per-TU replacement)
   7. Fill ``files.content`` with ``#ifdef``-filtered text — tokenize the
      TU to find which lines are active for the build configuration
@@ -1451,7 +1451,6 @@ def store_symbols_for_unit(
         inheritance = result.inheritance
         overrides = result.overrides
         macros = result.macros
-        pending_dispatches = result.pending_dispatches
         slots = result.slots
         # Every file whose cursors this parse walked — the set this TU owns in
         # this run.  Headers already claimed by an earlier TU are absent
@@ -1483,7 +1482,6 @@ def store_symbols_for_unit(
             inheritance = result.inheritance
             overrides = result.overrides
             macros = result.macros
-            pending_dispatches = getattr(result, 'pending_dispatches', [])
             slots = result.slots
             # Every file whose cursors this parse walked — the set this TU
             # owns in this run.  Headers already claimed by an earlier TU are
@@ -1672,43 +1670,6 @@ def store_symbols_for_unit(
         _insert_slot_facts(conn, config_hash, slots, _rel, "")
         if slots.from_instances is not None:
             _insert_slot_facts(conn, config_hash, slots.from_instances, _rel, instance_unit)
-
-    # Pending dispatch edges (for deferred resolution in post-processing)
-    # Dispatch edges (event-loop callbacks, thread starts, timer callbacks)
-    # cannot be resolved during per-TU processing because the target symbol
-    # may live in a different TU that hasn't been parsed yet.  Instead, we
-    # store them in a temp table and resolve them after ALL TUs are indexed
-    # (see the dispatch bridging phase in runner.py).
-    if index_refs and pending_dispatches:
-        conn.execute(
-            """CREATE TEMP TABLE IF NOT EXISTS _pending_dispatch (
-                config_hash TEXT,
-                callee_qn TEXT,
-                target_qn_partial TEXT,
-                target_name TEXT,
-                target_usr TEXT,
-                file TEXT,
-                line INTEGER,
-                caller_usr TEXT
-            )"""
-        )
-        pd_rows = [
-            (
-                config_hash,
-                pd.callee_qn,
-                pd.target_qn_partial,
-                pd.target_name,
-                pd.target_usr or "",
-                _rel(pd.file),
-                pd.line,
-                pd.caller_usr or "",
-            )
-            for pd in pending_dispatches
-        ]
-        conn.executemany(
-            "INSERT INTO _pending_dispatch VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            pd_rows,
-        )
 
     # Inheritance
     if inheritance:

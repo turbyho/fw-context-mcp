@@ -3,10 +3,13 @@
 The walk records the slot facts (``indexer/_slots.py``: tables
 ``slot_sources``, ``slot_flows``, ``slot_sites``, ``slot_arguments``), and
 the step ``slot_edges`` resolves them (``indexer/_slot_resolution.py``):
-it writes the call edges (``refs`` with the origins ``SLOT`` and
-``TYPE_ONLY``), the targets of each slot (``slot_targets``) and the slots
-that escape (``slot_escaped``).  The tools ``find_indirect_call_sites``,
-``find_indirect_targets`` and ``get_symbol_context`` read them here.
+it writes the call edges (``refs`` with the origins ``SLOT``,
+``TYPE_ONLY`` and ``SDK``), the targets of each slot (``slot_targets``) and
+the slots that escape (``slot_escaped``).  The tools
+``find_indirect_call_sites``, ``find_indirect_targets``, ``find_callers``
+and ``get_symbol_context`` read them here.  The rules of the SDK model
+that apply to the build are in ``sdk_links`` (``indexer/_sdk_model.py``):
+an edge of a rule gets its ``entry`` (``sdk_entry``).
 
 A symbol is a slot when it is a field (``F|<USR>``) or a variable
 (``V|<USR>``).  A parameter is no symbol of the index: a call through it
@@ -30,6 +33,7 @@ __all__ = [
     "function_calls_by_slot",
     "function_stores",
     "indirect_sites",
+    "sdk_entry",
     "site_targets",
     "slot_escapes",
     "slot_key",
@@ -41,7 +45,10 @@ __all__ = [
 POINTER_KINDS: tuple[str, ...] = ("field", "variable", "varglobal", "varlocal")
 # The kinds of a symbol that makes calls and that a slot can hold.
 CODE_KINDS: tuple[str, ...] = ("function", "method", "constructor", "destructor", "lambda")
-_RESOLVED = int(RefOrigin.SLOT | RefOrigin.TYPE_ONLY)
+_RESOLVED = int(RefOrigin.SLOT | RefOrigin.TYPE_ONLY | RefOrigin.SDK)
+# The origins of an edge that a rule of the SDK model can give: ``SDK``
+# from a "call" rule, ``SLOT`` from the site that a "flow" rule reaches.
+_MODEL_ORIGINS = int(RefOrigin.SLOT | RefOrigin.SDK)
 # The slots that the walk back through `via` visits at most, for one
 # function of one slot (`stored_places`).  Each way back ends at a source;
 # the limit bounds the work of one row of an answer, and an answer that it
@@ -319,7 +326,7 @@ def function_calls_by_slot(
     params = (config_hash, function, _RESOLVED)
     total = int(conn.execute(f"SELECT COUNT(*) FROM refs r WHERE {where}", params).fetchone()[0])
     rows = conn.execute(
-        f"""SELECT r.from_file, r.from_line, r.from_col, r.origins,
+        f"""SELECT r.from_file, r.from_line, r.from_col, r.origins, r.from_usr, r.to_usr,
                    c.qualified_name AS caller_qname, c.name AS caller_name, c.kind AS caller_kind
             FROM refs r LEFT JOIN symbols c ON c.config_hash = r.config_hash AND c.usr = r.from_usr
             WHERE {where}
@@ -328,3 +335,40 @@ def function_calls_by_slot(
         (*params, limit, offset),
     ).fetchall()
     return rows, total
+
+
+def sdk_entry(
+    conn: sqlite3.Connection, config_hash: str, edge: tuple[int, str | None, str, int, int, str],
+) -> str | None:
+    """The concept that starts the target of an edge (the scheduler, an interrupt), when a rule of the SDK model tells it.
+
+    *edge* is ``(origins, caller, file, line, col, target)`` of a row of
+    ``refs``.  An ``SDK`` edge stands at the declaration of the function of
+    a "call" rule.  A ``SLOT`` edge comes from a site whose slot a "flow"
+    rule reaches: the site is the trigger in C (``z_thread_entry``), and the
+    rule tells what runs the trigger.  In the two cases the target must be
+    in the slot of the rule (``slot_targets``).  WHY: a trigger can also
+    get a function from plain C code (`my_trampoline(plain)`), and one
+    function can have two rules on two parameters; a rule tells only what
+    starts the functions that went through its own slot.  None for every
+    other edge.  WHY a text of each entry: two rules can give one target.
+    """
+    origins, caller, file, line, col, target = edge
+    if not origins & _MODEL_ORIGINS:
+        return None
+    rows = conn.execute(
+        """SELECT l.entry FROM sdk_links l
+            WHERE l.config_hash = ? AND l.kind = 'call' AND l.target = ? AND l.file = ? AND l.line = ? AND l.col = ?
+              AND EXISTS (SELECT 1 FROM slot_targets t
+                           WHERE t.config_hash = l.config_hash AND t.slot = l.slot AND t.function = ?)
+           UNION
+           SELECT l.entry FROM sdk_links l
+             JOIN slot_sites s ON s.config_hash = l.config_hash AND s.slot = l.target
+            WHERE l.config_hash = ? AND l.kind = 'flow' AND s.file = ? AND s.line = ? AND s.col = ?
+              AND ifnull(s.caller, '') = ifnull(?, '')
+              AND EXISTS (SELECT 1 FROM slot_targets t
+                           WHERE t.config_hash = l.config_hash AND t.slot = l.slot AND t.function = ?)
+           ORDER BY 1""",
+        (config_hash, caller or "", file, line, col, target, config_hash, file, line, col, caller, target),
+    ).fetchall()
+    return "; ".join(row[0] for row in rows) or None

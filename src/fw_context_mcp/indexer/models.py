@@ -31,8 +31,10 @@ class RefOrigin(enum.IntFlag):
       older version that holds it gets a new config hash (the row format
       ``fw-context-rows/11``), thus its next index run writes every row.
     * ``ASM`` — the assembly reader: a vector table slot or an alias.
-    * ``DISPATCH`` — a dispatch bridge of the post-processing: an entry
-      point that runs a callback which a call site registered.
+    * ``SDK`` — a rule of the SDK model (``_sdk_model``): a function of an
+      SDK runs the function that a registration puts into its slot, and no
+      C code of the build does (a task that the port starts from a stack
+      frame, a library without source).
     * ``INSTANTIATION`` — the walk of the body of a template instance: a
       call that the template body names through a dependent type, which
       only an instantiation resolves.  The edge is stored on the template
@@ -50,7 +52,7 @@ class RefOrigin(enum.IntFlag):
 
     DIRECT = 1
     ASM = 4
-    DISPATCH = 8
+    SDK = 8
     INSTANTIATION = 16
     SLOT = 32
     TYPE_ONLY = 64
@@ -178,35 +180,6 @@ class InheritanceRecord:
     base_usr: str      # USR of the base class (parent)
     access: str        # "public", "protected", or "private"
     is_virtual: bool   # True for virtual inheritance
-
-
-@dataclass
-class PendingDispatch:
-    """Dispatch API call detected during indexing, resolved in post-processing.
-
-    Records a likely dispatch-registration pattern (e.g. ``EventQueue::call_every``
-    with ``&Class::method`` as an argument) before the dispatch entry point's
-    USR is known.  Resolver runs after all translation units are indexed.
-
-    Attributes:
-        callee_qn: Qualified name of the dispatch API method called
-            (e.g. ``"events::EventQueue::call_every"``).
-        target_qn_partial: Partial qualified name of the callback target
-            (e.g. ``"ZBLE::watch_ble"``).
-        target_name: Unqualified name of the callback target
-            (e.g. ``"watch_ble"``).
-        file: Source file path, relative to project root.
-        line: Source line number (1-based).
-        caller_usr: USR of the enclosing function that calls the dispatch API,
-            or None when at file scope.
-    """
-    callee_qn: str
-    target_qn_partial: str
-    target_name: str
-    file: str
-    line: int
-    caller_usr: str | None
-    target_usr: str | None = None
 
 
 # The slot facts of the indirect calls (indexer/_slots.py).  A slot key is

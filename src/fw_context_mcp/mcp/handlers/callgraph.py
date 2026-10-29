@@ -83,7 +83,7 @@ from .source import _lookup_definition
 log = logging.getLogger(__name__)
 
 # The origins of the call edges of the slot resolution.
-_INDIRECT_ORIGINS = int(RefOrigin.SLOT | RefOrigin.TYPE_ONLY)
+_INDIRECT_ORIGINS = int(RefOrigin.SLOT | RefOrigin.TYPE_ONLY | RefOrigin.SDK)
 
 def _resolve_virtual_callers(conn, config_hash: str, usr: str, root, ref_kind: list[str] | None,
                             limit: int = 50,
@@ -501,6 +501,7 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
                 "origins": origin_names(r["origins"]),
                 "caller": r["caller_qname"] or r["caller_name"] or "<file scope>",
                 "caller_kind": r["caller_kind"],
+                **indirect_rows.entry_field(conn, config_hash, r),
                 **({"target_qualified_name": r["target_qualified_name"]} if tagged else {}),
             }
             for r in rows
@@ -540,7 +541,10 @@ def find_callers(
     function-pointer assignments that text-based search cannot see.
     A slot of an assembly vector table (``ref_kind`` ``"vector"``) and an
     ``NVIC_SetVector`` install (``"runtime_vector"``) are not callers: use
-    ``find_references`` or ``get_vector_table`` for those.
+    ``find_references`` or ``get_vector_table`` for those.  The SDK model
+    gives the handler of an ``NVIC_SetVector`` install a ``"call"`` row
+    from ``NVIC_SetVector`` too (origin ``"sdk"``, entry ``"an
+    interrupt"``).
 
     Falls back to macro lookup when the symbol is not found as a
     function/method: returns the macro definition (kind="macro") and
@@ -592,15 +596,20 @@ def find_callers(
         ``"macro_use"``), origins (list — the analyses that found the site: ``"direct"``, the AST
         of the compiler names the target; ``"asm"``, the
         assembly reader (a call, a jump or a fall into another routine, of a
-        routine that the flow of control of the file gives); ``"dispatch"``,
-        a dispatch bridge;
+        routine that the flow of control of the file gives); ``"sdk"``, a
+        rule of the SDK model: a function of an SDK runs the function that a
+        registration put into its slot, and no C code of the build does (a
+        task that the scheduler starts, a callback of a library without
+        source); the row stands at the declaration of that function;
         ``"instantiation"``, the body of a template instance, stored on the
         template; ``"slot"``, an indirect call reaches a function that the
         code puts into the slot it calls through; ``"type_only"``, an
         indirect call whose slot does not tell its targets reaches each
         function of its type whose address the build takes, a superset),
         caller (enclosing function name), caller_kind (``"function"``,
-        ``"method"``, …). Macro fallback puts a dict with ``kind="macro"``,
+        ``"method"``, …), and ``entry`` when a rule of the SDK model gives
+        the edge: what starts the function (``"the FreeRTOS scheduler
+        (vTaskStartScheduler)"``, ``"an interrupt"``). Macro fallback puts a dict with ``kind="macro"``,
         ``signature`` (``#define`` free: ``NAME`` or ``NAME(a, b)``),
         ``is_function_like``, ``value`` (the replacement text ALONE) and
         ``expanded_value`` between the notice and the rows;
@@ -673,14 +682,14 @@ def find_references(
     Returns:
         The page notice first — ``total``, ``offset``, ``shown``, ``more``
         — then a dict per reference with: file, line, col, ref_kind,
-        origins (as in ``find_callers``), caller, caller_kind.
+        origins (as in ``find_callers``), caller, caller_kind, and
+        ``entry`` as in ``find_callers``.
         ``ref_kind`` is one of: ``"call"``, ``"ref"``, ``"member"``,
         ``"indirect"`` (function-pointer reference in arguments, assignments,
         initializers, or init lists), ``"implicit_construct"`` (the
         constructor that the compiler selects for an object at namespace
         or class scope; a local object, a new-expression and a member
-        initializer give a ``"call"``), ``"dispatch"`` (synthetic edge from a dispatch
-        bridge such as ``EventQueue::call_every``), ``"vector"`` (a slot of
+        initializer give a ``"call"``), ``"vector"`` (a slot of
         an assembly vector table names the symbol; file and line are the
         table entry), ``"vector_data"`` (a slot holds an address computed
         from the symbol, such as the initial stack pointer),
@@ -922,7 +931,8 @@ def find_indirect_targets(
         col, slot that receives the address, "" when none is known, and
         context, the code that stores it) and ``"called"`` (file, line,
         col, caller, caller_kind, origin: an indirect call that reaches
-        it).
+        it; ``"sdk"`` is a function of an SDK that runs it, and ``entry``
+        tells what starts it).
 
         When *name* matches several symbols, a ``warning`` dict names them
         and each row carries ``target_qualified_name``.
@@ -1000,6 +1010,7 @@ def find_indirect_targets(
                         "caller": call["caller_qname"] or call["caller_name"] or "<file scope>",
                         "caller_kind": call["caller_kind"],
                         "origin": origin_names(call["origins"] & _INDIRECT_ORIGINS)[0],
+                        **indirect_rows.entry_field(conn, config_hash, call),
                         **tag(label),
                     }
                     for call in calls
@@ -1135,8 +1146,8 @@ def find_call_path(
 ) -> list[dict]:
     """Find call paths between two C/C++ functions via BFS in the libclang
     call graph, including function-pointer edges, ISR vector
-    registrations, implicit constructors, and synthetic dispatch edges
-    (event loops, thread starts).  libclang-powered: follows
+    registrations, implicit constructors, and the edges of the SDK model
+    (a task that the scheduler starts).  libclang-powered: follows
     function-pointer edges and ISR vector registrations that text-based
     search cannot resolve.
 
@@ -1147,20 +1158,20 @@ def find_call_path(
     (e.g. ``"main → app_run → modem_init"``).
 
     **Edge types traversed:** The BFS includes ``call``, ``indirect``
-    (function pointers / ISRs), ``implicit_construct`` (the constructors
-    of the objects at namespace or class scope), and ``dispatch`` (synthetic edges through event
-    loops like ``EventQueue::dispatch_forever`` and thread starts like
-    ``Thread::start``).
+    (function pointers / ISRs), and ``implicit_construct`` (the constructors
+    of the objects at namespace or class scope).  A ``call`` edge with the
+    origin ``sdk`` comes from the SDK model: the registration function
+    (``xTaskCreate``) calls the task.
 
     **Limitations:**
 
-    - **Dispatch bridges:** callbacks registered through
-      ``EventQueue::call_every``, ``k_work_submit``, or ``xTimerStart``
-      reach their dispatch entry point (``dispatch_forever``,
-      ``z_work_q_main``) through a built-in map for mbed-os, Zephyr, and
-      FreeRTOS.  Add other RTOS patterns in
-      ``[call_graph.dispatch_bridges]`` (``.fw-context/config.toml``); a
-      bridge whose entry symbol is not in the index is skipped silently.
+    - **SDK entry points:** a task, a thread or a callback that an SDK
+      starts from data that no C code reads (a stack frame, a library
+      without source) gets its caller from the SDK model: built-in rules
+      for FreeRTOS, ESP-IDF, lwIP, Zephyr threads and CMSIS.  Add the
+      rules of another SDK in ``[[call_graph.sdk]]``
+      (``.fw-context/config.toml``).  The mbed ``EventQueue`` has no rule
+      yet: a callback that it calls can have no caller.
     - **Calls without a target:** a call that libclang cannot resolve
       (a dependent call in a template that is never instantiated) has NO
       call edge.  fw-context does not take a target from the name of the
@@ -1284,8 +1295,8 @@ def find_all_callers_recursive(
 ) -> list[dict]:
     """Find all transitive C/C++ callers — who calls *name*, directly or
     indirectly, through the libclang call graph including
-    function-pointer edges, implicit constructors, and synthetic
-    dispatch edges. libclang-powered: follows function-pointer
+    function-pointer edges, implicit constructors, and the edges of
+    the SDK model. libclang-powered: follows function-pointer
     assignments and ISR vector registrations across the full call tree.
 
     Use for impact analysis: "if I change this function, how far does the
@@ -1295,8 +1306,9 @@ def find_all_callers_recursive(
 
     **Edge types traversed:** Includes ``call``, ``indirect`` (function
     pointers / ISRs), ``implicit_construct`` (the constructors of the
-    objects at namespace or class scope), and ``dispatch`` (synthetic edges
-    through event loops and thread starts).
+    objects at namespace or class scope).  A ``call`` edge with the origin
+    ``sdk`` comes from the SDK model: the registration function
+    (``xTaskCreate``) calls the task.
 
     **Limitation — calls without a target:** a call that libclang cannot
     resolve (a dependent call in a template that is never instantiated)
@@ -1439,8 +1451,8 @@ def find_callees_recursive(
 ) -> list[dict]:
     """Find all transitive C/C++ callees — what *name* calls, directly or
     indirectly, through the libclang call graph including
-    function-pointer edges, implicit constructors, and synthetic
-    dispatch edges. libclang-powered: follows function-pointer
+    function-pointer edges, implicit constructors, and the edges of
+    the SDK model. libclang-powered: follows function-pointer
     calls and indirect invocations across the full dependency tree.
 
     Use for dependency analysis: "what does this function depend on to do
@@ -1450,8 +1462,9 @@ def find_callees_recursive(
 
     **Edge types traversed:** Includes ``call``, ``indirect`` (function
     pointers / ISRs), ``implicit_construct`` (the constructors of the
-    objects at namespace or class scope), and ``dispatch`` (synthetic edges
-    through event loops and thread starts).
+    objects at namespace or class scope).  A ``call`` edge with the origin
+    ``sdk`` comes from the SDK model: the registration function
+    (``xTaskCreate``) calls the task.
 
     **Limitation — calls without a target:** a call that libclang cannot
     resolve (a dependent call in a template that is never instantiated)

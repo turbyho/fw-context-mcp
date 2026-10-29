@@ -22,7 +22,6 @@ background runs as ``fw-context index``, thus the cleanup runs there too.
 from __future__ import annotations
 
 import logging
-import os
 import shutil
 import sqlite3
 import stat
@@ -227,7 +226,7 @@ def _config_files(project_root: Path | None) -> list[tuple[Path, bool, bool]]:
                 (config_dir / settings._PROJECT_CONFIG_NAME, False),
                 (config_dir / settings._PROJECT_LOCAL_CONFIG_NAME, True),
             )
-            if not _is_the_same_file(path, global_config)
+            if not settings._is_the_same_file(path, global_config)
         ]
     return config_files
 
@@ -248,10 +247,17 @@ def remove_unusable_values(project_root: Path | None, *, dry_run: bool = False) 
     file that the fix cannot write gives a failure for each value, thus the
     list of the check names the values also then.
     """
+    from .config import settings
     from .config.settings import config_value_problems
 
     report = CleanupReport()
+    # The file that the indexer reads the rules of the SDK model from.  In
+    # the home directory it is the global config (see _config_files).
+    project_config = (
+        None if project_root is None else project_root / settings._PROJECT_CONFIG_DIR / settings._PROJECT_CONFIG_NAME
+    )
     for path, of_project, backup in _config_files(project_root):
+        project_file = project_config is not None and settings._is_the_same_file(path, project_config)
         document, _unknown = _parse_config_file(path, report)
         if document is None:
             continue
@@ -259,7 +265,9 @@ def remove_unusable_values(project_root: Path | None, *, dry_run: bool = False) 
         # An old [llm] backend key is not a value to remove: the LLM profile
         # migration (``_llm_profile_migration``) moves it, and reports it.
         problems = [
-            problem for problem in config_value_problems(document.unwrap(), global_file=not of_project)
+            problem for problem in config_value_problems(
+                document.unwrap(), global_file=not of_project, project_file=project_file,
+            )
             if not (problem.keys[:1] == ("llm",) and problem.keys[1:2] and problem.keys[1] in _moved_llm_keys())
         ]
         removable = [problem for problem in problems if problem.removable]
@@ -280,7 +288,10 @@ def remove_unusable_values(project_root: Path | None, *, dry_run: bool = False) 
         # check named the same value again.
         left = {
             problem.message
-            for problem in config_value_problems(tomlkit.parse(tomlkit.dumps(document)).unwrap(), global_file=not of_project)
+            for problem in config_value_problems(
+                tomlkit.parse(tomlkit.dumps(document)).unwrap(), global_file=not of_project,
+                project_file=project_file,
+            )
         }
         if any(problem.message in left for problem in removable):
             report.failures += [
@@ -336,20 +347,6 @@ def _remove_at(document: tomlkit.TOMLDocument, keys: tuple[str | int, ...]) -> N
     for key in keys[:-1]:
         container = container[key]
     del container[keys[-1]]
-
-
-def _is_the_same_file(path: Path, other: Path) -> bool:
-    """Say if *path* and *other* are one file.
-
-    ``os.path.samefile`` also sees a link, and two spellings on a file
-    system that ignores the case.  A path that is not there, or that
-    cannot be examined, gives False: the read of that path then fails
-    too, and reports it, thus the global config is not changed twice.
-    """
-    try:
-        return os.path.samefile(path, other)
-    except OSError:
-        return False
 
 
 def _parse_config_file(path: Path, report: CleanupReport) -> tuple[tomlkit.TOMLDocument | None, bool]:
