@@ -2302,16 +2302,26 @@ place is the place of the expansion.
 - `"asm"` — the assembly reader (a vector table slot, an alias, a call
   or jump instruction, control that falls into another routine).
 - `"sdk"` — a rule of the SDK model: a function of an SDK runs the
-  function that a registration puts into its slot, and no C code of the
-  build does. A FreeRTOS task starts from a stack frame that the port
-  writes, and a library of the ESP32 Arduino core has no source. The row
-  is a `"call"` from the registration function (`xTaskCreate`) at its
-  declaration. The row also has `entry`: what starts the function, for
-  example `"the FreeRTOS scheduler (vTaskStartScheduler)"`. A `"slot"`
-  row has `entry` too when the target came to the site through the slot
-  of a rule (a Zephyr thread, which `z_thread_entry` calls). A plain C
-  call of `z_thread_entry` gives no `entry`. The built-in rules
-  cover FreeRTOS, ESP-IDF, lwIP, Zephyr threads and CMSIS;
+  function that a registration puts into a slot, and the call graph
+  cannot see the call. A FreeRTOS task starts from a stack frame that the
+  port writes, a library of the ESP32 Arduino core has no source, and the
+  mbed `EventQueue` keeps an event in memory as `void *`. The row is a
+  `"call"` from the function of the rule (`xTaskCreate`,
+  `EventQueue::function_call`) at its declaration. The row also has
+  `entry`: what starts the function, for example `"the FreeRTOS scheduler
+  (vTaskStartScheduler)"`. A `"call"` row of an other origin has `entry`
+  too when a rule tells what starts its target. This applies to two kinds
+  of row:
+  - A call from the function of a rule to a function of its slot. A
+    lambda that `function_call` calls through the instance of its
+    template gets no second row, but it gets the `entry`.
+  - A `"slot"` row whose target came to the site through the slot of a
+    rule. `z_thread_entry` calls a Zephyr thread in this way. A plain C
+    call of `z_thread_entry` gives no `entry`.
+
+  The built-in rules cover FreeRTOS, ESP-IDF, lwIP, Zephyr threads,
+  CMSIS and the mbed `EventQueue` (`call`, `call_in`, `call_every`; a
+  handler of `queue.event()` gets no caller from the model).
   `[[call_graph.sdk]]` adds rules (see the configuration).
 - `"instantiation"` — the body of a template instance. A call in a
   template body that names a dependent type (`device.sample()` with

@@ -1165,13 +1165,15 @@ def find_call_path(
 
     **Limitations:**
 
-    - **SDK entry points:** a task, a thread or a callback that an SDK
-      starts from data that no C code reads (a stack frame, a library
-      without source) gets its caller from the SDK model: built-in rules
-      for FreeRTOS, ESP-IDF, lwIP, Zephyr threads and CMSIS.  Add the
-      rules of another SDK in ``[[call_graph.sdk]]``
-      (``.fw-context/config.toml``).  The mbed ``EventQueue`` has no rule
-      yet: a callback that it calls can have no caller.
+    - **SDK entry points:** an SDK can start a task, a thread or a
+      callback from data that the call graph cannot follow (a stack
+      frame, a library without source, an event in memory through
+      ``void *``).  Such a function gets its caller from the SDK model.
+      The built-in rules cover FreeRTOS, ESP-IDF, lwIP, Zephyr threads,
+      CMSIS and the mbed ``EventQueue`` (``call``, ``call_in``,
+      ``call_every``).  A handler of ``queue.event(handler)`` gets no
+      caller from the model.  Add the rules of another SDK in
+      ``[[call_graph.sdk]]`` (``.fw-context/config.toml``).
     - **Calls without a target:** a call that libclang cannot resolve
       (a dependent call in a template that is never instantiated) has NO
       call edge.  fw-context does not take a target from the name of the

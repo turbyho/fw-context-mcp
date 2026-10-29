@@ -93,7 +93,7 @@ TUNING = [
      "[call_graph] dispatch_bridges is removed: write each rule as [[call_graph.sdk]]"),
     ("[call_graph]\nsdk = 3", "[[call_graph.sdk]] must be an array of tables"),
     ('[[call_graph.sdk]]\nsdk = "x"\nentry = "e"\nfunction = "f"',
-     "[[call_graph.sdk]] number 1: give 'param' or 'field', not the two and not neither"),
+     "[[call_graph.sdk]] number 1: give one of 'param', 'field' and 'slot'"),
     ('[[call_graph.sdk]]\nsdk = "x"\nentry = "e"\nfunction = "f"\nparam = -1',
      "[[call_graph.sdk]] number 1: 'param' must be an integer of 0 or more"),
     ('[[call_graph.sdk]]\nsdk = "x"\nentry = "e"\nfrom = { field = "a::b" }',
@@ -106,9 +106,15 @@ TUNING = [
      "[[call_graph.sdk]] number 1: 'sdk' must be a text that is not empty"),
     ('[[call_graph.sdk]]\nsdk = "x"\nentry = "e"\nfunction = "f"\nparam = true',
      "[[call_graph.sdk]] number 1: 'param' must be an integer of 0 or more"),
-    ('[[call_graph.sdk]]\nsdk = "x"\nentry = "e"\nfunction = "f"\nparam = 0\noutside_c = 1',
-     "[[call_graph.sdk]] number 1: 'outside_c' must be true or false"),
-    ('[[call_graph.sdk]]\nsdk = "x"\nentry = "e"\nfunction = "f"\nparam = 0\nslot = 1',
+    ('[[call_graph.sdk]]\nsdk = "x"\nentry = "e"\nfunction = "f"\nparam = 0\nalways = 1',
+     "[[call_graph.sdk]] number 1: 'always' must be true or false"),
+    ('[[call_graph.sdk]]\nsdk = "x"\nentry = "e"\nfunction = "f"\nparam = 0\nslot = { function = "g", param = 1 }',
+     "[[call_graph.sdk]] number 1: give one of 'param', 'field' and 'slot'"),
+    ('[[call_graph.sdk]]\nsdk = "x"\nentry = "e"\nfunction = "f"\nslot = 1',
+     "[[call_graph.sdk]] number 1 'slot' must be a table {function = \"f\", param = 0}: a field is the key 'field'"),
+    ('[[call_graph.sdk]]\nsdk = "x"\nentry = "e"\nfunction = "f"\nslot = { field = "a::b" }',
+     "[[call_graph.sdk]] number 1 'slot' must be a table {function = \"f\", param = 0}: a field is the key 'field'"),
+    ('[[call_graph.sdk]]\nsdk = "x"\nentry = "e"\nfunction = "f"\nparam = 0\nqueue = 1',
      "[[call_graph.sdk]] number 1: a rule holds 'sdk', 'entry' and either 'from' and 'to'"),
     ('[[call_graph.sdk]]\nsdk = "x"\nentry = "e"\nfrom = { field = "a::b", param = 1 }\nto = { field = "c::d" }',
      "[[call_graph.sdk]] number 1 'from' must hold 'function' and 'param', or 'field' only"),
@@ -337,7 +343,7 @@ class TestRemoval:
         rules = tomllib.loads((root / ".fw-context" / "config.toml").read_text(encoding="utf-8"))["call_graph"]["sdk"]
         assert [rule.get("param") for rule in rules] == [0, 0]
         assert [label for _, label in report.removed_keys] == [
-            "[[call_graph.sdk]] number 2: give 'param' or 'field', not the two and not neither",
+            "[[call_graph.sdk]] number 2: give one of 'param', 'field' and 'slot'",
         ]
 
     def test_local_toml_gets_a_copy_of_its_old_text(self, tmp_path, home):

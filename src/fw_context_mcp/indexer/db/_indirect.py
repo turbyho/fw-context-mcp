@@ -22,6 +22,7 @@ from __future__ import annotations
 import sqlite3
 
 from ..models import RefOrigin
+from ._schema import _table_exists
 
 __all__ = [
     "CODE_KINDS",
@@ -46,9 +47,6 @@ POINTER_KINDS: tuple[str, ...] = ("field", "variable", "varglobal", "varlocal")
 # The kinds of a symbol that makes calls and that a slot can hold.
 CODE_KINDS: tuple[str, ...] = ("function", "method", "constructor", "destructor", "lambda")
 _RESOLVED = int(RefOrigin.SLOT | RefOrigin.TYPE_ONLY | RefOrigin.SDK)
-# The origins of an edge that a rule of the SDK model can give: ``SDK``
-# from a "call" rule, ``SLOT`` from the site that a "flow" rule reaches.
-_MODEL_ORIGINS = int(RefOrigin.SLOT | RefOrigin.SDK)
 # The slots that the walk back through `via` visits at most, for one
 # function of one slot (`stored_places`).  Each way back ends at a source;
 # the limit bounds the work of one row of an answer, and an answer that it
@@ -326,7 +324,7 @@ def function_calls_by_slot(
     params = (config_hash, function, _RESOLVED)
     total = int(conn.execute(f"SELECT COUNT(*) FROM refs r WHERE {where}", params).fetchone()[0])
     rows = conn.execute(
-        f"""SELECT r.from_file, r.from_line, r.from_col, r.origins, r.from_usr, r.to_usr,
+        f"""SELECT r.from_file, r.from_line, r.from_col, r.origins, r.ref_kind, r.from_usr, r.to_usr,
                    c.qualified_name AS caller_qname, c.name AS caller_name, c.kind AS caller_kind
             FROM refs r LEFT JOIN symbols c ON c.config_hash = r.config_hash AND c.usr = r.from_usr
             WHERE {where}
@@ -338,27 +336,46 @@ def function_calls_by_slot(
 
 
 def sdk_entry(
-    conn: sqlite3.Connection, config_hash: str, edge: tuple[int, str | None, str, int, int, str],
+    conn: sqlite3.Connection, config_hash: str, edge: tuple[int, str, str | None, str, int, int, str],
 ) -> str | None:
     """The concept that starts the target of an edge (the scheduler, an interrupt), when a rule of the SDK model tells it.
 
-    *edge* is ``(origins, caller, file, line, col, target)`` of a row of
-    ``refs``.  An ``SDK`` edge stands at the declaration of the function of
-    a "call" rule.  A ``SLOT`` edge comes from a site whose slot a "flow"
-    rule reaches: the site is the trigger in C (``z_thread_entry``), and the
-    rule tells what runs the trigger.  In the two cases the target must be
-    in the slot of the rule (``slot_targets``).  WHY: a trigger can also
-    get a function from plain C code (`my_trampoline(plain)`), and one
-    function can have two rules on two parameters; a rule tells only what
-    starts the functions that went through its own slot.  None for every
-    other edge.  WHY a text of each entry: two rules can give one target.
+    *edge* is ``(origins, ref_kind, caller, file, line, col, target)`` of a
+    row of ``refs``.  Only a ``call`` edge can have an entry: an
+    ``indirect`` row of the function of a rule takes an address, it calls
+    nothing.  Two cases:
+
+    * The caller is the function of a "call" rule.  The edge is its
+      ``SDK`` edge, or an edge that the code gives (the mbed
+      ``EventQueue::function_call`` calls a lambda through the instance of
+      its template, and the rule then adds no edge).  An edge by the type
+      only gets no entry: it is a guess, and the rule then gives its own
+      ``SDK`` edge (``_slot_resolution._known_calls``).
+    * An edge from a site whose slot a "flow" rule reaches: the site is the
+      trigger in C (``z_thread_entry``), and the rule tells what runs the
+      trigger.  WHY no test of the origin: the flow gives each function of
+      the source slot to the slot of the site, thus the row of the site to
+      such a target always holds the origin ``SLOT``.  A row has one key for
+      each site, and the origins of the analyses that found it are bits of
+      that row.
+
+    In the two cases the target must be in the slot of the rule
+    (``slot_targets``).  WHY: a trigger can also get a function from plain
+    C code (`my_trampoline(plain)`), and one function can have two rules
+    on two parameters; a rule tells only what starts the functions that
+    went through its own slot.  None for every other edge.  WHY a text of
+    each entry: two rules can give one target.
+
+    An index of an older version has no table ``sdk_links``, and the read
+    paths of the MCP server do not migrate it (see ``_memory.
+    get_memory_regions``): it gives None, as an index without a rule.
     """
-    origins, caller, file, line, col, target = edge
-    if not origins & _MODEL_ORIGINS:
+    origins, ref_kind, caller, file, line, col, target = edge
+    if ref_kind != "call" or not _table_exists(conn, "sdk_links"):
         return None
     rows = conn.execute(
         """SELECT l.entry FROM sdk_links l
-            WHERE l.config_hash = ? AND l.kind = 'call' AND l.target = ? AND l.file = ? AND l.line = ? AND l.col = ?
+            WHERE ? AND l.config_hash = ? AND l.kind = 'call' AND l.target = ?
               AND EXISTS (SELECT 1 FROM slot_targets t
                            WHERE t.config_hash = l.config_hash AND t.slot = l.slot AND t.function = ?)
            UNION
@@ -369,6 +386,9 @@ def sdk_entry(
               AND EXISTS (SELECT 1 FROM slot_targets t
                            WHERE t.config_hash = l.config_hash AND t.slot = l.slot AND t.function = ?)
            ORDER BY 1""",
-        (config_hash, caller or "", file, line, col, target, config_hash, file, line, col, caller, target),
+        (
+            bool(origins & ~RefOrigin.TYPE_ONLY), config_hash, caller or "", target,
+            config_hash, file, line, col, caller, target,
+        ),
     ).fetchall()
     return "; ".join(row[0] for row in rows) or None

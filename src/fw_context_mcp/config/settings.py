@@ -333,22 +333,24 @@ _PROJECT_DEFAULTS_TEMPLATE = """\
 
 [call_graph]
 # [[call_graph.sdk]]: a rule of the SDK model. It tells what runs a function
-#   that an SDK registers, when no C code of the build calls it (a task that
-#   the port starts from a stack frame, a callback of a library without
-#   source). The built-in rules cover FreeRTOS, ESP-IDF, lwIP, Zephyr
-#   threads and CMSIS. A rule of the project adds to them.
+#   that an SDK registers, when the call graph cannot see the call (a task
+#   that the port starts from a stack frame, a callback of a library without
+#   source, an event in memory through void *). The built-in rules cover
+#   FreeRTOS, ESP-IDF, lwIP, Zephyr threads, CMSIS and the mbed EventQueue.
+#   A rule of the project adds to them.
 #
 #   A call: `function` runs the function in its parameter `param` (from 0),
-#   or in the field `field` ("record::field"). The edge goes from
-#   `function` to each function of the slot. Without `outside_c = true`
-#   the rule applies only when the build has no body of `function`.
+#   in the field `field` ("record::field"), or in the parameter of an other
+#   function: `slot = { function = "f", param = 0 }`. The edge goes from
+#   `function` to each function of the slot. Without `always = true` the
+#   rule applies only when the build has no body of `function`.
 #
 # [[call_graph.sdk]]
 # sdk = "my-rtos"
 # entry = "the my-rtos scheduler"
 # function = "task_create"
 # param = 0
-# outside_c = true
+# always = true
 #
 #   A flow: code out of the AST gives the value of one slot to an other
 #   slot, and C code calls through the second one.

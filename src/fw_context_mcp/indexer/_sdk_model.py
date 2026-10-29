@@ -2,12 +2,15 @@
 
 WHY this module exists: the slot facts carry a function to the slot of its
 registration (`xTaskCreate(task, ...)` puts `task` into parameter 0), but
-some SDKs start the function from data that no C code reads:
+some SDKs start the function from data that the slot facts do not follow:
 
 * A task or a thread starts from a stack frame that the port writes as
   integers, and assembly code loads the frame.
 * A library has no source in the build (the ESP32 Arduino core has only
   the headers of FreeRTOS, ESP-IDF and lwIP), thus no body reads the slot.
+* An event queue copies a callable object into the memory of an event,
+  and its dispatch reads the object through `void *` (the mbed
+  ``EventQueue``: ``new (e) F(f)``, then ``(*static_cast<F *>(p))()``).
 
 Such a function had no caller.  The model gives the missing step, as data.
 A rule has one of two shapes:
@@ -17,14 +20,21 @@ A rule has one of two shapes:
   ``arch_new_thread`` to parameter 0 of ``z_thread_entry`` through a stack
   frame.  The slot resolution then gives the edge from the real trigger
   (origin ``SLOT``).
-* ``Call`` — a function runs the function in a slot, and no C code does.
-  The edge goes from the function of the registration to each target of
-  the slot (origin ``SDK``).  The rule applies when the build has no body
-  of the function (a library without source), or always when the start is
-  out of C (``outside_c``: a FreeRTOS task, an RTX thread, an interrupt
-  vector that ``NVIC_SetVector`` writes).  WHY not always: a body that
-  calls the slot in C gives the edge from the real trigger (lwIP with its
-  source calls ``pcb->recv``).
+* ``Call`` — a function runs the function in a slot: a parameter of the
+  function, a parameter of an other function, or a field.  The edge goes
+  from the function to each target of the slot (origin ``SDK``).  The rule
+  applies when the build has no body of the function (a library without
+  source).  With ``always``, it applies also with a body: the slot facts
+  cannot see the path.  Examples are a FreeRTOS task, an RTX thread, an
+  interrupt vector that ``NVIC_SetVector`` writes, and the event memory
+  of the mbed ``EventQueue``.  WHY not always: a body that calls the slot
+  in C gives the edge from the real trigger (lwIP with its source calls
+  ``pcb->recv``).
+
+A ``Call`` rule gives no edge where the code already gives an edge from
+its function to the target (other than by the type only): the mbed
+``EventQueue::function_call`` calls a lambda through the instance of its
+template.  That edge gets the ``entry`` of the rule instead.
 
 A ``Call`` rule whose slot flows into the slot of an other ``Call`` rule
 gives no edge (``_slot_resolution``): the inner rule gives it, thus a
@@ -56,6 +66,10 @@ Limits:
   Zephyr has no rule: ``IRQ_DIRECT_CONNECT`` writes the same field
   (``_isr_list::func``) with the flag ``ISR_FLAG_DIRECT``, and the
   hardware calls such a function, not ``_isr_wrapper``.
+* A rule needs the function in a slot.  The mbed ``EventQueue::event``
+  gives its function to the constructor of ``Event`` in a ``return``
+  statement, and the slot facts lose it there.  Thus a handler of
+  ``queue.event(handler)`` gets no caller from the model.
 """
 
 from __future__ import annotations
@@ -107,17 +121,18 @@ class Flow:
 
 @dataclass(frozen=True)
 class Call:
-    """*function* runs the function in its parameter *slot* (an index) or in a field.
+    """*function* runs the function in *slot*: its own parameter (an index), a parameter of an other function, or a field.
 
-    *outside_c*: the start is out of C, thus the rule applies also when the
-    build has the body of *function*.
+    *always*: the slot facts cannot see the path from the slot to the
+    call, thus the rule applies also when the build has the body of
+    *function*.
     """
 
     sdk: str
     entry: str
     function: str
-    slot: int | Field
-    outside_c: bool = False
+    slot: int | Param | Field
+    always: bool = False
 
 
 Rule = Flow | Call
@@ -128,13 +143,15 @@ _INTERRUPT = "an interrupt"
 _EVENT_LOOP = "the ESP-IDF default event loop task"
 _TCPIP = "the lwIP tcpip thread"
 _ZEPHYR = "the Zephyr scheduler"
+_EVENT_QUEUE = "the mbed EventQueue (dispatch)"
+_FUNCTION_CALL = "events::EventQueue::function_call"
 
 BUILTIN_RULES: tuple[Rule, ...] = (
     # ── FreeRTOS, with the ESP-IDF names: the port writes the stack frame.
-    Call("FreeRTOS", _FREERTOS, "xTaskCreate", 0, outside_c=True),
-    Call("FreeRTOS", _FREERTOS, "xTaskCreateStatic", 0, outside_c=True),
-    Call("FreeRTOS", _FREERTOS, "xTaskCreatePinnedToCore", 0, outside_c=True),
-    Call("FreeRTOS", _FREERTOS, "xTaskCreateStaticPinnedToCore", 0, outside_c=True),
+    Call("FreeRTOS", _FREERTOS, "xTaskCreate", 0, always=True),
+    Call("FreeRTOS", _FREERTOS, "xTaskCreateStatic", 0, always=True),
+    Call("FreeRTOS", _FREERTOS, "xTaskCreatePinnedToCore", 0, always=True),
+    Call("FreeRTOS", _FREERTOS, "xTaskCreateStaticPinnedToCore", 0, always=True),
     Call("FreeRTOS", _TIMER_TASK, "xTimerCreate", 4),
     Call("FreeRTOS", _TIMER_TASK, "xTimerCreateStatic", 4),
     # ── ESP-IDF: the libraries of the ESP32 Arduino core have no source.
@@ -172,9 +189,18 @@ BUILTIN_RULES: tuple[Rule, ...] = (
     Flow("Zephyr", _ZEPHYR, Param("arch_switch_to_main_thread", 2), Param("z_thread_entry", 0)),
     # ── CMSIS: the RTX kernel starts a thread from its stack frame, and the
     # NVIC calls the vector that the table of integers holds.
-    Call("CMSIS-RTOS2", "the RTX kernel (osKernelStart)", "osThreadNew", 0, outside_c=True),
-    Call("CMSIS", _INTERRUPT, "NVIC_SetVector", 1, outside_c=True),
-    Call("CMSIS", _INTERRUPT, "__NVIC_SetVector", 1, outside_c=True),
+    Call("CMSIS-RTOS2", "the RTX kernel (osKernelStart)", "osThreadNew", 0, always=True),
+    Call("CMSIS", _INTERRUPT, "NVIC_SetVector", 1, always=True),
+    Call("CMSIS", _INTERRUPT, "__NVIC_SetVector", 1, always=True),
+    # ── mbed OS: the EventQueue copies the callable object into the memory
+    # of the event, and `function_call<F>` calls it through `void *`.  The
+    # function is in the parameter F of each overload that takes one
+    # (`call(F f)`, `call_in(ms, F f)`, `call_every(ms, F f)`); the other
+    # overloads give their function to these.  A parameter of an overload
+    # at the same index that holds an object pointer holds no function.
+    Call("Mbed OS", _EVENT_QUEUE, _FUNCTION_CALL, Param("events::EventQueue::call", 0), always=True),
+    Call("Mbed OS", _EVENT_QUEUE, _FUNCTION_CALL, Param("events::EventQueue::call_in", 1), always=True),
+    Call("Mbed OS", _EVENT_QUEUE, _FUNCTION_CALL, Param("events::EventQueue::call_every", 1), always=True),
 )
 
 
@@ -214,20 +240,31 @@ def _rule(table: object, label: str) -> Rule:
     keys = set(table) - {"sdk", "entry"}
     if keys == {"from", "to"}:
         return Flow(sdk, entry, _slot_name(table["from"], f"{label} 'from'"), _slot_name(table["to"], f"{label} 'to'"))
-    if "function" in keys and keys <= {"function", "param", "field", "outside_c"}:
+    if "function" in keys and keys <= {"function", "param", "field", "slot", "always"}:
         function = _text(table, "function", label)
-        outside_c = table.get("outside_c", False)
-        if not isinstance(outside_c, bool):
-            raise ValueError(f"{label}: 'outside_c' must be true or false")
-        if ("param" in table) == ("field" in table):
-            raise ValueError(f"{label}: give 'param' or 'field', not the two and not neither")
-        slot: int | Field = (
-            _index(table["param"], label) if "param" in table else Field(_text(table, "field", label))
-        )
-        return Call(sdk, entry, function, slot, outside_c=outside_c)
+        always = table.get("always", False)
+        if not isinstance(always, bool):
+            raise ValueError(f"{label}: 'always' must be true or false")
+        if len(keys & {"param", "field", "slot"}) != 1:
+            raise ValueError(f"{label}: give one of 'param', 'field' and 'slot'")
+        slot: int | Param | Field
+        if "param" in table:
+            slot = _index(table["param"], label)
+        elif "field" in table:
+            slot = Field(_text(table, "field", label))
+        else:
+            # WHY a parameter only: `field` already names a field, and one
+            # fact must have one key.
+            value = table["slot"]
+            if not isinstance(value, Mapping) or set(value) != {"function", "param"}:
+                raise ValueError(
+                    f"{label} 'slot' must be a table {{function = \"f\", param = 0}}: a field is the key 'field'",
+                )
+            slot = Param(_text(value, "function", f"{label} 'slot'"), _index(value["param"], f"{label} 'slot'"))
+        return Call(sdk, entry, function, slot, always=always)
     raise ValueError(
         f"{label}: a rule holds 'sdk', 'entry' and either 'from' and 'to' (a flow), or 'function' with "
-        "'param' or 'field' and an optional 'outside_c' (a call)",
+        "one of 'param', 'field' and 'slot', and an optional 'always' (a call)",
     )
 
 
@@ -312,10 +349,10 @@ def write_links(conn: sqlite3.Connection, config_hash: str, rules: Iterable[Rule
     """Replace the links of the build (table ``sdk_links``): each rule for each symbol of its names.
 
     A ``flow`` row gives the source slot and the target slot.  A ``call``
-    row gives the slot, the function of the registration (*target*) and
-    the place of its declaration, where the edge stands: the SDK runs the
-    function from there, and the build has no line that does.  Gives the
-    count of the rows.
+    row gives the slot, the function of the rule (*target*) and the place
+    of its declaration, where the edge stands: the SDK runs the function
+    from there, and the build has no line that the slot facts see.  Gives
+    the count of the rows.
     """
     rules = list(rules)
     function_names = {rule.function for rule in rules if isinstance(rule, Call)}
@@ -343,7 +380,7 @@ def write_links(conn: sqlite3.Connection, config_hash: str, rules: Iterable[Rule
                     rows.add((config_hash, "flow", source, target, rule.entry, rule.sdk, "", 0, 0))
             continue
         for symbol in functions.get(rule.function, []):
-            if symbol.is_definition and not rule.outside_c:
+            if symbol.is_definition and not rule.always:
                 continue
             targets = [f"P|{symbol.usr}|{rule.slot}"] if isinstance(rule.slot, int) else slots(rule.slot)
             for slot in targets:

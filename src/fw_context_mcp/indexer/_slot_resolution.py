@@ -20,9 +20,10 @@ code that makes the call, at the place of the call:
   a slot that code out of view can write (an escape flows into it).
 * origin ``SDK``: a rule of the SDK model (``_sdk_model``, table
   ``sdk_links``) says that a function of an SDK runs the function in a
-  slot, and no C code of the build does.  The edge goes from that function,
-  at its declaration.  A "flow" rule of the model is a flow of the graph:
-  the edge that it gives comes from a site, with origin ``SLOT``.
+  slot, and the slot facts cannot see the call.  The edge goes from that
+  function, at its declaration, where the code gives no edge from it to
+  the target.  A "flow" rule of the model is a flow of the graph: the
+  edge that it gives comes from a site, with origin ``SLOT``.
 
 A slot that no source reaches and that does not escape gets no target: no
 code of the build puts a function into it.  WHY not the functions of its
@@ -309,7 +310,9 @@ def _reach(start: str, slots: _Slots) -> set[str]:
     return reached
 
 
-def _sdk_edges(config_hash: str, calls: list[_SdkCall], slots: _Slots) -> list[tuple]:
+def _sdk_edges(
+    config_hash: str, calls: list[_SdkCall], slots: _Slots, known: set[tuple[str, str]],
+) -> list[tuple]:
     """The ``SDK`` edges of the "call" links: from the caller of the link to each target of its slot.
 
     A link whose slot flows into the slot of an inner link gives no edge.
@@ -322,6 +325,14 @@ def _sdk_edges(config_hash: str, calls: list[_SdkCall], slots: _Slots) -> list[t
     flow into each other, give their edges, because no one of them runs
     the targets in place of the other.  An outer link whose slot flows into
     two inner links gives an edge from each of them: each is a path.
+
+    A target that the code already calls from the function of the link
+    (*known*: the pairs of caller and target of the other edges, except an
+    edge by the type only) gets no second edge.  WHY: the mbed
+    ``EventQueue::function_call<F>`` calls a lambda through the instance of
+    its template (origin ``INSTANTIATION``); an edge at the declaration
+    would give one call two rows.  That edge gets the entry of the link
+    (``db/_indirect.sdk_entry``).
     """
     linked = {call.slot for call in calls}
     reach = {slot: _reach(slot, slots) for slot in linked}
@@ -330,10 +341,36 @@ def _sdk_edges(config_hash: str, calls: list[_SdkCall], slots: _Slots) -> list[t
         if any(call.slot not in reach[other] for other in reach[call.slot] & linked):
             continue
         for target in sorted(slots.targets.get(call.slot, ())):
+            if (call.caller, target) in known:
+                continue
             rows.append((
                 config_hash, target, call.file, call.line, call.caller, "call", None, call.col, int(RefOrigin.SDK),
             ))
     return rows
+
+
+def _known_calls(
+    conn: sqlite3.Connection, config_hash: str, calls: list[_SdkCall], rows: list[tuple],
+) -> set[tuple[str, str]]:
+    """The pairs (caller, target) of the call edges from the functions of *calls*, except an edge by the type only.
+
+    The rows of the other analyses are in ``refs`` (this resolution has
+    deleted its own); *rows* are the edges of the sites of this run.
+    """
+    callers = {call.caller for call in calls}
+    known: set[tuple[str, str]] = set()
+    for caller in sorted(callers):
+        known.update(
+            (caller, row[0]) for row in conn.execute(
+                "SELECT DISTINCT to_usr FROM refs WHERE config_hash = ? AND from_usr = ? AND ref_kind = 'call'",
+                (config_hash, caller),
+            )
+        )
+    known.update(
+        (row[4], row[1]) for row in rows
+        if row[4] in callers and row[8] != int(RefOrigin.TYPE_ONLY)
+    )
+    return known
 
 
 def resolve_slot_edges(conn: sqlite3.Connection, config_hash: str) -> dict[str, int]:
@@ -390,7 +427,7 @@ def resolve_slot_edges(conn: sqlite3.Connection, config_hash: str) -> dict[str, 
         else:
             counts["unresolved"] += 1
     counts["edges"] = len(set(rows))
-    sdk_rows = _sdk_edges(config_hash, calls, slots)
+    sdk_rows = _sdk_edges(config_hash, calls, slots, _known_calls(conn, config_hash, calls, rows))
     counts["sdk"] = len(set(sdk_rows))
     if rows or sdk_rows:
         insert_refs_batch(conn, rows + sdk_rows)

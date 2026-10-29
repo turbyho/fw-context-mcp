@@ -565,8 +565,13 @@ Some SDKs start a registered function from data that no C code reads. A
 FreeRTOS task starts from a stack frame that the port writes as integers,
 and a library of the ESP32 Arduino core has no source. Such a function has
 no caller in the code. The SDK model gives the missing step. The built-in
-rules cover FreeRTOS, ESP-IDF, lwIP, Zephyr threads and CMSIS
-(`NVIC_SetVector`, the RTX `osThreadNew`). Each `[[call_graph.sdk]]` table
+rules cover FreeRTOS, ESP-IDF, lwIP, Zephyr threads, CMSIS
+(`NVIC_SetVector`, the RTX `osThreadNew`) and the mbed `EventQueue` (an
+event goes through memory as `void *`). The rules of the `EventQueue`
+cover `call`, `call_in` and `call_every`. A handler of
+`queue.event(handler)` gets no caller from the model: the call graph loses
+the function where `EventQueue::event` gives it to the constructor of
+`Event`. Each `[[call_graph.sdk]]` table
 adds a rule. fw-context reads the rules only from `.fw-context/config.toml`
 of the project, at each index run and at each `reindex_file`. A rule in
 `local.toml` or in the global config gives a warning, and fw-context does
@@ -575,12 +580,19 @@ not use it: move it to `config.toml`.
 A rule has one of two shapes:
 
 - A call: `function` runs the function in its parameter `param` (counted
-  from 0), or in the field `field` (`"record::field"`). The call graph gets
-  an edge from `function` to each function that the code puts there
-  (origin `"sdk"`). The rule applies only when the build has no body of
-  `function`, because a body that calls the slot in C gives the edge from
-  the real caller. Set `outside_c = true` when the start is out of C
-  (assembly, hardware): the rule then applies also with a body.
+  from 0), in the field `field` (`"record::field"`), or in the parameter
+  of an other function (`slot = { function = "f", param = 0 }`). The call
+  graph gets an edge from `function` to each function that the code puts
+  there (origin `"sdk"`). The rule applies only when the build has no body
+  of `function`, because a body that calls the slot in C gives the edge
+  from the real caller. Set `always = true` when the call graph cannot see
+  the path from the slot to the call. Examples are a start from assembly
+  or hardware, and memory through `void *`. The rule then applies also
+  with a body. Where the code already gives an edge from `function` to a
+  function of the slot, the rule adds no edge, and that edge gets the
+  `entry`. An edge by the type only (origin `"type_only"`) does not count
+  here: the rule adds its edge next to it, and the edge by the type only
+  gets no `entry`.
 - A flow: code out of the AST gives the value of the slot `from` to the
   slot `to`, and C code calls through `to`. Zephyr writes the entry of a
   thread into a stack frame in `arch_new_thread`, and `z_thread_entry`
@@ -592,7 +604,7 @@ A rule has one of two shapes:
 |-----|-------------|
 | `sdk` | The name of the SDK, a text that is not empty. |
 | `entry` | What starts the function, for example `"the my-rtos scheduler"`. The tools show it with the edge. |
-| `function`, `param` or `field`, `outside_c` | A call rule. `outside_c` is optional (default `false`). |
+| `function`, one of `param`, `field` and `slot`, `always` | A call rule. `always` is optional (default `false`). |
 | `from`, `to` | A flow rule. |
 
 ```toml
@@ -601,7 +613,7 @@ sdk = "my-rtos"
 entry = "the my-rtos scheduler"
 function = "task_create"
 param = 0
-outside_c = true
+always = true
 
 [[call_graph.sdk]]
 sdk = "my-rtos"

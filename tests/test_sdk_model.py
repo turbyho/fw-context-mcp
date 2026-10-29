@@ -5,8 +5,9 @@ integers, and a library of the ESP32 Arduino core has no source.  The slot
 facts carry the function to the slot of its registration; a rule of the
 model tells what runs it:
 
-* a "call" rule: the registration function calls the slot (origin ``sdk``),
-  when the build has no body of it, or always when the start is out of C;
+* a "call" rule: a function calls the slot (origin ``sdk``).  The rule
+  applies when the build has no body of the function, or ``always`` when
+  the slot facts cannot see the path to the call;
 * a "flow" rule: code out of the AST gives the slot to the slot of a
   trigger in C (Zephyr ``arch_new_thread`` → ``z_thread_entry``), and the
   slot resolution gives the edge from the trigger (origin ``slot``).
@@ -106,10 +107,16 @@ void in1(void (*f)(void)) { frame_word = (uint32_t) f; }
 void in2(void (*f)(void)) { frame_word2 = (uint32_t) f; }
 void outer(void (*f)(void)) { if (f) in1(f); else in2(f); }
 static void two_job(void) {}
+void post(void (*f)(void)) { frame_word = (uint32_t) f; }
+static void posted(void);
+void dispatcher(void) { post(posted); }
+void runner(void (*f)(void)) { f(); }
+static void ran_job(void) {}
+static void posted(void) {}
 void use(struct tcp_pcb *pcb)
 {
     tcp_recv(pcb, on_recv); my_task_start(my_task); port_thread(my_thread);
-    my_trampoline(plain); reg_cycle(cycle_job); reg2(fa, fb); ra(mutual_job); outer(two_job);
+    my_trampoline(plain); reg_cycle(cycle_job); reg2(fa, fb); ra(mutual_job); outer(two_job); post(posted); runner(ran_job);
 }
 """
 OWN_RULES = """
@@ -118,7 +125,7 @@ sdk = "my-rtos"
 entry = "the my-rtos scheduler"
 function = "my_task_start"
 param = 0
-outside_c = true
+always = true
 
 [[call_graph.sdk]]
 sdk = "my-rtos"
@@ -136,56 +143,121 @@ sdk = "my-rtos"
 entry = "the cycle"
 function = "reg_cycle"
 param = 0
-outside_c = true
+always = true
 
 [[call_graph.sdk]]
 sdk = "my-rtos"
 entry = "entry A"
 function = "reg2"
 param = 0
-outside_c = true
+always = true
 
 [[call_graph.sdk]]
 sdk = "my-rtos"
 entry = "entry B"
 function = "reg2"
 param = 1
-outside_c = true
+always = true
 
 [[call_graph.sdk]]
 sdk = "my-rtos"
 entry = "the my-rtos scheduler"
 function = "ra"
 param = 0
-outside_c = true
+always = true
 
 [[call_graph.sdk]]
 sdk = "my-rtos"
 entry = "the my-rtos scheduler"
 function = "rb"
 param = 0
-outside_c = true
+always = true
 
 [[call_graph.sdk]]
 sdk = "my-rtos"
 entry = "the my-rtos scheduler"
 function = "in1"
 param = 0
-outside_c = true
+always = true
 
 [[call_graph.sdk]]
 sdk = "my-rtos"
 entry = "the my-rtos scheduler"
 function = "in2"
 param = 0
-outside_c = true
+always = true
 
 [[call_graph.sdk]]
 sdk = "my-rtos"
 entry = "the my-rtos scheduler"
 function = "outer"
 param = 0
-outside_c = true
+always = true
+
+[[call_graph.sdk]]
+sdk = "my-rtos"
+entry = "the my-rtos dispatcher"
+function = "dispatcher"
+slot = { function = "post", param = 0 }
+always = true
+
+[[call_graph.sdk]]
+sdk = "my-rtos"
+entry = "the my-rtos runner"
+function = "runner"
+param = 0
+always = true
+"""
+
+
+# An event queue of the shape of the mbed EventQueue: the callable object
+# goes into the memory of the event, and `function_call<F>` calls it
+# through `void *`.  A `std::function` carries its function as an
+# `mbed::Callback` does; a lambda gets its call from the instance of the
+# template.
+QUEUE_CPP = """\
+#include <functional>
+#include <new>
+namespace events {
+typedef void (*cb_t)(void *);
+void equeue_post(cb_t cb, void *p);
+void *equeue_alloc(unsigned size);
+class EventQueue {
+public:
+    template <typename F> int call(F f)
+    {
+        void *p = equeue_alloc(sizeof(F));
+        new (p) F(f);
+        equeue_post(&EventQueue::function_call<F>, p);
+        return 1;
+    }
+    template <typename F> int call_every(int ms, F f) { (void) ms; return call(f); }
+    template <typename F, typename A> int call(F f, A a) { return call(context<F, A>(f, a)); }
+    template <typename T, typename R> int call(T *obj, R (T::*method)()) { (void) obj; (void) method; return 0; }
+private:
+    template <typename F> static void function_call(void *p) { (*static_cast<F *>(p))(); }
+    template <typename F, typename A> struct context {
+        F f; A a;
+        context(F f, A a) : f(f), a(a) {}
+        void operator()() { f(a); }
+    };
+};
+}
+static void with_arg(int x) { (void) x; }
+struct Obj { void m() {} };
+static Obj obj;
+static void job() {}
+static void every() {}
+static int by_pointer() { return 0; }
+void app(events::EventQueue &queue, int n)
+{
+    queue.call(&by_pointer);
+    queue.call(std::function<void()>(job));
+    queue.call_every(10, std::function<void()>(every));
+    queue.call([n] { (void) n; });
+    queue.call(&with_arg, 5);
+    queue.call(&obj, &Obj::m);
+}
 """
 
 
@@ -201,8 +273,9 @@ def _index(root: Path, files: dict[str, str], name: str, config: str = "") -> tu
     for file, text in files.items():
         (root / file).write_text(text, encoding="utf-8")
     (root / "compile_commands.json").write_text(json.dumps([
-        {"directory": str(root), "file": file, "arguments": ["cc", "-std=gnu11", "-c", file]}
-        for file in files if file.endswith(".c")
+        {"directory": str(root), "file": file,
+         "arguments": ["c++", "-std=c++17", "-c", file] if file.endswith(".cpp") else ["cc", "-std=gnu11", "-c", file]}
+        for file in files if file.endswith((".c", ".cpp"))
     ]), encoding="utf-8")
     db_path = db_dir / name / "index.db"
     db_path.parent.mkdir(parents=True)
@@ -235,7 +308,8 @@ def _entry(conn: sqlite3.Connection, config_hash: str, name: str) -> str | None:
 
     edge = _edge(conn, name)
     return sdk_entry(conn, config_hash, (
-        edge["origins"], edge["from_usr"], edge["from_file"], edge["from_line"], edge["from_col"], edge["to_usr"],
+        edge["origins"], edge["ref_kind"], edge["from_usr"], edge["from_file"], edge["from_line"], edge["from_col"],
+        edge["to_usr"],
     ))
 
 
@@ -253,6 +327,15 @@ def without_source(tmp_path_factory) -> tuple[sqlite3.Connection, str, Path]:
     root.mkdir()
     conn, config_hash = _index(root, {"sdk.h": SDK_H, "kernel.c": KERNEL_C, "app.c": APP_C}, "proj-sdk")
     yield conn, config_hash, root
+    conn.close()
+
+
+@pytest.fixture(scope="module")
+def queue(tmp_path_factory) -> tuple[sqlite3.Connection, str]:
+    root = tmp_path_factory.mktemp("queue") / "proj"
+    root.mkdir()
+    conn, config_hash = _index(root, {"queue.cpp": QUEUE_CPP}, "proj-queue")
+    yield conn, config_hash
     conn.close()
 
 
@@ -337,6 +420,70 @@ def test_the_resolution_of_reindex_file_writes_the_links_again(without_source):
     assert _callers(conn, "task_a") == [("xTaskCreatePinnedToCore", ["sdk"])]
 
 
+def test_a_callable_object_of_an_event_queue_gets_its_caller(queue):
+    """`function_call<F>` calls the object through `void *`: the slots stop at `call(F f)`."""
+    conn, config_hash = queue
+    assert _callers(conn, "job") == [("events::EventQueue::function_call", ["sdk"])]
+    assert _callers(conn, "every") == [("events::EventQueue::function_call", ["sdk"])]
+    assert _entry(conn, config_hash, "job") == "the mbed EventQueue (dispatch)"
+
+
+def test_an_edge_by_the_type_only_does_not_stop_the_edge_of_the_rule(queue):
+    """`function_call<int (*)()>` calls through a pointer with no slot: each `int()` function by its type only."""
+    from fw_context_mcp.indexer.db._indirect import sdk_entry
+    from fw_context_mcp.indexer.models import origin_names
+
+    conn, config_hash = queue
+    assert _callers(conn, "by_pointer") == [
+        ("events::EventQueue::function_call", ["sdk"]), ("events::EventQueue::function_call", ["type_only"]),
+    ]
+    entries = {
+        tuple(origin_names(row["origins"])): sdk_entry(conn, config_hash, (
+            row["origins"], row["ref_kind"], row["from_usr"], row["from_file"], row["from_line"], row["from_col"],
+            row["to_usr"],
+        ))
+        for row in conn.execute(
+            "SELECT r.* FROM refs r JOIN symbols t ON t.usr = r.to_usr WHERE t.name = 'by_pointer' AND r.ref_kind = 'call'"
+        )
+    }
+    assert entries == {("sdk",): "the mbed EventQueue (dispatch)", ("type_only",): None}, "a guess gets no entry"
+
+
+def test_an_overload_of_the_queue_gives_its_function_on_and_no_second_edge(queue):
+    """`call(F f, A a)` gives the function to `call(F f)` through a context object: one edge.
+
+    `call(T *obj, R (T::*method)())` holds an object pointer at parameter 0:
+    no function reaches the slot of the rule there.
+    """
+    conn, _ = queue
+    assert _callers(conn, "with_arg") == [("events::EventQueue::function_call", ["sdk"])]
+    [method] = conn.execute("SELECT usr FROM symbols WHERE qualified_name = 'Obj::m'").fetchall()
+    assert conn.execute(
+        "SELECT COUNT(*) FROM refs WHERE to_usr = ? AND ref_kind = 'call'", (method[0],),
+    ).fetchone()[0] == 0
+
+
+def test_a_call_that_the_code_gives_gets_no_second_edge_but_the_entry(queue):
+    """The instance of `function_call<F>` calls a lambda: the rule adds no edge at the declaration."""
+    conn, config_hash = queue
+    [usr] = [row[0] for row in conn.execute("SELECT usr FROM symbols WHERE kind = 'lambda'")]
+    rows = conn.execute(
+        "SELECT r.*, c.qualified_name AS caller FROM refs r JOIN symbols c ON c.usr = r.from_usr"
+        " WHERE r.to_usr = ? AND r.ref_kind = 'call'", (usr,),
+    ).fetchall()
+    from fw_context_mcp.indexer.models import origin_names
+
+    assert [(row["caller"], origin_names(row["origins"])) for row in rows] == [
+        ("events::EventQueue::function_call", ["instantiation"]),
+    ]
+    from fw_context_mcp.indexer.db._indirect import sdk_entry
+
+    [row] = rows
+    assert sdk_entry(conn, config_hash, (
+        row["origins"], row["ref_kind"], row["from_usr"], row["from_file"], row["from_line"], row["from_col"], usr,
+    )) == "the mbed EventQueue (dispatch)"
+
+
 def test_a_library_with_its_source_gets_the_edge_from_the_slots(with_source):
     """lwIP calls `pcb->recv` in C: the rule of `tcp_recv` gives no edge, the slot does."""
     conn, _ = with_source
@@ -346,6 +493,51 @@ def test_a_library_with_its_source_gets_the_edge_from_the_slots(with_source):
 def test_a_call_rule_of_the_project_applies(with_source):
     conn, _ = with_source
     assert _callers(conn, "my_task") == [("my_task_start", ["sdk"])]
+
+
+def test_a_call_rule_of_the_project_with_a_slot_of_an_other_function_applies(with_source):
+    conn, config_hash = with_source
+    assert _callers(conn, "posted") == [("dispatcher", ["sdk"])]
+    assert _entry(conn, config_hash, "posted") == "the my-rtos dispatcher"
+
+
+def test_a_slot_edge_from_the_function_of_a_rule_stops_the_edge_of_the_rule(with_source):
+    """`runner` calls `f()` in C: its site gives the edge, and the rule only gives the entry."""
+    conn, config_hash = with_source
+    assert _callers(conn, "ran_job") == [("runner", ["slot"])]
+    assert _entry(conn, config_hash, "ran_job") == "the my-rtos runner"
+
+
+def test_a_row_that_takes_an_address_gets_no_entry(with_source):
+    """`dispatcher` takes the address of `posted` (`indirect`): that is no call."""
+    from fw_context_mcp.indexer.db._indirect import sdk_entry
+
+    conn, config_hash = with_source
+    [row] = conn.execute(
+        "SELECT r.* FROM refs r JOIN symbols t ON t.usr = r.to_usr JOIN symbols c ON c.usr = r.from_usr"
+        " WHERE t.name = 'posted' AND c.name = 'dispatcher' AND r.ref_kind = 'indirect'"
+    ).fetchall()
+    assert sdk_entry(conn, config_hash, (
+        row["origins"], row["ref_kind"], row["from_usr"], row["from_file"], row["from_line"], row["from_col"],
+        row["to_usr"],
+    )) is None
+
+
+def test_an_index_without_the_table_of_the_links_gives_no_entry(with_source):
+    """An index of an older version has no table sdk_links, and a read path does not migrate it."""
+    from fw_context_mcp.indexer.db._indirect import sdk_entry
+
+    conn, config_hash = with_source
+    old = sqlite3.connect(":memory:")
+    old.row_factory = sqlite3.Row
+    conn.backup(old)
+    old.execute("DROP TABLE sdk_links")
+    edge = _edge(old, "my_task")
+    assert sdk_entry(old, config_hash, (
+        edge["origins"], edge["ref_kind"], edge["from_usr"], edge["from_file"], edge["from_line"], edge["from_col"],
+        edge["to_usr"],
+    )) is None
+    old.close()
 
 
 def test_a_flow_rule_of_the_project_applies(with_source):
