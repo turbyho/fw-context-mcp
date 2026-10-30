@@ -3146,16 +3146,19 @@ def _resolve_slot_edges_locked(
 ) -> None:
     """Run the resolution of the slot facts under the write lock; a failure adds a warning to *result*.
 
-    The links of the SDK model come first, as in an index run: a rule
-    names symbols, and the file can add one, remove one, or hold the
-    declaration where an edge of a rule stands.
+    The USRs of the `static` functions and the links of the SDK model
+    come first, as in an index run: the parse writes the USR of the
+    language of the unit, a rule names symbols, and the file can add one,
+    remove one, or hold the declaration where an edge of a rule stands.
     """
+    from ...indexer._internal_usrs import unify_internal_functions
     from ...indexer._sdk_model import project_rules, write_links
     from ...indexer._slot_resolution import resolve_slot_edges
     from ...indexer.db import write_lock
     rules = project_rules(root)
     try:
         with write_lock(db_dir, timeout=60.0), transaction(conn):
+            unify_internal_functions(conn, config_hash)
             write_links(conn, config_hash, rules)
             resolve_slot_edges(conn, config_hash)
     except (sqlite3.Error, WriteLockTimeout) as exc:

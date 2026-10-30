@@ -158,7 +158,12 @@ __all__ = [
 #      class template instance, had no row.  A cast to an integer or to
 #      `void *` was an escape, thus each call of the read value got every
 #      function of its type.
-CURRENT_ROW_FORMAT = "fw-context-rows/12"
+# /13 — a reference to a `static` function names the USR of its symbol, also
+#      from a unit of the other language: clang gives such a function of a
+#      header one USR in C and an other in C++ (`internal_decls`).  Before
+#      it, 1195 calls of an Mbed project and 305 of an STM32 project named a
+#      USR that is no symbol.
+CURRENT_ROW_FORMAT = "fw-context-rows/13"
 
 # The config-hash format that was current when CURRENT_ROW_FORMAT last moved.
 #
@@ -173,7 +178,7 @@ CURRENT_ROW_FORMAT = "fw-context-rows/12"
 # the build, thus a plain `fw-context index` writes every file and every
 # body again.  The two must therefore move together, and
 # `test_row_format_invalidation.py` fails when only one of them does.
-ROW_FORMAT_PAIRED_WITH = "fw-context-cc/14"
+ROW_FORMAT_PAIRED_WITH = "fw-context-cc/15"
 
 
 def _row_format_number(value: str) -> int | None:
@@ -256,6 +261,9 @@ _ROW_FORMAT_FAULTS: tuple[tuple[int, str], ...] = (
          "text, thus an override through a type alias or of a template "
          "instance member is missing, and a function pointer cast to an "
          "integer or void * gave each indirect call of its type an edge to it"),
+    (12, "a call from a C unit to a static function of a header that a C++ "
+         "unit indexed (or back) names a USR that is no symbol, thus "
+         "find_callers and the call paths miss it"),
 )
 
 
@@ -1019,6 +1027,23 @@ CREATE TABLE IF NOT EXISTS slot_escaped (
     slot         TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_slot_escaped_slot ON slot_escaped(config_hash, slot);
+-- internal_decls: the definition of each function with internal linkage
+-- (`static`) that a unit names, by the USR of the language of the unit
+-- (indexer/_internal_usrs.py): clang gives such a function of a header
+-- one USR in C and an other in C++.  decl_file, line and col are the place
+-- of the name of the definition, as in symbols; from_file is the main
+-- file of the unit, which owns the row.
+CREATE TABLE IF NOT EXISTS internal_decls (
+    config_hash  TEXT    NOT NULL,
+    usr          TEXT    NOT NULL,
+    name         TEXT    NOT NULL,
+    decl_file    TEXT    NOT NULL,
+    line         INTEGER NOT NULL,
+    col          INTEGER NOT NULL,
+    from_file    TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_internal_decls_from ON internal_decls(config_hash, from_file);
+CREATE INDEX IF NOT EXISTS idx_internal_decls_usr  ON internal_decls(config_hash, usr, from_file);
 -- sdk_links: the rules of the SDK model (indexer/_sdk_model.py) that apply
 -- to the build.  kind 'flow': code out of the AST gives the value of slot
 -- to the slot target.  kind 'call': the function target runs the function

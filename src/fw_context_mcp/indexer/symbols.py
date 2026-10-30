@@ -62,6 +62,7 @@ from ._overrides import VIRTUAL_METHOD_KINDS, extract_overrides
 from .compile_commands import CompilationUnit
 from .models import (
     InheritanceRecord,
+    InternalDecl,
     Macro,
     Reference,
     RefOrigin,
@@ -1063,6 +1064,7 @@ def _lambda_qualified_name(expression: cx.Cursor) -> str:
 
 def _walk_template_instances(
     seeds: dict[str, cx.Cursor], refs: list[Reference], seen_ref: _SeenRefs,
+    internal_decls: dict[str, InternalDecl],
 ) -> list[cx.Cursor]:
     """Walk the bodies of the template instances that the unit uses, claim their calls, and give the definitions.
 
@@ -1089,7 +1091,10 @@ def _walk_template_instances(
 
     Only calls give an edge here.  A function address in an instance body
     is a slot fact: the definitions that the walk gives go to
-    ``_slots.collect_slot_facts``, in the order of the walk.
+    ``_slots.collect_slot_facts``, in the order of the walk.  A function
+    with internal linkage that a body names gets its place in
+    *internal_decls*, as in the walk of the written code: a dependent call
+    of the template names it only in the instance.
 
     A body is walked as the AST walk reads it: the calls in a lambda belong
     to the lambda (`_lambda_usr`), and a call of a lambda (``l()``) is an
@@ -1134,6 +1139,8 @@ def _walk_template_instances(
             target = node.referenced
             if target is None:
                 continue
+            if node.kind == cx.CursorKind.DECL_REF_EXPR:
+                _note_internal_function(node, internal_decls)
             _queue_instance(target, queued, work)
             if node.kind != cx.CursorKind.CALL_EXPR:
                 continue
@@ -1305,7 +1312,7 @@ def _build_refs(
     anon_usr_to_field: dict[str, str],
     _log,
     skip_files: frozenset[str] | None = None,
-) -> tuple[list[Reference], list[cx.Cursor]]:
+) -> tuple[list[Reference], list[cx.Cursor], dict[str, InternalDecl]]:
     """Walk the TU AST extracting references.
 
     When *skip_files* is a non-empty frozenset, subtrees of already
@@ -1324,7 +1331,9 @@ def _build_refs(
       function's ``end_line`` (which is non-zero only for TU-resident
       definitions), it is popped (we passed the closing brace).
 
-    Returns (refs, instances): *instances* are the
+    Returns (refs, instances, internal_decls): *internal_decls* holds the
+    place of each function with internal linkage that the unit names
+    (``_note_internal_function``), and *instances* are the
     definitions of the template instances that the unit walked.
     """
     import logging as _logging
@@ -1332,6 +1341,7 @@ def _build_refs(
 
     refs: list[Reference] = []
     seen_ref: _SeenRefs = {}
+    internal_decls: dict[str, InternalDecl] = {}
 
     fn_stack: list[tuple[str, int, str]] = []
     # The caller of each cursor in the body of a lambda, by cursor hash:
@@ -1416,6 +1426,8 @@ def _build_refs(
         _process_ref_cursor(
             cursor, cur_fn, refs, seen_ref, resolve_fn, static_init_calls, instance_seeds,
         )
+        if cursor.kind == cx.CursorKind.DECL_REF_EXPR:
+            _note_internal_function(cursor, internal_decls)
 
         # The body of a lambda is code of the lambda: the calls in it are
         # its calls.  The expression itself (its address), its captures and
@@ -1428,9 +1440,9 @@ def _build_refs(
                 lambda_callers[(node.hash, node.kind.value)] = key
 
     # The calls that only the instances of the templates resolve.
-    instances = _walk_template_instances(instance_seeds, refs, seen_ref)
+    instances = _walk_template_instances(instance_seeds, refs, seen_ref, internal_decls)
 
-    return refs, instances
+    return refs, instances, internal_decls
 
 
 def _is_plain_assignment(cursor: cx.Cursor) -> bool:
@@ -1837,6 +1849,29 @@ def _process_ref_cursor(
     if cursor.kind == cx.CursorKind.CALL_EXPR:
         _handle_fn_ptr_as_argument(cursor, cur_fn, refs, seen_ref)
     _handle_fn_ptr_cases(cursor, cur_fn, refs, seen_ref)
+
+
+def _note_internal_function(cursor: cx.Cursor, internal_decls: dict[str, InternalDecl]) -> None:
+    """Record the definition of the function with internal linkage that *cursor* names, by its USR.
+
+    WHY: clang gives a `static` function of a header one USR in a C unit
+    and an other in a C++ unit, and the index holds the symbol of only one
+    of them.  The place of the definition and the name match the USRs of
+    one function (``_internal_usrs``).  A `static` function template is no
+    concern: only a C++ unit can compile it, and each C++ unit gives it one
+    USR.
+    """
+    target = cursor.referenced
+    if target is None or target.kind != cx.CursorKind.FUNCTION_DECL or target.linkage != cx.LinkageKind.INTERNAL:
+        return
+    usr = _code_usr(target)
+    if not usr or usr in internal_decls:
+        return
+    definition = target.get_definition() or target
+    location = definition.location
+    if location.file is None:
+        return
+    internal_decls[usr] = InternalDecl(definition.spelling, location.file.name, location.line, location.column)
 
 
 def _add_ref(refs: list[Reference], seen_ref: _SeenRefs, to_usr: str,
@@ -2590,6 +2625,9 @@ class ExtractionResult:
     # The slot facts of the indirect calls (indexer/_slots.py), or None
     # when the references are not extracted.
     slots: SlotFacts | None = None
+    # The place of each function with internal linkage that the unit names,
+    # by its USR in this language (indexer/_internal_usrs.py).
+    internal_decls: dict[str, InternalDecl] = field(default_factory=dict)
     newly_seen_files: set[str] = field(default_factory=set)
     # The error diagnostics of the parse (see _parse_diagnostics).
     parse_errors: int = 0
@@ -2763,7 +2801,7 @@ def extract_all(
         )
         return result
 
-    refs, instances = _build_refs(
+    refs, instances, internal_decls = _build_refs(
         tu, tu_path_str, _resolve, anon_usr_to_field, _log,
         skip_files=_skip_frozen,
     )
@@ -2780,7 +2818,7 @@ def extract_all(
     result = ExtractionResult(
         tu=tu if return_tu else None, symbols=symbols, references=refs,
         inheritance=inheritance, macros=macros, overrides=overrides,
-        slots=slots, newly_seen_files=_newly_seen,
+        slots=slots, internal_decls=internal_decls, newly_seen_files=_newly_seen,
         parse_errors=parse_errors, parse_fatal=parse_fatal, parse_first_error=parse_first_error,
     )
     return result

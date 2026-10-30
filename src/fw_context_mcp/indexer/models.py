@@ -182,6 +182,19 @@ class InheritanceRecord:
     is_virtual: bool   # True for virtual inheritance
 
 
+@dataclass(frozen=True)
+class InternalDecl:
+    """The definition of a function with internal linkage that a unit names (``_internal_usrs``).
+
+    *file* is absolute while the unit is extracted; *line* and *column* are
+    the place of the name, as for a symbol.
+    """
+    name: str
+    file: str
+    line: int
+    column: int
+
+
 # The slot facts of the indirect calls (indexer/_slots.py).  A slot key is
 # `F|<field USR>`, `V|<variable USR>`, `P|<code key>|<index>` or
 # `R|<code key>`; the place of a fact is the file (absolute while the

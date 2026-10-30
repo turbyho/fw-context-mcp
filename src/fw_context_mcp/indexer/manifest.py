@@ -1107,6 +1107,9 @@ def compute_config_hash(
         # /14 marks the overrides from the compiler and the slot facts of an
         # integer or a `void *` place: an unchanged unit kept the overrides
         # of the match of names and its casts as escapes.
+        # /15 marks the place of each `static` function that a unit names
+        # (`internal_decls`): an unchanged unit had no such rows, thus a
+        # call from a C unit to a function of a header kept the USR of C.
         #
         # WHY the format version belongs in THIS hash: a new config_hash
         # leaves no row for the build, thus a plain `fw-context index` writes
@@ -1117,7 +1120,7 @@ def compute_config_hash(
         #
         # Every existing index therefore gets one final reindex, which is
         # intended.
-        "_format": "fw-context-cc/14",
+        "_format": "fw-context-cc/15",
         "project_root": str(project_root),
         # WHY only these two: config_hash answers "could the same source text
         # compile to something different now?"  Macros flip #ifdef, and the

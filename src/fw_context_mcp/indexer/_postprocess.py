@@ -563,6 +563,25 @@ def _step_purge_files_outside_build(conn: sqlite3.Connection, ctx: dict) -> None
     )
 
 
+def _step_internal_usrs(conn: sqlite3.Connection, ctx: dict) -> None:
+    """Give each reference to a `static` function the USR of its symbol (``_internal_usrs``).
+
+    WHY before the slot edges: the keys of the slot facts name the USR,
+    and the resolution joins the facts of the C units and of the C++ units
+    by it.  WHY in each run: each parse writes the USR of its own language.
+    """
+    from ._internal_usrs import unify_internal_functions
+
+    conn.commit()
+    with transaction(conn):
+        counts = unify_internal_functions(conn, ctx["config_hash"])
+    if counts["refs"] or counts["slot_values"]:
+        log.info(
+            "Internal functions: %d reference(s) and %d slot value(s) moved to the USR of their symbol",
+            counts["refs"], counts["slot_values"],
+        )
+
+
 def _step_resolve_slots(conn: sqlite3.Connection, ctx: dict) -> None:
     """Give each indirect call its targets: the call edges of the slot facts and of the SDK model.
 
@@ -1336,6 +1355,7 @@ _STEPS: list[tuple[str, Callable[..., None], Callable[..., bool] | None]] = [
     ("generated_flag",   _step_reconcile_generated, None),
     ("coverage_purge",   _step_purge_files_outside_build, None),
     ("macros",           _step_expand_macros,      lambda c: c["index_macros_expanded"] and c["units"] and _needs_macros(c)),
+    ("internal_usrs",    _step_internal_usrs,       lambda c: c["index_refs"]),
     ("slot_edges",       _step_resolve_slots,       lambda c: c["index_refs"]),
     ("llm_analysis",     _step_llm_analysis,       lambda c: c["analyze_symbols"] and c["llm_config"] is not None and c["llm_config"].enabled),
     ("embeddings",       _step_build_embeddings,   lambda c: c["index_embeddings"] and c["llm_config"] is not None and c["llm_config"].enabled),

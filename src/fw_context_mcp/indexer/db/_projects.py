@@ -244,6 +244,7 @@ def delete_build_data(conn: sqlite3.Connection, config_hash: str) -> None:
     conn.execute("DELETE FROM ref_producers WHERE config_hash = ?", (config_hash,))
     conn.execute("DELETE FROM refs WHERE config_hash = ?", (config_hash,))
     delete_slot_facts_for_config(conn, config_hash)
+    conn.execute("DELETE FROM internal_decls WHERE config_hash = ?", (config_hash,))
     conn.execute("DELETE FROM inheritance WHERE config_hash = ?", (config_hash,))
     conn.execute("DELETE FROM overrides WHERE config_hash = ?", (config_hash,))
     conn.execute("DELETE FROM hotspot_cache WHERE config_hash = ?", (config_hash,))

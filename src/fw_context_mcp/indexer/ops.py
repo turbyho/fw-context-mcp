@@ -1452,6 +1452,7 @@ def store_symbols_for_unit(
         overrides = result.overrides
         macros = result.macros
         slots = result.slots
+        internal_decls = result.internal_decls
         # Every file whose cursors this parse walked — the set this TU owns in
         # this run.  Headers already claimed by an earlier TU are absent
         # (skip_files excluded their subtrees).  Drives stale-row deletion and
@@ -1483,6 +1484,7 @@ def store_symbols_for_unit(
             overrides = result.overrides
             macros = result.macros
             slots = result.slots
+            internal_decls = result.internal_decls
             # Every file whose cursors this parse walked — the set this TU
             # owns in this run.  Headers already claimed by an earlier TU are
             # absent (skip_files excluded their subtrees).  Drives stale-row
@@ -1670,6 +1672,18 @@ def store_symbols_for_unit(
         _insert_slot_facts(conn, config_hash, slots, _rel, "")
         if slots.from_instances is not None:
             _insert_slot_facts(conn, config_hash, slots.from_instances, _rel, instance_unit)
+
+    # The definitions of the functions with internal linkage that the unit
+    # names (indexer/_internal_usrs.py), owned by the main file of the unit.
+    if index_refs and internal_decls:
+        conn.executemany(
+            "INSERT INTO internal_decls (config_hash, usr, name, decl_file, line, col, from_file)"
+            " VALUES (?,?,?,?,?,?,?)",
+            [
+                (config_hash, usr, decl.name, _rel(decl.file), decl.line, decl.column, normalized_tu_path)
+                for usr, decl in sorted(internal_decls.items())
+            ],
+        )
 
     # Inheritance
     if inheritance:
