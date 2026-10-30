@@ -13,7 +13,7 @@ from fw_context_mcp.utils import abs_path as _abs_path
 class TestAbsPath:
     def test_relative_joined_with_root(self):
         root = Path("/home/user/project")
-        assert _abs_path(root, "src/zble.cpp") == "/home/user/project/src/zble.cpp"
+        assert _abs_path(root, "src/ble.cpp") == "/home/user/project/src/ble.cpp"
 
     def test_absolute_returned_unchanged(self):
         root = Path("/home/user/project")

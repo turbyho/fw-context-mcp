@@ -489,19 +489,19 @@ class TestSearchSymbols:
         file_id = upsert_file(populated_db, "hash-deadbeef", "/tmp/ble.cpp", "cpp")
         insert_symbols_batch(populated_db, [
             ("hash-deadbeef", file_id, "lib/ble/ble.cpp",
-             split_tokens("onConnectionComplete", "ZBLE::onConnectionComplete"),
-             "u20", "onConnectionComplete", "ZBLE::onConnectionComplete",
+             split_tokens("onConnectionComplete", "BLE::onConnectionComplete"),
+             "u20", "onConnectionComplete", "BLE::onConnectionComplete",
              "method", 1, 1, 0, 1, "void onConnectionComplete()", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
             ("hash-deadbeef", file_id, "lib/ble/ble.cpp",
-             split_tokens("startAdvertising", "ZBLE::startAdvertising"),
-             "u21", "startAdvertising", "ZBLE::startAdvertising",
+             split_tokens("startAdvertising", "BLE::startAdvertising"),
+             "u21", "startAdvertising", "BLE::startAdvertising",
              "method", 2, 1, 0, 1, "void startAdvertising()", "", None, 0, 0, "", 0, "", 0, 0.0, "", 0),
         ])
         # connect* must find onConnectionComplete via name_tokens = "on connection complete"
         results = search_symbols(populated_db, "connect*", "hash-deadbeef")
         assert len(results) == 1
         assert results[0]["name"] == "onConnectionComplete"
-        assert results[0]["name_tokens"] == "on connection complete zble"
+        assert results[0]["name_tokens"] == "on connection complete ble"
 
     def test_search_no_results(self, populated_db):
         results = search_symbols(populated_db, "nonexistent_symbol_xyz", "hash-deadbeef")

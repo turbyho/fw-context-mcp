@@ -149,9 +149,9 @@ def split_tokens(name: str, qualified_name: str = "") -> str:
     Examples:
         onConnectionComplete       → "on connection complete"
         modem_parser_oob_init      → "modem parser oob init"
-        ZCfgDataManager            → "cfg data manager"
+        CCfgDataManager            → "cfg data manager"
         HTTPResponse               → "http response"
-        ZBLE::onConnectionComplete → "zble on connection complete"
+        BLE::onConnectionComplete  → "ble on connection complete"
         _last_ble_connected        → "last ble connected"
     """
     def _tokenize(s: str) -> list[str]:
