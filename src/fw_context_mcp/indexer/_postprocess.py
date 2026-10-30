@@ -589,8 +589,11 @@ def _step_resolve_slots(conn: sqlite3.Connection, ctx: dict) -> None:
     the targets of a call in an other unit, thus the step replaces the
     edges of the whole build (``_slot_resolution``).  The rules of the SDK
     model (``_sdk_model``) name symbols of the build, thus the step writes
-    their links again first.
+    their links again first.  So does it with the slot facts of the
+    interrupt registrations of the build artifact (``_isr_facts``): the
+    build makes the artifact again.
     """
+    from ._isr_facts import write_isr_slot_facts
     from ._sdk_model import project_rules, write_links
     from ._slot_resolution import resolve_slot_edges
 
@@ -602,6 +605,7 @@ def _step_resolve_slots(conn: sqlite3.Connection, ctx: dict) -> None:
     conn.commit()
     with transaction(conn):
         write_links(conn, ctx["config_hash"], rules)
+        write_isr_slot_facts(conn, ctx["config_hash"], ctx.get("project_root"))
         counts = resolve_slot_edges(conn, ctx["config_hash"])
     log.info(
         "Slot edges: %d edge(s) for %d indirect call(s): %d by slot, %d by type only, "

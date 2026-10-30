@@ -46,10 +46,44 @@ _ARTIFACT = Path("zephyr") / "zephyr_pre0.elf"
 _KCONFIG = Path("zephyr") / ".config"
 _DYNAMIC_OPTION = "CONFIG_DYNAMIC_INTERRUPTS=y"
 
+# The size of the header of a 32-bit ELF file.
+_ELF32_HEADER_SIZE = 52
+
 # Symbol types worth resolving an address to: a handler is a function, and
 # an argument is usually a device instance.
 _SYMBOL_FUNC = 2
 _SYMBOL_OBJECT = 1
+# The symbol that names the source file of the local symbols after it.
+_SYMBOL_FILE = 4
+_BINDING_LOCAL = 0
+
+# Zephyr `sw_isr_table.h`: `#define ISR_FLAG_DIRECT BIT(0)`.  A direct
+# interrupt goes into the hardware vector table, and no software table
+# entry calls it.
+ISR_FLAG_DIRECT = 1 << 0
+
+
+@dataclass(frozen=True)
+class ElfSymbol:
+    """A function or an object symbol of the artifact.
+
+    Attributes:
+        name: The name of the symbol.
+        function: True for a function, False for an object.
+        local: True for a symbol with local binding (`static` in C).  A
+            local name is unique only in its object file, thus a reader
+            needs *file* to find its definition.
+        file: The name of the last file symbol before a local symbol, as
+            the compiler wrote it: the source file of the object.  ELF
+            puts each local symbol after the file symbol of its object.
+            "" for a global symbol, and for a local symbol with no file
+            symbol before it.
+    """
+
+    name: str
+    function: bool
+    local: bool
+    file: str
 
 
 @dataclass(frozen=True)
@@ -69,12 +103,19 @@ class IsrRegistration:
             ``nrfx_power_clock_irq_handler`` behind the ``nrfx_isr`` shim
             in one driver and the device ``__device_dts_ord_116`` in
             another.  Only a reader who knows the handler can say which.
+        flags: The flags of the registration (``ISR_FLAG_DIRECT``).
+        handler_symbol: The symbol of the handler.
+        argument_symbol: The symbol of the argument, or None when the
+            argument is a plain value.
     """
 
     irq: int
     slot: int
     handler: str
     argument: str
+    flags: int = 0
+    handler_symbol: ElfSymbol | None = None
+    argument_symbol: ElfSymbol | None = None
 
 
 @dataclass(frozen=True)
@@ -124,6 +165,11 @@ class _Elf:
     def __init__(self, path: Path) -> None:
         self._path = path
         self._data = path.read_bytes()
+        # WHY a size check: a link that stops (a full disk, a killed build)
+        # leaves a cut file, and a read past its end must give "no answer"
+        # and not stop the index run.
+        if len(self._data) < _ELF32_HEADER_SIZE:
+            raise ValueError(f"{path} is too short for an ELF header")
         if self._data[:4] != b"\x7fELF":
             raise ValueError(f"{path} is not an ELF file")
         if self._data[4] != 1:
@@ -174,15 +220,15 @@ class _Elf:
             return b""
         return self._data[found.offset:found.offset + found.size]
 
-    def addresses_to_names(self) -> dict[int, str]:
-        """Map the address of every function and object symbol to its name.
+    def symbols_by_address(self) -> dict[int, ElfSymbol]:
+        """Map the address of every function and object symbol to the symbol.
 
         The address is used exactly as stored.  On ARM a Thumb function
         carries its low bit set, and the ``.intList`` entry carries the
         same odd value, so the two match without masking — measured, along
         with the even values of a RISC-V build.
 
-        The first name for an address wins, so a later alias cannot
+        The first symbol for an address wins, so a later alias cannot
         displace the definition it aliases.
         """
         symbols = self._by_name.get(".symtab")
@@ -195,21 +241,26 @@ class _Elf:
             return {}
         names = self._data[strings.offset:strings.offset + strings.size]
 
-        out: dict[int, str] = {}
-        end_of_table = symbols.offset + symbols.size
+        out: dict[int, ElfSymbol] = {}
+        file = ""
+        end_of_table = min(symbols.offset + symbols.size, len(self._data))
         for position in range(symbols.offset, end_of_table, symbols.item_size):
             if position + 16 > end_of_table:
                 break
             name_offset, address = self._u("II", position)
-            kind = self._data[position + 12] & 0xF
-            if kind not in (_SYMBOL_FUNC, _SYMBOL_OBJECT):
-                continue
-            if not address or address in out:
-                continue
+            info = self._data[position + 12]
+            kind, local = info & 0xF, info >> 4 == _BINDING_LOCAL
             end = names.find(b"\x00", name_offset)
             name = names[name_offset:end].decode("ascii", "replace")
-            if name:
-                out[address] = name
+            if kind == _SYMBOL_FILE:
+                file = name
+                continue
+            if kind not in (_SYMBOL_FUNC, _SYMBOL_OBJECT):
+                continue
+            if not address or address in out or not name:
+                continue
+            out[address] = ElfSymbol(name=name, function=kind == _SYMBOL_FUNC, local=local,
+                                     file=file if local else "")
         return out
 
 
@@ -242,8 +293,8 @@ def read_isr_registrations(build_dir: Path) -> IsrTable | None:
 
     try:
         declared, offset = struct.unpack_from(elf.byte_order + "II", raw, 0)
-        names = elf.addresses_to_names()
-        registrations = _decode(raw, declared, offset, names, elf.byte_order)
+        symbols = elf.symbols_by_address()
+        registrations = _decode(raw, declared, offset, symbols, elf.byte_order)
     except (ValueError, struct.error):
         log.debug("could not decode %s of %s", _SECTION, artifact, exc_info=True)
         return None
@@ -261,17 +312,17 @@ def _decode(
     raw: bytes,
     declared: int,
     offset: int,
-    names: dict[int, str],
+    symbols: dict[int, ElfSymbol],
     byte_order: str,
 ) -> tuple[IsrRegistration, ...]:
     """Turn the section body into registrations, dropping what makes no sense."""
     out: list[IsrRegistration] = []
     for position in range(_HEADER_SIZE, len(raw) - _ENTRY_SIZE + 1, _ENTRY_SIZE):
-        irq, _flags, func, param = struct.unpack_from(
+        irq, flags, func, param = struct.unpack_from(
             byte_order + "iiII", raw, position,
         )
-        handler = names.get(func, "")
-        if not handler:
+        handler = symbols.get(func)
+        if handler is None:
             # An address with no symbol is not worth a row: the whole point
             # of reading this is the name.
             continue
@@ -282,11 +333,15 @@ def _decode(
             # no number.
             log.debug("dropping irq %d: slot %d outside 0..%d", irq, slot, declared)
             continue
+        argument = symbols.get(param)
         out.append(IsrRegistration(
             irq=irq,
             slot=slot,
-            handler=handler,
-            argument=names.get(param, ""),
+            handler=handler.name,
+            argument=argument.name if argument is not None else "",
+            flags=flags,
+            handler_symbol=handler,
+            argument_symbol=argument,
         ))
     return tuple(out)
 

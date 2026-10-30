@@ -300,3 +300,58 @@ class TestNothingToRead:
     def test_a_section_too_short_for_a_header(self, tmp_path, size):
         _build(tmp_path, b"\x00" * size, [("handler", 0x1001, 2)])
         assert read_isr_registrations(tmp_path) is None
+
+
+def test_the_symbols_keep_their_binding_and_the_file_of_a_local(tmp_path):
+    """A local symbol takes the file symbol before it; a global or a weak one takes none."""
+    from fw_context_mcp.indexer.intlist import ElfSymbol, _Elf
+
+    artifact = tmp_path / "a.elf"
+    artifact.write_bytes(_elf(b"", [
+        ("a.c", 0, 0x04),
+        ("isr_a", 0x101, 0x02),
+        ("b.c", 0, 0x04),
+        ("isr_b", 0x201, 0x02),
+        ("alias_b", 0x201, 0x12),
+        ("handler", 0x301, 0x12),
+        ("maybe", 0x401, 0x22),
+        ("device", 0x501, 0x11),
+    ]))
+    assert _Elf(artifact).symbols_by_address() == {
+        0x101: ElfSymbol("isr_a", function=True, local=True, file="a.c"),
+        0x201: ElfSymbol("isr_b", function=True, local=True, file="b.c"),
+        0x301: ElfSymbol("handler", function=True, local=False, file=""),
+        0x401: ElfSymbol("maybe", function=True, local=False, file=""),
+        0x501: ElfSymbol("device", function=False, local=False, file=""),
+    }
+
+
+def test_a_cut_artifact_gives_no_answer_and_raises_nothing(tmp_path):
+    """A link that stops leaves a cut file: each length must give None or a table, never an exception."""
+    whole = _elf(_intlist(48, 0, [(0, 0x2798F, 0x27A57)]), [
+        ("nrfx_isr", 0x2798F, 2), ("nrfx_power_clock_irq_handler", 0x27A57, 2),
+    ])
+    zephyr = tmp_path / "zephyr"
+    zephyr.mkdir()
+    for length in range(len(whole)):
+        (zephyr / "zephyr_pre0.elf").write_bytes(whole[:length])
+        read_isr_registrations(tmp_path)
+
+
+def test_a_symbol_table_past_the_end_of_the_file_raises_nothing(tmp_path):
+    """The header of `.symtab` gives a size past the end: the last entry ends in the middle of the file end."""
+    from fw_context_mcp.indexer.intlist import _Elf
+
+    whole = bytearray(_elf(_intlist(48, 0, [(0, 0x2798F, 0)]), [("nrfx_isr", 0x2798F, 2)]))
+    table_offset = struct.unpack_from("<I", whole, 32)[0]
+    symtab_header = table_offset + 2 * SECTION_HEADER
+    symtab_offset = struct.unpack_from("<I", whole, symtab_header + 16)[0]
+    # Ten bytes after the last whole entry: an entry of 16 bytes there
+    # holds its name and address, and its type byte is past the end.
+    whole += b"\x00" * ((10 - (len(whole) - symtab_offset)) % SYMBOL)
+    struct.pack_into("<I", whole, symtab_header + 20, len(whole) - symtab_offset + SYMBOL - 10)
+    artifact = tmp_path / "zephyr" / "zephyr_pre0.elf"
+    artifact.parent.mkdir()
+    artifact.write_bytes(bytes(whole))
+    assert _Elf(artifact).symbols_by_address()[0x2798F].name == "nrfx_isr"
+    read_isr_registrations(tmp_path)

@@ -193,7 +193,10 @@ def _load(
     ):
         if row["slot"]:
             slots.add_source(row["slot"], row["function"])
-        if row["function_type"] != "lambda":
+        # A lambda has no type that a pointer can have, and a fact of the
+        # build artifact (``_isr_facts``) has no type: the artifact names
+        # the function, not its type.
+        if row["function_type"] not in ("lambda", ""):
             by_type[row["function_type"]].add(row["function"])
     for row in conn.execute("SELECT source, target FROM slot_flows WHERE config_hash = ?", (config_hash,)):
         slots.add_flow(row["source"], row["target"])

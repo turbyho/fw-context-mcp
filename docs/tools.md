@@ -2723,6 +2723,16 @@ function, `stored_places` counts the places of every way to the field
 (`set1(ev); set2(ev);` gives two), and `stored_in` lists the slots that
 the code stored it in, when one of them is not the queried one.
 
+A place in the build artifact (`zephyr/zephyr_pre0.elf` of the build
+tree, at line 0) is an interrupt registration that a Zephyr build
+recorded. `IRQ_CONNECT` writes it into the `.intList` section, and the
+generated table `_sw_isr_table` holds addresses only. Such a handler is in
+the field `_isr_table_entry::isr`, and a function in its argument is in
+parameter 0 of the handler. For a function, the `context` of such a place
+is `"<interrupt registration of the build>"`. A direct interrupt
+(`ISR_FLAG_DIRECT`) and an interrupt connected at run time give no such
+place.
+
 A leading `warning` row says when code out of view can write the field or
 the variable (its address escapes): a call through it also reaches each
 function of its type, which `find_indirect_call_sites` lists with origin
@@ -2855,7 +2865,7 @@ definition has an empty `file`.
 | `"runtime"` | The image holds that alias, but a `NVIC_SetVector` call installs a real handler at run time (a target with `CMSIS_VECTAB_VIRTUAL`). The interrupt is serviced only after the registering code has run. |
 | `"data"` | The slot holds an address built from the symbol, such as `.word sym + CONST`. On Cortex-M this is slot 0, the initial stack pointer. It is not code. |
 | `"linker"` | The linker script gives the address, and no compiled file defines the name. Slot 0 of a CMSIS table looks like this. It is not code. |
-| `"dispatcher"` | The target holds more than one slot of the table AND calls through a pointer, such as Zephyr's `_isr_wrapper`. It decides at run time where to go. Follow it with `get_symbol_context`. |
+| `"dispatcher"` | The target holds more than one slot of the table AND calls through a pointer, such as Zephyr's `_isr_wrapper`. It decides at run time where to go. Follow it with `get_symbol_context`: its callees can include the handlers that the build registered. |
 
 `source` says where a row came from:
 

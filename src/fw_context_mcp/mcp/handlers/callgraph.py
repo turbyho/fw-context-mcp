@@ -59,7 +59,7 @@ from typing import Annotated
 from pydantic import Field
 
 from ...indexer import db as index_db
-from ...indexer.compile_commands import compile_directory
+from ...indexer._isr_facts import BUILD_UNIT, build_directory
 from ...indexer.db import _indirect as indirect_db
 from ...indexer.db import (
     count_refs,
@@ -81,6 +81,9 @@ from ._base import BaseHandler, DbContext
 from .source import _lookup_definition
 
 log = logging.getLogger(__name__)
+
+# The context of a place in the build artifact: no code holds it (``indexer._isr_facts``).
+_BUILD_CONTEXT = "<interrupt registration of the build>"
 
 # The origins of the call edges of the slot resolution.
 _INDIRECT_ORIGINS = int(RefOrigin.SLOT | RefOrigin.TYPE_ONLY | RefOrigin.SDK)
@@ -918,7 +921,11 @@ def find_indirect_targets(
         and stored_line (the first place that stores it), stored_places
         (the places of every way to the slot), and stored_in (a list) when
         the code stored it in another slot whose value flows here
-        (``["parameter 0 of set_cb"]``).  ``stored_places_capped`` (True)
+        (``["parameter 0 of set_cb"]``).  A stored place in the build
+        artifact (``zephyr/zephyr_pre0.elf`` of the build tree, line 0) is
+        an interrupt registration that a Zephyr build recorded in
+        ``.intList``; for a function, its ``context`` is
+        ``"<interrupt registration of the build>"``.  ``stored_places_capped`` (True)
         marks a count that the walk back cut.  A ``warning`` dict comes
         first when code out of view can write the
         slot: a call through it also reaches each function of its type
@@ -991,7 +998,9 @@ def find_indirect_targets(
                         "line": store["line"],
                         "col": store["col"],
                         "slot": indirect_db.describe_slot(conn, config_hash, store["slot"]),
-                        "context": store["context"] or "<file scope>",
+                        "context": store["context"] or (
+                            _BUILD_CONTEXT if store["unit"] == BUILD_UNIT else "<file scope>"
+                        ),
                         **tag(label),
                     }
                     for store in stores
@@ -2349,37 +2358,6 @@ def _from_the_build(conn, config_hash: str, coverage: list[dict], table) -> list
     return out
 
 
-def _build_directory(conn, config_hash: str):
-    """Return the build tree of this configuration, or None.
-
-    The tree is what holds the artifacts a build records, and it is NOT
-    the directory of compile_commands.json.  fw-context generates its own
-    copy of that file under `.fw-context/build/`, so the parent of the
-    path in the database is a directory with no artifact in it.  The
-    build itself names the tree, in the `directory` field of every entry,
-    which `compile_directory` reads.
-
-    Measured on the Zephyr project before this read the field: every one
-    of the nine images answered "no registrations", because
-    `read_isr_registrations` looked for `zephyr/zephyr_pre0.elf` under
-    `.fw-context/build`.  The artifact was there all along, two
-    directories away, with its `.intList` section intact.
-
-    The parent is still the answer when the file names no directory.  A
-    build system that writes compile_commands.json into its own tree —
-    which is where CMake puts it — is right either way.
-    """
-    found = conn.execute(
-        """SELECT compile_commands_path FROM build_configs
-           WHERE config_hash = ? LIMIT 1""",
-        (config_hash,),
-    ).fetchone()
-    if found is None or not found["compile_commands_path"]:
-        return None
-    path = Path(str(found["compile_commands_path"]))
-    return compile_directory(path) or path.parent
-
-
 def _slot_key(slot: dict) -> tuple:
     """The order of the slots of every source, the build rows included.
 
@@ -2458,7 +2436,7 @@ def _vector_rows(
     )
     # Read once and share: both the rows that name a gap and the summary
     # of what is connected come out of the same artifact.
-    build_dir = _build_directory(conn, config_hash)
+    build_dir = build_directory(conn, config_hash)
     recorded = read_isr_registrations(build_dir) if build_dir else None
 
     # A trailer describes the whole table rather than one slot, so it is
@@ -2593,8 +2571,9 @@ def get_vector_table(
       servicing one particular interrupt; it decides at run time where to
       go.  Zephyr fills every external IRQ slot with ``_isr_wrapper``,
       which reads the interrupt number and jumps through
-      ``_sw_isr_table``.  Follow it: ``get_symbol_context`` on the name,
-      then ``find_references`` on the table it uses.  A handler that
+      ``_sw_isr_table``.  Follow it: ``get_symbol_context`` on the name
+      can give the handlers that the build registered as callees, and
+      ``find_references`` on the table it uses.  A handler that
       merely calls one registered callback is NOT this — it holds a
       single slot and keeps ``"c"``.
 

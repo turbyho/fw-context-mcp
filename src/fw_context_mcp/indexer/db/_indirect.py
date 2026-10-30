@@ -294,7 +294,7 @@ def function_stores(
     is.
     """
     return conn.execute(
-        """SELECT DISTINCT so.file, so.line, so.col, so.slot,
+        """SELECT DISTINCT so.file, so.line, so.col, so.slot, so.unit,
                   (SELECT c.qualified_name FROM symbols c
                    WHERE c.config_hash = so.config_hash AND c.kind IN ({kinds})
                      AND NOT (c.kind = 'lambda' AND c.usr = so.function)

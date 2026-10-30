@@ -17,6 +17,7 @@ import json
 import pytest
 
 import fw_context_mcp  # noqa: F401  — must precede sqlite3
+from fw_context_mcp.indexer._isr_facts import build_directory
 from fw_context_mcp.indexer.db import (
     get_table_coverage,
     insert_refs_batch,
@@ -29,7 +30,6 @@ from fw_context_mcp.indexer.db import (
 )
 from fw_context_mcp.indexer.intlist import read_isr_registrations
 from fw_context_mcp.mcp.handlers.callgraph import (
-    _build_directory,
     _from_the_build,
     _interrupt_summary,
     _vector_rows,
@@ -361,7 +361,7 @@ class TestTheBuildTree:
             cc_directory=tmp_path / "build",
         )
         try:
-            assert _build_directory(conn, CONFIG) == tmp_path / "build"
+            assert build_directory(conn, CONFIG) == tmp_path / "build"
             # And the whole path works: the registration becomes a row.
             rows = _vector_rows(
                 conn, CONFIG, unhandled_only=False, limit=400,
@@ -382,7 +382,7 @@ class TestTheBuildTree:
             cc_directory=None,
         )
         try:
-            assert _build_directory(conn, CONFIG) == tmp_path / "build"
+            assert build_directory(conn, CONFIG) == tmp_path / "build"
         finally:
             conn.close()
 
@@ -390,7 +390,7 @@ class TestTheBuildTree:
         """Nothing recorded is not a directory to guess at."""
         conn = _index(tmp_path, registrations=[], cc_in_db=False)
         try:
-            assert _build_directory(conn, CONFIG) is None
+            assert build_directory(conn, CONFIG) is None
         finally:
             conn.close()
 
