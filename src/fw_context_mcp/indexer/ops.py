@@ -82,6 +82,7 @@ from fw_context_mcp.indexer.db import (
     record_claims,
     release_ref_producer,
     replace_file_data,
+    settle_stale_files,
     slot_unit_key,
     split_tokens,
     upsert_file,
@@ -1235,8 +1236,9 @@ def _delete_old_for_tu(
     must include the headers: their symbol rows carry the HEADER's file_id,
     so deleting only the TU's file_id would leave them in place.  The fresh
     rows would then hit ``ON CONFLICT(config_hash, usr)`` in
-    ``insert_symbols_batch``, whose guard only promotes a declaration to a
-    definition — every other update is dropped.  The visible effect is a
+    ``insert_symbols_batch``.  Its guard lets a new row replace a current
+    row only when the new row is the stronger definition, thus it drops
+    most updates.  The visible effect is a
     header whose symbols keep the line numbers, signatures, and even the
     membership of the very first index.
 
@@ -1272,6 +1274,9 @@ def _delete_old_for_tu(
     replace_file_data(
         conn, config_hash, _owned_file_ids(known, normalized_tu_path, owned_paths)
     )
+    # The rows of these files are gone, and the new rows of this parse are
+    # current: a row of an other unit must not replace them.
+    settle_stale_files(conn, config_hash, owned_paths if owned_paths is not None else {normalized_tu_path})
 
 
 def _store_macros_for_unit(

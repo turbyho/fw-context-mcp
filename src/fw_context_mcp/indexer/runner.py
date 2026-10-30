@@ -66,11 +66,13 @@ from .db import (
     forget_unit,
     get_file_hashes,
     load_ownership,
+    mark_stale_files,
     open_db,
     rebuild_fts,
     release_files,
     release_ref_producer,
     replace_file_data,
+    settle_stale_files,
     skip_form,
     slot_unit_key,
     transaction,
@@ -1143,12 +1145,27 @@ def run(
     # a full run.  Only files that a listing includes: the rows of the
     # assembly pass and of the linker scripts have no owner by design.
     included = frozenset().union(*(decision.includes for decision in decisions))
-    unowned = files_without_owner(conn, config_hash) & included
+    without_owner = files_without_owner(conn, config_hash)
+    unowned = without_owner & included
     if unowned:
         _, assigned = _hand_over(decisions, 0, unowned, conn, config_hash, db_path.parent)
         for heir, heir_paths in assigned.items():
             awaiting.setdefault(heir, set()).update(heir_paths)
         log.info("%d file(s) had rows and no owner; their first includer claims them", len(unowned))
+
+    # The rows that this run replaces or removes give way to the new rows of
+    # the run (db._symbols.mark_stale_files): the files that the last run
+    # gave to each listing that this run parses again, and to each listing
+    # that left the build, and the files that no listing owns (an index of
+    # a version without the claims, a run that stopped before the heir).  A
+    # definition that moved to a file of an other unit was lost before, by
+    # the order of the units.
+    mark_stale_files(conn, config_hash, sorted(
+        {path for decision in decisions if not decision.unchanged for path in ownership.files_of(decision.key)}
+        | {path for unit_key in left for path in ownership.files_of(unit_key)}
+        | without_owner
+    ))
+    conn.commit()
 
     # This run writes the marker before its first row, and removes it after
     # its own post-processing.
@@ -1232,6 +1249,11 @@ def run(
         if check_status == "skipped":
             skipped += 1
             log.info("[%d/%d] %s: skipped", processed, len(units), fname)
+            # The unit keeps its rows, and the files that it got from a listing
+            # that lost them keep theirs: the marks end for the rest of the run
+            # (db._symbols.mark_stale_files).
+            settle_stale_files(conn, config_hash)
+            conn.commit()
             _settle_claims(
                 i, decisions, None, ownership, awaiting, skip_files,
                 conn, config_hash, db_path.parent, project_root,
@@ -1291,6 +1313,11 @@ def run(
             else:
                 skipped += 1
                 log.info("[%d/%d] %s: skipped", processed, len(units), fname)
+                # The store failed and rolled back: the unit keeps its rows,
+                # also the rows of the files that it claimed or got in this
+                # run.  The marks end for the rest of the run.
+                settle_stale_files(conn, config_hash)
+                conn.commit()
 
         claimed = (
             {_normalize_file_path(path, project_root) for path in parsed_data.newly_seen_files}
@@ -1322,6 +1349,15 @@ def run(
         len(units), left_at, ownership, decisions, awaiting, skip_files,
         conn, config_hash, db_path.parent, project_root,
     )
+    # The loop of the C and C++ units is over: a row of a file that no unit
+    # parsed again is the row that the post-processing keeps or removes, as
+    # before.  The marks are for the C and C++ units only, thus they end
+    # before the linker scripts and the assembly.  These passes clear their
+    # own rows first, and they must keep the usual order of the upsert:
+    # two assembly units that read one shared file give one USR, and a
+    # `.weak` row must not replace a `.global` row.
+    settle_stale_files(conn, config_hash)
+    conn.commit()
 
     # ── Linker scripts, between the C units and the assembly ──
     # The position is deliberate, and both neighbours depend on it — see

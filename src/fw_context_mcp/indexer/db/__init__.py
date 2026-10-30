@@ -114,6 +114,7 @@ __all__ = [
     "load_ownership",
     "lookup_macro",
     "make_analysis_summary",
+    "mark_stale_files",
     "missing_columns",
     "number_listings",
     "open_db",
@@ -139,6 +140,7 @@ __all__ = [
     "search_symbols",
     "set_analyze_vendor",
     "set_entry_point",
+    "settle_stale_files",
     "skip_form",
     "slot_unit_key",
     "split_tokens",
@@ -315,7 +317,9 @@ from ._symbols import (
     insert_symbols_batch,
     link_definition,
     lookup_macro,
+    mark_stale_files,
     search_symbols,
+    settle_stale_files,
     split_tokens,
 )
 

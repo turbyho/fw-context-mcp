@@ -61,7 +61,7 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 
 from fw_context_mcp.utils import is_db_exception
 
@@ -77,7 +77,9 @@ __all__ = [
     "insert_symbols_batch",
     "link_definition",
     "lookup_macro",
+    "mark_stale_files",
     "search_symbols",
+    "settle_stale_files",
     "split_tokens",
 ]
 
@@ -183,6 +185,134 @@ def split_tokens(name: str, qualified_name: str = "") -> str:
     return " ".join(tokens)
 
 
+# The files whose rows the index run replaces or removes, and that it did
+# not parse again yet (``mark_stale_files``), by ``files.id``.  A TEMP
+# table: it belongs to the connection of one run, and an other connection
+# never sees it.  WHY the id and not the path: a writer of a symbol row
+# that spells the path in an other form cannot hide the row from the mark.
+_STALE_FILES_DDL = "CREATE TEMP TABLE IF NOT EXISTS stale_files (file_id INTEGER PRIMARY KEY)"
+
+
+def mark_stale_files(conn: sqlite3.Connection, config_hash: str, paths: Iterable[str]) -> None:
+    """Mark the files *paths* of the build *config_hash* as stale: the run replaces or removes their rows.
+
+    WHY: one row of ``symbols`` holds each USR, and the first definition
+    wins.  When a definition moves to a file of an other unit (a body
+    inline in a header, a function moved to an other `.cpp`), the parse of
+    the new place can come before the delete of the old rows.  Without the
+    mark, the upsert drops the new definition, and the delete then removes
+    the symbol until a full run.  A row of a stale file gives way to any
+    new row (``insert_symbols_batch``), as a row that the run did not
+    insert yet.
+
+    The runner marks, before the first parse, the files that the last run
+    gave to the units that this run parses again and to the units that
+    left the build, and the files that no unit owns.
+
+    The first unit whose parse or store fails ends every mark
+    (``settle_stale_files``): the unit keeps its rows, and the rows of
+    the files that the run handed to it.  From there the upsert keeps the
+    first definition, as an index run did before the marks.
+
+    Limits:
+
+    * A unit that the run does not parse gives no row again.  A deleted
+      definition thus loses its symbol, also when an unchanged unit
+      declares it (that build does not link).
+    * After a failed unit, a definition that moved to a later unit, or to
+      a file that the run hands to a later unit, can be lost as before.
+      The next run that parses the unit with the moved definition repairs
+      it.  An earlier unit can have replaced a row of the failed unit
+      already; the next run that parses the failed unit repairs it.
+    * A run that stops keeps each row that a new row replaced, for example
+      a declaration in place of the definition of a changed unit that the
+      run did not reach.  When that unit gets its earlier text back, the
+      next run does not parse it, and the definition is lost until the
+      unit changes again or a full run.
+    """
+    conn.execute(_STALE_FILES_DDL)
+    conn.executemany(
+        "INSERT OR IGNORE INTO stale_files (file_id) SELECT id FROM files WHERE config_hash = ? AND path = ?",
+        [(config_hash, path) for path in paths],
+    )
+
+
+def settle_stale_files(conn: sqlite3.Connection, config_hash: str, paths: Iterable[str] | None = None) -> None:
+    """End the stale mark of the files *paths* of the build *config_hash*, or of every file when *paths* is None.
+
+    A unit settles the files whose rows it replaced: those rows are
+    current, and the usual order of the upsert applies to them again.  A
+    failed unit ends every mark (``mark_stale_files``).
+    """
+    conn.execute(_STALE_FILES_DDL)
+    if paths is None:
+        conn.execute("DELETE FROM stale_files")
+    else:
+        conn.executemany(
+            "DELETE FROM stale_files WHERE file_id IN (SELECT id FROM files WHERE config_hash = ? AND path = ?)",
+            [(config_hash, path) for path in paths],
+        )
+
+
+def _drop_old_data_of_stale_rows(conn: sqlite3.Connection, keys: Iterable[tuple[str, str]]) -> None:
+    """Delete the old data of each row of a stale file that a key ``(config_hash, usr)`` names.
+
+    The old data: the LLM analysis and its copy in ``symbols``
+    (``summary``, ``inputs``, ``outputs``), the embeddings, the vectors,
+    and the override edges whose derived end is the row.
+
+    WHY: the upsert keeps the id of the row that it replaces, and moves the
+    row to the file of the new row.  The delete of the stale file thus does
+    not find the row.  Without this delete, the row keeps the data of the
+    old text: a body that is gone, or the body of an other place.
+    ``semantic_search`` then finds the row through the old vector, and
+    ``search_code`` through the old analysis, which ``symbols_fts``
+    indexes.  A method that now overrides nothing keeps the edge to its old
+    base: no unit gives a row of the method that replaces the edge
+    (``insert_overrides_batch``).
+
+    The function removes the data as the delete of the file does:
+
+    * The embeddings go to the stash first.  The embedding step takes a
+      vector back when the text did not change (``take_stashed_embeddings``).
+    * A unit writes its override edges after its symbols (``ops``).  The
+      unit of the new row, or a later unit that holds the definition of
+      the method, thus writes the current edges again.
+    * The inheritance edges need no delete here: a unit deletes the edges
+      of each class that it parses before it writes its symbols
+      (``ops._delete_old_for_tu``), and only a definition of a class gets
+      a row.
+    """
+    from ._embeddings import stash_embeddings_for_symbols
+
+    found_rows: dict[int, tuple[str, str]] = {}
+    for key in keys:
+        found = conn.execute(
+            "SELECT s.id FROM symbols s JOIN temp.stale_files r ON r.file_id = s.file_id"
+            " WHERE s.config_hash = ? AND s.usr = ?",
+            key,
+        ).fetchone()
+        if found is not None:
+            found_rows[found[0]] = key
+    if not found_rows:
+        return
+    conn.executemany("DELETE FROM overrides WHERE config_hash = ? AND derived_usr = ?", list(found_rows.values()))
+    ids = list(found_rows)
+    stash_embeddings_for_symbols(conn, ids)
+    for chunk in chunked(ids):
+        marks = ",".join("?" * len(chunk))
+        conn.execute(f"DELETE FROM llm_analysis WHERE symbol_id IN ({marks})", chunk)
+        conn.execute(f"UPDATE symbols SET summary = '', inputs = '', outputs = '' WHERE id IN ({marks})", chunk)
+        conn.execute(f"DELETE FROM embeddings WHERE symbol_id IN ({marks})", chunk)
+        try:
+            conn.execute(f"DELETE FROM vec_symbols WHERE symbol_id IN ({marks})", chunk)
+        except sqlite3.OperationalError as error:
+            # sqlite-vec is not there: no table, or a table whose module
+            # (vec0) this connection did not load (``_connection._load_sqlite_vec``).
+            if "no such table" not in str(error) and "no such module" not in str(error):
+                raise
+
+
 def insert_symbols_batch(
     conn: sqlite3.Connection,
     rows: list[tuple],
@@ -199,7 +329,7 @@ def insert_symbols_batch(
     no linker resolves (a type, a test fixture) leaves it out.  A row
     without ``is_tentative`` is no tentative definition.
 
-    Returns count of rows inserted or upgraded to definition.
+    Returns count of rows inserted or updated.
 
     Conflict resolution strategy
     ─────────────────────────────
@@ -216,7 +346,7 @@ def insert_symbols_batch(
       • A **declaration** arriving before a definition is silently
         overwritten when the definition row arrives later.
       • A **definition** arriving first stays untouched — the declaration
-        row cannot downgrade it.
+        row cannot downgrade it, unless its file is stale (below).
       • A **weak definition** gives way to a strong one of the same USR,
         as the linker does: the weak `HAL_GPIO_EXTI_Callback` of a HAL
         file and the strong one of the project are one USR, and the units
@@ -229,14 +359,23 @@ def insert_symbols_batch(
         the paths.
       • Two declarations for the same USR (e.g. from two headers), or two
         definitions of one strength, keep whichever arrived first.
+      • A row of a **stale** file (``mark_stale_files``) gives way to any
+        new row, a declaration too: the run replaces or removes the rows
+        of that file, thus the row is not current.  The row keeps its id,
+        and loses its old data first (``_drop_old_data_of_stale_rows``),
+        as the delete of the file removes it.
 
-    Without this guard, a declaration row arriving AFTER a definition
-    would overwrite ``is_definition`` back to 0 — breaking the call graph.
+    Without this guard, a declaration row arriving AFTER a current
+    definition would overwrite ``is_definition`` back to 0 — breaking the
+    call graph.
     """
 
     # The two last values are optional: (link_name, is_tentative).
     defaults = ("", 0)
     full = [(*row, *defaults[len(row) - 24:]) for row in rows]
+    conn.execute(_STALE_FILES_DDL)
+    if conn.execute("SELECT 1 FROM temp.stale_files LIMIT 1").fetchone() is not None:
+        _drop_old_data_of_stale_rows(conn, [(row[0], row[4]) for row in full])
     cur = conn.executemany(
         """INSERT INTO symbols
            (config_hash, file_id, file_path, name_tokens, usr, name, qualified_name, kind,
@@ -251,7 +390,7 @@ def insert_symbols_batch(
                line          = excluded.line,
                col           = excluded.col,
                end_line      = excluded.end_line,
-               is_definition = 1,
+               is_definition = excluded.is_definition,
                signature     = excluded.signature,
                docstring     = excluded.docstring,
                enum_value    = excluded.enum_value,
@@ -266,11 +405,11 @@ def insert_symbols_batch(
                is_weak       = excluded.is_weak,
                link_name     = excluded.link_name,
                is_tentative  = excluded.is_tentative
-           WHERE excluded.is_definition = 1 AND (
+           WHERE (excluded.is_definition = 1 AND (
                symbols.is_definition = 0 OR (symbols.is_weak = 1 AND excluded.is_weak = 0)
                OR (symbols.is_tentative = 1 AND excluded.is_tentative = 0
                    AND excluded.is_weak <= symbols.is_weak)
-           )""",
+           )) OR EXISTS (SELECT 1 FROM temp.stale_files r WHERE r.file_id = symbols.file_id)""",
         full,
     )
     return cur.rowcount  # approximate with ON CONFLICT DO UPDATE WHERE (used for logging only)
