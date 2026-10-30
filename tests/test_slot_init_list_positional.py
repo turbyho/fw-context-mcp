@@ -5,10 +5,10 @@ position of each element is its field, in the order of the struct
 (``symbols._positional_struct_fields``).
 
 The mapping stops at the first doubt (brace elision, a designator, an
-anonymous member, a C++ base class).  An element after the stop gives its
-function with no slot (only its type tells its calls).  The tests of those
-cases check that each slot that IS given is true; a slot that is left out
-is the price of not guessing.
+anonymous member of the Microsoft extension, a C++ base class).  An
+element after the stop gives its function with no slot (only its type
+tells its calls).  The tests of those cases check that each slot that IS
+given is true; a slot that is left out is the price of not guessing.
 """
 
 from __future__ import annotations
@@ -80,6 +80,38 @@ void runtime_setup(void) {
     struct many array_with_call = { .arr = { fa, fb, pick(fc) } };
     (void)call_in_condition; (void)one_branch_calls; (void)array_with_call;
 }
+struct qinfo { struct { int max; } q; cb_t cb; };
+static struct qinfo unnamed_type_braced = { { 4 }, fa };
+struct uinfo { union { int i; void *p; } u; cb_t cb; };
+static struct uinfo unnamed_union_braced = { { 1 }, fb };
+struct twice { struct { int a; } q1, q2; cb_t cb; };
+static struct twice one_type_two_fields = { { 1 }, { 2 }, fc };
+struct config { unsigned flags; struct { void **data; int max; } isr; struct { void *addr; unsigned size; } mem;
+                cb_t thread; init_fn_t setup; unsigned count; };
+static struct config rtx_like = { 0, { 0, 4 }, { 0, 8 }, fa, dev_init, 2 };
+struct elided_unnamed { struct { int a; } q; cb_t cb; };
+static struct elided_unnamed unnamed_type_elided = { 1, fd };
+static struct anon braced_anonymous = { fa, { fb }, fc };
+struct holder { struct inner_tag { int a; }; cb_t cb; };
+static struct holder tagged_inside = { fa };
+union lead { struct { cb_t p; cb_t q; }; int n; };
+static union lead union_anonymous_first = { { fa, fb } };
+struct zero { int a; int : 0; struct { cb_t in; }; cb_t c; };
+static struct zero zero_width_bits = { 1, { fa }, fb };
+"""
+
+MS_SOURCE = """\
+typedef void (*cb_t)(int);
+static void fa(int v) { (void)v; }
+static void fb(int v) { (void)v; }
+struct pair { cb_t first; };
+typedef struct pair pair_t;
+struct ms_tag { struct pair; cb_t cb; };
+static struct ms_tag ms_tagged = { fa, fb };
+struct ms_def { pair_t; cb_t cb; };
+static struct ms_def ms_typedef = { fa, fb };
+struct ms_in { struct pair2 { cb_t first; }; cb_t cb; };
+static struct ms_in ms_defined = { fa, fb };
 """
 
 CXX_SOURCE = """\
@@ -95,6 +127,11 @@ void ov(int);
 void ov(double);
 struct by_type { cbd_t d; };
 static by_type overloaded = { ov };
+struct with_unnamed { struct { int a; } q; cb_t cb; };
+static with_unnamed unnamed_member_type = { {1}, dev_cb };
+template <class T> struct box { struct { T a; }; cb_t cb; };
+static box<int> braced_box = { {1}, dev_cb };
+static box<int> elided_box = { 1, dev_cb };
 """
 
 
@@ -111,6 +148,11 @@ def _extract(tmp_path_factory, name: str, text: str, language: str, args: list[s
 @pytest.fixture(scope="module")
 def c_rows(tmp_path_factory):
     return _extract(tmp_path_factory, "pos.c", C_SOURCE, "c", ["-std=c11"])
+
+
+@pytest.fixture(scope="module")
+def ms_rows(tmp_path_factory):
+    return _extract(tmp_path_factory, "ms.c", MS_SOURCE, "c", ["-std=gnu11", "-fms-extensions"])
 
 
 @pytest.fixture(scope="module")
@@ -212,6 +254,66 @@ def test_the_field_type_picks_an_overload_at_its_position(cxx_rows):
 def test_review_shapes_give_no_wrong_slot(c_rows, text, truth):
     """An anonymous member, a GNU designator, and a call as an element."""
     assert _slotted(c_rows, C_SOURCE, text) <= truth
+
+
+@pytest.mark.libclang
+@pytest.mark.parametrize(("text", "facts"), [
+    ("struct qinfo unnamed_type_braced", {("fa", "cb")}),
+    ("struct uinfo unnamed_union_braced", {("fb", "cb")}),
+    ("struct twice one_type_two_fields", {("fc", "cb")}),
+    ("struct config rtx_like", {("fa", "thread"), ("dev_init", "setup")}),
+])
+def test_a_named_field_of_an_unnamed_type_keeps_the_positions(c_rows, text, facts):
+    """`struct { ... } q;` is a named field that takes one element; only an anonymous member stops the list."""
+    assert _sources(c_rows, C_SOURCE, text) == facts
+
+
+@pytest.mark.libclang
+@pytest.mark.parametrize(("text", "facts"), [
+    ("struct anon braced_anonymous", {("fa", "a"), ("fb", "x"), ("fc", "c")}),
+    ("struct holder tagged_inside", {("fa", "cb")}),
+    ("union lead union_anonymous_first", {("fa", "p"), ("fb", "q")}),
+    ("struct zero zero_width_bits", {("fa", "in"), ("fb", "c")}),
+])
+def test_a_braced_anonymous_member_and_a_tagged_definition_inside_keep_the_positions(c_rows, text, facts):
+    """A braced element fills the anonymous member; a tagged definition with no declarator is no member."""
+    assert _sources(c_rows, C_SOURCE, text) == facts
+
+
+@pytest.mark.libclang
+@pytest.mark.parametrize("text", ["struct ms_tag ms_tagged", "struct ms_def ms_typedef", "struct ms_in ms_defined"])
+def test_an_anonymous_member_of_the_microsoft_extension_gives_no_wrong_slot(ms_rows, text):
+    """`struct pair;` with `-fms-extensions` is a member, and `fa` fills `pair.first` by brace elision.
+
+    The children of the record have no field for it, thus a list of the
+    children gave `fa` to `cb`.
+    """
+    assert _slotted(ms_rows, MS_SOURCE, text) <= {("fa", "first"), ("fb", "cb")}
+
+
+@pytest.mark.libclang
+def test_brace_elision_into_a_field_of_an_unnamed_type_still_stops(c_rows):
+    """`{ 1, fd }`: the `1` fills `q.a` without braces, thus the position of `fd` is in doubt."""
+    assert _sources(c_rows, C_SOURCE, "struct elided_unnamed unnamed_type_elided") == {("fd", "")}
+
+
+@pytest.mark.libclang
+def test_a_cxx_named_field_of_an_unnamed_type_keeps_the_positions(cxx_rows):
+    line = _line(CXX_SOURCE, "static with_unnamed unnamed_member_type")
+    assert {(_short(s.function), _short(s.slot)) for s in cxx_rows.slots.sources if s.line == line} == {
+        ("dev_cb", "cb"),
+    }
+
+
+@pytest.mark.libclang
+@pytest.mark.parametrize(("text", "facts"), [
+    ("static box<int> braced_box", {("dev_cb", "cb")}),
+    ("static box<int> elided_box", {("dev_cb", "")}),
+])
+def test_an_anonymous_member_of_a_template_instance(cxx_rows, text, facts):
+    line = _line(CXX_SOURCE, text)
+    assert {(_short(s.function), _short(s.slot) if s.slot else "")
+            for s in cxx_rows.slots.sources if s.line == line} == facts
 
 
 @pytest.mark.libclang

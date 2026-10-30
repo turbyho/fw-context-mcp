@@ -2351,12 +2351,25 @@ def _positional_struct_fields(cursor: cx.Cursor) -> list[tuple[str | None, str, 
     * The type must be a struct, a union or a C++ aggregate class with no
       base class.  A positional element of a C++17 aggregate initializes
       the bases first.  A union takes one element, its first member.
-    * The members are read in their order.  An anonymous struct or union
-      member stops the list, because its fields take the next positions
-      and libclang gives no field for it.  ``is_anonymous`` is also True
-      for the unnamed type of a named field (``struct { ... } f;``): that
-      stop costs rows, never a wrong one.  An unnamed bit-field takes no
-      element and is skipped.
+    * The fields come from the type (``get_fields``), in their order, and
+      not from the children of the declaration.  The children have no
+      field for an anonymous member: they have the declaration of its
+      record.  The type gives the field of the member:
+
+      - An anonymous struct or union member (C11, C++) is a field that
+        libclang names after its record.  A braced element initializes it
+        through its own list.  An element without braces stops the list
+        (brace elision, below).
+      - An anonymous member of the Microsoft extension (``struct pair;``
+        with ``-fms-extensions``) is a field with no name, which stops the
+        list.  The children show only a declaration of the record, which
+        does not tell a member from a declaration, thus a list of the
+        children gave the elements after it to the wrong fields.
+      - A field of an unnamed type (``struct { ... } f;``) takes one
+        element, as each named field does.  A stop at the unnamed record
+        lost each field after it (measured: the timer thread and the timer
+        setup function of the configuration of an RTOS).
+      - An unnamed bit-field takes no element and is skipped.
     * A field that is a struct, a union or an array, with an element that
       has no braces of its own, stops the list: brace elision spreads that
       element over the inner values.  A field that is an array of function
@@ -2380,19 +2393,17 @@ def _positional_struct_fields(cursor: cx.Cursor) -> list[tuple[str | None, str, 
         # cipher tables of an SDK, 50 functions with no slot).
         record = list_type.get_declaration()
         record = record.get_definition() or record
-        members = list(record.get_children())
+        children = list(record.get_children())
         elements = list(cursor.get_children())
         template = record.specialized_template
-        if template is not None and not any(m.kind == cx.CursorKind.FIELD_DECL for m in members):
+        if template is not None and not children:
             # An implicit instance of a class template shows no children
-            # (measured, libclang 22): its type gives its fields, and its
-            # template its base classes.
-            if any(m.kind == cx.CursorKind.CXX_BASE_SPECIFIER for m in template.get_children()):
-                return []
-            members = list(list_type.get_fields())
+            # (measured, libclang 22): its template gives its base classes.
+            children = list(template.get_children())
+        members = list(list_type.get_fields())
     except (ValueError, TypeError, RuntimeError, AttributeError):
         return []
-    if any(m.kind == cx.CursorKind.CXX_BASE_SPECIFIER for m in members):
+    if any(c.kind == cx.CursorKind.CXX_BASE_SPECIFIER for c in children):
         return []
     if any(_has_member_designator(e) for e in elements):
         return []
@@ -2401,10 +2412,6 @@ def _positional_struct_fields(cursor: cx.Cursor) -> list[tuple[str | None, str, 
     for member in members:
         if len(mapped) == len(elements) or (union and mapped):
             break
-        if member.kind in _RECORD_DECL_KINDS and member.is_anonymous():
-            break
-        if member.kind != cx.CursorKind.FIELD_DECL:
-            continue
         if not member.spelling:
             if member.is_bitfield():
                 continue
@@ -2439,13 +2446,6 @@ def _positional_struct_fields(cursor: cx.Cursor) -> list[tuple[str | None, str, 
             continue
         mapped.append(_field_entry(member))
     return mapped
-
-
-_RECORD_DECL_KINDS = frozenset({
-    cx.CursorKind.STRUCT_DECL,
-    cx.CursorKind.UNION_DECL,
-    cx.CursorKind.CLASS_DECL,
-})
 
 
 _CHAR_TYPE_KINDS = frozenset({
