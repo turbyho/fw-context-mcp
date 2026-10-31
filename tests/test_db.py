@@ -37,6 +37,7 @@ from fw_context_mcp.indexer.db import (
     upsert_file,
     upsert_project,
 )
+from tests._usr_keys import base_names
 
 
 def find_refs(conn, config_hash, name, ref_kind=None, limit=50):
@@ -1928,7 +1929,7 @@ class TestIndirectCallSitesArraySubscript:
         source = src / name
         source.write_text(code, encoding="utf-8")
         unit = CompilationUnit(file=source, directory=src, language="c", clang_args=["-std=c11"])
-        return extract_all(unit, with_refs=True).slots.sites
+        return base_names(extract_all(unit, with_refs=True).slots.sites, source)
 
     @pytest.mark.libclang
     def test_extract_all_detects_array_subscript_call(self, tmp_path):
@@ -2122,7 +2123,7 @@ void init(void) {
 """, encoding="utf-8")
 
         unit = CompilationUnit(file=init_c, directory=src, language="c", clang_args=["-std=c11"])
-        slots = extract_all(unit, with_refs=True).slots
+        slots = base_names(extract_all(unit, with_refs=True).slots, init_c)
 
         assert [(s.function, s.slot, s.function_type) for s in slots.sources] == [
             ("c:init.c@F@my_handler_cb", "F|c:@S@config@FI@handler", "void (int)"),

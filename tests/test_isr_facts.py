@@ -219,6 +219,23 @@ def test_the_file_symbol_picks_the_static_handler(root):
     assert ("_isr_wrapper", "local_isr", "drv.c") not in calls
 
 
+def test_two_static_handlers_in_files_of_one_base_name_give_no_target(root):
+    """`drv.c` and `sub/drv.c` both define `static local_isr`: the file symbol `drv.c` names neither one."""
+    _project(root)
+    (root / "sub").mkdir()
+    (root / "sub" / "drv.c").write_text(
+        "static void local_isr(const void *arg) { (void)arg; }\n"
+        "void take(void (*f)(const void *));\n"
+        "void use_sub(void) { take(local_isr); }\n",
+        encoding="utf-8",
+    )
+    entries = json.loads((root / "compile_commands.json").read_text(encoding="utf-8"))
+    entries.append({"directory": str(root), "file": "sub/drv.c", "arguments": ["cc", "-std=gnu11", "-c", "sub/drv.c"]})
+    (root / "compile_commands.json").write_text(json.dumps(entries), encoding="utf-8")
+    _run(root)
+    assert not {call for call in _calls(root) if call[:2] == ("_isr_wrapper", "local_isr")}
+
+
 def test_a_local_symbol_with_no_file_symbol_gives_no_target(root):
     """Two `static local_isr`: without the file symbol of the artifact, no definition is the one."""
     _project(root, symbols=[s for s in SYMBOLS if s[2] != _FILE])

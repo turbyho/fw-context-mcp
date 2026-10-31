@@ -34,6 +34,7 @@ from collections.abc import Callable, Iterable
 from functools import cache
 
 from ._libclang import cindex as cx
+from ._usr import cursor_usr
 
 __all__ = ["VIRTUAL_METHOD_KINDS", "extract_overrides"]
 
@@ -106,7 +107,7 @@ def extract_overrides(
         work = _overridden(method)
         while work:
             base = work.pop()
-            usr = base.get_usr()
+            usr = cursor_usr(base)
             if not usr or usr in seen:
                 continue
             seen.add(usr)

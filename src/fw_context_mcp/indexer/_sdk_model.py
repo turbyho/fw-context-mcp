@@ -52,7 +52,7 @@ slot (``slot_sources``), which ``find_indirect_targets`` gives.
 
 A rule names a function or a field by its qualified name.  Each symbol of
 the build with that name gets the rule: an overload, and a ``static
-inline`` copy of a header (USR ``c:task.h@F@xTaskCreate``).  A rule whose
+inline`` copy of a header (USR ``c:task.h~<key>@F@xTaskCreate``).  A rule whose
 name is not in the build does nothing, thus one table can hold every SDK.
 
 A project adds its own rules in ``[[call_graph.sdk]]`` of

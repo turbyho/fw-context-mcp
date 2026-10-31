@@ -1,9 +1,10 @@
 """One USR for a function with internal linkage that C units and C++ units of a build both compile.
 
 WHY this module exists: clang gives a `static` function more than one USR.
-A C unit gives `c:hdr.h@F@f`, and a C++ unit gives `c:hdr.h@F@f#I#` with
-the signature, also inside `extern "C"`.  The file in the USR is the file
-of the first declaration that the unit reads, thus a prototype in an other
+A C unit gives `c:hdr.h~<key>@F@f`, and a C++ unit gives
+`c:hdr.h~<key>@F@f#I#` with the signature, also inside `extern "C"`
+(``_usr.file_key`` names the file).  The file in the USR is the file of
+the first declaration that the unit reads, thus a prototype in an other
 header gives an other USR in the same language.  A header with `static
 inline` functions (CMSIS, the low-layer drivers of a HAL, the FreeRTOS of
 ESP-IDF) has its symbols from the first unit that walks it; the other
@@ -81,9 +82,9 @@ def _aliases(conn: sqlite3.Connection, config_hash: str) -> dict[str, str]:
 
     No match:
 
-    * An alias recorded at two places: the USR names the file by its base
-      name only, thus `dirA/util.h` and `dirB/util.h` give one USR to two
-      functions.
+    * An alias recorded at two places: the USR names one file
+      (``_usr.file_key``), and the file defines two functions of the name
+      under two conditions (`#if`) that two units read.
     * An alias with two symbols of its name at its place: the place does
       not tell them apart (a macro that defines two overloads).
     * A symbol whose C++ USRs (its own one and its aliases) hold two

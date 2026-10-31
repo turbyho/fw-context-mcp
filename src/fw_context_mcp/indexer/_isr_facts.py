@@ -143,10 +143,10 @@ def _definition(conn: sqlite3.Connection, config_hash: str, symbol: ElfSymbol) -
     strong one, thus the one strong definition wins.
 
     A local symbol is unique only in its object file, thus its definition
-    must have the name and the file of the symbol.  The file is the base
-    name only.  That is enough: libclang gives a `static` function of C the
-    USR of the base name of its file (`c:drv.c@F@isr`), thus the index holds
-    one symbol for two such functions in files of one base name.
+    must have the name and the file of the symbol.  The artifact gives the
+    base name of the file only, thus two `static` functions of one name in
+    two files of one base name (two symbols, ``_usr.file_key``) give no
+    match.
 
     No match, or more than one, gives None: a wrong target is worse than
     none.  A `static` function of a header has the file of its unit in the

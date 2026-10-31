@@ -50,6 +50,7 @@ from pathlib import Path
 
 from . import symbols as _sym
 from ._libclang import cindex as cx
+from ._usr import cursor_usr
 from .models import SlotArgument, SlotEscape, SlotFlow, SlotSite, SlotSource
 
 _K = cx.CursorKind
@@ -439,7 +440,7 @@ class _Collector:
 
     def callable_record(self, declaration: cx.Cursor) -> bool:
         """The record has an ``operator()``, of its own or of a base class."""
-        usr = declaration.get_usr()
+        usr = cursor_usr(declaration)
         if not usr:
             return False
         known = self._callable_records.get(usr)
@@ -468,7 +469,7 @@ class _Collector:
         declaration = _record(record_type)
         if declaration is None:
             return False
-        usr = declaration.get_usr()
+        usr = cursor_usr(declaration)
         known = self._records_with_methods.get(usr)
         if known is None:
             known = next(iter(record_type.get_canonical().get_methods()), None) is not None
@@ -480,7 +481,7 @@ class _Collector:
         declaration = _record(_strip_arrays(type_))
         if declaration is None or not self.callable_record(declaration):
             return None
-        return "W:" + declaration.get_usr()
+        return "W:" + cursor_usr(declaration)
 
     def slot_type(self, type_: cx.Type) -> str | None:
         return _pointer_type(type_) or _table_pointer_type(type_) or self.object_type(type_)
@@ -503,7 +504,7 @@ class _Collector:
         of the instance bodies gives its facts, and one call in a template
         was a site of each instance.
         """
-        usr = declaration.get_usr()
+        usr = cursor_usr(declaration)
         parent = declaration.semantic_parent
         if not usr or parent is None:
             return usr
@@ -531,7 +532,7 @@ class _Collector:
             if match is None:
                 break
             current = match
-        mapped = current.get_usr() or usr
+        mapped = cursor_usr(current) or usr
         self._member_usrs[usr] = mapped
         return mapped
 
@@ -559,7 +560,7 @@ class _Collector:
             for node in definition.walk_preorder():
                 if (_kind(node) == _K.VAR_DECL and node.spelling == variable.spelling
                         and _sym._same_place(node, variable)):
-                    mapped = node.get_usr() or usr
+                    mapped = cursor_usr(node) or usr
                     break
         self._member_usrs[usr] = mapped
         return mapped
@@ -865,7 +866,7 @@ class _Collector:
         if usr is None:
             return None, None
         for field_cursor in init_list.type.get_canonical().get_fields():
-            if field_cursor.get_usr() == usr:
+            if cursor_usr(field_cursor) == usr:
                 return self.member_usr(field_cursor), field_type
         return usr, field_type
 
@@ -1429,7 +1430,7 @@ class _Collector:
         record = function.semantic_parent
         returned_record = _record(result)
         if (record is not None and returned_record is not None
-                and returned_record.get_usr() == record.get_usr()):
+                and cursor_usr(returned_record) == cursor_usr(record)):
             return None
         target = self.call_object(call, function)
         return self.slot_of(target)[0] if target is not None else None

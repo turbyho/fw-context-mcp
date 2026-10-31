@@ -163,7 +163,12 @@ __all__ = [
 #      header one USR in C and an other in C++ (`internal_decls`).  Before
 #      it, 1195 calls of an Mbed project and 305 of an STM32 project named a
 #      USR that is no symbol.
-CURRENT_ROW_FORMAT = "fw-context-rows/13"
+# /14 — the USR of a symbol with no external name (a `static` function or
+#      variable, a local, a macro) names its file by a key of the path
+#      (`c:drv.c~3fa9c2e1@F@isr`, `_usr.file_key`).  Before it, the USR held
+#      the base name of the file, thus two files of one base name in two
+#      directories gave one symbol for two (the two `fatal.c` of Zephyr).
+CURRENT_ROW_FORMAT = "fw-context-rows/14"
 
 # The config-hash format that was current when CURRENT_ROW_FORMAT last moved.
 #
@@ -178,7 +183,7 @@ CURRENT_ROW_FORMAT = "fw-context-rows/13"
 # the build, thus a plain `fw-context index` writes every file and every
 # body again.  The two must therefore move together, and
 # `test_row_format_invalidation.py` fails when only one of them does.
-ROW_FORMAT_PAIRED_WITH = "fw-context-cc/15"
+ROW_FORMAT_PAIRED_WITH = "fw-context-cc/16"
 
 
 def _row_format_number(value: str) -> int | None:
@@ -264,6 +269,9 @@ _ROW_FORMAT_FAULTS: tuple[tuple[int, str], ...] = (
     (12, "a call from a C unit to a static function of a header that a C++ "
          "unit indexed (or back) names a USR that is no symbol, thus "
          "find_callers and the call paths miss it"),
+    (13, "two static functions or variables of one name in two files of one "
+         "base name (two fatal.c in two directories) are one symbol, with one "
+         "body and the references of the two"),
 )
 
 

@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._usr_keys import base_names
+
 SOURCE = """\
 typedef void (*cb_t)(int);
 static void dev_a(int v) { (void)v; }
@@ -32,7 +34,7 @@ def extracted(tmp_path_factory):
     src: Path = tmp_path_factory.mktemp("valuefield") / "v.cpp"
     src.write_text(SOURCE, encoding="utf-8")
     unit = CompilationUnit(file=src, directory=src.parent, language="cpp", clang_args=["-std=c++20"])
-    return extract_all(unit, with_refs=True)
+    return base_names(extract_all(unit, with_refs=True), src)
 
 
 def _line(text: str) -> int:

@@ -22,6 +22,7 @@ from pathlib import Path
 import pytest
 
 import fw_context_mcp  # noqa: F401  (pysqlite3 redirect before any sqlite3)
+from tests._usr_keys import base_names
 
 pytest.importorskip("clang.cindex", reason="libclang not available")
 pytestmark = pytest.mark.libclang
@@ -453,7 +454,7 @@ def _fact_rows(tmp_path: Path, name: str, source: str):
     src = tmp_path / name
     src.write_text(source, encoding="utf-8")
     unit = _get_index().parse(str(src), args=["-x", "c", "-std=gnu11"])
-    return collect_slot_facts(unit, None, lambda p: Path(p).resolve())
+    return base_names(collect_slot_facts(unit, None, lambda p: Path(p).resolve()), src)
 
 
 def test_a_read_of_a_void_pointer_place_gives_each_fact_one_time(tmp_path):

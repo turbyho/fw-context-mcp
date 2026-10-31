@@ -1110,6 +1110,9 @@ def compute_config_hash(
         # /15 marks the place of each `static` function that a unit names
         # (`internal_decls`): an unchanged unit had no such rows, thus a
         # call from a C unit to a function of a header kept the USR of C.
+        # /16 names the file of an internal USR by a key of its path
+        # (`_usr.file_key`): an unchanged unit kept the USRs with the base
+        # name, and they named no symbol.
         #
         # WHY the format version belongs in THIS hash: a new config_hash
         # leaves no row for the build, thus a plain `fw-context index` writes
@@ -1120,7 +1123,7 @@ def compute_config_hash(
         #
         # Every existing index therefore gets one final reindex, which is
         # intended.
-        "_format": "fw-context-cc/15",
+        "_format": "fw-context-cc/16",
         "project_root": str(project_root),
         # WHY only these two: config_hash answers "could the same source text
         # compile to something different now?"  Macros flip #ifdef, and the

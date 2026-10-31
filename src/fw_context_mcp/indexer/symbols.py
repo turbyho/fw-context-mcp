@@ -59,6 +59,7 @@ from typing import TYPE_CHECKING
 
 from ._libclang import cindex as cx
 from ._overrides import VIRTUAL_METHOD_KINDS, extract_overrides
+from ._usr import cursor_usr, file_key
 from .compile_commands import CompilationUnit
 from .models import (
     InheritanceRecord,
@@ -305,7 +306,7 @@ def _build_anon_usr_to_field(
         if cursor.kind == cx.CursorKind.FIELD_DECL:
             for child in cursor.get_children():
                 if _is_anonymous_struct_or_union(child):
-                    child_usr = child.get_usr()
+                    child_usr = cursor_usr(child)
                     if child_usr:
                         mapping[child_usr] = cursor.spelling
             return  # don't walk into field children (they're the anon struct members)
@@ -347,7 +348,7 @@ def _qualified_name(
     c = cursor
     while c and c.kind != cx.CursorKind.TRANSLATION_UNIT:
         spelling = c.spelling
-        usr = c.get_usr() if anon_map else None
+        usr = cursor_usr(c) if anon_map else None
         field_name = anon_map.get(usr) if usr and anon_map else None
         if field_name:
             parts.append(field_name)
@@ -477,12 +478,12 @@ def _find_fn_refs_in_expr(
             if expected is None:
                 return results
             for target in _resolve_overload_set(ref, expected):
-                if not (_skip_usr and target.get_usr() == _skip_usr) and target.location.file:
+                if not (_skip_usr and cursor_usr(target) == _skip_usr) and target.location.file:
                     results.append((target, cursor.location))
             return results
         if ref is not None and ref.kind in _INDIRECT_TARGET_KINDS:
             # Skip if this is the callee of the enclosing function call
-            if _skip_usr and ref.get_usr() == _skip_usr:
+            if _skip_usr and cursor_usr(ref) == _skip_usr:
                 return results
             if ref.location.file:
                 results.append((ref, cursor.location))
@@ -508,7 +509,7 @@ def _find_fn_refs_in_expr(
         nested_callee = cursor.referenced
         nested_skip = _skip_usr
         if nested_callee is not None:
-            nested_callee_usr = nested_callee.get_usr()
+            nested_callee_usr = cursor_usr(nested_callee)
             if nested_callee_usr:
                 loc = nested_callee.location
                 if loc.file:
@@ -628,7 +629,7 @@ def _process_one_base_specifier(
     base_ref = child.referenced
     if base_ref is None:
         return None
-    base_usr = base_ref.get_usr()
+    base_usr = cursor_usr(base_ref)
     if not base_usr:
         return None
     base_loc = base_ref.location
@@ -652,7 +653,7 @@ def _extract_inheritance(class_cursors: list[cx.Cursor]) -> list[InheritanceReco
         cx.AccessSpecifier.PRIVATE: "private",
     }
     for cls_cursor in class_cursors:
-        cls_usr = cls_cursor.get_usr()
+        cls_usr = cursor_usr(cls_cursor)
         if not cls_usr:
             continue
         try:
@@ -836,14 +837,14 @@ def _code_usr(target: cx.Cursor) -> str:
         if expression is not None:
             return _lambda_usr(expression)
     if target.kind not in _INSTANCE_FUNCTION_KINDS:
-        return target.get_usr()
+        return cursor_usr(target)
     current = target
     for _ in range(_TEMPLATE_CHAIN_LIMIT):
         template = current.specialized_template
         if template is None or not _has_place_of(current, template):
             break
         current = template
-    return current.get_usr() or target.get_usr()
+    return cursor_usr(current) or cursor_usr(target)
 
 
 # The cursor kinds of a function that a template instance can be.
@@ -876,13 +877,13 @@ def _instance_key(cursor: cx.Cursor) -> str:
     only the first lambda got its edge.  The two instances are two
     declarations, and the hash of the cursor tells them apart.
     """
-    return f"{cursor.get_usr()}#{cursor.hash}"
+    return f"{cursor_usr(cursor)}#{cursor.hash}"
 
 
 def _seed_instance(seeds: dict[str, cx.Cursor], cursor: cx.Cursor) -> None:
     """Add *cursor* to *seeds* when it is a function that is an implicit template instance."""
     if cursor.kind in _INSTANCE_FUNCTION_KINDS and _is_implicit_instance(cursor):
-        if cursor.get_usr():
+        if cursor_usr(cursor):
             seeds.setdefault(_instance_key(cursor), cursor)
 
 
@@ -959,9 +960,9 @@ def _lambda_usr(expression: cx.Cursor) -> str:
     if owner is not None and owner.kind in _LAMBDA_OWNER_KINDS:
         owner_key = _code_usr(owner)
     else:
-        owner_key = owner.get_usr() if owner is not None else ""
+        owner_key = cursor_usr(owner) if owner is not None else ""
     place = expression.location
-    file_name = Path(place.file.name).name if place.file is not None else ""
+    file_name = file_key(place.file.name) if place.file is not None else ""
     return f"{owner_key or 'c:'}@lambda@{file_name}:{place.line}:{place.column}"
 
 
@@ -983,7 +984,7 @@ def _seen_lambdas() -> dict[tuple[str, str, int, int], cx.Cursor]:
 
 def _closure_key(closure: cx.Cursor) -> tuple[str, str, int, int]:
     place = closure.location
-    return (closure.get_usr(), place.file.name if place.file else "", place.line, place.column)
+    return (cursor_usr(closure), place.file.name if place.file else "", place.line, place.column)
 
 
 def _remember_lambda(expression: cx.Cursor) -> None:
@@ -1122,7 +1123,7 @@ def _walk_template_instances(
         definition = declaration.get_definition()
         if definition is None or not definition.is_definition() or not _is_implicit_instance(definition):
             continue
-        if not definition.get_usr():
+        if not cursor_usr(definition):
             continue
         definition_key = _instance_key(definition)
         if definition_key in walked:
@@ -1131,7 +1132,7 @@ def _walk_template_instances(
         definitions.append(definition)
         parent = definition.semantic_parent
         if parent is not None and parent.kind in _INSTANCE_CLASS_KINDS and _is_implicit_instance(parent):
-            classes.setdefault(parent.get_usr(), parent)
+            classes.setdefault(cursor_usr(parent), parent)
         definition_key = _code_usr(definition)
         for node, frame in _body_cursors(definition):
             if node.kind not in _REF_KINDS:
@@ -1146,7 +1147,7 @@ def _walk_template_instances(
                 continue
             caller = definition_key if frame is None else _lambda_usr(frame)
             site = node.location
-            if not site.file or not target.location.file or not target.get_usr():
+            if not site.file or not target.location.file or not cursor_usr(target):
                 continue
             _claim_ref(refs, seen_ref, Reference(
                 to_usr=_code_usr(target), from_file=site.file.name, from_line=site.line,
@@ -1186,7 +1187,7 @@ def _queue_instance(cursor: cx.Cursor, queued: set[str], work: list[cx.Cursor]) 
     """Put *cursor* on the work list of ``_walk_template_instances`` when it is a new implicit instance."""
     if cursor.kind in _INSTANCE_FUNCTION_KINDS and _is_implicit_instance(cursor):
         key = _instance_key(cursor)
-        if cursor.get_usr() and key not in queued:
+        if cursor_usr(cursor) and key not in queued:
             queued.add(key)
             work.append(cursor)
 
@@ -1288,7 +1289,7 @@ def _emit_fn_ptr_targets(
         if not targets:
             continue
         for target, site in targets:
-            if target.get_usr() == skip_usr:
+            if cursor_usr(target) == skip_usr:
                 continue
             target_usr = _code_usr(target)
             target_loc = target.location
@@ -1381,7 +1382,7 @@ def _build_refs(
         cur_fn = lambda_callers.get((cursor.hash, cursor.kind.value), cur_fn)
 
         if cursor.kind in _CALLABLE_KINDS and cursor.is_definition():
-            own_usr = cursor.get_usr()
+            own_usr = cursor_usr(cursor)
             if own_usr:
                 cur_fn = own_usr
             try:
@@ -1535,7 +1536,7 @@ def _process_one_symbol(
     if not is_def and cursor.kind not in _DECL_KINDS:
         return False
 
-    usr = cursor.get_usr()
+    usr = cursor_usr(cursor)
     if not usr:
         return False
 
@@ -1579,7 +1580,7 @@ def _process_one_symbol(
         cx.CursorKind.CLASS_TEMPLATE,
         cx.CursorKind.CLASS_TEMPLATE_PARTIAL_SPECIALIZATION,
     ):
-        parent_usr = sem_parent.get_usr() or ""
+        parent_usr = cursor_usr(sem_parent) or ""
 
     if not parent_usr and kind in ("varlocal", "variable"):
         if sem_parent and sem_parent.kind in _CALLABLE_KINDS:
@@ -1612,19 +1613,19 @@ def _process_one_symbol(
         if cursor.kind in _template_check_kinds:
             specialized = cursor.specialized_template
             if specialized is not None:
-                template_usr = specialized.get_usr() or ""
+                template_usr = cursor_usr(specialized) or ""
             if not template_usr:
                 parent = cursor.semantic_parent
                 if parent is not None:
                     parent_spec = parent.specialized_template
                     if parent_spec is not None:
-                        template_usr = parent_spec.get_usr() or ""
+                        template_usr = cursor_usr(parent_spec) or ""
             if not template_usr:
                 decl = cursor.type.get_declaration()
                 if decl is not None and decl != cursor:
                     decl_spec = decl.specialized_template
                     if decl_spec is not None:
-                        template_usr = decl_spec.get_usr() or ""
+                        template_usr = cursor_usr(decl_spec) or ""
 
     # Deduplication: seen_usrs[usr] = bool(is_definition).
     # Forward declaration (False) → definition (True) is promoted.
@@ -1754,7 +1755,7 @@ def _weak_usrs(tu_cursor: cx.Cursor) -> set[str]:
         if not any(child.kind.is_attribute() for child in cursor.get_children()):
             continue
         if "weak" in _attribute_names(cursor.pretty_printed(policy)):
-            found.add(cursor.get_usr())
+            found.add(cursor_usr(cursor))
     return found
 
 
@@ -1972,12 +1973,12 @@ def _handle_fn_ptr_as_argument(cursor: cx.Cursor, cur_fn: str | None,
     function is a slot fact (``_slots.py``).
     """
     direct_callee = cursor.referenced
-    direct_callee_usr = direct_callee.get_usr() if direct_callee else None
+    direct_callee_usr = cursor_usr(direct_callee) if direct_callee else None
 
     for arg in cursor.get_arguments():
         targets = _find_fn_refs_in_expr(arg, direct_callee_usr)
         for target, site in targets:
-            raw_usr = target.get_usr()
+            raw_usr = cursor_usr(target)
             target_usr = _code_usr(target)
             if raw_usr and raw_usr != direct_callee_usr and site.file:
                 _add_ref(refs, seen_ref, target_usr, site, cur_fn, "indirect", RefOrigin.DIRECT)
@@ -2303,7 +2304,7 @@ def _init_list_element_field(
             last = member_at[-1]
             ref = designators[last].referenced
             if ref is not None and ref.kind == cx.CursorKind.FIELD_DECL:
-                return (ref.get_usr(), ref.spelling, _field_type_spelling(ref), ref.type)
+                return (cursor_usr(ref), ref.spelling, _field_type_spelling(ref), ref.type)
     return (None, "", "", None)
 
 
@@ -2505,7 +2506,7 @@ def _is_string_literal(value: cx.Cursor) -> bool:
 
 def _field_entry(field_decl: cx.Cursor) -> tuple[str | None, str, str, cx.Type | None]:
     """The ``(USR, name, type, field type)`` entry of a field that can receive a function."""
-    return (field_decl.get_usr(), field_decl.spelling, _field_type_spelling(field_decl),
+    return (cursor_usr(field_decl), field_decl.spelling, _field_type_spelling(field_decl),
             field_decl.type)
 
 

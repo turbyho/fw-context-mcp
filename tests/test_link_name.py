@@ -21,6 +21,7 @@ from fw_context_mcp.indexer.db import (
     upsert_file,
     upsert_project,
 )
+from tests._usr_keys import base_names
 
 _CPP = """\
 int main() { return 0; }
@@ -55,7 +56,7 @@ def _extract(tmp_path: Path, name: str, code: str, language: str) -> dict[str, s
     src.write_text(code, encoding="utf-8")
     args = ["-std=c++17"] if language == "cpp" else []
     unit = CompilationUnit(file=src, directory=tmp_path, language=language, clang_args=args)
-    return {s.usr: s.link_name for s in extract_all(unit).symbols}
+    return base_names({s.usr: s.link_name for s in extract_all(unit).symbols}, src)
 
 
 @pytest.mark.libclang

@@ -36,6 +36,7 @@ import logging
 
 import clang.cindex as cx
 
+from ._usr import cursor_usr
 from .models import Reference, RefOrigin
 
 _log = logging.getLogger(__name__)
@@ -109,7 +110,7 @@ def _handler_usr(argument: cx.Cursor) -> str | None:
     referenced = found.referenced
     if referenced is None or referenced.kind != cx.CursorKind.FUNCTION_DECL:
         return None
-    usr = referenced.get_usr()
+    usr = cursor_usr(referenced)
     return usr or None
 
 

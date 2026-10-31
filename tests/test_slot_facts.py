@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._usr_keys import base_names
+
 pytestmark = pytest.mark.libclang
 
 _C = """\
@@ -202,7 +204,7 @@ def _facts(tmp_path: Path, name: str, code: str):
     src.write_text(code, encoding="utf-8")
     language = ["-x", "c++", "-std=c++17"] if name.endswith(".cpp") else ["-x", "c"]
     tu = _get_index().parse(str(src), args=language)
-    facts = collect_slot_facts(tu, None, lambda p: Path(p).resolve())
+    facts = base_names(collect_slot_facts(tu, None, lambda p: Path(p).resolve()), src)
     own = str(src)
     return {
         "sources": {(s.function, s.slot, s.line) for s in facts.sources if s.file == own},
@@ -508,7 +510,7 @@ def test_the_index_holds_the_facts_and_a_reparse_replaces_them(tmp_path: Path):
         sites = conn.execute("SELECT file, line, caller, slot FROM slot_sites ORDER BY line").fetchall()
         sources = conn.execute("SELECT COUNT(*) FROM slot_sources WHERE file = 'fp.c'").fetchone()[0]
 
-        assert [tuple(row) for row in sites] == [
+        assert [base_names(tuple(row), src) for row in sites] == [
             ("fp.c", 7, "c:@F@fire", "V|c:fp.c@g_cb"),
             ("fp.c", 8, "c:@F@load", "F|c:@S@dev@FI@on_rx"),
         ]
