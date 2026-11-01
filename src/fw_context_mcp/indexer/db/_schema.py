@@ -168,7 +168,13 @@ __all__ = [
 #      (`c:drv.c~3fa9c2e1@F@isr`, `_usr.file_key`).  Before it, the USR held
 #      the base name of the file, thus two files of one base name in two
 #      directories gave one symbol for two (the two `fatal.c` of Zephyr).
-CURRENT_ROW_FORMAT = "fw-context-rows/14"
+# /15 — the USR of an anonymous type, and of each member and constant of it,
+#      holds the place of its declaration (`c:@Ea@ST_IDLE~sm.c~<hash>:12:1`).
+#      Before it, two anonymous enums of two files with one first constant,
+#      two structs that two typedefs of one name name, and two anonymous
+#      unions of one struct were one symbol, and two lambdas of the scope of
+#      one file gave one `operator()`.
+CURRENT_ROW_FORMAT = "fw-context-rows/15"
 
 # The config-hash format that was current when CURRENT_ROW_FORMAT last moved.
 #
@@ -183,7 +189,7 @@ CURRENT_ROW_FORMAT = "fw-context-rows/14"
 # the build, thus a plain `fw-context index` writes every file and every
 # body again.  The two must therefore move together, and
 # `test_row_format_invalidation.py` fails when only one of them does.
-ROW_FORMAT_PAIRED_WITH = "fw-context-cc/16"
+ROW_FORMAT_PAIRED_WITH = "fw-context-cc/17"
 
 
 def _row_format_number(value: str) -> int | None:
@@ -272,6 +278,10 @@ _ROW_FORMAT_FAULTS: tuple[tuple[int, str], ...] = (
     (13, "two static functions or variables of one name in two files of one "
          "base name (two fatal.c in two directories) are one symbol, with one "
          "body and the references of the two"),
+    (14, "two anonymous enums of two files with one first constant, two "
+         "structs that two typedefs of one name name, and two anonymous unions "
+         "of one struct are one symbol, with the constants or the fields of "
+         "the two; two lambdas of the scope of one file give one operator()"),
 )
 
 

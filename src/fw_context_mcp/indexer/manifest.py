@@ -1113,6 +1113,8 @@ def compute_config_hash(
         # /16 names the file of an internal USR by a key of its path
         # (`_usr.file_key`): an unchanged unit kept the USRs with the base
         # name, and they named no symbol.
+        # /17 writes the place of each anonymous type into its USR: an
+        # unchanged unit kept the USRs with no place.
         #
         # WHY the format version belongs in THIS hash: a new config_hash
         # leaves no row for the build, thus a plain `fw-context index` writes
@@ -1123,7 +1125,7 @@ def compute_config_hash(
         #
         # Every existing index therefore gets one final reindex, which is
         # intended.
-        "_format": "fw-context-cc/16",
+        "_format": "fw-context-cc/17",
         "project_root": str(project_root),
         # WHY only these two: config_hash answers "could the same source text
         # compile to something different now?"  Macros flip #ifdef, and the

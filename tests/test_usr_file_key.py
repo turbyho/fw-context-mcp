@@ -39,6 +39,35 @@ SOURCES = {
     "c/z.c": '#include "../a/util.h"\nint use_z(void) { return helper(); }\n',
     # A C++ unit reads the header of a C unit: one symbol in the two languages.
     "a/x.cpp": '#include "util.h"\nint use_cpp() { return helper(); }\n',
+    # Anonymous types: an enum named by its first constant, a struct named by
+    # a typedef, and two anonymous unions of one struct.
+    "a/sm.c": (
+        "enum { ST_IDLE, ST_RUN };\ntypedef struct { int speed; } cfg_t;\n"
+        "int state_a(void) { cfg_t c = { ST_RUN }; return c.speed + ST_IDLE; }\n"
+    ),
+    "b/sm.c": (
+        "enum { ST_IDLE, ST_STOP, ST_RUN };\ntypedef struct { long speed; } cfg_t;\n"
+        "int state_b(void) { cfg_t c = { ST_RUN }; return (int)c.speed + ST_STOP; }\n"
+    ),
+    "a/two.h": (
+        "struct two { union { int first; }; union { int second; }; };\n"
+        "struct outer { struct { union { int inner; }; int beside; } field; };\n"
+    ),
+    "a/t1.c": '#include "two.h"\nint t1(struct two *t) { return t->first; }\n',
+    "a/t2.c": '#include "two.h"\nint t2(struct two *t, struct outer *o) { return t->second + o->field.inner; }\n',
+    "a/t3.cpp": '#include "two.h"\nint t3(two *t) { return t->first + t->second; }\n',
+    "a/an.cpp": (
+        "namespace { struct AN { union { int n1; }; union { int n2; }; }; }\n"
+        "int an_use() { AN a{}; return a.n1 + a.n2; }\n"
+    ),
+    # A specialization whose argument is a typedef-named type: no anonymous type.
+    "a/spec.cpp": (
+        "typedef struct { int m; } mb_t;\ntemplate <class T> struct cv { int c; };\n"
+        "template <> struct cv<mb_t> { int d; };\n"
+        "namespace n { typedef struct { int q; } foo; }\ntemplate <class T> struct foo { T t; };\n"
+        "template <> struct foo<n::foo> { int w; };\n"
+        "int spec_use() { cv<mb_t> v{}; foo<n::foo> f{}; return v.d + f.w; }\n"
+    ),
     "a/l.cpp": "static auto pick = [](int v) { return v + 1; };\nint run_a() { return pick(1); }\n",
     "b/l.cpp": "static auto pick = [](int v) { return v + 1; };\nint run_b() { return pick(2); }\n",
 }
@@ -106,6 +135,52 @@ def test_two_files_of_one_base_name_give_two_symbols(indexed):
     assert files_of("scale") == ["a/fatal.c", "b/fatal.c"]
     assert files_of("product") == ["a/fatal.c", "b/fatal.c"], "a local of two static functions"
     assert files_of("hidden") == ["a/n.cpp", "b/n.cpp"], "a member of an anonymous namespace"
+    assert files_of("ST_IDLE") == ["a/sm.c", "b/sm.c"], "a constant of two anonymous enums"
+    assert files_of("ST_RUN") == ["a/sm.c", "b/sm.c"]
+    assert files_of("speed") == ["a/sm.c", "b/sm.c"], "a field of two structs that two typedefs name"
+
+
+def test_each_anonymous_type_is_a_symbol_of_its_own(indexed):
+    """Two anonymous unions of one struct of one header: two symbols, also when two units read it."""
+    rows = _rows(
+        indexed, "SELECT line FROM symbols WHERE kind = 'union' AND file_path = 'a/two.h' AND is_definition = 1",
+    )
+    assert sorted(row[0] for row in rows) == [1, 1, 2], "a C and a C++ unit read the header"
+    parents = dict(_rows(indexed, "SELECT name, parent_usr FROM symbols WHERE name IN ('first', 'second')"))
+    assert parents["first"] != parents["second"]
+    namespace = _rows(indexed, "SELECT COUNT(*) FROM symbols WHERE kind = 'union' AND file_path = 'a/an.cpp'")
+    assert namespace == [(2,)], "two anonymous unions of a struct of an anonymous namespace"
+    enums = _rows(indexed, "SELECT file_path FROM symbols WHERE kind = 'enum' AND file_path LIKE '%sm.c'")
+    assert sorted(row[0] for row in enums) == ["a/sm.c", "b/sm.c"]
+
+
+def test_a_member_of_an_unnamed_type_with_a_place_stays_inside_the_range_of_its_type(indexed):
+    """`struct { union { int inner; }; int beside; } field;`: libclang gives the type a place, and no mark.
+
+    ``find_references`` of a type reads the USRs from `<type>@` to `<type>A`:
+    `inner` (in the anonymous union) and `beside` must both be in it.
+    """
+    usrs = dict(_rows(indexed, "SELECT name, usr FROM symbols WHERE name IN ('inner', 'beside')"))
+    owner = usrs["beside"].rsplit("@FI@", 1)[0]
+    assert usrs["inner"].startswith(owner + "@"), (owner, usrs["inner"])
+
+
+def test_a_specialization_for_a_typedef_named_type_is_no_anonymous_type(indexed):
+    """`cv<mb_t>`: its USR ends with `@SA@mb_t`, the component of its argument, and it gets no mark."""
+    usrs = dict(_rows(indexed, "SELECT name, usr FROM symbols WHERE name IN ('m', 'd', 'w')"))
+    assert usrs["d"] == "c:@S@cv>#$@SA@mb_t@FI@d"
+    assert usrs["w"] == "c:@S@foo>#$@N@n@SA@foo@FI@w", "a template of the name of the typedef"
+    assert usrs["m"].startswith("c:@SA@mb_t~spec.cpp~"), "the typedef-named type gets its mark"
+
+
+def test_a_reference_names_the_constant_of_its_own_file(indexed):
+    calls = set(_rows(
+        indexed,
+        "SELECT a.name, b.name, b.file_path FROM refs r JOIN symbols a ON a.usr = r.from_usr"
+        " JOIN symbols b ON b.usr = r.to_usr WHERE a.name LIKE 'state_%' AND b.name LIKE 'ST_%'",
+    ))
+    assert calls >= {("state_a", "ST_RUN", "a/sm.c"), ("state_b", "ST_RUN", "b/sm.c")}
+    assert not {call for call in calls if call[0][-1] != call[2][0]}, "no reference crosses the files"
 
 
 def test_each_caller_reaches_the_helper_of_its_own_header(indexed):
@@ -145,6 +220,60 @@ def test_a_header_that_two_units_read_stays_one_symbol(indexed):
 def test_the_lambdas_of_two_files_of_one_base_name_are_two_symbols(indexed):
     rows = _rows(indexed, "SELECT file_path FROM symbols WHERE kind = 'lambda'")
     assert sorted(row[0] for row in rows) == ["a/l.cpp", "b/l.cpp"]
+
+
+def test_two_lambdas_of_the_scope_of_one_file_have_two_call_operators(tmp_path):
+    """The closure of a lambda is an anonymous class (`@Sa`): the mark gives each `operator()` a USR of its own.
+
+    libclang gives the two `operator()` of one file scope one USR.  The index
+    names a lambda by its own key (``_lambda_usr``), thus only the USR of
+    ``cursor_usr`` shows the difference.
+    """
+    import clang.cindex as cx
+
+    from fw_context_mcp.indexer._usr import cursor_usr
+
+    source = tmp_path / "gl.cpp"
+    source.write_text(
+        "static auto l1 = [](int v) { return v + 1; };\nstatic auto l2 = [](int v) { return v + 2; };\n"
+        "int use() { return l1(1) + l2(2); }\n",
+        encoding="utf-8",
+    )
+    unit = cx.Index.create().parse(str(source), args=["-x", "c++", "-std=c++17"])
+    # The walk does not visit the implicit class of a closure: a call names its `operator()`.
+    calls = [node.referenced for node in unit.cursor.walk_preorder()
+             if node.kind == cx.CursorKind.CALL_EXPR and node.spelling == "operator()"]
+    assert len(calls) == 2 and calls[0].get_usr() == calls[1].get_usr(), "libclang gives one USR"
+    assert cursor_usr(calls[0]) != cursor_usr(calls[1])
+
+
+def test_the_mark_of_an_anonymous_enum_walks_no_child(tmp_path, monkeypatch):
+    """The mark reads the end of the USR of the enum, not its first constant.
+
+    ``get_children`` collects each constant, thus a walk to the first one
+    for each constant costs the square of the number of constants.
+    """
+    import clang.cindex as cx
+
+    from fw_context_mcp.indexer._usr import cursor_usr, file_key
+
+    source = tmp_path / "big.cpp"
+    # The attribute is the first child of the enum and no constant: a walk
+    # to the first constant must skip it.  The mark must not need the walk.
+    source.write_text("enum __attribute__((packed)) { BIG_0, BIG_1 };\nenum {};\n", encoding="utf-8")
+    unit = cx.Index.create().parse(str(source), args=["-x", "c++", "-std=c++17"])
+    enums = [node for node in unit.cursor.walk_preorder() if node.kind == cx.CursorKind.ENUM_DECL]
+    constants = [node for node in unit.cursor.walk_preorder() if node.kind == cx.CursorKind.ENUM_CONSTANT_DECL]
+
+    def no_walk(self):
+        raise AssertionError("get_children")
+
+    monkeypatch.setattr(cx.Cursor, "get_children", no_walk)
+    key = file_key(str(source))
+    assert [cursor_usr(node) for node in constants] == [
+        f"c:@Ea@BIG_0~{key}:1:1@BIG_0", f"c:@Ea@BIG_0~{key}:1:1@BIG_1",
+    ]
+    assert cursor_usr(enums[1]) == f"c:@Ea~{key}:2:1", "an enum with no constant"
 
 
 def test_a_header_through_a_symbolic_link_has_the_key_of_its_real_path(tmp_path):
