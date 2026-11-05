@@ -142,6 +142,7 @@ _TIMER_TASK = "the FreeRTOS timer service task"
 _INTERRUPT = "an interrupt"
 _EVENT_LOOP = "the ESP-IDF default event loop task"
 _TCPIP = "the lwIP tcpip thread"
+_NVM = "the end of an NVM operation of the platform"
 _ZEPHYR = "the Zephyr scheduler"
 _EVENT_QUEUE = "the mbed EventQueue (dispatch)"
 _FUNCTION_CALL = "events::EventQueue::function_call"
@@ -172,6 +173,7 @@ BUILTIN_RULES: tuple[Rule, ...] = (
     # ── lwIP: with its source, the slots give these edges (``pcb->recv``).
     Call("lwIP", _TCPIP, "tcpip_api_call", 0),
     Call("lwIP", _TCPIP, "tcpip_callback", 0),
+    Call("lwIP", _TCPIP, "tcp_connect", 3),
     Call("lwIP", _TCPIP, "tcp_accept", 1),
     Call("lwIP", _TCPIP, "tcp_recv", 1),
     Call("lwIP", _TCPIP, "tcp_sent", 1),
@@ -179,6 +181,19 @@ BUILTIN_RULES: tuple[Rule, ...] = (
     Call("lwIP", _TCPIP, "tcp_poll", 1),
     Call("lwIP", _TCPIP, "udp_recv", 1),
     Call("lwIP", _TCPIP, "dns_gethostbyname", 2),
+    # ── POSIX threads: the pthread of ESP-IDF has no source in the ESP32
+    # Arduino core.  The routine runs in the thread of the first call.
+    Call("POSIX", "the first call of pthread_once", "pthread_once", 1),
+    # ── Nanostack: `arm_hal_nvm.h` declares the NVM of the platform, and a
+    # build can have no driver of it.  Each operation calls its callback
+    # when it ends.
+    Call("Nanostack", _NVM, "platform_nvm_init", 0),
+    Call("Nanostack", _NVM, "platform_nvm_finalize", 0),
+    Call("Nanostack", _NVM, "platform_nvm_key_create", 0),
+    Call("Nanostack", _NVM, "platform_nvm_key_delete", 0),
+    Call("Nanostack", _NVM, "platform_nvm_write", 0),
+    Call("Nanostack", _NVM, "platform_nvm_read", 0),
+    Call("Nanostack", _NVM, "platform_nvm_flush", 0),
     # ── Zephyr: `arch_new_thread` writes the stack frame, and assembly
     # starts `z_thread_entry`, which calls the entry in C.  Static threads
     # and `k_thread_create` go through `z_setup_new_thread` to it.

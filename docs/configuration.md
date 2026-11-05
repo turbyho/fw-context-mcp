@@ -565,7 +565,8 @@ Some SDKs start a registered function from data that no C code reads. A
 FreeRTOS task starts from a stack frame that the port writes as integers,
 and a library of the ESP32 Arduino core has no source. Such a function has
 no caller in the code. The SDK model gives the missing step. The built-in
-rules cover FreeRTOS, ESP-IDF, lwIP, Zephyr threads, CMSIS
+rules cover FreeRTOS, ESP-IDF, lwIP, POSIX `pthread_once`, the NVM of
+Nanostack (`platform_nvm_*`), Zephyr threads, CMSIS
 (`NVIC_SetVector`, the RTX `osThreadNew`) and the mbed `EventQueue` (an
 event goes through memory as `void *`). The rules of the `EventQueue`
 cover `call`, `call_in` and `call_every`. A handler of

@@ -40,6 +40,20 @@ void *esp_http_client_init(const esp_http_client_config_t *config);
 void NVIC_SetVector(int irq, uint32_t vector);
 typedef void (*k_thread_entry_t)(void *p1, void *p2, void *p3);
 void k_thread_create(void *thread, k_thread_entry_t entry);
+typedef int (*tcp_connected_fn)(void *arg, struct tcp_pcb *tpcb, int err);
+int tcp_connect(struct tcp_pcb *pcb, const void *ipaddr, uint16_t port, tcp_connected_fn connected);
+typedef int pthread_once_t;
+int pthread_once(pthread_once_t *once_control, void (*init_routine)(void));
+typedef void nvm_callback(int status, void *context);
+int platform_nvm_init(nvm_callback *callback, void *context);
+int platform_nvm_finalize(nvm_callback *callback, void *context);
+int platform_nvm_key_create(nvm_callback *callback, const char *key_name, uint16_t value_len, uint32_t flags,
+                            void *context);
+int platform_nvm_key_delete(nvm_callback *callback, const char *key_name, void *context);
+int platform_nvm_write(nvm_callback *callback, const char *key_name, const void *data, uint16_t *data_len,
+                       void *context);
+int platform_nvm_read(nvm_callback *callback, const char *key_name, void *buf, uint16_t *buf_len, void *context);
+int platform_nvm_flush(nvm_callback *callback, void *context);
 """
 KERNEL_C = """\
 #include "sdk.h"
@@ -64,8 +78,33 @@ static int on_recv(void *arg, struct tcp_pcb *pcb, void *p, int err) { (void) ar
 static int on_http(void *evt) { (void) evt; return 0; }
 static void uart_isr(void) {}
 static void thread_main(void *a, void *b, void *c) { (void) a; (void) b; (void) c; }
+static int on_connected(void *arg, struct tcp_pcb *tpcb, int err) { (void) arg; (void) tpcb; return err; }
+static void once_init(void) {}
+static pthread_once_t once;
+static void nvm_init_done(int status, void *context) { (void) status; (void) context; }
+static void nvm_finalize_done(int status, void *context) { (void) status; (void) context; }
+static void nvm_create_done(int status, void *context) { (void) status; (void) context; }
+static void nvm_delete_done(int status, void *context) { (void) status; (void) context; }
+static void nvm_write_done(int status, void *context) { (void) status; (void) context; }
+static void nvm_read_done(int status, void *context) { (void) status; (void) context; }
+static void nvm_flush_done(int status, void *context) { (void) status; (void) context; }
+static void nvm_use(void)
+{
+    uint16_t len = 4;
+    char buf[4];
+    platform_nvm_init(nvm_init_done, 0);
+    platform_nvm_finalize(nvm_finalize_done, 0);
+    platform_nvm_key_create(nvm_create_done, "k", 4, 0, 0);
+    platform_nvm_key_delete(nvm_delete_done, "k", 0);
+    platform_nvm_write(nvm_write_done, "k", buf, &len, 0);
+    platform_nvm_read(nvm_read_done, "k", buf, &len, 0);
+    platform_nvm_flush(nvm_flush_done, 0);
+}
 void app_main(void)
 {
+    tcp_connect(0, 0, 80, on_connected);
+    pthread_once(&once, once_init);
+    nvm_use();
     xTaskCreatePinnedToCore(task_a, "a", 1024, 0, 1, 0, 1);
     xTaskCreate(task_b, "b", 1024, 0, 1, 0);
     tcp_recv(0, on_recv);
@@ -368,6 +407,31 @@ def test_an_inline_wrapper_gives_no_second_edge(without_source):
 def test_a_callback_of_a_library_without_source_gets_its_caller(without_source):
     conn, _, _ = without_source
     assert _callers(conn, "on_recv") == [("tcp_recv", ["sdk"])]
+
+
+_NVM_END = "the end of an NVM operation of the platform"
+
+
+@pytest.mark.parametrize("callback, function, entry", [
+    ("on_connected", "tcp_connect", "the lwIP tcpip thread"),
+    ("once_init", "pthread_once", "the first call of pthread_once"),
+    ("nvm_init_done", "platform_nvm_init", _NVM_END),
+    ("nvm_finalize_done", "platform_nvm_finalize", _NVM_END),
+    ("nvm_create_done", "platform_nvm_key_create", _NVM_END),
+    ("nvm_delete_done", "platform_nvm_key_delete", _NVM_END),
+    ("nvm_write_done", "platform_nvm_write", _NVM_END),
+    ("nvm_read_done", "platform_nvm_read", _NVM_END),
+    ("nvm_flush_done", "platform_nvm_flush", _NVM_END),
+])
+def test_a_callback_of_a_library_api_without_body_gets_the_function_of_the_api(without_source, callback, function, entry):
+    """The function of a library API calls the callback: `tcp_connect`, `pthread_once` and `platform_nvm_*`.
+
+    Measured on an ESP32 Arduino build (lwIP and pthread have no source) and
+    on an Mbed build (no driver of the NVM): these callbacks had no caller.
+    """
+    conn, config_hash, _ = without_source
+    assert _callers(conn, callback) == [(function, ["sdk"])]
+    assert _entry(conn, config_hash, callback) == entry
 
 
 def test_a_field_of_a_config_struct_is_a_slot_of_a_rule(without_source):

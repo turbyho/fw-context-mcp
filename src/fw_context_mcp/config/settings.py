@@ -336,7 +336,8 @@ _PROJECT_DEFAULTS_TEMPLATE = """\
 #   that an SDK registers, when the call graph cannot see the call (a task
 #   that the port starts from a stack frame, a callback of a library without
 #   source, an event in memory through void *). The built-in rules cover
-#   FreeRTOS, ESP-IDF, lwIP, Zephyr threads, CMSIS and the mbed EventQueue.
+#   FreeRTOS, ESP-IDF, lwIP, POSIX pthread_once, the NVM of Nanostack,
+#   Zephyr threads, CMSIS and the mbed EventQueue.
 #   A rule of the project adds to them.
 #
 #   A call: `function` runs the function in its parameter `param` (from 0),
