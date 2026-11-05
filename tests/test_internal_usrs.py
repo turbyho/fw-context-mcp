@@ -59,8 +59,9 @@ CPP_UNIT = """\
 static void job_cpp() {}
 int use_cpp() { post(job_cpp); return twice(3) + bare(4) + pair_a() + pair_b() + ov(1) + ov(2.0) + g(5); }
 """
-# The two orders of the units: the first unit walks the header and gives
-# the symbols, thus each order tests one direction of the rename.
+# The two orders of the paths of the units.  The C++ unit claims the header
+# in each of them (``db.claim_order``), thus the symbols have the USRs of
+# C++, and the calls of the C unit are renamed.
 ORDERS = {
     "c-first": {"a.c": C_UNIT, "b.cpp": CPP_UNIT},
     "cpp-first": {"a.cpp": CPP_UNIT, "b.c": C_UNIT},
@@ -118,11 +119,11 @@ def _callers(conn: sqlite3.Connection, name: str) -> list[str]:
     )
 
 
-def test_the_first_unit_gives_the_symbol(index):
-    """The two orders give the two forms of the USR: each direction of the rename is under test."""
-    order, conn = index
+def test_the_cpp_unit_gives_the_symbol_in_each_order_of_the_paths(index):
+    """The C++ units claim first: the order of the paths does not decide the language of the symbol."""
+    _order, conn = index
     [usr] = [row[0] for row in conn.execute("SELECT usr FROM symbols WHERE name = 'twice'")]
-    assert ("#" in usr) == (order == "cpp-first")
+    assert "#" in usr
 
 
 @pytest.mark.parametrize("name", ["bare", "post"])
@@ -162,7 +163,7 @@ def test_two_overloads_at_the_place_of_one_function_of_c_get_no_match(index):
     call of an other language moves: a call of `ov(double)` must never
     reach `ov(int)`.
     """
-    order, conn = index
+    _order, conn = index
     symbols = {row[0]: row[1] for row in conn.execute("SELECT usr, signature FROM symbols WHERE name = 'ov'")}
     callers = {
         usr: sorted(row[0] for row in conn.execute(
@@ -171,10 +172,7 @@ def test_two_overloads_at_the_place_of_one_function_of_c_get_no_match(index):
         ))
         for usr in symbols
     }
-    if order == "c-first":
-        assert list(callers.values()) == [["use_c"]]
-    else:
-        assert sorted(callers.values()) == [["use_cpp"], ["use_cpp"]]
+    assert sorted(callers.values()) == [["use_cpp"], ["use_cpp"]]
 
 
 def test_a_function_that_a_unit_of_the_other_language_stores_reaches_the_call(index):
@@ -194,45 +192,55 @@ PROTO = "static inline int pf(int x);\n"
 PROTO_HEADER = "static inline int pf(int x) { return x - 1; }\n"
 
 
-def test_a_prototype_in_an_other_header_gives_one_more_usr_of_the_same_function(tmp_path):
-    """The USR names the file of the first declaration: `c:proto.h@F@pf` in a.c, `c:hdr2.h@F@pf` in b.c."""
+@pytest.mark.parametrize("cxx", ["c.cpp", "0.cpp"])
+def test_a_prototype_in_an_other_header_gives_one_more_usr_of_the_same_function(tmp_path, cxx):
+    """The USR names the file of the first declaration: `c:proto.h@F@pf` in a.c, `c:hdr2.h@F@pf` in b.c.
+
+    The C++ unit owns `hdr2.h` and `a.c` owns `proto.h`, thus `a.c` stores a
+    declaration row with its USR.  The call of `a.c` must reach the
+    definition, and the function has one row, for each order of the paths.
+    """
     root = tmp_path / "proj"
     root.mkdir()
     units = {
         "a.c": '#include "proto.h"\n#include "hdr2.h"\nint use_a(void) { return pf(1); }\n',
         "b.c": '#include "hdr2.h"\nint use_b(void) { return pf(2); }\n',
-        "c.cpp": '#include "hdr2.h"\nint use_c() { return pf(3); }\n',
+        cxx: '#include "hdr2.h"\nint use_c() { return pf(3); }\n',
     }
     _write(root, units, {"proto.h": PROTO, "hdr2.h": PROTO_HEADER})
     conn = _run(root)
     assert _callers(conn, "pf") == ["use_a", "use_b", "use_c"]
+    assert [tuple(row) for row in conn.execute("SELECT file_path, is_definition FROM symbols WHERE name = 'pf'")] == [
+        ("hdr2.h", 1),
+    ]
     conn.close()
 
 
 def test_an_unchanged_unit_keeps_its_call_when_an_other_unit_owns_the_header(tmp_path):
-    """a.c owns hdr.h first, thus the symbol is of C; then only C++ units include it.
+    """c.cpp owns hdr.h first, thus the symbol is of C++; then only C units include it.
 
-    The call of the unchanged c.cpp holds the USR of C after the first run;
-    the second run gives the symbol the USR of C++, and the call must
-    follow it, as a full run would give.
+    The call of the unchanged b.c holds the USR of C++ after the first run
+    (the rename); the second run gives the symbol the USR of C, and the
+    call must follow it, as a full run would give.
     """
     root = tmp_path / "proj"
     root.mkdir()
     units = {
         "a.c": '#include "hdr.h"\ncb_t g_cb;\nint use_a(void) { return twice(1); }\n',
-        "b.cpp": '#include "hdr.h"\nint use_b() { return twice(2); }\n',
+        "b.c": '#include "hdr.h"\nint use_b(void) { return twice(2); }\n',
         "c.cpp": '#include "hdr.h"\nint use_c() { return twice(3); }\n',
     }
     _write(root, units)
     conn = _run(root)
+    [usr] = [row[0] for row in conn.execute("SELECT usr FROM symbols WHERE name = 'twice'")]
+    assert "#" in usr, "the symbol is of C++"
     assert _callers(conn, "twice") == ["use_a", "use_b", "use_c"]
     conn.close()
-    (root / "a.c").write_text("typedef void (*cb_t)(void);\ncb_t g_cb;\nint use_a(void) { return 1; }\n",
-                              encoding="utf-8")
+    (root / "c.cpp").write_text("int use_c() { return 3; }\n", encoding="utf-8")
     conn = _run(root)
     [usr] = [row[0] for row in conn.execute("SELECT usr FROM symbols WHERE name = 'twice'")]
-    assert "#" in usr, "the symbol is of C++ now"
-    assert _callers(conn, "twice") == ["use_b", "use_c"]
+    assert "#" not in usr, "the symbol is of C now"
+    assert _callers(conn, "twice") == ["use_a", "use_b"]
     conn.close()
 
 
@@ -250,10 +258,12 @@ def test_the_resolution_step_of_reindex_file_renames_an_alias(tmp_path):
     _write(root, ORDERS["c-first"])
     conn = _run(root)
     [config_hash] = [row[0] for row in conn.execute("SELECT DISTINCT config_hash FROM symbols")]
+    # The C++ unit gives the symbol; the C unit recorded the USR of C.
+    [usr] = [row[0] for row in conn.execute("SELECT usr FROM symbols WHERE name = 'twice'")]
     [alias] = [row[0] for row in conn.execute(
-        "SELECT usr FROM internal_decls WHERE name = 'twice' AND usr LIKE '%#%'")]
+        "SELECT usr FROM internal_decls WHERE name = 'twice' AND usr NOT LIKE '%#%'")]
     with conn:
-        conn.execute("UPDATE refs SET to_usr = ? WHERE to_usr = 'c:hdr.h@F@twice'", (alias,))
+        conn.execute("UPDATE refs SET to_usr = ? WHERE to_usr = ?", (alias, usr))
     result: dict = {}
     _resolve_slot_edges_locked(conn, config_hash, root.parent / "db" / "proj-internal", root, result)
     assert result == {}

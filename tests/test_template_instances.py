@@ -82,9 +82,11 @@ class TestTemplateUsrIsFilled:
     def test_a_variable_links_through_its_type(self, tmp_path: Path) -> None:
         # `Box<int> box_of_int;` — the implicit specialization is not a child
         # of the translation unit, thus only the type declaration reaches it.
-        symbols = {s.name: s for s in _extract(tmp_path, SOURCE) if s.template_usr}
+        extracted = _extract(tmp_path, SOURCE)
+        symbols = {s.name: s for s in extracted if s.template_usr}
         assert "box_of_int" in symbols
-        assert symbols["box_of_int"].template_usr.endswith("Box")
+        template = next(s for s in extracted if s.is_template and s.name == "Box")
+        assert symbols["box_of_int"].template_usr == template.usr
 
     def test_two_instances_of_one_template_share_its_usr(self, tmp_path: Path) -> None:
         symbols = {s.name: s for s in _extract(tmp_path, SOURCE) if s.template_usr}

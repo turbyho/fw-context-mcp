@@ -25,6 +25,7 @@ from ._indirect import ONE_UNIT_SITES
 from ._owners import delete_ownership_for_build
 from ._schema import _ensure_column
 from ._slots import delete_slot_facts_for_config
+from ._type_places import delete_type_places_for_build
 
 __all__ = [
     "ANALYZABLE_KINDS",
@@ -253,6 +254,9 @@ def delete_build_data(conn: sqlite3.Connection, config_hash: str) -> None:
     conn.execute("DELETE FROM build_configs WHERE config_hash = ?", (config_hash,))
     # The claims of the units: the tables come when first used, not from _SCHEMA.
     delete_ownership_for_build(conn, config_hash)
+    # The places of the C++ types and the merge (_type_places.py), also
+    # tables that come when first used.
+    delete_type_places_for_build(conn, config_hash)
     # vec0 virtual table — not covered by ON DELETE CASCADE.
     # The table only exists when the sqlite-vec extension is loaded.
     try:

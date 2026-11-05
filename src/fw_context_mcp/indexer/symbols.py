@@ -59,7 +59,7 @@ from typing import TYPE_CHECKING
 
 from ._libclang import cindex as cx
 from ._overrides import VIRTUAL_METHOD_KINDS, extract_overrides
-from ._usr import cursor_usr, file_key
+from ._usr import TypeDecisions, cursor_usr, file_key, odr_place, type_decisions
 from .compile_commands import CompilationUnit
 from .models import (
     InheritanceRecord,
@@ -1664,6 +1664,7 @@ def _process_one_symbol(
         template_usr=template_usr,
         link_name=_link_name(cursor),
         is_tentative=is_tentative,
+        odr_place=odr_place(cursor) if is_def else None,
     ))
 
     if cursor.kind in (cx.CursorKind.CLASS_DECL, cx.CursorKind.STRUCT_DECL) and is_def:
@@ -2630,6 +2631,13 @@ class ExtractionResult:
     # by its USR in this language (indexer/_internal_usrs.py).
     internal_decls: dict[str, InternalDecl] = field(default_factory=dict)
     newly_seen_files: set[str] = field(default_factory=set)
+    # The file key of each place that a USR of the parse holds, as a mark or
+    # left out by the merge, and the merge key of each class template whose
+    # place it looked for in the build (``_usr.type_decisions``): a change of
+    # the decisions about these files or templates changes the rows of the
+    # unit.
+    place_files: frozenset[str] = frozenset()
+    template_keys: frozenset[str] = frozenset()
     # The error diagnostics of the parse (see _parse_diagnostics).
     parse_errors: int = 0
     parse_fatal: bool = False
@@ -2665,8 +2673,18 @@ def extract_all(
     *,
     return_tu: bool = False,
     skip_files: set[str] | frozenset[str] | None = None,
+    decisions: TypeDecisions | None = None,
 ) -> ExtractionResult:
     """Parse one translation unit and return extracted symbols, references, and inheritance.
+
+    *decisions* are the decisions of the build about the places of the
+    types (``_odr.py``): the C++ definitions that the ODR makes one, whose
+    USRs leave out their place, and the place of each class template that a
+    unit declares and does not define.  An index run and ``reindex_file``
+    give the decisions of the build (``_odr.load_type_decisions``), thus the
+    rows of each unit agree.  None is the parse of a unit outside an index of
+    a build.  The extraction calls ``cursor_usr`` only inside this call, thus
+    the context ends with it.
 
     This is the single-pass entry point for all data extraction from a
     ``CompilationUnit``.  It parses the file with libclang, walks the AST
@@ -2700,7 +2718,21 @@ def extract_all(
         during the symbol walk — used to accumulate the skip set for
         subsequent translation units).
     """
+    with type_decisions(decisions if decisions is not None else TypeDecisions()) as record:
+        result = _extract_all(unit, with_refs, return_tu=return_tu, skip_files=skip_files)
+    result.place_files = frozenset(record.files)
+    result.template_keys = frozenset(record.templates)
+    return result
 
+
+def _extract_all(
+    unit: CompilationUnit,
+    with_refs: bool,
+    *,
+    return_tu: bool,
+    skip_files: set[str] | frozenset[str] | None,
+) -> ExtractionResult:
+    """The body of ``extract_all``, inside the context of its merged marks."""
     import logging
     import time as _time
     _log = logging.getLogger(__name__)

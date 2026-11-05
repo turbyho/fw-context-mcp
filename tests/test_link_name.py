@@ -67,16 +67,17 @@ class TestExtraction:
         assert names["c:@F@main#"] == "main"
         assert names["c:@F@SystemInit"] == "SystemInit"
         assert names["c:@F@cpp_func#I#"] == "_Z8cpp_funci"
-        assert names["c:@S@Uart@F@write#I#"] == "_ZN4Uart5writeEi"
+        # The USR of a type holds the place of its definition (`struct Uart`: line 6).
+        assert names["c:@S@Uart~a.cpp:6:8@F@write#I#"] == "_ZN4Uart5writeEi"
         assert names["c:@global_var"] == "global_var"
         # Internal linkage: no other object names it.
         assert names["c:a.cpp@F@cpp_static#"] == ""
         assert names["c:a.cpp@aN@F@anon_fn#"] == ""
         assert names["c:a.cpp@static_var"] == ""
         # A type has no link name.
-        assert names["c:@S@Uart"] == ""
+        assert names["c:@S@Uart~a.cpp:6:8"] == ""
         # A member of a class template is a template: no object holds it.
-        assert names["c:@ST>1#T@Box@count"] == ""
+        assert names["c:@ST>1#T@Box~a.cpp:11:27@count"] == ""
 
     def test_c(self, tmp_path: Path):
         names = _extract(tmp_path, "b.c", _C, "c")

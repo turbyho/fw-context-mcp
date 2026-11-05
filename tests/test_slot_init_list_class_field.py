@@ -71,8 +71,9 @@ def facts(tmp_path_factory):
 
 
 FA = "c:k.cpp@F@fa#I#"
-HOLDER_K = "F|c:@S@holder@FI@k"
-HOLDER_CB = "F|c:@S@holder@FI@cb"
+# The USR of a type holds the place of its definition (`struct holder`: line 13).
+HOLDER_K = "F|c:@S@holder~k.cpp:13:8@FI@k"
+HOLDER_CB = "F|c:@S@holder~k.cpp:13:8@FI@cb"
 PICK = "P|c:k.cpp@F@pick#*Fv(#I)#|0"
 PICK_RETURN = "R|c:k.cpp@F@pick#*Fv(#I)#"
 
@@ -122,7 +123,7 @@ def test_a_call_that_returns_a_plain_pointer_builds_the_class_field_from_its_res
 @pytest.mark.libclang
 def test_a_factory_of_a_plain_struct_fills_the_fields_in_its_body(facts):
     """``make_ops`` returns a struct that it fills: ``o`` itself is no slot."""
-    assert _slots(facts, "by_factory") == {"P|c:k.cpp@F@make_ops#*Fv(#I)#|0", "F|c:@S@config@FI@cb"}
+    assert _slots(facts, "by_factory") == {"P|c:k.cpp@F@make_ops#*Fv(#I)#|0", "F|c:@S@config~k.cpp:20:8@FI@cb"}
 
 
 @pytest.mark.libclang
@@ -137,12 +138,12 @@ def test_each_shape_gives_the_function_to_what_stores_it(facts):
     ``bool`` holds none, and a wrapper converts back into the field."""
     assert _slots(facts, "static mixed shapes") == {
         "P|c:k.cpp@F@make_timer#*Fv(#I)#|0",
-        "P|c:@S@Derived@F@Base#*Fv(#I)#|0",
+        "P|c:@S@Derived~k.cpp:27:8@F@Base#*Fv(#I)#|0",
         "",
-        "P|c:@S@Wrap@F@Wrap#*Fv(#I)#|0",
+        "P|c:@S@Wrap~k.cpp:28:8@F@Wrap#*Fv(#I)#|0",
     }
     assert _flows(facts, "static mixed shapes") == {
-        ("R|c:@S@Wrap@F@operator void (*)(int)#1", "F|c:@S@mixed@FI@cb"),
+        ("R|c:@S@Wrap~k.cpp:28:8@F@operator void (*)(int)#1", "F|c:@S@mixed~k.cpp:29:8@FI@cb"),
     }
 
 
@@ -157,4 +158,4 @@ def test_a_bool_holds_no_function_whatever_the_cast(facts):
 @pytest.mark.libclang
 def test_a_new_object_is_not_the_function(facts):
     """``new Wrap(fa)`` gives a pointer to a heap object: the field does not hold ``fa``."""
-    assert _slots(facts, "static heap allocated") == {"P|c:@S@Wrap@F@Wrap#*Fv(#I)#|0", ""}
+    assert _slots(facts, "static heap allocated") == {"P|c:@S@Wrap~k.cpp:28:8@F@Wrap#*Fv(#I)#|0", ""}

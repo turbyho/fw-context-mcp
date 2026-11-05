@@ -174,7 +174,16 @@ __all__ = [
 #      two structs that two typedefs of one name name, and two anonymous
 #      unions of one struct were one symbol, and two lambdas of the scope of
 #      one file gave one `operator()`.
-CURRENT_ROW_FORMAT = "fw-context-rows/15"
+# /16 — the USR of a named type with a definition, and of each member, method
+#      and constant of it, holds the place of the definition
+#      (`c:@S@config~drv.c~<hash>:3:8`), and a typedef at the scope of a file
+#      or namespace has no file and a key of its target
+#      (`c:@T@word_t~<hash>`).  Before it, two types of one name in two
+#      files were one symbol, and the order of the includes decided the
+#      file in the USR of a typedef.  A C++ type with two places in files
+#      that C++ units read (a copy of a header) stays one type: the ODR
+#      makes it one, and its USR leaves out the marks (`_odr.py`).
+CURRENT_ROW_FORMAT = "fw-context-rows/16"
 
 # The config-hash format that was current when CURRENT_ROW_FORMAT last moved.
 #
@@ -189,7 +198,7 @@ CURRENT_ROW_FORMAT = "fw-context-rows/15"
 # the build, thus a plain `fw-context index` writes every file and every
 # body again.  The two must therefore move together, and
 # `test_row_format_invalidation.py` fails when only one of them does.
-ROW_FORMAT_PAIRED_WITH = "fw-context-cc/17"
+ROW_FORMAT_PAIRED_WITH = "fw-context-cc/18"
 
 
 def _row_format_number(value: str) -> int | None:
@@ -282,6 +291,10 @@ _ROW_FORMAT_FAULTS: tuple[tuple[int, str], ...] = (
          "structs that two typedefs of one name name, and two anonymous unions "
          "of one struct are one symbol, with the constants or the fields of "
          "the two; two lambdas of the scope of one file give one operator()"),
+    (15, "two types of one name in two files (two drivers that each define "
+         "struct config) are one symbol, with the members of the two, and the "
+         "order of the includes decides which symbol a typedef that two "
+         "headers declare is"),
 )
 
 

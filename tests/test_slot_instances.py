@@ -16,6 +16,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._usr_keys import base_names
+
 pytest.importorskip("clang.cindex", reason="libclang not available")
 pytestmark = pytest.mark.libclang
 
@@ -39,7 +41,13 @@ void h2(int);
 void use(Q &q) { q.call(Fn()); each(h1); each(h2); }
 """
 
-RUN = "c:@S@Q@FT@>1#Trun#*v#v#S"
+def _run(file: str) -> str:
+    """The USR of ``Q::run`` of the templates in *file* (a file key, or a base name after ``base_names``).
+
+    `struct Q` is at line 3, column 8 of ``TEMPLATES``: the USR of a type
+    holds the place of its definition.
+    """
+    return f"c:@S@Q~{file}:3:8@FT@>1#Trun#*v#v#S"
 
 
 def _is_post(key: str, prefix: str = "") -> bool:
@@ -55,7 +63,7 @@ def facts(tmp_path_factory):
     src: Path = tmp_path_factory.mktemp("instances") / "shapes.cpp"
     src.write_text(SHAPES, encoding="utf-8")
     unit = CompilationUnit(file=src, directory=src.parent, language="cpp", clang_args=["-std=c++17"])
-    return extract_all(unit, with_refs=True).slots
+    return base_names(extract_all(unit, with_refs=True).slots, src)
 
 
 def _line(text: str) -> int:
@@ -67,7 +75,7 @@ def test_an_address_in_a_template_body_comes_from_the_instance(facts):
     line = _line("post(&Q::run<F>, &f)")
     assert not [s for s in facts.sources if s.line == line]
     found = [(s.function, s.slot) for s in facts.from_instances.sources if s.line == line]
-    assert len(found) == 1 and found[0][0] == RUN and _is_post(found[0][1], "P|"), found
+    assert len(found) == 1 and found[0][0] == _run("shapes.cpp") and _is_post(found[0][1], "P|"), found
 
 
 def test_a_call_of_the_template_and_of_its_instances_is_one_site(facts):
@@ -143,6 +151,13 @@ def _index(root: Path, db_path: Path) -> None:
     )
 
 
+def _header_run(db_path: Path) -> str:
+    """The USR of ``Q::run`` of `q.h` of the project of *db_path* (see ``_project``)."""
+    from fw_context_mcp.indexer._usr import file_key
+
+    return _run(file_key(str(db_path.parent.parent / "proj" / "q.h")))
+
+
 def _rows(db_path: Path) -> list[tuple]:
     from fw_context_mcp.indexer.db import open_db
 
@@ -151,7 +166,7 @@ def _rows(db_path: Path) -> list[tuple]:
         return sorted(
             (row["file"], row["line"], row["function"], row["slot"], row["unit"].split("|", 1)[1])
             for row in conn.execute("SELECT file, line, function, slot, unit FROM slot_sources WHERE function = ?",
-                                    (RUN,))
+                                    (_header_run(db_path),))
         )
     finally:
         conn.close()
@@ -192,7 +207,7 @@ def test_each_unit_keeps_the_facts_of_its_instances_in_the_shared_header(indexed
 
 def test_the_indirect_call_in_post_reaches_the_template_of_the_instances(indexed):
     _root, db_path = indexed
-    assert any(_is_post(caller) and target == RUN for caller, target in _edges(db_path))
+    assert any(_is_post(caller) and target == _header_run(db_path) for caller, target in _edges(db_path))
 
 
 def test_a_new_parse_of_one_unit_replaces_its_facts(indexed):
@@ -229,7 +244,9 @@ def test_a_local_variable_of_an_instance_is_the_variable_of_the_template(tmp_pat
     assert len(sites) == 1 and "@FT@" in sites[0].slot and sites[0].slot.endswith("@local"), sites
     stored = {(s.function, s.slot) for s in slots.from_instances.sources if s.line == 2}
     assert {slot for _function, slot in stored} == {sites[0].slot}
-    assert {function.rsplit("@S@", 1)[1] for function, _slot in stored} == {"A@F@handler#S", "B@F@handler#S"}
+    assert {base_names(function, src).rsplit("@S@", 1)[1] for function, _slot in stored} == {
+        "A~locals.cpp:3:8@F@handler#S", "B~locals.cpp:4:8@F@handler#S",
+    }
 
 
 def _conn(tmp_path: Path):

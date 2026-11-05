@@ -1966,7 +1966,7 @@ void dispatch_event(struct Dispatcher* d, int event_id) {
 }
 """)
         assert [(s.line, s.caller, s.slot) for s in sites] == [
-            (9, "c:@F@dispatch_event", "F|c:@S@Dispatcher@FI@callbacks"),
+            (9, "c:@F@dispatch_event", "F|c:@S@Dispatcher~dispatcher.c:3:8@FI@callbacks"),
         ]
 
     @pytest.mark.libclang
@@ -1999,7 +1999,7 @@ void process_data(struct Driver* driver, const char* data, int len) {
     }
 }
 """)
-        assert [s.slot for s in sites] == ["F|c:@S@Driver@FI@onData"]
+        assert [s.slot for s in sites] == ["F|c:@S@Driver~driver.c:3:8@FI@onData"]
 
 
 class TestHeaderInlineCallableFnStack:
@@ -2126,9 +2126,9 @@ void init(void) {
         slots = base_names(extract_all(unit, with_refs=True).slots, init_c)
 
         assert [(s.function, s.slot, s.function_type) for s in slots.sources] == [
-            ("c:init.c@F@my_handler_cb", "F|c:@S@config@FI@handler", "void (int)"),
+            ("c:init.c@F@my_handler_cb", "F|c:@S@config~init.c:3:8@FI@handler", "void (int)"),
         ]
-        assert ("F|c:@S@config@FI@handler", "V|c:init.c@stored_handler") in {
+        assert ("F|c:@S@config~init.c:3:8@FI@handler", "V|c:init.c@stored_handler") in {
             (f.source, f.target) for f in slots.flows
         }
         assert [(s.slot, s.slot_type) for s in slots.sites] == [("V|c:init.c@stored_handler", "void (int)")]

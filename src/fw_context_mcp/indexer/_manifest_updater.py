@@ -215,6 +215,29 @@ class _OldEntries:
         return self._all[file][0]
 
 
+def mark_pending_units(manifest: dict, paths: Collection[str], project_root: Path) -> int:
+    """Give ``needs_reparse`` to each entry of a unit in *paths*, and return how many entries got it.
+
+    *paths* holds the normalized paths (``ops._normalize_file_path``) of the
+    units whose rows do not follow the places of the C++ types of the build
+    (``odr_pending_units``).  The table tells the next index run to parse
+    them, but the status and the daemon read the manifest: without the mark
+    the entry of such a unit can read as current (the loop parsed it), and
+    no run comes.  Each listing of a path gets the mark, because the table
+    keys a unit by its path.
+    """
+    from .ops import _normalize_file_path
+
+    flagged = 0
+    for entry in manifest.get("entries", []):
+        file = entry.get("file", "")
+        path = file if Path(file).is_absolute() else str(project_root / file)
+        if _normalize_file_path(path, project_root) in paths and not entry.get("needs_reparse"):
+            entry["needs_reparse"] = True
+            flagged += 1
+    return flagged
+
+
 def _update_manifest_after_index(
     *,
     manifest: dict | None,

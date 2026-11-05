@@ -69,7 +69,7 @@ from ..utils import SAFE_EXCEPT, is_fatal
 from . import _force_llm_marker as force_llm_marker
 from ._embedding import _build_embeddings
 from ._llm_analysis import ContextChoice, _build_llm_analysis
-from ._manifest_updater import _backfill_header_source_hashes, _update_manifest_after_index
+from ._manifest_updater import _backfill_header_source_hashes, _update_manifest_after_index, mark_pending_units
 from .db import (
     CURRENT_ROW_FORMAT,
     CURRENT_SCHEMA_VERSION,
@@ -85,6 +85,7 @@ from .db import (
 )
 from .db._chunking import chunked
 from .manifest import _is_generated_header
+from .manifest import save as save_manifest
 
 log = logging.getLogger(__name__)
 
@@ -440,6 +441,13 @@ def _step_update_manifest(conn: sqlite3.Connection, ctx: dict) -> None:
     # not have to re-read it.  A no-op run returns None and leaves the
     # on-disk manifest (already loaded into ctx) current.
     ctx["effective_manifest"] = updated_manifest or ctx.get("manifest")
+    # After each branch of the update above, also the one that keeps the
+    # manifest as it is: a run whose second parse failed can store no unit.
+    if ctx["odr_pending"] and ctx["effective_manifest"] is not None:
+        flagged = mark_pending_units(ctx["effective_manifest"], ctx["odr_pending"], ctx["project_root"])
+        if flagged:
+            save_manifest(ctx["effective_manifest"], ctx["db_dir"], config_hash)
+            log.info("manifest.json: %d entr(ies) of units pending for the places of C++ types", flagged)
     # Each run, also a run that parsed nothing: the rows of an older index
     # stay without a hash until something writes them.
     _backfill_header_source_hashes(
@@ -575,10 +583,11 @@ def _step_internal_usrs(conn: sqlite3.Connection, ctx: dict) -> None:
     conn.commit()
     with transaction(conn):
         counts = unify_internal_functions(conn, ctx["config_hash"])
-    if counts["refs"] or counts["slot_values"]:
+    if counts["refs"] or counts["slot_values"] or counts["declarations"]:
         log.info(
-            "Internal functions: %d reference(s) and %d slot value(s) moved to the USR of their symbol",
-            counts["refs"], counts["slot_values"],
+            "Internal functions: %d reference(s) and %d slot value(s) moved to the USR of their symbol, "
+            "%d declaration row(s) of an other USR deleted",
+            counts["refs"], counts["slot_values"], counts["declarations"],
         )
 
 
@@ -1412,6 +1421,7 @@ def _run_postprocess(
     transient_defines: Collection[str],
     pending_run: bool = False,
     flags_hashes: list[str] | None = None,
+    odr_pending: frozenset[str] = frozenset(),
 ) -> None:
     """Run all post-processing phases via a data-driven pipeline.
 
@@ -1472,6 +1482,9 @@ def _run_postprocess(
         "pending_run": pending_run,
         # The flags hash of each unit, as the decision of the run computed it.
         "flags_hashes": flags_hashes,
+        # The units whose rows do not follow the places of the C++ types
+        # (``odr_pending_units``): the next run must parse them.
+        "odr_pending": odr_pending,
     }
 
     defer_skip: set[str] = set()

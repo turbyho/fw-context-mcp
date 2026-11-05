@@ -43,7 +43,7 @@ def _line(text: str) -> int:
 
 @pytest.mark.libclang
 @pytest.mark.parametrize(("text", "functions"), [
-    ("through_object[]", {"c:@S@C@F@s#I#S"}),
+    ("through_object[]", {"c:@S@C~v.cpp:4:8@F@s#I#S"}),  # `struct C` is defined at line 4
     ("chosen[]", {"c:v.cpp@F@dev_a#I#", "c:v.cpp@F@dev_b#I#"}),
 ])
 def test_each_element_fills_the_array(extracted, text, functions):

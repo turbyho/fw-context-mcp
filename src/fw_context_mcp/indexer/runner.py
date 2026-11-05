@@ -18,8 +18,9 @@ import os
 import sqlite3
 import threading
 import time
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from ..config.settings import derive_project_id
 
@@ -59,13 +60,22 @@ from .config_hash import DEFAULT_TRANSIENT_DEFINES
 from .db import (
     Ownership,
     UnitKey,
+    UnitPlaces,
+    add_pending_units,
+    claim_order,
     clear_embedding_stash,
+    clear_pending_units,
     delete_slot_facts_of_unit,
+    delete_unit_places,
     drop_fts_triggers,
+    files_claimed_before,
     files_without_owner,
     forget_unit,
     get_file_hashes,
     load_ownership,
+    load_pending_units,
+    load_type_places,
+    load_unit_places,
     mark_stale_files,
     open_db,
     rebuild_fts,
@@ -75,6 +85,8 @@ from .db import (
     settle_stale_files,
     skip_form,
     slot_unit_key,
+    store_merged_types,
+    store_template_places,
     transaction,
     unclaimed,
     upsert_build_config,
@@ -82,6 +94,9 @@ from .db import (
     write_lock,
 )
 from .ops import _normalize_file_path
+
+if TYPE_CHECKING:
+    from ._usr import TypeDecisions
 
 log = logging.getLogger(__name__)
 
@@ -174,21 +189,22 @@ def _in_claim_order(
     between two builds.  Two full runs then gave the headers different
     owners, and an incremental run could not repeat a full run.
 
-    The key is the normalized path and the flags hash of the listing.  The
-    flags hash keeps the listings of one file in a fixed order too: the
-    index holds the rows of the listing that the run parses last (see
-    :func:`decide_units`).  The sort is stable, thus two listings with the
-    same key keep their order, and those two give the same rows.
+    The key is ``db.claim_order``: the C++ units first (the reason is in
+    ``db/_owners.py``), then the normalized path and the flags hash of the
+    listing.  The flags hash keeps the listings of one file in a fixed
+    order too: the index holds the rows of the listing that the run parses
+    last (see :func:`decide_units`).  The sort is stable, thus two listings
+    with the same key keep their order, and those two give the same rows.
     """
     from .config_hash import compute_flags_hash
 
-    def key(unit) -> tuple[str, str]:
+    def key(unit) -> tuple[int, str, str]:
         path = _normalize_file_path(str(unit.file.resolve()), project_root)
         flags_hash = (
             compute_flags_hash(unit.raw_entry, transient_defines=transient_defines)
             if unit.raw_entry is not None else ""
         )
-        return path, flags_hash
+        return claim_order((path, flags_hash), unit.language)
 
     return sorted(units, key=key)
 
@@ -295,6 +311,8 @@ def _settle_left(
     with write_lock(db_dir, timeout=120.0), transaction(conn):
         for unit_key in left:
             forget_unit(conn, config_hash, unit_key)
+            # The files of the places of its rows (_settle_odr_merge).
+            delete_unit_places(conn, config_hash, unit_key)
             # The edges of template instances that only this listing found.
             release_ref_producer(conn, config_hash, unit_key)
             # The slot facts of the template instances of this listing.
@@ -521,27 +539,269 @@ def _files_read_by_c_units(
     A header path is relative to *project_root* for a file of the project,
     and absolute for a file outside it.  Both forms are resolved here.
     """
-    def resolve(name: str) -> Path:
-        path = Path(name)
-        return (path if path.is_absolute() else project_root / path).resolve()
+    from .manifest import path_resolver
 
+    resolve = path_resolver(project_root)
     read: set[Path] = set()
     for unit in units:
-        source = unit.file.resolve()
-        read.add(source)
-        try:
-            key = str(source.relative_to(project_root))
-        except ValueError:
-            key = str(source)
-        if key in unit_headers:
-            names = list(unit_headers[key])
-        else:
-            # The manifest keys an entry with the same relative-or-absolute
-            # form (``_manifest_updater``, ``"file": tu_rel``).
-            entries = (manifest_lookup or {}).get(key, [])
-            names = [name for entry in entries for name in entry.get("headers", [])]
-        read.update(resolve(name) for name in names)
+        read.update(_files_read_by_unit(unit, unit_headers, manifest_lookup, project_root, resolve))
     return frozenset(read)
+
+
+def _tu_key(unit, project_root: Path) -> str:
+    """The key of *unit* in ``tu_headers`` and ``reparsed_tus``: its path relative to *project_root*, else absolute."""
+    try:
+        return str(unit.file.resolve().relative_to(project_root))
+    except ValueError:
+        return str(unit.file.resolve())
+
+
+def _files_read_by_unit(
+    unit,
+    unit_headers: dict[str, set[str]],
+    manifest_lookup: dict[str, list[dict]] | None,
+    project_root: Path,
+    resolve: Callable[[str], Path],
+) -> frozenset[Path]:
+    """Give the resolved path of the source file of *unit* and of each header that it reads.
+
+    The sources and the path forms are the ones of ``_files_read_by_c_units``.
+    """
+    source = unit.file.resolve()
+    try:
+        key = str(source.relative_to(project_root))
+    except ValueError:
+        key = str(source)
+    if key in unit_headers:
+        names = list(unit_headers[key])
+    else:
+        # The manifest keys an entry with the same relative-or-absolute
+        # form (``_manifest_updater``, ``"file": tu_rel``).
+        entries = (manifest_lookup or {}).get(key, [])
+        names = [name for entry in entries for name in entry.get("headers", [])]
+    return frozenset({source, *(resolve(name) for name in names)})
+
+
+def _units_of_changed_places(
+    changed_files: frozenset[Path],
+    read: list[frozenset[Path]],
+    decisions: list,
+    unit_places: dict[UnitKey, UnitPlaces],
+) -> list[int]:
+    """Give the index of each unit whose rows hold a place in *changed_files*, the files of a change of the merge.
+
+    *unit_places* gives the file keys of the places that the rows of each
+    listing hold (``odr_unit_places``): only these rows change.  Measured on
+    an Mbed build: 6 of the 65 units that read a file of a merged type hold
+    a place of it.  A listing with no row has rows of an index without the
+    table: each such unit that reads a file of the change (*read*) is parsed
+    again, because a unit can hold a place only of a file that it reads.
+    """
+    from ._usr import file_key
+
+    changed_keys = {file_key(str(path)) for path in changed_files}
+    affected: list[int] = []
+    for index, files in enumerate(read):
+        places = unit_places.get(decisions[index].key)
+        if places is None:
+            if files & changed_files:
+                affected.append(index)
+        elif places.files & changed_keys:
+            affected.append(index)
+    return affected
+
+
+def _units_of_changed_templates(
+    changed: set[str], decisions: list, unit_places: dict[UnitKey, UnitPlaces],
+) -> list[int]:
+    """Give the index of each unit whose rows took the place of a template of *changed* from the build.
+
+    Such a unit does not read the definition of the template, thus the files
+    that it reads do not tell it.  A listing with no row has rows of an
+    index without the table: it is parsed again when a place changed.
+    """
+    if not changed:
+        return []
+    affected: list[int] = []
+    for index, decision in enumerate(decisions):
+        places = unit_places.get(decision.key)
+        if places is None or places.templates & changed:
+            affected.append(index)
+    return affected
+
+
+def _changed_templates(before: TypeDecisions, after: TypeDecisions) -> set[str]:
+    """Give the merge key of each template whose place in the build differs between *before* and *after*."""
+    return {
+        key for key in before.templates.keys() | after.templates.keys()
+        if before.templates.get(key) != after.templates.get(key)
+    }
+
+
+def _settle_odr_merge(
+    *,
+    conn,
+    config_hash: str,
+    units: list,
+    decisions: list,
+    previous: TypeDecisions,
+    pending: frozenset[str],
+    failed: set[str],
+    unit_headers: dict[str, set[str]],
+    tu_headers: dict[str, list[dict]],
+    reparsed_tus: dict[str, str],
+    manifest_lookup: dict[str, list[dict]] | None,
+    project_root: Path,
+    db_path: Path,
+    index_refs: bool,
+    vendor_patterns: list[str],
+    project_patterns: list[str],
+    build_dir_patterns: list[str] | None,
+) -> int:
+    """Decide the places of the C++ types from the definitions of all units, and parse again each unit whose rows change.
+
+    The loop parsed each unit with *previous*, the decisions of the last
+    run.  The definitions of this run can give other decisions: a copy of a
+    header came or went, or a unit of the other language reads it now
+    (``_odr.merged_types_of_build``), or the definition of a class template
+    that some units do not define came, went or moved
+    (``_odr.template_places_of_build``).  Each unit whose rows hold a place
+    in a file of the difference of the merge
+    (``_units_of_changed_places``), or took the place of a changed template
+    from the build (``_units_of_changed_templates``), is parsed and stored
+    again, in the claim order, with the files that the listings before it
+    claimed as its skip set: the claims of the run stay as they are.
+
+    The new decisions and the units to parse are written first, in one
+    transaction.  A run that stops before it stored each unit leaves them in
+    ``odr_pending_units``, and the next run parses them with the new
+    decisions (``run``).  A unit that fails stays pending, and so does a
+    unit whose parse failed in the loop (*failed*): a later listing took its
+    claims of this run, and a parse now would take them back.
+
+    *pending* holds the units that an earlier run left; the loop parsed
+    them with *previous*, and each one that did not fail is done when the
+    decisions do not change.
+
+    A unit that this function stores gives its headers to *tu_headers* and
+    its source hash to *reparsed_tus*, as a parse of the loop does: the
+    manifest then holds the hashes of the text of its rows.
+
+    Returns the number of units that this function stored: their rows
+    changed, and the post-processing must know it (``_needs_macros``).
+    """
+    from ._odr import StoredPlace, decide_types, files_of_keys
+    from .manifest import path_resolver
+
+    resolve = path_resolver(project_root)
+
+    def places() -> list[StoredPlace]:
+        return [
+            StoredPlace(resolve(path), key, line, column)
+            for path, key, line, column in load_type_places(conn, config_hash)
+        ]
+
+    def path_of(index: int) -> str:
+        return _normalize_file_path(str(units[index].file.resolve()), project_root)
+
+    read = [_files_read_by_unit(unit, unit_headers, manifest_lookup, project_root, resolve) for unit in units]
+    cxx_files = frozenset().union(*(files for unit, files in zip(units, read, strict=True) if unit.language == "cpp"))
+    main_files = frozenset(unit.file.resolve() for unit in units)
+
+    def decide(stored: list[StoredPlace], unit_places: dict[UnitKey, UnitPlaces]) -> TypeDecisions:
+        keys = frozenset().union(*(places.templates for places in unit_places.values()))
+        return decide_types(stored, cxx_files, main_files, keys)
+
+    def units_of_change(
+        stored: list[StoredPlace], before: TypeDecisions, after: TypeDecisions,
+        unit_places: dict[UnitKey, UnitPlaces],
+    ) -> list[int]:
+        changed_keys = {key for key, _ in before.merged ^ after.merged}
+        by_files = _units_of_changed_places(files_of_keys(stored, changed_keys), read, decisions, unit_places)
+        by_templates = _units_of_changed_templates(_changed_templates(before, after), decisions, unit_places)
+        return sorted({*by_files, *by_templates})
+
+    stored = places()
+    unit_places = load_unit_places(conn, config_hash)
+    new = decide(stored, unit_places)
+    if new == previous:
+        if pending:
+            with write_lock(db_path.parent, timeout=120.0), transaction(conn):
+                clear_pending_units(conn, config_hash, pending - failed)
+        return 0
+
+    affected = units_of_change(stored, previous, new, unit_places)
+    log.info(
+        "places of C++ types: %d definition(s) merged (was %d), %d template place(s) changed; "
+        "%d unit(s) parsed again",
+        len(new.merged), len(previous.merged), len(_changed_templates(previous, new)), len(affected),
+    )
+    with write_lock(db_path.parent, timeout=120.0), transaction(conn):
+        store_merged_types(conn, config_hash, new.merged)
+        store_template_places(conn, config_hash, new.templates)
+        add_pending_units(conn, config_hash, {path_of(index) for index in affected})
+
+    ownership = load_ownership(conn, config_hash)
+    existing_files = get_file_hashes(conn, config_hash)
+    stored_paths: set[str] = set()
+    failed_paths = {path_of(index) for index in affected} & failed
+    for index in affected:
+        unit, decision, path = units[index], decisions[index], path_of(index)
+        if path in failed:
+            continue
+        skip = frozenset(skip_form(files_claimed_before(ownership, decision.key, unit.language), project_root))
+        status, parsed, timing, _ = _parse_unit(unit, index_refs, set(skip), decision.hashes, new)
+        headers = None
+        if status == "updated":
+            with write_lock(db_path.parent, timeout=120.0):
+                status, _, _, _, headers = _process_unit(
+                    unit, config_hash, project_root, vendor_patterns, project_patterns, index_refs,
+                    db_path, existing_files, conn=conn, pre_parsed=parsed, parse_timing=timing,
+                    hashes=decision.hashes, build_dir_patterns=build_dir_patterns,
+                    skip_files=skip or None, listing=decision.key,
+                )
+        if status == "updated":
+            stored_paths.add(path)
+            # The rows come from this parse now, thus the manifest takes the
+            # headers and the hashes of the text that it read, as the loop
+            # does: a header that changed after the loop and came back must
+            # read as a change.
+            if headers is not None:
+                tu_key = _tu_key(unit, project_root)
+                tu_headers[tu_key] = headers
+                reparsed_tus[tu_key] = decision.hashes[0]
+        else:
+            failed_paths.add(path)
+    for path in sorted(failed_paths):
+        log.warning("places of C++ types: %s stays pending, its parse or store failed", path)
+    with write_lock(db_path.parent, timeout=120.0), transaction(conn):
+        clear_pending_units(conn, config_hash, (stored_paths | (pending - failed)) - failed_paths)
+
+    # The definitions are the ones of the parse and not of the decisions
+    # (``_usr.odr_place``), and a parse looks for the same templates with
+    # each decision, thus the second parse gives the same decisions, unless
+    # a file changed on the disk after the parse of the loop, or a unit with
+    # no row in ``odr_unit_places`` (an index without the table) stored the
+    # templates that it looked for.  Then the units of the difference go to
+    # the next run: that run parses them with the decisions of the new rows.
+    # The changed file alone does not make the index stale (the second
+    # parse stored the hash of the new text), thus ``run`` gives the pending
+    # units ``needs_reparse`` in the manifest.  The other units read nothing
+    # of the difference.
+    again_places = places()
+    again_unit_places = load_unit_places(conn, config_hash)
+    again = decide(again_places, again_unit_places)
+    if again != new:
+        late = {path_of(index) for index in units_of_change(again_places, new, again, again_unit_places)}
+        log.warning(
+            "places of C++ types: the second parse changed the decisions (a file changed during the run, "
+            "or units of an older index stored their templates); %d unit(s) parsed in the next run", len(late),
+        )
+        with write_lock(db_path.parent, timeout=120.0), transaction(conn):
+            store_merged_types(conn, config_hash, again.merged)
+            store_template_places(conn, config_hash, again.templates)
+            add_pending_units(conn, config_hash, late)
+    return len(stored_paths)
 
 
 def _store_linker_scripts(
@@ -1026,6 +1286,21 @@ def run(
         )
         header_stale_tus = _tus_to_requeue(manifest, stale_headers, project_root)
 
+    # ── The places of C++ types (indexer/_odr.py) ──
+    # The decisions that the rows of the build follow (the merged
+    # definitions, the places of the class templates): each unit of this
+    # run parses with them, thus its rows agree with the rows of the units
+    # that the run does not parse.  A run that stopped after a change of the
+    # decisions left units to parse again (_settle_odr_merge): they are
+    # parsed now.
+    from ._odr import load_type_decisions
+
+    odr_decisions = load_type_decisions(conn, config_hash)
+    odr_pending = load_pending_units(conn, config_hash)
+    if odr_pending:
+        log.info("%d unit(s) parsed again for the places of C++ types", len(odr_pending))
+        header_stale_tus = header_stale_tus | odr_pending
+
     # Drop FTS5 content-sync triggers before bulk indexing — each symbol
     # INSERT/DELETE/UPDATE would otherwise pay per-row FTS index overhead
     # (~2× write I/O).  The FTS table is rebuilt from scratch in one pass
@@ -1058,9 +1333,12 @@ def run(
     # Collect headers during tokenization for incremental manifest update.
     # Maps file_path → list of {path, hash, generated} header dicts.
     tu_headers: dict[str, list[dict]] = {}
-    # The header paths that each C unit of this run read, over ALL listings
-    # of its file.  `tu_headers` keeps the list of the last listing only,
-    # and the assembly pass must know each header that a C unit reads.
+    # The header paths that each C or C++ unit of this run read (a unit of
+    # libclang, not of the assembly pass), over ALL listings of its file.
+    # `tu_headers` keeps the list of the last listing only.  Two readers
+    # must know each header that such a unit reads: the assembly pass, and
+    # the merge of the types (`_settle_odr_merge`), which takes the files
+    # that the C++ units read from it.
     c_unit_headers: dict[str, set[str]] = {}
     # TUs actually re-parsed in this run, with the source hash that the
     # decision read before the parse.  The manifest may only take fresh
@@ -1068,6 +1346,9 @@ def run(
     # previous symbols would erase the evidence that the index is behind —
     # and it takes this source hash, not one read at the end of the run.
     reparsed_tus: dict[str, str] = {}
+    # The normalized path of each unit whose parse or store failed in this
+    # run: it keeps its old rows, thus a unit of odr_pending stays pending.
+    failed_tus: set[str] = set()
     t0 = time.monotonic()
 
     # Is any PROJECT file still missing its ifdef-filtered content?  One query
@@ -1126,17 +1407,22 @@ def run(
 
     # A listing that left the build gives its files away at its old position
     # in the loop: a listing before that position that the run parses can
-    # claim them first, as in a full run.  The keys of the decisions are in
-    # the order of _in_claim_order, thus a bisect finds the position.
+    # claim them first, as in a full run.  The decisions are in the order of
+    # _in_claim_order, thus a bisect of their claim_order finds the position.
+    # A listing that left has no unit: its recorded language gives its key.
     # {index of a listing: files that it must claim in this run}
     awaiting: dict[int, set[str]] = {}
     # {index of the loop: the listings that left the build before it}
     left_at: dict[int, list[UnitKey]] = {}
-    left = sorted(ownership.recorded - {decision.key for decision in decisions})
+    left = sorted(
+        ownership.recorded - {decision.key for decision in decisions},
+        key=lambda unit_key: claim_order(unit_key, ownership.languages[unit_key]),
+    )
     if left:
-        keys = [decision.key for decision in decisions]
+        order = [claim_order(decision.key, unit.language) for decision, unit in zip(decisions, units, strict=True)]
         for unit_key in left:
-            left_at.setdefault(bisect.bisect_left(keys, unit_key), []).append(unit_key)
+            position = bisect.bisect_left(order, claim_order(unit_key, ownership.languages[unit_key]))
+            left_at.setdefault(position, []).append(unit_key)
         log.info("%d listing(s) left the build; their files go to the next includer", len(left))
 
     # A file with rows and no owner: a run that stopped after a listing lost
@@ -1212,7 +1498,7 @@ def run(
             check_status, parsed_data, parse_timing = "unchanged", None, None
         else:
             check_status, parsed_data, parse_timing, _ = _parse_unit(
-                unit, index_refs, skip_files, hashes,
+                unit, index_refs, skip_files, hashes, odr_decisions,
             )
 
         # Snapshot the skip set BEFORE folding in this TU's own files.
@@ -1248,6 +1534,7 @@ def run(
 
         if check_status == "skipped":
             skipped += 1
+            failed_tus.add(_normalize_file_path(str(unit.file.resolve()), project_root))
             log.info("[%d/%d] %s: skipped", processed, len(units), fname)
             # The unit keeps its rows, and the files that it got from a listing
             # that lost them keep theirs: the marks end for the rest of the run
@@ -1286,10 +1573,7 @@ def run(
                 acc_parse += timing[0]
                 acc_lock += timing[1]
                 acc_write += timing[2]
-                try:
-                    tu_key = str(unit.file.resolve().relative_to(project_root))
-                except ValueError:
-                    tu_key = str(unit.file.resolve())
+                tu_key = _tu_key(unit, project_root)
                 # Only a re-parsed TU may refresh its manifest entry — its
                 # symbols now match the headers it just read.
                 reparsed_tus[tu_key] = hashes[0]
@@ -1312,6 +1596,7 @@ def run(
                 )
             else:
                 skipped += 1
+                failed_tus.add(_normalize_file_path(str(unit.file.resolve()), project_root))
                 log.info("[%d/%d] %s: skipped", processed, len(units), fname)
                 # The store failed and rolled back: the unit keeps its rows,
                 # also the rows of the files that it claimed or got in this
@@ -1358,6 +1643,25 @@ def run(
     # `.weak` row must not replace a `.global` row.
     settle_stale_files(conn, config_hash)
     conn.commit()
+
+    # ── The places of C++ types, after each C and C++ row (indexer/_odr.py) ──
+    # Before the linker scripts, the assembly and the post-processing: they
+    # read the rows of the C and C++ units.  A unit that it stores again
+    # counts as updated: the post-processing must see that rows changed,
+    # also in a run whose loop changed none.
+    updated += _settle_odr_merge(
+        conn=conn, config_hash=config_hash, units=units, decisions=decisions,
+        previous=odr_decisions, pending=odr_pending, failed=failed_tus,
+        unit_headers=c_unit_headers, tu_headers=tu_headers, reparsed_tus=reparsed_tus,
+        manifest_lookup=manifest_lookup, project_root=project_root,
+        db_path=db_path, index_refs=index_refs, vendor_patterns=vendor_patterns,
+        project_patterns=project_patterns_list, build_dir_patterns=build_dir_patterns,
+    )
+    # A unit that stays pending holds rows that do not follow the decisions,
+    # and its entry can be fresh: the loop parsed it.  Only the manifest
+    # tells the status and the daemon that a run must come, thus the update
+    # of the manifest marks it (``_postprocess._step_update_manifest``).
+    odr_left = load_pending_units(conn, config_hash)
 
     # ── Linker scripts, between the C units and the assembly ──
     # The position is deliberate, and both neighbours depend on it — see
@@ -1456,6 +1760,7 @@ def run(
         transient_defines=transient_defines,
         pending_run=pending_run,
         flags_hashes=flags_hashes,
+        odr_pending=odr_left,
     )
     _run_marker.clear_pending(db_path.parent, config_hash)
 

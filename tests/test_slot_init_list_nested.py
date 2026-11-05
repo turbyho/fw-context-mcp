@@ -21,6 +21,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._usr_keys import base_names
+
 SOURCE = """\
 typedef int (*init_fn_t)(void);
 typedef void (*cb_t)(int);
@@ -61,20 +63,33 @@ def extracted(tmp_path_factory):
     src: Path = tmp_path_factory.mktemp("initlist") / "init.c"
     src.write_text(SOURCE, encoding="utf-8")
     unit = CompilationUnit(file=src, directory=src.parent, language="c", clang_args=["-std=gnu11"])
-    return extract_all(unit, with_refs=True)
+    return base_names(extract_all(unit, with_refs=True), src)
 
 
 def _line(text: str) -> int:
     return next(i for i, line in enumerate(SOURCE.splitlines(), 1) if text in line)
 
 
+def _struct(record: str) -> str:
+    """The name of the struct of the USR component *record*, after a check of its mark.
+
+    The USR of a type holds the place of its definition (`ops~init.c:3:8`).
+    """
+    name = record.split("~", 1)[0]
+    row = next(i for i, row in enumerate(SOURCE.splitlines(), 1) if row.startswith(f"struct {name} {{"))
+    assert record == f"{name}~init.c:{row}:8", record
+    return name
+
+
 def _sources(extracted, text: str) -> set[tuple[str, str]]:
     """(function, struct::field) of each slot fact on the line of *text*."""
     line = _line(text)
-    return {
-        (source.function.rsplit("@", 1)[-1], source.slot.removeprefix("F|c:@S@").replace("@FI@", "::"))
-        for source in extracted.slots.sources if source.line == line
-    }
+    found = set()
+    for source in extracted.slots.sources:
+        if source.line == line:
+            record, _, field = source.slot.removeprefix("F|c:@S@").partition("@FI@")
+            found.add((source.function.rsplit("@", 1)[-1], f"{_struct(record)}::{field}"))
+    return found
 
 
 INIT = ("dev_init", "ops::init")

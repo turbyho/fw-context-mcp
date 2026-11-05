@@ -36,8 +36,8 @@ def test_an_index_without_the_tables_records_nothing(temp_db):
 
 def test_the_claims_of_a_listing_replace_its_earlier_claims(temp_db):
     with transaction(temp_db):
-        record_claims(temp_db, "h1", A, {"src/a.c", "src/shared.h", "src/old.h"})
-        record_claims(temp_db, "h1", A, {"src/a.c", "src/shared.h"})
+        record_claims(temp_db, "h1", A, {"src/a.c", "src/shared.h", "src/old.h"}, "c")
+        record_claims(temp_db, "h1", A, {"src/a.c", "src/shared.h"}, "c")
     ownership = load_ownership(temp_db, "h1")
     assert ownership.recorded == {A}
     assert ownership.files_of(A) == {"src/a.c", "src/shared.h"}
@@ -46,7 +46,7 @@ def test_the_claims_of_a_listing_replace_its_earlier_claims(temp_db):
 def test_a_listing_that_claims_nothing_is_recorded(temp_db):
     """The marker tells "claims nothing" from "claims unknown"."""
     with transaction(temp_db):
-        record_claims(temp_db, "h1", B, set())
+        record_claims(temp_db, "h1", B, set(), "c")
     ownership = load_ownership(temp_db, "h1")
     assert B in ownership.recorded
     assert ownership.files_of(B) == frozenset()
@@ -54,8 +54,8 @@ def test_a_listing_that_claims_nothing_is_recorded(temp_db):
 
 def test_a_file_moves_to_the_listing_that_claims_it(temp_db):
     with transaction(temp_db):
-        record_claims(temp_db, "h1", B, {"src/b.c", "src/shared.h"})
-        record_claims(temp_db, "h1", A, {"src/a.c", "src/shared.h"})
+        record_claims(temp_db, "h1", B, {"src/b.c", "src/shared.h"}, "c")
+        record_claims(temp_db, "h1", A, {"src/a.c", "src/shared.h"}, "c")
     ownership = load_ownership(temp_db, "h1")
     assert ownership.owner_of("src/shared.h") == A
     assert ownership.files_of(B) == {"src/b.c"}
@@ -63,18 +63,55 @@ def test_a_file_moves_to_the_listing_that_claims_it(temp_db):
 
 def test_the_files_claimed_before_a_listing(temp_db):
     with transaction(temp_db):
-        record_claims(temp_db, "h1", A, {"src/a.c", "src/shared.h"})
-        record_claims(temp_db, "h1", B, {"src/b.c"})
+        record_claims(temp_db, "h1", A, {"src/a.c", "src/shared.h"}, "c")
+        record_claims(temp_db, "h1", B, {"src/b.c"}, "c")
     ownership = load_ownership(temp_db, "h1")
-    assert files_claimed_before(ownership, B) == {"src/a.c", "src/shared.h"}
-    assert files_claimed_before(ownership, B, exclude=[A]) == set()
-    assert files_claimed_before(ownership, A) == set()
+    assert files_claimed_before(ownership, B, "c") == {"src/a.c", "src/shared.h"}
+    assert files_claimed_before(ownership, B, "c", exclude=[A]) == set()
+    assert files_claimed_before(ownership, A, "c") == set()
+
+
+def test_a_cpp_listing_claims_before_each_c_listing(temp_db):
+    """`z.cpp` sorts after `a.c` by its path, but the C++ units come first (``claim_order``)."""
+    cxx = ("src/z.cpp", "fz")
+    with transaction(temp_db):
+        record_claims(temp_db, "h1", A, {"src/a.c"}, "c")
+        record_claims(temp_db, "h1", cxx, {"src/z.cpp", "src/shared.h"}, "cpp")
+    ownership = load_ownership(temp_db, "h1")
+    assert ownership.languages == {A: "c", cxx: "cpp"}
+    assert files_claimed_before(ownership, A, "c") == {"src/z.cpp", "src/shared.h"}
+    assert files_claimed_before(ownership, cxx, "cpp") == set()
+    # A `.c` file that the build compiles as C++ (`-std=gnu++17`) is a C++
+    # unit: after `z.cpp` by its path, before each C unit.
+    late = ("src/zz.c", "fzz")
+    assert files_claimed_before(ownership, late, "cpp") == {"src/z.cpp", "src/shared.h"}
+    assert files_claimed_before(ownership, late, "c") == {"src/a.c", "src/z.cpp", "src/shared.h"}
+
+
+def test_a_listing_with_no_language_is_not_recorded(temp_db):
+    """An older table has no language: the run cannot place its claims, thus it parses the unit again."""
+    temp_db.execute(
+        "CREATE TABLE owner_units (config_hash TEXT NOT NULL, owner_path TEXT NOT NULL, "
+        "owner_flags_hash TEXT NOT NULL, PRIMARY KEY (config_hash, owner_path, owner_flags_hash))"
+    )
+    temp_db.execute(
+        "CREATE TABLE header_owners (config_hash TEXT NOT NULL, path TEXT NOT NULL, owner_path TEXT NOT NULL, "
+        "owner_flags_hash TEXT NOT NULL, PRIMARY KEY (config_hash, path))"
+    )
+    temp_db.execute("INSERT INTO owner_units VALUES ('h1', 'src/a.c', 'fa')")
+    temp_db.execute("INSERT INTO header_owners VALUES ('h1', 'src/a.c', 'src/a.c', 'fa')")
+    assert load_ownership(temp_db, "h1").recorded == frozenset()
+    with transaction(temp_db):
+        record_claims(temp_db, "h1", B, {"src/b.c"}, "c")
+    ownership = load_ownership(temp_db, "h1")
+    assert ownership.recorded == {B}
+    assert ownership.owner_of("src/a.c") is None
 
 
 def test_forget_and_release(temp_db):
     with transaction(temp_db):
-        record_claims(temp_db, "h1", A, {"src/a.c", "src/shared.h"})
-        record_claims(temp_db, "h1", B, {"src/b.c"})
+        record_claims(temp_db, "h1", A, {"src/a.c", "src/shared.h"}, "c")
+        record_claims(temp_db, "h1", B, {"src/b.c"}, "c")
         forget_unit(temp_db, "h1", B)
         release_files(temp_db, "h1", {"src/shared.h"})
     ownership = load_ownership(temp_db, "h1")
@@ -84,8 +121,8 @@ def test_forget_and_release(temp_db):
 
 def test_the_claims_belong_to_one_build(temp_db):
     with transaction(temp_db):
-        record_claims(temp_db, "h1", A, {"src/a.c"})
-        record_claims(temp_db, "h2", A, {"src/a.c"})
+        record_claims(temp_db, "h1", A, {"src/a.c"}, "c")
+        record_claims(temp_db, "h2", A, {"src/a.c"}, "c")
         delete_build_data(temp_db, "h1")
     assert load_ownership(temp_db, "h1").recorded == frozenset()
     assert load_ownership(temp_db, "h2").recorded == {A}
@@ -115,7 +152,7 @@ def test_files_without_owner(populated_db):
             _symbol_row(ids["src/lost.h"], "src/lost.h", "c:@F@lost"),
             _symbol_row(ids["src/start.S"], "src/start.S", "asm:start"),
         ])
-        record_claims(conn, "hash-deadbeef", A, {"src/owned.h"})
+        record_claims(conn, "hash-deadbeef", A, {"src/owned.h"}, "c")
     assert files_without_owner(conn, "hash-deadbeef") == {"src/lost.h"}
 
 
@@ -190,7 +227,7 @@ def test_hand_over_leaves_a_listing_that_the_loop_handled(temp_db, tmp_path: Pat
 
 def test_hand_over_releases_a_file_that_no_later_listing_includes(temp_db, tmp_path: Path):
     with transaction(temp_db):
-        record_claims(temp_db, "h1", A, {"src/a.c", "src/gone.h"})
+        record_claims(temp_db, "h1", A, {"src/a.c", "src/gone.h"}, "c")
     decisions = [_decision("src/a.c", False, set()), _decision("src/b.c", True, set())]
     promoted, assigned = _hand_over(decisions, 1, {"src/gone.h"}, temp_db, "h1", tmp_path)
     assert promoted == set()

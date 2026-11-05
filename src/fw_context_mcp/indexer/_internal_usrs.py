@@ -17,11 +17,20 @@ symbol, and ``find_callers`` did not see it.  Measured: an Mbed project had
 The match is a fact of the compiler: each unit records, for each such
 function that it names, the place of the definition and the name
 (``symbols._note_internal_function``, table ``internal_decls``).  A USR
-that is no symbol of the build goes to the symbol of a function with the
+with no definition in the build goes to the symbol of a function with the
 same name, defined at the same place (file, line, column).  WHY not the
 text of the USR: C++ can overload a `static` function, thus the part
 before the signature can name more than one symbol (measured: 13 such
 names in the Mbed project).
+
+A USR with no definition can still be a symbol: a unit that reads a
+prototype in an other header first gives the function the USR of that
+header, and when it owns that header and not the header of the
+definition, it stores a declaration row with that USR.  Its calls then
+reached the declaration, and the definition had no caller (measured: 33
+calls of 4 functions of uECC in an Mbed project, 2026-11-03).  The step
+renames such a USR too, and deletes its declaration rows: one function
+has one row, as when the two declarations have one USR.
 
 The step runs at each index run and at each ``reindex_file``, before the
 resolution of the slots, because each parse writes the USR of its own
@@ -78,7 +87,7 @@ def _signature(usr: str) -> str | None:
 
 
 def _aliases(conn: sqlite3.Connection, config_hash: str) -> dict[str, str]:
-    """Map each recorded USR that is no symbol to the one function symbol with its name at its place.
+    """Map each recorded USR with no definition to the one function symbol with its name at its place.
 
     No match:
 
@@ -100,7 +109,8 @@ def _aliases(conn: sqlite3.Connection, config_hash: str) -> dict[str, str]:
              LEFT JOIN symbols s ON s.config_hash = d.config_hash AND s.file_path = d.decl_file
                                 AND s.line = d.line AND s.col = d.col AND s.name = d.name AND s.kind = 'function'
             WHERE d.config_hash = ?
-              AND NOT EXISTS (SELECT 1 FROM symbols x WHERE x.config_hash = d.config_hash AND x.usr = d.usr)""",
+              AND NOT EXISTS (SELECT 1 FROM symbols x WHERE x.config_hash = d.config_hash AND x.usr = d.usr
+                                                       AND x.is_definition = 1)""",
         (config_hash,),
     ):
         places[alias].add((decl_file, line, col))
@@ -218,17 +228,35 @@ def _record_symbols(conn: sqlite3.Connection, config_hash: str, aliases: dict[st
 def unify_internal_functions(conn: sqlite3.Connection, config_hash: str) -> dict[str, int]:
     """Give each recorded USR of a function with internal linkage the USR of its symbol, in the build *config_hash*.
 
-    Gives the counts for the log: the aliases, the moved references and
-    the changed values of the slot facts.  The caller holds the
-    transaction.
+    Gives the counts for the log: the aliases, the moved references, the
+    changed values of the slot facts and the deleted declaration rows.  The
+    caller holds the transaction.
     """
     aliases = _aliases(conn, config_hash)
     if not aliases:
-        return {"aliases": 0, "refs": 0, "slot_values": 0}
+        return {"aliases": 0, "refs": 0, "slot_values": 0, "declarations": 0}
     counts = {
         "aliases": len(aliases),
         "refs": _rename_refs(conn, config_hash, aliases),
         "slot_values": _rename_slot_facts(conn, config_hash, aliases),
+        "declarations": _delete_declarations(conn, config_hash, aliases),
     }
     _record_symbols(conn, config_hash, aliases)
     return counts
+
+
+def _delete_declarations(conn: sqlite3.Connection, config_hash: str, aliases: dict[str, str]) -> int:
+    """Delete the declaration rows of each alias; give the count of the rows.
+
+    An alias has no definition (``_aliases``), thus a row of it is the
+    declaration of a prototype in an other header: the function is the
+    symbol of the alias now, and it has one row.  The full-text triggers and
+    ``ON DELETE CASCADE`` remove the rows that hang off the symbol.
+    """
+    return sum(
+        conn.execute(
+            "DELETE FROM symbols WHERE config_hash = ? AND usr = ? AND is_definition = 0 AND kind = 'function'",
+            (config_hash, alias),
+        ).rowcount
+        for alias in sorted(aliases)
+    )

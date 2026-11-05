@@ -369,6 +369,13 @@ class Symbol:
             is a definition, but a definition with an initializer of the
             same object in another unit wins over it, as the linker merges
             a common symbol (``-fcommon``) into it.
+        odr_place: For the definition of a type with a merge key, also of a
+            C tag (``_usr.odr_place``): its merge key, line and column.  The build
+            merges the definitions of one key in two or more headers that
+            C++ units read, and gives the place of a class template to the
+            units that do not define it (``_odr.py``).  None for a type in
+            the body of a type, which follows the merge of that type, and
+            for all else.
     """
     name: str
     qualified_name: str      # namespace::Class::method
@@ -391,3 +398,4 @@ class Symbol:
     link_name: str = ""      # the name the linker resolves (external linkage only)
     is_weak: bool = False    # a declaration of the TU makes it weak (`_weak_usrs`)
     is_tentative: bool = False  # a C tentative definition (`int g_x;` at file scope)
+    odr_place: tuple[str, int, int] | None = None  # merge key, line, column (``_usr.odr_place``)

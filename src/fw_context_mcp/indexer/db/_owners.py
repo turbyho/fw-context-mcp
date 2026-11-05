@@ -1,11 +1,22 @@
 """The owner of each header: the translation unit that stores its rows.
 
-The index run parses the units in a fixed order (``runner._in_claim_order``).
-The first unit that walks a header claims it: that unit writes the rows of
-the header, and each later unit skips its subtree (``skip_files``).  A header
+The index run parses the units in a fixed order (``claim_order``).  The
+first unit that walks a header claims it: that unit writes the rows of the
+header, and each later unit skips its subtree (``skip_files``).  A header
 that a C unit and a C++ unit include, or that two units read with different
 defines, has different rows for each unit.  Thus the owner decides the
 content of the index.
+
+The C++ units come first.  A header that the two languages read then has
+the rows of C++: its C++ classes (often in an ``#ifdef __cplusplus`` block)
+and the places of its types, which the ODR merge of the build reads
+(``indexer/_odr.py``).  Before, the order of the paths decided, and a C
+unit that came first gave such a header its C rows: no row of the class,
+no merge, and the calls of the copies of the header lost their target.
+The limit: a part of a header that only C reads (``#ifndef __cplusplus``)
+has no rows when a C++ unit reads the header too.  Measured on four
+projects of C and C++ (2026-11-03): 1, 24, 25 and 68 headers change their
+owner, and their C and C++ declarations are the same.
 
 An incremental run parses only the changed units.  Before these tables, its
 skip set started empty, and the first changed unit claimed every header that
@@ -20,10 +31,14 @@ Two tables keep the claims of the last run:
   that claimed it.  The key is the path, not ``files.id``: a unit can claim a
   header that has no ``files`` row (only forward declarations), and that
   claim must also stop a later unit.
-* ``owner_units`` — one row for each unit whose claims are recorded.  A unit
-  that claims no file has no ``header_owners`` row.  Without this marker, a
-  run cannot tell such a unit from a unit whose claims nobody recorded (an
-  index from an older version).  A unit without the marker is parsed again.
+* ``owner_units`` — one row for each unit whose claims are recorded, with
+  the language of the unit (``CompilationUnit.language``): a unit that left
+  the build keeps its position in the order, and its key does not tell its
+  language (a ``.c`` file with ``-std=gnu++17`` is C++).  A unit that claims
+  no file has no ``header_owners`` row.  Without this marker, a run cannot
+  tell such a unit from a unit whose claims nobody recorded (an index from
+  an older version).  A unit without the marker, or with no language, is
+  parsed again.
 
 A unit is the pair ``(path, flags_hash)``: compile_commands.json can list one
 file more than once with different flags, and each listing claims files.
@@ -64,22 +79,37 @@ _TABLES = (
         config_hash      TEXT NOT NULL,
         owner_path       TEXT NOT NULL,
         owner_flags_hash TEXT NOT NULL,
+        language         TEXT,
         PRIMARY KEY (config_hash, owner_path, owner_flags_hash)
     )""",
 )
+
+
+def claim_order(unit: UnitKey, language: str) -> tuple[int, str, str]:
+    """Return the key of *unit* in the order of the claims: the C++ units first, then the key of the listing.
+
+    *language* is ``CompilationUnit.language`` (``"cpp"`` or ``"c"``).  Each
+    reader of the order uses this key: the loop of the run, the position of
+    a unit that left, the skip set of ``reindex_file`` and the first includer
+    of a header.  One order everywhere, else a re-parse claims what a full
+    run does not.
+    """
+    return (0 if language == "cpp" else 1, *unit)
 
 
 @dataclass(frozen=True)
 class Ownership:
     """The claims of one build, as the last run recorded them.
 
-    *recorded* holds each unit whose claims are known.  *owned* gives the
-    files that each unit claimed.  A recorded unit that claimed nothing is
-    in *recorded* and not in *owned*.
+    *recorded* holds each unit whose claims are known, and *languages* the
+    language of each of them.  *owned* gives the files that each recorded
+    unit claimed.  A recorded unit that claimed nothing is in *recorded*
+    and not in *owned*.
     """
 
     recorded: frozenset[UnitKey] = frozenset()
     owned: dict[UnitKey, frozenset[str]] = field(default_factory=dict)
+    languages: dict[UnitKey, str] = field(default_factory=dict)
 
     def files_of(self, unit: UnitKey) -> frozenset[str]:
         """Return the files that *unit* claimed, empty when it claimed none."""
@@ -152,17 +182,20 @@ def listing_key(key: UnitKey, occurrence: int) -> UnitKey:
     return key if occurrence == 1 else (key[0], f"{key[1]}#{occurrence:04d}")
 
 
-def files_claimed_before(ownership: Ownership, unit: UnitKey, exclude: Iterable[UnitKey] = ()) -> set[str]:
-    """Return the files that the listings before *unit* in the claim order own.
+def files_claimed_before(
+    ownership: Ownership, unit: UnitKey, language: str, exclude: Iterable[UnitKey] = (),
+) -> set[str]:
+    """Return the files that the listings before *unit* (of *language*) in the claim order own.
 
-    The claim order is the order of the keys (``runner._in_claim_order``).
-    *exclude* holds listings that the caller parses again: their claims of
-    the last run do not count, because the new parse gives them.
+    The claim order is ``claim_order``.  *exclude* holds listings that the
+    caller parses again: their claims of the last run do not count, because
+    the new parse gives them.
     """
     skip = set(exclude)
+    position = claim_order(unit, language)
     claimed: set[str] = set()
     for owner, paths in ownership.owned.items():
-        if owner < unit and owner not in skip:
+        if claim_order(owner, ownership.languages[owner]) < position and owner not in skip:
             claimed.update(paths)
     return claimed
 
@@ -176,46 +209,58 @@ def _tables_exist(conn: sqlite3.Connection) -> bool:
 
 
 def ensure_owner_tables(conn: sqlite3.Connection) -> None:
-    """Create the two tables when they are not there.
+    """Create the two tables when they are not there, and the column of the language in an older table.
 
     Plain ``execute`` calls, not ``executescript``: ``executescript`` commits
-    the open transaction first, and a caller can be inside one.
+    the open transaction first, and a caller can be inside one.  The rows of
+    an older table get no language, thus their units read as not recorded
+    (``load_ownership``) and the next run parses them in the new order.
     """
     for statement in _TABLES:
         conn.execute(statement)
+    if "language" not in {row[1] for row in conn.execute("PRAGMA table_info(owner_units)")}:
+        conn.execute("ALTER TABLE owner_units ADD COLUMN language TEXT")
 
 
 def load_ownership(conn: sqlite3.Connection, config_hash: str) -> Ownership:
     """Return the claims that the last runs recorded for *config_hash*.
 
     An index without the tables gives an empty result: no unit is recorded,
-    thus the run parses each unit and records its claims.
+    thus the run parses each unit and records its claims.  So does a unit
+    with no language (a table of an older version): without the language,
+    its position in the claim order is not known, thus its claims are not
+    either.
     """
     if not _tables_exist(conn):
         return Ownership()
-    recorded = frozenset(
-        (row[0], row[1])
+    if "language" not in {row[1] for row in conn.execute("PRAGMA table_info(owner_units)")}:
+        return Ownership()
+    languages = {
+        (row[0], row[1]): row[2]
         for row in conn.execute(
-            "SELECT owner_path, owner_flags_hash FROM owner_units WHERE config_hash = ?",
+            "SELECT owner_path, owner_flags_hash, language FROM owner_units "
+            "WHERE config_hash = ? AND language IS NOT NULL",
             (config_hash,),
         )
-    )
+    }
     owned: dict[UnitKey, set[str]] = {}
     for row in conn.execute(
         "SELECT path, owner_path, owner_flags_hash FROM header_owners WHERE config_hash = ?",
         (config_hash,),
     ):
-        owned.setdefault((row[1], row[2]), set()).add(row[0])
+        if (row[1], row[2]) in languages:
+            owned.setdefault((row[1], row[2]), set()).add(row[0])
     return Ownership(
-        recorded=recorded,
+        recorded=frozenset(languages),
         owned={unit: frozenset(paths) for unit, paths in owned.items()},
+        languages=languages,
     )
 
 
 def record_claims(
-    conn: sqlite3.Connection, config_hash: str, unit: UnitKey, paths: Iterable[str],
+    conn: sqlite3.Connection, config_hash: str, unit: UnitKey, paths: Iterable[str], language: str,
 ) -> None:
-    """Record that *unit* claimed *paths* in this run, and nothing else.
+    """Record that *unit*, a unit of *language*, claimed *paths* in this run, and nothing else.
 
     The rows of the earlier claims of *unit* go first: a file that the unit
     does not claim now has no owner until a later unit claims it.  A file
@@ -234,9 +279,9 @@ def record_claims(
         [(config_hash, path, owner_path, owner_flags_hash) for path in paths],
     )
     conn.execute(
-        "INSERT OR IGNORE INTO owner_units (config_hash, owner_path, owner_flags_hash) "
-        "VALUES (?, ?, ?)",
-        (config_hash, owner_path, owner_flags_hash),
+        "INSERT OR REPLACE INTO owner_units (config_hash, owner_path, owner_flags_hash, language) "
+        "VALUES (?, ?, ?, ?)",
+        (config_hash, owner_path, owner_flags_hash, language),
     )
 
 

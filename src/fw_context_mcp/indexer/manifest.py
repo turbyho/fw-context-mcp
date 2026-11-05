@@ -24,11 +24,12 @@ reparsing (the hashes of the manifest entry) but NOT a full reindex
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import logging
 import time
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from pathlib import Path
 
 from fw_context_mcp.indexer.compile_commands import _DROP_WITH_ARG
@@ -149,6 +150,24 @@ def tu_arguments(manifest: dict, entry: dict) -> list[str]:
     if isinstance(index, int) and 0 <= index < len(arg_sets):
         return list(arg_sets[index])
     return []
+
+
+def path_resolver(project_root: Path) -> Callable[[str], Path]:
+    """Give a function that resolves a path of the manifest or of ``files`` (relative to *project_root*, or absolute).
+
+    The index run (``runner``) and ``reindex_file`` resolve the files that
+    the units read with it, thus the two decide the merge of the types from
+    the same paths.
+
+    WHY a cache: the units of a build read mostly the same headers, and each
+    resolve is a call of the file system for each part of the path.
+    """
+    @functools.cache
+    def resolve(name: str) -> Path:
+        path = Path(name)
+        return (path if path.is_absolute() else project_root / path).resolve()
+
+    return resolve
 
 
 def _intern_arguments(arguments: list[str], arg_sets: list[list[str]]) -> int:
@@ -1115,6 +1134,9 @@ def compute_config_hash(
         # name, and they named no symbol.
         # /17 writes the place of each anonymous type into its USR: an
         # unchanged unit kept the USRs with no place.
+        # /18 writes the place of the definition of each named type, and the
+        # key of its target into a typedef: an unchanged unit kept the USRs
+        # with no place.
         #
         # WHY the format version belongs in THIS hash: a new config_hash
         # leaves no row for the build, thus a plain `fw-context index` writes
@@ -1125,7 +1147,7 @@ def compute_config_hash(
         #
         # Every existing index therefore gets one final reindex, which is
         # intended.
-        "_format": "fw-context-cc/17",
+        "_format": "fw-context-cc/18",
         "project_root": str(project_root),
         # WHY only these two: config_hash answers "could the same source text
         # compile to something different now?"  Macros flip #ifdef, and the

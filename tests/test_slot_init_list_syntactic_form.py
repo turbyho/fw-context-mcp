@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._usr_keys import base_names
+
 SOURCE = """\
 typedef void (*cb_t)(int);
 static void fa(int v) { (void)v; }
@@ -32,7 +34,9 @@ static H temporary = { .cb = { Wrap(fa) } };
 static H positional = { { Wrap(fa) } };
 """
 
-CONVERSION = "R|c:@S@Wrap@F@operator void (*)(int)#1"
+# The USR of a type holds the place of its definition: `struct Wrap` at
+# line 12, column 8, `struct H` at line 13, `struct A` at line 3.
+CONVERSION = "R|c:@S@Wrap~s.cpp:12:8@F@operator void (*)(int)#1"
 
 
 @pytest.fixture(scope="module")
@@ -43,7 +47,7 @@ def facts(tmp_path_factory):
     src: Path = tmp_path_factory.mktemp("syntactic") / "s.cpp"
     src.write_text(SOURCE, encoding="utf-8")
     unit = CompilationUnit(file=src, directory=src.parent, language="cpp", clang_args=["-std=c++20"])
-    return extract_all(unit, with_refs=True).slots
+    return base_names(extract_all(unit, with_refs=True).slots, src)
 
 
 def _line(text: str) -> int:
@@ -52,7 +56,7 @@ def _line(text: str) -> int:
 
 @pytest.mark.libclang
 @pytest.mark.parametrize(("text", "function", "function_type"), [
-    ("member_pointer =", "c:@S@A@F@m#I#", "M:void (A::*)(int)"),
+    ("member_pointer =", "c:@S@A~s.cpp:3:8@F@m#I#", "M:void (A::*)(int)"),
     ("from_template[]", "c:@FT@>1#Ttf#t0.0#v#", "void (double)"),
 ])
 def test_an_overload_set_gets_the_type_key_of_its_place(facts, text, function, function_type):
@@ -71,9 +75,9 @@ def test_a_list_of_a_dependent_type_fills_no_variable(facts):
 @pytest.mark.libclang
 @pytest.mark.parametrize(("text", "target"), [
     ("cb_t a = { w }", "V|"),
-    ("H h = { .cb = { w } }", "F|c:@S@H@FI@cb"),
-    ("static H temporary", "F|c:@S@H@FI@cb"),
-    ("static H positional", "F|c:@S@H@FI@cb"),
+    ("H h = { .cb = { w } }", "F|c:@S@H~s.cpp:13:8@FI@cb"),
+    ("static H temporary", "F|c:@S@H~s.cpp:13:8@FI@cb"),
+    ("static H positional", "F|c:@S@H~s.cpp:13:8@FI@cb"),
 ])
 def test_a_conversion_in_scalar_braces_flows_into_the_place(facts, text, target):
     line = _line(text)

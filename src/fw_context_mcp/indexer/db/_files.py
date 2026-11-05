@@ -292,9 +292,17 @@ def delete_orphan_files(
     ).fetchall()
     if not candidates:
         return 0
+    from ._type_places import file_ids_with_places
 
+    # A file that holds the definition of a type with a merge key (also a C
+    # tag) is no orphan, also with no symbol: all its rows can lose to the
+    # rows of an other copy of the header (``ON CONFLICT(usr)``), and the
+    # merge of the build needs the place (``_type_places.py``).
+    with_places = file_ids_with_places(conn, config_hash)
     doomed: list[int] = []
     for row in candidates:
+        if row["id"] in with_places:
+            continue
         p = Path(row["path"])
         if not p.is_absolute():
             if project_root is None:
@@ -579,6 +587,7 @@ def _delete_rows_owned_by(
     from ._refs import delete_refs_for_files
     from ._slots import delete_slot_facts_for_files
     from ._symbols import delete_macros_for_files
+    from ._type_places import delete_type_places_for_files
 
     if stash_embeddings:
         stash_embeddings_for_files(conn, [file_id for file_id, _ in files])
@@ -604,6 +613,9 @@ def _delete_rows_owned_by(
         delete_symbols_for_file(conn, file_id)
 
     delete_macros_for_files(conn, [fid for fid, _ in files])
+    # The places of the C++ types of the files (_type_places.py) go with
+    # their symbols: a stored place names a definition that the file holds.
+    delete_type_places_for_files(conn, [fid for fid, _ in files])
     paths = [path for _, path in files if path]
     delete_refs_for_files(conn, config_hash, paths, keep_instance_edges=keep_instance_edges)
     delete_slot_facts_for_files(conn, config_hash, paths, every_unit=not keep_instance_edges)

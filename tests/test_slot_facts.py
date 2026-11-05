@@ -250,7 +250,7 @@ def cpp_review2(tmp_path_factory):
 
 class TestC:
     def test_a_designated_and_a_positional_initializer_fill_the_field(self, c_facts):
-        field = "F|c:@S@dev@FI@on_rx"
+        field = "F|c:@S@dev~fp.c:2:8@FI@on_rx"
         assert ("c:@F@read_flash", field, 9) in c_facts["sources"]
         assert ("c:@F@read_card", field, 12) in c_facts["sources"]
 
@@ -262,7 +262,7 @@ class TestC:
 
     def test_the_calls_through_a_global_and_a_field_are_sites(self, c_facts):
         assert ("c:@F@fire", "pointer", "V|c:fp.c@g_cb", 7) in c_facts["sites"]
-        assert ("c:@F@load", "pointer", "F|c:@S@dev@FI@on_rx", 8) in c_facts["sites"]
+        assert ("c:@F@load", "pointer", "F|c:@S@dev~fp.c:2:8@FI@on_rx", 8) in c_facts["sites"]
 
     def test_an_address_cast_to_void_pointer_goes_into_its_place(self, c_facts):
         """`void *p = (void *)read_flash;`: the place holds the function, a cast back reads it."""
@@ -274,13 +274,13 @@ class TestC:
 
 class TestCpp:
     def test_a_lambda_goes_into_a_function_object(self, cpp_facts):
-        lambda_key = "c:@S@Client@F@start#@lambda@fp.cpp:9:19"
-        assert (lambda_key, "F|c:@S@Client@FI@on_done", 9) in cpp_facts["sources"]
-        assert ("c:@S@Client@F@start#", "object", "F|c:@S@Client@FI@on_done", 11) in cpp_facts["sites"]
+        lambda_key = "c:@S@Client~fp.cpp:4:8@F@start#@lambda@fp.cpp:9:19"
+        assert (lambda_key, "F|c:@S@Client~fp.cpp:4:8@FI@on_done", 9) in cpp_facts["sources"]
+        assert ("c:@S@Client~fp.cpp:4:8@F@start#", "object", "F|c:@S@Client~fp.cpp:4:8@FI@on_done", 11) in cpp_facts["sites"]
 
     def test_a_pointer_to_a_member_function(self, cpp_facts):
-        assert ("c:@S@Client@F@handle#I#", "F|c:@S@Client@FI@method", 10) in cpp_facts["sources"]
-        assert ("c:@S@Client@F@start#", "pointer", "F|c:@S@Client@FI@method", 12) in cpp_facts["sites"]
+        assert ("c:@S@Client~fp.cpp:4:8@F@handle#I#", "F|c:@S@Client~fp.cpp:4:8@FI@method", 10) in cpp_facts["sources"]
+        assert ("c:@S@Client~fp.cpp:4:8@F@start#", "pointer", "F|c:@S@Client~fp.cpp:4:8@FI@method", 12) in cpp_facts["sites"]
 
     def test_a_return_value_flows_into_a_variable(self, cpp_facts):
         assert ("c:@F@work#I#", "R|c:@F@pick#b#", 16) in cpp_facts["sources"]
@@ -298,8 +298,8 @@ class TestCReview:
     def test_each_operand_of_a_macro_expansion_keeps_its_place(self, c_review):
         """The operands of one expansion have one extent: the node, not the extent, tells them."""
         assert ("c:@F@on_gpio", "P|c:@F@gpio_isr_handler_add|1", 26) in c_review["sources"]
-        assert ("c:@F@f1", "F|c:@S@ops@FI@init", 21) in c_review["sources"]
-        assert ("c:@F@f2", "F|c:@S@ops@FI@run", 21) in c_review["sources"]
+        assert ("c:@F@f1", "F|c:@S@ops~review.c:6:8@FI@init", 21) in c_review["sources"]
+        assert ("c:@F@f2", "F|c:@S@ops~review.c:6:8@FI@run", 21) in c_review["sources"]
         assert ("c:@F@f1", "V|c:@g_a", 27) in c_review["sources"]
         assert ("P|c:@F@use|1", "V|c:@g_a", 27) in c_review["flows"]
 
@@ -319,7 +319,7 @@ class TestCReview:
         escapes = c_review["escapes"]
         assert ("V|c:review.c@handlers", "address taken", 33) in escapes
         assert ("V|c:review.c@handlers", "address taken", 34) in escapes
-        assert ("F|c:@S@s@FI@cbs", "address taken", 35) in escapes
+        assert ("F|c:@S@s~review.c:7:8@FI@cbs", "address taken", 35) in escapes
         assert ("V|c:review.c@handlers", "address taken", 38) in escapes
 
     def test_an_element_access_does_not_escape(self, c_review):
@@ -337,20 +337,21 @@ class TestCppReview:
         assert (self.LAMBDA_ARGUMENT, "void ()") in cpp_review["types"]
 
     def test_a_lambda_in_a_positional_initializer_fills_the_field(self, cpp_review):
-        assert (self.LAMBDA_FIELD, "F|c:@S@timer_args@FI@callback", 21) in cpp_review["sources"]
+        assert (self.LAMBDA_FIELD, "F|c:@S@timer_args~review.cpp:6:8@FI@callback", 21) in cpp_review["sources"]
         assert (self.LAMBDA_FIELD, "void (void *)") in cpp_review["types"]
 
     def test_a_function_whose_name_starts_with_operator_is_a_source(self, cpp_review):
         assert ("c:@F@operatorSelect#", "V|c:review.cpp@g_isr", 23) in cpp_review["sources"]
 
     def test_a_member_of_a_template_instance_is_the_member_of_the_template(self, cpp_review):
-        assert ("c:@F@h1#I#", "F|c:@ST>1#T@Box@FI@f", 25) in cpp_review["sources"]
-        assert ("c:@F@h2#I#", "V|c:@ST>1#T@Box@s", 26) in cpp_review["sources"]
-        assert ("c:@ST>1#T@Box@F@fire#", "pointer", "F|c:@ST>1#T@Box@FI@f", 14) in cpp_review["sites"]
+        assert ("c:@F@h1#I#", "F|c:@ST>1#T@Box~review.cpp:14:27@FI@f", 25) in cpp_review["sources"]
+        assert ("c:@F@h2#I#", "V|c:@ST>1#T@Box~review.cpp:14:27@s", 26) in cpp_review["sources"]
+        assert ("c:@ST>1#T@Box~review.cpp:14:27@F@fire#", "pointer", "F|c:@ST>1#T@Box~review.cpp:14:27@FI@f", 14) in cpp_review["sites"]
 
     def test_a_member_of_an_explicit_specialization_keeps_its_own_key(self, cpp_review):
-        assert ("c:@F@h2#I#", "F|c:@S@Box>#C@FI@f", 28) in cpp_review["sources"]
-        assert ("c:@S@Box>#C@F@fire#", "pointer", "F|c:@S@Box>#C@FI@f", 16) in cpp_review["sites"]
+        # `Box<char>` keeps its own component; its place is the place of the template `Box`.
+        assert ("c:@F@h2#I#", "F|c:@S@Box>#C~review.cpp:14:27@FI@f", 28) in cpp_review["sources"]
+        assert ("c:@S@Box>#C~review.cpp:14:27@F@fire#", "pointer", "F|c:@S@Box>#C~review.cpp:14:27@FI@f", 16) in cpp_review["sites"]
 
     def test_an_argument_of_a_callable_object_is_an_argument_of_the_site(self, cpp_review):
         assert any(
@@ -395,8 +396,8 @@ class TestCReview2:
         assert ("V|c:review2.c@fixed", "P|c:@F@dispatch|0", 21) in c_review2["flows"]
 
     def test_brace_elision_fills_each_element_of_an_array_field(self, c_review2):
-        assert ("c:@F@h", "F|c:@S@s@FI@cbs", 11) in c_review2["sources"]
-        assert ("c:@F@h2", "F|c:@S@s@FI@cbs", 11) in c_review2["sources"]
+        assert ("c:@F@h", "F|c:@S@s~review2.c:10:8@FI@cbs", 11) in c_review2["sources"]
+        assert ("c:@F@h2", "F|c:@S@s~review2.c:10:8@FI@cbs", 11) in c_review2["sources"]
 
 
 class TestCppReview2:
@@ -422,11 +423,11 @@ class TestCppReview2:
 
     def test_a_method_that_gives_its_own_object_is_no_accessor(self, cpp_review2):
         """`Chain &add(cb_t)` gives `*this`: the object does not flow into its return slot."""
-        assert not any(target.startswith("R|c:@S@Chain@F@add") for _s, target, _l in cpp_review2["flows"])
+        assert not any(target.startswith("R|c:@S@Chain~review2.cpp:9:8@F@add") for _s, target, _l in cpp_review2["flows"])
 
     def test_a_method_that_gives_a_reference_keeps_its_parameter(self, cpp_review2):
         assert any(
-            function == "c:@F@h1#I#" and slot.startswith("P|c:@S@Chain@F@add") and slot.endswith("|0")
+            function == "c:@F@h1#I#" and slot.startswith("P|c:@S@Chain~review2.cpp:9:8@F@add") and slot.endswith("|0")
             and line == 15
             for function, slot, line in cpp_review2["sources"]
         )
@@ -441,7 +442,7 @@ def test_a_cast_of_the_callee_keeps_its_slot(tmp_path: Path):
         "void isr(struct handle *h) { ((fn_arg_t)h->fn)(h->arg); }\n"
     )
     facts = _facts(tmp_path, "cast.c", code)
-    assert ("c:@F@isr", "pointer", "F|c:@S@handle@FI@fn", 4) in facts["sites"]
+    assert ("c:@F@isr", "pointer", "F|c:@S@handle~cast.c:3:8@FI@fn", 4) in facts["sites"]
 
 
 def test_a_jump_to_an_address_is_a_site_with_the_text_of_the_address(tmp_path: Path):
@@ -512,7 +513,7 @@ def test_the_index_holds_the_facts_and_a_reparse_replaces_them(tmp_path: Path):
 
         assert [base_names(tuple(row), src) for row in sites] == [
             ("fp.c", 7, "c:@F@fire", "V|c:fp.c@g_cb"),
-            ("fp.c", 8, "c:@F@load", "F|c:@S@dev@FI@on_rx"),
+            ("fp.c", 8, "c:@F@load", "F|c:@S@dev~fp.c:2:8@FI@on_rx"),
         ]
         assert sources == 4
 

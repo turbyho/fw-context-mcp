@@ -253,6 +253,61 @@ def test_the_top_level_sums_the_units_that_did_not_parse(tmp_path):
     assert answer["translation_units"] == 4 and answer["symbols_updated"] == 7
 
 
+def test_a_unit_that_does_not_parse_is_skipped_as_in_the_index_run(tmp_path):
+    """The index run skips a unit whose parse raises ValueError, and reindex_file let the ValueError leave the tool.
+
+    The parse raises ValueError when `__WCHAR_TYPE__` is no integer type:
+    the key of `wchar_t` in C++ is the type of that macro
+    (``_usr._character_kinds``).
+    """
+    from fw_context_mcp.indexer.runner import run
+
+    root = tmp_path / "proj"
+    (root / "src").mkdir(parents=True)
+    (root / "src/ok.cpp").write_text("int ok_value(void) { return 1; }\n", encoding="utf-8")
+    (root / "src/wide.cpp").write_text("typedef wchar_t wide_t;\nint wide_value(wide_t c) { return (int)c; }\n", encoding="utf-8")
+    index_dir = tmp_path / "index"
+    (root / ".fw-context").mkdir()
+    (root / ".fw-context" / "config.toml").write_text(f'[project]\nid = "{PROJECT_ID}"\n', encoding="utf-8")
+    (root / ".fw-context" / "local.toml").write_text(f'[index]\ndb_dir = "{index_dir.as_posix()}"\n', encoding="utf-8")
+    db_path = index_dir / PROJECT_ID / "index.db"
+    cc = root / "cc_a.json"
+    cc.write_text(json.dumps([
+        {"directory": str(root), "file": name,
+         "arguments": ["c++", "-U__WCHAR_TYPE__", "-D__WCHAR_TYPE__=float", "-c", name, "-o", f"{name}.o"]}
+        for name in ("src/ok.cpp", "src/wide.cpp")
+    ]), encoding="utf-8")
+    run(
+        compile_commands=cc, db_path=db_path, project_root=root, project_id=PROJECT_ID,
+        index_refs=False, index_embeddings=False, analyze_symbols=False, variant="a",
+    )
+    assert "ok_value" in _names(db_path, "a") and "wide_value" not in _names(db_path, "a"), "the run skips the unit"
+
+    result = _reindex(root, "src/wide.cpp")
+
+    assert result["skipped_tus"] == ["wide.cpp"], result
+    assert "failed to parse" in result["error"]
+
+
+def test_a_db_error_of_the_parse_is_an_error_and_not_a_skipped_unit(two_builds, monkeypatch):
+    """A skipped unit says that the unit is at fault; a DB error stops the update of the build."""
+    import sqlite3
+
+    from fw_context_mcp.indexer import symbols
+
+    root, _ = two_builds
+
+    def _locked(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(symbols, "extract_all", _locked)
+
+    result = _reindex(root, "src/only_a.c")
+
+    assert result["error"] == "DB error during parse of only_a.c: database is locked", result
+    assert "skipped_tus" not in result
+
+
 def test_an_error_of_the_only_build_stays_at_the_top_level(two_builds, monkeypatch):
     """One build compiles the file: the answer keeps the shape it had before builds were a part of it."""
     root, _ = two_builds

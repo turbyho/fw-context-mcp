@@ -18,6 +18,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._usr_keys import base_names
+
 SOURCE = """\
 typedef void (*cb_t)(int);
 typedef void (*cbd_t)(double);
@@ -52,7 +54,7 @@ def refs(tmp_path_factory):
     src: Path = tmp_path_factory.mktemp("overload") / "ov.cpp"
     src.write_text(SOURCE, encoding="utf-8")
     unit = CompilationUnit(file=src, directory=src.parent, language="cpp", clang_args=["-std=c++20"])
-    return extract_all(unit, with_refs=True).references
+    return base_names(extract_all(unit, with_refs=True).references, src)
 
 
 def _slots(refs, text: str) -> list[tuple[str, int | None]]:
@@ -79,13 +81,14 @@ def test_the_type_of_each_field_picks_its_overload(refs):
 
 @pytest.mark.libclang
 def test_a_member_pointer_tells_the_const_overload_apart(refs):
-    assert _slots(refs, "plain_members[]") == [("c:@S@C@F@m#I#", 0)]
-    assert _slots(refs, "const_members[]") == [("c:@S@C@F@m#I#1", 0)]
+    # The USR of a type holds the place of its definition (`struct C`: line 11).
+    assert _slots(refs, "plain_members[]") == [("c:@S@C~ov.cpp:11:8@F@m#I#", 0)]
+    assert _slots(refs, "const_members[]") == [("c:@S@C~ov.cpp:11:8@F@m#I#1", 0)]
 
 
 @pytest.mark.libclang
 def test_a_plain_pointer_takes_the_static_method_only(refs):
-    assert _slots(refs, "statics[]") == [("c:@S@C@F@s#I#S", 0)]
+    assert _slots(refs, "statics[]") == [("c:@S@C~ov.cpp:11:8@F@s#I#S", 0)]
 
 
 @pytest.mark.libclang

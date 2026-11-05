@@ -78,6 +78,7 @@ from fw_context_mcp.indexer.db import (
     insert_refs_batch,
     insert_slot_facts,
     insert_symbols_batch,
+    insert_type_places,
     link_ref_producers,
     record_claims,
     release_ref_producer,
@@ -85,6 +86,7 @@ from fw_context_mcp.indexer.db import (
     settle_stale_files,
     slot_unit_key,
     split_tokens,
+    store_unit_places,
     upsert_file,
 )
 from fw_context_mcp.utils import (
@@ -1020,6 +1022,14 @@ def _store_symbol_rows(
     # is orders of magnitude faster than individual INSERT per symbol.
     if rows:
         insert_symbols_batch(conn, rows)
+    # The definition of each type with a merge key (also of a C tag) that is
+    # not in the body of a type (_usr.odr_place), in the transaction of the
+    # rows: the run decides the merge and the places of the class templates
+    # from the definitions of all files (indexer/_odr.py).
+    insert_type_places(conn, [
+        (config_hash, file_id_cache[_normalize_file_path(s.file, project_root)], *s.odr_place)
+        for s in syms if s.odr_place is not None
+    ])
     return len(rows), file_proj
 
 
@@ -1425,6 +1435,7 @@ def store_symbols_for_unit(
     times with the same flags has two keys (``number_listings``).  Without
     *listing*, nothing is recorded.
     """
+    from fw_context_mcp.indexer._odr import load_type_decisions
     from fw_context_mcp.indexer.symbols import extract_all
 
     if vendor_patterns is None:
@@ -1476,11 +1487,15 @@ def store_symbols_for_unit(
         #     during parse) — log and skip this TU; the indexer continues
         #     with the remaining TUs.
         try:
+            # The decisions of the build about the places of the types: the
+            # rows of this unit must agree with the rows of the other units
+            # (_odr.py).
             result = extract_all(
                 unit,
                 with_refs=index_refs,
                 return_tu=True,
                 skip_files=set(skip_files) if skip_files else None,
+                decisions=load_type_decisions(conn, config_hash),
             )
             tu = result.tu
             syms = result.symbols
@@ -1567,7 +1582,12 @@ def store_symbols_for_unit(
     # gives these files to this listing again when it does not parse it (see
     # db/_owners.py).  A caller that does not name the listing records nothing.
     if listing is not None:
-        record_claims(conn, config_hash, listing, owned_paths)
+        record_claims(conn, config_hash, listing, owned_paths, unit.language)
+        # The files of the places that the rows below hold, and the
+        # templates whose place they took from the build: a change of the
+        # decisions of the build parses again only the listings whose rows
+        # read a file or a template of the change (runner._settle_odr_merge).
+        store_unit_places(conn, config_hash, listing, result.place_files, result.template_keys)
         # The edges of template instances that this listing found in the
         # last run: they go, and the parse below writes them again.  An edge
         # that another listing also found stays (see ``ref_producers``).

@@ -30,7 +30,7 @@ import time
 from collections.abc import Collection
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 from pydantic import Field
 
@@ -97,6 +97,9 @@ from ..shared.stale import (
 from ..shared.stale import after_the_run as _after_the_run
 from ..shared.stale import with_action as _with_action
 from ..shared.variants import IMAGE_DESCRIPTION, VARIANT_DESCRIPTION
+
+if TYPE_CHECKING:
+    from ...indexer._usr import TypeDecisions
 
 log = logging.getLogger(__name__)
 
@@ -2483,6 +2486,34 @@ def _reindex_cleanup_deleted_file(
         return {"error": f"Could not acquire write lock for cleanup of {target}: {e}", "action": "timeout"}
 
 
+def _decisions_of_manifest(
+    manifest: dict, root: Path, places: list[tuple[str, str, int, int]], template_keys: frozenset[str],
+) -> TypeDecisions:
+    """Decide the places of the C++ types of the build from its stored definitions and its manifest.
+
+    The index run decides from the units of compile_commands.json and the
+    files that each one reads (``runner._settle_odr_merge``).  The manifest
+    holds the same: an entry for each unit, its arguments (the language of
+    the unit, ``compile_commands._detect_language``) and its headers.  Thus
+    the two give one answer, and ``_odr.decide_types`` applies the rules.
+    """
+    from ...indexer._odr import StoredPlace, decide_types
+    from ...indexer.compile_commands import _detect_language
+    from ...indexer.manifest import path_resolver, tu_arguments
+
+    resolve = path_resolver(root)
+    cxx_files: set[Path] = set()
+    main_files: set[Path] = set()
+    for entry in manifest.get("entries") or ():
+        source = resolve(entry.get("file", ""))
+        main_files.add(source)
+        if _detect_language(source, tu_arguments(manifest, entry)) == "cpp":
+            cxx_files.add(source)
+            cxx_files.update(resolve(header) for header in entry.get("headers") or ())
+    stored = [StoredPlace(resolve(path), key, line, column) for path, key, line, column in places]
+    return decide_types(stored, cxx_files, main_files, template_keys)
+
+
 def _reindex_parse_and_store(
     conn: sqlite3.Connection,
     matching: list,
@@ -2514,20 +2545,33 @@ def _reindex_parse_and_store(
     Returns ``(total_symbols, result_dict)``.  The result dict includes
     ``symbols_updated``, ``elapsed_s``, and optionally ``skipped_tus``.
     """
+    from ...indexer._odr import load_type_decisions
+    from ...indexer._unit_processor import TranslationUnitLoadError
     from ...indexer.compile_commands import CompilationUnit as TU
-    from ...indexer.db import files_claimed_before, number_listings, record_claims, skip_form, unclaimed
+    from ...indexer.db import (
+        claim_order,
+        files_claimed_before,
+        load_type_places,
+        load_unit_places,
+        number_listings,
+        record_claims,
+        skip_form,
+        unclaimed,
+    )
     from ...indexer.db import write_lock as db_write_lock
     from ...indexer.ops import _normalize_file_path, store_symbols_for_unit
     from ...indexer.symbols import (
         ExtractionResult,
         extract_all,
     )
+    from ...utils import SAFE_EXCEPT, is_db_exception, is_fatal
 
     config_hash = cfg_data["config_hash"]
     ownership = ownership or Ownership()
 
-    # The listings in the order of the index run: (normalized path, flags
-    # hash), as runner._in_claim_order sorts them.
+    # The listings in the order of the index run: the claim order of their
+    # key (normalized path, flags hash) and language, as
+    # runner._in_claim_order sorts them.
     keyed = sorted(
         (
             (
@@ -2536,7 +2580,7 @@ def _reindex_parse_and_store(
             )
             for unit in matching
         ),
-        key=lambda pair: pair[0],
+        key=lambda pair: claim_order(pair[0], pair[1].language),
     )
     # Two listings of the file with the same flags get two keys, as in the
     # index run (number_listings).  *matching* holds each listing of the
@@ -2563,19 +2607,31 @@ def _reindex_parse_and_store(
     unit_claims: list[tuple[tuple[str, str], frozenset[str] | None]] = []
     seen_this_call: set[str] = set()
     skipped_tus: list[str] = []
+    # The decisions of the build about the places of the types
+    # (indexer/_odr.py): the rows of this call must agree with the rows of
+    # the other units.
+    type_decisions = load_type_decisions(conn, config_hash)
     for key, unit in keyed:
-        before = files_claimed_before(ownership, key, exclude=reparsed_keys)
+        before = files_claimed_before(ownership, key, unit.language, exclude=reparsed_keys)
         skip = frozenset(skip_form(before, root) | seen_this_call) or None
         try:
-            parsed = extract_all(unit, with_refs=cfg_refs, return_tu=True, skip_files=skip)
+            parsed = extract_all(
+                unit, with_refs=cfg_refs, return_tu=True, skip_files=skip, decisions=type_decisions,
+            )
             parsed_units.append((unit, parsed))
             unit_claims.append((key, skip))
             seen_this_call.update(parsed.newly_seen_files or ())
-        except sqlite3.Error as exc:
-            return 0, {"error": f"DB error during parse of {unit.file.name}: {exc}"}
-        except RuntimeError as exc:
-            # Clang parse failures (missing headers, syntax errors) are
-            # non-fatal — skip the TU and continue with others.
+        except (*SAFE_EXCEPT, TranslationUnitLoadError) as exc:
+            if is_fatal(exc):
+                raise
+            if is_db_exception(exc):
+                return 0, {"error": f"DB error during parse of {unit.file.name}: {exc}"}
+            # The index run (_unit_processor._parse_unit) also skips a unit
+            # on each of these exceptions that is not a DB error.  Thus the
+            # run and this call agree on which units have rows.  A
+            # ValueError of the parse is one of them: a macro text that is
+            # not an integer type with a known sign (_usr._character_kinds).
+            # A DB error stops this call and does not skip a unit.
             log.warning("skip TU %s during reindex: %s", unit.file.name, exc)
             skipped_tus.append(str(unit.file.name))
 
@@ -2593,8 +2649,8 @@ def _reindex_parse_and_store(
             # The header records of each store, for the manifest below:
             # their hashes are the ones of the text that the parse read.
             unit_headers: list[list[dict] | None] = []
-            # The parsed units that keep a file which they no longer
-            # claim: the next index run must parse them (see below).
+            # The parsed units that keep a file which they no longer claim:
+            # the next index run must parse them (see below).
             keeps_lost_files: set[int] = set()
             for index, ((unit, parsed), (key, skip)) in enumerate(
                 zip(parsed_units, unit_claims, strict=True)
@@ -2627,7 +2683,7 @@ def _reindex_parse_and_store(
                     # listing before this one, or one parsed in this call.
                     kept = unclaimed(ownership.files_of(key) - claimed, skip or frozenset(), root)
                     if kept:
-                        record_claims(conn, config_hash, key, claimed | kept)
+                        record_claims(conn, config_hash, key, claimed | kept, unit.language)
                         keeps_lost_files.add(index)
                 unit_headers.append(headers)
 
@@ -2650,9 +2706,20 @@ def _reindex_parse_and_store(
             if deleted_orphans:
                 log.debug("Orphan files cleaned up: %d", deleted_orphans)
 
+            # The places of the C++ types decide the merge of the build and
+            # the places of its class templates, and this call parses some
+            # units, not the build.  The rows that it stored and the headers
+            # that the units read now give the decisions again: when they
+            # differ from the decisions of the parse, the next index run
+            # must decide and parse the units of the change.
             _update_manifest_after_reindex(
                 parsed_units, unit_headers, root, db_path.parent, config_hash,
                 transient_defines=transient_defines, keeps_lost_files=keeps_lost_files,
+                decided=type_decisions,
+                places=load_type_places(conn, config_hash),
+                template_keys=frozenset().union(
+                    *(places.templates for places in load_unit_places(conn, config_hash).values())
+                ),
             )
 
             elapsed = round(time.monotonic() - t0, 2)
@@ -2725,6 +2792,9 @@ def _update_manifest_after_reindex(
     *,
     transient_defines: Collection[str],
     keeps_lost_files: Collection[int] = (),
+    decided: TypeDecisions | None = None,
+    places: list[tuple[str, str, int, int]] | None = None,
+    template_keys: frozenset[str] = frozenset(),
 ) -> None:
     """Update manifest.json entries for reindexed translation units.
 
@@ -2752,10 +2822,21 @@ def _update_manifest_after_reindex(
     and this call gave the entry the hash of the new text beside the symbols
     of the old one, and the next index run found the unit current.
 
-    *keeps_lost_files* holds the indexes in *parsed_units* of the units that keep a
-    file which they no longer claim (see ``_reindex_parse_and_store``).
+    *keeps_lost_files* holds the indexes in *parsed_units* of the units that
+    keep a file which they no longer claim (see ``_reindex_parse_and_store``).
     Their entries get ``needs_reparse``: the next index run parses them and
     gives the file to its next includer.
+
+    *decided* holds the decisions about the places of the C++ types that the
+    parse followed (``indexer/_odr.py``).  *places* holds the stored
+    definitions after the store, and *template_keys* the templates that the
+    stored units looked for.  With the refreshed entries, they give the
+    decisions of the build again (``_decisions_of_manifest``).  When these
+    differ, each refreshed entry of this call gets ``needs_reparse``: the
+    next index run then decides again and parses the units of the change
+    (``runner._settle_odr_merge``).  The compare is the rule of the run
+    itself, thus a change that no decision reads (a new C struct in a C
+    build, a moved line of a merged copy) sends no unit to a run.
     """
     try:
         from ...indexer._parsed_text import file_of_parse, parsed_hash
@@ -2794,6 +2875,8 @@ def _update_manifest_after_reindex(
                 for path, record in (manifest_data.get("headers") or {}).items()
             }
             refreshed: set[int] = set()
+            # The entry of each unit that this call stored.
+            stored_entries: list[int] = []
             listings: list[tuple[str, str]] = []
             for unit, _parsed in parsed_units:
                 try:
@@ -2854,9 +2937,20 @@ def _update_manifest_after_reindex(
                         "flags_hash": flags_hash,
                     })
                     refreshed.add(len(manifest_data["entries"]) - 1)
+                entry_index = slot if slot is not None else len(manifest_data["entries"]) - 1
+                stored_entries.append(entry_index)
                 if index in keeps_lost_files:
-                    entry_index = slot if slot is not None else len(manifest_data["entries"]) - 1
                     manifest_data["entries"][entry_index]["needs_reparse"] = True
+            if (
+                decided is not None and places is not None and stored_entries
+                and _decisions_of_manifest(manifest_data, root, places, template_keys) != decided
+            ):
+                for entry_index in stored_entries:
+                    manifest_data["entries"][entry_index]["needs_reparse"] = True
+                log.info(
+                    "reindex_file: the places of the C++ types of the build changed; "
+                    "%d entr(ies) flagged needs_reparse", len(stored_entries),
+                )
             # This function refreshed the SHARED header hashes, so the next
             # full index run sees no difference for the OTHER units that
             # include those headers — their rows still come from the old
@@ -3654,12 +3748,13 @@ def _tu_for_header(
     single tool call into hours, thus the caller warns that the answer
     comes from one compilation context and points at a full index.
 
-    The choice is the lowest stored path in sort order, not the first
-    entry.  That is the first includer in the order of the index run,
-    which parses the units sorted by their stored path
-    (``runner._in_claim_order``).  The caller uses this function only for
-    a header that no listing owns: a header with an owner goes to its
-    owner first.
+    The choice is the first includer in the order of the index run, not
+    the first entry: a C++ unit before a C unit, then the lowest stored
+    path in sort order (``db.claim_order``).  The language of an entry is
+    the one of its arguments, as compile_commands.json gives it to the run
+    (``compile_commands._detect_language``).  The caller uses this function
+    only for a header that no listing owns: a header with an owner goes to
+    its owner first.
 
     Paths are compared as strings.  The manifest already stores resolved
     forms — relative to the project root when inside it, absolute
@@ -3668,11 +3763,15 @@ def _tu_for_header(
     add a syscall for each of the tens of thousands of header references
     a large manifest holds.
     """
+    from ...indexer.compile_commands import _detect_language
+    from ...indexer.db import claim_order
+    from ...indexer.manifest import tu_arguments
+
     if not manifest:
         return None
     root = project_root.resolve()
     target_str = str(target)
-    best: str | None = None
+    best: tuple[int, str, str] | None = None
     for entry in manifest.get("entries") or ():
         tu_file = entry.get("file")
         if not tu_file:
@@ -3681,12 +3780,14 @@ def _tu_for_header(
             header_abs = header if Path(header).is_absolute() else str(root / header)
             if header_abs != target_str:
                 continue
-            if best is None or tu_file < best:
-                best = tu_file
+            # No flags hash: the caller orders the listings of the file that this gives.
+            position = claim_order((tu_file, ""), _detect_language(Path(tu_file), tu_arguments(manifest, entry)))
+            if best is None or position < best:
+                best = position
             break
     if best is None:
         return None
-    return Path(best) if Path(best).is_absolute() else root / best
+    return Path(best[1]) if Path(best[1]).is_absolute() else root / best[1]
 
 
 def _with_owners_of_changed_headers(
@@ -3814,8 +3915,13 @@ def _reindex_match_tus(
         # the error below, which is the same answer as before.
         via = [u for u in units if Path(u.file).resolve() == tu_path]
         if via:
-            # The first listing of the file in the order of the index run.
-            first = min(via, key=lambda unit: _listing_flags_hash(unit, transient_defines))
+            # The first listing of the file in the order of the index run:
+            # two listings of one file can have two languages (`-std=`).
+            from ...indexer.db import claim_order
+
+            first = min(via, key=lambda unit: claim_order(
+                (str(tu_path), _listing_flags_hash(unit, transient_defines)), unit.language,
+            ))
             return with_owners([first]), True, None
     return [], False, None
 

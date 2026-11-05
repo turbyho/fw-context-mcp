@@ -1658,6 +1658,45 @@ class TestReindexFileImplEdgeCases:
         manifest["entries"].reverse()
         assert _tu_for_header(target, manifest, tmp_path) == chosen
 
+    @pytest.mark.parametrize("define", ["-DA=1", "-DB=1", "-DC=1", "-DD=1"])
+    def test_a_header_goes_to_the_cpp_listing_of_its_first_includer(self, tmp_path: Path, define: str):
+        """`src/two.c` is listed as C and as C++ (`-std=`): the C++ listing claims first, whatever its flags hash."""
+        from fw_context_mcp.mcp.handlers.maintenance import _reindex_match_tus
+
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "shared.h").write_text("int shared;\n", encoding="utf-8")
+        (tmp_path / "src" / "two.c").write_text('#include "shared.h"\n', encoding="utf-8")
+        cc = tmp_path / "compile_commands.json"
+        cc.write_text(json.dumps([
+            {"directory": str(tmp_path), "file": "src/two.c", "arguments": ["cc", "-std=gnu11", "-c", "src/two.c"]},
+            {"directory": str(tmp_path), "file": "src/two.c",
+             "arguments": ["cc", "-std=gnu++17", define, "-c", "src/two.c"]},
+        ]), encoding="utf-8")
+        manifest = {"entries": [{"file": "src/two.c", "headers": ["src/shared.h"]}]}
+        matching, via_header, error = _reindex_match_tus(
+            (tmp_path / "src" / "shared.h").resolve(), {"compile_commands_path": str(cc)},
+            manifest=manifest, project_root=tmp_path,
+        )
+        assert error is None and via_header
+        assert [unit.language for unit in matching] == ["cpp"]
+
+    def test_tu_for_header_takes_a_cpp_unit_before_a_c_unit(self, tmp_path: Path):
+        """The C++ units claim first (``db.claim_order``), also a `.c` file that `-std=` makes C++."""
+        from fw_context_mcp.mcp.handlers.maintenance import _tu_for_header
+
+        manifest = {
+            "arg_sets": [["-std=gnu11"], ["-std=gnu++17"]],
+            "entries": [
+                {"file": "src/alpha.c", "arg_set": 0, "headers": ["src/shared.h"]},
+                {"file": "src/zeta.cpp", "arg_set": 1, "headers": ["src/shared.h"]},
+                {"file": "src/omega.c", "arg_set": 1, "headers": ["src/shared.h"]},
+            ],
+        }
+        target = (tmp_path / "src" / "shared.h").resolve()
+        assert _tu_for_header(target, manifest, tmp_path) == tmp_path.resolve() / "src" / "omega.c"
+        manifest["entries"].pop(2)
+        assert _tu_for_header(target, manifest, tmp_path) == tmp_path.resolve() / "src" / "zeta.cpp"
+
     def test_header_reduced_to_comments_stops_serving_its_old_text(
         self, indexed_project: Path
     ):

@@ -54,6 +54,7 @@ from collections.abc import Collection
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 try:
     from clang.cindex import TranslationUnitLoadError
@@ -70,6 +71,9 @@ from .db import (
     write_lock,
 )
 from .ops import _build_filtered_file_content, _normalize_file_path, store_symbols_for_unit
+
+if TYPE_CHECKING:
+    from ._usr import TypeDecisions
 
 log = logging.getLogger(__name__)
 
@@ -230,12 +234,17 @@ def decide_units(
     return decisions
 
 
-def _parse_unit(unit, index_refs, skip_files: set[str] | None, hashes: tuple[str, str]):
+def _parse_unit(
+    unit, index_refs, skip_files: set[str] | None, hashes: tuple[str, str], decisions: TypeDecisions,
+):
     """Parse a unit that :func:`decide_units` did not find unchanged.
 
     Does NOT write to the database — the caller is responsible for
     acquiring ``write_lock`` and calling ``_process_unit(pre_parsed=...)``
     to persist the result.
+
+    *decisions* are the decisions of the build about the places of the
+    types (``extract_all``).
 
     Returns:
         * ``("skipped", None, None, None)`` — parse failed.
@@ -251,6 +260,7 @@ def _parse_unit(unit, index_refs, skip_files: set[str] | None, hashes: tuple[str
             with_refs=index_refs,
             return_tu=True,
             skip_files=skip_files,
+            decisions=decisions,
         )
     except sqlite3.Error:
         log.error("Fatal DB error parsing %s — stopping indexer", unit.file.name)

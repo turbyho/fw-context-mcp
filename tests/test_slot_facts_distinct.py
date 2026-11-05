@@ -18,6 +18,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._usr_keys import base_names
+
 SOURCE = """\
 typedef int (*init_fn_t)(void);
 typedef void (*cb_t)(int);
@@ -62,11 +64,12 @@ def extracted(tmp_path_factory):
     src: Path = tmp_path_factory.mktemp("fp") / "fp.c"
     src.write_text(SOURCE, encoding="utf-8")
     unit = CompilationUnit(file=src, directory=src.parent, language="c", clang_args=["-std=c11"])
-    return extract_all(unit, with_refs=True)
+    return base_names(extract_all(unit, with_refs=True), src)
 
 
-# The slot of the field ``cb`` of ``struct device``.
-CB = "F|c:@S@device@FI@cb"
+# The slot of the field ``cb`` of ``struct device``: the USR of the type
+# holds the place of its definition (line 4).
+CB = "F|c:@S@device~fp.c:4:8@FI@cb"
 
 
 def _line(text: str) -> int:
@@ -134,7 +137,7 @@ def test_an_assignment_inside_a_macro_is_kept(extracted):
 @pytest.mark.libclang
 def test_a_macro_that_expands_twice_on_one_line_gives_one_fact(extracted):
     line = _line("FOR_EACH(DEFINE_OPS)")
-    assert [slot for _, slot in _sources(extracted, line)] == ["F|c:@S@ops@FI@init"]
+    assert [slot for _, slot in _sources(extracted, line)] == ["F|c:@S@ops~fp.c:5:8@FI@init"]
 
 
 @pytest.mark.libclang
