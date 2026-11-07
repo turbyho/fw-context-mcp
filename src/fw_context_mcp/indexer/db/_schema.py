@@ -473,13 +473,31 @@ def _derive_schema_version(
     migrations to different branches will produce different fingerprints,
     which triggers a full reindex instead of silent schema drift.
 
-    The result is masked to 31 bits (``& 0x7FFFFFFF``) to fit in a
-    signed 32-bit SQLite INTEGER without overflow.
+    The result lies above ``_RELEASED_SCHEMA_VERSION_MAX`` and at most
+    ``0x7FFFFFFF``, to fit in a signed 32-bit SQLite INTEGER.  WHY above:
+    a release from v0.8.2 to v0.35.0 migrates an index only when the
+    version of the index is smaller than its own (``<``).  An older
+    fw-context that opens an index of this version (an MCP server that the
+    client did not restart) then only stamps it, or leaves the stamp
+    (v0.8.2 to v0.24 add only empty tables of their own).  Its migration
+    made the old key of ``refs`` again, and its deduplication deleted the
+    rows of two calls on one line, which this version keeps.
     """
 
     tables = _parse_expected_columns(schema_sql, migration_statements)
     canonical = "".join(f"{table}:{','.join(sorted(cols))};" for table, cols in sorted(tables.items()))
-    return int.from_bytes(hashlib.sha256(canonical.encode()).digest()[:4], "big") & 0x7FFFFFFF
+    digest = int.from_bytes(hashlib.sha256(canonical.encode()).digest()[:4], "big")
+    return _RELEASED_SCHEMA_VERSION_MAX + 1 + digest % (0x7FFFFFFF - _RELEASED_SCHEMA_VERSION_MAX)
+
+
+#: The highest schema version of a release that compares the version of an
+#: index with ``<`` (v0.12.0).  Measured over each tag from v0.1.1 to
+#: v0.35.0: each tag extracted with `git archive`, and its
+#: ``CURRENT_SCHEMA_VERSION`` and the comparison of ``open_db`` read.
+#: v0.4.0 to v0.8.1 migrate at each open, whatever the version, and do not
+#: change ``refs``.  A new release keeps this value: its versions lie above
+#: it already.
+_RELEASED_SCHEMA_VERSION_MAX = 2016954547
 
 
 # Simple add-column migrations — run idempotently and feed into the schema
@@ -1550,11 +1568,21 @@ def _run_data_migrations(conn: sqlite3.Connection) -> None:
     # makes two NULLs one value, as the new index reads them.  Its origins
     # stay 0 (an older version did not record them), and the row format
     # asks for a reindex of such an index.
+    #
+    # The old key goes at each migration, also when idx_refs_site exists.
+    # A release migrates an index whose schema version is smaller than its
+    # own: it makes idx_refs_unique again and stamps its version.  A
+    # development build of this version had a smaller version, and an index
+    # of it got the two keys: two calls on one line gave "UNIQUE constraint
+    # failed" and stopped the index run.  The version of this code is now
+    # larger than each released version (_derive_schema_version), thus a
+    # release only stamps the index, or leaves the stamp, and this drop
+    # repairs an index of the development build.
+    conn.execute("DROP INDEX IF EXISTS idx_refs_unique")
     idx_exists = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_refs_site'"
     ).fetchone()
     if not idx_exists:
-        conn.execute("DROP INDEX IF EXISTS idx_refs_unique")
         cur = conn.execute(
             """DELETE FROM refs WHERE rowid NOT IN (
                 SELECT rowid FROM (

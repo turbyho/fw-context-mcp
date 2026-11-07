@@ -34,6 +34,25 @@ def _has_index(conn, name: str) -> bool:
     return conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?", (name,)).fetchone() is not None
 
 
+@pytest.mark.parametrize("schema", ["", "CREATE TABLE a (x INTEGER);", "CREATE TABLE b (y TEXT, z REAL);"])
+def test_no_release_migrates_an_index_of_this_version(schema):
+    """A release from v0.8.2 migrates an index when its version is smaller than the version of the release.
+
+    Such a migration of an index of this version made the old key of
+    `refs` again, and its deduplication deleted rows of two calls on one
+    line, which this version keeps.  The highest version of such a release
+    is 2016954547 (v0.12.0): the comment of `_RELEASED_SCHEMA_VERSION_MAX`
+    tells the measurement, and this test only guards the value.  A version
+    of this code is larger, thus a release only stamps such an index, or
+    leaves the stamp.
+    """
+    from fw_context_mcp.indexer.db._schema import _RELEASED_SCHEMA_VERSION_MAX, _derive_schema_version
+
+    assert _RELEASED_SCHEMA_VERSION_MAX == 2016954547
+    assert _RELEASED_SCHEMA_VERSION_MAX < _derive_schema_version(schema, []) <= 0x7FFFFFFF
+    assert _RELEASED_SCHEMA_VERSION_MAX < CURRENT_SCHEMA_VERSION <= 0x7FFFFFFF
+
+
 # A hash of each side: the top bit flipped, the largest value, and a small one.
 @pytest.mark.parametrize("stamp", [CURRENT_SCHEMA_VERSION ^ 0x40000000, 0x7FFFFFFF, 1])
 def test_an_index_of_another_version_migrates_whatever_its_hash(tmp_path, stamp):

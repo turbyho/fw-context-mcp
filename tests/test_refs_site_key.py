@@ -191,6 +191,45 @@ def test_the_migration_keeps_the_slots_of_an_older_index(tmp_path: Path):
         migrated.close()
 
 
+def test_the_migration_drops_the_old_key_that_an_older_process_made_again(tmp_path: Path):
+    """A release migrated an index whose schema version was smaller than its own, and stamped its version.
+
+    A development build of this version had a smaller version.  The
+    migration of the release made the old key idx_refs_unique again, which
+    has no column.  The migration of this version kept the old key when
+    idx_refs_site existed, thus two calls on one line gave "UNIQUE
+    constraint failed" and stopped the index run.
+    """
+    import sqlite3
+
+    db = tmp_path / "index.db"
+    conn = open_db(db, skip_integrity_check=True)
+    conn.close()
+    raw = sqlite3.connect(db)
+    raw.execute(
+        "CREATE UNIQUE INDEX idx_refs_unique ON refs(config_hash, to_usr, from_file, from_line, from_usr, ref_kind)"
+    )
+    raw.execute("PRAGMA user_version = 1")
+    raw.commit()
+    raw.close()
+
+    migrated = open_db(db, skip_integrity_check=True)
+    try:
+        with transaction(migrated):
+            upsert_project(migrated, "pid", "p", str(tmp_path))
+            upsert_build_config(migrated, CH, "pid", "cc.json")
+        insert_refs_batch(migrated, [
+            (CH, "u_cb", "drv.c", 4, "u_a", "call", None, 3, 0),
+            (CH, "u_cb", "drv.c", 4, "u_a", "call", None, 20, 0),
+        ])
+        migrated.commit()
+        indexes = {row[0] for row in migrated.execute("SELECT name FROM sqlite_master WHERE tbl_name = 'refs'")}
+        assert "idx_refs_unique" not in indexes and "idx_refs_site" in indexes
+        assert len(_rows(migrated)) == 2
+    finally:
+        migrated.close()
+
+
 class TestTheClaimsOfOneUnit:
     def _ref(self, **changes) -> Reference:
         fields = {
