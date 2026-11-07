@@ -19,7 +19,11 @@ A rule has one of two shapes:
   the AST carries it.  A trigger in C exists: Zephyr gives parameter 3 of
   ``arch_new_thread`` to parameter 0 of ``z_thread_entry`` through a stack
   frame.  The slot resolution then gives the edge from the real trigger
-  (origin ``SLOT``).
+  (origin ``SLOT``).  As a ``Call`` rule does, it applies when the build
+  has no body of the function of its source slot, and with ``always``
+  also with a body.  WHY: a body that stores the value in C gives the flow
+  to the slot facts, and the rule then gave an ``entry`` to one part of
+  the targets of a site (``fdevopen`` of picolibc from its source).
 * ``Call`` — a function runs the function in a slot: a parameter of the
   function, a parameter of an other function, or a field.  The edge goes
   from the function to each target of the slot (origin ``SDK``).  The rule
@@ -111,12 +115,19 @@ SlotName = Param | Field
 
 @dataclass(frozen=True)
 class Flow:
-    """Code out of the AST gives the value of *source* to *target*."""
+    """Code out of the AST gives the value of *source* to *target*.
+
+    *always*: the rule applies also when the build has the body of the
+    function of *source*: the body writes the value as data that the slot
+    facts cannot follow (a stack frame of integers).  A field in *source*
+    has no body, thus such a rule always applies.
+    """
 
     sdk: str
     entry: str
     source: SlotName
     target: SlotName
+    always: bool = False
 
 
 @dataclass(frozen=True)
@@ -143,6 +154,8 @@ _INTERRUPT = "an interrupt"
 _EVENT_LOOP = "the ESP-IDF default event loop task"
 _TCPIP = "the lwIP tcpip thread"
 _NVM = "the end of an NVM operation of the platform"
+_STDIO_LIBC = "picolibc / avr-libc"
+_STDIO_WRITE = "a write to a FILE (stream->put)"
 _ZEPHYR = "the Zephyr scheduler"
 _EVENT_QUEUE = "the mbed EventQueue (dispatch)"
 _FUNCTION_CALL = "events::EventQueue::function_call"
@@ -194,14 +207,32 @@ BUILTIN_RULES: tuple[Rule, ...] = (
     Call("Nanostack", _NVM, "platform_nvm_write", 0),
     Call("Nanostack", _NVM, "platform_nvm_read", 0),
     Call("Nanostack", _NVM, "platform_nvm_flush", 0),
-    # ── Zephyr: `arch_new_thread` writes the stack frame, and assembly
-    # starts `z_thread_entry`, which calls the entry in C.  Static threads
-    # and `k_thread_create` go through `z_setup_new_thread` to it.
-    Flow("Zephyr", _ZEPHYR, Param("arch_new_thread", 3), Param("z_thread_entry", 0)),
-    Flow("Zephyr", _ZEPHYR, Param("arch_new_thread", 4), Param("z_thread_entry", 1)),
-    Flow("Zephyr", _ZEPHYR, Param("arch_new_thread", 5), Param("z_thread_entry", 2)),
-    Flow("Zephyr", _ZEPHYR, Param("arch_new_thread", 6), Param("z_thread_entry", 3)),
-    Flow("Zephyr", _ZEPHYR, Param("arch_switch_to_main_thread", 2), Param("z_thread_entry", 0)),
+    # ── picolibc and avr-libc: the two have a `struct __file` with the
+    # field `put`.  Each output function writes each character through the
+    # `put` function of its FILE (`stream->put`), directly or through
+    # `vfprintf` and `putc`.  The `_P` functions of avr-libc read the
+    # format or the text from the program memory.  A build can link the
+    # library with no source of it (Zephyr, an AVR core).  The slot is the
+    # field, thus each of these functions gets an edge to each function
+    # that the build stores in `put`.  `fdevopen` stores its parameter 0
+    # there.
+    *(
+        Call(_STDIO_LIBC, _STDIO_WRITE, name, Field("__file::put"))
+        for name in (
+            "fputc", "putc", "putchar", "fputs", "puts", "fwrite", "printf", "fprintf", "vprintf", "vfprintf",
+            "fputs_P", "puts_P", "printf_P", "fprintf_P", "vfprintf_P",
+        )
+    ),
+    Flow(_STDIO_LIBC, _STDIO_WRITE, Param("fdevopen", 0), Field("__file::put")),
+    # ── Zephyr: `arch_new_thread` writes the stack frame in C, as
+    # integers, and assembly starts `z_thread_entry`, which calls the entry
+    # in C.  Static threads and `k_thread_create` go through
+    # `z_setup_new_thread` to it.
+    Flow("Zephyr", _ZEPHYR, Param("arch_new_thread", 3), Param("z_thread_entry", 0), always=True),
+    Flow("Zephyr", _ZEPHYR, Param("arch_new_thread", 4), Param("z_thread_entry", 1), always=True),
+    Flow("Zephyr", _ZEPHYR, Param("arch_new_thread", 5), Param("z_thread_entry", 2), always=True),
+    Flow("Zephyr", _ZEPHYR, Param("arch_new_thread", 6), Param("z_thread_entry", 3), always=True),
+    Flow("Zephyr", _ZEPHYR, Param("arch_switch_to_main_thread", 2), Param("z_thread_entry", 0), always=True),
     # ── CMSIS: the RTX kernel starts a thread from its stack frame, and the
     # NVIC calls the vector that the table of integers holds.
     Call("CMSIS-RTOS2", "the RTX kernel (osKernelStart)", "osThreadNew", 0, always=True),
@@ -253,13 +284,16 @@ def _rule(table: object, label: str) -> Rule:
     sdk = _text(table, "sdk", label)
     entry = _text(table, "entry", label)
     keys = set(table) - {"sdk", "entry"}
-    if keys == {"from", "to"}:
-        return Flow(sdk, entry, _slot_name(table["from"], f"{label} 'from'"), _slot_name(table["to"], f"{label} 'to'"))
+    always = table.get("always", False)
+    if not isinstance(always, bool):
+        raise ValueError(f"{label}: 'always' must be true or false")
+    if keys - {"always"} == {"from", "to"}:
+        return Flow(
+            sdk, entry, _slot_name(table["from"], f"{label} 'from'"), _slot_name(table["to"], f"{label} 'to'"),
+            always=always,
+        )
     if "function" in keys and keys <= {"function", "param", "field", "slot", "always"}:
         function = _text(table, "function", label)
-        always = table.get("always", False)
-        if not isinstance(always, bool):
-            raise ValueError(f"{label}: 'always' must be true or false")
         if len(keys & {"param", "field", "slot"}) != 1:
             raise ValueError(f"{label}: give one of 'param', 'field' and 'slot'")
         slot: int | Param | Field
@@ -279,7 +313,7 @@ def _rule(table: object, label: str) -> Rule:
         return Call(sdk, entry, function, slot, always=always)
     raise ValueError(
         f"{label}: a rule holds 'sdk', 'entry' and either 'from' and 'to' (a flow), or 'function' with "
-        "one of 'param', 'field' and 'slot', and an optional 'always' (a call)",
+        "one of 'param', 'field' and 'slot' (a call), and an optional 'always'",
     )
 
 
@@ -382,15 +416,19 @@ def write_links(conn: sqlite3.Connection, config_hash: str, rules: Iterable[Rule
     functions = _symbols(conn, config_hash, function_names, _FUNCTION_KINDS)
     fields = _symbols(conn, config_hash, field_names, ("field",))
 
-    def slots(name: SlotName) -> list[str]:
+    def slots(name: SlotName, with_body: bool = True) -> list[str]:
+        """The slots of *name*; with *with_body* False, no parameter of a function that the build defines."""
         if isinstance(name, Field):
             return [f"F|{symbol.usr}" for symbol in fields.get(name.name, [])]
-        return [f"P|{symbol.usr}|{name.index}" for symbol in functions.get(name.function, [])]
+        return [
+            f"P|{symbol.usr}|{name.index}" for symbol in functions.get(name.function, [])
+            if with_body or not symbol.is_definition
+        ]
 
     rows: set[tuple] = set()
     for rule in rules:
         if isinstance(rule, Flow):
-            for source in slots(rule.source):
+            for source in slots(rule.source, with_body=rule.always):
                 for target in slots(rule.target):
                     rows.add((config_hash, "flow", source, target, rule.entry, rule.sdk, "", 0, 0))
             continue

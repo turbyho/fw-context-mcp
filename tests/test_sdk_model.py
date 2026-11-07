@@ -10,7 +10,10 @@ model tells what runs it:
   the slot facts cannot see the path to the call;
 * a "flow" rule: code out of the AST gives the slot to the slot of a
   trigger in C (Zephyr ``arch_new_thread`` → ``z_thread_entry``), and the
-  slot resolution gives the edge from the trigger (origin ``slot``).
+  slot resolution gives the edge from the trigger (origin ``slot``).  The
+  rule applies when the build has no body of the function of its source
+  slot, or ``always`` when that body writes the value as data that the
+  slot facts cannot follow.
 """
 
 from __future__ import annotations
@@ -54,6 +57,24 @@ int platform_nvm_write(nvm_callback *callback, const char *key_name, const void 
                        void *context);
 int platform_nvm_read(nvm_callback *callback, const char *key_name, void *buf, uint16_t *buf_len, void *context);
 int platform_nvm_flush(nvm_callback *callback, void *context);
+struct __file { int (*put)(char c, struct __file *stream); };
+typedef struct __file FILE;
+int fputc(int c, FILE *stream);
+int putc(int c, FILE *stream);
+int putchar(int c);
+int fputs(const char *s, FILE *stream);
+int puts(const char *s);
+unsigned long fwrite(const void *ptr, unsigned long size, unsigned long nmemb, FILE *stream);
+int printf(const char *fmt, ...);
+int fprintf(FILE *stream, const char *fmt, ...);
+int vprintf(const char *fmt, __builtin_va_list ap);
+int vfprintf(FILE *stream, const char *fmt, __builtin_va_list ap);
+FILE *fdevopen(int (*put)(char c, FILE *stream), int (*get)(FILE *stream), int (*flush)(FILE *stream));
+int fputs_P(const char *s, FILE *stream);
+int puts_P(const char *s);
+int printf_P(const char *fmt, ...);
+int fprintf_P(FILE *stream, const char *fmt, ...);
+int vfprintf_P(FILE *stream, const char *fmt, __builtin_va_list ap);
 """
 KERNEL_C = """\
 #include "sdk.h"
@@ -88,6 +109,9 @@ static void nvm_delete_done(int status, void *context) { (void) status; (void) c
 static void nvm_write_done(int status, void *context) { (void) status; (void) context; }
 static void nvm_read_done(int status, void *context) { (void) status; (void) context; }
 static void nvm_flush_done(int status, void *context) { (void) status; (void) context; }
+static int out_put(char c, FILE *stream) { (void) c; (void) stream; return 0; }
+static FILE out = { .put = out_put };
+static int dev_put(char c, FILE *stream) { (void) c; (void) stream; return 0; }
 static void nvm_use(void)
 {
     uint16_t len = 4;
@@ -102,6 +126,8 @@ static void nvm_use(void)
 }
 void app_main(void)
 {
+    fputs("x", &out);
+    printf("%s", fdevopen(dev_put, 0, 0) ? "y" : "n");
     tcp_connect(0, 0, 80, on_connected);
     pthread_once(&once, once_init);
     nvm_use();
@@ -152,8 +178,14 @@ void dispatcher(void) { post(posted); }
 void runner(void (*f)(void)) { f(); }
 static void ran_job(void) {}
 static void posted(void) {}
+struct holder { void (*fn)(void); };
+static struct holder h;
+void store_fn(void (*f)(void)) { h.fn = f; }
+void call_holder(void) { h.fn(); }
+static void held(void) {}
 void use(struct tcp_pcb *pcb)
 {
+    store_fn(held);
     tcp_recv(pcb, on_recv); my_task_start(my_task); port_thread(my_thread);
     my_trampoline(plain); reg_cycle(cycle_job); reg2(fa, fb); ra(mutual_job); outer(two_job); post(posted); runner(ran_job);
 }
@@ -171,6 +203,13 @@ sdk = "my-rtos"
 entry = "the my-rtos thread start"
 from = { function = "port_thread", param = 0 }
 to = { function = "my_trampoline", param = 0 }
+always = true
+
+[[call_graph.sdk]]
+sdk = "my-rtos"
+entry = "the my-rtos store"
+from = { function = "store_fn", param = 0 }
+to = { field = "holder::fn" }
 
 [[call_graph.sdk]]
 sdk = "my-rtos"
@@ -434,6 +473,45 @@ def test_a_callback_of_a_library_api_without_body_gets_the_function_of_the_api(w
     assert _entry(conn, config_hash, callback) == entry
 
 
+_OUTPUT_FUNCTIONS = sorted([
+    "fputc", "putc", "putchar", "fputs", "puts", "fwrite", "printf", "fprintf", "vprintf", "vfprintf",
+    "fputs_P", "puts_P", "printf_P", "fprintf_P", "vfprintf_P",
+])
+
+
+def test_each_output_function_of_the_stdio_calls_the_put_function_of_its_file(without_source):
+    """picolibc and avr-libc write each character through `stream->put`; a build can link them with no source.
+
+    The slot is the field, thus each output function of the build gets the
+    edge, and not only the one that the build calls.  Measured on a Zephyr
+    build: 4 functions in `__file::put` had no caller.
+    """
+    from fw_context_mcp.indexer.db._indirect import sdk_entry
+
+    conn, config_hash, _ = without_source
+    assert _callers(conn, "out_put") == [(function, ["sdk"]) for function in _OUTPUT_FUNCTIONS]
+    rows = conn.execute(
+        "SELECT r.* FROM refs r JOIN symbols t ON t.usr = r.to_usr WHERE t.name = 'out_put' AND r.ref_kind = 'call'"
+    ).fetchall()
+    assert {
+        sdk_entry(conn, config_hash, (
+            row["origins"], row["ref_kind"], row["from_usr"], row["from_file"], row["from_line"], row["from_col"],
+            row["to_usr"],
+        ))
+        for row in rows
+    } == {"a write to a FILE (stream->put)"}
+
+
+def test_the_put_function_of_fdevopen_goes_into_the_field_of_the_file(without_source):
+    """`fdevopen` stores its parameter 0 in `put` of the new FILE, and the library has no source to show it.
+
+    Before, the slot facts did not see the store, thus the put function had
+    no caller.
+    """
+    conn, _, _ = without_source
+    assert _callers(conn, "dev_put") == [(function, ["sdk"]) for function in _OUTPUT_FUNCTIONS]
+
+
 def test_a_field_of_a_config_struct_is_a_slot_of_a_rule(without_source):
     conn, _, _ = without_source
     assert _callers(conn, "on_http") == [("esp_http_client_init", ["sdk"])]
@@ -615,6 +693,18 @@ def test_a_flow_rule_tells_no_entry_for_a_plain_call_of_the_trigger(with_source)
     assert _callers(conn, "plain") == [("my_trampoline", ["slot"])]
     assert _entry(conn, config_hash, "plain") is None
     assert _entry(conn, config_hash, "my_thread") == "the my-rtos thread start"
+
+
+def test_a_flow_rule_does_not_apply_to_a_source_function_with_a_body(with_source):
+    """The body of `store_fn` stores the value in C, and the slot facts give the flow.
+
+    Before, the rule applied also then, and gave its entry only to the
+    targets that came through `store_fn`, not to the other targets of the
+    site (`fdevopen` of picolibc with its source).
+    """
+    conn, config_hash = with_source
+    assert _callers(conn, "held") == [("call_holder", ["slot"])]
+    assert _entry(conn, config_hash, "held") is None
 
 
 def test_a_slot_that_flows_back_to_itself_keeps_its_edge(with_source):

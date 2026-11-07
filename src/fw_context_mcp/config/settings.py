@@ -337,8 +337,8 @@ _PROJECT_DEFAULTS_TEMPLATE = """\
 #   that the port starts from a stack frame, a callback of a library without
 #   source, an event in memory through void *). The built-in rules cover
 #   FreeRTOS, ESP-IDF, lwIP, POSIX pthread_once, the NVM of Nanostack,
-#   Zephyr threads, CMSIS and the mbed EventQueue.
-#   A rule of the project adds to them.
+#   the stdio of picolibc and avr-libc, Zephyr threads, CMSIS and the mbed
+#   EventQueue. A rule of the project adds to them.
 #
 #   A call: `function` runs the function in its parameter `param` (from 0),
 #   in the field `field` ("record::field"), or in the parameter of an other
@@ -354,13 +354,16 @@ _PROJECT_DEFAULTS_TEMPLATE = """\
 # always = true
 #
 #   A flow: code out of the AST gives the value of one slot to an other
-#   slot, and C code calls through the second one.
+#   slot, and C code calls through the second one. Without `always = true`
+#   the rule applies only when the build has no body of the function of
+#   `from`.
 #
 # [[call_graph.sdk]]
 # sdk = "my-rtos"
 # entry = "the my-rtos scheduler"
 # from = { function = "port_new_task", param = 1 }
 # to = { function = "task_trampoline", param = 0 }
+# always = true
 
 # The LLM profiles are in the global config (~/.fw-context/config.toml).
 # Select the profile of this project, and local paths, in local.toml (gitignored).

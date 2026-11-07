@@ -1179,11 +1179,12 @@ def find_call_path(
       frame, a library without source, an event in memory through
       ``void *``).  Such a function gets its caller from the SDK model.
       The built-in rules cover FreeRTOS, ESP-IDF, lwIP, POSIX
-      ``pthread_once``, the NVM of Nanostack, Zephyr threads, CMSIS and
-      the mbed ``EventQueue`` (``call``, ``call_in``, ``call_every``).
-      A handler of ``queue.event(handler)`` gets no caller from the
-      model.  Add the rules of another SDK in
-      ``[[call_graph.sdk]]`` (``.fw-context/config.toml``).
+      ``pthread_once``, the NVM of Nanostack, the stdio of picolibc and
+      avr-libc, Zephyr threads, CMSIS and the mbed ``EventQueue``
+      (``call``, ``call_in``, ``call_every``).  A handler of
+      ``queue.event(handler)`` gets no caller from the model.  Add the
+      rules of another SDK in ``[[call_graph.sdk]]``
+      (``.fw-context/config.toml``).
     - **Calls without a target:** a call that libclang cannot resolve
       (a dependent call in a template that is never instantiated) has NO
       call edge.  fw-context does not take a target from the name of the

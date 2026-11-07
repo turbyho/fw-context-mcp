@@ -118,6 +118,9 @@ TUNING = [
      "[[call_graph.sdk]] number 1: a rule holds 'sdk', 'entry' and either 'from' and 'to'"),
     ('[[call_graph.sdk]]\nsdk = "x"\nentry = "e"\nfrom = { field = "a::b", param = 1 }\nto = { field = "c::d" }',
      "[[call_graph.sdk]] number 1 'from' must hold 'function' and 'param', or 'field' only"),
+    # A flow rule takes 'always' as a call rule does.
+    ('[[call_graph.sdk]]\nsdk = "x"\nentry = "e"\nfrom = { field = "a::b" }\nto = { field = "c::d" }\nalways = "yes"',
+     "[[call_graph.sdk]] number 1: 'always' must be true or false"),
 ]
 
 #: The first lines of an Ollama profile of the global config.  A wrong

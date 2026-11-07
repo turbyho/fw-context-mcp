@@ -2320,9 +2320,10 @@ place is the place of the expansion.
     call of `z_thread_entry` gives no `entry`.
 
   The built-in rules cover FreeRTOS, ESP-IDF, lwIP, POSIX
-  `pthread_once`, the NVM of Nanostack, Zephyr threads, CMSIS and the
-  mbed `EventQueue` (`call`, `call_in`, `call_every`; a
-  handler of `queue.event()` gets no caller from the model).
+  `pthread_once`, the NVM of Nanostack, the stdio of picolibc and
+  avr-libc, Zephyr threads, CMSIS and the mbed `EventQueue` (`call`,
+  `call_in`, `call_every`; a handler of `queue.event()` gets no caller
+  from the model).
   `[[call_graph.sdk]]` adds rules (see the configuration).
 - `"instantiation"` — the body of a template instance. A call in a
   template body that names a dependent type (`device.sample()` with

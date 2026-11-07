@@ -566,7 +566,8 @@ FreeRTOS task starts from a stack frame that the port writes as integers,
 and a library of the ESP32 Arduino core has no source. Such a function has
 no caller in the code. The SDK model gives the missing step. The built-in
 rules cover FreeRTOS, ESP-IDF, lwIP, POSIX `pthread_once`, the NVM of
-Nanostack (`platform_nvm_*`), Zephyr threads, CMSIS
+Nanostack (`platform_nvm_*`), the stdio of picolibc and avr-libc (the
+`put` function of a `FILE`, also from `fdevopen`), Zephyr threads, CMSIS
 (`NVIC_SetVector`, the RTX `osThreadNew`) and the mbed `EventQueue` (an
 event goes through memory as `void *`). The rules of the `EventQueue`
 cover `call`, `call_in` and `call_every`. A handler of
@@ -599,14 +600,19 @@ A rule has one of two shapes:
   thread into a stack frame in `arch_new_thread`, and `z_thread_entry`
   calls it. Each slot is `{ function = "f", param = 0 }` or
   `{ field = "record::f" }`. The edge comes from the C code that calls
-  through `to` (origin `"slot"`).
+  through `to` (origin `"slot"`). The rule applies only when the build has
+  no body of the function of `from`, because a body that stores the value
+  in C gives the flow. Set `always = true` when that body writes the value
+  as data that the call graph cannot follow, for example a stack frame of
+  integers. A field in `from` has no body, thus such a rule always
+  applies.
 
 | Key | Description |
 |-----|-------------|
 | `sdk` | The name of the SDK, a text that is not empty. |
 | `entry` | What starts the function, for example `"the my-rtos scheduler"`. The tools show it with the edge. |
 | `function`, one of `param`, `field` and `slot`, `always` | A call rule. `always` is optional (default `false`). |
-| `from`, `to` | A flow rule. |
+| `from`, `to`, `always` | A flow rule. `always` is optional (default `false`). |
 
 ```toml
 [[call_graph.sdk]]
@@ -621,6 +627,7 @@ sdk = "my-rtos"
 entry = "the my-rtos scheduler"
 from = { function = "port_new_task", param = 1 }
 to = { function = "task_trampoline", param = 0 }
+always = true
 ```
 
 A table that is not a rule gives a warning, and the other rules apply.
