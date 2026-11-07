@@ -70,6 +70,16 @@ Limits:
   Zephyr has no rule: ``IRQ_DIRECT_CONNECT`` writes the same field
   (``_isr_list::func``) with the flag ``ISR_FLAG_DIRECT``, and the
   hardware calls such a function, not ``_isr_wrapper``.
+* A rule gives an edge from the function of the rule, not from a function
+  that returns into the target.  RTX up to 5.7 writes ``osThreadExit`` as
+  the return address of the frame of a thread, thus it runs when the
+  function of the thread returns.  Its correct callers are those
+  functions, and no rule shape gives them: ``osThreadExit`` has no caller.
+* A rule cannot select a version of an SDK.  From CMSIS-RTX 5.8, the
+  frame of a thread starts ``osThreadEntry``, which calls the function of
+  the thread and ``osThreadExit`` in C.  The RTX rules give the edge from
+  ``osThreadNew`` and ``svcRtxThreadNew``, and ``osThreadEntry`` has no
+  caller.
 * A rule needs the function in a slot.  The mbed ``EventQueue::event``
   gives its function to the constructor of ``Event`` in a ``return``
   statement, and the slot facts lose it there.  Thus a handler of
@@ -157,6 +167,7 @@ _NVM = "the end of an NVM operation of the platform"
 _STDIO_LIBC = "picolibc / avr-libc"
 _STDIO_WRITE = "a write to a FILE (stream->put)"
 _ZEPHYR = "the Zephyr scheduler"
+_RTX = "the RTX kernel (osKernelStart)"
 _EVENT_QUEUE = "the mbed EventQueue (dispatch)"
 _FUNCTION_CALL = "events::EventQueue::function_call"
 
@@ -233,9 +244,19 @@ BUILTIN_RULES: tuple[Rule, ...] = (
     Flow("Zephyr", _ZEPHYR, Param("arch_new_thread", 5), Param("z_thread_entry", 2), always=True),
     Flow("Zephyr", _ZEPHYR, Param("arch_new_thread", 6), Param("z_thread_entry", 3), always=True),
     Flow("Zephyr", _ZEPHYR, Param("arch_switch_to_main_thread", 2), Param("z_thread_entry", 0), always=True),
-    # ── CMSIS: the RTX kernel starts a thread from its stack frame, and the
-    # NVIC calls the vector that the table of integers holds.
-    Call("CMSIS-RTOS2", "the RTX kernel (osKernelStart)", "osThreadNew", 0, always=True),
+    # ── CMSIS: the RTX kernel up to 5.7 (CMSIS 5, the copy of Mbed) starts
+    # a thread from its stack frame, and the NVIC calls the vector that the
+    # table of integers holds.  From CMSIS-RTX 5.8, the frame starts the C
+    # function `osThreadEntry`, which calls the function of the thread: the
+    # rules then give the edge from the function of the rule, and
+    # `osThreadEntry` has no caller (a Flow into `osThreadEntry` needs a
+    # rule that only one version applies).
+    Call("CMSIS-RTOS2", _RTX, "osThreadNew", 0, always=True),
+    # The kernel creates its idle and timer threads with `svcRtxThreadNew`,
+    # which writes the frame.  `osThreadNew` reaches it through an SVC in
+    # assembly, thus no slot flows from the one to the other, and the rule
+    # of `osThreadNew` keeps the threads of the application.
+    Call("CMSIS-RTOS2", _RTX, "svcRtxThreadNew", 0, always=True),
     Call("CMSIS", _INTERRUPT, "NVIC_SetVector", 1, always=True),
     Call("CMSIS", _INTERRUPT, "__NVIC_SetVector", 1, always=True),
     # ── mbed OS: the EventQueue copies the callable object into the memory

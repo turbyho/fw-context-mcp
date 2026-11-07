@@ -88,6 +88,15 @@ void arch_new_thread(void *thread, void *stack, char *ptr, k_thread_entry_t entr
     fr.a1 = (uint32_t) entry; fr.a2 = (uint32_t) p1; fr.a3 = (uint32_t) p2; fr.a4 = (uint32_t) p3;
 }
 void k_thread_create(void *thread, k_thread_entry_t entry) { arch_new_thread(thread, 0, 0, entry, 0, 0, 0); }
+typedef void (*osThreadFunc_t)(void *argument);
+static void rtx_idle(void *argument) { (void) argument; }
+void *svcRtxThreadNew(osThreadFunc_t func, void *argument, const void *attr)
+{
+    (void) argument; (void) attr;
+    fr.pc = (uint32_t) func;
+    return 0;
+}
+void osRtxThreadStartup(void) { svcRtxThreadNew(rtx_idle, 0, 0); }
 static uint32_t vectors[64];
 void NVIC_SetVector(int irq, uint32_t vector) { vectors[irq + 16] = vector; }
 """
@@ -510,6 +519,18 @@ def test_the_put_function_of_fdevopen_goes_into_the_field_of_the_file(without_so
     """
     conn, _, _ = without_source
     assert _callers(conn, "dev_put") == [(function, ["sdk"]) for function in _OUTPUT_FUNCTIONS]
+
+
+def test_a_thread_that_the_rtx_kernel_creates_gets_its_caller(without_source):
+    """The kernel creates its idle and timer threads with `svcRtxThreadNew`, which writes the stack frame as integers.
+
+    `osThreadNew` reaches `svcRtxThreadNew` through an SVC in assembly, thus
+    its own rule keeps the threads of the application.  Measured on an
+    Mbed build: `osRtxIdleThread` and `osRtxTimerThread` had no caller.
+    """
+    conn, config_hash, _ = without_source
+    assert _callers(conn, "rtx_idle") == [("svcRtxThreadNew", ["sdk"])]
+    assert _entry(conn, config_hash, "rtx_idle") == "the RTX kernel (osKernelStart)"
 
 
 def test_a_field_of_a_config_struct_is_a_slot_of_a_rule(without_source):

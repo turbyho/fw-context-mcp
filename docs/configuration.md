@@ -568,8 +568,11 @@ no caller in the code. The SDK model gives the missing step. The built-in
 rules cover FreeRTOS, ESP-IDF, lwIP, POSIX `pthread_once`, the NVM of
 Nanostack (`platform_nvm_*`), the stdio of picolibc and avr-libc (the
 `put` function of a `FILE`, also from `fdevopen`), Zephyr threads, CMSIS
-(`NVIC_SetVector`, the RTX `osThreadNew`) and the mbed `EventQueue` (an
-event goes through memory as `void *`). The rules of the `EventQueue`
+(`NVIC_SetVector`, the RTX `osThreadNew` and `svcRtxThreadNew` up to RTX
+5.7) and the mbed `EventQueue` (an event goes through memory as
+`void *`). From CMSIS-RTX 5.8, the frame of a thread starts
+`osThreadEntry`, and that function gets no caller from the model. The
+rules of the `EventQueue`
 cover `call`, `call_in` and `call_every`. A handler of
 `queue.event(handler)` gets no caller from the model: the call graph loses
 the function where `EventQueue::event` gives it to the constructor of
