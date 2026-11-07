@@ -1627,8 +1627,10 @@ def get_project_status(
         symbol_count, file_count, reference_count, modified_files_count
         (int — files whose content no longer matches the index; counted in
         both modes), header_affected_tus (int — number of source files with
-        stale header dependencies; a file that compile_commands.json lists
-        more than once counts once), parse_errors (dict or None — see
+        stale header dependencies, or that the next index run must parse
+        again, for example after a failed parse; each unit of the manifest
+        counts, and a file that compile_commands.json lists more than once
+        counts once), parse_errors (dict or None — see
         above), manifest_verification (str — "full"
         when manifest.json exists, "partial" when it exists and the
         embeddings are not complete, "none" without one), analysis (dict — LLM
@@ -2607,6 +2609,9 @@ def _reindex_parse_and_store(
     unit_claims: list[tuple[tuple[str, str], frozenset[str] | None]] = []
     seen_this_call: set[str] = set()
     skipped_tus: list[str] = []
+    # The normalized path of each unit whose parse failed: its manifest
+    # entry gets needs_reparse (_update_manifest_after_reindex).
+    failed_paths: set[str] = set()
     # The decisions of the build about the places of the types
     # (indexer/_odr.py): the rows of this call must agree with the rows of
     # the other units.
@@ -2634,6 +2639,7 @@ def _reindex_parse_and_store(
             # A DB error stops this call and does not skip a unit.
             log.warning("skip TU %s during reindex: %s", unit.file.name, exc)
             skipped_tus.append(str(unit.file.name))
+            failed_paths.add(key[0])
 
     from ...mcp.shared.stale import _invalidate_modified_cache
     _invalidate_modified_cache(config_hash)
@@ -2715,6 +2721,7 @@ def _reindex_parse_and_store(
             _update_manifest_after_reindex(
                 parsed_units, unit_headers, root, db_path.parent, config_hash,
                 transient_defines=transient_defines, keeps_lost_files=keeps_lost_files,
+                failed_units=failed_paths,
                 decided=type_decisions,
                 places=load_type_places(conn, config_hash),
                 template_keys=frozenset().union(
@@ -2792,6 +2799,7 @@ def _update_manifest_after_reindex(
     *,
     transient_defines: Collection[str],
     keeps_lost_files: Collection[int] = (),
+    failed_units: Collection[str] = (),
     decided: TypeDecisions | None = None,
     places: list[tuple[str, str, int, int]] | None = None,
     template_keys: frozenset[str] = frozenset(),
@@ -2827,6 +2835,12 @@ def _update_manifest_after_reindex(
     Their entries get ``needs_reparse``: the next index run parses them and
     gives the file to its next includer.
 
+    *failed_units* holds the normalized paths of the units whose parse
+    failed in this call.  Their entries get ``needs_reparse``: such a unit
+    keeps the rows of its last parse, and its entry the hashes of that
+    parse, thus the status read an index without the result of the unit
+    as current.
+
     *decided* holds the decisions about the places of the C++ types that the
     parse followed (``indexer/_odr.py``).  *places* holds the stored
     definitions after the store, and *template_keys* the templates that the
@@ -2839,6 +2853,7 @@ def _update_manifest_after_reindex(
     build, a moved line of a merged copy) sends no unit to a run.
     """
     try:
+        from ...indexer._manifest_updater import mark_pending_units
         from ...indexer._parsed_text import file_of_parse, parsed_hash
         from ...indexer.config_hash import compute_flags_hash
         from ...indexer.manifest import (
@@ -2967,6 +2982,9 @@ def _update_manifest_after_reindex(
                     "reindex_file: %d entr(ies) flagged needs_reparse after "
                     "%d refreshed header(s)", behind, len(changed),
                 )
+            failed = mark_pending_units(manifest_data, failed_units, root)
+            if failed:
+                log.info("reindex_file: %d entr(ies) of a failed parse flagged needs_reparse", failed)
             save_manifest(manifest_data, db_dir, config_hash)
     except OSError:
         log.debug("manifest.json update skipped during reindex_file", exc_info=True)

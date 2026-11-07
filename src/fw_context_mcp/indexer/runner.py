@@ -1761,6 +1761,7 @@ def run(
         pending_run=pending_run,
         flags_hashes=flags_hashes,
         odr_pending=odr_left,
+        failed_units=frozenset(failed_tus),
     )
     _run_marker.clear_pending(db_path.parent, config_hash)
 

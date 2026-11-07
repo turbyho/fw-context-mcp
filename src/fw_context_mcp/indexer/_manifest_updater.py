@@ -219,12 +219,13 @@ def mark_pending_units(manifest: dict, paths: Collection[str], project_root: Pat
     """Give ``needs_reparse`` to each entry of a unit in *paths*, and return how many entries got it.
 
     *paths* holds the normalized paths (``ops._normalize_file_path``) of the
-    units whose rows do not follow the places of the C++ types of the build
-    (``odr_pending_units``).  The table tells the next index run to parse
-    them, but the status and the daemon read the manifest: without the mark
-    the entry of such a unit can read as current (the loop parsed it), and
-    no run comes.  Each listing of a path gets the mark, because the table
-    keys a unit by its path.
+    units that the next index run must parse: the units whose rows do not
+    follow the places of the C++ types of the build (``odr_pending_units``),
+    and the units whose parse or store failed (they keep the rows of their
+    last parse).  The status and the daemon read the manifest: without the
+    mark the entry of such a unit can read as current, and no run comes.
+    Each listing of a path gets the mark, because the two sets key a unit
+    by its path.
     """
     from .ops import _normalize_file_path
 

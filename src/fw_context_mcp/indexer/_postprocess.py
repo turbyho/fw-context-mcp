@@ -443,11 +443,18 @@ def _step_update_manifest(conn: sqlite3.Connection, ctx: dict) -> None:
     ctx["effective_manifest"] = updated_manifest or ctx.get("manifest")
     # After each branch of the update above, also the one that keeps the
     # manifest as it is: a run whose second parse failed can store no unit.
-    if ctx["odr_pending"] and ctx["effective_manifest"] is not None:
-        flagged = mark_pending_units(ctx["effective_manifest"], ctx["odr_pending"], ctx["project_root"])
+    # A unit whose parse or store failed keeps the rows of its last parse,
+    # and its entry keeps the hashes of that parse: without the mark, the
+    # status read an index without the result of the unit as current.
+    to_parse = ctx["odr_pending"] | ctx["failed_units"]
+    if to_parse and ctx["effective_manifest"] is not None:
+        flagged = mark_pending_units(ctx["effective_manifest"], to_parse, ctx["project_root"])
         if flagged:
             save_manifest(ctx["effective_manifest"], ctx["db_dir"], config_hash)
-            log.info("manifest.json: %d entr(ies) of units pending for the places of C++ types", flagged)
+            log.info(
+                "manifest.json: %d entr(ies) of units to parse again (the places of C++ types, a failed parse)",
+                flagged,
+            )
     # Each run, also a run that parsed nothing: the rows of an older index
     # stay without a hash until something writes them.
     _backfill_header_source_hashes(
@@ -1422,6 +1429,7 @@ def _run_postprocess(
     pending_run: bool = False,
     flags_hashes: list[str] | None = None,
     odr_pending: frozenset[str] = frozenset(),
+    failed_units: frozenset[str] = frozenset(),
 ) -> None:
     """Run all post-processing phases via a data-driven pipeline.
 
@@ -1485,6 +1493,9 @@ def _run_postprocess(
         # The units whose rows do not follow the places of the C++ types
         # (``odr_pending_units``): the next run must parse them.
         "odr_pending": odr_pending,
+        # The units whose parse or store failed in this run: they keep the
+        # rows of their last parse, and the next run must parse them.
+        "failed_units": failed_units,
     }
 
     defer_skip: set[str] = set()

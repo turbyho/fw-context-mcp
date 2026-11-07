@@ -836,7 +836,6 @@ def _check_header_staleness(
     config_hash: str,
     root: Path,
     *,
-    max_files: int = 200,
     use_cache: bool = True,
     hash_cache: dict[str, str] | None = None,
 ) -> tuple[int, list[str]]:
@@ -856,8 +855,12 @@ def _check_header_staleness(
     file with three stale listings counted three, and stood three times in
     the list.
 
-    Performance is bounded by *max_files* (default 200).  When
-    *use_cache* is True (default), results are cached for 30 seconds.
+    It checks each entry: an index with one unit to parse again is not
+    current, wherever that unit is in the manifest.  It read only the first
+    200 entries, and a stale unit past them read as current.  Measured on an
+    Mbed project (870 entries, 1035 headers): 0.77 s for all entries, 0.37 s
+    for the first 200.  When *use_cache* is True (default), results are
+    cached for 30 seconds.
     Callers that need fresh results (e.g. ``get_project_status``) should
     pass ``use_cache=False``.
     """
@@ -896,11 +899,10 @@ def _check_header_staleness(
     # A dict keeps the order of the entries and holds each file once.
     affected_files: dict[str, None] = {}
 
-    # Resolved per entry rather than for the whole manifest: only the first
-    # *max_files* entries are examined, and on a large project that is a small
-    # fraction of them.
+    # Resolved per entry: each entry names its own headers, and *hash_cache*
+    # hashes a header that several entries share once.
     header_table = manifest.get("headers")
-    for entry in manifest.get("entries", [])[:max_files]:
+    for entry in manifest.get("entries", []):
         stale, _ = check_tu_staleness(
             entry, project_root,
             hash_cache=hash_cache,

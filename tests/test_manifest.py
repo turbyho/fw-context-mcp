@@ -1820,14 +1820,7 @@ class TestMarkEntriesBehind:
 
 
 class TestTheFlagReachesTheReport:
-    """``_check_header_staleness`` must count a flagged entry.
-
-    The window is the trap here.  _check_header_staleness scans
-    manifest["entries"][:max_files] with max_files=200, so an entry past
-    index 200 is invisible to the report — the test would then measure the
-    window and not the flag.  The entry below sits inside it, and
-    test_an_entry_past_the_window_is_not_seen records the boundary.
-    """
+    """``_check_header_staleness`` must count a flagged entry, wherever it is in the manifest."""
 
     @staticmethod
     def _write(tmp_path: Path, *, flagged_at: int, total: int) -> tuple[Path, str]:
@@ -1893,16 +1886,16 @@ class TestTheFlagReachesTheReport:
 
         assert self._count(tmp_path, db_dir, config_hash) == 0
 
-    def test_an_entry_past_the_window_is_not_seen(self, tmp_path: Path):
-        """A recorded limit, not a defect to fix here.
+    def test_an_entry_past_200_entries_is_seen(self, tmp_path: Path):
+        """The report read only the first 200 entries: a stale unit past them read as current.
 
-        max_files exists for the latency of get_project_status.  On the Mbed project (876
-        TUs) a flagged entry past index 200 is invisible to this report,
-        while the index run itself still queues it.
+        An index with a unit that the next run must parse is not current.
+        Measured on an Mbed project (870 entries, 1035 headers): all entries
+        take 0.77 s, the first 200 took 0.37 s.
         """
         db_dir, config_hash = self._write(tmp_path, flagged_at=250, total=260)
 
-        assert self._count(tmp_path, db_dir, config_hash) == 0
+        assert self._count(tmp_path, db_dir, config_hash) == 1
 
     def test_a_file_with_two_stale_listings_counts_once(self, tmp_path: Path):
         """The report is about files; a file listed twice has two entries."""

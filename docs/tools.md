@@ -3304,10 +3304,15 @@ the index. Both modes count it. `fast` controls only the header check:
 dependencies. A file that `compile_commands.json` lists more than once
 counts once. This count is non-zero when headers changed since the
 last index with `manifest_verification: "full"` or `"partial"`. The count
-also holds the units that the next index run must parse again: a unit
-whose parse failed, and the units that a `reindex_file` call marked. These
-are, for example, the other units that include a header that the call
-changed, and the units of a changed place of a C++ type.
+checks each unit of the manifest. It also holds each unit that the next
+index run must parse again (`needs_reparse`). An index run or a
+`reindex_file` call marks such a unit: a unit whose parse or store failed
+(it keeps the rows of its last parse, thus the index is not current until
+a parse succeeds, also when a parse with the same input fails again), a
+unit that includes a header that another unit parsed again, and a unit of
+a changed place of a C++ type. This count does not hold a change of
+`compile_commands.json` or a new source file: `reindex_reasons` names
+them.
 
 `parse_errors` counts the translation units whose last parse gave an
 error: `units`, `errors` (the sum of the errors), `fatal_units`, and
