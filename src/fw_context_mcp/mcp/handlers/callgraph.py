@@ -2534,9 +2534,11 @@ def get_vector_table(
 
     The ``status`` field says what services the interrupt:
 
-    * ``"c"`` — a definition outside assembly.  Code runs.  When the
-      index also holds the weak definition that this one replaced, the
-      row has ``overridden`` with its file and line.
+    * ``"c"`` — a definition outside assembly, or a C declaration of a
+      function that a library defines (then ``file`` is the header).
+      Code runs.  When the index also holds the weak definition that
+      this one replaced, the row has ``overridden`` with its file and
+      line.
     * ``"assembly"`` — an assembly definition that is not an alias.
       Assembly services the interrupt.
     * ``"unhandled"`` — an assembly name that is an alias (``.thumb_set``)

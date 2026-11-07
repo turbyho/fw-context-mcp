@@ -213,26 +213,21 @@ analyze_symbols = true
 #     context         the context of the model in tokens, only for a model
 #                     whose model list gives none (an openai_compatible API).
 #                     The model list of the provider has priority
+#   openrouter, openai_compatible:
+#     embed_context   the tokens of one input of the embedding model of the
+#                     API (openrouter: from its model list)
 #   openrouter only:
 #     routing         the hosts that get the request.  Defaults: sort = "price",
 #                     quantizations = 8 bits or more and "unknown".  Options:
 #                     zdr = true, data_collection = "deny"
+#     embed_routing   the hosts that get the embedding requests (default:
+#                     zdr = true, data_collection = "deny")
 [llm.profiles.local]
 provider = "ollama"
 url = "http://localhost:11434"
-# Chat model for symbolic analysis and search query generation.
-# Minimum recommended: 14B parameters — smaller models produce inconsistent JSON
-# and poor-quality descriptions for C++ embedded code.
-#
-# Recommended models (min. 14B parameters):
-#   Local:
-#     qwen2.5-coder:14b        (4.8 GB VRAM, balanced speed/quality)
-#     deepseek-coder-v2:16b    (10 GB VRAM, strong code comprehension)
-#     qwen2.5-coder:32b        (19 GB VRAM, best local quality)
-#   Cloud (Ollama proxies to cloud APIs — "ollama pull <model>"):
-#     qwen3-coder:480b-cloud         (coding-focused, best quality)
-#     deepseek-v4-flash:cloud        (284B MoE, 13B active — great value)
-#   See: https://ollama.com/search?c=cloud
+# The chat model of the symbol analysis and of the search queries.
+# The list [llm.models] gives the measured quality and size of each model.
+# 'fw-context llm recommend' recommends a model for this machine.
 model = "qwen2.5-coder:14b"
 num_ctx = 16384
 # keep_alive = "10m"
@@ -252,7 +247,7 @@ _PROJECT_DEFAULTS_TEMPLATE = """\
 [build]
 # Build system auto-detection: scans for .mbed, west.yml, or platformio.ini.
 # Set system explicitly when auto-detection fails or you need to force a specific one.
-# system = "mbed-os"        # choices: mbed-os, zephyr, platformio
+# system = "mbed-os"        # choices: see [build] system in the configuration documentation of fw-context
 # clean = true              # always clean build before indexing (recommended)
 # command = "bear -- make"  # full override — bypasses all detection
 
@@ -309,13 +304,13 @@ _PROJECT_DEFAULTS_TEMPLATE = """\
 # variants), and the index reads its compile_commands.json from there.
 
 [index]
-# compile_commands = "ci/compile_commands.json"   # a database of your own; no build of fw-context
+# compile_commands = "ci/compile_commands.json"   # a database of your own: fw-context runs no build
 # Generate the build with:  fw-context index --build  (auto-detects build system)
 # config_header = "config/my_build_config.h"   # path to config.h for custom build systems
 #vendor_paths = ["third_party", "vendor_libs"]
-#project_paths = ["src/old_hal", "lib/muj_modul"]
-#  Pro cesty MIMO project_root používejte ABSOLUTNÍ cesty:
-#  project_paths = ["/home/user/esp/components/muj_fork"]
+#project_paths = ["src/old_hal", "lib/my_module"]
+#  For a path outside the project root, use an absolute path:
+#  project_paths = ["/home/user/esp/components/my_fork"]
 
 # transient_defines: -D macros whose value makes each build unique.  The
 #   index ignores them when it compares two builds.  This list replaces the

@@ -3341,14 +3341,21 @@ def reindex_file(
 
     A source file must be listed in ``compile_commands.json``.  A header is
     not listed there — compile_commands.json names translation units — so it
-    is re-parsed through one unit that includes it, taken from the manifest
-    of each build.  That answer describes a single compilation context,
+    is re-parsed through one unit of each build.  A header goes to the unit
+    that owns it in the index (the unit that wrote its rows in the last
+    index run).  Only a header without an owner goes to an including unit
+    from the manifest.  That answer describes a single compilation context,
     thus the result carries a ``warning``: another unit can see the header
     under a different set of ``#define`` values and still hold stale
     symbols.  Only a full ``fw-context index`` covers every context.  One
     unit and not all of them is a cost decision — an application header
     reaches a median of 3 units but as many as 266 on a real project, at
     tens of seconds each.
+
+    Each re-parse writes only the files that the parsed unit owns, as an
+    index run does.  When a header that the unit includes changed on disk
+    and a different unit owns that header, the tool also re-parses that
+    owner, thus the changed header gets its new rows.
 
     Also rebuilds the method override relationships, the PageRank scores
     and the hotspot cache when reference indexing is on
@@ -4053,15 +4060,16 @@ def check_ollama(
         vec_error (str, optional), debug_log (str, optional — only when
         debug logging is enabled)}
 
-        The chat model is looked for on the Ollama server of the chat
-        calls: ``ollama_url``, or the Ollama server that ``chat_api_base``
-        names.  An OpenAI-compatible ``chat_api_base`` runs the model
-        itself, and no Ollama server is asked for it.  ``"model_missing"``:
+        The tool looks for the chat model on the Ollama server of the chat
+        profile (the ``url`` of an Ollama profile).  A profile of another
+        provider (an API or the ChatGPT plan) runs the model itself, and
+        the tool asks no Ollama server for it.  ``"model_missing"``:
         ``message`` names a command for each missing model, which sets
         ``OLLAMA_HOST`` to the server that must hold the model.
-        ``"error"`` also means that the Ollama server of ``chat_api_base``
-        gives no model list.  When the server of ``ollama_url`` does not
-        answer, the chat model is not looked for.
+        ``"error"`` also means that the Ollama server of the chat profile
+        gives no model list.  When the Ollama server of the embeddings
+        (``ollama_url``) does not answer, the tool does not look for the
+        chat model.
 
         ollama_url, num_ctx, installed_models, model_details,
         configured_embed_model, and embedding_installed are present only

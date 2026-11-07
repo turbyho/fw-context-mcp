@@ -33,9 +33,9 @@ an old time (`cp -p`) does. The `-D` macros of `[index] transient_defines`
 
 A run that stops before its end (a watchdog, `Ctrl+C`, a manual
 `reindex_file`) keeps the files that it parsed: the run writes its manifest
-each minute. The next run parses the other files, and also the files whose
-call-graph dispatch edges (event-loop callbacks, thread starts) the stop
-lost. It expands the macros again, which the stopped run did not do.
+each minute. The next run parses the other files. It also expands the
+macros again, which the stopped run did not do. Each run does the steps
+over the whole build (the slot edges, the SDK model, PageRank).
 
 ```bash
 # Incremental (default) — reuse existing compile_commands.json, fast:
@@ -86,7 +86,7 @@ fw-context index --vendor-paths sdk third_party --project-paths src lib
 | `--background` | off | The mode of the file-watcher daemon. The run does not rebuild a stale `compile_commands.json`, does not repair it, and prunes no registry rows. It builds only when the backend can build on its own. |
 | `--force` | off | Force re-index of all files, embeddings, PageRank, and hotspot cache (skips the hash checks). The LLM analysis comes from the cache. |
 | `--llm <profile>` | the profile of the project | The LLM profile of the analysis of this run. Without it, the command asks at its start on a terminal when two profiles or more can run. See [The LLM profile of one run](#the-llm-profile-of-one-run). |
-| `--force-llm` | off | Make the LLM analysis of each symbol again. The analyses of the caches from before the command do not apply, and the new ones replace the entries of the local cache, and of the cache server when the token has `can_overwrite`. It turns on the analysis. With `--no-analyze`, the command stops with an error. A command that stops, or that does not reach each symbol (Ollama did not answer), leaves the old analyses of the symbols that it did not reach. The next `--force-llm` with the same chat model continues from the time of the first command: the file `force_llm.json` of the index keeps it until a command reaches each symbol. Needs Ollama 0.30.1 or later. |
+| `--force-llm` | off | Make the LLM analysis of each symbol again. The analyses of the caches from before the command do not apply, and the new ones replace the entries of the local cache, and of the cache server when the token has `can_overwrite`. It turns on the analysis. With `--no-analyze`, the command stops with an error. A command that stops, or that does not reach each symbol (Ollama did not answer), leaves the old analyses of the symbols that it did not reach. The next `--force-llm` with the same chat model continues from the time of the first command: the file `force_llm.json` of the index keeps it until a command reaches each symbol. With an Ollama profile, it needs Ollama 0.30.1 or later. |
 | `--variant NAME` | all variants | Restrict indexing to one build variant (name from `[[build.variants]]`) |
 | `--variants A,B` | all variants | Comma-separated list of build variants to index |
 | `--image NAME` | all images | Index only this image of the build (Zephyr sysbuild, ESP-IDF). The build stays complete. |
@@ -1482,7 +1482,8 @@ Find patterns in the **text of a definition** — the code inside its extent.
 Searches the stored text of every definition, and a definition is not only
 a callable. Measured on one project of 60,877 symbols, the text covers:
 
-- Callables — `function`, `method`, `constructor`, `destructor`.
+- Callables — `function`, `method`, `constructor`, `destructor`,
+  `lambda`.
 - Types — `class`, `struct`, `union`, `enum`, `namespace`. An enum
   constant, a bit field, and a member declaration such as
   `InterruptIn _pin;` are inside the body of the type that holds them.
@@ -1837,8 +1838,10 @@ Output: [{"total": 7, "offset": 0, "shown": 7, "more": false},
           "signature": "int g_debug_level",
           "enclosing_function": "<file scope>", "enclosing_class": "",
           "references": [
-            {"function": "log_init", "file": "/path/src/logging.c", "line": 42, "ref_kind": "ref"},
-            {"function": "log_write", "file": "/path/src/logging.c", "line": 68, "ref_kind": "ref"}
+            {"function": "log_init", "file": "/path/src/logging.c", "line": 42,
+             "col": 5, "ref_kind": "ref", "origins": ["direct"]},
+            {"function": "log_write", "file": "/path/src/logging.c", "line": 68,
+             "col": 9, "ref_kind": "ref", "origins": ["direct"]}
           ],
           "references_total": 2}, …]
 ```
@@ -2121,8 +2124,12 @@ Output: {"name": "modem_connect", "kind": "function",
          "signature": "int modem_connect(const char* apn)",
          "source": " 210  int modem_connect(const char* apn) {\n  …\n 245  }",
          "callers": [
-           {"name": "network_init", "file": "/path/src/net.c", "line": 80, "kind": "function"},
-           {"name": "on_registration_timeout", "file": "/path/src/modem.c", "line": 310, "kind": "function"}
+           {"name": "network_init", "qualified_name": "network_init",
+            "file": "/path/src/net.c", "line": 80, "col": 9, "kind": "function",
+            "ref_kind": "call", "origins": ["direct"]},
+           {"name": "on_registration_timeout", "qualified_name": "on_registration_timeout",
+            "file": "/path/src/modem.c", "line": 310, "col": 5, "kind": "function",
+            "ref_kind": "call", "origins": ["direct"]}
          ],
          "callees": [
            {"name": "send_at_command", "kind": "function", "file": "/path/src/modem.c"},
@@ -2163,7 +2170,7 @@ a maximum:
 
 | List | Maximum | Tool that pages it |
 |------|---------|--------------------|
-| `callers` | 50 `call` and `indirect` references, each with its line, column, `origins` and `entry` (as in `find_callers`) | `find_callers` |
+| `callers` | 50 `call`, `indirect` and `implicit_construct` references, each with its line, column, `origins` and `entry` (as in `find_callers`) | `find_callers` |
 | `callees` | 100 rows, one for each callee and kind of reference | `find_callees_recursive` with `max_depth=1` |
 | `indirect_call_sites` | 200 rows of `find_indirect_call_sites` | `find_indirect_call_sites` |
 | `indirect_targets` | 50 rows of `find_indirect_targets`, for a field or a variable | `find_indirect_targets` |
@@ -2172,8 +2179,8 @@ a maximum:
 `indirect_targets_total` count each whole list. When the maximum cuts a
 list, `callers_hint`, `callees_hint`, `indirect_call_sites_hint` or
 `indirect_targets_hint` names the tool that pages it. The hint names no
-offset: the paged tool counts a wider set, thus its pages do not continue
-the list row for row.
+offset: this list and the tool that pages it do not promise one order of
+rows, thus a page of the tool can start at a different row of the list.
 
 `indirect_call_sites` holds, for a field or a variable, the calls through
 it (also through a copy of its value), and for a function, a method or a
@@ -2412,7 +2419,8 @@ sites of all of them. A leading `warning` row names the symbols, and each
 row carries `target_qualified_name`, the symbol that the row belongs to.
 Give the full qualified name to ask about one symbol only. The same
 applies to `find_references`, `find_call_path`,
-`find_all_callers_recursive`, and `find_callees_recursive`.
+`find_all_callers_recursive`, `find_callees_recursive`,
+`find_indirect_call_sites`, and `find_indirect_targets`.
 
 **Virtual methods.** A virtual method with no call site of its own
 answers with the call sites of its base method and of the sibling
@@ -3295,7 +3303,11 @@ the index. Both modes count it. `fast` controls only the header check:
 `header_affected_tus` reports how many source files have stale header
 dependencies. A file that `compile_commands.json` lists more than once
 counts once. This count is non-zero when headers changed since the
-last index with `manifest_verification: "full"` or `"partial"`.
+last index with `manifest_verification: "full"` or `"partial"`. The count
+also holds the units that the next index run must parse again: a unit
+whose parse failed, and the units that a `reindex_file` call marked. These
+are, for example, the other units that include a header that the call
+changed, and the units of a changed place of a C++ type.
 
 `parse_errors` counts the translation units whose last parse gave an
 error: `units`, `errors` (the sum of the errors), `fatal_units`, and
@@ -3640,9 +3652,10 @@ compile_commands.json lists no headers, thus fw-context re-parses a header
 through ONE translation unit in each build. This unit is the owner of the
 header in the index (`header_owners`): the unit that wrote the rows of the
 header in the last index run. Only for a header without an owner does
-fw-context use the manifest: the unit that includes the header and has
-the lowest path in sort order. The result then
-holds a `warning` ("Header re-indexed via one TU…"). Other units can include the header
+fw-context use the manifest: the unit that includes the header and comes
+first in the order of the index run, a C++ unit before a C unit, then the
+lowest path in sort order. A re-parse of a header always holds a
+`warning` ("Header re-indexed via one TU…"). Other units can include the header
 with other `#define` values and still hold stale symbols. Run a full
 `fw-context index` for full accuracy. A file that no unit builds or
 includes gives an `error`.
@@ -3876,14 +3889,16 @@ build, and a project of several builds answers no query without one. Use
 #### `fw-context://stats`
 
 Markdown summary of all indexed projects — symbol counts, file counts,
-freshness, and index timestamps.
+freshness, and index timestamps. A project of several builds shows the
+number of its builds and no counts: a sum counts the shared code one time
+for each build.
 
 ```
 URI:    fw-context://stats
 Output: # fw-context — 3 project(s)
 
-        - **my-zephyr-app** (a1b2…) — 12430 symbols, 1502 files, indexed 2026-06-05T09:35:18, ✓ fresh
-        - **my-pio-app** (c3d4…) — 8586 symbols, 952 files, indexed 2026-06-04T16:20:45, ⚠ stale
+        - **my-zephyr-app** (a1b2…) — 3 builds, indexed 2026-06-05 09:35:18, ✓ ready
+        - **my-pio-app** (c3d4…) — 8586 symbols, 952 files, indexed 2026-06-04 16:20:45, ⚠ reindex_needed
 ```
 
 Aggregates data across all project databases under `~/.fw-context/index/`.
@@ -3937,7 +3952,8 @@ Phase 1: Rough search (FTS5)
                     ▼
 Phase 2a: LLM query generation
 ┌────────────────────────────────────────────────────┐
-│ Ollama sees the query + sample symbols.            │
+│ The chat model of the LLM profile sees the query   │
+│ + sample symbols.                                  │
 │ Learns naming style (snake_case vs camelCase).     │
 │ UNDERSTANDING: <subsystem, intent>                 │
 │ QUERIES: ["network_reg*", "modem_attach*", …]      │
@@ -4061,7 +4077,7 @@ For manual recovery, use `reindex_file` or `fw-context index`.
    Category: function, method, class, enum, typedef, variable, field, and other kinds
    Compute is_project per-symbol (project code = 1, vendor/SDK = 0)
    Extract cross-references including vendor/SDK (on by default; skip with --no-refs)
-   Extract macros via clang -dM -E (preprocessor dump; stored in macro_defs table)
+   Extract the macro definitions from the AST (macros table)
    Read the preprocessor skipped ranges (clang_getAllSkippedRanges,
    indexer/skipped_ranges.py) → blank each inactive #if line in
    files.content and symbols.source; line numbers do not move;
@@ -4077,24 +4093,44 @@ For manual recovery, use `reindex_file` or `fw-context index`.
    Delete old symbols for this TU
    Insert new symbols + FTS5 triggers
    Insert references (on by default; skip with --no-refs)
-   Insert macros with expanded values
-   Generate + store vector embeddings (on by default; skip with --no-embeddings)
+   Insert the macros (the expanded values come in step 7)
 
-4. Linker scripts (after the C units, before the assembly; indexer/linker_script.py):
+4. Places of C++ types (after all C and C++ units, before the linker
+   scripts; indexer/_odr.py):
+   Merge the definitions of one C++ type in two or more files into one type
+   Give the place of a class template to each unit that declares it and
+   does not define it
+   Parse again each unit whose rows hold a place that the merge changed
+
+5. Linker scripts (after the C units, before the assembly; indexer/linker_script.py):
    Read the linker scripts that the build names
    Store symbol definitions (NAME = expr; PROVIDE), ENTRY, and MEMORY
    A symbol that a compiled file defines keeps that definition
 
-5. Assembly units (.S, after every other unit; indexer/asm.py):
+6. Assembly units (.S, after every other unit; indexer/asm.py):
    Preprocess with clang -E -C (#if resolves, C macros expand, comments stay)
    Remove the comments of the target (ARM @, RISC-V and Xtensa #)
    Expand assembler macros (.macro, .rept, .irp)
    Take only the branch of .if/.ifdef that the assembler takes
-   Store labels, .global/.weak symbols, .equ/.set aliases
+   Store the entry labels, .global/.weak symbols, .equ/.set aliases, and
+   each local label as a symbol of kind "label"
    Link each alias and vector-table slot to its target by the link name
    (ref_kind "alias", "vector")
+   Follow the flow of control of each routine → a call edge for each call,
+   jump or fall into another routine (ref_kind "call", origin "asm")
 
-6. Write build metadata:
+7. Post-process the build (indexer/_postprocess.py):
+   Expand the macro values with clang -dM -E ([index]
+   index_macros_expanded), when the run parsed a unit, when a file left
+   the index, or when an earlier run stopped before this step
+   Give the internal (static) functions one USR
+   Resolve the slot facts and the SDK rules into call edges
+   (origin "slot", "type_only", "sdk")
+   LLM analysis and embeddings (on by default; skip with --no-analyze,
+   --no-embeddings)
+   Compute PageRank and the hotspot cache
+
+8. Write build metadata:
    compile_commands.json hash, file mtimes, symbol/file/ref/macro counts
    Stamp the row format at the end of the run (get_project_status compares it)
 ```
@@ -4150,8 +4186,9 @@ location, `out/` is this directory.
 - **Use short queries.** A query with 1 to 3 words works best. FTS5 is a
   token-based engine, so a longer phrase narrows the results too
   aggressively.
-- **Omit underscores.** FTS5 treats `_` as a word separator. `modem_init` →
-  `modem AND init`. Write `modem init` instead.
+- **Omit underscores.** FTS5 treats `_` as a word separator. `modem_init`
+  asks for the tokens `modem` and `init` next to each other (a phrase), and
+  misses `modem_parser_oob_init`. Write `modem init` instead.
 - **Trailing `*` for a prefix match.** `uart_*` finds `uart_init`,
   `uart_write`, `uart_read`, and other names with that prefix.
 - **Quotes for exact phrases.** `"spi transfer"` matches that exact token sequence,

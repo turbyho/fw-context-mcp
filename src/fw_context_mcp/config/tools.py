@@ -354,12 +354,15 @@ as a `warning` + `hint` instead, thus `[]` is an answer, not a failure.
 3. Switch tools — search_bodies → search_content (wider query, and it
    covers the preprocessor and extern "C", which belong to no definition).
 4. Use `lookup_symbol` for known names.
-5. `find_callers` empty → callers can exist through member-field accesses
-   (`obj.method()`), base-class pointers or function pointers. Use
-   `search_bodies("function_name")`, which searches the text of the bodies
-   and not the call graph. If it is empty too, use
-   `search_content("function_name")`. For a function pointer, use
-   `find_indirect_targets("function_name")`.
+5. `find_callers` gives only an `info` row → no call of the build reaches
+   the function. The answer holds direct calls, assembly calls (origin
+   `asm`), calls through a function pointer (origin `slot` or
+   `type_only`), calls of an SDK rule (origin `sdk`), and each store of
+   its address. For each other use (a `return` of its address), use
+   `find_references("function_name")`. A unit with a fatal parse error
+   (`parse_errors`) can lose calls, and code out of the build (a library
+   without source) can call it. For an interrupt handler, use
+   `get_vector_table`. To find the name in the text, use `search_content`.
 6. Only AFTER exhausting all fw-context tools — use other tools.
 
 ### A name that means several symbols
@@ -387,9 +390,10 @@ Every tool that takes a symbol name handles this, in one of two shapes.
 
 **Tools that return a LIST** — `find_all_callers_recursive`,
 `find_callees_recursive`, `find_call_path`, `find_callers`,
-`find_references` — answer for ALL of the symbols. The answer starts with
-a `warning` row that names them, and each result carries
-`target_qualified_name`, which tells the symbol it belongs to.
+`find_references`, `find_indirect_call_sites`, `find_indirect_targets` —
+answer for ALL of the symbols. The answer starts with a `warning` row that
+names them, and each result carries `target_qualified_name`, which tells
+the symbol it belongs to.
 
 - Read `target_qualified_name` before you say who calls what. Without it
   a caller of one class reads as a caller of the other.

@@ -155,7 +155,7 @@ installs the core Python packages automatically: `libclang-ng`, `pysqlite3`,
 | Tool | Why |
 |------|-----|
 | Python 3.11+ | Runtime |
-| `clang` (system binary) | fw-context uses this tool to resolve expanded macro values, with `clang -dM -E`. It also preprocesses assembly units (`.S`) with `clang -E -C`. Without `clang`, fw-context does not index assembly symbols and vector tables. |
+| `clang` (system binary) | fw-context uses this tool to resolve expanded macro values, with `clang -dM -E`. It also preprocesses assembly units (`.S`) with `clang -E -C`. Without `clang`, fw-context does not index the symbols, the call edges and the vector tables of assembly units. |
 
 ```bash
 # Arch / Manjaro
@@ -338,6 +338,10 @@ cd ~/.fw-context/src && make update
 `make update` runs `git pull`, and then the same editable install as
 `make install`.
 
+An update from a release that used the `libclang` package leaves that
+package installed. Run `fw-context doctor --fix`: it removes the old
+package and installs `libclang-ng` again. See [libclang](#libclang).
+
 An update can change the format of the rows in the index. Then
 `get_project_status` reports `row_format_mismatch`. Run `fw-context index`
 once in each project to write the rows again.
@@ -353,6 +357,26 @@ now. `fw-context index` and `fw-context doctor --fix` remove them. To see
 the list first, run `fw-context cleanup --dry-run`. To remove them now,
 run `fw-context cleanup`. See
 [`fw-context cleanup`](tools.md#fw-context-cleanup).
+
+### Update from 0.35 or older
+
+Do these steps in this order:
+
+1. Run `fw-context init` in one project, or
+   `fw-context doctor --fix --only config`, one time. The command converts
+   the old `[llm]` backend keys of the global config (`ollama_url`,
+   `model`, `num_ctx` and the other keys) to LLM profiles. Until then, the
+   other commands stop with a config error. See
+   [The old `[llm]` backend keys](configuration.md#the-old-llm-backend-keys).
+2. In each project, run `fw-context init` before `fw-context index`. It
+   converts the old `[llm]` keys of the project (`config.toml` and
+   `local.toml`), and it writes the new instruction block for the LLM.
+3. Run `fw-context index` in each project. The first run of each build
+   writes each row again, as a first index run does: the row format and the
+   config hash changed. The LLM analysis of each global variable with a
+   definition also runs again one time (see
+   [`fw-context analyze`](tools.md#fw-context-analyze)). On a paid LLM
+   profile, this run costs more than a usual run.
 
 ## Verify
 

@@ -1281,7 +1281,8 @@ def _without_ollama(result: dict, cfg: LLMConfig, ollama_embedding: bool, cause:
         result["status"] = "not_configured"
         result["message"] = (
             f"{cause} No chat API is configured. Options: (1) {repair[0].lower()}{repair[1:]}, "
-            "(2) configure a cloud API via the configure_llm tool."
+            "(2) the operator adds a cloud profile with `fw-context llm setup` in a terminal, "
+            "then configure_llm(profile=<name>) selects it for this project."
         )
     return result
 

@@ -22,7 +22,7 @@ def cmd_llm(args: argparse.Namespace) -> int:
     print("usage: fw-context llm setup                         (the setup of the LLM services)")
     print("       fw-context llm list | test <profile> | remove <profile>")
     print("       fw-context llm recommend [--again]           (the recommended local models)")
-    print("       fw-context llm default <profile> [--global]")
+    print("       fw-context llm default <profile> [--global | --ollama]")
     print("       fw-context llm key {set,delete,status} [profile]")
     print("       fw-context llm {login,logout,models} <profile>   (a profile of provider chatgpt)")
     return 0

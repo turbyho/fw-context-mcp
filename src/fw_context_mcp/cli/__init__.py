@@ -237,7 +237,9 @@ def main() -> None:
         action="store_true",
         dest="background",
         default=False,
-        help="Background reindex mode — skip build, validation, and dep-tracking fixes (safe for automated runs)",
+        help="The mode of the file-watcher daemon. The run does not rebuild or repair "
+        "compile_commands.json, builds only with a backend that can build on its own, "
+        "and prunes no registry row",
     )
     p_index.add_argument(
         "--takeover",
@@ -531,7 +533,10 @@ def main() -> None:
     p_cleanup.set_defaults(func=cmd_cleanup)
 
     from ._llm import cmd_llm, cmd_llm_key_delete, cmd_llm_key_set, cmd_llm_key_status  # noqa: I001
-    p_llm = sub.add_parser("llm", help="Manage the LLM profiles (the API keys)")
+    p_llm = sub.add_parser(
+        "llm",
+        help="Set up the LLM services, and manage the LLM profiles, their API keys and the ChatGPT sign-in",
+    )
     p_llm_sub = p_llm.add_subparsers(dest="llm_command")
     p_llm_key = p_llm_sub.add_parser("key", help="Store, remove or show the API key of an LLM profile")
     p_llm_key_sub = p_llm_key.add_subparsers(dest="llm_key_command")

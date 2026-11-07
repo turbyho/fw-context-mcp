@@ -737,10 +737,10 @@ mcp = FastMCP(
         "  continuation of `candidates`.\n"
         "• `ambiguous_warning` — one sentence naming the symbol answered.\n"
         "LIST tools — find_all_callers_recursive, find_callees_recursive,\n"
-        "find_call_path, find_callers, find_references — answer for ALL of\n"
-        "them.  A `warning` row comes first and names the symbols, and each\n"
-        "result carries `target_qualified_name`, which tells the symbol it\n"
-        "belongs to.\n"
+        "find_call_path, find_callers, find_references, find_indirect_call_sites,\n"
+        "find_indirect_targets — answer for ALL of them.  A `warning` row comes\n"
+        "first and names the symbols, and each result carries\n"
+        "`target_qualified_name`, which tells the symbol it belongs to.\n"
         "• Read `target_qualified_name` before you say who calls what.\n"
         "  Without it a caller of one class reads as a caller of the other.\n"
         "• Give the full qualified name (`ClassB::probe`) to ask about one\n"
@@ -771,12 +771,15 @@ mcp = FastMCP(
         '   the query and covers the preprocessor (#define, #ifdef) and extern "C",\n'
         "   which belong to no definition and thus reach no symbol body.\n"
         "4. Use lookup_symbol for known symbol names.\n"
-        "5. find_callers empty → callers can exist through member-field accesses\n"
-        "   (obj.method()), base-class pointers or function pointers. Use\n"
-        '   search_bodies("function_name"), which searches the text of the bodies\n'
-        "   and not the call graph. If it is empty too, use\n"
-        '   search_content("function_name"). For a function pointer, use\n'
-        '   find_indirect_targets("function_name").\n'
+        "5. find_callers gives only an `info` row → no call of the build reaches\n"
+        "   the function. The answer holds direct calls, assembly calls (origin\n"
+        "   `asm`), calls through a function pointer (origin `slot` or\n"
+        "   `type_only`), calls of an SDK rule (origin `sdk`), and each store of\n"
+        "   its address. For each other use (a `return` of its address), use\n"
+        '   find_references("function_name"). A unit with a fatal parse error\n'
+        "   (`parse_errors`) can lose calls, and code out of the build (a library\n"
+        "   without source) can call it. For an interrupt handler, use\n"
+        '   get_vector_table. To find the name in the text, use search_content.\n'
         "6. Only AFTER exhausting fw-context — use other available tools.\n\n"
         "project_only=True (on search_code, search_bodies, search_content,\n"
         "find_dead_code, find_hotspots) excludes vendor SDK code — use it when\n"
@@ -986,12 +989,9 @@ mcp = FastMCP(
         "   Prioritize review of hotspots (20+ callers) over leaf functions.\n"
         "1. get_symbol_context(name) — body + direct callers + callees + LLM analysis\n"
         "   in one call. Replaces lookup_symbol + find_callers + a list of direct callees.\n"
-        '2. If get_symbol_context callers are empty → search_bodies("name") and\n'
-        '   find_indirect_targets("name") (function pointers, callbacks, ISRs\n'
-        "   invisible to the call graph): it gives each place that stores the\n"
-        "   address of the function, and each indirect call that reaches it.\n"
-        "   find_indirect_call_sites takes a POINTER (a field or a variable:\n"
-        "   the calls through it) or a function (the indirect calls it makes).\n"
+        '2. If the callers are empty → find_references("name") for each use that\n'
+        "   is not a call, get_vector_table for an interrupt handler, and\n"
+        '   search_content("name") for code out of the build.\n'
         "3. find_all_callers_recursive() → transitive upstream impact (full call tree).\n"
         "4. find_callees_recursive() → transitive downstream check.\n"
         "   After a logic change, verify compatibility with everything this function\n"
@@ -1001,7 +1001,7 @@ mcp = FastMCP(
         "7. find_dead_code() → detect newly dead functions after removal.\n"
         "8. trace_data_flow(type_name, to_symbol) → cross-module data dependencies.\n"
         "   Use when a changed function produces or consumes typed data that flows\n"
-        '   through other modules. E.g. trace_data_flow("SlotPin", "InventoryWriter").\n'
+        '   through other modules: trace_data_flow("SensorData", "uart_send").\n'
         "9. For each search_bodies result set: scan ALL results — the 3rd match\n"
         "   may reveal an implementation the diff didn't touch (e.g. duplicate CRC\n"
         "   in a private method).\n"

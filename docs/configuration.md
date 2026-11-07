@@ -201,9 +201,9 @@ and multi-image builds](build.md).
 | `db_dir` | `"~/.fw-context/index"` | global, local | The directory for SQLite index databases. fw-context creates one subdirectory for each project. |
 | `compile_commands` | `".fw-context/build/compile_commands.json"` | project | The path to the compilation database. fw-context resolves relative paths from the project root. For a build that fw-context runs, the default (and the older value `"compile_commands.json"`) means the database of that build, in `.fw-context/build/<variant>/out`. Set another path for a build that fw-context cannot run (for example an STM32CubeIDE project), or for a database of your own. fw-context then runs no build, makes no variants from the environments of platformio.ini, and the linker scripts and the vector table of the build stay unknown. A missing file is an error, `--build` with such a file is an error, and so is `[[build.variants]]` beside it. |
 | `vendor_paths` | `[]` | project | Additional vendor or SDK directory patterns. fw-context adds these patterns to its automatic detection. A path that matches one of these patterns gets `is_project=0`. Example: `["third_party", "generated"]`. |
-| `project_paths` | `[]` | project | Manual project directory patterns. These patterns override automatic detection. A path that matches one of these patterns gets `is_project=1`. Use this key for vendored code that your team maintains, for example `["src/old_hal"]`. For a path outside the project root, use an absolute path, for example `["/home/user/esp/components/muj_fork"]`. |
+| `project_paths` | `[]` | project | Manual project directory patterns. These patterns override automatic detection. A path that matches one of these patterns gets `is_project=1`. Use this key for vendored code that your team maintains, for example `["src/old_hal"]`. For a path outside the project root, use an absolute path, for example `["/home/user/esp/components/my_fork"]`. |
 | `index_refs` | `true` | project | Build the cross-reference and call graph data. This key is on by default, and it enables tools such as `find_callers`, `find_call_path`, and `find_dead_code`. Set this key to `false`, or pass `--no-refs`, for faster indexing on very large projects. |
-| `index_embeddings` | `true` | project | Generate vector embeddings during indexing. An Ollama `embed_model` requires Ollama; a sentence-transformers or `ft://` model runs locally. The embeddings power semantic search and hybrid FTS5+vector re-ranking. Disable this key with `false`, or with `--no-embeddings`. |
+| `index_embeddings` | `true` | project | Generate vector embeddings during indexing. An Ollama `embed_model` requires Ollama; a sentence-transformers or `ft://` model runs locally. With an API profile in `[llm] embed_profile`, the API makes the embeddings. The embeddings power semantic search and hybrid FTS5+vector re-ranking. Disable this key with `false`, or with `--no-embeddings`. |
 | `config_header` | `""` *(none)* | project | The path to a configuration header that the build generates (for example `config.h`), relative to the project root. fw-context adds `-include <file>` to each translation unit. Use this key for a build system that does not put `-include` into `compile_commands.json`. A missing file stops `fw-context index` with an error. |
 | `rerank_top_k` | `50` | global, local | The number of rows at the top of each `semantic_search` page that `[llm] reranker_model` scores again. Without `reranker_model`, this key has no effect. |
 | `min_dense_count` | `3` | project | The minimum number of embedding results for a `smart_search` ranking from the embeddings only. With fewer results, `smart_search` uses the FTS5 results. A value below 1 counts as 1. |
@@ -257,7 +257,7 @@ Each profile is one LLM backend. The name of a profile has only letters, digits,
 | Key | Default | Provider | Description |
 |-----|---------|----------|-------------|
 | `provider` | *(required)* | each | `"ollama"` for an Ollama server, `"openai_compatible"` for an API with the OpenAI chat format, `"openrouter"` for OpenRouter, `"deepseek"` for the API of DeepSeek, or `"chatgpt"` for the ChatGPT plan of the user (see [ChatGPT plan](#chatgpt-plan)). For `openrouter` and `deepseek`, fw-context knows the URL, the key variable and the request fields that turn the reasoning of the model off. A request to `ollama` sends `think: false`: a model that thinks by default (gemma4) otherwise used each answer token for its reasoning and gave an empty answer. gpt-oss ignores the key. A `chatgpt` profile has `provider`, `model`, `context` and, as each profile, `timeout` and `stream`. `stream` has no effect there, because each request of the plan streams. |
-| `model` | *(required)* | each | The chat model. Use a model with 14B parameters or more: a smaller model gives JSON that is not consistent, and poor descriptions of embedded C++ code. |
+| `model` | *(required)* | each | The chat model. The list `[llm.models]` gives the measured quality and size of each model of Ollama. `fw-context llm recommend` recommends a model for this machine, see [The recommendation of a model](#the-recommendation-of-a-model). |
 | `url` | `"http://localhost:11434"` for Ollama, `"https://openrouter.ai/api/v1"` for OpenRouter, `"https://api.deepseek.com"` for DeepSeek | each, except `chatgpt` | The server. Required for `openai_compatible`. fw-context adds `/chat/completions` to a URL that contains `/v1`, and `/v1/chat/completions` to a URL without `/v1`. A URL that ends with `/chat/completions` stays as it is. |
 | `timeout` | `600.0` | each | The HTTP request timeout, in seconds. Embed requests use `timeout × 2`. |
 | `stream` | `false` | each | When `true`, fw-context sends `stream: true` and reads SSE chunks for chat requests. This setting keeps the HTTP connection open with a continuous data flow, and prevents reverse-proxy idle timeouts (nginx default: 60 s, Cloudflare: 100 s). When `false`, fw-context uses a non-streaming path. |
@@ -688,6 +688,7 @@ fw-context removes the config keys and the files that an older release wrote and
 | `[build] default_variant`, `default_image` | each config file, also in `[[build.variants]]` |
 | `[index] compile_commands` with the value `compile_commands.json` or `.fw-context/build/compile_commands.json` | `config.toml` and `local.toml` of the project, when two conditions are true. fw-context runs the build of the project: for a stub build (for example STM32CubeIDE), the value names the database of the project. And the files below it give such a value too, or none: else the removal brings up the value of a lower file. The global config keeps the key, because it applies to each project, a stub project too. |
 | `.fw-context/toolchains.toml` | the project |
+| The ninja wrapper `.fw-context/ninja` and `.fw-context/.ninja.tmp` of the Zephyr and ESP-IDF builds | the project. A file with a different text stays. |
 | The build output of the older layout (`.fw-context/autobuild/`, the files directly in `.fw-context/build/`), see [build.md](build.md) | the project. A database that a build of the index reads stays. |
 | `platformio-shared.ini` | the global directory |
 
@@ -775,7 +776,7 @@ board = "nrf52840dk_nrf52840"            # required — your board name
 # clean = true                           # pristine build (recommended)
 
 [index]
-# compile_commands = "compile_commands.json"   # only for a build that fw-context cannot run
+# compile_commands = "ci/compile_commands.json"   # a database of your own: fw-context runs no build
 # vendor_paths = ["third_party"]          # additional vendor dirs (additive to auto-detection)
 # project_paths = ["src/old_hal"]        # manual project dirs (overrides auto-detection)
 ```
@@ -790,7 +791,7 @@ name = "my-pio-project"
 # system = "platformio"                  # auto-detected from platformio.ini
 
 [index]
-# compile_commands = "compile_commands.json"   # only for a build that fw-context cannot run
+# compile_commands = "ci/compile_commands.json"   # a database of your own: fw-context runs no build
 # PlatformIO framework packages are auto-detected as vendor (is_project=0).
 # For vendored code your team maintains, use project_paths to mark it as project:
 # project_paths = ["src/my_customized_framework"]
@@ -812,7 +813,7 @@ name = "my-mbed-app"
 # defines = ["VERSION_FW_MAJOR=4", "DEV"]  # extra -D macros
 
 [index]
-# compile_commands = "compile_commands.json"   # only for a build that fw-context cannot run
+# compile_commands = "ci/compile_commands.json"   # a database of your own: fw-context runs no build
 # vendor_paths = ["third_party"]          # additional vendor dirs (additive to auto-detection)
 # project_paths = ["src/old_hal"]        # manual project dirs (overrides auto-detection)
 ```

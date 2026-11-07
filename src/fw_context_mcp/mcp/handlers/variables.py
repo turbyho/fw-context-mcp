@@ -130,7 +130,8 @@ def find_variables(
         ``"<file scope>"`` for varglobal), enclosing_class (str — class
         or struct name for fields and static members, empty otherwise),
         references (list[dict] — ``function``, ``file``, ``line``,
-        ``ref_kind``; at most 30), references_total (int — every
+        ``col``, ``ref_kind``, ``origins`` as in ``find_callers``; at
+        most 30), references_total (int — every
         reference of the variable).  When the list is cut,
         ``references_hint`` names the ``find_references`` call that
         lists them all.

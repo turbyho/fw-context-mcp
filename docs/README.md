@@ -11,7 +11,8 @@ This document explains **how** to start using fw-context.
 Before you index a project, you need:
 
 -   Python 3.11+
--   libclang
+-   `clang` on the `PATH` (for macro values and assembly units).
+    `make install` installs libclang.
 -   Bear (or another way to generate `compile_commands.json`)
 -   Optional: an LLM service (for semantic search and symbol explanation):
     a local Ollama, or a cloud service such as OpenRouter, DeepSeek or the
@@ -60,8 +61,10 @@ To index a project that fw-context can build, run:
 fw-context index
 ```
 
-This run reads `.fw-context/build/<variant>/out/compile_commands.json`.
-When the build is not there, the run builds the project first.
+This run reads the `compile_commands.json` of each build under
+`.fw-context/build/<variant>/out/`. See
+[Where the build goes](build.md#where-the-build-goes). When the build is
+not there, the run builds the project first.
 
 To index an existing `compile_commands.json` file, give its path:
 
@@ -93,7 +96,7 @@ If your team runs a [shared cache server](cache-server.md), configure fw-context
 fw-context cache remote-init
 ```
 
-The interactive wizard asks for your server URL and your token. The wizard verifies the connection. The wizard writes the configuration to your project.
+The interactive wizard asks for your server URL and your token. The wizard verifies the connection. The wizard writes the URL to the global config `~/.fw-context/config.toml`, and the token to `~/.fw-context/.cache_token`. It writes no project file.
 
 ## Next steps
 

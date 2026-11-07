@@ -35,7 +35,7 @@ The case study includes the review output, methodology and per-tool token analys
 ### Prerequisites
 
 - Python 3.11 or newer
-- libclang
+- `clang` on the `PATH` (for macro values and assembly units). `pip install fw-context-mcp` installs libclang.
 - a project that can produce `compile_commands.json`
 - an MCP-capable coding agent such as Claude Code or OpenCode
 
