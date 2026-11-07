@@ -1,6 +1,6 @@
 """fw-context MCP server — build-aware code intelligence for embedded C/C++ projects.
 
-Serves 37 MCP tools and 4 MCP resources via FastMCP (stdio transport).
+Serves 37 MCP tools and 3 MCP resources via FastMCP (stdio transport).
 The two counts are pinned by a test — a docstring that drifts describes
 a server that no longer exists.
 
@@ -67,7 +67,9 @@ client-side connection timeouts.
 ``check_ollama``, ``configure_llm``, ``reindex_file``, ``reset_index``.
 
 **MCP Resources:** ``fw-context://stats``, ``fw-context://projects``,
-``fw-context://symbols/{name}``, ``fw-context://skills/fw-review``.
+``fw-context://skills/fw-review``.  The resource ``fw-context://symbols/{name}``
+is removed: a resource takes no build, and a project of several builds
+answers no query without one.  ``get_source`` gives the same body.
 """
 
 import asyncio
@@ -76,7 +78,6 @@ import inspect
 import logging
 import os
 import re
-import sqlite3
 import sys
 import textwrap
 import time
@@ -1304,38 +1305,6 @@ def resource_projects() -> str:
     import json
 
     return json.dumps(maintenance.list_projects(), indent=2, ensure_ascii=False, default=str)
-
-
-@mcp.resource("fw-context://symbols/{name}")
-def resource_symbol(name: str) -> str:
-    """Return the definition source of a symbol as a markdown document.
-
-    Read-only. Renders symbol metadata (name, kind, file, signature) and
-    source code as a formatted markdown resource.
-    """
-    import json
-
-    try:
-        result = source.get_source(name)
-    except (sqlite3.Error, OSError, ValueError) as exc:
-        return json.dumps({"error": f"Failed to read symbol '{name}': {exc}"})
-    if "error" in result:
-        return json.dumps(result)
-    source_code = result.pop("source", "")
-    # Render as a small markdown document
-    lines = [
-        f"# {result['name']}",
-        "",
-        f"- **qualified:** `{result['qualified_name']}`",
-        f"- **kind:** {result['kind']}",
-        f"- **file:** `{result['file']}:{result['line']}`",
-        f"- **signature:** `{result.get('signature', '')}`",
-        "",
-        "```cpp",
-        source_code,
-        "```",
-    ]
-    return "\n".join(lines)
 
 
 # ── Embedded review skill ───────────────────────────────────────────────────

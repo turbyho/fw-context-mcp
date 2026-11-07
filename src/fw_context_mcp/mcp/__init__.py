@@ -1,8 +1,9 @@
-"""MCP server package — FastMCP stdio server with 37 tools and 4 resources.
+"""MCP server package — FastMCP stdio server with 37 tools and 3 resources.
 
 Serves build-aware code intelligence for embedded C/C++ firmware projects.
 Tools are registered as async functions on a FastMCP instance; resources
-expose project stats and symbol source as MCP resource URIs.
+give the project stats, the project list and the review skill as MCP
+resource URIs.
 
 The MCP protocol uses JSON-RPC over stdin/stdout — no HTTP server, no
 port, no network surface.  This is deliberate: embedded firmware tools

@@ -639,6 +639,19 @@ def test_the_module_docstring_counts_what_the_server_serves():
     )
 
 
+def test_no_resource_answers_about_a_symbol():
+    """`fw-context://symbols/{name}` took no build: on a project of several builds, each read gave an error.
+
+    A resource takes no `variant` and no `image`, and one query answers for
+    one build.  `get_source` gives the body for the build that the caller
+    selects.
+    """
+    templates = asyncio.run(server.mcp.list_resource_templates())
+    static = asyncio.run(server.mcp.list_resources())
+    uris = [str(r.uriTemplate) for r in templates] + [str(r.uri) for r in static]
+    assert sorted(uris) == ["fw-context://projects", "fw-context://skills/fw-review", "fw-context://stats"], uris
+
+
 @pytest.mark.parametrize("tool", TOOLS, ids=TOOL_IDS)
 def test_a_tool_that_takes_a_project_root_also_takes_a_project(tool):
     """One tool without the parameter recreates the original failure."""

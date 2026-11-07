@@ -3867,8 +3867,10 @@ was changed.
 ### MCP Resources
 
 Resources are read-only, URI-addressable endpoints that return structured
-content, in Markdown or JSON. Unlike tools, resources take no JSON-RPC
-parameters, except `symbols/{name}`, which takes a name path segment.
+content, in Markdown or JSON. Unlike tools, resources take no parameters.
+The resource `fw-context://symbols/{name}` is removed: a resource takes no
+build, and a project of several builds answers no query without one. Use
+[`get_source`](#get_source) with the `variant` and the `image` of a build.
 
 #### `fw-context://stats`
 
@@ -3894,30 +3896,6 @@ Same data as [`list_projects`](#list_projects), serialized as indented JSON.
 URI:    fw-context://projects
 Output: [{"project_id": "a1b2…", "name": "my-zephyr-app", "symbol_count": 12430, …}, …]
 ```
-
-#### `fw-context://symbols/{name}`
-
-Definition source of a symbol rendered as a Markdown document. Uses the
-same lookup as [`get_source`](#get_source).
-
-```
-URI:    fw-context://symbols/uart_init
-Output: # uart_init
-
-        - **qualified:** `drv::uart_init`
-        - **kind:** function
-        - **file:** `/path/src/uart.c:42`
-        - **signature:** `void uart_init(int baudrate)`
-
-        ```cpp
-        void uart_init(int baudrate) {
-          …
-        }
-        ```
-```
-
-When fw-context does not find the symbol, this resource returns a JSON
-error object.
 
 #### `fw-context://skills/fw-review`
 
