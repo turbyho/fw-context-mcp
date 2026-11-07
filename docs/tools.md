@@ -3529,8 +3529,9 @@ the shell of the user can be in a different directory. A `status` of `"skipped"`
 missing. For example, the audit skips `libclang-so` when
 `libclang-python` is absent. A skipped check is not a failure.
 
-In a project that is not initialized, only the checks that need no
-project config run: the Python packages and libclang. The checks
+In a project that is not initialized, only the checks of the installation
+run: `pysqlite3`, `sqlite-ext`, `sqlite-vec`, `libclang-python`,
+`libclang-so`, `clang-resource`, `watchfiles` and `tomli-w`. The checks
 `gpu-tools`, `ollama`, `chat-model`, `embed-model`, `llm-recommend`,
 `db-integrity`, and `disk-space` read the config. When fw-context cannot
 use a config file, the `config` check gives the error, and these checks

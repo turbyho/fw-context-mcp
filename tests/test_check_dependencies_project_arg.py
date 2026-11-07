@@ -35,6 +35,40 @@ def test_the_doctor_command_names_the_project(tmp_path, monkeypatch):
     )
 
 
+def test_a_project_before_init_gets_each_check_of_the_installation(tmp_path, monkeypatch):
+    """Before `fw-context init`, the tool ran 6 of the 8 checks of the installation.
+
+    `clang-resource` was not one of them, thus the missing ARM headers of
+    libclang were not reported before the first init.
+    """
+    from fw_context_mcp.mcp.handlers.maintenance import check_dependencies
+
+    home = tmp_path / "home" / "config.toml"
+    home.parent.mkdir()
+    home.write_text("", encoding="utf-8")
+    monkeypatch.setattr(settings, "_GLOBAL_CONFIG_PATH", home)
+    root = tmp_path / "proj"
+    (root / ".git").mkdir(parents=True)
+
+    names = {row["name"] for row in check_dependencies(project_root=str(root))}
+
+    assert names == {
+        "pysqlite3", "sqlite-ext", "sqlite-vec", "libclang-python", "libclang-so", "clang-resource", "watchfiles",
+        "tomli-w",
+    }
+
+
+def test_no_check_of_the_installation_reads_the_config():
+    """The checks before `config` run before init: none of them is a check that `run_full_check` loads the config for.
+
+    The set of the 8 names is pinned by the test above.
+    """
+    from fw_context_mcp.deps import _NEEDS_CONFIG, installation_checks
+
+    assert installation_checks() and not installation_checks() & _NEEDS_CONFIG
+    assert "config" not in installation_checks()
+
+
 def test_other_commands_stay_as_they_are():
     from fw_context_mcp.mcp.handlers.maintenance import _with_project
 

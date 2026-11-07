@@ -4185,12 +4185,6 @@ def _dep_to_schema(r, root: Path) -> dict:
     return d
 
 
-# The checks that need no project config: they run also before `fw-context
-# init`.  libclang-so needs only libclang-python, thus the signal "missing
-# libclang .so → reinstall libclang-ng" works before the first init.
-_PRE_INIT_CHECKS = frozenset({"pysqlite3", "sqlite-vec", "libclang-python", "libclang-so", "watchfiles", "tomli-w"})
-
-
 def check_dependencies(
     project_root: Annotated[
         str | None,
@@ -4208,9 +4202,9 @@ def check_dependencies(
     prerequisite is missing (e.g. ``libclang-so`` skipped because
     ``libclang-python`` is absent) — not a failure.
 
-    In a project that is not initialized, only the checks that need no
-    project config run: the Python packages and libclang.  The Ollama,
-    model, database and build checks need the config.
+    In a project that is not initialized, only the checks of the
+    installation run: the Python packages, SQLite, libclang and its
+    headers.  The LLM, model, database and disk checks need the config.
 
     The check ``config`` names a config file that cannot be used.  The
     checks that read the config are then ``skipped``.  When a config file
@@ -4225,7 +4219,7 @@ def check_dependencies(
         ``critical`` (bool), ``message``, and an optional ``action``
         ({message, command}).
     """
-    from ...deps import run_full_check
+    from ...deps import installation_checks, run_full_check
 
     root = resolve_project_root(project_root)
     try:
@@ -4237,7 +4231,7 @@ def check_dependencies(
     if initialized:
         results = run_full_check(project_root=str(root))
     else:
-        results = run_full_check(project_root=str(root), subset=set(_PRE_INIT_CHECKS))
+        results = run_full_check(project_root=str(root), subset=set(installation_checks()))
     return [_dep_to_schema(r, root) for r in results]
 
 

@@ -103,8 +103,9 @@ def run_full_check(
 
     When *subset* is given, only checks whose ``name`` is in *subset* run
     (in ``CHECK_ORDER`` order).  Used by ``check_dependencies`` for the
-    ``not_initialized`` path — pip-only checks that do not depend on a
-    project config.  Default ``None`` runs the full audit (unchanged for
+    ``not_initialized`` path — the checks of the installation
+    (``installation_checks``), which read no project config.  Default
+    ``None`` runs the full audit (unchanged for
     ``doctor``).  When *subset* holds a check of ``_NEEDS_CONFIG`` and
     the config does not load, the check ``config`` also runs.  WHY: if
     not, the subset gives only ``skipped`` rows, and ``exit_code``
@@ -184,6 +185,21 @@ def run_full_check(
             )
 
     return results
+
+
+def installation_checks() -> frozenset[str]:
+    """The checks of the installation: each check before ``config`` in ``CHECK_ORDER``.
+
+    They read no config, thus they run also in a project before ``fw-context
+    init`` (``check_dependencies``).  WHY from the order and not from a list
+    of names: a second list named 6 of the 8 checks, and without
+    ``clang-resource`` the missing ARM headers of libclang were not
+    reported before the first init.
+    """
+    from ._checks import CHECK_ORDER
+
+    names = [name for name, _ in CHECK_ORDER]
+    return frozenset(names[: names.index("config")])
 
 
 #: The checks that read the config of the project through ``load``.  When
