@@ -12,7 +12,6 @@ rows change.
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import functools
 import json
 import os
@@ -21,6 +20,8 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+
+from fw_context_mcp.file_lock import try_lock
 
 pytest.importorskip("clang.cindex", reason="libclang not available")
 pytestmark = pytest.mark.libclang
@@ -778,7 +779,7 @@ def _cli_build(tmp_path: Path, stack: contextlib.ExitStack, files: dict[str, str
     db_path.parent.mkdir(parents=True, exist_ok=True)
     lock = os.open(db_path.parent / "watcher.lock", os.O_CREAT | os.O_RDWR)
     stack.callback(os.close, lock)
-    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    assert try_lock(lock), "a different process holds watcher.lock"
 
     def index() -> None:
         result = _cli(["index", "--no-analyze", "--no-embeddings", str(proj / "compile_commands.json")], cwd=proj)
