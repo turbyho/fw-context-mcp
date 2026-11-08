@@ -28,6 +28,7 @@ import pytest
 from fw_context_mcp.indexer.autobuild import build_missing_reason
 from fw_context_mcp.indexer.build_layout import BuildLayout
 from fw_context_mcp.indexer.db import CURRENT_ROW_FORMAT, open_db, transaction, upsert_build_config, upsert_project
+from tests._toml import toml_string
 
 PROJECT_ID = "0123456789abcdef0123456789abcdef"
 
@@ -173,7 +174,7 @@ def _project(root: Path, index_dir: Path, cc: Path, system: str = "cmake") -> Pa
     config_dir.mkdir(exist_ok=True)
     (config_dir / "config.toml").write_text(
         f'[project]\nid = "{PROJECT_ID}"\n[build]\nsystem = "{system}"\n', encoding="utf-8")
-    (config_dir / "local.toml").write_text(f'[index]\ndb_dir = "{index_dir}"\n', encoding="utf-8")
+    (config_dir / "local.toml").write_text(f'[index]\ndb_dir = {toml_string(index_dir)}\n', encoding="utf-8")
     return db_dir / "index.db"
 
 

@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._toml import toml_string
+
 pytest.importorskip("clang.cindex", reason="libclang not available")
 pytestmark = pytest.mark.libclang
 
@@ -92,7 +94,7 @@ SOURCES = {
 def _project(root: Path) -> None:
     (root / ".fw-context").mkdir(parents=True, exist_ok=True)
     (root / ".fw-context" / "config.toml").write_text(
-        f'[project]\nid = "proj-usr"\n\n[build]\n\n[index]\ndb_dir = "{root.parent / "db"}"\n', encoding="utf-8",
+        f'[project]\nid = "proj-usr"\n\n[build]\n\n[index]\ndb_dir = {toml_string(root.parent / "db")}\n', encoding="utf-8",
     )
     for name, text in SOURCES.items():
         (root / name).parent.mkdir(parents=True, exist_ok=True)

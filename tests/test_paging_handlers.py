@@ -25,6 +25,7 @@ from fw_context_mcp.indexer.db import (
     upsert_project,
 )
 from fw_context_mcp.utils import compute_source_hash
+from tests._toml import toml_string
 
 CH = "hash-handlers"
 PROJECT_ID = "proj-handlers"
@@ -81,7 +82,7 @@ def project(tmp_path: Path) -> Path:
     (root / "src").mkdir(parents=True)
     (root / ".fw-context").mkdir()
     (root / ".fw-context" / "config.toml").write_text(
-        f'[project]\nid = "{PROJECT_ID}"\n\n[build]\n\n[index]\ndb_dir = "{tmp_path}"\n',
+        f'[project]\nid = "{PROJECT_ID}"\n\n[build]\n\n[index]\ndb_dir = {toml_string(tmp_path)}\n',
         encoding="utf-8",
     )
     source = root / "src" / "dl.cpp"

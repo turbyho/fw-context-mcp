@@ -21,6 +21,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._toml import toml_string
+
 # A file whose text is easy to count by eye.  Line 4 holds the constant,
 # line 9 the table entry that names it again, and line 12 a comment that
 # only a widened query reaches.
@@ -78,7 +80,7 @@ def indexed_project(tmp_path: Path) -> Path:
     (root / ".fw-context").mkdir()
     project_id = "proj-001"
     (root / ".fw-context" / "config.toml").write_text(
-        f'[project]\nid = "{project_id}"\n\n[build]\n\n[index]\ndb_dir = "{tmp_path}"\n',
+        f'[project]\nid = "{project_id}"\n\n[build]\n\n[index]\ndb_dir = {toml_string(tmp_path)}\n',
         encoding="utf-8",
     )
     files = {"src/command.h": ("c", _HEADER), "src/worker.cpp": ("cpp", _SOURCE)}

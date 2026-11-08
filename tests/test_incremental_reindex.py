@@ -35,6 +35,7 @@ from fw_context_mcp.indexer.db import (
     upsert_file,
     upsert_project,
 )
+from tests._toml import toml_string
 
 # ── helpers ──────────────────────────────────────────────────────────
 
@@ -88,7 +89,7 @@ def _isolate_index_db(project_root: Path, tmp_dir: Path) -> None:
     local_toml = local_config_dir / "local.toml"
     index_dir = tmp_dir / "index"
     local_toml.write_text(
-        f'[index]\ndb_dir = "{index_dir}"\n',
+        f'[index]\ndb_dir = {toml_string(index_dir)}\n',
         encoding="utf-8",
     )
 

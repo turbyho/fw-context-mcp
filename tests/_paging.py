@@ -18,6 +18,7 @@ from fw_context_mcp.indexer.db import (
     upsert_project,
 )
 from fw_context_mcp.utils import compute_source_hash
+from tests._toml import toml_string
 
 CH = "hash-paging"
 PROJECT_ID = "proj-paging"
@@ -62,7 +63,7 @@ def make_project(tmp_path: Path, fill: Callable[..., None], *, files: int = 1) -
     (root / "src").mkdir(parents=True)
     (root / ".fw-context").mkdir()
     (root / ".fw-context" / "config.toml").write_text(
-        f'[project]\nid = "{PROJECT_ID}"\n\n[build]\n\n[index]\ndb_dir = "{tmp_path}"\n',
+        f'[project]\nid = "{PROJECT_ID}"\n\n[build]\n\n[index]\ndb_dir = {toml_string(tmp_path)}\n',
         encoding="utf-8",
     )
     db_path = tmp_path / PROJECT_ID / "index.db"

@@ -22,6 +22,7 @@ from pathlib import Path
 import pytest
 
 import fw_context_mcp  # noqa: F401  (pysqlite3 redirect before any sqlite3)
+from tests._toml import toml_string
 from tests._usr_keys import base_names
 
 pytest.importorskip("clang.cindex", reason="libclang not available")
@@ -114,7 +115,7 @@ def _edges(tmp_path: Path, name: str, source: str, headers: dict[str, str] | Non
     root = tmp_path / "proj"
     (root / ".fw-context").mkdir(parents=True)
     (root / ".fw-context" / "config.toml").write_text(
-        f'[project]\nid = "proj-gaps"\n\n[build]\n\n[index]\ndb_dir = "{tmp_path}"\n', encoding="utf-8",
+        f'[project]\nid = "proj-gaps"\n\n[build]\n\n[index]\ndb_dir = {toml_string(tmp_path)}\n', encoding="utf-8",
     )
     (root / name).write_text(source, encoding="utf-8")
     for header, text in (headers or {}).items():
@@ -311,7 +312,7 @@ def _edges_units(tmp_path: Path, sources: dict[str, str]) -> set[tuple]:
     root = tmp_path / "proj"
     (root / ".fw-context").mkdir(parents=True)
     (root / ".fw-context" / "config.toml").write_text(
-        f'[project]\nid = "proj-outside"\n\n[build]\n\n[index]\ndb_dir = "{tmp_path}"\n', encoding="utf-8",
+        f'[project]\nid = "proj-outside"\n\n[build]\n\n[index]\ndb_dir = {toml_string(tmp_path)}\n', encoding="utf-8",
     )
     for name, text in sources.items():
         (root / name).write_text(text, encoding="utf-8")

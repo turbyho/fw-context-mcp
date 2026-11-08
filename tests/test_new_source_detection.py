@@ -25,6 +25,7 @@ from fw_context_mcp.mcp.shared.stale import (
     annotate_stale,
     find_unindexed_sources,
 )
+from tests._toml import toml_string
 
 _CONFIG_HASH = "hash-deadbeef"
 
@@ -669,7 +670,7 @@ class TestEveryUncoveredFileIsRecorded:
         # A project id the config resolver can find, pointing at our database.
         (root / ".fw-context").mkdir(exist_ok=True)
         (root / ".fw-context" / "config.toml").write_text(
-            f'[project]\nid = "pid"\n\n[build]\n\n[index]\ndb_dir = "{db_path.parent}"\n',
+            f'[project]\nid = "pid"\n\n[build]\n\n[index]\ndb_dir = {toml_string(db_path.parent)}\n',
             encoding="utf-8",
         )
         target = db_path.parent / "pid" / "index.db"

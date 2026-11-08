@@ -24,6 +24,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._toml import toml_string
+
 pytest.importorskip("clang.cindex", reason="libclang not available")
 pytestmark = pytest.mark.libclang
 
@@ -355,7 +357,7 @@ def _index(root: Path, files: dict[str, str], name: str, config: str = "") -> tu
     (root / ".fw-context").mkdir(parents=True)
     db_dir = root.parent / f"db-{name}"
     (root / ".fw-context" / "config.toml").write_text(
-        f'[project]\nid = "{name}"\n\n[build]\n\n[index]\ndb_dir = "{db_dir}"\n' + config, encoding="utf-8",
+        f'[project]\nid = "{name}"\n\n[build]\n\n[index]\ndb_dir = {toml_string(db_dir)}\n' + config, encoding="utf-8",
     )
     for file, text in files.items():
         (root / file).write_text(text, encoding="utf-8")
