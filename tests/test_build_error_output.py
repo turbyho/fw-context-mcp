@@ -52,7 +52,7 @@ def test_the_reason_on_stdout_reaches_the_message(monkeypatch, tmp_path):
         _Result(
             255,
             stdout="Compile [ 50.0%]: main.cpp\n"
-            "./src/download_manager.cpp:1693:88: error: 'BOOTLOADER_SIZE' was not declared\n",
+            "./src/updater.cpp:1693:88: error: 'BOOTLOADER_SIZE' was not declared\n",
             stderr='[mbed] ERROR: "python" returned error.\n       Code: 1\n',
         ),
     )

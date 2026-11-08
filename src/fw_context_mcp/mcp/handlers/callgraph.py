@@ -93,9 +93,9 @@ def _resolve_virtual_callers(conn, config_hash: str, usr: str, root, ref_kind: l
                             offset: int = 0) -> tuple[list[dict], int] | None:
     """Return callers of sibling override methods when *usr* has no direct callers.
 
-    When libclang resolves ``this->end_download()`` to the nearest override
-    (e.g. ``DownloadManagerSD::end_download``), the most-derived override
-    (e.g. ``DownloadManagerFlash::end_download``) shows 0 callers in ``refs``.
+    When libclang resolves ``this->close()`` to the nearest override
+    (e.g. ``StorageSD::close``), the most-derived override
+    (e.g. ``StorageFlash::close``) shows 0 callers in ``refs``.
     This propagates callers from peer overrides to reveal the real call sites.
 
     Uses two resolution strategies:

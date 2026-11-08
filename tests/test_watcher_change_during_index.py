@@ -5,8 +5,8 @@ Observed defect: ``fw-context watch status`` reported ``Index: idle`` and
 and the index log give the sequence:
 
 - 16:08:25 — the daemon detected a change and started the index subprocess.
-- 16:09:07 — the subprocess indexed the translation unit of ``zled.h``.
-- 16:09:21 — the user wrote ``zled.h`` again.
+- 16:09:07 — the subprocess indexed the translation unit of ``led.h``.
+- 16:09:21 — the user wrote ``led.h`` again.
 - 16:15:55 — the subprocess completed, and the daemon went back to the watch.
 
 The daemon watched for changes with an ``async for`` over ``awatch``.  To start
@@ -192,7 +192,7 @@ class TestWatcherTask:
         return pending.is_set()
 
     def test_a_header_change_sets_the_flag(self, monkeypatch, tmp_path: Path):
-        assert self._run_watcher(monkeypatch, tmp_path, "/p/src/zled.h") is True
+        assert self._run_watcher(monkeypatch, tmp_path, "/p/src/led.h") is True
 
     def test_a_document_change_does_not_set_the_flag(self, monkeypatch, tmp_path: Path):
         assert self._run_watcher(monkeypatch, tmp_path, "/p/README.md") is False
