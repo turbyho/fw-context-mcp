@@ -9,11 +9,11 @@ Key design decisions:
 
 - **Daemon spawning uses a kernel file lock (not PID files) for mutual exclusion**:
   PID files have an inherent TOCTOU race — the PID may be reused between
-  ``read_pid()`` and ``os.kill()``.  :mod:`fw_context_mcp.file_lock` is an atomic kernel lock that
-  survives process death (the kernel releases it automatically).  The spawning
-  protocol in ``_ensure_daemon_running`` holds the lock, spawns the daemon,
-  then releases — the daemon blocks on its own ``flock`` acquisition and
-  picks up the lock as soon as the spawner releases.  No race window.
+  ``read_pid()`` and ``os.kill()``.  :mod:`fw_context_mcp.file_lock` is an
+  atomic kernel lock that the kernel releases when its process ends.  The
+  daemon holds ``watcher.lock`` for its whole life, and a second daemon
+  exits at its try of the lock.  ``_ensure_daemon_running`` releases its
+  try of the lock before it spawns the daemon.
 
 - **The check of the work that waits is in the daemon**: the daemon's
   ``_staleness_check`` runs one time at its start.  It finds the work of the
@@ -217,10 +217,23 @@ def read_reindex_progress(db_dir: Path) -> str | None:
 def _ensure_daemon_running(root: Path) -> None:
     """Make sure the persistent watcher daemon is running for *root*.
 
-    Uses *watcher.lock* (a kernel file lock) as both daemon-alive indicator and spawn
-    guard.  The daemon acquires the lock at startup; this function checks
-    the ping first (fast path), then falls back to the lock for spawn
-    coordination.
+    Uses *watcher.lock* (a kernel file lock) as the daemon-alive indicator.
+    The daemon holds the lock for its whole life.  This function checks
+    the ping first (fast path), then tries the lock.
+
+    WHY the lock is free when the daemon starts: the daemon takes the lock
+    with a try that does not wait, and it exits when a different file
+    descriptor holds it.  A wait in the daemon is not a solution, because
+    a second daemon would then wait for the end of the first one.  Before,
+    this function held the lock until after the spawn: a daemon that came
+    to its lock call first exited, and no daemon ran until the next ping
+    cycle.
+
+    Two MCP servers can spawn a daemon at the same time.  The daemon that
+    gets the lock first runs, and the other one exits at its lock call
+    before it writes a marker or its PID file (``daemon_main``).  Thus a
+    second spawn costs one process start and one line in ``daemon.log``,
+    and no second daemon runs.
     """
     from .daemon import ping_daemon
 
@@ -240,35 +253,21 @@ def _ensure_daemon_running(root: Path) -> None:
     except OSError:
         return
     try:
-        locked = try_lock(lock_fd)
+        if not try_lock(lock_fd):
+            # Lock held — a daemon runs, or a daemon starts.
+            return
+        try:
+            # We hold the lock — no daemon holds it.  A daemon that started
+            # between the ping and the try of the lock answers the ping now.
+            daemon_answers = ping_daemon(root)
+        finally:
+            unlock(lock_fd)
     except OSError:
-        os.close(lock_fd)
         return
-    if not locked:
-        # Lock held — daemon is running or another MCP server is spawning it
+    finally:
         os.close(lock_fd)
-        return
-
-    # We hold the lock — daemon is definitely dead (or never started).
-    # Double-check ping in case of a race (daemon started between ping and lock).
-    if ping_daemon(root):
-        unlock(lock_fd)
-        os.close(lock_fd)
+    if daemon_answers:
         return
 
-    # ── Spawn-before-release protocol ──
-    # The daemon's main() blocks on LOCK_EX acquisition of watcher.lock.
-    # We spawn the daemon WHILE holding our lock.  The daemon starts,
-    # reaches its lock call, and blocks (because WE
-    # hold the lock).  Then we release — the daemon immediately acquires
-    # the lock and enters its main loop.
-    #
-    # Without this protocol, a second MCP server arriving between our
-    # release and the daemon's acquisition would see the lock free,
-    # conclude "daemon dead," and spawn a SECOND daemon — leading to
-    # two daemons racing to run background reindexes.
     log.info("Spawning watcher daemon for %s", root)
     _spawn_daemon(root)
-
-    unlock(lock_fd)
-    os.close(lock_fd)
