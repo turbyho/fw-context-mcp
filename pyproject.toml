@@ -141,9 +141,15 @@ include = [
     "/src",
     "/tests",
 ]
+# A folder exclude ends in "/**", not in "/". Hatchling puts these patterns
+# after the patterns of .gitignore into one pathspec.GitIgnoreSpec. In it, a
+# pattern that matches the file itself has priority over a pattern that
+# matches only a parent folder. Thus "!**/.fw-context/config.toml" of
+# .gitignore won over "tests/builds/", and each untracked config.toml of
+# tests/builds/ went into an sdist of the working tree.
 exclude = [
-    "tests/builds/",
-    "docs/examples/raw/",
+    "tests/builds/**",
+    "docs/examples/raw/**",
     "tests/test_feature_comparison.py",
 ]
 
