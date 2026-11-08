@@ -2,7 +2,7 @@
 
 TOCTOU note: ``os.kill(pid, 0)`` has an inherent race — the PID may be
 reused between the check and the action.  Risk is low on Linux (PID wrap
-at 4M), and :func:`fcntl.flock` is used where correctness matters
+at 4M), and :mod:`fw_context_mcp.file_lock` is used where correctness matters
 (``watcher.lock``).  The helpers in this module are for **coordination
 markers** (pause, reindex-in-progress), not mutual exclusion.
 
@@ -142,7 +142,7 @@ class PidFile:
 
         **TOCTOU:** the PID may be reused between the check and the
         action.  Risk is low on Linux (PID wrap at 4M).  Use
-        :func:`fcntl.flock` where correctness matters.
+        :mod:`fw_context_mcp.file_lock` where correctness matters.
         """
         try:
             os.kill(pid, 0)

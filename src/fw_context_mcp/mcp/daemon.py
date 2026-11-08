@@ -62,7 +62,6 @@ Four missed pings = 60 s.  This gives headroom for:
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import logging
 import os
 import re
@@ -78,6 +77,7 @@ from typing import TextIO
 from ..config import derive_project_id
 from ..config import load as load_config
 from ..exit_codes import EXIT_ALREADY_RUNNING, EXIT_SUPERSEDED
+from ..file_lock import try_lock, unlock
 from ..indexer.db._locking import index_run_lock_held
 from ..utils import HEADER_EXTENSIONS, TU_EXTENSIONS, remove_stale_tmp
 from .background import PENDING_MARKER
@@ -226,8 +226,11 @@ async def daemon_main(project_root: Path) -> None:
     lock_file = db_dir / "watcher.lock"
     try:
         lock_fd = os.open(lock_file, os.O_CREAT | os.O_RDWR)
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except (OSError, BlockingIOError):
+        locked = try_lock(lock_fd)
+    except OSError as exc:
+        log.error("Cannot lock %s: %s", lock_file, exc)
+        sys.exit(1)
+    if not locked:
         log.error("Daemon already running for %s", project_root)
         sys.exit(1)
 
@@ -266,7 +269,7 @@ async def daemon_main(project_root: Path) -> None:
     try:
         server, sock_path = await _setup_unix_socket(db_dir, _on_ping)
     except OSError:
-        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        unlock(lock_fd)
         os.close(lock_fd)
         pid_file.unlink(missing_ok=True)
         sys.exit(1)
@@ -825,7 +828,7 @@ async def _cleanup_daemon(
     # of the next daemon finds it again.
     PidFile(sock_path.parent / PENDING_MARKER).unlink_if_ours()
     _cleanup_files(sock_path, pid_file)
-    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    unlock(lock_fd)
     os.close(lock_fd)
 
 

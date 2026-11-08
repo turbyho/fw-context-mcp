@@ -26,13 +26,11 @@ from __future__ import annotations
 
 import base64
 import contextlib
-import errno
 import hashlib
 import json
 import logging
 import os
 import secrets as token_random
-import sys
 import threading
 import time
 import uuid
@@ -46,6 +44,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
 
+from ..file_lock import lock, unlock
 from ..utils import fw_context_home, is_fatal, write_text_atomic
 from .client import ChatResult, Usage
 from .errors import ChatApiError, ChatPromptTooLong, LLMError, LLMStopRun
@@ -151,38 +150,18 @@ def _refresh_lock(profile: str) -> Iterator[None]:
 
     The refresh token rotates: a second process that refreshed the old one
     at the same time made the sign-in unusable (``refresh_token_reused``).
-    ``fcntl.flock`` on Linux and macOS, ``msvcrt.locking`` on Windows; the
-    kernel releases the lock when the process ends.
+    :mod:`fw_context_mcp.file_lock` (``flock`` on Linux and macOS,
+    ``LockFileEx`` on Windows); the kernel releases the lock when the process
+    ends.
     """
     path = credentials_path(profile).with_suffix(".lock")
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a+b") as handle:
-        if sys.platform == "win32":
-            import msvcrt
-
-            handle.seek(0)
-            while True:
-                try:
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-                    break
-                except OSError as exc:
-                    # LK_LOCK gives up after 10 s with EDEADLOCK: wait again.
-                    # Another error does not pass by a wait.
-                    if exc.errno not in (errno.EDEADLOCK, errno.EACCES):
-                        raise
-            try:
-                yield
-            finally:
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        lock(handle.fileno())
+        try:
+            yield
+        finally:
+            unlock(handle.fileno())
 
 
 # ── The ID token ──

@@ -1,29 +1,32 @@
 """File-system write lock for index operations.
 
 Serializes all write operations (symbol storage, LLM analysis, embeddings)
-across processes.  Uses ``fcntl.flock`` — the kernel releases the lock
-automatically on process exit, so a crash never leaves a stale lock.
+across processes.  Uses :mod:`fw_context_mcp.file_lock` (``flock`` on POSIX,
+``LockFileEx`` on Windows) — the kernel releases the lock automatically on
+process exit, so a crash never leaves a stale lock.
 
-WHY fcntl.flock (not a file-based lock or SQLite WAL): SQLite WAL mode
+WHY a kernel file lock (not a file-based lock or SQLite WAL): SQLite WAL mode
 allows concurrent reads but serializes writes per connection.  Multiple
 processes (indexing daemon, reindex_file, CLI watch) may all try to write
 simultaneously.  An external lock serializes them at the application level,
 preventing SQLITE_BUSY errors and ensuring atomic multi-table operations.
 
-WHY advisory lock (not mandatory): fcntl.flock is cooperative — only
-processes that check the lock are serialized.  This is sufficient because
+WHY advisory lock (not mandatory): the lock is cooperative — only
+processes that check the lock are serialized.  On Windows the lock is on one
+byte after the end of the file, thus it blocks no read of the file.  This is sufficient because
 all fw-context processes use ``write_lock``.  A mandatory lock (chmod +l)
 would block even read-only operations and requires root.
 """
 
 from __future__ import annotations
 
-import fcntl
 import os
 import time as _time
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
+
+from ...file_lock import held_by_another, try_lock, unlock
 
 __all__ = [
     "IndexRunLocked",
@@ -67,7 +70,7 @@ def index_run_lock(db_dir: Path) -> Generator[None, None, None]:
     each captured its own file snapshot and header ownership at start, and
     each deletes rows the other just wrote.
 
-    WHY ``flock`` rather than a PID file: the kernel drops the lock when the
+    WHY a kernel file lock rather than a PID file: the kernel drops the lock when the
     process exits, however it exits.  A PID file survives a crash and has to
     be validated against ``/proc``, which is how the previous guard here came
     to be dead code — it compared the interpreter name against a list that
@@ -83,11 +86,9 @@ def index_run_lock(db_dir: Path) -> Generator[None, None, None]:
     fd = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o644)
     acquired = False
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            acquired = True
-        except BlockingIOError:
-            raise IndexRunLocked(db_dir, _read_holder_pid(lock_file)) from None
+        if not try_lock(fd):
+            raise IndexRunLocked(db_dir, _read_holder_pid(lock_file))
+        acquired = True
         # Record who holds it, for the refusal message the next caller prints.
         os.ftruncate(fd, 0)
         os.write(fd, str(os.getpid()).encode())
@@ -96,7 +97,7 @@ def index_run_lock(db_dir: Path) -> Generator[None, None, None]:
     finally:
         if acquired:
             os.ftruncate(fd, 0)
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            unlock(fd)
         os.close(fd)
 
 
@@ -109,20 +110,7 @@ def index_run_lock_held(db_dir: Path) -> bool:
     lock went to another one.  The lock itself stays with its holder until
     the holder ends.
     """
-    lock_file = db_dir / "index.lock"
-    try:
-        fd = os.open(lock_file, os.O_RDWR)
-    except OSError:
-        return False
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        return True
-    else:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        return False
-    finally:
-        os.close(fd)
+    return held_by_another(db_dir / "index.lock")
 
 
 def _read_holder_pid(lock_file: Path) -> int | None:
@@ -144,8 +132,9 @@ def write_lock(db_dir: Path, timeout: float = 60.0) -> Generator[None, None, Non
     """Acquire an exclusive write lock for the index directory.
 
     Serializes all write operations (symbol storage, LLM analysis, embeddings)
-    across processes.  Uses ``fcntl.flock`` — the kernel releases the lock
-    automatically on process exit, so a crash never leaves a stale lock.
+    across processes.  Uses :func:`fw_context_mcp.file_lock.try_lock` — the
+    kernel releases the lock automatically on process exit, so a crash never
+    leaves a stale lock.
 
     Blocks for up to *timeout* seconds; raises ``WriteLockTimeout`` when the
     lock cannot be acquired in time.  Callers should catch and propagate
@@ -164,19 +153,15 @@ def write_lock(db_dir: Path, timeout: float = 60.0) -> Generator[None, None, Non
     deadline = _time.monotonic() + timeout
     acquired = False
     try:
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                acquired = True
-                break
-            except BlockingIOError:
-                if _time.monotonic() > deadline:
-                    raise WriteLockTimeout(
-                        f"Could not acquire write lock for {db_dir} within {timeout:.0f}s"
-                    ) from None
-                _time.sleep(0.5)
+        while not try_lock(fd):
+            if _time.monotonic() > deadline:
+                raise WriteLockTimeout(
+                    f"Could not acquire write lock for {db_dir} within {timeout:.0f}s"
+                )
+            _time.sleep(0.5)
+        acquired = True
         yield
     finally:
         if acquired:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            unlock(fd)
         os.close(fd)

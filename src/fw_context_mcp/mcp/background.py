@@ -7,9 +7,9 @@ and how to pause the background reindex during write operations.
 
 Key design decisions:
 
-- **Daemon spawning uses ``fcntl.flock`` (not PID files) for mutual exclusion**:
+- **Daemon spawning uses a kernel file lock (not PID files) for mutual exclusion**:
   PID files have an inherent TOCTOU race — the PID may be reused between
-  ``read_pid()`` and ``os.kill()``.  ``flock`` is an atomic kernel lock that
+  ``read_pid()`` and ``os.kill()``.  :mod:`fw_context_mcp.file_lock` is an atomic kernel lock that
   survives process death (the kernel releases it automatically).  The spawning
   protocol in ``_ensure_daemon_running`` holds the lock, spawns the daemon,
   then releases — the daemon blocks on its own ``flock`` acquisition and
@@ -31,7 +31,6 @@ Key design decisions:
 
 from __future__ import annotations
 
-import fcntl
 import logging
 import os
 import re
@@ -39,6 +38,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from ..file_lock import held_by_another, try_lock, unlock
 from .shared.context import _db_path
 from .shared.pid_file import PidFile
 
@@ -102,27 +102,13 @@ def _is_bg_reindex_running(root: Path) -> bool:
     if not db_path.exists():
         return False
 
-    def _lock_held(lock_file: Path) -> bool:
-        try:
-            lock_fd = os.open(lock_file, os.O_CREAT | os.O_RDWR)
-        except OSError:
-            return False
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            os.close(lock_fd)
-            return True
-        fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        os.close(lock_fd)
-        return False
-
     # 1. Index PID file — daemon subprocess or standalone fw-context index
     reindex_pid_file = db_path.parent / "reindex.pid"
     if PidFile.is_active(reindex_pid_file):
         return True
 
     # 2. General write lock — held during reindex_file, reset_index, etc.
-    if _lock_held(db_path.parent / "write.lock"):
+    if held_by_another(db_path.parent / "write.lock"):
         return True
 
     return False
@@ -231,7 +217,7 @@ def read_reindex_progress(db_dir: Path) -> str | None:
 def _ensure_daemon_running(root: Path) -> None:
     """Make sure the persistent watcher daemon is running for *root*.
 
-    Uses *watcher.lock* (fcntl) as both daemon-alive indicator and spawn
+    Uses *watcher.lock* (a kernel file lock) as both daemon-alive indicator and spawn
     guard.  The daemon acquires the lock at startup; this function checks
     the ping first (fast path), then falls back to the lock for spawn
     coordination.
@@ -251,24 +237,29 @@ def _ensure_daemon_running(root: Path) -> None:
     lock_file = db_dir / "watcher.lock"
     try:
         lock_fd = os.open(lock_file, os.O_CREAT | os.O_RDWR)
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        # Lock held — daemon is running or another MCP server is spawning it
-        return
     except OSError:
+        return
+    try:
+        locked = try_lock(lock_fd)
+    except OSError:
+        os.close(lock_fd)
+        return
+    if not locked:
+        # Lock held — daemon is running or another MCP server is spawning it
+        os.close(lock_fd)
         return
 
     # We hold the lock — daemon is definitely dead (or never started).
     # Double-check ping in case of a race (daemon started between ping and lock).
     if ping_daemon(root):
-        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        unlock(lock_fd)
         os.close(lock_fd)
         return
 
     # ── Spawn-before-release protocol ──
     # The daemon's main() blocks on LOCK_EX acquisition of watcher.lock.
     # We spawn the daemon WHILE holding our lock.  The daemon starts,
-    # reaches its fcntl.flock(LOCK_EX) call, and blocks (because WE
+    # reaches its lock call, and blocks (because WE
     # hold the lock).  Then we release — the daemon immediately acquires
     # the lock and enters its main loop.
     #
@@ -279,5 +270,5 @@ def _ensure_daemon_running(root: Path) -> None:
     log.info("Spawning watcher daemon for %s", root)
     _spawn_daemon(root)
 
-    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    unlock(lock_fd)
     os.close(lock_fd)
