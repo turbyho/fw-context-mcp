@@ -69,7 +69,16 @@ def ninja_project(tmp_path: Path) -> Path:
             {
                 "directory": str(tmp_path),
                 "file": "main.c",
-                "arguments": ["cc", "-c", "main.c", "-o", "main.o"],
+                # An ELF target on each host: a GNU linker script names
+                # the symbols of ELF objects.  The `cc` of macOS has a Mach-O
+                # target, and there the link name of a C symbol starts with
+                # `_` (measured: libclang 22 gives `_main` for
+                # arm64-apple-darwin, `main` for x86_64-unknown-linux-gnu),
+                # thus no name of the script matches a compiled definition.
+                "arguments": [
+                    "cc", "--target=x86_64-unknown-linux-gnu",
+                    "-c", "main.c", "-o", "main.o",
+                ],
             }
         ]),
         encoding="utf-8",

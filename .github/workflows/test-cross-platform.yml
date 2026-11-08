@@ -1,11 +1,12 @@
-# Tests on macOS and Windows.
+# Tests on Windows.
 #
-# The project must support Linux and macOS, and Windows where it can.  This
-# workflow is prepared but not yet part of every push: it runs only when it
-# is started by hand (Actions > Test (macOS, Windows) > Run workflow).  When
-# the suite passes on both hosts, add `push` and `pull_request` to `on`, or
-# move the matrix into test.yml.
-name: Test (macOS, Windows)
+# The project must support Linux and macOS (test.yml runs them on each push),
+# and Windows where it can.  Windows is not supported yet: the file locks
+# (fcntl), the daemon socket (AF_UNIX) and the process groups (killpg) use
+# POSIX calls, thus mypy and the tests fail.  This workflow runs only when it
+# is started by hand (Actions > Test (Windows) > Run workflow).  When the suite
+# passes on Windows, move windows-latest into the matrix of test.yml.
+name: Test (Windows)
 
 on:
   workflow_dispatch:
@@ -15,11 +16,7 @@ permissions:
 
 jobs:
   test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

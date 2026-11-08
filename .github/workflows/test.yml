@@ -7,13 +7,26 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows is not supported yet: the file locks, the daemon socket and
+        # the process groups use POSIX calls.  test-cross-platform.yml runs
+        # Windows by hand.
+        os: [ubuntu-latest, macos-latest]
+        # The oldest version of requires-python and the newest Python.
+        python-version: ['3.11', '3.14']
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: ${{ matrix.python-version }}
       - run: pip install -e ".[dev]"
       - run: ruff check src/
       - run: mypy src/
+      # Unpack the bundled clang compiler headers, as `fw-context init` does
+      # on a user host.
+      - run: fw-context doctor --fix --only clang-resource
+        continue-on-error: true
       - run: pytest tests/ -q -m "not ollama and not libclang and not slow and not system"
