@@ -71,6 +71,8 @@ dev = [
     "ruff>=0.4",
     "mypy>=1.10",
     "bandit>=1.7",
+    # tests/test_packaging.py asks the sdist builder which files it selects.
+    "hatchling>=1.27",
 ]
 
 [tool.bandit]
