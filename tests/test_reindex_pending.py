@@ -25,6 +25,7 @@ from types import SimpleNamespace
 import pytest
 
 from fw_context_mcp.exit_codes import EXIT_ALREADY_RUNNING, EXIT_SUPERSEDED
+from fw_context_mcp.file_lock import try_lock
 from fw_context_mcp.mcp.background import PENDING_MARKER
 from fw_context_mcp.mcp.shared.pid_file import PidFile
 
@@ -535,6 +536,9 @@ class TestTheStartOfTheDaemon:
 
         PidFile(tmp_path / PENDING_MARKER).write()
         lock_fd = os.open(tmp_path / "watcher.lock", os.O_CREAT | os.O_RDWR)
+        # The daemon holds the lock until its cleanup.  Windows refuses the
+        # unlock of a file descriptor that holds no lock (ERROR_NOT_LOCKED).
+        assert try_lock(lock_fd)
         asyncio.run(daemon_mod._cleanup_daemon(
             None, _Server(), tmp_path / "daemon.sock", tmp_path / "watcher.pid", lock_fd, asyncio.Event(),
         ))
