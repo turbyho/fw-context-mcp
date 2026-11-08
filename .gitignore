@@ -8,18 +8,16 @@ build/
 venv/
 .env
 
-# Project memory and plans (local only)
+# Project memory (local only)
 MEMORY.md
 memory/
-plans/
-
-# Local debug scripts
-_debug_*.py
 
 .lean-ctx
 
-# AI tools
-.claude/
+# Files that "fw-context init" and the AI tools write. They are copies of
+# files in src/fw_context_mcp/data/ or settings of a tool, not sources.
+/.claude/skills/fw-review/
+/.claude/agents/
 .opencode/
 .agents/
 .codex/
@@ -27,8 +25,6 @@ _debug_*.py
 .cursor/
 .copilot/
 .windsurf/
-CLAUDE.md
-AGENTS.md
 
 # IDE
 .vscode/
@@ -39,18 +35,10 @@ AGENTS.md
 .coverage
 htmlcov/
 .lean-ctx/
-# Keep this pattern anchored to the project root.  An unanchored "work/"
-# also matches the absolute path of a checkout below a directory with the
-# name "work".  Hatchling tests the project root against this file and drops
-# every pattern on a match, thus the sdist gets all ignored files.
-# See hatchling/builders/config.py, load_vcs_exclusion_patterns().
-/work/
 tests/results/
-docs/examples/raw/
 
 # Backup and temporary files
 *.bak
-LEAN-CTX.md
 
 # Python version manager (local only)
 .python-version
@@ -60,21 +48,6 @@ LEAN-CTX.md
 # it tracked only shipped a stale 500 KB file inside every sdist. Track it
 # again if the build ever moves to `uv sync --locked`.
 uv.lock
-
-# Search-quality experiments — local only.  The scripts and their datasets
-# are named after the private firmware projects they were measured on, and
-# this repository is public.  Kept on disk, out of git.
-experiments/
-
-# Planning documents — local only.  Czech-language internal planning that
-# names private firmware projects, their repository layout and their
-# findings.  This repository is public.  Kept on disk, out of git.
-plans/
-
-# Local comparison harness — runs only with FW_CONTEXT_COMPARISON=1 against
-# indexes of private firmware projects, and is hardcoded to their project
-# ids and symbol names.  It can never run for anyone else.
-tests/test_feature_comparison.py
 
 # fw-context
 compile_commands.json
