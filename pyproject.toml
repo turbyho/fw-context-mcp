@@ -116,9 +116,35 @@ include = [
     "src/fw_context_mcp/data/clang-resource/*",
 ]
 
+# The sdist holds only the public files. The work material (plans/,
+# experiments/ and the files for LLM agents) is in git on the private
+# remote, thus .gitignore does not keep it out of the sdist. This list
+# does that.
 [tool.hatch.build.targets.sdist]
+include = [
+    "/.dockerignore",
+    "/.fw-context/config.toml",
+    "/.github",
+    "/.gitignore",
+    "/.glama",
+    "/Dockerfile",
+    "/LICENSE",
+    "/Makefile",
+    "/README-MCP.md",
+    "/README.md",
+    "/bump.py",
+    "/docs",
+    "/glama.json",
+    "/pyproject.toml",
+    "/scripts/build_clang_headers.py",
+    "/server.json",
+    "/src",
+    "/tests",
+]
 exclude = [
     "tests/builds/",
+    "docs/examples/raw/",
+    "tests/test_feature_comparison.py",
 ]
 
 [tool.ruff]
