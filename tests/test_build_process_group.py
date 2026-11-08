@@ -337,9 +337,16 @@ def test_the_recorded_start_time_matches_the_live_leader(tmp_path: Path):
         "import sys; from fw_context_mcp.utils import process_start_time; "
         "import os; print(process_start_time(os.getpid()))"
     )
+    # The parent writes the record after the start of the leader, as in the
+    # tests above: the leader waits for it.  On macOS the parent first runs
+    # `ps` for the start time, and the leader read an empty record.
+    script = (
+        f"while [ ! -s {record} ]; do sleep 0.01; done; "
+        f"cat {record} > {copy}; exec {sys.executable} -c '{probe}' > {own}"
+    )
     with record_build_groups(record):
         run_in_process_group(
-            ["sh", "-c", f"cat {record} > {copy}; exec {sys.executable} -c '{probe}' > {own}"],
+            ["sh", "-c", script],
             cwd=tmp_path, env=dict(os.environ), timeout=30.0, capture_output=True,
         )
 
