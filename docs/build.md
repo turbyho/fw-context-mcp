@@ -256,8 +256,8 @@ Exceptions:
 | `clean` | `bool` | `true` | Mbed OS, PlatformIO, Zephyr, ESP-IDF, Arduino, CMake | Run a clean build before fw-context generates the file. **Recommended.** A clean build makes sure that `compile_commands.json` is complete. The other builders do not read this key. A Zephyr sysbuild variant does not read it either: it always builds with `--pristine=auto`. |
 | `command` | `str` | — | all | A command that replaces the build of the builder. Highest priority: fw-context ignores the settings of the builder. It runs `pre_build` first, and it applies `[build] env` to the command. The command must write `compile_commands.json` into the project root. `timeout` does not apply: the command has no time limit. The command runs without a shell, see [example 11](#11-shell-override--bear-wrapping-a-custom-build). |
 | `python` | `str` | (auto-detect) | all | The Python interpreter for pip-based CLI tools, such as `mbed-cli`, `platformio`, `keil2clangd`, or `compiledb`. `fw-context init` detects this automatically, from pyenv, venv, and common install paths. Set this parameter manually when automatic detection fails. |
-| `activate` | `str` | (auto-detect) | all | A shell script that fw-context sources before the build, for example the toolchain environment of NCS, or `export.sh` for ESP-IDF. `fw-context init` detects this automatically. Set this parameter manually when automatic detection fails. |
-| `pre_build` | `str` | — | all | A shell command that fw-context runs before the build, the convert step, or the generate step. Put it in `config.toml` when the whole team uses it, or in `local.toml` when it is specific to your machine. |
+| `activate` | `str` | (auto-detect) | all | A script that sets up the environment of the build, for example the toolchain environment of NCS, or `export.sh` for ESP-IDF. On Linux and macOS it is a shell script that fw-context sources before each build command. On Windows it is a `.bat`, `.cmd` or `.ps1` script (see [General](#general)). `fw-context init` detects this automatically. Set this parameter manually when automatic detection fails. |
+| `pre_build` | `str` | — | all | A command line that fw-context runs before the build, the convert step, or the generate step. It runs without a shell: fw-context splits it as the shell of the host does (POSIX shell words, or the rules of `CommandLineToArgvW` on Windows). For a shell, write `sh -c '…'` or `cmd /c …`. Put it in `config.toml` when the whole team uses it, or in `local.toml` when it is specific to your machine. |
 | `env` | `dict[str,str]` | `{}` | all | Environment variables for each command of the build: the builder commands, `pre_build` and `command`. |
 | `timeout` | `float` | `7200` | all | The maximum time in seconds of each build command and of `pre_build`. When a command runs longer, fw-context stops it, and the build fails. |
 
@@ -279,6 +279,15 @@ it looks in the `PATH` of the build, which includes `extra_path`. The
 a `west` from outside the environment of the project can name a different
 workspace. A sysbuild variant with its own `activate` looks in its own
 environment.
+
+On Windows there is no `source`. fw-context runs the `activate` script
+(`.bat` or `.cmd` through `cmd.exe`, `.ps1` through PowerShell) before each
+build command, reads the environment that the script leaves, and runs the
+command with that environment, without a shell. The script and the command
+share one `timeout`. fw-context looks for a tool in the `PATH` and the
+`PATHEXT` of that environment, and not in the current directory. Another
+kind of script (`.sh`), or a `.bat` path that holds `%` or `^`, stops the
+build with an error that names the script.
 
 The Zephyr and ESP-IDF builds ask for no dependency (`.d`) files: the
 manifest of the index records the headers of each unit. An older version
@@ -746,9 +755,10 @@ Before the conversion step, `pre_build` runs a script that generates
 `version.h`. The script is part of the repository, as the build files are.
 
 `pre_build`, `command` and each build command run in a new session with no
-controlling terminal. Thus fw-context can stop the whole build, the
-compilers included. Output to the terminal still works. A hook that opens
-`/dev/tty` fails: a password prompt (`sudo`, `ssh`) or a curses screen
+controlling terminal (on Windows: in a job object). Thus fw-context can stop
+the whole build, the compilers included. Output to the terminal still
+works. The build gets no input: a hook that opens `/dev/tty` or reads its
+stdin fails, thus a password prompt (`sudo`, `ssh`) or a curses screen
 (`menuconfig`) does not work there.
 
 ### 10. CMake with Ninja
