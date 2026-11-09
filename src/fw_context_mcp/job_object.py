@@ -43,11 +43,16 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
+from typing import TypeVar
 
 if sys.platform == "win32":
     import ctypes
     from ctypes import wintypes
+
+    #: A ``Popen`` in text mode or in bytes mode.
+    _Process = TypeVar("_Process", subprocess.Popen[str], subprocess.Popen[bytes])
 
     CREATE_SUSPENDED = 0x00000004
     CREATE_NEW_PROCESS_GROUP = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -179,13 +184,37 @@ if sys.platform == "win32":
                 raise
 
         def start(
-            self, cmd: list[str], *, cwd: Path, env: dict[str, str], stdout: int | None, stderr: int | None,
+            self, cmd: list[str] | str, *, cwd: Path, env: dict[str, str], stdout: int | None, stderr: int | None,
         ) -> subprocess.Popen[str]:
             """Start *cmd* suspended (text mode), put it into this job, then let it run.
 
+            *cmd* is a list of arguments, or a Windows command line for a
+            program whose command line has rules of its own (``cmd.exe /c``
+            for a batch file, ``utils._windows_command``).
+
             ``CREATE_NEW_PROCESS_GROUP`` keeps the Ctrl-C of the terminal
             from the build, as the new session does on POSIX: this process
-            gets it, and it stops the build.
+            gets it, and it stops the build.  No stdin: in an MCP server it
+            is the JSON-RPC pipe of the client.
+            """
+            return self._started(lambda: subprocess.Popen(  # noqa: S603 — argv list or a command line of fw-context
+                cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, text=True,
+                creationflags=CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP,
+            ))
+
+        def start_command_line(self, command_line: str, *, cwd: Path, env: dict[str, str]) -> subprocess.Popen[bytes]:
+            """Start the Windows *command_line* as :meth:`start` does, with stdout and stderr as bytes in pipes.
+
+            The output is bytes, because the caller knows its encoding.
+            """
+            return self._started(lambda: subprocess.Popen(  # noqa: S603 — a command line of fw-context
+                command_line, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                creationflags=CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP,
+            ))
+
+        def _started(self, popen: Callable[[], _Process]) -> _Process:
+            """Run *popen* (a suspended start), put the process into this job, then resume it.
 
             When the process cannot go into the job, it is ended and the
             error is raised: it has run no instruction.  The same for an
@@ -193,25 +222,26 @@ if sys.platform == "win32":
             the process runs: a suspended process outside of the job would
             stay forever.
             """
-            proc: subprocess.Popen[str] | None = None
+            proc: _Process | None = None
             try:
-                proc = subprocess.Popen(  # noqa: S603 — argv list, no shell
-                    cmd, cwd=cwd, env=env, stdout=stdout, stderr=stderr, text=True,
-                    creationflags=CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP,
-                )
-                process = _kernel32.OpenProcess(_PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, proc.pid)
-                _check(process, "OpenProcess")
-                try:
-                    _check(_kernel32.AssignProcessToJobObject(self._require(), process), "AssignProcessToJobObject")
-                finally:
-                    _kernel32.CloseHandle(process)
-                _resume_process(proc.pid)
+                proc = popen()
+                self._adopt(proc.pid)
             except BaseException:
                 if proc is not None:
                     proc.kill()
                     proc.wait()
                 raise
             return proc
+
+        def _adopt(self, pid: int) -> None:
+            """Put the suspended process *pid* into this job, then resume it."""
+            process = _kernel32.OpenProcess(_PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, pid)
+            _check(process, "OpenProcess")
+            try:
+                _check(_kernel32.AssignProcessToJobObject(self._require(), process), "AssignProcessToJobObject")
+            finally:
+                _kernel32.CloseHandle(process)
+            _resume_process(pid)
 
         def close(self) -> None:
             """Close the handle: Windows ends each process that is still in the job."""

@@ -21,6 +21,7 @@ import shlex
 from collections.abc import Iterator
 from pathlib import Path
 
+from ...utils import windows_words
 from ..linker_script import strip_comments
 
 log = logging.getLogger(__name__)
@@ -371,61 +372,6 @@ def ld_path(token: str, posix: bool | None = None) -> str | None:
     except ValueError:
         return None
     return words[0] if len(words) == 1 else None
-
-
-def windows_words(text: str) -> list[str]:
-    """Return the arguments that a Windows program gets for the command line *text*.
-
-    The rules of `CommandLineToArgvW`, which the C runtime and thus ld and
-    gcc use.  A double quote starts or ends a quoted part anywhere in a
-    word, `""` in a quoted part is one quote, and a backslash is literal
-    unless it comes before a quote: 2n backslashes give n and keep the quote
-    as a delimiter, 2n+1 give n and a literal quote.  `shlex` with
-    `posix=False` knows a quote only at the start of a word, thus
-    `-L"C:/My Projects/x"` became two words.
-
-    The `""` rule is the rule of the C runtime since 2008: the quoted part
-    stays open after the literal quote.  The first argument of a command
-    line has other rules, and this function never gets one.  The layer of
-    `cmd.exe /C` (`^`, `%`), which CMake adds for PRE_LINK and POST_BUILD,
-    is not modelled: those commands hold no argument of the link.
-    """
-    words: list[str] = []
-    index = 0
-    while index < len(text):
-        while index < len(text) and text[index] in " \t":
-            index += 1
-        if index == len(text):
-            break
-        word: list[str] = []
-        quoted = False
-        while index < len(text) and (quoted or text[index] not in " \t"):
-            char = text[index]
-            if char == "\\":
-                end = index
-                while end < len(text) and text[end] == "\\":
-                    end += 1
-                count = end - index
-                if end < len(text) and text[end] == '"':
-                    word.append("\\" * (count // 2))
-                    if count % 2:
-                        word.append('"')
-                        end += 1
-                else:
-                    word.append("\\" * count)
-                index = end
-            elif char == '"':
-                if quoted and index + 1 < len(text) and text[index + 1] == '"':
-                    word.append('"')
-                    index += 2
-                    continue
-                quoted = not quoted
-                index += 1
-            else:
-                word.append(char)
-                index += 1
-        words.append("".join(word))
-    return words
 
 
 def shell_words(text: str) -> list[str] | None:

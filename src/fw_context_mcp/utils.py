@@ -19,6 +19,7 @@ Why a single utils module instead of topic-split utility files:
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import io
 import json
@@ -40,7 +41,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, AnyStr
 
 if TYPE_CHECKING:
     from fw_context_mcp.indexer.build import BuildConfig
@@ -544,6 +545,10 @@ def run_in_process_group(
     curses screen (``menuconfig``) in a ``pre_build`` hook does not work.
     No build that fw-context starts needs one.
 
+    No stdin either (``DEVNULL``): in an MCP server the stdin of this
+    process is the JSON-RPC pipe of the client, and a build that read it
+    took the messages of the client.
+
     The record goes only when the group is gone.  An exception during the
     stop (a second Ctrl-C) can leave members alive, and the next index run
     then finds them through the record.
@@ -555,7 +560,8 @@ def run_in_process_group(
         return _run_in_job(cmd, cwd=cwd, env=env, timeout=timeout, capture_output=capture_output)
     pipe = subprocess.PIPE if capture_output else None
     proc = subprocess.Popen(  # noqa: S603 — argv list, no shell
-        cmd, cwd=cwd, env=env, stdout=pipe, stderr=pipe, text=True, start_new_session=True,
+        cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=pipe, stderr=pipe, text=True,
+        start_new_session=True,
     )
     record = _BUILD_GROUP_RECORD.get()
     try:
@@ -581,7 +587,9 @@ if sys.platform == "win32":
     #: The longest wait of :func:`_communicate_in_slices` before Python code runs again.
     _WAIT_SLICE_S = 0.1
 
-    def _communicate_in_slices(proc: subprocess.Popen, timeout: float | None) -> tuple[str | None, str | None]:
+    def _communicate_in_slices(
+        proc: subprocess.Popen[AnyStr], timeout: float | None,
+    ) -> tuple[AnyStr | None, AnyStr | None]:
         """``proc.communicate(timeout=timeout)``, in waits of ``_WAIT_SLICE_S``.
 
         WHY: on Windows ``communicate`` waits in ``WaitForSingleObject``, and
@@ -607,6 +615,204 @@ if sys.platform == "win32":
                 return proc.communicate(timeout=wait)
             except subprocess.TimeoutExpired:
                 continue
+
+    def _env_value(env: dict[str, str], name: str) -> str | None:
+        """The value of the variable *name* in *env*: the names of Windows are case-insensitive."""
+        upper = name.upper()
+        return next((value for key, value in env.items() if key.upper() == upper), None)
+
+    def _find_program(name: str, env: dict[str, str]) -> str | None:
+        """The full path of the program *name* in the ``PATH`` of *env*, with the extensions of its ``PATHEXT``.
+
+        WHY not ``shutil.which``: on Python 3.11 it looks in the current
+        directory of THIS process first (the directory of the MCP server),
+        and it takes ``PATHEXT`` from this process.  The build gets the
+        ``PATH`` and the ``PATHEXT`` of its environment, as POSIX
+        ``execvpe`` takes the ``PATH`` of the environment and no current
+        directory.  A name that has an extension of ``PATHEXT`` is looked
+        for as it is.
+        """
+        extensions = [ext for ext in (_env_value(env, "PATHEXT") or "").split(os.pathsep) if ext]
+        if Path(name).suffix.lower() in {ext.lower() for ext in extensions}:
+            candidates = [name]
+        else:
+            candidates = [name + ext for ext in extensions]
+        for directory in (_env_value(env, "PATH") or "").split(os.pathsep):
+            directory = directory.strip().strip('"')
+            if not directory:
+                continue
+            for candidate in candidates:
+                path = Path(directory, candidate)
+                if path.is_file():
+                    return str(path)
+        return None
+
+    class ActivateScriptError(RuntimeError):
+        """The activate script cannot run on Windows: its kind or its path (a fault of the config)."""
+
+    #: The characters that ``cmd.exe`` changes in a quoted path: ``%NAME%``
+    #: expands, and ``call`` doubles each ``^``.
+    _CMD_PATH_UNSAFE = ('"', "%", "^")
+
+    def _cmd_safe_path(path: str, what: str) -> str:
+        """*path* for a quoted place in a command line of ``cmd.exe``; ``ActivateScriptError`` when cmd.exe would change it."""
+        unsafe = [char for char in _CMD_PATH_UNSAFE if char in path]
+        if unsafe:
+            raise ActivateScriptError(f"{what} {path}: cmd.exe cannot run a path that holds {' '.join(unsafe)}")
+        return path
+
+    def _batch_argument(argument: str) -> str:
+        """*argument* quoted for a batch file that ``cmd.exe /c`` runs.
+
+        The rules of the repair of CVE-2024-24576 (BatBadBut) in the Rust
+        standard library: ``cmd.exe`` parses the command line of a batch
+        file again, thus ``&``, ``|``, ``<`` or ``>`` in an argument that
+        ``subprocess.list2cmdline`` makes start a second command.  Each
+        argument goes in double quotes, where those characters are literal;
+        a ``"`` is ``""``; a ``%`` is ``%%cd:~,%``, which ``cmd.exe`` gives
+        back as ``%`` and does not expand; backslashes before the closing
+        quote are doubled.  A line break cannot go through ``cmd.exe``.
+        """
+        if any(char in argument for char in "\r\n\0"):
+            raise ValueError(f"an argument of a batch file cannot hold a line break: {argument!r}")
+        quoted = argument.replace('"', '""').replace("%", "%%cd:~,%")
+        trailing = len(quoted) - len(quoted.rstrip("\\"))
+        return f'"{quoted}{chr(92) * trailing}"'
+
+    def _windows_command(cmd: list[str], env: dict[str, str]) -> list[str] | str:
+        """The program of *cmd* as a full path, and the command line of ``cmd.exe`` for a batch file.
+
+        - A bare name: ``_find_program`` in the environment of the build.
+          WHY: ``CreateProcess`` looks in the ``PATH`` of this process, not
+          of the build, and it adds only ``.exe``: a tool of ``extra_path``
+          or of an activate script did not start.  A name that the ``PATH``
+          does not hold raises ``FileNotFoundError``, as ``Popen`` on POSIX.
+        - A ``.bat`` or ``.cmd`` program (a shim of pyenv-win, a script of a
+          SDK): ``cmd.exe`` runs it, with the arguments of
+          ``_batch_argument``.  ``Popen`` with a list quotes them with
+          ``list2cmdline``, and ``cmd.exe`` then ran the text after a ``&``
+          of an argument, for example of a project path ``C:\\R&D\\fw``.
+        """
+        program = cmd[0]
+        if not os.path.dirname(program):
+            found = _find_program(program, env)
+            if found is None:
+                raise FileNotFoundError(errno.ENOENT, f"{program} is not on the PATH of the build", program)
+            program = found
+        if Path(program).suffix.lower() not in (".bat", ".cmd"):
+            return [program, *cmd[1:]]
+        batch = _cmd_safe_path(program, "build program")
+        arguments = " ".join(_batch_argument(argument) for argument in cmd[1:])
+        return f'"{_system_program("cmd.exe")}" /d /e:on /v:off /s /c ""{batch}" {arguments}"'
+
+    def _system_program(*parts: str) -> str:
+        """The full path of a program of Windows in ``%SystemRoot%\\System32``.
+
+        WHY not the bare name: ``CreateProcess`` looks for a bare name in
+        the PATH of this process, and the PATH of an operator can name a
+        different ``cmd.exe``.
+        """
+        return str(Path(os.environ["SystemRoot"], "System32", *parts))
+
+    #: Python code that writes its environment as JSON on stdout.  ASCII only
+    #: (``ensure_ascii``), thus no code page of a console or of PowerShell
+    #: changes a value on its way.  No ``"``, ``'``, ``%`` or ``^``: it goes
+    #: in quotes into the command lines of ``_activation_command_line``.
+    _DUMP_ENVIRONMENT = "import json,os,sys;sys.stdout.write(json.dumps(dict(os.environ)))"
+
+    def _activation_command_line(script: Path) -> str:
+        """The command line that runs the activate *script*, then writes the environment that it leaves.
+
+        The script writes its own output to stderr, and Python
+        (``_DUMP_ENVIRONMENT``) writes the environment to stdout:
+
+        - ``.bat``, ``.cmd``: ``cmd.exe`` runs the script with ``call`` and
+          ``1>&2``.  ``/s`` removes only the outer quotes of the command,
+          ``/v:off`` keeps ``!`` literal.
+        - ``.ps1``: PowerShell dot-sources the script, with each of its
+          streams to stderr.  ``-EncodedCommand`` carries the command, thus
+          no quote of the path reaches a parser of the command line.
+
+        Raises ``ActivateScriptError`` for another kind of script, and for a
+        ``.bat`` path that ``cmd.exe`` changes (``_cmd_safe_path``).
+        """
+        import base64
+
+        python = sys.executable
+        suffix = script.suffix.lower()
+        if suffix in (".bat", ".cmd"):
+            batch = _cmd_safe_path(str(script), "activate script")
+            interpreter = _cmd_safe_path(python, "the Python of fw-context")
+            line = f'call "{batch}" 1>&2 && "{interpreter}" -c "{_DUMP_ENVIRONMENT}"'
+            return f'"{_system_program("cmd.exe")}" /d /e:on /v:off /s /c "{line}"'
+        if suffix == ".ps1":
+            def literal(text: str) -> str:
+                return "'" + text.replace("'", "''") + "'"
+
+            command = (
+                "$ErrorActionPreference = 'Stop'; "
+                f". {literal(str(script))} *>&1 | ForEach-Object {{ [Console]::Error.WriteLine([string]$_) }}; "
+                f"& {literal(python)} -c {literal(_DUMP_ENVIRONMENT)}; "
+                "exit $LASTEXITCODE"
+            )
+            encoded = base64.b64encode(command.encode("utf-16-le")).decode("ascii")
+            powershell = _system_program("WindowsPowerShell", "v1.0", "powershell.exe")
+            return f'"{powershell}" -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {encoded}'
+        raise ActivateScriptError(
+            f"activate script {script}: on Windows fw-context runs a .bat, .cmd or .ps1 script "
+            "([build] activate)",
+        )
+
+    def _parse_environment(script: Path, stdout: bytes) -> dict[str, str]:
+        """Read the environment that ``_DUMP_ENVIRONMENT`` wrote after *script*."""
+        try:
+            values = json.loads(stdout.decode("ascii"))
+        except ValueError as exc:
+            raise RuntimeError(f"activate script {script}: cannot read its environment: {exc}") from exc
+        if not isinstance(values, dict) or not all(
+            isinstance(key, str) and isinstance(value, str) for key, value in values.items()
+        ):
+            raise RuntimeError(f"activate script {script}: its environment is not a map of strings")
+        return values
+
+    def _activated_environment(
+        script: Path, *, cwd: Path, env: dict[str, str], timeout: float | None,
+    ) -> dict[str, str]:
+        """Run the activate *script* with *env*, and return the environment that it leaves.
+
+        WHY not the command after the script in one shell, as ``source``
+        on POSIX: each argument of the command would need the quoting of
+        ``cmd.exe``, and a wrong quote lets ``cmd.exe`` run a part of an
+        argument.  The build command then runs with the environment, and
+        without a shell (``_windows_command``).
+
+        The script runs in a job object, as a build: a timeout or a stop
+        ends each process that it started.  ``ActivateScriptError`` for a
+        script that cannot run on Windows, ``RuntimeError`` for a script
+        that fails (with the end of its output, in the OEM code page of
+        ``cmd.exe``), ``BuildTimeoutError`` for a timeout.
+        """
+        from .job_object import BuildJob
+
+        command_line = _activation_command_line(script)
+        with BuildJob() as job:
+            proc = job.start_command_line(command_line, cwd=cwd, env=env)
+            try:
+                stdout, stderr = _communicate_in_slices(proc, timeout)
+            except subprocess.TimeoutExpired:
+                job.close()
+                proc.communicate()
+                raise BuildTimeoutError(f"activate script {script} timed out after {timeout}s") from None
+            except BaseException:
+                job.close()
+                proc.wait()
+                raise
+        if proc.returncode != 0:
+            output = (stderr or b"").decode("oem", errors="replace")
+            raise RuntimeError(
+                f"activate script {script} failed (exit {proc.returncode}){_quote_stream('output', output)}",
+            )
+        return _parse_environment(script, stdout or b"")
 
     def _run_in_job(
         cmd: list[str],
@@ -638,7 +844,7 @@ if sys.platform == "win32":
 
         pipe = subprocess.PIPE if capture_output else None
         with BuildJob() as job:
-            proc = job.start(cmd, cwd=cwd, env=env, stdout=pipe, stderr=pipe)
+            proc = job.start(_windows_command(cmd, env), cwd=cwd, env=env, stdout=pipe, stderr=pipe)
             try:
                 stdout, stderr = _communicate_in_slices(proc, timeout)
             except subprocess.TimeoutExpired:
@@ -650,6 +856,102 @@ if sys.platform == "win32":
                 proc.wait()
                 raise
         return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+
+
+def windows_words(text: str) -> list[str]:
+    """Return the arguments that a Windows program gets for the command line *text*.
+
+    The rules of `CommandLineToArgvW`, which the C runtime and thus ld and
+    gcc use.  A double quote starts or ends a quoted part anywhere in a
+    word, `""` in a quoted part is one quote, and a backslash is literal
+    unless it comes before a quote: 2n backslashes give n and keep the quote
+    as a delimiter, 2n+1 give n and a literal quote.  `shlex` with
+    `posix=False` knows a quote only at the start of a word, thus
+    `-L"C:/My Projects/x"` became two words.
+
+    The `""` rule is the rule of the C runtime since 2008: the quoted part
+    stays open after the literal quote.  The first argument of a command
+    line has other rules, and this function never gets one.  The layer of
+    `cmd.exe /C` (`^`, `%`), which CMake adds for PRE_LINK and POST_BUILD,
+    is not modelled: those commands hold no argument of the link.
+    """
+    words: list[str] = []
+    index = 0
+    while index < len(text):
+        while index < len(text) and text[index] in " \t":
+            index += 1
+        if index == len(text):
+            break
+        word: list[str] = []
+        quoted = False
+        while index < len(text) and (quoted or text[index] not in " \t"):
+            char = text[index]
+            if char == "\\":
+                end = index
+                while end < len(text) and text[end] == "\\":
+                    end += 1
+                count = end - index
+                if end < len(text) and text[end] == '"':
+                    word.append("\\" * (count // 2))
+                    if count % 2:
+                        word.append('"')
+                        end += 1
+                else:
+                    word.append("\\" * count)
+                index = end
+            elif char == '"':
+                if quoted and index + 1 < len(text) and text[index + 1] == '"':
+                    word.append('"')
+                    index += 2
+                    continue
+                quoted = not quoted
+                index += 1
+            else:
+                word.append(char)
+                index += 1
+        words.append("".join(word))
+    return words
+
+
+def _windows_program_word(text: str) -> tuple[str, str]:
+    """Split the program name from a Windows command line; return the name and the rest.
+
+    The first argument has rules of its own in ``CommandLineToArgvW``: a
+    name that starts with a double quote ends at the next double quote, and
+    each other name ends at the first space or tab.  A backslash is always
+    literal there, thus ``"C:\\tools\\"`` keeps its last backslash.
+    """
+    text = text.lstrip(" \t")
+    if text.startswith('"'):
+        end = text.find('"', 1)
+        if end < 0:
+            return text[1:], ""
+        return text[1:end], text[end + 1:]
+    end = len(text)
+    for index, char in enumerate(text):
+        if char in " \t":
+            end = index
+            break
+    return text[:end], text[end:]
+
+
+def command_words(text: str) -> list[str]:
+    """Split a command line of the config (``[build] pre_build``, ``command``) into its arguments.
+
+    The rules of the host, as its shell gives the arguments to the program:
+    POSIX shell words (``shlex``) on POSIX, ``CommandLineToArgvW`` on
+    Windows.  WHY not ``shlex`` on Windows: it removes each backslash, thus
+    ``C:\\tools\\pre.bat`` became ``C:toolspre.bat``.
+
+    Raises ``ValueError`` for a POSIX command line with a quote that does
+    not end, as ``shlex.split`` does.
+    """
+    if sys.platform != "win32":
+        return shlex.split(text)
+    program, rest = _windows_program_word(text)
+    if not program and not rest.strip():
+        return []
+    return [program, *windows_words(rest)]
 
 
 def build_cfg_env(build_cfg: BuildConfig | None, env: dict[str, str] | None = None) -> dict[str, str]:
@@ -682,6 +984,17 @@ class BuildTimeoutError(RuntimeError):
     """
 
 
+def activate_script(activate: str, cwd: Path) -> Path:
+    """The path of the activate script *activate* of a build in *cwd*.
+
+    A relative path is relative to the directory of the build.  WHY:
+    ``source env.sh``, a name without a slash, looks in PATH before the
+    current directory, thus a different ``env.sh`` on PATH won.
+    """
+    script = Path(activate).expanduser()
+    return script if script.is_absolute() else Path(cwd) / script
+
+
 def run_build_command(
     cmd: list[str],
     cwd: Path,
@@ -704,7 +1017,8 @@ def run_build_command(
       ``timeout``, and ``env`` merge logic — a maintenance liability.
     - The ``activate`` block maps a declarative ``build_cfg.activate``
       field (a shell script path) into a ``bash -c "source <script>
-      && <cmd>"`` invocation.  Centralising this logic means only one
+      && <cmd>"`` invocation.  On Windows the command runs with the
+      environment that the script leaves (``_activated_environment``).  Centralising this logic means only one
       call site tests quoting (``shlex.quote``) and shell injection
       resistance — and only one call site has to keep the shell startup
       hooks out of that bash, which :func:`build_env` does.
@@ -737,17 +1051,22 @@ def run_build_command(
 
     merged_env = build_cfg_env(build_cfg, env)
 
-    if build_cfg:
-        if build_cfg.activate:
-            script = Path(build_cfg.activate).expanduser()
-            # A relative path is relative to the directory of the build.
-            # `source env.sh`, a name without a slash, looks in PATH before
-            # the current directory, thus a different env.sh on PATH won.
-            if not script.is_absolute():
-                script = Path(cwd) / script
-            expanded = str(script)
+    if build_cfg is not None and build_cfg.activate:
+        script = activate_script(build_cfg.activate, cwd)
+        if sys.platform == "win32":
+            # One timeout for the script and the command, as on POSIX, where
+            # bash runs the two under one timeout.
+            started = time.monotonic()
+            merged_env = _activated_environment(script, cwd=cwd, env=merged_env, timeout=timeout)
+            timeout -= time.monotonic() - started
+            if timeout <= 0:
+                raise BuildTimeoutError(
+                    f"Build command timed out: the activate script {script} used the whole timeout: "
+                    f"{description or ' '.join(cmd)}",
+                )
+        else:
             cmd_str = " ".join(shlex.quote(c) for c in cmd)
-            cmd = ["bash", "-c", f"source {shlex.quote(expanded)} && {cmd_str}"]
+            cmd = ["bash", "-c", f"source {shlex.quote(str(script))} && {cmd_str}"]
 
     try:
         # In its own process group — see run_in_process_group.
@@ -798,7 +1117,26 @@ def build_tool_available(name: str, cwd: Path, build_cfg: BuildConfig | None) ->
 
     A failed activate script also gives False, and the caller names the
     script in its message.
+
+    On Windows the lookup is ``_find_program`` in the environment that the
+    script leaves, as the build gets it.  A script that cannot run on
+    Windows (its kind, its path) raises ``ActivateScriptError``: the
+    message "not on PATH" would hide a fault of the config.
     """
+    if sys.platform == "win32":
+        environment = build_cfg_env(build_cfg)
+        if build_cfg is not None and build_cfg.activate:
+            script = activate_script(build_cfg.activate, cwd)
+            try:
+                environment = _activated_environment(
+                    script, cwd=cwd, env=environment, timeout=_TOOL_LOOKUP_TIMEOUT_S,
+                )
+            except ActivateScriptError:
+                raise
+            except RuntimeError as exc:
+                log.warning("%s not found after the activate script %s: %s", name, script, exc)
+                return False
+        return _find_program(name, environment) is not None
     if build_cfg is not None and build_cfg.activate:
         try:
             run_build_command(
@@ -825,6 +1163,12 @@ def missing_tool_message(name: str, build_cfg: BuildConfig | None, install_hint:
     message names the script, because a ``west`` on the PATH of the
     operator does not help that build.
     """
+    if build_cfg is not None and build_cfg.activate and sys.platform == "win32":
+        return (
+            f"{name} is not on PATH after the activate script {build_cfg.activate} "
+            "([build] activate).  Correct the script, or set [build] activate "
+            "to the script that sets up the environment of the project."
+        )
     if build_cfg is not None and build_cfg.activate:
         return (
             f"{name} is not on PATH after `source {build_cfg.activate}` "

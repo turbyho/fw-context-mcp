@@ -383,8 +383,10 @@ def test_a_pre_build_timeout_is_a_runtime_error(tmp_path: Path):
     """Each caller of generate_compile_commands catches RuntimeError only."""
     from fw_context_mcp.indexer.build import BuildConfig, _run_pre_build
 
+    # Python and not `sleep`: Windows has no sleep program.
+    sleep = f'"{sys.executable}" -c "import time; time.sleep(30)"'
     with pytest.raises(RuntimeError, match="timed out"):
-        _run_pre_build(BuildConfig(pre_build="sleep 30", timeout=1), tmp_path)
+        _run_pre_build(BuildConfig(pre_build=sleep, timeout=1), tmp_path)
 
 
 @posix_group
