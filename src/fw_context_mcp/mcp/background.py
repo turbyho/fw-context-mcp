@@ -54,6 +54,26 @@ def _pid_exists(pid: int) -> bool:
     return PidFile._pid_exists(pid)
 
 
+# The daemon serves each MCP server of the project, thus it must not end with
+# the terminal or the console of the process that started it, and a Ctrl-C
+# there must not reach it.
+#
+# - POSIX: a new session (start_new_session), thus no SIGHUP and no SIGINT of
+#   the terminal.  creationflags must be 0 there.
+# - Windows: start_new_session does nothing there, and the daemon shared the
+#   console of its parent: the close of that console or a Ctrl-C in it ended
+#   the daemon.  CREATE_NO_WINDOW gives the daemon a console of its own with
+#   no window, and its index runs and their builds get that console too, thus
+#   no window opens for them.  CREATE_NEW_PROCESS_GROUP keeps a Ctrl-C of a
+#   console from the daemon.
+if sys.platform == "win32":
+    _DAEMON_CREATIONFLAGS = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+    _DAEMON_NEW_SESSION = False
+else:
+    _DAEMON_CREATIONFLAGS = 0
+    _DAEMON_NEW_SESSION = True
+
+
 def _spawn_daemon(root: Path) -> None:
     """Spawn the watcher daemon, logging output to a file.
 
@@ -65,14 +85,18 @@ def _spawn_daemon(root: Path) -> None:
     try:
         fd = os.open(log_file, O_NOFOLLOW | os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
         log_fh = os.fdopen(fd, "a", encoding="utf-8", closefd=True)
-        subprocess.Popen(
+        subprocess.Popen(  # noqa: S603 — argv list, no shell
             [sys.executable, "-u", "-m", "fw_context_mcp.mcp.daemon", str(root)],
-            start_new_session=True,
+            # Not the stdin of this process: in an MCP server that is the
+            # JSON-RPC pipe of the client, and a daemon that held it kept the
+            # pipe open after the end of the server.
+            stdin=subprocess.DEVNULL,
             stdout=log_fh,
             stderr=subprocess.STDOUT,
+            start_new_session=_DAEMON_NEW_SESSION,
+            creationflags=_DAEMON_CREATIONFLAGS,
         )
         log_fh.close()
-        # Daemon process runs independently via start_new_session=True — no detach needed
     except (OSError, ValueError, TypeError, RuntimeError, AttributeError):
         log.exception("Failed to spawn watcher daemon for %s", root)
 

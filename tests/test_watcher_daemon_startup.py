@@ -408,3 +408,33 @@ class TestCmdIndexWiring:
         assert "'-DBUILD_ID' is not a macro name" in capsys.readouterr().err
         assert built == []
         assert started == []
+
+
+# ── The daemon does not end with the terminal of its parent ─────────────────
+
+
+def test_the_daemon_gets_a_session_or_a_console_of_its_own(monkeypatch, tmp_path: Path):
+    """POSIX: a new session.  Windows: a console of its own with no window, and a new process group.
+
+    On Windows ``start_new_session`` does nothing, and the daemon shared the
+    console of its parent: the close of that console or a Ctrl-C in it
+    ended the daemon.
+    """
+    import subprocess
+    import sys
+
+    import fw_context_mcp.mcp.background as background_mod
+
+    seen: dict = {}
+    monkeypatch.setattr(background_mod, "_db_path", lambda root: tmp_path / "index.db")
+    monkeypatch.setattr(background_mod.subprocess, "Popen", lambda argv, **kwargs: seen.update(kwargs))
+
+    background_mod._spawn_daemon(tmp_path)
+
+    # The stdin of an MCP server is the JSON-RPC pipe of its client.
+    assert seen["stdin"] is subprocess.DEVNULL
+    if sys.platform == "win32":
+        assert seen["creationflags"] == subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+        assert seen["start_new_session"] is False
+    else:
+        assert (seen["creationflags"], seen["start_new_session"]) == (0, True)
