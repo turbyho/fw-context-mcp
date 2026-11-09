@@ -873,7 +873,12 @@ async def explain_symbol(
         )
     else:
         try:
-            lines = Path(file_path).read_text(encoding="utf-8", errors="replace").splitlines()
+            # The lines of the indexer (``_parsed_text.decode_lines``): a text
+            # stream ends a line at "\n", "\r\n" or "\r" only.  str.splitlines()
+            # also ends one at "\f", "\v" and "\x85", and a file with form feeds
+            # (GNU page breaks) then showed a window above the symbol.
+            with Path(file_path).open(encoding="utf-8", errors="replace") as fh:
+                lines = [line.rstrip("\n") for line in fh]
             start = max(0, line_no - context_lines - 1)
             end = min(len(lines), line_no + context_lines)
             numbered = "\n".join(
