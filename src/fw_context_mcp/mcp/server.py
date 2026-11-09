@@ -1443,6 +1443,15 @@ def main() -> None:
         cfg = load_config(project_root=root)
     except ProjectNotInitializedError:
         log.info("Project not initialized at %s — get_project_status() will report not_initialized", root)
+        # The ping thread, as for a project without an index: the operator
+        # runs `fw-context init` and `fw-context index` while this server
+        # runs, and only the thread then starts the watcher daemon.  The
+        # thread survives the error of a project that is not initialized
+        # (ProjectNotInitializedError is a RuntimeError).
+        try:
+            _start_ping_thread(root)
+        except (RuntimeError, OSError):
+            log.exception("Ping thread startup failed — no automatic reindex until the server restarts")
         mcp.run()
         return
     except ConfigError as exc:

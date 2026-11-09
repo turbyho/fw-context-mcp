@@ -453,11 +453,12 @@ def pytest_runtest_protocol(item, nextitem):
 def _stop_leftover_processes(marker_value: str) -> list[str]:
     """Stop each process that this session started and that still runs; return a line for each.
 
-    A test that runs ``fw-context index`` as a process starts the watcher
-    daemon (``cli._index._ensure_watcher_after_index``), and no test stops
-    it.  Measured 2026-10-21: the daemon of a test project lived on after
-    the session, saw the file that the test deleted, and started
-    ``fw-context index --background``.
+    A process of a test can live after the test, for example a watcher
+    daemon that a query handler started (``_ensure_daemon_running`` of the
+    stale recovery).  Measured 2026-10-21: the daemon of a test project
+    lived on after the session, saw the file that the test deleted, and
+    started ``fw-context index --background``.  At that time
+    ``fw-context index`` also started the daemon.
 
     WHY the environment and not the PID files: a test can set its own
     ``db_dir``, and a PID file can hold a PID that a test wrote on purpose.

@@ -15,7 +15,9 @@ Two independent holes produced that state:
    failed ping, but the code only wrote a debug log line.  A daemon that
    stopped was therefore never started again.
 
-These tests hold the two repairs in place.
+These tests hold the two repairs in place.  ``fw-context index`` started
+the daemon too, as a third repair.  It started a daemon also for a project
+without an MCP server, thus it is gone: the two repairs cover the defect.
 """
 
 from __future__ import annotations
@@ -27,7 +29,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from fw_context_mcp.exit_codes import EXIT_SUPERSEDED
 from fw_context_mcp.indexer.build import BuildVariant
 
 # ── Fix 1: the ping loop must start the daemon again ─────────────────────────
@@ -214,6 +215,27 @@ class TestServerStartup:
         # No index exists yet, thus a direct spawn would only raise.
         assert calls["ensure"] == []
 
+    def test_the_ping_thread_starts_in_a_project_that_is_not_initialized(self, monkeypatch, tmp_path: Path):
+        """The operator runs `fw-context init` and `fw-context index` while the server runs.
+
+        ``fw-context index`` starts no daemon, thus the ping thread is the
+        only component that starts it for this server.
+        """
+        import fw_context_mcp.config as config_mod
+        from fw_context_mcp.config.settings import ProjectNotInitializedError
+        from fw_context_mcp.mcp import server as server_mod
+
+        calls = self._patch_main(monkeypatch, tmp_path)
+
+        def _not_initialized(project_root=None):
+            raise ProjectNotInitializedError(project_root)
+
+        monkeypatch.setattr(config_mod, "load", _not_initialized)
+        server_mod.main()
+
+        assert calls["ping"] == [tmp_path]
+        assert calls["ensure"] == []
+
     def test_both_start_when_the_index_exists(self, monkeypatch, tmp_path: Path):
         from fw_context_mcp.mcp import server as server_mod
 
@@ -247,37 +269,18 @@ class TestServerStartup:
         assert calls["ping"] == []
 
 
-# ── Fix 3: `fw-context index` must start the daemon it can have missed ───────
-
-
-class TestEnsureWatcherAfterIndex:
-    """The helper must start the daemon, and must never break the index run."""
-
-    def test_it_starts_the_daemon(self, monkeypatch, tmp_path: Path):
-        import fw_context_mcp.mcp.background as background_mod
-        from fw_context_mcp.cli._index import _ensure_watcher_after_index
-
-        seen: list[Path] = []
-        monkeypatch.setattr(background_mod, "_ensure_daemon_running", seen.append)
-        _ensure_watcher_after_index(tmp_path)
-
-        assert seen == [tmp_path]
-
-    @pytest.mark.parametrize("exc", [RuntimeError("not initialized"), OSError("no socket")])
-    def test_a_failure_does_not_stop_the_index_run(self, monkeypatch, tmp_path: Path, exc):
-        """The index is already written.  Only automatic reindex is lost."""
-        import fw_context_mcp.mcp.background as background_mod
-        from fw_context_mcp.cli._index import _ensure_watcher_after_index
-
-        def _raise(root: Path) -> None:
-            raise exc
-
-        monkeypatch.setattr(background_mod, "_ensure_daemon_running", _raise)
-        _ensure_watcher_after_index(tmp_path)  # must not raise
+# ── `fw-context index` starts no daemon ─────────────────────────────────────
 
 
 class TestCmdIndexWiring:
-    """``cmd_index`` must call the helper on success, and only on success."""
+    """``cmd_index`` starts no watcher daemon: only an MCP server starts it.
+
+    Before, a successful run started the daemon.  Without an MCP client of
+    the project the daemon lived 60 s for nobody, made its staleness check,
+    and held ``daemon.log`` open: on Windows a removal of the index
+    directory failed (WinError 32).  ``TestServerStartup`` and
+    ``TestPingLoopRevival`` hold the start by the MCP server in place.
+    """
 
     @staticmethod
     def _patch_cmd_index(monkeypatch, tmp_path: Path, cfg: _FakeCfg) -> list[Path]:
@@ -308,8 +311,11 @@ class TestCmdIndexWiring:
         monkeypatch.setattr(runner_mod, "run", lambda **kw: "0" * 64)
         monkeypatch.setattr(index_mod, "_post_index_optimize", lambda *a, **kw: None)
 
+        import fw_context_mcp.mcp.background as background_mod
+
         started: list[Path] = []
-        monkeypatch.setattr(index_mod, "_ensure_watcher_after_index", started.append)
+        monkeypatch.setattr(background_mod, "_ensure_daemon_running", started.append)
+        monkeypatch.setattr(background_mod, "_spawn_daemon", started.append)
         return started
 
     @staticmethod
@@ -323,45 +329,16 @@ class TestCmdIndexWiring:
             project_paths=None,
         )
 
-    def test_a_successful_run_starts_the_daemon(self, monkeypatch, tmp_path: Path):
+    def test_a_successful_run_starts_no_daemon(self, monkeypatch, tmp_path: Path):
         from fw_context_mcp.cli._index import cmd_index
 
         cfg = _FakeCfg(index=_FakeIndexCfg(db_dir=tmp_path / "index"))
         started = self._patch_cmd_index(monkeypatch, tmp_path, cfg)
 
         assert cmd_index(self._args()) == 0
-        assert started == [tmp_path]
-
-    def test_a_failed_validation_does_not_start_the_daemon(self, monkeypatch, tmp_path: Path):
-        from fw_context_mcp.cli import _index as index_mod
-        from fw_context_mcp.cli._index import cmd_index
-
-        cfg = _FakeCfg(index=_FakeIndexCfg(db_dir=tmp_path / "index"))
-        started = self._patch_cmd_index(monkeypatch, tmp_path, cfg)
-        monkeypatch.setattr(
-            index_mod, "_validate_and_fix_artifacts", lambda *a, **kw: (None, [], False)
-        )
-
-        assert cmd_index(self._args()) == 1
         assert started == []
 
-    def test_a_superseded_run_does_not_start_the_daemon(self, monkeypatch, tmp_path: Path):
-        """Another run took over.  That run starts the daemon itself."""
-        import fw_context_mcp.indexer.runner as runner_mod
-        from fw_context_mcp.cli._index import cmd_index
-
-        cfg = _FakeCfg(index=_FakeIndexCfg(db_dir=tmp_path / "index"))
-        started = self._patch_cmd_index(monkeypatch, tmp_path, cfg)
-
-        def _superseded(**kw):
-            raise runner_mod.IndexSuperseded("a newer run took over")
-
-        monkeypatch.setattr(runner_mod, "run", _superseded)
-
-        assert cmd_index(self._args()) == EXIT_SUPERSEDED
-        assert started == []
-
-    def test_a_successful_variant_run_starts_the_daemon(self, monkeypatch, tmp_path: Path):
+    def test_a_successful_variant_run_starts_no_daemon(self, monkeypatch, tmp_path: Path):
         from fw_context_mcp.cli import _index as index_mod
         from fw_context_mcp.cli._index import cmd_index
 
@@ -373,20 +350,6 @@ class TestCmdIndexWiring:
         monkeypatch.setattr(index_mod, "_run_multi", lambda *a, **kw: 0)
 
         assert cmd_index(self._args()) == 0
-        assert started == [tmp_path]
-
-    def test_a_failed_variant_run_does_not_start_the_daemon(self, monkeypatch, tmp_path: Path):
-        from fw_context_mcp.cli import _index as index_mod
-        from fw_context_mcp.cli._index import cmd_index
-
-        cfg = _FakeCfg(
-            index=_FakeIndexCfg(db_dir=tmp_path / "index"),
-            build=_FakeBuildCfg(variants=[BuildVariant(name="v")]),
-        )
-        started = self._patch_cmd_index(monkeypatch, tmp_path, cfg)
-        monkeypatch.setattr(index_mod, "_run_multi", lambda *a, **kw: 1)
-
-        assert cmd_index(self._args()) == 1
         assert started == []
 
     @pytest.mark.parametrize("variants", [[], [BuildVariant(name="v")]], ids=["single", "variants"])

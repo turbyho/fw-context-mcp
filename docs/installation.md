@@ -78,6 +78,8 @@ editable mode.
 
 The MCP server starts a background watcher daemon automatically. When you save a C/C++ file, this daemon waits 2 s for more changes. Then it starts `fw-context index --background`, which updates the index. A change of the checkout (another branch, a tag, or a commit on a detached HEAD) also starts such a run. You do not need separate configuration.
 
+Only an MCP server starts the daemon. `fw-context index` does not start it. Each MCP server of the project sends a ping to the daemon every 15 s, and the daemon stops when it gets no ping for 60 s.
+
 ## Configure your project
 
 After you install fw-context, run `fw-context init` in your firmware project. It creates `<project>/.fw-context/config.toml` and `local.toml` with default values and a project ID. The MCP tools and `fw-context index` create no config file in a project that `init` did not set up.

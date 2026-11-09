@@ -63,7 +63,6 @@ def _run(tmp_path: Path, monkeypatch, environments: list[str] | None, build_tabl
     monkeypatch.setattr(index_mod, "_run_multi", _multi)
     monkeypatch.setattr(index_mod, "_run_single", _single)
     monkeypatch.setattr(index_mod, "_build_run_kwargs", lambda *a, **kw: {})
-    monkeypatch.setattr(index_mod, "_ensure_watcher_after_index", lambda root: None)
     args = SimpleNamespace(
         verbose=False, project=str(root), background=False, build=True,
         compile_commands=None, no_clean=False, force=False, takeover=False,

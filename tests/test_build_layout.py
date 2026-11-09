@@ -377,7 +377,6 @@ class TestIndexRemovesLegacyOutput:
 
         monkeypatch.setattr(index_mod, "_run_single", lambda *a, **k: exit_code)
         monkeypatch.setattr(index_mod, "_build_run_kwargs", lambda *a, **kw: {})
-        monkeypatch.setattr(index_mod, "_ensure_watcher_after_index", lambda root: None)
         monkeypatch.setattr(index_mod, "_refuse_without_build", lambda *a, **k: "")
         args = SimpleNamespace(
             verbose=False, project=str(root), background=False, build=True,

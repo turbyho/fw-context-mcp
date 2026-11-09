@@ -370,7 +370,6 @@ class TestTheProblemOfAMultiRun:
             index_mod.autobuild, "clear_problem",
             lambda db_dir: recorded.append("cleared"),
         )
-        monkeypatch.setattr(index_mod, "_ensure_watcher_after_index", lambda root: None)
 
         args = SimpleNamespace(
             verbose=False, project=None, background=True, build=False,

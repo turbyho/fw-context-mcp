@@ -418,7 +418,6 @@ class TestTheRunOfTheUser:
         monkeypatch.setattr(index_mod, "_run_single", _run_single)
         monkeypatch.setattr(index_mod, "_build_run_kwargs", lambda *a, **kw: {})
         monkeypatch.setattr(index_mod, "_record_still_uncovered", lambda *a, **kw: None)
-        monkeypatch.setattr(index_mod, "_ensure_watcher_after_index", lambda root: None)
         args = SimpleNamespace(
             verbose=False, project=str(root), background=False, build=False,
             compile_commands=None, no_clean=False, force=False, takeover=False,
@@ -448,7 +447,6 @@ class TestTheRunOfTheUser:
         built: list[str] = []
         monkeypatch.setattr(index_mod, "_run_multi", lambda *a, **kw: built.append("multi") or 0)
         monkeypatch.setattr(index_mod, "_build_run_kwargs", lambda *a, **kw: {})
-        monkeypatch.setattr(index_mod, "_ensure_watcher_after_index", lambda root: None)
         args = SimpleNamespace(
             verbose=False, project=str(root), background=False, build=True,
             compile_commands=None, no_clean=False, force=False, takeover=False,
@@ -514,7 +512,6 @@ class TestTheRunOfTheUser:
         monkeypatch.setattr(index_mod, "_run_single", lambda *a, **kw: 0)
         monkeypatch.setattr(index_mod, "_build_run_kwargs", lambda *a, **kw: {})
         monkeypatch.setattr(index_mod, "_record_still_uncovered", lambda *a, **kw: None)
-        monkeypatch.setattr(index_mod, "_ensure_watcher_after_index", lambda root: None)
         args = SimpleNamespace(
             verbose=False, project=str(root), background=False, build=False,
             compile_commands=None, no_clean=False, force=False, takeover=False,
@@ -631,7 +628,6 @@ class TestTheRunOfTheUser:
         monkeypatch.setattr(runner_mod, "run", lambda **kw: indexed.append(Path(kw["compile_commands"])) or "0" * 64)
         monkeypatch.setattr(index_mod, "_build_run_kwargs", lambda *a, **kw: {})
         monkeypatch.setattr(index_mod, "_post_index_optimize", lambda *a, **kw: None)
-        monkeypatch.setattr(index_mod, "_ensure_watcher_after_index", lambda root: None)
         args = SimpleNamespace(
             verbose=False, project=str(root), background=False, build=False,
             compile_commands=None, no_clean=False, force=False, takeover=False,
@@ -871,7 +867,6 @@ class TestTheMcpAnswers:
         monkeypatch.setattr(index_mod, "_run_single", _run_single)
         monkeypatch.setattr(index_mod, "_build_run_kwargs", lambda *a, **kw: {})
         monkeypatch.setattr(index_mod, "_record_still_uncovered", lambda *a, **kw: None)
-        monkeypatch.setattr(index_mod, "_ensure_watcher_after_index", lambda root: None)
         args = SimpleNamespace(
             verbose=False, project=str(root), background=True, build=False,
             compile_commands=None, no_clean=False, force=False, takeover=False,

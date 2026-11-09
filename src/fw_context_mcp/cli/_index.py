@@ -1351,30 +1351,6 @@ def _build_run_kwargs(
     )
 
 
-def _ensure_watcher_after_index(project_root: Path) -> None:
-    """Start the watcher daemon after an index run that was successful.
-
-    WHY: an MCP server spawns the daemon only at startup, and only when
-    ``index.db`` already exists.  A server that starts before the first
-    index takes an early return and spawns no daemon.  The daemon is the
-    only component that starts a background reindex, thus that project
-    gets no automatic reindex.
-
-    This function closes that window.  After the index run, ``index.db``
-    exists, which is the only precondition of ``_ensure_daemon_running``.
-    The call does nothing when a daemon already runs.
-    """
-    try:
-        from ..mcp.background import _ensure_daemon_running
-
-        _ensure_daemon_running(project_root)
-    except (RuntimeError, OSError):
-        # Not fatal — the index is complete and usable.  Only the
-        # automatic reindex of changed files is not available.  The
-        # command `fw-context watch restart` corrects this.
-        log.debug("Could not start the watcher daemon for %s", project_root, exc_info=True)
-
-
 class _SigtermOutsideTheLock:
     """The SIGTERM handler of ``cmd_index`` while this run does not own the index.
 
@@ -1552,14 +1528,14 @@ def _cmd_index(args: argparse.Namespace, outside: _SigtermOutsideTheLock) -> int
         # of treating either as a broken run.
         print(f"{exc.label}: {exc}", file=sys.stderr)
         return exc.exit_code
-    if exit_code != 0:
-        return exit_code
-
-    # Outside the index lock.  The daemon does a staleness check when it
-    # starts, thus a daemon that starts inside the lock could start a second
-    # index run against the database that this run still changes.
-    _ensure_watcher_after_index(project_root)
-    return 0
+    # No watcher daemon from here: only an MCP server starts it (its ping
+    # thread, ``mcp/server.py``), because the daemon serves the MCP clients
+    # of the project.  A daemon of an index run without a client lived 60 s
+    # for nobody, made its staleness check, and held its files open: on
+    # Windows a removal of the index directory then failed.  An MCP server
+    # that started before the first index starts the daemon on its next
+    # ping, at most PING_INTERVAL after the index exists.
+    return exit_code
 
 
 def _index_owned(
