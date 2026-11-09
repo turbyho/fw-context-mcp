@@ -54,8 +54,16 @@ def _rebuild_from_scratch(proj: Path) -> Path:
 
     An empty database cannot carry a stale row forward, which is what makes
     this side the reference the incremental result is measured against.
+
+    The query executor of the database goes first, as ``reset_index`` does
+    it: a test that called an MCP handler (``reindex_file``) holds its
+    connection, and Windows does not remove an open file.
     """
-    shutil.rmtree(_db_path_for_project(proj).parent)
+    from fw_context_mcp.mcp.shared.context import invalidate_executor
+
+    db_path = _db_path_for_project(proj)
+    invalidate_executor(str(db_path.resolve()))
+    shutil.rmtree(db_path.parent)
     result = _index(proj)
     assert result.returncode == 0, result.stderr
     db_path = _db_path_for_project(proj)
