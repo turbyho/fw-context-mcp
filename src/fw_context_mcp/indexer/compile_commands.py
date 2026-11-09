@@ -27,6 +27,7 @@ from fw_context_mcp.indexer._driver_query import (
     query_gcc_driver,
     resolve_compiler,
 )
+from fw_context_mcp.path_key import canonical_path
 from fw_context_mcp.utils import CPP_SOURCE_EXTENSIONS, TU_EXTENSIONS
 
 # Flags libclang does not support — drop silently
@@ -608,11 +609,14 @@ def parse(path: Path) -> Iterator[CompilationUnit]:
     # without it in others; see known_compilers().
     known = known_compilers(entries)
     for entry in entries:
-        file = Path(entry["file"])
         cwd = Path(entry.get("directory", path.parent))
-
-        if not file.is_absolute():
-            file = (cwd / file).resolve()
+        # The identity of the file: links resolved, the case of the disk
+        # (path_key.canonical_path).  A build tool can spell a file of a
+        # case-insensitive file system in a different case, and each later
+        # resolve() of a canonical path keeps it canonical.  An absolute
+        # entry gets the same form: it was not resolved before, and its
+        # spelling then differed from the key of its own file.
+        file = canonical_path(cwd / entry["file"])
 
         raw_args: list[str] = entry.get("arguments") or shlex.split(
             entry.get("command", "")

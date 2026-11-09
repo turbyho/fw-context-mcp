@@ -35,6 +35,7 @@ from collections.abc import Collection, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ..path_key import canonical_path
 from ._asm_cfg import AsmCall, unit_flow
 from ._asm_isa import ARM, RISCV, XTENSA
 from ._asm_layout import (
@@ -247,12 +248,7 @@ def _map_output(text: str, base: Path) -> AsmSource:
             if name in _SYNTHETIC_FILES:
                 cur_file = None
             else:
-                candidate = Path(name)
-                cur_file = str(
-                    candidate.resolve()
-                    if candidate.is_absolute()
-                    else (base / candidate).resolve()
-                )
+                cur_file = str(canonical_path(base / name))
             line_map.append(None)
             continue
         if cur_file is None:
@@ -320,8 +316,8 @@ def read_unit_texts(unit) -> dict[Path, UnitText] | None:
         return None
 
     skipped = collect_skipped_lines(tu)
-    files = [(Path(unit.file).resolve(), file_of_parse(tu, str(unit.file)))]
-    files += [(Path(str(inc.include.name)).resolve(), inc.include) for inc in tu.get_includes()]
+    files = [(canonical_path(unit.file), file_of_parse(tu, str(unit.file)))]
+    files += [(canonical_path(str(inc.include.name)), inc.include) for inc in tu.get_includes()]
     texts: dict[Path, UnitText] = {}
     for resolved, handle in files:
         if resolved in texts:
@@ -368,17 +364,10 @@ def _is_project_file(path: str, project_root: Path,
     before this: 91 handlers reported, against 2 real ones before assembly
     was indexed at all.
     """
-    from .sdk_detect import _path_matches
+    from ..path_key import index_key
+    from .sdk_detect import classify_key
 
-    resolved = Path(path).resolve()
-    try:
-        rel = str(resolved.relative_to(project_root.resolve()))
-    except ValueError:
-        # Outside the project: vendor unless a project pattern claims it.
-        return 1 if any(_path_matches(str(resolved), p) for p in project_patterns) else 0
-    if any(_path_matches(rel, p) for p in project_patterns):
-        return 1
-    return 0 if any(_path_matches(rel, p) for p in vendor_patterns) else 1
+    return classify_key(index_key(path, project_root), vendor_patterns, project_patterns)
 
 
 def _clear_previous_pass(conn, config_hash: str) -> None:

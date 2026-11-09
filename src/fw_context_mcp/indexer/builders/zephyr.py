@@ -143,7 +143,8 @@ def _zephyr_vendor_patterns(
             continue                      # outside the project — no pattern
         if rel == Path("."):
             continue                      # project root IS the workspace
-        pattern = f"{rel}/%"
+        # "/" on each system: the patterns match the index keys (path_key).
+        pattern = f"{rel.as_posix()}/%"
         if pattern not in patterns:
             patterns.append(pattern)
     return patterns

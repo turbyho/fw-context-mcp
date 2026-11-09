@@ -89,6 +89,7 @@ from fw_context_mcp.indexer.db import (
     store_unit_places,
     upsert_file,
 )
+from fw_context_mcp.path_key import canonical_path, index_key
 from fw_context_mcp.utils import (
     CPP_EXTENSIONS,
     abs_path,
@@ -239,13 +240,10 @@ def _normalize_file_path(file_path: str, project_root: Path) -> str:
     removed the spelling the manifest did not use.
 
     One spelling per file is the invariant every path-keyed lookup relies on,
-    so this is the only place that decides it.
+    so :func:`fw_context_mcp.path_key.index_key` decides it: the separator
+    ``/`` on each system, and the case of the disk.
     """
-    resolved = Path(file_path).resolve()
-    try:
-        return str(resolved.relative_to(project_root.resolve()))
-    except ValueError:
-        return str(resolved)
+    return index_key(file_path, project_root)
 
 
 def _token_lines_of_file(tu: Any, handle: Any, size: int) -> set[int]:
@@ -439,15 +437,12 @@ def _build_filtered_file_content(
             continue
         seen_headers.add(abs_path)
 
-        resolved = Path(abs_path).resolve()
+        resolved = canonical_path(abs_path)
         handles.setdefault(resolved, inc.include)
         # No extension filter — see _collect_headers_from_tokens() for why.
         # Anything reached by an #include belongs in the manifest, or it can
         # neither be kept nor invalidated.
-        try:
-            rel = str(resolved.relative_to(project_root))
-        except ValueError:
-            rel = str(resolved)
+        rel = index_key(resolved, project_root)
 
         # The hash of the text that this parse read, not of the disk now: a
         # header saved after the parse gave the manifest the hash of the new
@@ -504,7 +499,7 @@ def _build_filtered_file_content(
             @cache
             def _res(path: str) -> Path:
                 p = Path(path)
-                return (unit.directory / p).resolve() if not p.is_absolute() else p.resolve()
+                return canonical_path(unit.directory / p)
 
             walker = _iter_cursor_skip(root_cursor, skip_files, _res)
         else:
@@ -571,7 +566,7 @@ def _build_filtered_file_content(
     candidates: dict[Path, set[int]] = {}
     for spelling, rows in active.items():
         if rows:
-            candidates.setdefault(Path(spelling).resolve(), set()).update(rows)
+            candidates.setdefault(canonical_path(spelling), set()).update(rows)
     unit_file = Path(unit.file).resolve()
     for path in (str(unit_file), *(header for header, _ in header_files)):
         candidates.setdefault(Path(path), set())
@@ -903,13 +898,24 @@ def _store_symbol_rows(
     stored hash.  *tu* is that parse: the bodies come from the text that it
     read (``_cached_read_lines``).
     """
-    from .sdk_detect import _path_matches
+    from .sdk_detect import classify_key
 
     rows = []
     file_proj: dict[int, int] = {}
+    # One key, one resolved path and one class for each file, not for each
+    # symbol: a unit has up to 100k symbols in about 1k files, and each key
+    # is a file system call (on macOS an open and an fcntl, see path_key).
+    keys: dict[str, str] = {}
+    resolved_paths: dict[str, Path] = {}
+    classes: dict[str, int] = {}
     for s in syms:
         sym_file = s.file
-        normalized_sym_file = _normalize_file_path(sym_file, project_root)
+        normalized_sym_file = keys.get(sym_file)
+        if normalized_sym_file is None:
+            normalized_sym_file = keys[sym_file] = _normalize_file_path(sym_file, project_root)
+            resolved_paths[sym_file] = canonical_path(sym_file)
+            classes[sym_file] = classify_key(normalized_sym_file, vendor_patterns, project_patterns)
+        resolved_sym = resolved_paths[sym_file]
         if normalized_sym_file not in file_id_cache:
             lang = "cpp" if Path(sym_file).suffix in CPP_EXTENSIONS else "c"
             try:
@@ -930,9 +936,8 @@ def _store_symbol_rows(
                 conn, config_hash, normalized_sym_file, lang,
                 generated=_is_generated_header(normalized_sym_file, build_dir_patterns),
                 mtime=sym_mtime,
-                source_hash=(file_hashes or {}).get(Path(sym_file).resolve(), ""),
+                source_hash=(file_hashes or {}).get(resolved_sym, ""),
             )
-        rel_path = normalized_sym_file
         # ── Compute is_project ──
         # project_patterns are checked FIRST because a path that matches
         # both project_patterns AND vendor_patterns should be treated as
@@ -941,21 +946,7 @@ def _store_symbol_rows(
         # Files outside the project root (framework headers from absolute
         # system paths) cannot match project_patterns — they default to
         # is_project=0 unless a broad project_pattern catches them.
-        try:
-            resolved_sym = Path(sym_file).resolve()
-            rel = str(resolved_sym.relative_to(project_root))
-            if any(_path_matches(rel, p) for p in project_patterns):
-                is_proj = 1
-            elif any(_path_matches(rel, p) for p in vendor_patterns):
-                is_proj = 0
-            else:
-                is_proj = 1
-        except ValueError:
-            abs_path = str(resolved_sym)
-            if any(_path_matches(abs_path, p) for p in project_patterns):
-                is_proj = 1
-            else:
-                is_proj = 0
+        is_proj = classes[sym_file]
         # ── Extract function body for definitions ──
         # Bodies are stored in the DB to power search_bodies (FTS5 over
         # function implementations).  Declarations (is_definition=False)
@@ -971,9 +962,8 @@ def _store_symbol_rows(
         if s.is_definition and s.end_line >= s.line:
             file_lines = _cached_read_lines(s.file, tu)
             if file_lines is not None:
-                # resolved_sym is reused from the is_project block above:
-                # the skipped map is keyed by resolved path, and one
-                # Path.resolve() for each symbol is enough.
+                # The skipped map is keyed by the canonical path
+                # (skipped_ranges), and resolved_sym is that path.
                 body = _read_body(
                     file_lines, s.line, s.end_line,
                     skipped.get(resolved_sym, frozenset()),
@@ -987,7 +977,7 @@ def _store_symbol_rows(
             (
                 config_hash,
                 file_id_cache[normalized_sym_file],
-                rel_path,
+                normalized_sym_file,
                 split_tokens(s.name, s.qualified_name),
                 s.usr,
                 s.name,
@@ -1150,10 +1140,10 @@ def _detect_moved_symbols(
         # symbol.  We update the OLD row's location fields to point at
         # the new file, then delete the duplicate.  LLM analysis and
         # embedding rows remain linked to the old row's id.
-        try:
-            new_rel = str(Path(s.file).resolve().relative_to(project_root))
-        except ValueError:
-            new_rel = s.file
+        # The key of files.path, also for a file outside the root.  Before,
+        # a file outside the root kept the name that libclang gave, which
+        # is not resolved, and the row did not match its files row.
+        new_rel = index_key(s.file, project_root)
         conn.execute(
             """UPDATE symbols SET file_id = ?, file_path = ?,
                line = ?, col = ?, end_line = ?

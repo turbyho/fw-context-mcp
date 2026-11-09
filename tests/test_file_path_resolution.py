@@ -128,7 +128,7 @@ class TestTheMatchIsOnAPathSegment:
 
         conn = open_db(_db_of(indexed))
         try:
-            resolved = _resolve_indexed_file(conn, CONFIG_HASH, "config.h")
+            resolved = _resolve_indexed_file(conn, CONFIG_HASH, "config.h", "config.h")
         finally:
             conn.close()
         assert resolved == PROJECT_FILE
@@ -139,7 +139,7 @@ class TestTheMatchIsOnAPathSegment:
 
         conn = open_db(_db_of(indexed))
         try:
-            resolved = _resolve_indexed_file(conn, CONFIG_HASH, "pinconfig.h")
+            resolved = _resolve_indexed_file(conn, CONFIG_HASH, "pinconfig.h", "pinconfig.h")
         finally:
             conn.close()
         assert resolved == "/opt/sdk/framework/libraries/wrapper/inc/pinconfig.h"
@@ -149,7 +149,7 @@ class TestTheMatchIsOnAPathSegment:
 
         conn = open_db(_db_of(indexed))
         try:
-            assert _resolve_indexed_file(conn, CONFIG_HASH, "no_such_file.h") is None
+            assert _resolve_indexed_file(conn, CONFIG_HASH, "no_such_file.h", "no_such_file.h") is None
         finally:
             conn.close()
 
@@ -159,8 +159,8 @@ class TestTheMatchIsOnAPathSegment:
 
         conn = open_db(_db_of(indexed))
         try:
-            assert _resolve_indexed_file(conn, CONFIG_HASH, "%config.h") is None
-            assert _resolve_indexed_file(conn, CONFIG_HASH, "_onfig.h") is None
+            assert _resolve_indexed_file(conn, CONFIG_HASH, "%config.h", "%config.h") is None
+            assert _resolve_indexed_file(conn, CONFIG_HASH, "_onfig.h", "_onfig.h") is None
         finally:
             conn.close()
 

@@ -57,6 +57,7 @@ from functools import cache
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ..path_key import canonical_path
 from ._libclang import cindex as cx
 from ._overrides import VIRTUAL_METHOD_KINDS, extract_overrides
 from ._usr import TypeDecisions, cursor_usr, file_key, odr_place, type_decisions
@@ -1365,7 +1366,7 @@ def _build_refs(
         else tu.cursor.walk_preorder()
     ):
         _cl = cursor.location
-        _cl_file = str(Path(_cl.file.name).resolve()) if _cl and _cl.file else None
+        _cl_file = str(canonical_path(_cl.file.name)) if _cl and _cl.file else None
         _cl_line = _cl.line if _cl else -1
         # Pop condition 1 — file mismatch: the top-of-stack function was
         # defined in the TU's own file (tu_path_str) but the cursor is now
@@ -2752,10 +2753,13 @@ def _extract_all(
     # maxsize=None — the cache lives only for this extract_all() call
     # (one TU).  Even 10 000 unique header paths (~2 MB) is negligible,
     # and unbounded cache avoids eviction churn during the AST walk.
+    # canonical_path and not Path.resolve: skip_files holds the paths of
+    # db._owners.skip_form, which come from the index keys, and a key has
+    # the case of the disk (path_key).  A header that libclang names in a
+    # different case is the same file on Windows and macOS.
     @cache
     def _resolve(path: str) -> Path:
-        p = Path(path)
-        return (cwd / p).resolve() if not p.is_absolute() else p.resolve()
+        return canonical_path(cwd / path)
 
     # Convert mutable set to frozen for hash-consistency across call sites.
     # The mutable set lives in runner.py; each extract_all call gets a

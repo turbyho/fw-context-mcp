@@ -52,18 +52,19 @@ def code_files() -> list[Path]:
     rows for the same scripts, and a hand-kept version number is easy to
     forget.  The code is the reader, the pass, and each function that
     `store_scripts` gives a row to: the path and the USR come from
-    `ops._normalize_file_path`, `is_project` from `sdk_detect._path_matches`,
-    and the rows from the `db` writers.
+    `path_key.index_key` (through `ops._normalize_file_path`), `is_project`
+    from `sdk_detect.classify_key`, and the rows from the `db` writers.
 
     The list comes from the functions, not from file names, thus a function
     that moves to another module takes its new file with it.
     """
+    from .. import path_key
     from . import linker_script, ops, sdk_detect
     from .db import insert_symbols_batch, replace_memory_regions, set_entry_point, upsert_file
 
     functions = (
-        store_scripts, linker_script.parse, ops._normalize_file_path, sdk_detect._path_matches,
-        insert_symbols_batch, replace_memory_regions, set_entry_point, upsert_file,
+        store_scripts, linker_script.parse, ops._normalize_file_path, path_key.index_key,
+        sdk_detect.classify_key, insert_symbols_batch, replace_memory_regions, set_entry_point, upsert_file,
     )
     files = {Path(__file__).resolve()}
     files.update(Path(inspect.getfile(function)).resolve() for function in functions)

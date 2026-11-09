@@ -172,10 +172,8 @@ def decide_units(
     for unit in units:
         resolved_tu = unit.file.resolve()
         file_path = _normalize_file_path(str(resolved_tu), project_root)
-        try:
-            tu_rel = str(resolved_tu.relative_to(project_root))
-        except ValueError:
-            tu_rel = str(resolved_tu)
+        # The key of the manifest entry is the key of files.path.
+        tu_rel = file_path
         file_entries = manifest.get(tu_rel, ()) if manifest is not None else ()
         # The time first, then the hash: a save between the two leaves the
         # row with an older time than the text, and the staleness check of
@@ -519,10 +517,8 @@ def _handle_unchanged(
         - ``content_filled`` (int): 1 if ifdef content was filled, 0 otherwise.
     """
     file_path_str = _normalize_file_path(str(unit.file.resolve()), project_root)
-    try:
-        tu_key = str(unit.file.resolve().relative_to(project_root))
-    except ValueError:
-        tu_key = str(unit.file.resolve())
+    # The key of the manifest entry is the key of files.path.
+    tu_key = file_path_str
 
     # An unchanged TU has nothing to contribute to the manifest: its stored
     # entry is still accurate, and decide_units found it, with real

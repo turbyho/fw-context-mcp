@@ -38,6 +38,7 @@ from fw_context_mcp.indexer.config_hash import (
     compute_flags_hash,
     drop_transient_defines,
 )
+from fw_context_mcp.path_key import canonical_path, index_key, key_path
 from fw_context_mcp.utils import compute_source_hash, write_text_atomic
 
 log = logging.getLogger(__name__)
@@ -161,11 +162,14 @@ def path_resolver(project_root: Path) -> Callable[[str], Path]:
 
     WHY a cache: the units of a build read mostly the same headers, and each
     resolve is a call of the file system for each part of the path.
+
+    WHY ``canonical_path``: the paths of this function and the paths of the
+    source files (``runner._files_read_by_unit``) go into one set, and the
+    case of the disk makes one path for each file on Windows and macOS.
     """
     @functools.cache
     def resolve(name: str) -> Path:
-        path = Path(name)
-        return (path if path.is_absolute() else project_root / path).resolve()
+        return canonical_path(key_path(name, project_root))
 
     return resolve
 
@@ -301,7 +305,7 @@ def _collect_headers_from_tokens(
             continue
         seen.add(abs_path)
 
-        resolved = Path(abs_path).resolve()
+        resolved = canonical_path(abs_path)
         # Everything get_includes() returns was reached by an #include, so it
         # IS a header — whatever it is called.  There used to be an extension
         # whitelist here ({.h .hpp .hxx .hh .inl}), and it silently dropped
@@ -312,10 +316,7 @@ def _collect_headers_from_tokens(
         # could change any of them without marking a single TU stale, because
         # no hash was recorded to compare.  A whitelist of "what counts as a
         # header" cannot be kept complete; not filtering can.
-        try:
-            rel = str(resolved.relative_to(project_root))
-        except ValueError:
-            rel = str(resolved)  # absolute path for files outside project tree
+        rel = index_key(resolved, project_root)
 
         headers.append(rel)
         if rel not in header_table:
@@ -370,11 +371,7 @@ def generate(
     t0 = time.monotonic()
 
     for unit in units:
-        source_file = str(unit.file.resolve())
-        try:
-            source_rel = str(unit.file.resolve().relative_to(project_root))
-        except ValueError:
-            source_rel = source_file
+        source_rel = index_key(unit.file, project_root)
 
         source_hash = compute_source_hash(unit.file.resolve())
         headers = _collect_headers_from_tokens(
@@ -683,11 +680,7 @@ def build_preliminary(
     entries: list[dict] = []
     arg_sets: list[list[str]] = []
     for unit in units:
-        source_file = str(unit.file.resolve())
-        try:
-            source_rel = str(unit.file.resolve().relative_to(project_root))
-        except ValueError:
-            source_rel = source_file
+        source_rel = index_key(unit.file, project_root)
 
         entries.append({
             "file": source_rel,
@@ -1290,7 +1283,7 @@ def check_tu_staleness(
     # ── Check source file hash ──
     source_file = Path(entry["file"])
     if not source_file.is_absolute():
-        source_file = (project_root / entry["file"]).resolve()
+        source_file = canonical_path(key_path(entry["file"], project_root))
 
     current_source_hash = source_hash if source_hash is not None else compute_source_hash(source_file)
     if current_source_hash != entry.get("source_hash", ""):
@@ -1304,9 +1297,7 @@ def check_tu_staleness(
     # ── Check header hashes ──
     for h in headers or ():
         header_path = h["path"]
-        p = Path(header_path)
-        if not p.is_absolute():
-            p = (project_root / header_path).resolve()
+        p = canonical_path(key_path(header_path, project_root))
 
         if _hash_with_cache(p, hash_cache) != h.get("hash", ""):
             return True, current_source_hash
@@ -1340,9 +1331,7 @@ def collect_stale_headers(
     stale: set[str] = set()
 
     for header_path, record in (manifest.get("headers") or {}).items():
-        p = Path(header_path)
-        if not p.is_absolute():
-            p = (project_root / header_path).resolve()
+        p = canonical_path(key_path(header_path, project_root))
 
         if _hash_with_cache(p, hash_cache) != record.get("hash", ""):
             stale.add(header_path)

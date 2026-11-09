@@ -1002,7 +1002,7 @@ class TestOneEntryForEachListing:
             if unit.clang_args not in arg_sets:
                 arg_sets.append(list(unit.clang_args))
             entries.append({
-                "file": str(unit.file.relative_to(tmp_path)),
+                "file": unit.file.relative_to(tmp_path).as_posix(),
                 "directory": str(tmp_path),
                 "arg_set": arg_sets.index(unit.clang_args),
                 "source_hash": "stored-source",
@@ -1555,7 +1555,7 @@ class TestNoHeaderIsTrusted:
                     continue
                 # The rule read as: skip when the record says generated.
                 if re.search(r'\.get\("generated"\)', line):
-                    offenders.append(f"{path.relative_to(src)}:{lineno}: {line.strip()}")
+                    offenders.append(f"{path.relative_to(src).as_posix()}:{lineno}: {line.strip()}")
 
         allowed = {
             # merge_header_records keeps the flag; it decides nothing.

@@ -74,7 +74,8 @@ def _libdeps_dir(project_root: Path) -> str:
         rel = candidate.resolve().relative_to(project_root.resolve())
     except (ValueError, OSError):
         return default
-    return str(rel) if str(rel) != "." else default
+    # "/" on each system: the pattern matches the index keys (path_key).
+    return rel.as_posix() if rel != Path(".") else default
 
 
 def _first_line(exc: RuntimeError) -> str:

@@ -55,12 +55,13 @@ the claims and the rows always agree, also after a run that stopped.
 
 from __future__ import annotations
 
-import os
 import sqlite3
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
+
+from ...path_key import key_path
 
 UnitKey = tuple[str, str]
 """``(normalized path, flags_hash)`` of one listing of compile_commands.json."""
@@ -127,18 +128,14 @@ class Ownership:
 
 
 def skip_form(paths: Iterable[str], project_root: Path) -> set[str]:
-    """Return *paths* in the form of ``skip_files``: resolved and absolute.
+    """Return *paths* in the form of ``skip_files``: canonical, absolute, with the separator of the system.
 
-    These tables hold normalized paths (relative inside the project, see
-    ``ops._normalize_file_path``).  ``extract_all`` compares the resolved
-    path of each cursor with ``skip_files``.
-
-    A normalized path is the resolved path relative to the resolved root,
-    thus the join with the resolved root gives the resolved path again, and
-    no file system call is necessary for each path.
+    These tables hold index keys (``path_key.index_key``).  ``extract_all``
+    compares ``str(canonical_path(...))`` of each cursor with
+    ``skip_files``, and ``path_key.key_path`` gives that path for a key with
+    no file system call.
     """
-    root = project_root.resolve()
-    return {path if os.path.isabs(path) else str(root / path) for path in paths}
+    return {str(key_path(path, project_root)) for path in paths}
 
 
 def unclaimed(paths: Iterable[str], skip_files: set[str] | frozenset[str], project_root: Path) -> set[str]:
@@ -147,11 +144,7 @@ def unclaimed(paths: Iterable[str], skip_files: set[str] | frozenset[str], proje
     A path in *skip_files* has an owner in this run: an earlier listing
     claimed it.
     """
-    root = project_root.resolve()
-    return {
-        path for path in paths
-        if (path if os.path.isabs(path) else str(root / path)) not in skip_files
-    }
+    return {path for path in paths if str(key_path(path, project_root)) not in skip_files}
 
 
 def number_listings(keys: Iterable[UnitKey]) -> list[UnitKey]:

@@ -78,7 +78,7 @@ from ...llm.errors import LLMError
 from ...llm.ollama import OllamaModelNotFoundError
 from ...utils import abs_path, macro_signature, read_file_lines
 from ...utils import escape_like as _escape_like
-from ..shared.context import _normalize_file_path_query
+from ..shared.context import _normalize_file_path_query, _written_path
 from ..shared.paging import call_text, clamp_offset, page_hint, page_notice, past_end_info, selector_args
 from ..shared.stale import _file_differs
 from ..shared.variants import IMAGE_DESCRIPTION, VARIANT_DESCRIPTION
@@ -88,7 +88,7 @@ from ._base import BaseHandler
 log = logging.getLogger(__name__)
 
 
-def _resolve_indexed_file(conn, config_hash: str, file_path: str) -> str | None:
+def _resolve_indexed_file(conn, config_hash: str, file_path: str, written: str) -> str | None:
     """Give the path the index holds for what the caller wrote, or None.
 
     A caller writes ``main.cpp`` where the index holds ``src/main.cpp``,
@@ -118,8 +118,10 @@ def _resolve_indexed_file(conn, config_hash: str, file_path: str) -> str | None:
         return exact["path"]
 
     # The caller writes a name, not a LIKE pattern: '%' and '_' in it are
-    # characters of a filename and must not widen the match.
-    escaped = file_path.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    # characters of a filename and must not widen the match.  *written* is
+    # the text of the caller (``_written_path``), not the key: a link in the
+    # root can make the key of a partial path absolute.
+    escaped = written.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     row = conn.execute(
         "SELECT path FROM files WHERE config_hash=? AND path LIKE ? ESCAPE '\\' "
         "ORDER BY is_project DESC, LENGTH(path), path LIMIT 1",
@@ -1193,7 +1195,8 @@ def get_file_map(
     except RuntimeError as e:
         return {"error": str(e)}
     root = db.root
-    file_path = _normalize_file_path_query(file_path)
+    written = _written_path(file_path)
+    file_path = _normalize_file_path_query(file_path, root)
 
     def _query(conn, config_hash):
         # Runs under the executor lock on the single shared connection;
@@ -1201,7 +1204,7 @@ def get_file_map(
         # _wrap_tool (300 s + interrupt), not here.
         # Path resolution: the exact path first, then the file of that
         # name.  Callers often pass just "main.cpp" or "src/main.cpp".
-        resolved = _resolve_indexed_file(conn, config_hash, file_path)
+        resolved = _resolve_indexed_file(conn, config_hash, file_path, written)
         if resolved is None:
             return {"error": f"File not found in index: {file_path}. Check the path — use relative paths like 'src/main.cpp'."}
         # The path came out of the ``files`` table of this build, thus the
@@ -1932,7 +1935,8 @@ def read_file(
     except RuntimeError as e:
         return {"error": str(e)}
     root = db.root
-    file_path = _normalize_file_path_query(file_path)
+    written = _written_path(file_path)
+    file_path = _normalize_file_path_query(file_path, root)
 
     def _query(conn, config_hash):
         # Runs under the executor lock on the single shared connection;
@@ -1942,7 +1946,7 @@ def read_file(
         # Path resolution: the exact path first, then the file of that
         # name (same helper as get_file_map — callers often pass a bare
         # filename).
-        resolved = _resolve_indexed_file(conn, config_hash, file_path)
+        resolved = _resolve_indexed_file(conn, config_hash, file_path, written)
         if resolved is None:
             return {
                 "error": f"File not found in index: {file_path}. "

@@ -33,6 +33,7 @@ from ..exit_codes import (  # noqa: F401 — re-exported
     EXIT_TERMINATED,
 )
 from ..mcp.shared.pid_file import PidFile
+from ..path_key import ABSOLUTE_KEY_SQL, canonical_path, index_key
 from ..utils import TU_EXTENSIONS, StopRequested
 from . import _run_marker
 from ._embedding import (
@@ -550,10 +551,7 @@ def _files_read_by_c_units(
 
 def _tu_key(unit, project_root: Path) -> str:
     """The key of *unit* in ``tu_headers`` and ``reparsed_tus``: its path relative to *project_root*, else absolute."""
-    try:
-        return str(unit.file.resolve().relative_to(project_root))
-    except ValueError:
-        return str(unit.file.resolve())
+    return index_key(unit.file, project_root)
 
 
 def _files_read_by_unit(
@@ -567,11 +565,8 @@ def _files_read_by_unit(
 
     The sources and the path forms are the ones of ``_files_read_by_c_units``.
     """
-    source = unit.file.resolve()
-    try:
-        key = str(source.relative_to(project_root))
-    except ValueError:
-        key = str(source)
+    source = canonical_path(unit.file)
+    key = index_key(source, project_root)
     if key in unit_headers:
         names = list(unit_headers[key])
     else:
@@ -1034,10 +1029,11 @@ def run(
         The ``config_hash`` string — a content-addressable fingerprint of the
         ``compile_commands.json`` used for staleness detection.
     """
+    # The canonical root (path_key): each key of the run is relative to it.
     if project_root is None:
-        project_root = compile_commands.parent.resolve()
+        project_root = canonical_path(compile_commands.parent)
     else:
-        project_root = project_root.resolve()
+        project_root = canonical_path(project_root)
     # One set for the whole run: each unit tests each argument against it.
     transient_defines = frozenset(transient_defines)
 
@@ -1045,7 +1041,7 @@ def run(
     # vendor set waits for the translation units — see below.
     from .sdk_detect import _build_sdk_excludes, _normalize_patterns
 
-    project_patterns_list = _normalize_patterns(list(project_paths)) if project_paths else []
+    project_patterns_list = _normalize_patterns(list(project_paths), project_root) if project_paths else []
 
     if project_id is None:
         project_id = derive_project_id(project_root)
@@ -1106,7 +1102,7 @@ def run(
         _build_sdk_excludes(project_root, build_system, units=units)
     )
     if vendor_paths:
-        vendor_patterns.extend(_normalize_patterns(vendor_paths))
+        vendor_patterns.extend(_normalize_patterns(vendor_paths, project_root))
     log.info(
         "vendor patterns for %s: %s",
         variant or project_root.name,
@@ -1356,15 +1352,15 @@ def run(
     # TUs keep running the content pass so it can complete; once every project
     # file has content they skip it, along with the libclang parse behind it.
     #
-    # WHY project files only (relative path = inside project_root, see
-    # _normalize_file_path): out-of-tree system headers routinely end up with
+    # WHY project files only (relative key = inside project_root, see
+    # path_key.index_key; ABSOLUTE_KEY_SQL also knows the Windows form C:/): out-of-tree system headers routinely end up with
     # an empty content column — e.g. libstdc++ headers whose cursors were all
     # claimed by an earlier TU.  Counting those would pin the flag to True
     # forever on any C++ project and the pass would never be skipped.
     content_backfill_needed = (
         conn.execute(
             "SELECT 1 FROM files WHERE config_hash = ? AND content = '' "
-            "AND path NOT LIKE '/%' LIMIT 1",
+            f"AND NOT {ABSOLUTE_KEY_SQL} LIMIT 1",
             (config_hash,),
         ).fetchone()
         is not None

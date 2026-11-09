@@ -36,6 +36,8 @@ from functools import cache
 from pathlib import Path
 from typing import Any
 
+from ..path_key import canonical_path
+
 log = logging.getLogger(__name__)
 
 
@@ -113,7 +115,7 @@ def _count_reads(tu: Any) -> dict[Path, int]:
         name = included.name
         path = resolved.get(name)
         if path is None:
-            path = Path(name).resolve()
+            path = canonical_path(name)
             resolved[name] = path
         reads[path] += 1
     return dict(reads)
@@ -180,13 +182,13 @@ def collect_skipped_lines(tu: Any) -> dict[Path, set[int]]:
     hits: dict[Path, Counter[int]] = {}
     # One resolve for each spelling, and not one for each range.  A header
     # of a vendor SDK holds many `#if` regions that all name the same file,
-    # and `Path.resolve()` walks the file system for every call.
+    # and `canonical_path` walks the file system for every call.
     resolved: dict[str, Path] = {}
 
     def _resolve(name: str) -> Path:
         path = resolved.get(name)
         if path is None:
-            path = Path(name).resolve()
+            path = canonical_path(name)
             resolved[name] = path
         return path
 

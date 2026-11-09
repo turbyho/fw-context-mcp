@@ -72,6 +72,7 @@ from ...indexer.db import (
 from ...indexer.db._locking import IndexRunLocked, index_run_lock
 from ...indexer.git_context import head_moved, stored_head
 from ...llm.ollama import check_setup
+from ...path_key import index_key
 from ...utils import HEADER_EXTENSIONS, resolve_project_root
 from ..background import read_reindex_progress, read_reindex_state
 from ..shared.context import (
@@ -2894,10 +2895,7 @@ def _update_manifest_after_reindex(
             stored_entries: list[int] = []
             listings: list[tuple[str, str]] = []
             for unit, _parsed in parsed_units:
-                try:
-                    rel = str(unit.file.resolve().relative_to(root))
-                except ValueError:
-                    rel = str(unit.file.resolve())
+                rel = index_key(unit.file, root)
                 flags = (
                     compute_flags_hash(unit.raw_entry, transient_defines=transient_defines)
                     if unit.raw_entry else ""
@@ -4029,9 +4027,9 @@ def _reindex_build_patterns(
         manifest, root, build_system=cfg.build.system
     )
     if cfg.index.vendor_paths:
-        vendor_patterns.extend(_normalize_patterns(cfg.index.vendor_paths))
+        vendor_patterns.extend(_normalize_patterns(cfg.index.vendor_paths, root))
     project_patterns_list = (
-        _normalize_patterns(list(cfg.index.project_paths))
+        _normalize_patterns(list(cfg.index.project_paths), root)
         if cfg.index.project_paths
         else []
     )

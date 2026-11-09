@@ -842,9 +842,12 @@ def _is_source_file(path_str: str, build_patterns: list[str] | None = None) -> b
     p = Path(path_str)
     if p.suffix not in _SOURCE_EXTS_WATCH:
         return False
-    if _EXCLUDE_RX.search(path_str):
+    # _EXCLUDE_RX and the build patterns use "/", as the index keys do
+    # (path_key).  watchfiles gives a path of the system: "\\" on Windows.
+    posix = p.as_posix()
+    if _EXCLUDE_RX.search(posix):
         return False
-    if build_patterns and any(pat in path_str for pat in build_patterns):
+    if build_patterns and any(pat in posix for pat in build_patterns):
         return False
     return True
 
