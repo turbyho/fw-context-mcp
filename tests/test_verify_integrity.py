@@ -75,7 +75,7 @@ def _insert_probe_row(conn, table: str, overrides: dict) -> None:
     names: list[str] = []
     values: list[object] = []
     for col in info:
-        _cid, name, ctype, notnull, default, pk = col[0], col[1], col[2], col[3], col[4], col[5]
+        name, ctype, notnull, default = col[1], col[2], col[3], col[4]
         if name in overrides:
             names.append(name)
             values.append(overrides[name])

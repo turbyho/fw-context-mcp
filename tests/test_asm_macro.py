@@ -15,11 +15,11 @@ from __future__ import annotations
 
 from fw_context_mcp.indexer._asm_macro import (
     BARRIER,
-    is_barrier,
     MAX_DEPTH,
     Report,
     bind,
     expand_stream,
+    is_barrier,
     parse_parameters,
     split_arguments,
     substitute,

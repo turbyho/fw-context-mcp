@@ -52,9 +52,8 @@ class TestStatements:
 
     @staticmethod
     def _statements(tmp_path: Path, text: str, args: list[str] | None = None):
-        from fw_context_mcp.indexer.asm import _statements
-
         from fw_context_mcp.indexer._asm_macro import BARRIER, is_barrier
+        from fw_context_mcp.indexer.asm import _statements
 
         source = preprocess(_unit(tmp_path, "t.S", text, args))
         assert source is not None
