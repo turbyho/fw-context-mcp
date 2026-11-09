@@ -431,7 +431,7 @@ def train_step(
         "desc_version": config_hash,
     }
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
+    (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     log.info("Fine-tuned model saved to %s", out_dir)
 
     return out_dir

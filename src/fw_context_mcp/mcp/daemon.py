@@ -1023,7 +1023,7 @@ async def _run_index_async(
     log_target: int | TextIO
     try:
         fd = os.open(log_file, os.O_NOFOLLOW | os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
-        log_target = os.fdopen(fd, "w", closefd=True)
+        log_target = os.fdopen(fd, "w", encoding="utf-8", closefd=True)
     except OSError as exc:
         # The run does its work also without a log.
         log.warning("Cannot open %s: %s — the background index runs without a log", log_file, exc)
@@ -1143,6 +1143,10 @@ def _optimize_db(db_dir: Path) -> None:
 
 if __name__ == "__main__":
     import sys as _sys
+
+    from ..utils import use_utf8_stdio
+
+    use_utf8_stdio()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",

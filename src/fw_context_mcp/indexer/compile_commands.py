@@ -296,7 +296,7 @@ def expand_response_file(token: str, cwd: Path | None = None) -> list[str]:
         rsp = cwd / rsp
     if not rsp.exists():
         return []
-    return shlex.split(rsp.read_text())
+    return shlex.split(rsp.read_text(encoding="utf-8"))
 
 
 def _is_source_file(token: str) -> bool:

@@ -104,7 +104,7 @@ def detect_nginx() -> dict[str, Any]:
         for conf in NGINX_SITES_ENABLED.iterdir():
             if conf.is_symlink() or conf.is_file():
                 try:
-                    content = conf.read_text()
+                    content = conf.read_text(encoding="utf-8")
                     if "listen 443 ssl" in content or "listen [::]:443 ssl" in content:
                         result["has_https"] = True
                         # Extract server_name for display

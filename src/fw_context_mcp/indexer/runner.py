@@ -1177,7 +1177,7 @@ def run(
         def _heartbeat() -> None:
             while not _hb_stop.wait(30.0):
                 try:
-                    with open(_hb_log, "a") as f:
+                    with open(_hb_log, "a", encoding="utf-8") as f:
                         f.write(f"{time.strftime('%H:%M:%S')} heartbeat\n")
                 except (OSError, ValueError, TypeError, RuntimeError, AttributeError, sqlite3.Error):
                     pass  # non-fatal — continue

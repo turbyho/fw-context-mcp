@@ -54,7 +54,7 @@ def cmd_watch_status(args: argparse.Namespace) -> int:
     if alive:
         if pid_file.exists():
             try:
-                pid = int(pid_file.read_text().strip())
+                pid = int(pid_file.read_text(encoding="utf-8").strip())
                 import time as _time
 
                 uptime_s = _time.time() - pid_file.stat().st_mtime
@@ -125,7 +125,7 @@ def cmd_watch_restart(args: argparse.Namespace) -> int:
     # Kill existing daemon
     if pid_file.exists():
         try:
-            pid = int(pid_file.read_text().strip())
+            pid = int(pid_file.read_text(encoding="utf-8").strip())
             print(f"Stopping daemon (pid {pid})...")
             _os.kill(pid, _signal.SIGTERM)
             # Wait for shutdown

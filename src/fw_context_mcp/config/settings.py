@@ -1242,7 +1242,7 @@ def update_global_config(fix: bool = False) -> None:
     if not path.exists():
         if fix:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(_GLOBAL_DEFAULTS)
+            path.write_text(_GLOBAL_DEFAULTS, encoding="utf-8")
             print(f"  [fix] created {path}")
         else:
             print(f"  [info] {path} missing — run with --force to create")

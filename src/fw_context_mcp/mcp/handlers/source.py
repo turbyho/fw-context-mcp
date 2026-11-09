@@ -411,7 +411,7 @@ def _read_symbol_body(
         read_end = min(read_end, start_idx + body_cap)
         from itertools import islice
 
-        with p.open(errors="replace") as fh:
+        with p.open(encoding="utf-8", errors="replace") as fh:
             window = [line.rstrip("\n\r") for line in islice(fh, read_start, read_end)]
     except OSError:
         return ""
@@ -486,7 +486,7 @@ def _read_probe_lines(file_path: str, line_no: int, count: int = _NAME_PROBE_LIN
 
     start = max(0, line_no - 1)
     try:
-        with Path(file_path).open(errors="replace") as fh:
+        with Path(file_path).open(encoding="utf-8", errors="replace") as fh:
             return [line.rstrip("\n\r") for line in islice(fh, start, start + count)]
     except OSError:
         return []
@@ -873,7 +873,7 @@ async def explain_symbol(
         )
     else:
         try:
-            lines = Path(file_path).read_text(errors="replace").splitlines()
+            lines = Path(file_path).read_text(encoding="utf-8", errors="replace").splitlines()
             start = max(0, line_no - context_lines - 1)
             end = min(len(lines), line_no + context_lines)
             numbered = "\n".join(

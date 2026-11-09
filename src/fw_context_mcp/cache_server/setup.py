@@ -568,7 +568,7 @@ def _save_credentials(password: str) -> None:
     home_parent = Path.home() / ".fw-context"
     home_parent.mkdir(parents=True, exist_ok=True)
     home_path = home_parent / "db.env"
-    home_path.write_text(db_url_line)
+    home_path.write_text(db_url_line, encoding="utf-8")
     home_path.chmod(0o600)
     print(f"  [✓] Credentials saved to {home_path}")
     os.environ["FW_CACHE_DB_URL"] = db_url
@@ -591,7 +591,7 @@ def _find_db_url() -> str:
         return db_url
     for env_path in (Path("/var/lib/fw-cache-server/db.env"), Path.home() / ".fw-context" / "db.env"):
         if env_path.exists():
-            content = env_path.read_text()
+            content = env_path.read_text(encoding="utf-8")
             m = re.search(r'FW_CACHE_DB_URL="([^"]+)"', content)
             if m:
                 os.environ["FW_CACHE_DB_URL"] = m.group(1)

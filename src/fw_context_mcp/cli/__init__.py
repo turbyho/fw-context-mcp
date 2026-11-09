@@ -110,6 +110,9 @@ def main() -> None:
     duplicating it in every ``cmd_*`` function and ensures consistent
     behaviour regardless of which subcommand is invoked.
     """
+    from ..utils import use_utf8_stdio
+
+    use_utf8_stdio()
     # ── Fast pre-flight: critical dependency checks (<50ms) ──
     # Skipped for doctor/init/quickstart (they run their own dependency
     # audit), and for version/--version/--help/-h.

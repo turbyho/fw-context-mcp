@@ -1380,3 +1380,24 @@ def fmt_count(n: int) -> str:
     if n < 0:
         return "-" + f"{abs(n):_d}".replace("_", " ")
     return f"{n:_d}".replace("_", " ")
+
+
+def use_utf8_stdio() -> None:
+    """Write ``sys.stdout`` and ``sys.stderr`` in UTF-8 on Windows.
+
+    WHY: on Windows, Python writes a pipe or a file in the ANSI code page of
+    the system (cp1252, cp1250), and ``print("✓")`` then raises
+    UnicodeEncodeError.  The daemon starts ``fw-context index --background``
+    with its output in a log file, and ``fw-context init`` under a pipe
+    stopped in its dependency audit (measured on Windows 11, 2026-11-09).
+    A console is UTF-8 already (PEP 528), and Python 3.15 makes UTF-8 the
+    default for the other streams too (PEP 686).
+
+    Call it at the start of an entry point that writes text, and not in the
+    MCP server: its transport wraps the binary ``sys.stdout.buffer`` itself.
+    """
+    if sys.platform != "win32":
+        return
+    for stream in (sys.stdout, sys.stderr):
+        if isinstance(stream, io.TextIOWrapper):
+            stream.reconfigure(encoding="utf-8")
