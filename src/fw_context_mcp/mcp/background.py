@@ -39,6 +39,7 @@ import sys
 from pathlib import Path
 
 from ..file_lock import held_by_another, try_lock, unlock
+from ..utils import O_NOFOLLOW
 from .shared.context import _db_path
 from .shared.pid_file import PidFile
 
@@ -62,7 +63,7 @@ def _spawn_daemon(root: Path) -> None:
     db_path = _db_path(root)
     log_file = db_path.parent / "daemon.log"
     try:
-        fd = os.open(log_file, os.O_NOFOLLOW | os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        fd = os.open(log_file, O_NOFOLLOW | os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
         log_fh = os.fdopen(fd, "a", encoding="utf-8", closefd=True)
         subprocess.Popen(
             [sys.executable, "-u", "-m", "fw_context_mcp.mcp.daemon", str(root)],

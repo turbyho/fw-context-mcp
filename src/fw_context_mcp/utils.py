@@ -1415,3 +1415,14 @@ def _reconfigure_utf8(streams: list) -> None:
         if isinstance(stream, io.TextIOWrapper):
             stream.reconfigure(encoding="utf-8", errors=stream.errors)
 
+
+#: ``os.O_NOFOLLOW`` where the system has it, else 0 (Windows).
+#:
+#: WHY: a log in the index directory opens with it, thus a link that a
+#: different user put there cannot send the write to a different file.
+#: Windows has no such flag.  There a symlink needs the privilege
+#: ``SeCreateSymbolicLinkPrivilege`` (or the developer mode), and the ACL
+#: of the profile keeps other users out of ``~/.fw-context``.  The open
+#: raised AttributeError before, which stopped the start of the daemon and
+#: of each background index run.
+O_NOFOLLOW: int = getattr(os, "O_NOFOLLOW", 0)

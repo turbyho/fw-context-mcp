@@ -79,7 +79,7 @@ from ..config import load as load_config
 from ..exit_codes import EXIT_ALREADY_RUNNING, EXIT_SUPERSEDED
 from ..file_lock import try_lock, unlock
 from ..indexer.db._locking import index_run_lock_held
-from ..utils import HEADER_EXTENSIONS, TU_EXTENSIONS, remove_stale_tmp
+from ..utils import HEADER_EXTENSIONS, O_NOFOLLOW, TU_EXTENSIONS, remove_stale_tmp
 from .background import PENDING_MARKER
 from .shared.pid_file import PidFile
 
@@ -1022,7 +1022,7 @@ async def _run_index_async(
     log_file = db_dir / "reindex.log"
     log_target: int | TextIO
     try:
-        fd = os.open(log_file, os.O_NOFOLLOW | os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        fd = os.open(log_file, O_NOFOLLOW | os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
         log_target = os.fdopen(fd, "w", encoding="utf-8", closefd=True)
     except OSError as exc:
         # The run does its work also without a log.
