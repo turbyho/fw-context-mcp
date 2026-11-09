@@ -832,7 +832,13 @@ def _reap_orphan_build_group(db_dir: Path) -> None:
     while a member lives, thus it needs no leader checks.  Such a group can
     also be a member that a build left on purpose (a compiler server); it
     stops too, because it writes to the build directory of this run.
+
+    POSIX only.  On Windows the build runs in a job object, and Windows
+    ends it when the run that holds the job dies (``job_object.py``).  Thus
+    a Windows run writes no record, and nothing is left to stop here.
     """
+    if sys.platform == "win32":
+        return
     from ..utils import stop_process_group
 
     record = db_dir / _BUILD_GROUP_RECORD

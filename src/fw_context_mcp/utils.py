@@ -475,7 +475,12 @@ def stop_process_group(
     The SIGKILL is in ``finally``: a second Ctrl-C during the wait raises
     ``KeyboardInterrupt`` out of ``time.sleep``, and a build that ignores
     SIGTERM then ran on.
+
+    POSIX only.  On Windows a build runs in a job object, and the job stops
+    it (``job_object.py``).
     """
+    if sys.platform == "win32":
+        raise OSError("a process group is POSIX; on Windows the job object of the build stops it")
     try:
         os.killpg(pgid, signal.SIGTERM)
     except ProcessLookupError:
@@ -500,8 +505,11 @@ def process_group_is_gone(pgid: int, leader: subprocess.Popen | None = None) -> 
     """Return True when no process of the group *pgid* runs.
 
     *leader* as in :func:`stop_process_group`: it is reaped first, because
-    a zombie leader still counts as a member.
+    a zombie leader still counts as a member.  POSIX only, as
+    :func:`stop_process_group`.
     """
+    if sys.platform == "win32":
+        raise OSError("a process group is POSIX; on Windows the job object of the build holds the build")
     if leader is not None:
         leader.poll()
     try:
@@ -539,7 +547,12 @@ def run_in_process_group(
     The record goes only when the group is gone.  An exception during the
     stop (a second Ctrl-C) can leave members alive, and the next index run
     then finds them through the record.
+
+    Windows has no process group that a stop can reach: there the build
+    runs in a job object (:func:`_run_in_job`).
     """
+    if sys.platform == "win32":
+        return _run_in_job(cmd, cwd=cwd, env=env, timeout=timeout, capture_output=capture_output)
     pipe = subprocess.PIPE if capture_output else None
     proc = subprocess.Popen(  # noqa: S603 — argv list, no shell
         cmd, cwd=cwd, env=env, stdout=pipe, stderr=pipe, text=True, start_new_session=True,
@@ -561,6 +574,82 @@ def run_in_process_group(
         if record is not None and process_group_is_gone(proc.pid, proc):
             _remove_group_record(record, proc.pid)
     return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+
+
+if sys.platform == "win32":
+
+    #: The longest wait of :func:`_communicate_in_slices` before Python code runs again.
+    _WAIT_SLICE_S = 0.1
+
+    def _communicate_in_slices(proc: subprocess.Popen, timeout: float | None) -> tuple[str | None, str | None]:
+        """``proc.communicate(timeout=timeout)``, in waits of ``_WAIT_SLICE_S``.
+
+        WHY: on Windows ``communicate`` waits in ``WaitForSingleObject``, and
+        a Ctrl-C or a stop request (``processes.request_stop`` →
+        ``interrupt_main``) runs its handler only when Python code runs
+        again.  Measured on Windows 11 (2026-11-09): a stop request during a
+        build of 60 s came after the 60 s.  A Ctrl-C during a build thus did
+        nothing until the build ended.  A wait in slices lets the handler
+        run within ``_WAIT_SLICE_S``.  ``communicate`` loses no output when
+        it is called again after ``TimeoutExpired`` (Python documentation).
+        The cost is 10 calls each second, which is nothing beside a build.
+        WHY not a wait for the stop event of ``processes``: a Ctrl-C of the
+        console sets no such event.  POSIX needs no slices: a signal
+        interrupts the wait there.
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                raise subprocess.TimeoutExpired(proc.args, timeout or 0)
+            wait = _WAIT_SLICE_S if remaining is None else min(_WAIT_SLICE_S, remaining)
+            try:
+                return proc.communicate(timeout=wait)
+            except subprocess.TimeoutExpired:
+                continue
+
+    def _run_in_job(
+        cmd: list[str],
+        *,
+        cwd: Path,
+        env: dict[str, str],
+        timeout: float | None,
+        capture_output: bool,
+    ) -> subprocess.CompletedProcess:
+        """Windows form of :func:`run_in_process_group`: the build runs in a job object.
+
+        The same result and the same exceptions, and ``JobObjectError`` (a
+        ``RuntimeError``) when Windows refuses the job.  A stop (the timeout,
+        an exception while the build runs) closes the job, and Windows ends
+        each process of the build at once; ``job_object.py`` gives the
+        reason and the measurements.  WHY the close and not
+        ``TerminateJobObject``: the close cannot fail, thus an error of the
+        stop cannot replace the exception that the stop handles.
+
+        At the end, also after a build that ended by itself, the close of
+        the job ends each process that the build left (a compiler server).
+        On POSIX the next index run stops such a process through the record
+        (``cli/_index._reap_orphan_build_group``).
+
+        No record (``record_build_groups``): a run that dies closes the
+        handle of the job, and Windows ends the build then.
+        """
+        from .job_object import BuildJob
+
+        pipe = subprocess.PIPE if capture_output else None
+        with BuildJob() as job:
+            proc = job.start(cmd, cwd=cwd, env=env, stdout=pipe, stderr=pipe)
+            try:
+                stdout, stderr = _communicate_in_slices(proc, timeout)
+            except subprocess.TimeoutExpired:
+                job.close()
+                stdout, stderr = proc.communicate()
+                raise subprocess.TimeoutExpired(cmd, timeout or 0, output=stdout, stderr=stderr) from None
+            except BaseException:
+                job.close()
+                proc.wait()
+                raise
+        return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
 
 def build_cfg_env(build_cfg: BuildConfig | None, env: dict[str, str] | None = None) -> dict[str, str]:
