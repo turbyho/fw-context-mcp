@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING
 from ..indexer import _force_llm_marker as force_llm_marker
 from ..indexer import _index_owner as index_owner
 from ..indexer import autobuild
+from ..processes import HANGUP_SIGNAL, install_stop_listener
 from ..utils import (
     SAFE_EXCEPT,
     build_dir_patterns_with_fw_context,
@@ -740,7 +741,7 @@ def _owned_index(db_dir: Path, args: argparse.Namespace, *, pid_marker: bool = T
     def _stopped(signum: int, frame: object) -> None:
         # SIGHUP too: a signal during the unwinding would interrupt it.
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        signal.signal(HANGUP_SIGNAL, signal.SIG_IGN)
         if _taken_over(db_dir):
             raise IndexSuperseded("terminated by another index run that took the index over")
         raise IndexTerminated("a SIGTERM that no index run sent stopped this run")
@@ -750,22 +751,28 @@ def _owned_index(db_dir: Path, args: argparse.Namespace, *, pid_marker: bool = T
         # its own session (see utils.run_in_process_group), thus the kernel
         # no longer sends it SIGHUP with the terminal.  The default action
         # stopped this process with no cleanup, and the build ran on.  Now
-        # the run unwinds, and the unwinding stops the build group.
-        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        # the run unwinds, and the unwinding stops the build group.  On
+        # Windows the signal is SIGBREAK (processes.HANGUP_SIGNAL): the C
+        # runtime gives it for the close of the console.
+        signal.signal(HANGUP_SIGNAL, signal.SIG_IGN)
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        raise IndexTerminated("the terminal closed (SIGHUP)")
+        raise IndexTerminated(f"the terminal closed ({HANGUP_SIGNAL.name})")
 
     previous = signal.signal(signal.SIGTERM, _stopped)
     # A SIGHUP that the caller ignores stays ignored: `nohup fw-context index`
     # asks the run to live on after the terminal closes, and the build does
     # (it has its own session).
-    previous_hup = signal.getsignal(signal.SIGHUP)
+    previous_hup = signal.getsignal(HANGUP_SIGNAL)
     if previous_hup is not signal.SIG_IGN:
-        signal.signal(signal.SIGHUP, _hung_up)
+        signal.signal(HANGUP_SIGNAL, _hung_up)
+    # The stop event on Windows (processes.request_stop) for each owner of
+    # the index, also one that enters here without cmd_index.  A second
+    # call does nothing.
+    install_stop_listener()
 
     def _restore_handler() -> None:
         signal.signal(signal.SIGTERM, signal.SIG_DFL if previous is None else previous)
-        signal.signal(signal.SIGHUP, signal.SIG_DFL if previous_hup is None else previous_hup)
+        signal.signal(HANGUP_SIGNAL, signal.SIG_DFL if previous_hup is None else previous_hup)
 
     with ExitStack() as stack:
         try:
@@ -1436,6 +1443,10 @@ def cmd_index(args: argparse.Namespace) -> int:
     """
     outside = _SigtermOutsideTheLock()
     previous = signal.signal(signal.SIGTERM, outside)
+    # On Windows a takeover or a stop of the daemon sets the stop event of
+    # this process (processes.request_stop): the listener then runs the
+    # SIGTERM handler that is installed at that time.
+    install_stop_listener()
     try:
         return _cmd_index(args, outside)
     except Exception as exc:

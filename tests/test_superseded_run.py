@@ -31,12 +31,16 @@ class TestSupersededGuard:
         raise_if_superseded(tmp_path)
 
     def test_a_live_foreign_marker_aborts_the_run(self, tmp_path: Path):
-        """PID 1 is always alive and is never us."""
-        (tmp_path / "reindex.pause").write_text("1", encoding="utf-8")
+        """The parent of this process is alive and is never us.
+
+        Not PID 1: Windows has no process with PID 1.
+        """
+        parent = os.getppid()
+        (tmp_path / "reindex.pause").write_text(str(parent), encoding="utf-8")
 
         with pytest.raises(IndexSuperseded) as exc:
             raise_if_superseded(tmp_path)
-        assert "pid 1" in str(exc.value)
+        assert f"pid {parent}" in str(exc.value)
 
     def test_our_own_marker_is_ignored(self, tmp_path: Path):
         """A foreground index writes the marker to stop the daemon, not itself."""

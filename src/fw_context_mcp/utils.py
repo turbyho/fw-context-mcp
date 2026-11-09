@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     from fw_context_mcp.indexer.build import BuildConfig
 
 from fw_context_mcp import _stdlib_sqlite3
+from fw_context_mcp.processes import MAX_PID, pid_exists
 
 log = logging.getLogger(__name__)
 
@@ -961,28 +962,28 @@ def owner_is_dead(token: str) -> bool:
     cannot know if the owner still runs.  A token that does not parse gives
     False too, because the file then has an unknown source.
 
-    A process that runs and belongs to a different user (EPERM) is alive.
-    A PID that is too large for ``pid_t`` (OverflowError) names no process,
-    but it did not come from this code, thus the file stays.
+    A process that runs and belongs to a different user is alive.  A PID
+    outside 1 .. ``processes.MAX_PID`` (``pid_t`` on POSIX, a DWORD on
+    Windows) did not come from this code, thus the file of such a token
+    stays.  So does the file when the probe gives an error that is no
+    answer: the cost of a kept file is disk space only.
 
-    On Windows, signal 0 of ``os.kill`` is ``CTRL_C_EVENT``: the call sends
-    Ctrl+C to the process group of the PID and tests nothing.  The probe
-    there is ``_windows_process_is_gone``.
+    The probe is :func:`fw_context_mcp.processes.pid_exists`: on Windows,
+    signal 0 of ``os.kill`` is ``CTRL_C_EVENT``, which sends Ctrl+C to the
+    process group of the PID and tests nothing.
     """
     pid_text, sep, tag = token.partition("@")
     # isascii first: isdigit() also accepts digits such as "²", which int()
     # refuses with a ValueError.
     if not sep or not (pid_text.isascii() and pid_text.isdigit()) or tag != _owner_tag():
         return False
-    if _ON_WINDOWS:
-        return _windows_process_is_gone(int(pid_text))
-    try:
-        os.kill(int(pid_text), 0)
-    except ProcessLookupError:
-        return True
-    except (OSError, OverflowError):
+    pid = int(pid_text)
+    if not 0 < pid <= MAX_PID:
         return False
-    return False
+    try:
+        return not pid_exists(pid)
+    except OSError:
+        return False
 
 
 
@@ -1052,56 +1053,6 @@ def remove_stale_tmp(directory: Path) -> int:
             tmp.unlink(missing_ok=True)
             removed += 1
     return removed
-
-
-_ON_WINDOWS = os.name == "nt"
-
-# Windows API values for the liveness probe, from the Win32 documentation.
-_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-_ERROR_INVALID_PARAMETER = 87
-_STILL_ACTIVE = 259
-
-
-def _windows_process_is_gone(pid: int) -> bool:
-    """Say if no process with *pid* runs, on Windows.
-
-    ``OpenProcess`` fails with ``ERROR_INVALID_PARAMETER`` for a PID that no
-    process has.  Another failure, such as access denied, is a process that
-    runs.  An open process whose exit code is ``STILL_ACTIVE`` runs.
-
-    On another platform the answer is False: the file then stays, which
-    costs disk space only.  The type checker reads the platform test and
-    does not check the Windows calls on another platform.
-
-    PID 0 and a PID that a DWORD cannot hold give False too, as an
-    ``OverflowError`` does on POSIX.  ctypes would cut a large PID to 32
-    bits and probe another process, and PID 0 is the idle process, for
-    which ``OpenProcess`` also fails with ``ERROR_INVALID_PARAMETER``.
-    The argument and result types are declared, so that a handle keeps
-    its full width.
-    """
-    if sys.platform != "win32" or not 0 < pid < 2**32:
-        return False
-    import ctypes
-    from ctypes import wintypes
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
-    kernel32.OpenProcess.restype = wintypes.HANDLE
-    kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
-    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
-    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
-    kernel32.CloseHandle.restype = wintypes.BOOL
-    handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-    if not handle:
-        return ctypes.get_last_error() == _ERROR_INVALID_PARAMETER
-    try:
-        code = wintypes.DWORD()
-        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
-            return False
-        return code.value != _STILL_ACTIVE
-    finally:
-        kernel32.CloseHandle(handle)
 
 
 def cc_staging_path(directory: Path) -> Path:

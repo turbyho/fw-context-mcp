@@ -104,14 +104,13 @@ def cmd_watch_status(args: argparse.Namespace) -> int:
 
 def cmd_watch_restart(args: argparse.Namespace) -> int:
     """Restart the watcher daemon for a project."""
-    import os as _os
-    import signal as _signal
     import time as _time
 
     from ..config import derive_project_id
     from ..config import load as load_config
     from ..mcp.background import _ensure_daemon_running
     from ..mcp.daemon import DAEMON_SOCK_NAME, ping_daemon
+    from ..processes import kill_hard, pid_exists, request_stop
     from ..utils import resolve_project_root
 
     root = resolve_project_root(args.project)
@@ -127,20 +126,18 @@ def cmd_watch_restart(args: argparse.Namespace) -> int:
         try:
             pid = int(pid_file.read_text(encoding="utf-8").strip())
             print(f"Stopping daemon (pid {pid})...")
-            _os.kill(pid, _signal.SIGTERM)
+            # The request runs the SIGTERM handler of the daemon, also on
+            # Windows (processes.request_stop), where os.kill(pid, SIGTERM)
+            # is TerminateProcess and os.kill(pid, 0) sends Ctrl+C.
+            request_stop(pid)
             # Wait for shutdown
             for _ in range(30):  # 3 seconds max
-                try:
-                    _os.kill(pid, 0)
-                except OSError:
+                if not pid_exists(pid):
                     break
                 _time.sleep(0.1)
             else:
-                print("Daemon did not stop, sending SIGKILL...")
-                try:
-                    _os.kill(pid, _signal.SIGKILL)
-                except OSError:
-                    pass
+                print("Daemon did not stop, ending it...")
+                kill_hard(pid)
                 _time.sleep(0.5)
             print("Old daemon stopped.")
         except (ValueError, OSError) as e:

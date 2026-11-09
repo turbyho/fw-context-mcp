@@ -79,6 +79,7 @@ from ..config import load as load_config
 from ..exit_codes import EXIT_ALREADY_RUNNING, EXIT_SUPERSEDED
 from ..file_lock import try_lock, unlock
 from ..indexer.db._locking import index_run_lock_held
+from ..processes import STOP_TOKEN_ENV, install_stop_listener, new_stop_token, request_stop
 from ..utils import HEADER_EXTENSIONS, O_NOFOLLOW, TU_EXTENSIONS, remove_stale_tmp
 from .background import PENDING_MARKER
 from .shared.pid_file import PidFile
@@ -87,6 +88,13 @@ log = logging.getLogger(__name__)
 
 # ── Constants ────────────────────────────────────────────────────────────────
 DAEMON_SOCK_NAME = "daemon.sock"
+
+# The stop token of the index runs of this daemon (processes.STOP_TOKEN_ENV).
+# WHY: on Windows the python.exe of a virtual environment is a launcher, and
+# the PID of the Popen is not the PID of the run, thus the run cannot make an
+# event for that PID.  One token for the life of the daemon is sufficient:
+# the daemon starts a run only after the end of the run before it.
+_RUN_STOP_TOKEN = new_stop_token()
 PING_INTERVAL = 15   # How often each MCP server pings (seconds)
 PING_TIMEOUT = 60    # Exit after this long without any ping (seconds)
 _DEBOUNCE_S = 2.0    # Collect changes before spawning index
@@ -789,17 +797,36 @@ async def _setup_unix_socket(db_dir: Path, on_ping) -> tuple[asyncio.Server, Pat
 
 
 def _setup_signal_handlers(shutdown: asyncio.Event) -> None:
-    """Register SIGTERM / SIGINT handlers that set *shutdown*."""
+    """Register SIGTERM / SIGINT handlers that set *shutdown*, and the stop listener.
+
+    POSIX: ``loop.add_signal_handler``.  Windows has no such call (the
+    Proactor loop raises NotImplementedError), and the daemon then had no
+    handler at all: ``fw-context watch stop`` ended it with
+    ``TerminateProcess``, and a stop request (``processes.request_stop``)
+    did nothing, because ``interrupt_main`` runs only a Python handler.  On
+    Windows the handler is a ``signal.signal`` handler: the Proactor loop
+    wakes for a signal through its wakeup socket, and the handler gives
+    *shutdown* to the loop.
+    """
     loop = asyncio.get_running_loop()
 
     def _handle_signal() -> None:
         shutdown.set()
 
+    if sys.platform == "win32":
+        def _from_signal(signum: int, frame: object) -> None:
+            # The handler stays after asyncio.run() closed the loop, and a
+            # late signal must not raise "Event loop is closed" in the
+            # cleanup of the process.
+            if not loop.is_closed():
+                loop.call_soon_threadsafe(_handle_signal)
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(sig, _from_signal)
+        install_stop_listener()
+        return
     for sig in (signal.SIGTERM, signal.SIGINT):
-        try:
-            loop.add_signal_handler(sig, _handle_signal)
-        except NotImplementedError:
-            pass
+        loop.add_signal_handler(sig, _handle_signal)
 
 
 async def _cleanup_daemon(
@@ -814,7 +841,7 @@ async def _cleanup_daemon(
     log.info("Daemon shutting down")
     if index_proc is not None and index_proc.returncode is None:
         log.info("Terminating index subprocess (pid %d)", index_proc.pid)
-        index_proc.terminate()
+        _stop_run(index_proc)
         try:
             await asyncio.wait_for(index_proc.wait(), timeout=10)
         except TimeoutError:
@@ -1032,6 +1059,7 @@ async def _run_index_async(
     env: dict[str, str] = {
         **os.environ,
         "PYTHONUNBUFFERED": "1",
+        STOP_TOKEN_ENV: _RUN_STOP_TOKEN,
     }
     if force_refs:
         env["FW_CONTEXT_FORCE_REFINDEX"] = "1"
@@ -1049,6 +1077,34 @@ async def _run_index_async(
         # The subprocess has its own copy of the file descriptor.
         if not isinstance(log_target, int):
             log_target.close()
+
+
+def _stop_run(proc: asyncio.subprocess.Process) -> None:
+    """Ask the index run *proc* to stop; end it at once when it cannot get the request.
+
+    POSIX: ``Process.terminate()``, which is SIGTERM and sends nothing to a
+    child that asyncio already reaped (a PID that the system can give to
+    another process).  Windows: the stop event of the token of the run
+    (``processes.request_stop``); ``Process.terminate()`` is
+    ``TerminateProcess`` there and runs no handler.
+
+    A run without a listener (on Windows a run that has not reached
+    ``cmd_index`` yet) ends at once, as SIGTERM with its default action
+    ends it on POSIX.  The caller waits for the end, and kills after 10 s.
+    """
+    if sys.platform == "win32":
+        if request_stop(proc.pid, token=_RUN_STOP_TOKEN):
+            return
+    else:
+        try:
+            proc.terminate()
+            return
+        except ProcessLookupError:
+            return
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
 
 
 async def _wait_index(
@@ -1071,11 +1127,11 @@ async def _wait_index(
     try:
         while proc.returncode is None:
             if shutdown.is_set():
-                proc.terminate()
+                _stop_run(proc)
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=10)
                 except TimeoutError:
-                    log.warning("Index subprocess did not exit after SIGTERM, killing")
+                    log.warning("Index subprocess did not exit after the stop request, killing")
                     proc.kill()
                     await proc.wait()
                 return None

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 import os
-import signal
+import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -22,6 +22,7 @@ from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 from ..mcp.shared.pid_file import PidFile
+from ..processes import kill_hard, process_argv_windows, request_stop
 
 # How long a run that was asked to stop (SIGTERM) gets to release the index
 # lock, and how long a run that got SIGKILL gets after that.  A cooperative
@@ -44,7 +45,12 @@ def process_argv(pid: int) -> list[str] | None:
     split.  The caller only looks for whole words (``index``,
     ``--background``) and for a program name suffix, which a split does not
     create.
+
+    Windows has neither: ``processes.process_argv_windows`` reads the
+    command line from the process (``NtQueryInformationProcess``).
     """
+    if sys.platform == "win32":
+        return process_argv_windows(pid)
     proc_cmdline = Path(f"/proc/{pid}/cmdline")
     try:
         # /proc joins argv with NULs.
@@ -69,6 +75,21 @@ def process_argv(pid: int) -> list[str] | None:
     return result.stdout.split() or None
 
 
+def _program_name(arg: str) -> str:
+    """Give *arg* without the ``.exe`` of a Windows program, for the compare with a program name.
+
+    pip makes ``Scripts\\fw-context.exe`` on Windows, and the argv of the
+    Python process holds that path.  The suffixes that the callers compare
+    (``fw-context``, ``fw_context_mcp.cli``) then did not match.
+    """
+    return arg[:-4] if arg.lower().endswith(".exe") else arg
+
+
+def _is_fw_context_program(argv: list[str], names: tuple[str, ...]) -> bool:
+    """Return True when an argument of *argv* ends with one of *names*, without ``.exe``."""
+    return any(_program_name(arg).endswith(names) for arg in argv)
+
+
 def index_run_kind(pid: int) -> str | None:
     """Return ``"background"`` or ``"foreground"`` for an fw-context index run.
 
@@ -86,7 +107,7 @@ def index_run_kind(pid: int) -> str | None:
     argv = process_argv(pid)
     if not argv:
         return None
-    if not any(arg.endswith(("fw-context", "fw_context_mcp.cli", "fw_context_mcp")) for arg in argv):
+    if not _is_fw_context_program(argv, ("fw-context", "fw_context_mcp.cli", "fw_context_mcp")):
         return None
     if "index" not in argv:
         return None
@@ -96,9 +117,8 @@ def index_run_kind(pid: int) -> str | None:
 def is_fw_context_process(pid: int) -> bool:
     """Return True when *pid* runs fw-context (any command, the MCP server or its daemon), for the message of a refusal."""
     argv = process_argv(pid)
-    return bool(argv) and any(
-        arg.endswith(("fw-context", "fw-context-mcp", "fw_context_mcp.cli", "fw_context_mcp", "fw_context_mcp.mcp.daemon"))
-        for arg in argv or ()
+    return bool(argv) and _is_fw_context_program(
+        argv or [], ("fw-context", "fw-context-mcp", "fw_context_mcp.cli", "fw_context_mcp", "fw_context_mcp.mcp.daemon"),
     )
 
 
@@ -107,24 +127,25 @@ def is_analyze_run(pid: int) -> bool:
     argv = process_argv(pid)
     if not argv:
         return False
-    return any(arg.endswith(("fw-context", "fw_context_mcp.cli", "fw_context_mcp")) for arg in argv) and (
+    return _is_fw_context_program(argv, ("fw-context", "fw_context_mcp.cli", "fw_context_mcp")) and (
         "analyze" in argv
     )
 
 
-def signal_index_run(pid: int, sig: signal.Signals) -> None:
-    """Send *sig* to *pid* when it is still an fw-context index run.
+def stop_index_run(pid: int, *, hard: bool) -> None:
+    """Ask *pid* to stop (``processes.request_stop``), or end it (*hard*), when it is still an fw-context index run.
 
-    Checked again right before each signal: the PID was read from the lock
+    Checked again right before each request: the PID was read from the lock
     file earlier, and the process may have exited and the PID been reused
-    since.
+    since.  The request is SIGTERM on POSIX and the stop event on Windows;
+    the hard stop is SIGKILL or ``TerminateProcess``.
     """
     if index_run_kind(pid) is None:
         return
-    try:
-        os.kill(pid, sig)
-    except ProcessLookupError:
-        pass
+    if hard:
+        kill_hard(pid)
+    else:
+        request_stop(pid)
 
 
 # The marker that tells a run which SIGTERM is a takeover.  A signal handler
@@ -260,7 +281,7 @@ def acquire_index(
     write_takeover_marker(db_dir, pid)
     won = False
     try:
-        signal_index_run(pid, signal.SIGTERM)
+        stop_index_run(pid, hard=False)
         won = wait_for_the_lock(db_dir, stack, pid, say)
     finally:
         if won:
@@ -293,8 +314,8 @@ def wait_for_the_lock(db_dir: Path, stack: ExitStack, pid: int, say: Callable[[s
                     raise
             time.sleep(0.1)
         if escalate:
-            say(f"  pid {pid} did not stop within {grace:.0f}s — sending SIGKILL")
-            signal_index_run(pid, signal.SIGKILL)
+            say(f"  pid {pid} did not stop within {grace:.0f}s — ending it")
+            stop_index_run(pid, hard=True)
     return False
 
 

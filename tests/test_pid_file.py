@@ -77,6 +77,10 @@ class TestIsActiveOther:
         assert path.exists(), "another process's marker must survive our cleanup"
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="the POSIX probe is os.kill(pid, 0); the Windows probe (OpenProcess) has its tests in test_processes.py",
+)
 class TestPidLiveness:
     """``os.kill(pid, 0)`` has three outcomes and they mean different things.
 
