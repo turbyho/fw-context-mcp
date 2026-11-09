@@ -34,7 +34,7 @@ def cmd_watch_status(args: argparse.Namespace) -> int:
     from ..config import derive_project_id
     from ..config import load as load_config
     from ..mcp.background import read_reindex_progress, read_reindex_state
-    from ..mcp.daemon import DAEMON_SOCK_NAME, ping_daemon
+    from ..mcp.daemon import DAEMON_PORT_NAME, _read_port_file, ping_daemon
     from ..utils import resolve_project_root
 
     root = resolve_project_root(args.project)
@@ -43,14 +43,14 @@ def cmd_watch_status(args: argparse.Namespace) -> int:
     db_dir = cfg.index.db_dir / project_id
 
     pid_file = db_dir / "watcher.pid"
-    sock_path = db_dir / DAEMON_SOCK_NAME
+    port_file = db_dir / DAEMON_PORT_NAME
 
     print(f"Project:    {root.name}")
     print(f"Path:       {root}")
     print(f"DB dir:     {db_dir}")
 
     # Daemon status
-    alive = ping_daemon(root) if sock_path.exists() else False
+    alive = ping_daemon(root)
     if alive:
         if pid_file.exists():
             try:
@@ -64,15 +64,18 @@ def cmd_watch_status(args: argparse.Namespace) -> int:
         else:
             print("Daemon:     running")
     else:
-        if sock_path.exists():
-            print("Daemon:     not responding (socket exists but no response)")
+        if port_file.exists():
+            print("Daemon:     not responding (port file exists but no answer)")
         elif pid_file.exists():
-            print("Daemon:     dead (pid file exists but socket missing)")
+            print("Daemon:     dead (pid file exists but port file missing)")
         else:
             print("Daemon:     not running")
 
-    # Socket
-    print(f"Socket:     {sock_path}{' (active)' if alive else ''}")
+    # Port file of the ping (TCP on 127.0.0.1): the port, for netstat or a
+    # firewall tool when the daemon does not answer.
+    known = _read_port_file(port_file)
+    port_text = f" (port {known[0]})" if known else ""
+    print(f"Port file:  {port_file}{port_text}{' (active)' if alive else ''}")
 
     # Modified files count
     db_path = db_dir / "index.db"
@@ -109,7 +112,7 @@ def cmd_watch_restart(args: argparse.Namespace) -> int:
     from ..config import derive_project_id
     from ..config import load as load_config
     from ..mcp.background import _ensure_daemon_running
-    from ..mcp.daemon import DAEMON_SOCK_NAME, ping_daemon
+    from ..mcp.daemon import DAEMON_PORT_NAME, ping_daemon
     from ..processes import kill_hard, pid_exists, request_stop
     from ..utils import resolve_project_root
 
@@ -119,7 +122,7 @@ def cmd_watch_restart(args: argparse.Namespace) -> int:
     db_dir = cfg.index.db_dir / project_id
 
     pid_file = db_dir / "watcher.pid"
-    sock_path = db_dir / DAEMON_SOCK_NAME
+    port_file = db_dir / DAEMON_PORT_NAME
 
     # Kill existing daemon
     if pid_file.exists():
@@ -148,7 +151,7 @@ def cmd_watch_restart(args: argparse.Namespace) -> int:
     # daemon a new inode, thus a lock of its own beside an old daemon that
     # survived its SIGKILL: two daemons.  A lock of a dead process is free.
     pid_file.unlink(missing_ok=True)
-    sock_path.unlink(missing_ok=True)
+    port_file.unlink(missing_ok=True)
 
     # Spawn new daemon
     print("Starting new daemon...")

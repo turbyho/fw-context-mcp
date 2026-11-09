@@ -1067,7 +1067,7 @@ Project:    my-zephyr-app
 Path:       /home/user/zephyr-app
 DB dir:     /home/user/.fw-context/index/a1b2c3d4
 Daemon:     running (pid 12345, uptime 3600s)
-Socket:     /home/user/.fw-context/index/a1b2c3d4/daemon.sock (active)
+Port file:  /home/user/.fw-context/index/a1b2c3d4/daemon.port (port 50731) (active)
 Modified:   3 file(s) in build nrf52840-dev/app
 Modified:   0 file(s) in build nrf52840-dev/mcuboot
 Index:      idle

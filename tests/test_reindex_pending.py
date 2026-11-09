@@ -445,26 +445,93 @@ class TestTheCheckAtTheStart:
             readiness._db_path(tmp_path)
 
 
-class TestTheSocketOfTheDaemon:
-    def test_a_socket_path_that_is_too_long_logs_the_cause(self, tmp_path, caplog):
-        """The daemon holds `watcher.lock` before the bind, thus no other daemon runs.
+class TestThePingOfTheDaemon:
+    """The heartbeat over TCP on 127.0.0.1: ``daemon.port`` holds the port and a token."""
 
-        The log said "daemon already running?" for each error of the bind,
-        and that sent the operator to look for a process that was not there.
-        """
+    @staticmethod
+    def _serve_and_ping(monkeypatch, db_dir: Path) -> tuple[bool, list[int]]:
+        """Start the ping server of *db_dir*, ping it once, and return the answer and the pings."""
         from fw_context_mcp.mcp import daemon as daemon_mod
 
-        # Longer than `sun_path` on Linux (108 bytes) and on macOS (104 bytes).
+        monkeypatch.setattr(daemon_mod, "_get_db_dir", lambda root: db_dir)
+        pings: list[int] = []
+
+        async def run() -> bool:
+            server, _ = await daemon_mod._setup_ping_server(db_dir, lambda: pings.append(1))
+            try:
+                return await asyncio.get_running_loop().run_in_executor(None, daemon_mod.ping_daemon, db_dir)
+            finally:
+                server.close()
+                await server.wait_closed()
+
+        return asyncio.run(run()), pings
+
+    def test_a_ping_gets_the_answer_of_the_daemon(self, tmp_path, monkeypatch):
+        answered, pings = self._serve_and_ping(monkeypatch, tmp_path)
+        assert answered is True
+        assert pings == [1]
+
+    def test_a_long_index_directory_is_no_problem(self, tmp_path, monkeypatch):
+        """A Unix domain socket stopped at 108 bytes (Linux) or 104 (macOS): the daemon did not start."""
         db_dir = tmp_path / ("d" * 120)
         db_dir.mkdir()
+        answered, _ = self._serve_and_ping(monkeypatch, db_dir)
+        assert answered is True
 
-        with caplog.at_level(logging.ERROR, logger="fw_context_mcp.mcp.daemon"), pytest.raises(OSError):
-            asyncio.run(daemon_mod._setup_unix_socket(db_dir, lambda: None))
+    def test_no_port_file_is_no_daemon(self, tmp_path, monkeypatch):
+        from fw_context_mcp.mcp import daemon as daemon_mod
 
-        messages = [r.getMessage() for r in caplog.records]
-        assert len(messages) == 1, messages
-        assert "AF_UNIX path too long" in messages[0]
-        assert "already running" not in messages[0]
+        monkeypatch.setattr(daemon_mod, "_get_db_dir", lambda root: tmp_path)
+        assert daemon_mod.ping_daemon(tmp_path) is False
+
+    def test_another_program_on_the_port_is_no_daemon(self, tmp_path, monkeypatch):
+        """A daemon that a SIGKILL stopped leaves its file, and its port can go to another program."""
+        from fw_context_mcp.mcp import daemon as daemon_mod
+
+        monkeypatch.setattr(daemon_mod, "_get_db_dir", lambda root: tmp_path)
+
+        async def other_program(reader, writer) -> None:
+            await reader.readline()
+            writer.write(b"HTTP/1.1 400 Bad Request\r\n")
+            await writer.drain()
+            writer.close()
+
+        async def run() -> bool:
+            server = await asyncio.start_server(other_program, host="127.0.0.1", port=0)
+            port = server.sockets[0].getsockname()[1]
+            (tmp_path / daemon_mod.DAEMON_PORT_NAME).write_text(f"{port} {'a' * 32}\n", encoding="utf-8")
+            try:
+                return await asyncio.get_running_loop().run_in_executor(None, daemon_mod.ping_daemon, tmp_path)
+            finally:
+                server.close()
+                await server.wait_closed()
+
+        assert asyncio.run(run()) is False
+
+    @pytest.mark.parametrize("text", ["4242 t\u00f6k\u00e9n", "4242", "x y", "70000 " + "a" * 32, "4242 " + "a" * 31])
+    def test_a_damaged_port_file_is_no_daemon(self, tmp_path, monkeypatch, text):
+        """A damaged file gives False, and no error in the ping thread of the MCP server."""
+        from fw_context_mcp.mcp import daemon as daemon_mod
+
+        monkeypatch.setattr(daemon_mod, "_get_db_dir", lambda root: tmp_path)
+        (tmp_path / daemon_mod.DAEMON_PORT_NAME).write_text(text, encoding="utf-8")
+        assert daemon_mod.ping_daemon(tmp_path) is False
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX file mode")
+    def test_the_port_file_is_for_this_user_only(self, tmp_path, monkeypatch):
+        """Another user who reads the token could answer on the port after a SIGKILL of the daemon."""
+        import stat
+
+        from fw_context_mcp.mcp import daemon as daemon_mod
+
+        self._serve_and_ping(monkeypatch, tmp_path)
+        mode = stat.S_IMODE((tmp_path / daemon_mod.DAEMON_PORT_NAME).stat().st_mode)
+        assert mode == 0o600
+
+    def test_the_start_removes_the_socket_of_an_older_version(self, tmp_path, monkeypatch):
+        (tmp_path / "daemon.sock").write_text("", encoding="utf-8")
+        self._serve_and_ping(monkeypatch, tmp_path)
+        assert not (tmp_path / "daemon.sock").exists()
 
 
 class TestTheStartOfTheDaemon:
@@ -481,7 +548,7 @@ class TestTheStartOfTheDaemon:
                 pass
 
         async def _socket(db_dir, on_ping):
-            return _Server(), db_dir / "daemon.sock"
+            return _Server(), db_dir / "daemon.port"
 
         async def _idle_watch(*args) -> None:
             await args[-2].wait()  # the shutdown event
@@ -494,7 +561,7 @@ class TestTheStartOfTheDaemon:
             seen["check"] = startup_check is daemon_mod._staleness_check
 
         monkeypatch.setattr(daemon_mod, "_get_db_dir", lambda root: tmp_path)
-        monkeypatch.setattr(daemon_mod, "_setup_unix_socket", _socket)
+        monkeypatch.setattr(daemon_mod, "_setup_ping_server", _socket)
         monkeypatch.setattr(daemon_mod, "_setup_signal_handlers", lambda shutdown: None)
         monkeypatch.setattr(daemon_mod, "_load_build_patterns", lambda db_dir: [])
         monkeypatch.setattr(daemon_mod, "_watch_changes", _idle_watch)
@@ -540,7 +607,7 @@ class TestTheStartOfTheDaemon:
         # unlock of a file descriptor that holds no lock (ERROR_NOT_LOCKED).
         assert try_lock(lock_fd)
         asyncio.run(daemon_mod._cleanup_daemon(
-            None, _Server(), tmp_path / "daemon.sock", tmp_path / "watcher.pid", lock_fd, asyncio.Event(),
+            None, _Server(), tmp_path / "daemon.port", tmp_path / "watcher.pid", lock_fd, asyncio.Event(),
         ))
 
         assert not (tmp_path / PENDING_MARKER).exists()
