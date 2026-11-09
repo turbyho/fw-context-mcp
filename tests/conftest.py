@@ -521,6 +521,32 @@ def _running(pid: int) -> bool:
     return state != "Z"
 
 
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_call(item):
+    """Close the connections of the query executors after the call of each test.
+
+    WHY: ``SyncQueryExecutor`` holds one connection to each database for
+    the life of the process (``mcp/shared/executor.py``), which is right for
+    an MCP server with a few databases.  A test session makes hundreds of
+    databases in temporary directories, and each one kept three file
+    descriptors (the database, ``-wal`` and ``-shm``).  Measured on Linux
+    2026-11-09: 803 open database files at the end of the fast suite.  On
+    macOS the default limit of 256 descriptors stopped the session at 40 %
+    ("unable to open database file", then EMFILE), and on Windows the open
+    files stopped the cleanup of the temporary directories (WinError 32).
+
+    WHY a wrapper of the call and not an autouse fixture: the teardown of an
+    autouse fixture comes after the teardown of the fixtures of the test,
+    thus a temporary directory went before its database was closed.
+    """
+    try:
+        return (yield)
+    finally:
+        from fw_context_mcp.mcp.shared.context import invalidate_executor
+
+        invalidate_executor()
+
+
 @pytest.fixture(autouse=True)
 def _no_model_list_requests(monkeypatch):
     """No test reads the model list of a real provider (``llm.model_list``).
