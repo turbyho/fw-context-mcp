@@ -15,6 +15,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from fw_context_mcp import net
 from fw_context_mcp.config import settings
 from fw_context_mcp.config.settings import ConfigError, LLMConfig, load
 from fw_context_mcp.llm.errors import ChatApiError
@@ -82,7 +83,7 @@ def _replies(monkeypatch, *responses: tuple[int, dict | str]) -> list[dict]:
             return httpx.Response(status, json=body, request=request)
         return httpx.Response(status, text=body, request=request)
 
-    monkeypatch.setattr(httpx, "post", _post)
+    monkeypatch.setattr(net, "post", _post)
     return sent
 
 
@@ -211,7 +212,7 @@ def _stream_replies(monkeypatch, status: int, body: bytes) -> None:
         kwargs.pop("timeout", None)
         return client.stream(method, url, **kwargs)
 
-    monkeypatch.setattr(httpx, "stream", _stream)
+    monkeypatch.setattr(net, "stream", _stream)
     assert real_stream is not _stream
 
 

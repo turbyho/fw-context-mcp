@@ -140,7 +140,7 @@ def test_an_ollama_that_is_not_reachable_is_reported(tmp_path, monkeypatch):
     def _refused(*args, **kwargs):
         raise httpx.ConnectError("connection refused")
 
-    monkeypatch.setattr(_embedding.httpx, "get", _refused)
+    monkeypatch.setattr(_embedding.net, "get", _refused)
 
     with pytest.raises(_embedding.EmbeddingsIncomplete, match="is not reachable"):
         _embedding._build_embeddings(None, "h", LLMConfig(), tmp_path)
@@ -161,7 +161,7 @@ def test_a_run_with_ollama_down_ends_and_stamps_partial(tmp_path, monkeypatch):
     def _refused(*args, **kwargs):
         raise httpx.ConnectError("connection refused")
 
-    monkeypatch.setattr(_embedding.httpx, "get", _refused)
+    monkeypatch.setattr(_embedding.net, "get", _refused)
     root = tmp_path / "proj"
     root.mkdir()
     (root / "main.c").write_text("int main_value(void) { return 1; }\n", encoding="utf-8")

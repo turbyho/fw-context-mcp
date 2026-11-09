@@ -21,6 +21,7 @@ import logging
 
 import httpx
 
+from .. import net
 from ..config.settings import LLMConfig
 from .embedder import Embedder, EmbedderContextUnknown, EmbedderError, EmbedderInputTooLong
 
@@ -70,7 +71,7 @@ class ApiEmbedder(Embedder):
         try:
             # Twice the timeout of the profile, as the embeddings of Ollama:
             # a batch of long bodies takes longer than one chat answer.
-            resp = httpx.post(url, json=payload, headers=headers, timeout=cfg.timeout * 2)
+            resp = net.post(url, json=payload, headers=headers, timeout=cfg.timeout * 2)
         except httpx.HTTPError as exc:
             raise ApiEmbedderError(f"the embedding API at {url} does not answer: {exc}") from exc
         if resp.status_code != 200:
@@ -146,7 +147,7 @@ class ApiEmbedder(Embedder):
         base = cfg.embed_api_base.rstrip("/")
         if base not in _CONTEXTS:
             try:
-                resp = httpx.get(f"{base}/models", params={"output_modalities": "embeddings"}, timeout=30.0)
+                resp = net.get(f"{base}/models", params={"output_modalities": "embeddings"}, timeout=30.0)
                 resp.raise_for_status()
                 _CONTEXTS[base] = {m["id"]: int(m["context_length"]) for m in resp.json()["data"]
                                    if isinstance(m, dict) and m.get("context_length")}

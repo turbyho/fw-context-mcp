@@ -79,7 +79,6 @@ import os
 import re
 import secrets
 import signal
-import socket
 import sqlite3
 import sys
 import time
@@ -87,6 +86,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TextIO
 
+from .. import loopback
 from ..config import derive_project_id
 from ..config import load as load_config
 from ..exit_codes import EXIT_ALREADY_RUNNING, EXIT_SUPERSEDED
@@ -191,7 +191,10 @@ def ping_daemon(project_root: Path) -> bool:
         return False
     port, token = known
     try:
-        with socket.create_connection((_LOOPBACK, port), timeout=2.0) as sock:
+        # loopback.create_connection: a port file of a daemon that is gone
+        # names a port with no listener, and on Windows
+        # socket.create_connection needed 2 s for that refused connect.
+        with loopback.create_connection((_LOOPBACK, port), timeout=2.0) as sock:
             sock.sendall(b"ping\n")
             answer = sock.makefile("rb").readline(256)
     except OSError:

@@ -22,6 +22,8 @@ from typing import TYPE_CHECKING
 
 import httpx
 
+from .. import net
+
 if TYPE_CHECKING:
     from ..cache_client import CacheClient
 
@@ -326,7 +328,7 @@ def cmd_cache_remote_init(args: argparse.Namespace) -> int:
     # --- Step 3: Verify connection ---
     print(f"\nVerifying connection to {url} ...")
     try:
-        with httpx.Client(base_url=url, timeout=10.0) as client:
+        with net.client(url, base_url=url, timeout=10.0) as client:
             # Check health first
             health_resp = client.get("/health")
             if health_resp.status_code != 200:

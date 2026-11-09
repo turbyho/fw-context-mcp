@@ -13,6 +13,7 @@ from unittest.mock import patch
 import httpx
 import pytest
 
+from fw_context_mcp import net
 from fw_context_mcp.config.settings import LLMConfig, _apply_embed_prompt_defaults
 from fw_context_mcp.llm.ollama import call_ollama_embed
 
@@ -85,7 +86,7 @@ def test_the_query_that_goes_to_ollama_ends_the_instruction_before_the_query():
         sent.append(json)
         return httpx.Response(200, json={"embeddings": [[0.1, 0.2]]}, request=httpx.Request("POST", url))
 
-    with patch.object(httpx, "post", _post):
+    with patch.object(net, "post", _post):
         call_ollama_embed(["write words to the flash"], cfg, query=True)
 
     assert sent[0]["input"] == [f"{QWEN3}write words to the flash"]

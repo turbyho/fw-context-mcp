@@ -171,7 +171,7 @@ class TestEditableInstall:
         """No guess: the check could report a release that the source tree holds."""
         monkeypatch.setattr(vc.importlib.metadata, "distribution", lambda name: _FakeDistribution("{not json"))
         monkeypatch.setattr(vc, "installed_version", lambda: "0.33.0")
-        monkeypatch.setattr(vc.httpx, "get", _no_request)
+        monkeypatch.setattr(vc.net, "get", _no_request)
         _write_state(home, "0.34.0")
 
         assert vc.start_update_check(True) is None
@@ -253,7 +253,7 @@ class TestLoadUpdateSettings:
 
 class TestRefresh:
     def test_it_stores_the_latest_version(self, home, monkeypatch):
-        monkeypatch.setattr(vc.httpx, "get", _pypi_get("0.34.0"))
+        monkeypatch.setattr(vc.net, "get", _pypi_get("0.34.0"))
         vc.refresh_latest_version(now=_NOW)
 
         state = vc.read_state()
@@ -261,13 +261,13 @@ class TestRefresh:
 
     def test_a_young_state_sends_no_request(self, home, monkeypatch):
         _write_state(home, "0.34.0", checked_at=_NOW - timedelta(hours=23))
-        monkeypatch.setattr(vc.httpx, "get", _no_request)
+        monkeypatch.setattr(vc.net, "get", _no_request)
         vc.refresh_latest_version(now=_NOW)
 
     def test_an_old_state_sends_a_request(self, home, monkeypatch):
         _write_state(home, "0.34.0", checked_at=_NOW - timedelta(hours=25))
         calls: list[str] = []
-        monkeypatch.setattr(vc.httpx, "get", _pypi_get("0.35.0", calls))
+        monkeypatch.setattr(vc.net, "get", _pypi_get("0.35.0", calls))
         vc.refresh_latest_version(now=_NOW)
 
         assert calls == [vc.PYPI_URL]
@@ -277,7 +277,7 @@ class TestRefresh:
         """A clock that moved back must not stop the check until it catches up."""
         _write_state(home, "0.34.0", checked_at=_NOW + timedelta(days=30))
         calls: list[str] = []
-        monkeypatch.setattr(vc.httpx, "get", _pypi_get("0.35.0", calls))
+        monkeypatch.setattr(vc.net, "get", _pypi_get("0.35.0", calls))
         vc.refresh_latest_version(now=_NOW)
 
         assert calls == [vc.PYPI_URL]
@@ -291,7 +291,7 @@ class TestRefresh:
         def _fail(url: str, timeout=None) -> httpx.Response:
             raise error
 
-        monkeypatch.setattr(vc.httpx, "get", _fail)
+        monkeypatch.setattr(vc.net, "get", _fail)
         vc._refresh_in_background()
         assert not (home / "update_check.json").exists()
 
@@ -299,7 +299,7 @@ class TestRefresh:
         def _get(url: str, timeout=None) -> httpx.Response:
             return httpx.Response(503, request=httpx.Request("GET", url))
 
-        monkeypatch.setattr(vc.httpx, "get", _get)
+        monkeypatch.setattr(vc.net, "get", _get)
         vc._refresh_in_background()
         assert not (home / "update_check.json").exists()
 
@@ -311,7 +311,7 @@ class TestRefresh:
         def _get(url: str, timeout=None) -> httpx.Response:
             return httpx.Response(200, content=body, request=httpx.Request("GET", url))
 
-        monkeypatch.setattr(vc.httpx, "get", _get)
+        monkeypatch.setattr(vc.net, "get", _get)
         vc._refresh_in_background()
         assert not (home / "update_check.json").exists()
 
@@ -335,17 +335,17 @@ class TestStartUpdateCheck:
     def test_stopped_starts_no_thread(self, home, monkeypatch, installed):
         installed("0.33.0")
         monkeypatch.setenv(vc.DISABLE_ENV, "1")
-        monkeypatch.setattr(vc.httpx, "get", _no_request)
+        monkeypatch.setattr(vc.net, "get", _no_request)
         assert vc.start_update_check(True) is None
 
     def test_an_editable_install_starts_no_thread(self, home, monkeypatch, enabled):
         monkeypatch.setattr(vc, "is_editable_install", lambda: True)
-        monkeypatch.setattr(vc.httpx, "get", _no_request)
+        monkeypatch.setattr(vc.net, "get", _no_request)
         assert vc.start_update_check(True) is None
 
     def test_the_thread_writes_the_state(self, home, monkeypatch, enabled, installed):
         installed("0.33.0")
-        monkeypatch.setattr(vc.httpx, "get", _pypi_get("0.34.0"))
+        monkeypatch.setattr(vc.net, "get", _pypi_get("0.34.0"))
         thread = vc.start_update_check(True)
         assert thread is not None and thread.daemon
         thread.join(timeout=10)
@@ -410,7 +410,7 @@ class TestCmdVersion:
 
         installed("0.33.0")
         _write_state(home, "0.34.0")
-        monkeypatch.setattr(vc.httpx, "get", _no_request)
+        monkeypatch.setattr(vc.net, "get", _no_request)
 
         assert cmd_version(Namespace()) == 0
         lines = capsys.readouterr().out.splitlines()

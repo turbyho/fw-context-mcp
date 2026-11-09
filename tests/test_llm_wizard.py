@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from fw_context_mcp import net
 from fw_context_mcp.cli import _init_interactive as ui
 from fw_context_mcp.cli import _llm_wizard as wizard
 from fw_context_mcp.config import settings
@@ -147,7 +148,7 @@ def test_the_remote_host_comes_from_the_tag_list(monkeypatch):
     import httpx
 
     body = {"models": [{"name": "gpt-oss:20b-cloud", "remote_host": "https://ollama.com"}, {"name": "local:1b"}]}
-    monkeypatch.setattr(httpx, "get", lambda url, timeout: httpx.Response(200, json=body, request=httpx.Request("GET", url)))
+    monkeypatch.setattr(net, "get", lambda url, timeout: httpx.Response(200, json=body, request=httpx.Request("GET", url)))
 
     assert _diag.remote_hosts("http://localhost:11434") == {"gpt-oss:20b-cloud": "https://ollama.com"}
 

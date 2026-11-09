@@ -10,6 +10,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
+from fw_context_mcp import net
 from fw_context_mcp.config.settings import LLMConfig
 from fw_context_mcp.llm import ollama
 
@@ -39,8 +40,8 @@ def _server(monkeypatch, *loaded_after: list[str]) -> list[dict]:
         posted.append(json)
         return httpx.Response(200, json={"done_reason": "unload"}, request=httpx.Request("POST", url))
 
-    monkeypatch.setattr(httpx, "get", _get)
-    monkeypatch.setattr(httpx, "post", _post)
+    monkeypatch.setattr(net, "get", _get)
+    monkeypatch.setattr(net, "post", _post)
     return posted
 
 
@@ -100,14 +101,14 @@ def test_an_empty_model_list_is_no_model(monkeypatch):
     def _get(url, timeout):
         return httpx.Response(200, json={"models": None}, request=httpx.Request("GET", url))
 
-    monkeypatch.setattr(httpx, "get", _get)
+    monkeypatch.setattr(net, "get", _get)
 
     assert ollama.loaded_models(URL) == []
 
 
 def test_a_refused_release_does_not_wait(monkeypatch):
     _server(monkeypatch, ["chat:1b"])
-    monkeypatch.setattr(httpx, "post", lambda url, json, timeout: httpx.Response(404, request=httpx.Request("POST", url)))
+    monkeypatch.setattr(net, "post", lambda url, json, timeout: httpx.Response(404, request=httpx.Request("POST", url)))
     monkeypatch.setattr(ollama, "_RELEASE_WAIT_S", 60.0)
 
     assert ollama.release_model(URL, "chat:1b") is False

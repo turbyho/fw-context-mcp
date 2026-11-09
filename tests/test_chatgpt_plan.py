@@ -20,6 +20,7 @@ import jwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 
+from fw_context_mcp import net
 from fw_context_mcp.config.settings import LLMConfig
 from fw_context_mcp.llm import chatgpt_plan as plan
 from fw_context_mcp.llm.errors import ChatApiError, LLMStopRun
@@ -80,7 +81,7 @@ def test_the_sign_in_stores_validated_credentials_with_mode_0600(home, signing_k
             "id_token": _id_token(signing_key, "client-1", nonce_holder["nonce"]),
         }, request=httpx.Request("POST", url))
 
-    monkeypatch.setattr(httpx, "post", _post)
+    monkeypatch.setattr(net, "post", _post)
     nonce_holder: dict[str, str] = {}
     shown_urls: list[str] = []
 
@@ -123,7 +124,7 @@ def test_an_expired_access_token_is_refreshed_and_the_new_refresh_token_is_store
         return httpx.Response(200, json={"access_token": "access-2", "refresh_token": "refresh-2", "expires_in": 3600},
                               request=httpx.Request("POST", url))
 
-    monkeypatch.setattr(httpx, "post", _post)
+    monkeypatch.setattr(net, "post", _post)
 
     assert plan.access_token("gpt") == "access-2"
 
@@ -134,14 +135,14 @@ def test_an_expired_access_token_is_refreshed_and_the_new_refresh_token_is_store
 
 def test_a_valid_access_token_is_not_refreshed(home, monkeypatch):
     _signed_in()
-    monkeypatch.setattr(httpx, "post", lambda *a, **k: pytest.fail("no refresh"))
+    monkeypatch.setattr(net, "post", lambda *a, **k: pytest.fail("no refresh"))
 
     assert plan.access_token("gpt") == TOKEN
 
 
 def test_a_reused_refresh_token_ends_the_sign_in_and_keeps_the_client(home, monkeypatch):
     _signed_in(expires_in=-10)
-    monkeypatch.setattr(httpx, "post", lambda url, data, timeout: httpx.Response(
+    monkeypatch.setattr(net, "post", lambda url, data, timeout: httpx.Response(
         400, json={"error": "refresh_token_reused"}, request=httpx.Request("POST", url)))
 
     with pytest.raises(plan.PlanAuthError, match="fw-context llm login gpt"):
@@ -157,7 +158,7 @@ def test_a_network_failure_of_the_refresh_keeps_the_tokens(home, monkeypatch):
     def _fail(*args, **kwargs):
         raise httpx.ConnectError("down")
 
-    monkeypatch.setattr(httpx, "post", _fail)
+    monkeypatch.setattr(net, "post", _fail)
 
     with pytest.raises(plan.LLMError) as error:
         plan.access_token("gpt")
@@ -197,7 +198,7 @@ def _serve(monkeypatch, *answers: tuple[int, bytes]) -> list[dict]:
         kwargs.pop("timeout", None)
         return httpx.Client(transport=httpx.MockTransport(handler)).stream(method, url, **kwargs)
 
-    monkeypatch.setattr(httpx, "stream", _stream)
+    monkeypatch.setattr(net, "stream", _stream)
     return sent
 
 
@@ -231,7 +232,7 @@ def test_the_usage_limit_of_the_plan_stops_the_run(home, monkeypatch):
 
 def test_a_401_refreshes_the_token_and_sends_again(home, monkeypatch):
     _signed_in()
-    monkeypatch.setattr(httpx, "post", lambda url, data, timeout: httpx.Response(
+    monkeypatch.setattr(net, "post", lambda url, data, timeout: httpx.Response(
         200, json={"access_token": "access-2", "refresh_token": "refresh-2", "expires_in": 3600},
         request=httpx.Request("POST", url)))
     sent = _serve(monkeypatch, (401, b'{"error": {"code": "subscription_sharing_invalid_user"}}'),
@@ -327,7 +328,7 @@ def _refresh_answer(monkeypatch, status: int, body: dict | str) -> None:
             return httpx.Response(status, json=body, request=httpx.Request("POST", url))
         return httpx.Response(status, text=body, request=httpx.Request("POST", url))
 
-    monkeypatch.setattr(httpx, "post", _post)
+    monkeypatch.setattr(net, "post", _post)
 
 
 def test_the_rotated_token_is_stored_when_the_keys_cannot_be_fetched(home, monkeypatch):
@@ -426,7 +427,7 @@ def _token_endpoint(monkeypatch, signing_key, seen, *, scope=plan.SCOPE, sub="us
             "id_token": _id_token(signing_key, "client-1", seen["nonce"], sub=sub),
         }, request=httpx.Request("POST", url))
 
-    monkeypatch.setattr(httpx, "post", _post)
+    monkeypatch.setattr(net, "post", _post)
     return revoked
 
 

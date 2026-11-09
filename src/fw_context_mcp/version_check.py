@@ -44,7 +44,7 @@ from pathlib import Path
 import httpx
 from packaging.version import InvalidVersion, Version
 
-from . import __version__
+from . import __version__, net
 from .utils import fw_context_home, write_text_atomic
 
 log = logging.getLogger(__name__)
@@ -224,7 +224,7 @@ def refresh_latest_version(now: datetime | None = None) -> None:
     # the check stops until the clock gets to the stored time.
     if state is not None and timedelta(0) <= current - state.checked_at < CHECK_INTERVAL:
         return
-    response = httpx.get(PYPI_URL, timeout=_TIMEOUT)
+    response = net.get(PYPI_URL, timeout=_TIMEOUT)
     response.raise_for_status()
     latest = str(response.json()["info"]["version"])
     Version(latest)

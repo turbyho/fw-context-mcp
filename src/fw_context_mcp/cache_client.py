@@ -521,7 +521,10 @@ class CacheClient:
         """
         if self._session is None:
             import httpx
-            self._session = httpx.Client(
+
+            from . import net
+            self._session = net.client(
+                self.url,
                 base_url=self.url,
                 timeout=self.timeout,
                 headers={"Authorization": f"Bearer {self.token}"},

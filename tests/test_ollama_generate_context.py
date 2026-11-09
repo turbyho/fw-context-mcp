@@ -44,7 +44,7 @@ def test_the_request_asks_the_server_not_to_cut_and_takes_the_context_of_the_cal
         sent.update(json)
         return _response(200, {"response": "ok"})
 
-    with mock.patch.object(ollama.httpx, "post", side_effect=post):
+    with mock.patch.object(ollama.net, "post", side_effect=post):
         call_llm("p", LLMConfig(num_ctx=16384), num_ctx=24576)
     assert sent["truncate"] is False
     assert sent["options"]["num_ctx"] == 24576
@@ -57,13 +57,13 @@ def test_without_a_context_the_call_has_the_context_of_the_config():
         sent.update(json)
         return _response(200, {"response": "ok"})
 
-    with mock.patch.object(ollama.httpx, "post", side_effect=post):
+    with mock.patch.object(ollama.net, "post", side_effect=post):
         call_llm("p", LLMConfig(num_ctx=16384))
     assert sent["options"]["num_ctx"] == 16384
 
 
 def test_a_prompt_longer_than_the_context_raises_with_the_count():
-    with mock.patch.object(ollama.httpx, "post", return_value=_response(400, _TOO_LONG)), \
+    with mock.patch.object(ollama.net, "post", return_value=_response(400, _TOO_LONG)), \
             pytest.raises(ollama.OllamaPromptTooLong) as raised:
         call_llm("p", LLMConfig())
     assert (raised.value.prompt_tokens, raised.value.context) == (6413, 2048)
@@ -79,7 +79,7 @@ def test_a_streamed_prompt_after_a_pull_raises_with_the_count(monkeypatch):
         yield httpx.Response(status, content=body, request=httpx.Request(method, url))
 
     monkeypatch.setattr(ollama, "_pull_model", lambda model, base: None)
-    with mock.patch.object(ollama.httpx, "stream", side_effect=stream), \
+    with mock.patch.object(ollama.net, "stream", side_effect=stream), \
             pytest.raises(ollama.OllamaPromptTooLong):
         call_llm("p", LLMConfig(stream=True, auto_pull=True))
 
@@ -89,7 +89,7 @@ def test_a_streamed_prompt_longer_than_the_context_raises_with_the_count():
     def stream(method, url, **_):
         yield httpx.Response(400, content=json.dumps(_TOO_LONG).encode(), request=httpx.Request(method, url))
 
-    with mock.patch.object(ollama.httpx, "stream", side_effect=stream), \
+    with mock.patch.object(ollama.net, "stream", side_effect=stream), \
             pytest.raises(ollama.OllamaPromptTooLong) as raised:
         call_llm("p", LLMConfig(stream=True))
     assert raised.value.prompt_tokens == 6413
@@ -102,14 +102,14 @@ def test_the_plain_message_of_ollama_040_raises_with_the_count():
     request failed three times, and the symbol got no analysis and no
     second pass with a larger context.
     """
-    with mock.patch.object(ollama.httpx, "post", return_value=_response(400, _TOO_LONG_040)), \
+    with mock.patch.object(ollama.net, "post", return_value=_response(400, _TOO_LONG_040)), \
             pytest.raises(ollama.OllamaPromptTooLong) as raised:
         call_llm("p", LLMConfig())
     assert (raised.value.prompt_tokens, raised.value.context) == (18924, 16384)
 
 
 def test_another_error_400_stays_an_ollama_error():
-    with mock.patch.object(ollama.httpx, "post", return_value=_response(400, {"error": "invalid options"})), \
+    with mock.patch.object(ollama.net, "post", return_value=_response(400, {"error": "invalid options"})), \
             pytest.raises(ollama.OllamaError) as raised:
         call_llm("p", LLMConfig())
     assert not isinstance(raised.value, ollama.OllamaPromptTooLong)
@@ -127,7 +127,7 @@ def test_the_count_comes_from_the_server(answer, count):
         sent.update(json)
         return answer
 
-    with mock.patch.object(ollama.httpx, "post", side_effect=post):
+    with mock.patch.object(ollama.net, "post", side_effect=post):
         assert get_chat_client(LLMConfig()).count_tokens("p", 16384) == count
     assert sent["options"] == {"num_ctx": 16384, "num_predict": 1}
     assert sent["truncate"] is False
@@ -152,7 +152,7 @@ def _version_server(version):
         assert url.endswith("/api/version")
         return httpx.Response(200, json={"version": version}, request=httpx.Request("GET", url))
 
-    return mock.patch.object(ollama.httpx, "get", side_effect=get)
+    return mock.patch.object(ollama.net, "get", side_effect=get)
 
 
 @pytest.mark.parametrize(("version", "old"), [
@@ -173,7 +173,7 @@ def test_a_server_that_does_not_answer_gives_no_version_problem():
     def get(url, **_):
         raise httpx.ConnectError("refused", request=httpx.Request("GET", url))
 
-    with mock.patch.object(ollama.httpx, "get", side_effect=get):
+    with mock.patch.object(ollama.net, "get", side_effect=get):
         assert ollama.ollama_version("http://localhost:11434") is None
         assert ollama.ollama_version_problem("http://localhost:11434") is None
 
@@ -215,8 +215,8 @@ def test_a_stop_of_the_run_is_not_wrapped(stream):
     def stopped(*a, **k):
         raise IndexTerminated("a SIGTERM stopped this run")
 
-    with mock.patch.object(ollama.httpx, "stream", side_effect=stopped), \
-            mock.patch.object(ollama.httpx, "post", side_effect=stopped), \
+    with mock.patch.object(ollama.net, "stream", side_effect=stopped), \
+            mock.patch.object(ollama.net, "post", side_effect=stopped), \
             pytest.raises(IndexTerminated):
         call_llm("p", LLMConfig(stream=stream))
     assert is_fatal(IndexTerminated("x"))
@@ -232,7 +232,7 @@ def test_the_request_turns_off_the_thinking_of_the_model():
         sent.update(json)
         return _response(200, {"response": "ok"})
 
-    with mock.patch.object(ollama.httpx, "post", side_effect=post):
+    with mock.patch.object(ollama.net, "post", side_effect=post):
         call_llm("p", LLMConfig(num_ctx=16384))
     assert sent["think"] is False
 
@@ -245,6 +245,6 @@ def test_a_streamed_request_turns_off_the_thinking_too():
         sent.update(json)
         yield httpx.Response(200, content=b'{"response": "ok", "done": true}\n', request=httpx.Request(method, url))
 
-    with mock.patch.object(ollama.httpx, "stream", side_effect=stream):
+    with mock.patch.object(ollama.net, "stream", side_effect=stream):
         call_llm("p", LLMConfig(stream=True))
     assert sent["think"] is False

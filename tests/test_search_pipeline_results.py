@@ -283,7 +283,7 @@ def test_check_setup_with_a_local_model_and_a_cloud_chat_is_ok_without_ollama():
     cfg = Config()
     cfg.llm.embed_model = "BAAI/bge-small-en-v1.5"
     cfg.llm.chat_api_base = "http://localhost:4000/v1"
-    with patch("httpx.get", side_effect=httpx.ConnectError("refused")):
+    with patch("fw_context_mcp.net.get", side_effect=httpx.ConnectError("refused")):
         result = check_setup(cfg.llm)
 
     assert result["status"] == "ok"

@@ -32,7 +32,7 @@ Plan A / Plan B streaming
       response Content-Type is SSE, parse the already-complete body
       as SSE lines — no extra HTTP round-trip, no config needed.
     * **Plan B** (active streaming): request ``stream: true`` and
-      consume SSE chunks via ``httpx.stream()``.  Keeps the connection
+      consume SSE chunks via ``net.stream()``.  Keeps the connection
       alive during long generations — avoids reverse-proxy idle
       timeouts (nginx 60s, Cloudflare 100s).  Used when the operator
       sets ``cfg.stream = True``.
@@ -76,6 +76,7 @@ from datetime import UTC, datetime
 
 import httpx
 
+from .. import net
 from ..config.settings import LLMConfig
 from ..utils import is_fatal
 from ._debug import _write_debug_log
@@ -167,7 +168,7 @@ def _pull_model(
     digest_states: dict[str, int] = {}  # digest → last completed bytes
 
     try:
-        with httpx.stream(
+        with net.stream(
             "POST", url, json={"name": model},
             timeout=httpx.Timeout(
                 connect=30.0,
@@ -337,7 +338,7 @@ class OllamaClient:
     qwen2.5-coder:14b).  gpt-oss ignores it: it knows only the levels of
     thinking.
 
-    Streaming (when ``cfg.stream`` is True, Plan B): ``httpx.stream()``
+    Streaming (when ``cfg.stream`` is True, Plan B): ``net.stream()``
     with newline-delimited JSON chunks.  Without it, the request sends
     ``stream: false``; an answer that streams anyway is parsed as a stream
     (Plan A).  See the module docstring.
@@ -409,13 +410,13 @@ class OllamaClient:
         cfg, url, base_url = self.cfg, self.generate_url, self.server_url
         try:
             with ollama_guard():
-                resp = httpx.post(url, json=payload, timeout=cfg.timeout)
+                resp = net.post(url, json=payload, timeout=cfg.timeout)
             if resp.status_code == 404:
                 if cfg.auto_pull:
                     log.info("LLM model '%s' not found, pulling...", cfg.model)
                     _pull_model(cfg.model, base_url)
                     with ollama_guard():
-                        resp = httpx.post(url, json=payload, timeout=cfg.timeout)
+                        resp = net.post(url, json=payload, timeout=cfg.timeout)
                 else:
                     raise OllamaModelNotFoundError(cfg.model, base_url) from None
             too_long = _prompt_too_long(resp)
@@ -445,7 +446,7 @@ class OllamaClient:
     def _stream(self, payload: dict) -> ChatResult:
         """One streaming request (Plan B).
 
-        ``httpx.stream()`` keeps the connection busy with continuous data,
+        ``net.stream()`` keeps the connection busy with continuous data,
         thus a reverse proxy in front of a remote Ollama does not close it
         as idle during a long answer.
         """
@@ -455,13 +456,13 @@ class OllamaClient:
         stats: dict = {}
         try:
             with ollama_guard():
-                with httpx.stream("POST", url, json=payload, timeout=cfg.timeout) as resp:
+                with net.stream("POST", url, json=payload, timeout=cfg.timeout) as resp:
                     if resp.status_code == 404:
                         if not cfg.auto_pull:
                             raise OllamaModelNotFoundError(cfg.model, base_url) from None
                         log.info("LLM model '%s' not found, pulling...", cfg.model)
                         _pull_model(cfg.model, base_url)
-                        with httpx.stream("POST", url, json=payload, timeout=cfg.timeout) as resp2:
+                        with net.stream("POST", url, json=payload, timeout=cfg.timeout) as resp2:
                             self._read_stream(resp2, chunks, stats)
                     else:
                         self._read_stream(resp, chunks, stats)
@@ -535,7 +536,7 @@ class OllamaClient:
         }
         try:
             with ollama_guard():
-                resp = httpx.post(url, json=payload, timeout=cfg.timeout)
+                resp = net.post(url, json=payload, timeout=cfg.timeout)
             too_long = _prompt_too_long(resp)
             if too_long is not None:
                 return too_long.prompt_tokens
@@ -613,7 +614,7 @@ def ollama_version(base_url: str) -> tuple[int, int, int] | None:
     A suffix such as ``-rc0`` does not count.
     """
     try:
-        resp = httpx.get(base_url.rstrip("/") + "/api/version", timeout=5.0)
+        resp = net.get(base_url.rstrip("/") + "/api/version", timeout=5.0)
         resp.raise_for_status()
         version = resp.json().get("version")
     except (httpx.HTTPError, OSError, ValueError, AttributeError):
@@ -697,7 +698,7 @@ def _call_ollama_embed_impl(
     t0 = time.monotonic()
     try:
         with ollama_guard():
-            resp = httpx.post(url, json=payload, timeout=cfg.timeout * 2)
+            resp = net.post(url, json=payload, timeout=cfg.timeout * 2)
         resp.raise_for_status()
         embeddings = resp.json()["embeddings"]
         if embedder is not None:
@@ -725,7 +726,7 @@ def _call_ollama_embed_impl(
                 _pull_model(cfg.embed_model, cfg.ollama_url)
                 try:
                     with ollama_guard():
-                        resp = httpx.post(url, json=payload, timeout=cfg.timeout * 2)
+                        resp = net.post(url, json=payload, timeout=cfg.timeout * 2)
                     resp.raise_for_status()
                     embeddings = resp.json()["embeddings"]
                     if embedder is not None:
@@ -798,7 +799,7 @@ def _with_tag(model: str) -> str:
 def loaded_models(server_url: str) -> list[str] | None:
     """Return the models that the Ollama server holds in memory (``/api/ps``), or None when it gives no list."""
     try:
-        resp = httpx.get(server_url.rstrip("/") + "/api/ps", timeout=5.0)
+        resp = net.get(server_url.rstrip("/") + "/api/ps", timeout=5.0)
         resp.raise_for_status()
         body = resp.json()
     except (httpx.HTTPError, ValueError):
@@ -830,7 +831,7 @@ def release_model(server_url: str, model: str) -> bool | None:
     if held is None or name not in held:
         return None
     try:
-        resp = httpx.post(server_url.rstrip("/") + "/api/generate", json={"model": name, "keep_alive": 0},
+        resp = net.post(server_url.rstrip("/") + "/api/generate", json={"model": name, "keep_alive": 0},
                           timeout=30.0)
     except httpx.HTTPError as exc:
         log.info("Ollama at %s: the release of %s failed: %s", server_url, name, type(exc).__name__)
@@ -945,7 +946,7 @@ def measure_speed(server_url: str, model: str, num_ctx: int, *, keep_alive: str,
             # for two requests in one tick of the clock.
             prompt = f"Request {time.monotonic_ns()}-{next(_REQUEST_NUMBERS)}.\n{_REFERENCE_PROMPT}"
             with ollama_guard():
-                resp = httpx.post(f"{base}/api/generate", json={
+                resp = net.post(f"{base}/api/generate", json={
                     "model": model, "prompt": prompt, "stream": stream, "truncate": False, "think": False,
                     "keep_alive": keep_alive, "options": {**options, "num_predict": tokens}}, timeout=timeout)
             if resp.status_code != 200:
@@ -1002,7 +1003,7 @@ def measure_embed_speed(server_url: str, model: str, *, keep_alive: str, timeout
     try:
         for _ in range(2):
             with ollama_guard():
-                resp = httpx.post(f"{base}/api/embed", json={
+                resp = net.post(f"{base}/api/embed", json={
                     "model": model, "input": _embed_reference_documents(), "keep_alive": keep_alive},
                     timeout=timeout)
             if resp.status_code != 200:
@@ -1035,9 +1036,9 @@ def calibration_key(server_url: str, model: str, lower: int, upper: int) -> Key 
     from .hardware import machine_memory
 
     try:
-        resp = httpx.get(server_url.rstrip("/") + "/api/tags", timeout=5.0)
+        resp = net.get(server_url.rstrip("/") + "/api/tags", timeout=5.0)
         resp.raise_for_status()
-        version = httpx.get(server_url.rstrip("/") + "/api/version", timeout=5.0).json().get("version")
+        version = net.get(server_url.rstrip("/") + "/api/version", timeout=5.0).json().get("version")
     except (httpx.HTTPError, ValueError, AttributeError):
         return None
     name = _with_tag(model)
@@ -1086,7 +1087,7 @@ def _trained_context(base: str, model: str) -> int | None:
     (``qwen3.context_length``), and ``general.architecture`` names it.
     """
     try:
-        resp = httpx.post(f"{base}/api/show", json={"model": model}, timeout=5.0)
+        resp = net.post(f"{base}/api/show", json={"model": model}, timeout=5.0)
         if resp.status_code != 200:
             return None
         info = resp.json().get("model_info", {})
@@ -1106,7 +1107,7 @@ def _loaded_context(base: str, model: str) -> int | None:
     """
     names = {model} if ":" in model.rsplit("/", 1)[-1] else {model, f"{model}:latest"}
     try:
-        resp = httpx.get(f"{base}/api/ps", timeout=5.0)
+        resp = net.get(f"{base}/api/ps", timeout=5.0)
         if resp.status_code != 200:
             return None
         loaded = resp.json().get("models", [])
@@ -1366,7 +1367,7 @@ def check_setup(cfg: LLMConfig) -> dict:
     # ── Ollama connectivity (for embedding + possibly chat) ──
     base_url = cfg.ollama_url.rstrip("/")
     try:
-        resp = httpx.get(base_url + "/api/tags", timeout=5.0)
+        resp = net.get(base_url + "/api/tags", timeout=5.0)
         resp.raise_for_status()
     except httpx.ConnectError:
         return _without_ollama(result, cfg, ollama_embedding, "Ollama is not running.", server_runs=False)

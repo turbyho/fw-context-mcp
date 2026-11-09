@@ -235,8 +235,10 @@ def _pull_via_api(model: str, url: str) -> tuple[bool, str]:
 
     import httpx
 
+    from .. import net
+
     try:
-        with httpx.stream(
+        with net.stream(
             "POST",
             f"{url.rstrip('/')}/api/pull",
             json={"name": model, "stream": True},
