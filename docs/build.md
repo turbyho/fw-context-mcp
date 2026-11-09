@@ -835,14 +835,15 @@ setup script. fw-context must source this script before `west build`.
 1. An `activate` that the config already holds. A new run of
    `fw-context init` shows it and keeps it by default.
 2. The Zephyr SDK of the current environment: the `environment-setup-*`
-   script of `ZEPHYR_SDK_INSTALL_DIR`.
+   script of `ZEPHYR_SDK_INSTALL_DIR`. Not on Windows: it is a shell script.
 3. The nRF Connect SDK versions that `nrfutil sdk-manager list` gives. You
    select the version, and `fw-context init` writes
    `.fw-context/ncs-env.sh` from `nrfutil sdk-manager toolchain env` and
-   `ZEPHYR_BASE`. The default version comes from `ZEPHYR_BASE` of your
-   shell.
-4. `zephyr-env.sh` in the `ZEPHYR_BASE` of your shell, or
-   `~/zephyr-sdk-*/environment-setup-*`.
+   `ZEPHYR_BASE`. On Windows it writes `.fw-context/ncs-env.cmd`, which runs
+   `nrfutil sdk-manager toolchain env --as-script cmd` each time. The
+   default version comes from `ZEPHYR_BASE` of your shell.
+4. `zephyr-env.sh` in the `ZEPHYR_BASE` of your shell (`zephyr-env.cmd` on
+   Windows), or `~/zephyr-sdk-*/environment-setup-*` (not on Windows).
 5. When it finds nothing, `fw-context init` asks for the path of the
    script.
 
@@ -870,6 +871,10 @@ For the nRF Connect SDK, `nrfutil` writes such a script:
 nrfutil sdk-manager toolchain env --ncs-version v3.2.3 --as-script sh > ~/ncs-v3.2.3-env.sh
 ```
 
+On Windows, write a script for Command Prompt (`--as-script cmd`) to a
+`.cmd` file: there `activate` must be a `.bat`, `.cmd` or `.ps1` file (see
+[General](#general)).
+
 When you set `activate`, the builder wraps the command:
 ```
 bash -c "source /path/to/setup.sh && west build -b nrf52840dk ..."
@@ -896,10 +901,12 @@ activate = "/home/user/esp/esp-idf/export.sh"
 `fw-context init` finds the script in this order:
 
 1. A `~/.espressif/tools/activate_idf_*.sh` of the Espressif Installation
-   Manager (EIM), the last one in name order
+   Manager (EIM), the last one in name order (not on Windows)
 2. `export.sh` in `$IDF_PATH`
 3. `~/esp/esp-idf/export.sh`
 4. `~/esp-idf/export.sh`.
+
+On Windows it looks for `export.bat` in the same directories.
 
 When it finds none of them, `init` sets no `activate`. As for Zephyr,
 fw-context looks for `idf.py` after it sources `activate` (see
@@ -1103,3 +1110,7 @@ For the nRF Connect SDK, `nrfutil` writes such a script:
 ```bash
 nrfutil sdk-manager toolchain env --ncs-version v3.2.3 --as-script sh > ~/ncs-v3.2.3-env.sh
 ```
+
+On Windows, write a script for Command Prompt (`--as-script cmd`) to a
+`.cmd` file: there `activate` must be a `.bat`, `.cmd` or `.ps1` file (see
+[General](#general)).
