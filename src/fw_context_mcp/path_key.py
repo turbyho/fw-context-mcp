@@ -77,11 +77,16 @@ if sys.platform == "darwin":
     def _disk_case_darwin(resolved: Path) -> Path:
         """Return *resolved* with the case of the disk for the part that exists.
 
-        ``O_EVTONLY`` opens the file for events only: it needs no read
-        permission, and with ``O_NONBLOCK`` a FIFO does not block the open.
-        A path that the process cannot open (no search permission on a
-        directory) keeps the spelling of *resolved*: the indexer cannot read
-        such a file, and no other source gives its case.
+        ``O_EVTONLY`` opens the file for events only, and with
+        ``O_NONBLOCK`` a FIFO does not block the open.  A path that the
+        process cannot examine keeps the spelling of *resolved*: a file with
+        mode 000 (``os.open`` gives EACCES), or a path below a directory
+        without search permission (``Path.exists`` raises EACCES on Python
+        before 3.12).  The indexer cannot read such a file, and no other
+        source gives its case.  Measured on macOS 26 (APFS), 2026-11-09:
+        ``F_GETPATH`` gives the case of the disk for a file and for a
+        directory, the path of the link that the open used for a file with
+        two hard links, and the name of a FIFO.
 
         WHY the compare after ``F_GETPATH``: the kernel gives one path of
         the vnode.  For a file with two hard links it can be the path of the
@@ -91,19 +96,19 @@ if sys.platform == "darwin":
         """
         existing = resolved
         tail: list[str] = []
-        while not existing.exists():
-            if existing.parent == existing:
-                return resolved
-            tail.append(existing.name)
-            existing = existing.parent
         try:
+            while not existing.exists():
+                if existing.parent == existing:
+                    return resolved
+                tail.append(existing.name)
+                existing = existing.parent
             fd = os.open(existing, os.O_EVTONLY | os.O_NONBLOCK)
+            try:
+                buffer = fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(_MAXPATHLEN))
+            finally:
+                os.close(fd)
         except OSError:
             return resolved
-        try:
-            buffer = fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(_MAXPATHLEN))
-        finally:
-            os.close(fd)
         on_disk = Path(os.fsdecode(buffer.split(b"\0", 1)[0]))
         if not _same_spelling(on_disk, existing):
             return resolved
