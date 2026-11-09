@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import shutil
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -44,6 +45,15 @@ def _app_elf(build_dir: Path) -> str | None:
 # The bootloader of ESP-IDF is a CMake project of its own, and idf.py builds
 # it in this subdirectory of the build directory of the application.
 _BOOTLOADER_DIR = "bootloader"
+
+
+#: The export script of ESP-IDF for the shell of the host: ``export.bat`` for
+#: Command Prompt on Windows, where a ``.sh`` script cannot run.  Detection and
+#: the question of ``fw-context init`` use this one name.
+if sys.platform == "win32":
+    EXPORT_SCRIPT = "export.bat"
+else:
+    EXPORT_SCRIPT = "export.sh"
 
 
 class ESPIDFBuildSystem:
@@ -365,20 +375,26 @@ class ESPIDFBuildSystem:
         # which fails on target-only installs (e.g. ``eim install -t esp32``
         # without the RISC-V toolchain).  ``export.sh`` by contrast runs
         # that check and aborts the build when any declared tool is absent.
-        tools_dir = Path.home() / ".espressif" / "tools"
-        eim_scripts = sorted(tools_dir.glob("activate_idf_*.sh"), reverse=True)
-        if eim_scripts:
-            return {"python": None, "activate": str(eim_scripts[0])}
+        #
+        # Windows: export.bat of ESP-IDF, for Command Prompt.  A .sh script
+        # cannot run there, and the form of the EIM scripts on Windows is
+        # not known here, thus they are left out.
+        windows = sys.platform == "win32"
+        if not windows:
+            tools_dir = Path.home() / ".espressif" / "tools"
+            eim_scripts = sorted(tools_dir.glob("activate_idf_*.sh"), reverse=True)
+            if eim_scripts:
+                return {"python": None, "activate": str(eim_scripts[0])}
 
         idf_path = os.environ.get("IDF_PATH")
         if idf_path:
-            export_sh = Path(idf_path) / "export.sh"
-            if export_sh.exists():
-                return {"python": None, "activate": str(export_sh)}
+            export_script = Path(idf_path) / EXPORT_SCRIPT
+            if export_script.exists():
+                return {"python": None, "activate": str(export_script)}
 
         for candidate in [
-            Path.home() / "esp" / "esp-idf" / "export.sh",
-            Path.home() / "esp-idf" / "export.sh",
+            Path.home() / "esp" / "esp-idf" / EXPORT_SCRIPT,
+            Path.home() / "esp-idf" / EXPORT_SCRIPT,
         ]:
             if candidate.exists():
                 return {"python": None, "activate": str(candidate)}

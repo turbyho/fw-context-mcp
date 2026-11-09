@@ -22,6 +22,7 @@ the END of each, because that is where a build tool puts the failure.
 from __future__ import annotations
 
 import subprocess
+import sys
 
 import pytest
 
@@ -166,13 +167,13 @@ def test_a_real_process_that_fails_on_stdout(tmp_path):
     """
     with pytest.raises(RuntimeError) as exc:
         run_build_command(
-            ["sh", "-c", "echo 'error: the real reason'; exit 3"],
+            [sys.executable, "-c", "print('error: the real reason'); raise SystemExit(3)"],
             cwd=tmp_path,
-            description="sh",
+            description="probe",
         )
 
     message = str(exc.value)
-    assert "Build command failed (exit 3): sh" in message
+    assert "Build command failed (exit 3): probe" in message
     assert "error: the real reason" in message
 
 

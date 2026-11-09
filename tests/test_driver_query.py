@@ -6,16 +6,16 @@ has no backend for (xtensa) then got the headers of the HOST: 252 of 757
 files of an ESP32 index came from ``/usr/include``, and ``#if __XTENSA__``
 read as false.
 
-The tests use a stub driver: a shell script that prints the answers of a
-real ``xtensa-esp32-elf-gcc`` 8.4.0 (shortened), its own working directory
-and its own arguments.  Thus they need no toolchain on the machine.
+The tests use a stub driver: a program (Python, an ``.exe`` on Windows, see
+``tests/_stubs.py``) that prints the answers of a real
+``xtensa-esp32-elf-gcc`` 8.4.0 (shortened), its own working directory and
+its own arguments.  Thus they need no toolchain on the machine.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import stat
 from pathlib import Path
 
 import pytest
@@ -34,6 +34,7 @@ from fw_context_mcp.indexer._driver_query import (
     resolve_compiler,
 )
 from fw_context_mcp.indexer.config_hash import DEFAULT_TRANSIENT_DEFINES
+from tests._stubs import WINDOWS, program_name, symlink_or_skip, system_path, write_python_tool
 
 #: The real function; the autouse fixture replaces the module attribute.
 _REAL_CLANG_RESOURCE_INCLUDE = _driver_query.clang_resource_include
@@ -81,7 +82,9 @@ def _stub_driver(directory: Path, name: str, *, macros: str = XTENSA_MACROS,
     """Write an executable stub GCC driver and its system include directories.
 
     The stub also prints two macros of its own: ``__STUB_CWD__`` (its working
-    directory) and ``__STUB_ARGS__`` (its arguments).
+    directory) and ``__STUB_ARGS__`` (its arguments).  It is Python in the
+    form of a program of the host (``tests/_stubs.py``): an ``.exe`` on
+    Windows, as a real compiler there.
     """
     toolchain = directory / "toolchain"
     cxx = toolchain / triple / "include" / "c++" / "8.4.0"
@@ -90,37 +93,31 @@ def _stub_driver(directory: Path, name: str, *, macros: str = XTENSA_MACROS,
     for path in (cxx, gcc_inc, libc):
         path.mkdir(parents=True, exist_ok=True)
     (gcc_inc / "stdbool.h").write_text("#define bool _Bool\n")
-    bin_dir = toolchain / "bin"
-    bin_dir.mkdir(exist_ok=True)
-    driver = bin_dir / name
     # The order is the order of GCC: libstdc++ first, the C library last.
-    search = "\n".join(f" {p}" for p in (cxx, gcc_inc, libc))
-    driver.write_text(
-        "#!/bin/sh\n"
-        f"[ {exit_code} -ne 0 ] && exit {exit_code}\n"
-        'for a in "$@"; do\n'
-        '  if [ "$a" = "-v" ]; then\n'
-        "    cat >&2 <<'EOF'\n"
+    search = "".join(f" {p}\n" for p in (cxx, gcc_inc, libc))
+    verbose = (
         f"Target: {triple}\n"
         '#include "..." search starts here:\n'
         "#include <...> search starts here:\n"
-        f"{search}\n"
+        f"{search}"
         "End of search list.\n"
-        "EOF\n"
-        "    exit 0\n"
-        "  fi\n"
-        '  if [ "$a" = "-dM" ]; then\n'
-        "    cat <<'EOF'\n"
-        f"{macros}"
-        "EOF\n"
-        '    echo "#define __STUB_CWD__ $(pwd)"\n'
-        '    echo "#define __STUB_ARGS__ $*"\n'
-        "    exit 0\n"
-        "  fi\n"
-        "done\n"
-        "exit 1\n"
     )
-    driver.chmod(driver.stat().st_mode | stat.S_IXUSR)
+    code = (
+        "import os, sys\n"
+        f"if {exit_code}:\n"
+        f"    sys.exit({exit_code})\n"
+        "for argument in sys.argv[1:]:\n"
+        "    if argument == '-v':\n"
+        f"        sys.stderr.write({verbose!r})\n"
+        "        sys.exit(0)\n"
+        "    if argument == '-dM':\n"
+        f"        sys.stdout.write({macros!r})\n"
+        "        print('#define __STUB_CWD__ ' + os.getcwd())\n"
+        "        print('#define __STUB_ARGS__ ' + ' '.join(sys.argv[1:]))\n"
+        "        sys.exit(0)\n"
+        "sys.exit(1)\n"
+    )
+    driver = write_python_tool(toolchain / "bin", name, code)
     return driver, [cxx, gcc_inc, libc]
 
 
@@ -283,19 +280,42 @@ class TestResolveCompiler:
     def test_a_bare_name_is_found_beside_another_compiler_of_the_build(self, tmp_path: Path) -> None:
         """Measured: an ESP32 build names g++ with its directory and gcc without it."""
         driver, _ = _stub_driver(tmp_path, "xtensa-esp32-elf-g++")
-        sibling = driver.parent / "xtensa-esp32-elf-gcc"
+        # The file name of the host: xtensa-esp32-elf-gcc.exe on Windows, and
+        # the build writes the bare name.
+        sibling = driver.parent / program_name("xtensa-esp32-elf-gcc")
         sibling.write_text("")
         known = {driver.name: driver}
         assert resolve_compiler("xtensa-esp32-elf-gcc", tmp_path, known) == sibling
 
+    def test_a_bare_name_matches_the_file_name_of_another_entry(self, tmp_path: Path) -> None:
+        """Step 1 on Windows: an entry names gcc.exe with its directory, another one gcc alone."""
+        driver, _ = _stub_driver(tmp_path, "xtensa-esp32-elf-gcc")
+        assert resolve_compiler("xtensa-esp32-elf-gcc", tmp_path / "elsewhere", {driver.name: driver}) == driver
+
     def test_a_symbolic_link_is_not_followed(self, tmp_path: Path) -> None:
         """A ccache masquerade link must run as gcc; its target ccache rejects -E."""
-        target = tmp_path / "ccache"
+        # The names of the host: Windows runs no file without an extension.
+        target = tmp_path / program_name("ccache")
         target.write_text("")
-        link = tmp_path / "masquerade" / "gcc"
+        link = tmp_path / "masquerade" / program_name("gcc")
         link.parent.mkdir()
-        link.symlink_to(target)
+        symlink_or_skip(link, target)
         assert resolve_compiler(str(link), tmp_path, {}) == link
+
+    def test_a_path_without_the_extension_of_the_host_is_found(self, tmp_path: Path) -> None:
+        """On Windows a build can name C:/tools/bin/gcc, and the file is gcc.exe."""
+        driver, _ = _stub_driver(tmp_path, "xtensa-esp32-elf-gcc")
+        assert resolve_compiler(str(driver.parent / "xtensa-esp32-elf-gcc"), tmp_path, {}) == driver
+
+    @pytest.mark.skipif(WINDOWS, reason="the execute bit of POSIX")
+    def test_a_file_on_path_that_is_no_program_is_passed_over(self, tmp_path: Path, monkeypatch) -> None:
+        """As shutil.which: a file without the execute bit is not the compiler."""
+        driver, _ = _stub_driver(tmp_path / "real", "xtensa-esp32-elf-gcc")
+        plain = tmp_path / "plain"
+        plain.mkdir()
+        (plain / "xtensa-esp32-elf-gcc").write_text("not a program\n")
+        monkeypatch.setenv("PATH", os.pathsep.join([str(plain), str(driver.parent)]))
+        assert resolve_compiler("xtensa-esp32-elf-gcc", tmp_path, {}) == driver
 
     def test_a_missing_compiler_gives_none(self, tmp_path: Path, monkeypatch) -> None:
         monkeypatch.setenv("PATH", str(tmp_path / "empty"))
@@ -516,7 +536,7 @@ class TestParseUsesTheDriver:
 
         monkeypatch.setattr(_driver_query, "libclang_supports", lambda triple: False)
         driver, dirs = _stub_driver(tmp_path, "xtensa-esp32-elf-gcc")
-        monkeypatch.setenv("PATH", f"{driver.parent}:/usr/bin:/bin")
+        monkeypatch.setenv("PATH", os.pathsep.join([str(driver.parent), *system_path()]))
         unit = next(parse(_cc(tmp_path, "xtensa-esp32-elf-gcc")))
 
         assert "--target=i386-unknown-elf" in unit.clang_args

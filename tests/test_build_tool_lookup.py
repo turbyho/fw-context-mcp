@@ -276,3 +276,12 @@ def test_the_script_and_the_command_share_one_timeout(tmp_path: Path) -> None:
 
     with pytest.raises(BuildTimeoutError):
         run_build_command(PRINT_SOURCE, cwd=tmp_path, timeout=2, build_cfg=BuildConfig(activate=str(script)))
+
+
+@windows_only
+def test_the_id_of_the_activation_is_no_part_of_the_build_environment(tmp_path: Path) -> None:
+    """A script can name a temporary file with FWCTX_ACTIVATION_ID; the build must not see it."""
+    script = write_activate(tmp_path / "env.bat", variables={"FWCTX_SOURCE": "x"})
+    probe = [sys.executable, "-c", "import os, sys; sys.exit(1 if 'FWCTX_ACTIVATION_ID' in os.environ else 0)"]
+
+    assert run_build_command(probe, cwd=tmp_path, build_cfg=BuildConfig(activate=str(script))).returncode == 0

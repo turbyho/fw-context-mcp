@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shlex
 import shutil
 import signal
@@ -36,7 +37,7 @@ import sys
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import UTC, datetime
@@ -64,26 +65,32 @@ __all__ = [
     "TU_EXTENSIONS",
     "BuildTimeoutError",
     "abs_path",
+    "activate_script",
     "build_dir_patterns_with_fw_context",
     "build_env",
     "build_tool_available",
     "cc_output_path",
     "cc_staging_path",
     "clear_dead_temporaries",
+    "command_words",
     "compute_content_hash",
     "compute_source_hash",
     "decode_source_lines",
+    "env_value",
     "fmt_count",
     "format_number_ranges",
     "is_compile_commands_stale",
     "is_db_exception",
     "is_fatal",
+    "is_program",
     "macro_signature",
     "missing_tool_message",
     "owner_is_dead",
     "owner_token",
+    "path_directories",
     "process_group_is_gone",
     "process_start_time",
+    "program_file_names",
     "read_file_lines",
     "record_build_groups",
     "resolve_project_root",
@@ -92,6 +99,7 @@ __all__ = [
     "stop_process_group",
     "temporary_owner",
     "truncate_path_middle",
+    "windows_words",
 ]
 
 # Seconds of tolerance when comparing file mtimes to account for
@@ -522,6 +530,70 @@ def process_group_is_gone(pgid: int, leader: subprocess.Popen | None = None) -> 
     return False
 
 
+#: The extensions of ``cmd.exe`` when the environment has no ``PATHEXT``.
+_CMD_DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD"
+
+
+def env_value(env: Mapping[str, str], name: str) -> str | None:
+    """The value of the variable *name* in *env*.
+
+    Windows: the names are case-insensitive, and a copy of ``os.environ``
+    can hold ``Path``.  POSIX: the name as it is.
+    """
+    if sys.platform != "win32":
+        return env.get(name)
+    upper = name.upper()
+    return next((value for key, value in env.items() if key.upper() == upper), None)
+
+
+def path_directories(env: Mapping[str, str] | None = None) -> list[Path]:
+    """The directories of the ``PATH`` of *env* (of this process when None), in their order.
+
+    An empty entry is left out.  Windows allows an entry in double quotes
+    (``"C:\\Program Files\\x"``) and with spaces around it, thus those are
+    removed there.  On POSIX a space is a part of the name of a directory,
+    as ``execvp`` reads it.
+    """
+    path = env_value(os.environ if env is None else env, "PATH") or ""
+    directories = []
+    for entry in path.split(os.pathsep):
+        if sys.platform == "win32":
+            entry = entry.strip().strip('"')
+        if entry:
+            directories.append(Path(entry))
+    return directories
+
+
+def is_program(path: Path) -> bool:
+    """Say if *path* is a file that the system can run as a program.
+
+    POSIX: a file with the execute bit for this user, as ``shutil.which``
+    and ``execvp`` require.  Windows: a file; the extension (``PATHEXT``)
+    makes it a program, and ``program_file_names`` gives the names.
+    """
+    if not path.is_file():
+        return False
+    return sys.platform == "win32" or os.access(path, os.X_OK)
+
+
+def program_file_names(name: str, env: Mapping[str, str] | None = None) -> list[str]:
+    """The file names that the program *name* can have on this system, in the order of the lookup.
+
+    POSIX: the name itself.  Windows: no program has a name without an
+    extension there.  A name with an extension of ``PATHEXT`` stays as it
+    is; else each extension of ``PATHEXT`` of *env* (of this process when
+    None) is added, as ``cmd.exe`` finds a program.  Without ``PATHEXT``,
+    the extensions of ``cmd.exe`` apply (``_CMD_DEFAULT_PATHEXT``).
+    """
+    if sys.platform != "win32":
+        return [name]
+    pathext = env_value(os.environ if env is None else env, "PATHEXT") or _CMD_DEFAULT_PATHEXT
+    extensions = [ext.lower() for ext in pathext.split(os.pathsep) if ext]
+    if Path(name).suffix.lower() in extensions:
+        return [name]
+    return [name + ext for ext in extensions]
+
+
 def run_in_process_group(
     cmd: list[str],
     *,
@@ -616,11 +688,6 @@ if sys.platform == "win32":
             except subprocess.TimeoutExpired:
                 continue
 
-    def _env_value(env: dict[str, str], name: str) -> str | None:
-        """The value of the variable *name* in *env*: the names of Windows are case-insensitive."""
-        upper = name.upper()
-        return next((value for key, value in env.items() if key.upper() == upper), None)
-
     def _find_program(name: str, env: dict[str, str]) -> str | None:
         """The full path of the program *name* in the ``PATH`` of *env*, with the extensions of its ``PATHEXT``.
 
@@ -629,21 +696,13 @@ if sys.platform == "win32":
         and it takes ``PATHEXT`` from this process.  The build gets the
         ``PATH`` and the ``PATHEXT`` of its environment, as POSIX
         ``execvpe`` takes the ``PATH`` of the environment and no current
-        directory.  A name that has an extension of ``PATHEXT`` is looked
-        for as it is.
+        directory.
         """
-        extensions = [ext for ext in (_env_value(env, "PATHEXT") or "").split(os.pathsep) if ext]
-        if Path(name).suffix.lower() in {ext.lower() for ext in extensions}:
-            candidates = [name]
-        else:
-            candidates = [name + ext for ext in extensions]
-        for directory in (_env_value(env, "PATH") or "").split(os.pathsep):
-            directory = directory.strip().strip('"')
-            if not directory:
-                continue
-            for candidate in candidates:
-                path = Path(directory, candidate)
-                if path.is_file():
+        names = program_file_names(name, env)
+        for directory in path_directories(env):
+            for candidate in names:
+                path = directory / candidate
+                if is_program(path):
                     return str(path)
         return None
 
@@ -713,6 +772,9 @@ if sys.platform == "win32":
         different ``cmd.exe``.
         """
         return str(Path(os.environ["SystemRoot"], "System32", *parts))
+
+    #: The variable that holds the ID of one activation (``_activated_environment``).
+    _ACTIVATION_ID = "FWCTX_ACTIVATION_ID"
 
     #: Python code that writes its environment as JSON on stdout.  ASCII only
     #: (``ensure_ascii``), thus no code page of a console or of PowerShell
@@ -795,8 +857,13 @@ if sys.platform == "win32":
         from .job_object import BuildJob
 
         command_line = _activation_command_line(script)
+        # A new value for each activation: a script can name a temporary
+        # file with it, and two runs at the same time must not share one
+        # (``ncs-env.cmd`` of the Zephyr builder).  It is no part of the
+        # environment of the build.
+        activation_env = {**env, _ACTIVATION_ID: secrets.token_hex(8)}
         with BuildJob() as job:
-            proc = job.start_command_line(command_line, cwd=cwd, env=env)
+            proc = job.start_command_line(command_line, cwd=cwd, env=activation_env)
             try:
                 stdout, stderr = _communicate_in_slices(proc, timeout)
             except subprocess.TimeoutExpired:
@@ -812,7 +879,9 @@ if sys.platform == "win32":
             raise RuntimeError(
                 f"activate script {script} failed (exit {proc.returncode}){_quote_stream('output', output)}",
             )
-        return _parse_environment(script, stdout or b"")
+        environment = _parse_environment(script, stdout or b"")
+        environment.pop(_ACTIVATION_ID, None)
+        return environment
 
     def _run_in_job(
         cmd: list[str],

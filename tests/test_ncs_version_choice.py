@@ -27,6 +27,7 @@ from fw_context_mcp.indexer.builders.zephyr import (
     SdkChoice,
     ZephyrBuildSystem,
 )
+from tests._stubs import WINDOWS, write_python_tool
 
 
 def _install(version: str, *, usable: bool = True) -> SdkChoice:
@@ -75,12 +76,8 @@ class TestVersionFromEnvironment:
 class TestListInstalled:
     @staticmethod
     def _fake_nrfutil(tmp_path: Path, payload: str) -> str:
-        script = tmp_path / "nrfutil"
-        script.write_text(
-            "#!/bin/sh\ncat <<'JSON'\n" + payload + "\nJSON\n", encoding="utf-8"
-        )
-        script.chmod(0o755)
-        return str(script)
+        """An nrfutil that prints *payload*, in the form of the host (``tests/_stubs.py``)."""
+        return str(write_python_tool(tmp_path / "bin", "nrfutil", f"print({payload!r})\n"))
 
     def test_versions_and_toolchains_are_read(self, tmp_path: Path):
         payload = json.dumps({"type": "info", "data": {"versions": [
@@ -322,8 +319,10 @@ class TestZephyrSdkIsNotNcs:
         assert choice is not None
         assert choice.kind == SDK_KIND_ZEPHYR
         assert choice.version == "0.17.0"
-        assert choice.usable is True
-        assert choice.env_script is not None
+        # environment-setup-* is a shell script: on Windows it cannot be the
+        # activate of a build.
+        assert choice.usable is not WINDOWS
+        assert (choice.env_script is None) is WINDOWS
 
     def test_without_the_variable_there_is_nothing_to_report(
         self, monkeypatch: pytest.MonkeyPatch

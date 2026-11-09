@@ -93,6 +93,7 @@ def test_a_batch_program_gets_each_argument_as_it_is(tmp_path: Path):
     out = tmp_path / "argv.json"
     tool = write_python_tool(
         tmp_path / "tools", "fwargs", f"import json, sys\nopen({str(out)!r}, 'w').write(json.dumps(sys.argv[1:]))\n",
+        batch=True,
     )
     assert tool.suffix == ".cmd"
 
@@ -133,3 +134,14 @@ def test_a_build_gets_no_stdin(tmp_path: Path):
     result = utils.run_in_process_group(probe, cwd=tmp_path, env=dict(os.environ), timeout=60.0, capture_output=True)
 
     assert result.stdout.strip() == "''"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the rules of POSIX")
+def test_a_space_is_a_part_of_a_posix_path_entry():
+    """execvp reads '/opt/my tools ' as a directory with that name."""
+    assert utils.path_directories({"PATH": "/opt/my tools :/usr/bin"}) == [Path("/opt/my tools "), Path("/usr/bin")]
+
+
+@windows_only
+def test_a_quoted_windows_path_entry_is_a_directory():
+    assert utils.path_directories({"Path": ' "C:\\Program Files\\x" ;C:\\y'}) == [Path(r"C:\Program Files\x"), Path(r"C:\y")]

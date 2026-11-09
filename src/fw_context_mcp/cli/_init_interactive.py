@@ -1051,26 +1051,29 @@ def resolve_build_env(
         print(f"  [ok] Build activate: {detected_activate} ({origin})")
 
     if system == "esp-idf" and not detected.get("activate"):
+        from ..indexer.builders.esp_idf import EXPORT_SCRIPT
+
         val = prompt_text(
-            "Path to ESP-IDF (directory containing export.sh) (or Enter to skip)",
+            f"Path to ESP-IDF (directory containing {EXPORT_SCRIPT}) (or Enter to skip)",
             non_interactive=non_interactive,
         )
         if val:
             idf_dir = Path(val).expanduser()
-            export_sh = idf_dir / "export.sh"
+            export_script = idf_dir / EXPORT_SCRIPT
             if not dry_run:
-                # idf_path sets IDF_PATH for the build; activate sources the
-                # export.sh so idf.py/ninja/toolchain are on PATH.  Both are
+                # idf_path sets IDF_PATH for the build; activate runs the
+                # export script of the host (export.sh, or export.bat on
+                # Windows) so idf.py/ninja/toolchain are on PATH.  Both are
                 # machine-specific and belong in local.toml.
                 _write_build_key(project_root, "idf_path", str(idf_dir))
-                if export_sh.exists():
-                    _write_build_key(project_root, "activate", str(export_sh))
-                    detected["activate"] = str(export_sh)
+                if export_script.exists():
+                    _write_build_key(project_root, "activate", str(export_script))
+                    detected["activate"] = str(export_script)
                 else:
                     detected["activate"] = val
             print(f"  [ok] Build idf_path: {idf_dir}")
-            if export_sh.exists():
-                print(f"  [ok] Build activate: {export_sh}")
+            if export_script.exists():
+                print(f"  [ok] Build activate: {export_script}")
 
     if not detected.get("python") and not detected.get("activate") and system in ("zephyr", "esp-idf"):
         print("  SDK environment script not found.")

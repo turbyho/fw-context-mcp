@@ -47,13 +47,14 @@ import logging
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import cache, lru_cache
 from pathlib import Path
+
+from ..utils import is_program, path_directories, program_file_names
 
 log = logging.getLogger(__name__)
 
@@ -195,22 +196,41 @@ def resolve_compiler(token: str, cwd: Path, known: Mapping[str, Path]) -> Path |
     The path is made absolute and normalized, but a symbolic link is NOT
     followed: a ccache masquerade link ``/usr/lib/ccache/bin/gcc`` must run
     as ``gcc``, while its target ``/usr/bin/ccache`` rejects ``-E``.
+
+    Each step, and a token with a directory, tries the file names of the
+    program on this system (``utils.program_file_names``): on Windows a
+    build writes ``gcc`` and the file is ``gcc.exe``.  Step 3 reads the
+    ``PATH`` of this process without its current directory
+    (``utils.path_directories``), and takes only a program
+    (``utils.is_program``: on POSIX a file with the execute bit, as
+    ``shutil.which``).
     """
     if "/" in token or "\\" in token:
-        return _existing(Path(token), cwd)
-    if token in known:
-        found = _existing(known[token], cwd)
-        if found is not None:
-            return found
-    for directory in dict.fromkeys(p.parent for p in known.values()):
-        found = _existing(directory / token, cwd)
-        if found is not None:
-            return found
-    on_path = shutil.which(token)
-    if on_path is None:
+        # A path: on Windows a build can write it without ``.exe``.
+        path = Path(token)
+        for name in program_file_names(path.name):
+            found = _existing(path.with_name(name), cwd)
+            if found is not None:
+                return found
         return None
-    _warn_path_lookup(token, on_path)
-    return Path(os.path.normpath(os.path.abspath(on_path)))
+    names = program_file_names(token)
+    for name in names:
+        if name in known:
+            found = _existing(known[name], cwd)
+            if found is not None:
+                return found
+    for directory in dict.fromkeys(p.parent for p in known.values()):
+        for name in names:
+            found = _existing(directory / name, cwd)
+            if found is not None:
+                return found
+    for directory in path_directories():
+        for name in names:
+            candidate = directory / name
+            if is_program(candidate):
+                _warn_path_lookup(token, str(candidate))
+                return Path(os.path.normpath(os.path.abspath(candidate)))
+    return None
 
 
 def _existing(path: Path, cwd: Path) -> Path | None:
