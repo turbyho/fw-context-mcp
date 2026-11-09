@@ -135,13 +135,20 @@ def test_a_config_that_is_not_utf8_gives_a_config_of_its_own(tmp_path: Path):
 
 
 def test_the_unreachable_url_refuses_the_connection():
-    """Not a port with a listener that never answers: each request would wait for its timeout."""
-    import socket
+    """Not a port with a listener that never answers: each request would wait for its timeout.
+
+    Through ``loopback.create_connection``, as each request of fw-context to
+    a loopback host connects: ``socket.create_connection`` needs 2 s for a
+    refused connect on Windows, the timeout of this check.
+    """
     from urllib.parse import urlparse
 
+    from fw_context_mcp.loopback import create_connection
+
     url = urlparse(UNREACHABLE)
+    assert url.hostname is not None and url.port is not None
     with pytest.raises(ConnectionRefusedError):
-        socket.create_connection((url.hostname, url.port), timeout=2).close()
+        create_connection((url.hostname, url.port), timeout=2).close()
 
 
 def test_operator_environ_refuses_a_name_that_the_isolation_does_not_set():
