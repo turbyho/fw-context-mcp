@@ -1382,8 +1382,8 @@ def fmt_count(n: int) -> str:
     return f"{n:_d}".replace("_", " ")
 
 
-def use_utf8_stdio() -> None:
-    """Write ``sys.stdout`` and ``sys.stderr`` in UTF-8 on Windows.
+def use_utf8_stdio(*, stdout: bool = True) -> None:
+    """Write ``sys.stderr``, and ``sys.stdout`` when *stdout*, in UTF-8 on Windows.
 
     WHY: on Windows, Python writes a pipe or a file in the ANSI code page of
     the system (cp1252, cp1250), and ``print("✓")`` then raises
@@ -1393,11 +1393,25 @@ def use_utf8_stdio() -> None:
     A console is UTF-8 already (PEP 528), and Python 3.15 makes UTF-8 the
     default for the other streams too (PEP 686).
 
-    Call it at the start of an entry point that writes text, and not in the
-    MCP server: its transport wraps the binary ``sys.stdout.buffer`` itself.
+    Call it at the start of an entry point that writes text.  The MCP server
+    gives ``stdout=False``: its transport wraps the binary
+    ``sys.stdout.buffer`` itself, and only its log on stderr needs the
+    change.
     """
     if sys.platform != "win32":
         return
-    for stream in (sys.stdout, sys.stderr):
+    _reconfigure_utf8([sys.stderr, sys.stdout] if stdout else [sys.stderr])
+
+
+def _reconfigure_utf8(streams: list) -> None:
+    """Set UTF-8 on each text stream of *streams*, and keep its error handler.
+
+    WHY keep ``errors``: ``reconfigure(encoding=...)`` alone resets it to
+    ``strict``, and stderr has ``backslashreplace``, thus a traceback with a
+    lone surrogate (a path decoded with ``surrogateescape``) raised instead
+    of the report.
+    """
+    for stream in streams:
         if isinstance(stream, io.TextIOWrapper):
-            stream.reconfigure(encoding="utf-8")
+            stream.reconfigure(encoding="utf-8", errors=stream.errors)
+

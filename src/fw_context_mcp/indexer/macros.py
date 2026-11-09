@@ -88,7 +88,7 @@ def resolve_macros_via_preprocessor(
     # Workaround: if the source file doesn't exist (e.g., virtual indexing),
     # create a temporary empty C file so clang doesn't error.
     if not file_path.exists():
-        with tempfile.NamedTemporaryFile(suffix=".c", mode="w", delete=False) as tmp:
+        with tempfile.NamedTemporaryFile(suffix=".c", mode="w", encoding="utf-8", delete=False) as tmp:
             tmp.write("/* empty */\n")
             tmp_path = tmp.name
         cmd = [clang_binary, "-dM", "-E", *flags, tmp_path]

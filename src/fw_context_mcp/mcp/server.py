@@ -1382,6 +1382,10 @@ def main() -> None:
     command via bash.  An early exit would make the tools disappear from
     the agent's context, breaking the guided setup flow.
     """
+    from ..utils import use_utf8_stdio
+
+    # The log on stderr only: the stdio transport writes the binary stdout.
+    use_utf8_stdio(stdout=False)
     log.info("fw-context MCP server starting")
 
     # Phase 0: ask PyPI for a newer release in a daemon thread.  The thread
