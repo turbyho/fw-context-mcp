@@ -495,14 +495,14 @@ class TestFindVariablesHandler:
 
         from fw_context_mcp.mcp.handlers._base import BaseHandler, DbContext
         from fw_context_mcp.mcp.handlers.variables import find_variables
-        from fw_context_mcp.mcp.shared.executor import SyncQueryExecutor
+        from fw_context_mcp.mcp.shared.context import get_executor
 
         conn.commit()
         conn.close()
         db_path = tmp_path / "test.db"
         db_ctx = DbContext(
             db_path=db_path,
-            executor=SyncQueryExecutor(str(db_path.resolve()), db_path),
+            executor=get_executor(db_path),
             config_hash="hash-deadbeef",
             project_id="proj-001",
             root=tmp_path,
@@ -563,12 +563,12 @@ class TestFindVariablesHandler:
 
         from fw_context_mcp.mcp.handlers._base import BaseHandler, DbContext
         from fw_context_mcp.mcp.handlers.variables import find_variables
-        from fw_context_mcp.mcp.shared.executor import SyncQueryExecutor
+        from fw_context_mcp.mcp.shared.context import get_executor
 
         db_path = tmp_path / "test.db"
         db_ctx = DbContext(
             db_path=db_path,
-            executor=SyncQueryExecutor(str(db_path.resolve()), db_path),
+            executor=get_executor(db_path),
             config_hash="hash-deadbeef", project_id="proj-001", root=tmp_path, cfg=None,
         )
         with mock.patch.object(BaseHandler, "resolve_db_context", return_value=db_ctx), \

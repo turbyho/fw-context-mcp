@@ -63,7 +63,7 @@ def _seed_symbols(conn: sqlite3.Connection) -> dict[str, int]:
 
 def _context(db_path: Path):
     from fw_context_mcp.config.settings import Config
-    from fw_context_mcp.mcp.shared.executor import SyncQueryExecutor
+    from fw_context_mcp.mcp.shared.context import get_executor
     from fw_context_mcp.search.context import PipelineContext
 
     return PipelineContext(
@@ -74,7 +74,7 @@ def _context(db_path: Path):
         original_query="q",
         limit=20,
         config=Config(),
-        executor=SyncQueryExecutor(str(db_path.resolve()), db_path),
+        executor=get_executor(db_path),
     )
 
 

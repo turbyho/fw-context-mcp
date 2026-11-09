@@ -60,12 +60,12 @@ def db(tmp_path):
 
 def _handler_db(tmp_path: Path):
     from fw_context_mcp.mcp.handlers._base import BaseHandler, DbContext
-    from fw_context_mcp.mcp.shared.executor import SyncQueryExecutor
+    from fw_context_mcp.mcp.shared.context import get_executor
 
     db_path = tmp_path / "test.db"
     ctx = DbContext(
         db_path=db_path,
-        executor=SyncQueryExecutor(str(db_path.resolve()), db_path),
+        executor=get_executor(db_path),
         config_hash=CH,
         project_id="proj-001",
         root=tmp_path,
