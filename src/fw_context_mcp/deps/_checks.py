@@ -1086,7 +1086,9 @@ def check_db_integrity(project_root: str | Path | None = None) -> DepCheckResult
         )
 
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        # as_uri(): a space, "#", "?" or "%" of the path is a character of a
+        # name, and a Windows path needs the form file:///C:/...
+        conn = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
         try:
             row = conn.execute("PRAGMA quick_check").fetchone()
             if row and row[0] == "ok":

@@ -275,6 +275,26 @@ class TestLocalCachePath:
 
         assert (tmp_path / "relhome" / "llm_cache.db").is_file()
 
+    @pytest.mark.parametrize("name", ["with space", "hash#mark", "query?mark", "per%cent"])
+    def test_a_home_with_uri_characters_opens_the_cache(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+    ) -> None:
+        """A space, ``#``, ``?`` or ``%`` in the path is a character of a name, not of the URI.
+
+        ``f"file://{path}"`` made ``#mark/llm_cache.db`` a fragment and
+        ``?mark/...`` the query of the URI, and SQLite opened a different
+        file or none.  On Windows ``file://C:\\...`` has the authority
+        ``C:`` and SQLite stops with ``invalid uri authority``.
+        """
+        import fw_context_mcp.cache_client as cc_mod
+
+        home = tmp_path / name
+        monkeypatch.setenv("FW_CONTEXT_HOME", str(home))
+        conn = cc_mod.get_local_cache_db()
+        conn.close()
+
+        assert (home / "llm_cache.db").is_file()
+
     def test_session_cache_is_not_in_the_home_of_the_operator(self) -> None:
         """The session isolation of ``conftest.py`` covers the cache too."""
         import os

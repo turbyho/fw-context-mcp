@@ -74,9 +74,9 @@ def _local_cache_path() -> Path:
     A module constant took the home of the operator before the test session
     set the variable, and the tests wrote their rows into the real cache.
 
-    The path is absolute, because :func:`get_local_cache_db` puts it into a
-    ``file://`` URI.  SQLite reads a relative ``$FW_CONTEXT_HOME`` there as
-    the URI authority and stops with ``invalid uri authority``.
+    The path is absolute, because :func:`get_local_cache_db` makes a
+    ``file:`` URI of it with ``Path.as_uri()``, which takes only an absolute
+    path.
     """
     return (fw_context_home() / "llm_cache.db").absolute()
 
@@ -231,7 +231,10 @@ def get_local_cache_db(readonly: bool = False) -> sqlite3.Connection:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     if readonly and not cache_path.exists():
         readonly = False
-    uri = f"file://{cache_path}?mode={'ro' if readonly else 'rwc'}"
+    # as_uri() and not f"file://{path}": it percent-encodes a space, "#",
+    # "?" and "%" of a name, and it writes a Windows path as
+    # file:///C:/..., where "file://C:\\..." has the authority "C:".
+    uri = f"{cache_path.as_uri()}?mode={'ro' if readonly else 'rwc'}"
     conn = sqlite3.connect(uri, uri=True)
     try:
         cache_path.chmod(0o600)

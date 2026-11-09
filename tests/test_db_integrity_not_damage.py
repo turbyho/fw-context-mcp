@@ -117,3 +117,28 @@ def test_damage_of_quick_check_stays_damage_when_the_second_read_fails(db_path, 
 
     assert (result.status, result.critical) == ("error", True), result
     assert "btreeInitPage" in result.message
+
+
+@pytest.mark.parametrize("name", ["in dex", "in#dex", "in?dex", "in%dex"])
+def test_a_good_index_in_a_directory_with_uri_characters_is_ok(db_path, name):
+    """A space, ``#``, ``?`` or ``%`` of the path is a character of a name, not of the URI.
+
+    ``f"file:{path}?mode=ro"`` made ``#dex/...`` a fragment and ``?dex/...``
+    the query of the URI, and the check opened no file: a good index read as
+    damaged.  On Windows a path needs the form ``file:///C:/...``.
+    """
+    from fw_context_mcp.deps._checks import check_db_integrity
+
+    index_dir = db_path.parents[1].with_name(name)
+    local = Path.cwd() / ".fw-context" / "local.toml"
+    local.write_text(f'[index]\ndb_dir = "{index_dir.as_posix()}"\n', encoding="utf-8")
+    path = index_dir / PID / "index.db"
+    path.parent.mkdir(parents=True)
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE t (x)")
+    conn.commit()
+    conn.close()
+
+    result = check_db_integrity()
+
+    assert result.status == "ok", result
