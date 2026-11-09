@@ -119,7 +119,7 @@ def test_damage_of_quick_check_stays_damage_when_the_second_read_fails(db_path, 
     assert "btreeInitPage" in result.message
 
 
-@pytest.mark.parametrize("name", ["in dex", "in#dex", "in?dex", "in%dex"])
+@pytest.mark.parametrize("name", ["in dex", "in#dex", pytest.param("in?dex", marks=pytest.mark.skipif(os.name == "nt", reason="Windows forbids '?' in a file name")), "in%dex"])
 def test_a_good_index_in_a_directory_with_uri_characters_is_ok(db_path, name):
     """A space, ``#``, ``?`` or ``%`` of the path is a character of a name, not of the URI.
 

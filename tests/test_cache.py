@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -275,7 +276,7 @@ class TestLocalCachePath:
 
         assert (tmp_path / "relhome" / "llm_cache.db").is_file()
 
-    @pytest.mark.parametrize("name", ["with space", "hash#mark", "query?mark", "per%cent"])
+    @pytest.mark.parametrize("name", ["with space", "hash#mark", pytest.param("query?mark", marks=pytest.mark.skipif(os.name == "nt", reason="Windows forbids '?' in a file name")), "per%cent"])
     def test_a_home_with_uri_characters_opens_the_cache(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
     ) -> None:
