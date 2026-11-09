@@ -350,10 +350,11 @@ class TestTheProblemOfAMultiRun:
         monkeypatch.setattr(index_mod, "_build_run_kwargs", lambda *a, **kw: {})
         def _multi(*a, **kw) -> int:
             if sigterm_self:
-                import os
                 import signal
 
-                os.kill(os.getpid(), signal.SIGTERM)
+                # raise_signal and not os.kill(os.getpid(), SIGTERM): on
+                # Windows that is TerminateProcess, and it ended pytest.
+                signal.raise_signal(signal.SIGTERM)
                 time.sleep(5)  # the handler raises before this ends
                 raise AssertionError("the SIGTERM handler did not stop the run")
             if error is not None:

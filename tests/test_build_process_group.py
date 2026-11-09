@@ -410,13 +410,16 @@ def test_nohup_keeps_its_sighup_ignored(tmp_path: Path):
     from types import SimpleNamespace
 
     from fw_context_mcp.cli._index import _owned_index
+    from fw_context_mcp.processes import HANGUP_SIGNAL
 
-    previous = signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    # HANGUP_SIGNAL: SIGHUP, or SIGBREAK on Windows.  raise_signal and not
+    # os.kill(os.getpid(), ...): on Windows os.kill ends the process.
+    previous = signal.signal(HANGUP_SIGNAL, signal.SIG_IGN)
     try:
         with _owned_index(tmp_path, SimpleNamespace(background=False, takeover=False)):
-            assert signal.getsignal(signal.SIGHUP) is signal.SIG_IGN
-            os.kill(os.getpid(), signal.SIGHUP)
+            assert signal.getsignal(HANGUP_SIGNAL) is signal.SIG_IGN
+            signal.raise_signal(HANGUP_SIGNAL)
             time.sleep(0.1)
-        assert signal.getsignal(signal.SIGHUP) is signal.SIG_IGN
+        assert signal.getsignal(HANGUP_SIGNAL) is signal.SIG_IGN
     finally:
-        signal.signal(signal.SIGHUP, previous)
+        signal.signal(HANGUP_SIGNAL, previous)
