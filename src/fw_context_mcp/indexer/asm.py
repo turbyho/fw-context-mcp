@@ -59,6 +59,7 @@ from ._asm_layout import (
 from ._asm_macro import NO_BYTES, UNSURE, barrier_effects
 from ._asm_macro import Report as MacroReport
 from ._asm_macro import expand_stream as expand_macros
+from ._clang_cli import clang_binary, run_clang
 from ._parsed_text import decode_lines
 
 log = logging.getLogger(__name__)
@@ -187,8 +188,9 @@ def preprocess(unit) -> AsmSource | None:
     skipped and counted by the caller, never guessed at: half of an
     assembly file read without its macros would be worse than none of it.
 
-    The compiler comes from the unit's own flags, so a cross build gets its
-    own preprocessor rather than the host one.
+    The preprocessor is clang (``_clang_cli.clang_binary``) with the flags
+    of the unit, its target among them: a cross build gets the predefined
+    macros of its target, and not the ones of the host.
     """
     # The source file is dropped from the flags and named once at the end.
     # `clang_args` already holds it, and appending it again handed clang
@@ -201,18 +203,14 @@ def preprocess(unit) -> AsmSource | None:
     # preprocessor.
     args = _args_without_source(unit)
     try:
-        result = subprocess.run(
-            # -C keeps comments.  Without it cpp strips them, and every
-            # comment line then reads as "the preprocessor dropped this"
-            # and gets blanked out of files.content — measured on
-            # irq_cm4f.S, 63 of 228 lines, including the @brief block that
-            # search_content is supposed to find.
-            ["clang", "-E", "-C", *args, str(unit.file)],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            timeout=PREPROCESS_TIMEOUT_S,
-            cwd=str(unit.directory) if unit.directory else None,
-            check=False,
+        # -C keeps comments.  Without it cpp strips them, and every comment
+        # line then reads as "the preprocessor dropped this" and gets
+        # blanked out of files.content — measured on irq_cm4f.S, 63 of 228
+        # lines, including the @brief block that search_content is
+        # supposed to find.  run_clang gives the flags in a response file.
+        result = run_clang(
+            clang_binary(), ["-E", "-C", *args, str(unit.file)],
+            timeout=PREPROCESS_TIMEOUT_S, cwd=str(unit.directory) if unit.directory else None,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         log.debug("preprocess %s: %s", unit.file.name, exc)

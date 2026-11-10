@@ -34,6 +34,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -56,6 +57,7 @@ log = logging.getLogger(__name__)
 
 __all__ = [
     "CC_STAGING_GLOB",
+    "CLANG_POSIX_RESPONSE_FILE",
     "CPP_EXTENSIONS",
     "CPP_HEADER_EXTENSIONS",
     "CPP_SOURCE_EXTENSIONS",
@@ -99,6 +101,8 @@ __all__ = [
     "remove_file",
     "replace_file",
     "resolve_project_root",
+    "response_file",
+    "response_file_text",
     "run_in_process_group",
     "sqlite_file_uri",
     "staging_owner",
@@ -643,6 +647,56 @@ def program_file_names(name: str, env: Mapping[str, str] | None = None) -> list[
     if Path(name).suffix.lower() in extensions:
         return [name]
     return [name + ext for ext in extensions]
+
+
+#: The option that makes clang read a response file with the quoting of GCC
+#: on each host.  Without it, clang on Windows reads the file with the rules
+#: of the Windows command line, and the escapes of
+#: :func:`response_file_text` mean something else there.
+CLANG_POSIX_RESPONSE_FILE = "--rsp-quoting=posix"
+
+_RESPONSE_FILE_SPECIAL = re.compile(r"""([\\\s'"])""")
+
+
+def response_file_text(args: Sequence[str]) -> str:
+    """Return *args* as the text of a response file (``@file``), one argument on each line.
+
+    The quoting is the one of GCC (libiberty ``buildargv``) and of clang
+    with :data:`CLANG_POSIX_RESPONSE_FILE`: a backslash makes the next
+    character part of the argument.  Thus each backslash, white space and
+    quote gets a backslash before it, and an empty argument is ``""``.
+    A Windows path keeps its meaning (``C:\\\\x`` reads as ``C:\\x``).
+    """
+    return "".join(('""' if arg == "" else _RESPONSE_FILE_SPECIAL.sub(r"\\\1", arg)) + "\n" for arg in args)
+
+
+@contextmanager
+def response_file(args: Sequence[str]) -> Iterator[Path]:
+    """Give a temporary response file that holds *args*, and remove it after the block.
+
+    WHY: Windows limits a command line to 32767 characters, and the flags
+    of one unit can be longer (measured: 32798 characters for one unit of
+    an ESP32 project, with its include paths).  CreateProcess then fails
+    with error 206.  A response file has no such limit.
+
+    The file is written with ``newline=""``: the text mode of Windows makes
+    each ``\\n`` a ``\\r\\n``, and an escaped line break in an argument then
+    reads as two arguments.  :func:`remove_file` removes it, because a
+    scanner of Windows can still hold the new file open.  A file that stays
+    after that is only a leftover in the temporary directory, thus it gives
+    a warning and does not take away the result of the block.
+    """
+    descriptor, name = tempfile.mkstemp(prefix="fwctx-args-", suffix=".rsp")
+    path = Path(name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as stream:
+            stream.write(response_file_text(args))
+        yield path
+    finally:
+        try:
+            remove_file(path)
+        except OSError as exc:
+            log.warning("The response file %s stays in the temporary directory: %s", path, exc)
 
 
 def venv_program(venv: Path, name: str) -> Path:

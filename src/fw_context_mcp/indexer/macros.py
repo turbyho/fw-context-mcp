@@ -15,42 +15,15 @@ for the indexed build configuration.
 from __future__ import annotations
 
 import logging
-import shutil
 import subprocess
-import sys
 import tempfile
-from functools import lru_cache
 from pathlib import Path
 
+from ._clang_cli import clang_binary as _clang_binary
+from ._clang_cli import run_clang
 from ._parsed_text import decode_lines
 
 log = logging.getLogger(__name__)
-
-
-@lru_cache(maxsize=1)
-def _find_clang_binary() -> str:
-    """Find the clang CLI binary.
-
-    Tries PATH first, then common Windows LLVM install locations.
-    Returns ``"clang"`` as fallback (will fail gracefully via
-    ``FileNotFoundError`` in the caller).
-    """
-    # 1. Check PATH
-    found = shutil.which("clang")
-    if found:
-        return found
-
-    # 2. Check common Windows LLVM install locations
-    if sys.platform == "win32":
-        for candidate in (
-            r"C:\Program Files\LLVM\bin\clang.exe",
-            r"C:\Program Files (x86)\LLVM\bin\clang.exe",
-        ):
-            if Path(candidate).exists():
-                return candidate
-
-    # 3. Fallback — caller handles FileNotFoundError
-    return "clang"
 
 
 def resolve_macros_via_preprocessor(
@@ -96,12 +69,14 @@ def resolve_macros_via_preprocessor(
         cmd = [clang_binary, "-dM", "-E", *flags, tmp_path]
         try:
             cmd = _sanitize_flags(cmd)
-            result = subprocess.run(
-                cmd, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout,
+            result = run_clang(
+                cmd[0], cmd[1:], timeout=timeout,
                 cwd=file_path.parent if file_path.parent.exists() else Path.cwd(),
             )
-        except FileNotFoundError:
-            log.debug("clang binary not found: %s — macro expansion skipped", clang_binary)
+        except FileNotFoundError as exc:
+            # The text of the error: clang can be missing, and the temporary
+            # directory of the response file can be missing too.
+            log.debug("clang -dM -E cannot run for %s: %s — macro expansion skipped", file_path.name, exc)
             return {}
         except subprocess.TimeoutExpired:
             log.debug("clang -dM -E timed out after %.1fs for %s", timeout, file_path.name)
@@ -112,11 +87,9 @@ def resolve_macros_via_preprocessor(
         # Strip flags that clang -E doesn't need (or that cause issues with -dM)
         cmd = _sanitize_flags(cmd)
         try:
-            result = subprocess.run(
-                cmd, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout, cwd=cwd,
-            )
-        except FileNotFoundError:
-            log.debug("clang binary not found: %s — macro expansion skipped", clang_binary)
+            result = run_clang(cmd[0], cmd[1:], timeout=timeout, cwd=cwd)
+        except FileNotFoundError as exc:
+            log.debug("clang -dM -E cannot run for %s: %s — macro expansion skipped", file_path.name, exc)
             return {}
         except subprocess.TimeoutExpired:
             log.debug("clang -dM -E timed out after %.1fs for %s", timeout, file_path.name)
@@ -265,7 +238,7 @@ def resolve_and_update(
     """
     expanded = resolve_macros_via_preprocessor(
         flags, file_path,
-        clang_binary if clang_binary != "clang" else _find_clang_binary(),
+        clang_binary if clang_binary != "clang" else _clang_binary(),
         cwd=cwd,
     )
     if not expanded:
