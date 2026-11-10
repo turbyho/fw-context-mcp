@@ -242,6 +242,50 @@ class TestPreprocess:
         assert len(files) == len({Path(p).resolve() for p in files})
         assert all(Path(p).is_absolute() for p in files)
 
+    def test_a_file_in_a_directory_with_a_non_ascii_name_keeps_its_lines(self, tmp_path: Path):
+        """clang writes each byte above 127 of a linemarker as an octal escape.
+
+        The name `m\\305\\231 \\305\\245/t.S` was used as it was, a file
+        that does not exist: its lines were lost, on each system.
+        """
+        directory = tmp_path / "mř ť"
+        directory.mkdir()
+        unit = _unit(directory, "t.S", "  .long A\n")
+
+        src = preprocess(unit)
+
+        assert src is not None
+        files = {m[0] for m in src.line_map if m is not None}
+        assert files == {str((directory / "t.S").resolve())}
+
+    def test_a_byte_that_is_no_utf8_does_not_stop_the_unit(self, tmp_path: Path):
+        """A comment in cp1252 stopped the unit with UnicodeDecodeError on Linux.
+
+        The text is decoded as the content fill decodes the file: UTF-8
+        with replacement.
+        """
+        src_file = tmp_path / "t.S"
+        src_file.write_bytes(b"/* Gr\xfc\xdfe */\n  .long A\n")
+        unit = SimpleNamespace(file=src_file, directory=tmp_path, clang_args=[])
+
+        src = preprocess(unit)
+
+        assert src is not None
+        assert "Gr\ufffd\ufffde" in src.text
+        assert ".long A" in src.text
+
+    def test_a_form_feed_in_a_comment_is_no_line_end(self, tmp_path: Path):
+        """str.splitlines split there, thus each statement after it got the number of the next line."""
+        unit = _unit(tmp_path, "t.S", "/* a \f b */\n  .long A\n")
+
+        from fw_context_mcp.indexer.asm import _raw_statements
+
+        src = preprocess(unit)
+
+        assert src is not None
+        resolved = str((tmp_path / "t.S").resolve())
+        assert (resolved, 2, "  .long A") in list(_raw_statements(src))
+
     def test_a_unit_that_cannot_be_preprocessed_returns_none(self, tmp_path: Path):
         """Never guessed at: half a file read without its macros is worse."""
         unit = _unit(tmp_path, "t.S", '#include "nowhere-at-all.h"\n')

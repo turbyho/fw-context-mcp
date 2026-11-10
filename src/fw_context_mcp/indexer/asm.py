@@ -28,6 +28,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import sqlite3
 import subprocess
@@ -71,7 +72,14 @@ PREPROCESS_TIMEOUT_S: float = 60.0
 # output switches file or jumps within one.  The flags (1 = entering a
 # file, 2 = returning) are not needed: the file and line alone place every
 # following line.
-_LINEMARKER_RE = re.compile(r'^# (\d+) "([^"]*)"')
+_LINEMARKER_RE = re.compile(r'^# (\d+) "((?:[^"\\]|\\.)*)"')
+
+# An escape in the file name of a linemarker.  clang writes the name as a C
+# string: `\\` for a backslash, `\"` for a quote, and each byte above 127 as
+# three octal digits — measured on Linux and Windows, `mř` gives `m\305\231`.
+# GCC escapes the backslash and the quote only.
+_MARKER_ESCAPE_RE = re.compile(r"\\([0-7]{1,3}|.)", re.DOTALL)
+_MARKER_CHARACTER_ESCAPES = {"n": "\n", "t": "\t"}
 
 # Linemarkers cpp emits for things that are not files on disk.  Lines
 # attributed to them belong to no source and are dropped.
@@ -201,7 +209,6 @@ def preprocess(unit) -> AsmSource | None:
             # search_content is supposed to find.
             ["clang", "-E", "-C", *args, str(unit.file)],
             capture_output=True,
-            text=True,
             timeout=PREPROCESS_TIMEOUT_S,
             cwd=str(unit.directory) if unit.directory else None,
             check=False,
@@ -210,12 +217,17 @@ def preprocess(unit) -> AsmSource | None:
         log.debug("preprocess %s: %s", unit.file.name, exc)
         return None
     if result.returncode != 0:
-        first = (result.stderr or "").strip().splitlines()[:1]
+        first = result.stderr.decode("utf-8", "replace").strip().splitlines()[:1]
         log.debug("preprocess %s failed: %s", unit.file.name, first)
         return None
 
     base = unit.directory if unit.directory else unit.file.parent
-    source = _map_output(result.stdout, Path(base))
+    # WHY bytes and decode_lines: the output is the text of the sources,
+    # decoded as the content fill decodes them (UTF-8 with replacement).
+    # ``text=True`` decoded it in the locale: a byte that is no UTF-8 in a
+    # comment stopped the unit with UnicodeDecodeError on Linux, and the
+    # ANSI code page of Windows gave other characters than the content fill.
+    source = _map_output("".join(decode_lines(result.stdout)), Path(base))
     # The raw entry, not clang_args: the translation to clang flags keeps
     # no `-Wa,` option.  Only the presence is read, never a value.
     source.defsym = "defsym" in json.dumps(getattr(unit, "raw_entry", None) or {})
@@ -240,11 +252,11 @@ def _map_output(text: str, base: Path) -> AsmSource:
     cur_file: str | None = None
     cur_line = 0
 
-    for raw in text.splitlines():
+    for raw in _output_lines(text):
         marker = _LINEMARKER_RE.match(raw)
         if marker is not None:
             cur_line = int(marker.group(1))
-            name = marker.group(2)
+            name = _marker_file_name(marker.group(2))
             if name in _SYNTHETIC_FILES:
                 cur_file = None
             else:
@@ -259,6 +271,47 @@ def _map_output(text: str, base: Path) -> AsmSource:
         cur_line += 1
 
     return AsmSource(text=text, line_map=line_map)
+
+
+def _output_lines(text: str) -> list[str]:
+    """Return the lines of the preprocessor output *text*, split at "\\n" only.
+
+    ``_map_output`` and the readers of the statements count the same lines.
+    WHY not ``str.splitlines``: it also splits at a form feed, a vertical
+    tab, U+0085, U+2028 and others, which a comment can hold, and the
+    preprocessor does not count them as line ends.  Measured: a form feed
+    in a comment moved each statement after it one line down.  The text
+    has ``\\n`` for each line end: ``decode_lines`` reads it with
+    universal newlines.
+    """
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
+def _marker_file_name(quoted: str) -> str:
+    """Return the file name of a linemarker from the text between its quotes.
+
+    Each escape (see ``_MARKER_ESCAPE_RE``) gives its byte, and the bytes
+    give the name as this process names files (``os.fsdecode``): UTF-8 on
+    Windows, the bytes of the name with surrogateescape on POSIX.  WHY:
+    the name was used as the marker wrote it, thus a file in a directory
+    with a name such as `mř` got lines of `m\\305\\231`, a file that does
+    not exist, and its statements were lost.
+    """
+    data = bytearray()
+    position = 0
+    for escape in _MARKER_ESCAPE_RE.finditer(quoted):
+        data += os.fsencode(quoted[position:escape.start()])
+        code = escape.group(1)
+        if code[0] in "01234567":
+            data.append(int(code, 8) & 0xFF)
+        else:
+            data += os.fsencode(_MARKER_CHARACTER_ESCAPES.get(code, code))
+        position = escape.end()
+    data += os.fsencode(quoted[position:])
+    return os.fsdecode(bytes(data))
 
 
 @dataclass
@@ -804,10 +857,10 @@ def _raw_statements(source: AsmSource) -> Iterator[tuple[str, int, str]]:
     A line the map cannot place still advances the comment state: a
     comment opened in it closes lines later, in a line that IS placed.
     """
-    # splitlines() once, not once per line: the output of a Zephyr unit is
+    # Split once, not once per line: the output of a Zephyr unit is
     # over a thousand lines and re-splitting it each time made this
     # quadratic for no reason.
-    text_lines = source.text.splitlines()
+    text_lines = _output_lines(source.text)
     in_comment = False
     for out_line, mapped in enumerate(source.line_map):
         clean, in_comment = _strip_block_comments(text_lines[out_line], in_comment)
