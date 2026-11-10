@@ -22,6 +22,8 @@ import tempfile
 from functools import lru_cache
 from pathlib import Path
 
+from ._parsed_text import decode_lines
+
 log = logging.getLogger(__name__)
 
 
@@ -95,7 +97,7 @@ def resolve_macros_via_preprocessor(
         try:
             cmd = _sanitize_flags(cmd)
             result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=timeout,
+                cmd, capture_output=True, timeout=timeout,
                 cwd=file_path.parent if file_path.parent.exists() else Path.cwd(),
             )
         except FileNotFoundError:
@@ -111,7 +113,7 @@ def resolve_macros_via_preprocessor(
         cmd = _sanitize_flags(cmd)
         try:
             result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd,
+                cmd, capture_output=True, timeout=timeout, cwd=cwd,
             )
         except FileNotFoundError:
             log.debug("clang binary not found: %s — macro expansion skipped", clang_binary)
@@ -123,12 +125,16 @@ def resolve_macros_via_preprocessor(
     if result.returncode != 0:
         log.debug(
             "clang -dM -E failed for %s (exit %d): %s",
-            file_path.name, result.returncode, result.stderr[:200],
+            file_path.name, result.returncode, result.stderr.decode("utf-8", "replace")[:200],
         )
         return {}
 
+    # WHY bytes and decode_lines: a value is text of the sources, decoded as
+    # the content fill decodes them (UTF-8 with replacement).  ``text=True``
+    # decoded it in the locale: on Windows the ANSI code page, and a byte
+    # that is no UTF-8 stopped the run with UnicodeDecodeError on Linux.
     macros: dict[str, str] = {}
-    for line in result.stdout.splitlines():
+    for line in decode_lines(result.stdout):
         line = line.strip()
         if not line.startswith("#define "):
             continue
