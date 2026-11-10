@@ -164,6 +164,10 @@ def cmd_setup(args: argparse.Namespace) -> int:
     A wizard reduces the error-prone manual process to a single
     command with guided prompts.
     """
+    if sys.platform == "win32":
+        # The wizard installs a service of systemd or launchd through sudo.
+        print("error: the setup wizard of the cache server supports Linux and macOS only", file=sys.stderr)
+        return 1
     from .setup import setup_wizard
 
     return setup_wizard()

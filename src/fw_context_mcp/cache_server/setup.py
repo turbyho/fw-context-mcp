@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import os
 import platform
-import pwd
 import re
 import secrets
 import shutil
@@ -45,6 +44,13 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Any
+
+# The wizard runs sudo, useradd, systemd or launchd and nginx, and it reads
+# the users of the system through ``pwd``: Linux and macOS only.  WHY a
+# guard of the module: ``cli.cmd_setup`` refuses Windows before the import,
+# and mypy checks the rest of the module only for POSIX.
+if sys.platform == "win32":
+    raise ImportError("the setup wizard of the cache server supports Linux and macOS only")
 
 
 def setup_wizard() -> int:
@@ -344,6 +350,8 @@ def _ensure_server_venv() -> bool:
 
     # Ensure fw-cache system user exists before chown.
     # The user must exist so the systemd service can run as fw-cache.
+    import pwd
+
     try:
         pwd.getpwnam("fw-cache")
     except KeyError:
