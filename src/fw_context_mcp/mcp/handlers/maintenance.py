@@ -72,7 +72,7 @@ from ...indexer.db import (
 from ...indexer.db._locking import IndexRunLocked, index_run_lock
 from ...indexer.git_context import head_moved, stored_head
 from ...llm.ollama import check_setup
-from ...path_key import index_key
+from ...path_key import index_key, key_path
 from ...utils import HEADER_EXTENSIONS, resolve_project_root
 from ..background import read_reindex_progress, read_reindex_state
 from ..shared.context import (
@@ -2476,7 +2476,7 @@ def _reindex_cleanup_deleted_file(
             db_dir=db_path.parent,
         )
         result = {
-            "file": str(target),
+            "file": target.as_posix(),
             "symbols_removed": symbol_count,
             "action": "deleted",
         }
@@ -2732,7 +2732,7 @@ def _reindex_parse_and_store(
 
             elapsed = round(time.monotonic() - t0, 2)
             result = {
-                "file": str(target),
+                "file": target.as_posix(),
                 "translation_units": len(matching),
                 "symbols_updated": total_symbols,
                 "elapsed_s": elapsed,
@@ -3695,7 +3695,7 @@ def _reindex_sums(target: Path, done: list[tuple[sqlite3.Row, dict]], elapsed_s:
     failed = [build_label(build) or "(no name)" for build, result in done if "error" in result]
     if not good:
         answer: dict = {
-            "file": str(target),
+            "file": target.as_posix(),
             "error": "fw-context could not update the file in each build that it tried. Each entry of builds holds its error.",
             "failed_builds": failed,
         }
@@ -3705,13 +3705,13 @@ def _reindex_sums(target: Path, done: list[tuple[sqlite3.Row, dict]], elapsed_s:
         return answer
     if not target.exists():
         answer = {
-            "file": str(target),
+            "file": target.as_posix(),
             "symbols_removed": sum(result.get("symbols_removed", 0) for result in good),
             "action": "deleted",
         }
     else:
         answer = {
-            "file": str(target),
+            "file": target.as_posix(),
             "translation_units": sum(result.get("translation_units", 0) for result in good),
             "symbols_updated": sum(result.get("symbols_updated", 0) for result in good),
             "elapsed_s": elapsed_s,
@@ -3779,12 +3779,14 @@ def _tu_for_header(
     only for a header that no listing owns: a header with an owner goes to
     its owner first.
 
-    Paths are compared as strings.  The manifest already stores resolved
-    forms — relative to the project root when inside it, absolute
-    otherwise (see ops.py) — and *target* arrives resolved from
-    _reindex_resolve_target, thus another resolve() per header would only
-    add a syscall for each of the tens of thousands of header references
-    a large manifest holds.
+    The manifest stores the index key of each header (``path_key``):
+    relative to the project root inside it, absolute outside it, with
+    ``/`` on each system.  *target* becomes its key one time, and the
+    headers are compared with it as strings.  WHY not a path of each
+    header: a resolve() for each of the tens of thousands of header
+    references of a large manifest only adds syscalls.  WHY not
+    ``str(Path)``: on Windows it gives ``C:\\ncs\\x.h`` for the key
+    ``C:/ncs/x.h``, and a header outside the root never matched.
     """
     from ...indexer.compile_commands import _detect_language
     from ...indexer.db import claim_order
@@ -3792,16 +3794,14 @@ def _tu_for_header(
 
     if not manifest:
         return None
-    root = project_root.resolve()
-    target_str = str(target)
+    target_key = index_key(target, project_root)
     best: tuple[int, str, str] | None = None
     for entry in manifest.get("entries") or ():
         tu_file = entry.get("file")
         if not tu_file:
             continue
         for header in entry.get("headers") or ():
-            header_abs = header if Path(header).is_absolute() else str(root / header)
-            if header_abs != target_str:
+            if header != target_key:
                 continue
             # No flags hash: the caller orders the listings of the file that this gives.
             position = claim_order((tu_file, ""), _detect_language(Path(tu_file), tu_arguments(manifest, entry)))
@@ -3810,7 +3810,7 @@ def _tu_for_header(
             break
     if best is None:
         return None
-    return Path(best[1]) if Path(best[1]).is_absolute() else root / best[1]
+    return key_path(best[1], project_root)
 
 
 def _with_owners_of_changed_headers(

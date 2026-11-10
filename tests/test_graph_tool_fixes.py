@@ -123,7 +123,7 @@ def test_no_hotspot_with_references_says_so(db, tmp_path):
 def test_absolute_sites(tmp_path):
     sites = callgraph._absolute_sites("src/a.c:10, /abs/b.c:20", tmp_path)
 
-    assert sites == f"{tmp_path / 'src/a.c'}:10, /abs/b.c:20"
+    assert sites == f"{(tmp_path / 'src/a.c').as_posix()}:10, /abs/b.c:20"
 
 
 def test_absolute_vector_paths_reach_the_nested_entries(tmp_path):
@@ -137,11 +137,11 @@ def test_absolute_vector_paths_reach_the_nested_entries(tmp_path):
 
     out = callgraph._absolute_vector_paths([row, build_row, {"coverage": "…"}], tmp_path)
 
-    assert out[0]["file"] == str(tmp_path / "src/timer.c")
-    assert out[0]["table_file"] == str(tmp_path / "startup.S")
-    assert out[0]["overridden"]["file"] == str(tmp_path / "startup.S")
-    assert out[0]["aliases"]["file"] == str(tmp_path / "startup.S")
-    assert out[0]["installed"][0]["file"] == str(tmp_path / "src/h.c")
-    assert out[0]["installed"][0]["at"] == f"{tmp_path / 'src/init.c'}:9"
+    assert out[0]["file"] == (tmp_path / "src/timer.c").as_posix()
+    assert out[0]["table_file"] == (tmp_path / "startup.S").as_posix()
+    assert out[0]["overridden"]["file"] == (tmp_path / "startup.S").as_posix()
+    assert out[0]["aliases"]["file"] == (tmp_path / "startup.S").as_posix()
+    assert out[0]["installed"][0]["file"] == (tmp_path / "src/h.c").as_posix()
+    assert out[0]["installed"][0]["at"] == f"{(tmp_path / 'src/init.c').as_posix()}:9"
     assert out[1]["file"] == ""
     assert out[2] == {"coverage": "…"}

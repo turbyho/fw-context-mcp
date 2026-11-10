@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     from fw_context_mcp.indexer.build import BuildConfig
 
 from fw_context_mcp import _stdlib_sqlite3
+from fw_context_mcp.path_key import is_absolute_key
 from fw_context_mcp.processes import MAX_PID, pid_exists
 
 log = logging.getLogger(__name__)
@@ -1359,18 +1360,29 @@ def resolve_project_root(explicit: str | Path | None = None) -> Path:
 
 
 def abs_path(root: Path, path: str) -> str:
-    """Resolve a stored (potentially relative) file path to an absolute path.
+    """Return the absolute path of the index key *path*, with the separator ``/``.
 
-    Absolute paths are returned unchanged; relative paths are joined with
-    *root*.  An empty string is returned as-is (callers should guard
-    against empty paths before calling).
+    A relative key is joined to *root*.  An absolute key (``/opt/...`` or
+    ``C:/...``) stays as it is.  An empty string stays empty: the caller
+    must not give one.
+
+    WHY ``/`` on each system: the answers of the MCP tools give this path
+    as ``file``, and a client gives it back to a tool, or compares it with
+    the path of a different answer.  The index keys use ``/`` (see
+    ``path_key``), thus one file has one spelling in each answer.  On
+    Linux and macOS ``as_posix()`` is ``str()``, thus no answer changes
+    there.  Windows accepts ``/`` in each path.
+
+    WHY ``is_absolute_key`` and not ``Path.is_absolute``: the result of
+    ``Path.is_absolute`` depends on the system.  On Windows ``/opt/sdk/x.h``
+    is not absolute, and ``root / key`` put the drive of *root* in front
+    of it.  On Linux ``C:/ncs/x.h`` is not absolute.
     """
     if not path:
-        return ""  # Empty path — caller should guard before calling
-    p = Path(path)
-    if p.is_absolute():
-        return str(p)
-    return str(root / p)
+        return ""
+    if is_absolute_key(path):
+        return Path(path).as_posix()
+    return (root / path).as_posix()
 
 
 def cc_output_path(project_root: Path, cfg: BuildConfig) -> Path:
