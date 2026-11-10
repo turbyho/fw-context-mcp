@@ -12,6 +12,7 @@ and holding Enter therefore walks every section without modifying anything.
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 _BUILD_SYSTEM_CHOICES: list[tuple[str, str]] = [
@@ -964,6 +965,27 @@ def resolve_build_params(
                     print(f"  [ok] Target: {val}")
 
 
+def _mbed_cli_problem(python: str) -> str | None:
+    """Return why *python* cannot run the Mbed OS build, or None when it can.
+
+    The build runs mbed-cli in this Python (data/mbed/compile_db.py
+    imports ``mbed.mbed``).  init checks the path that the user typed now,
+    thus a typing error shows here and not at the first index run.
+    """
+    if not Path(python).is_file():
+        return "the file does not exist"
+    try:
+        result = subprocess.run(
+            [python, "-c", "import mbed.mbed"],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False,
+        )
+    except OSError as exc:
+        return f"it does not start ({exc})"
+    if result.returncode != 0:
+        return "it cannot import mbed-cli (mbed.mbed)"
+    return None
+
+
 def resolve_build_env(
     project_root: Path,
     cfg,
@@ -1004,7 +1026,10 @@ def resolve_build_env(
             return
         if b.activate:
             print(f"  Build activate: {b.activate} (already configured)")
-        return
+        if system != "mbed-os" or b.python:
+            return
+        # Mbed OS with activate or idf_path but without python: the build
+        # stops without python, thus the search and the question below run.
 
     if not system:
         return
@@ -1095,11 +1120,14 @@ def resolve_build_env(
             "Path to the Python that has mbed-cli (or Enter to skip)",
             non_interactive=non_interactive,
         )
-        if val:
+        problem = _mbed_cli_problem(val) if val else None
+        if val and problem is None:
             if not dry_run:
                 _write_build_key(project_root, "python", val)
             print(f"  [ok] Build python: {val}")
         else:
+            if problem:
+                print(f"  [warn] {val}: {problem}. Nothing was written.")
             print("  [warn] The Mbed OS build needs [build] python in .fw-context/local.toml.")
             for line in builder_cls.environment_help().splitlines():
                 print(f"    {line}")

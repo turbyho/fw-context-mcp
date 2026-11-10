@@ -53,21 +53,42 @@ sys.path.insert(0, ROOT)
 import site_marker  # a module of the PYTHONPATH entry that mbed-cli gives
 if not getattr(sys.flags, "safe_path", False):
     import tools_helper  # a module beside make.py, as "python make.py" finds it
+from tools.build_api import build_project
 from tools.toolchains import mbedToolchain
 
-toolchain = mbedToolchain()
-given = [
-    toolchain.compile_command("./src/a.c", "BUILD/src/a.o", ["inc"]),
-    toolchain.compile_command(source="./src/b.cpp", object="BUILD/src/b.o", includes=["inc"]),
-    toolchain.compile_command("./src/start.S", "BUILD/src/start.o", []),
-    toolchain.compile_command("./src/old.c", "BUILD/src/old.o", []),
-    toolchain.compile_command("./src/api.h", "BUILD/src/api.o", []),
-]
+
+def compile_all():
+    toolchain = mbedToolchain()
+    if "--no-sources" in sys.argv:
+        return []
+    given = [
+        toolchain.compile_command("./src/a.c", "BUILD/src/a.o", ["inc"]),
+        toolchain.compile_command(source="./src/b.cpp", object="BUILD/src/b.o", includes=["inc"]),
+        toolchain.compile_command("./src/start.S", "BUILD/src/start.o", []),
+        toolchain.compile_command("./src/old.c", "BUILD/src/old.o", []),
+        toolchain.compile_command("./src/api.h", "BUILD/src/api.o", []),
+    ]
+    if "--interrupt" in sys.argv:
+        raise KeyboardInterrupt
+    return given
+
+
+# As make.py of mbed-os: an interrupt ends the build with status 0.
+try:
+    given = build_project(compile_all)
+except KeyboardInterrupt:
+    print("[CTRL+c] exit")
+    given = None
 # What the build itself got: the hook must not change it.
 with open(os.environ["FAKE_MAKE_GIVEN"], "w") as stream:
     json.dump(given, stream)
 if "--fail" in sys.argv:
     sys.exit(3)
+"""
+
+_FAKE_BUILD_API = """
+def build_project(compile_all):
+    return compile_all()
 """
 
 # The toolchain as mbed-os has it: need_update() decides, None for an
@@ -114,6 +135,7 @@ def project(request: pytest.FixtureRequest, tmp_path: Path) -> Path:
     else:
         (tools / "toolchains" / "__init__.py").write_text(_FAKE_TOOLCHAIN, encoding="utf-8")
     (tools / "make.py").write_text(_FAKE_MAKE, encoding="utf-8")
+    (tools / "build_api.py").write_text(_FAKE_BUILD_API, encoding="utf-8")
     (tools / "tools_helper.py").write_text("", encoding="utf-8")
     return root
 
@@ -186,6 +208,28 @@ def test_a_failed_build_writes_no_database(project: Path, tmp_path: Path):
     result = _run(project, out, "compile", "-t", "GCC_ARM", "-m", "BOARD", "--fail")
 
     assert result.returncode == 3
+    assert not out.exists()
+
+
+def test_an_interrupted_build_writes_no_database(project: Path, tmp_path: Path):
+    """make.py ends an interrupted build with status 0: the script must not take that as a build."""
+    out = tmp_path / "cc.json"
+
+    result = _run(project, out, "compile", "-t", "GCC_ARM", "-m", "BOARD", "--interrupt")
+
+    assert result.returncode == 1
+    assert "0 of 1 builds ran to their end" in result.stderr
+    assert not out.exists()
+
+
+def test_a_build_without_a_command_writes_no_database(project: Path, tmp_path: Path):
+    """No command means a toolchain that does not use compile_command of mbedToolchain."""
+    out = tmp_path / "cc.json"
+
+    result = _run(project, out, "compile", "-t", "GCC_ARM", "-m", "BOARD", "--no-sources")
+
+    assert result.returncode == 1
+    assert "gave no compile command" in result.stderr
     assert not out.exists()
 
 

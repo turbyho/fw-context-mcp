@@ -35,7 +35,8 @@ The script has two modes:
     ``compile_command`` gives, and for an object file that is current the
     command that it would give.  Thus a build without ``--clean`` also
     gives a full database.  OUT gets its content only when make.py ends
-    without an error.
+    without an error, each of its builds runs to its end, and the build
+    gives at least one command.
 """
 
 from __future__ import annotations
@@ -168,6 +169,24 @@ def _hook(out: str, make: str, make_args: list[str]) -> int:
         return commands
 
     toolchain_class.compile_command = compile_command
+
+    # make.py catches KeyboardInterrupt in its wrapper of build_project,
+    # prints "[CTRL+c] exit" and ends with status 0.  Its status thus does
+    # not tell if the build ran to its end, and a database of a part of the
+    # sources is not the database of the build.  make.py imports
+    # build_project by name when it runs, thus it gets this wrapper.
+    build_api: Any = importlib.import_module("tools.build_api")
+    original_build = build_api.build_project
+    builds = {"started": 0, "finished": 0}
+
+    def build_project(*args: Any, **kwargs: Any) -> Any:
+        """Count each build of make.py that starts and each that returns."""
+        builds["started"] += 1
+        result = original_build(*args, **kwargs)
+        builds["finished"] += 1
+        return result
+
+    build_api.build_project = build_project
     try:
         runpy.run_path(make, run_name="__main__")
         status = 0
@@ -175,6 +194,20 @@ def _hook(out: str, make: str, make_args: list[str]) -> int:
         status = _exit_code(stop)
     if status != 0:
         return status
+    if builds["started"] == 0 or builds["finished"] != builds["started"]:
+        print(
+            f"compile_db.py: make.py ended with status 0, but {builds['finished']} of "
+            f"{builds['started']} builds ran to their end (an interrupt stops a build of make.py "
+            "with status 0)",
+            file=sys.stderr,
+        )
+        return 1
+    if not records:
+        # Each build of an application compiles sources.  No record means
+        # that the build did not call the compile_command of mbedToolchain:
+        # this mbed-os has a toolchain that replaces it.
+        print("compile_db.py: the build gave no compile command: this mbed-os is not supported", file=sys.stderr)
+        return 1
     with open(out, "w", encoding="utf-8") as stream:
         json.dump(records, stream, indent=1)
     return 0
