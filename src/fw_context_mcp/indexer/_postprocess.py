@@ -646,9 +646,14 @@ def _step_expand_macros(conn: sqlite3.Connection, ctx: dict) -> None:
     # TUs that include project config headers.
     for unit in ctx["units"]:
         try:
+            # The directory of the compilation (the "directory" of its entry
+            # in compile_commands.json): a relative path in the flags is
+            # relative to it, as for the compiler, and as the preprocessor of
+            # the assembly units runs it.  The project root is the directory
+            # only when the build ran there.
             resolve_and_update(
                 conn, ctx["config_hash"], unit.clang_args,
-                unit.file.resolve(), cwd=ctx.get("project_root"),
+                unit.file.resolve(), cwd=unit.directory or ctx.get("project_root"),
             )
         except SAFE_EXCEPT as e:
             if is_fatal(e):
