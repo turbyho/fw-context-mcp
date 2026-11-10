@@ -1085,3 +1085,21 @@ def resolve_build_env(
             if not dry_run:
                 _write_build_key(project_root, "activate", val)
             print(f"  [ok] Build activate: {val}")
+
+    if system == "mbed-os" and not detected.get("python") and builder_cls:
+        # The Mbed OS build stops without [build] python (the `mbed` command
+        # on PATH does not tell which Python has mbed-cli).  Thus init asks
+        # now, and not the first build.
+        print("  No Python with mbed-cli found.")
+        val = prompt_text(
+            "Path to the Python that has mbed-cli (or Enter to skip)",
+            non_interactive=non_interactive,
+        )
+        if val:
+            if not dry_run:
+                _write_build_key(project_root, "python", val)
+            print(f"  [ok] Build python: {val}")
+        else:
+            print("  [warn] The Mbed OS build needs [build] python in .fw-context/local.toml.")
+            for line in builder_cls.environment_help().splitlines():
+                print(f"    {line}")

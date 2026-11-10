@@ -246,7 +246,7 @@ every variant. Use `--variant`, `--variants`, `--image`, or
 |-------------|---------|
 | **Zephyr** | `west build -b <board> -- -DCMAKE_EXPORT_COMPILE_COMMANDS=ON` |
 | **PlatformIO** | `pio run --target compiledb` |
-| **Mbed OS** | `bear -- mbed compile --profile release` |
+| **Mbed OS** | `fw-context index --build` (the Mbed OS backend records the commands of `mbed compile`) |
 | **CMake** | `bear -- cmake --build build` or `cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON` |
 | **Make** | `bear -- make` |
 | **Custom** | `bear -- <your-build-command>` |

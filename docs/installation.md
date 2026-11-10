@@ -8,13 +8,13 @@ This is the complete installation guide. This guide covers prerequisites, setup,
 
 ```bash
 # Ubuntu / Debian
-sudo apt install python3 bear
+sudo apt install python3
 
 # Arch / Manjaro
-sudo pacman -S python bear
+sudo pacman -S python
 
 # Fedora / RHEL
-sudo dnf install python3 bear
+sudo dnf install python3
 
 # uv (all distros)
 curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -24,7 +24,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 ```bash
 # Homebrew (install from https://brew.sh if not present)
-brew install python@3.12 uv bear llvm
+brew install python@3.12 uv llvm
 
 # Add Homebrew Python to PATH
 echo 'export PATH="/opt/homebrew/opt/python@3.12/libexec/bin:$PATH"' >> ~/.zshrc
@@ -59,14 +59,13 @@ ANSI code page of the system (measured with GCC 12.2: "ě" became "e", and GCC d
 file). GCC 13 and later declare the code page UTF-8 in their manifest
 ([GCC PR108865](https://gcc.gnu.org/bugzilla/show_bug.cgi?id=108865); measured with 14.2). Use
 GCC 13 or later, or keep such a project in a path without these characters.
-`bear` is not available on Windows.
 
 | What | Why |
 |------|-----|
 | Python 3.11+ | Runtime |
 | [`uv`](https://docs.astral.sh/uv/) *(optional)* | Fast package installer. Without a working `uv`, `make install` uses `python -m venv` and `pip`. |
 | Compiler toolchain (for example ARM GCC or the Zephyr SDK) | libclang needs system headers to parse cross-compiled code |
-| [`bear`](https://github.com/rizsotto/Bear) | Intercepts build commands → `compile_commands.json` |
+| [`bear`](https://github.com/rizsotto/Bear) *(optional)* | Records the compiler calls of a `[build] command` that you write. No builder of fw-context needs it. |
 | [Ollama](https://ollama.com) *(optional)* | Computes the vector embeddings (`semantic_search`, `smart_search` re-rank) and the symbol analysis (`explain_symbol`). The core index does not need it. See [Ollama (optional)](#ollama-optional). |
 
 ## Install
@@ -240,17 +239,17 @@ xcode-select --install   # ships clang as part of Command Line Tools
 
 | Tool | Why | Install |
 |------|-----|---------|
-| **bear** | Intercepts build → compile_commands.json | `sudo pacman -S bear` / `sudo apt install bear` / `sudo dnf install bear` / `brew install bear` |
-| **mbed** CLI | `mbed compile` | `pip install mbed-cli` (requires Python 3.11 or older — use pyenv or venv) |
+| **mbed** CLI | `mbed compile` | `pip install mbed-cli` into a Python 3.7 to 3.11 (use pyenv or venv), and set it in `[build] python` |
 | ARM GCC | Cross-compiler toolchain | [ARM GNU Toolchain](https://developer.arm.com/downloads/-/arm-gnu-toolchain-downloads) |
 
-`fw-context` runs `bear --output compile_commands.json -- mbed compile -t GCC_ARM -m <target>`.
+`fw-context` runs `mbed compile -t GCC_ARM -m <target>` in the Python of `[build] python`, and records the command of
+each source (`data/mbed/compile_db.py`). It does not need `bear`, on Linux, macOS and Windows.
 
 > **`fw-context init`** detects the Python interpreter for `mbed-cli` automatically,
-> from pyenv versions (`~/.pyenv/versions/*/bin/mbed`), common venv paths
-> (`~/mbed_venv`), and `~/.local/bin/mbed`. When `fw-context init` detects the
-> interpreter, it writes the path to `.fw-context/local.toml`. For details, see
-> **[Build Configuration →](build.md#12-build-environment--custom-python-for-mbed-cli)**.
+> from pyenv versions (`~/.pyenv/versions/*/bin/mbed`) and common venv paths
+> (`~/mbed_venv`). When `fw-context init` detects the interpreter, it writes the
+> path to `.fw-context/local.toml`. Without it, the build stops with an error. For
+> details, see **[Build Configuration →](build.md#12-build-environment--the-python-of-mbed-cli)**.
 
 ### Arduino CLI
 

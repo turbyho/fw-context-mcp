@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -23,6 +22,13 @@ _MBED_MARKERS = [".mbed", "mbed-os", "mbed_app.json"]
 # The preprocessed linker script that mbed-tools writes into its build
 # directory (see MbedOSBuildSystem.get_linker_scripts).
 _MBED_LINK_SCRIPT = ".link_script.ld"
+
+# The script that runs `mbed compile` and records the command of each
+# source (see its docstring).  The Python of the project runs it as a file,
+# thus it must be a real file on disk: fw-context is not installed in that
+# Python.  parents[2] is the package directory (builders -> indexer ->
+# fw_context_mcp).
+_COMPILE_DB_SCRIPT = Path(__file__).resolve().parents[2] / "data" / "mbed" / "compile_db.py"
 
 
 def _parse_mbed_dotfile(project_root: Path) -> dict[str, str]:
@@ -74,12 +80,14 @@ def _resolve_mbed_extra_profiles(project_root: Path, extra: list[str]) -> list[s
 
 
 class MbedOSBuildSystem:
-    """Mbed OS 5/6 build system (``mbed compile`` via ``bear``).
+    """Mbed OS 5/6 build system (``mbed compile`` of Mbed CLI 1).
 
-    WHY bear: Mbed OS uses its own build tool (``mbed compile``) which
-    internally calls the ARM GCC toolchain but does not produce
-    compile_commands.json.  ``bear`` intercepts the compiler invocations
-    via LD_PRELOAD and captures them into compile_commands.json.
+    WHY the script ``data/mbed/compile_db.py``: ``mbed compile`` writes no
+    compile_commands.json.  The script runs mbed-cli in the Python of the
+    project and records the command of each source where the tools of
+    mbed-os make it.  bear did this through LD_PRELOAD on Linux only: on
+    macOS and Windows bear has only wrappers, and these do not see the
+    compiler that mbed calls by its absolute path.
 
     WHY target resolution from multiple sources: the target board can be
     specified in .mbed (mbed config), custom_targets.json, or
@@ -102,11 +110,17 @@ class MbedOSBuildSystem:
     # ── Build ──
 
     def build(self, project_root: Path, cfg: BuildConfig) -> Path:
-        """Generate compile_commands.json via ``bear -- mbed compile --clean``."""
-        if not shutil.which("bear"):
+        """Run ``mbed compile`` through ``compile_db.py`` and return the database.
+
+        The Python of ``[build] python`` runs the script, thus mbed-cli runs
+        in that Python as ``python -m mbed`` does.  Without the setting the
+        build stops: the script must run in the Python that has mbed-cli,
+        and the ``mbed`` command on PATH does not tell which one that is.
+        """
+        if not cfg.python:
             raise RuntimeError(
-                "bear is required to generate compile_commands.json. "
-                "Install it:  sudo pacman -S bear   (or your distro's equivalent)"
+                "The Mbed OS build needs the Python that has mbed-cli in "
+                "[build] python of .fw-context/local.toml.\n" + self.environment_help()
             )
 
         dot = _parse_mbed_dotfile(project_root)
@@ -119,19 +133,14 @@ class MbedOSBuildSystem:
                 'in custom_targets.json, or in .fw-context/config.toml [build] target = "..."'
             )
 
-        if cfg.python:
-            mbed_prefix = [cfg.python, "-m", "mbed"]
-        else:
-            mbed_prefix = ["mbed"]
-
         cc_path = cc_output_path(project_root, cfg)
 
         cmd: list[str] = [
-            "bear",
-            "--output",
+            cfg.python,
+            str(_COMPILE_DB_SCRIPT),
+            "record",
             str(cc_path),
             "--",
-        ] + mbed_prefix + [
             "compile",
             "-t",
             toolchain,
@@ -159,10 +168,8 @@ class MbedOSBuildSystem:
 
         log.info("mbed-os build: %s", " ".join(cmd))
         run_build_command(cmd, cwd=project_root, description="mbed compile", build_cfg=cfg)
-
-        if not cc_path.exists():
-            raise RuntimeError("compile_commands.json was not generated — bear may have failed silently")
-
+        # generate_compile_commands() checks that the file exists, as for
+        # each backend.
         return cc_path
 
     def background_build_safe(self, cfg: BuildConfig) -> bool:
@@ -190,9 +197,9 @@ class MbedOSBuildSystem:
         Mbed project: `.link_script.ld` in the directory of `--build`, which
         holds the four regions of that target and `__StackTop`.
 
-        `build()` gives `--build` and bear the same directory, the output
-        directory of the variant, thus the directory of *compile_commands*
-        is the directory of the script.
+        `build()` gives `--build` and the database the same directory, the
+        output directory of the variant, thus the directory of
+        *compile_commands* is the directory of the script.
 
         Only that name counts.  A database that the user gives can sit in
         the project root, and the only `.ld` file there is not the script of
@@ -227,10 +234,12 @@ class MbedOSBuildSystem:
     # ── Validation ──
 
     def validate_artifacts(self, compile_commands: Path, project_root: Path) -> list[BuildIssue]:
+        """Return no issue: the generic checks of validate_and_fix() apply.
+
+        The database comes from the commands of the build itself, thus no
+        check of this builder can find more than those checks.
+        """
         issues: list[BuildIssue] = []
-        # Mbed OS via bear: .d files are generated alongside .o files in the
-        # build directory.  If bear ran successfully, .d files should exist.
-        # No extra validation beyond the generic checks in validate_and_fix().
         return issues
 
     # ── Auto-fix ──
@@ -241,7 +250,13 @@ class MbedOSBuildSystem:
     # ── Tools ──
 
     def required_tools(self) -> list[str]:
-        return ["bear", "mbed"]
+        """Return no tool on PATH.
+
+        The build runs the Python of ``[build] python`` (mbed-cli is a
+        package of it), and mbed finds the compiler through ``GCC_ARM_PATH``
+        of ``.mbed`` or ``mbed_settings.py``.
+        """
+        return []
 
     # ── Environment auto-detection ──
 
@@ -261,12 +276,8 @@ class MbedOSBuildSystem:
             if python_bin.exists():
                 return {"python": str(python_bin), "activate": None}
 
-        if (Path.home() / ".local" / "bin" / "mbed").exists():
-            return {"python": None, "activate": None}
-
-        if shutil.which("mbed"):
-            return {"python": None, "activate": None}
-
+        # An `mbed` command on PATH (or in ~/.local/bin) does not tell
+        # which Python has mbed-cli, and the build needs that Python.
         return {"python": None, "activate": None}
 
     @classmethod

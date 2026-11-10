@@ -69,13 +69,14 @@ variant and stays, also when its name is `deps`. The first index run
 gives the files of the index their new paths, thus it indexes the
 project again.
 
-A tool that fw-context gives the output path to (bear, compiledb,
-keil2clangd, the manual backend) does not write the file directly. It writes
-a staging file in the directory of the variant,
+A tool that fw-context gives the output path to (the Mbed OS backend,
+compiledb, keil2clangd, the manual backend) does not write the file
+directly. It writes a staging file in the directory of the variant,
 `<variant>/.compile_commands.<pid>@<tag>.json`, and one rename then gives
 `out/compile_commands.json` the new content. Thus a reader never gets a
 database that a build still writes. The staging file is beside `out/` and
-not in it, because `mbed compile --clean` removes `out/` while bear writes.
+not in it, because `mbed compile --clean` removes `out/` while the build
+runs.
 
 Only a build that a signal stops leaves a staging file. The next build in
 that directory deletes it when its process no longer runs. The `<tag>` is
@@ -255,7 +256,7 @@ Exceptions:
 | `system` | `str` | (auto-detect) | all | Build system: `mbed-os`, `zephyr`, `platformio`, `esp-idf`, `arduino`, `cmake`, `keil-mdk`, `iar-ewarm`, `makefile`, `bare`, `stm32cubeide`, `ti-ccs` |
 | `clean` | `bool` | `true` | Mbed OS, PlatformIO, Zephyr, ESP-IDF, Arduino, CMake | Run a clean build before fw-context generates the file. **Recommended.** A clean build makes sure that `compile_commands.json` is complete. The other builders do not read this key. A Zephyr sysbuild variant does not read it either: it always builds with `--pristine=auto`. |
 | `command` | `str` | — | all | A command that replaces the build of the builder. Highest priority: fw-context ignores the settings of the builder. It runs `pre_build` first, and it applies `[build] env` to the command. The command must write `compile_commands.json` into the project root. `timeout` does not apply: the command has no time limit. The command runs without a shell, see [example 11](#11-shell-override--bear-wrapping-a-custom-build). |
-| `python` | `str` | (auto-detect) | all | The Python interpreter for pip-based CLI tools, such as `mbed-cli`, `platformio`, `keil2clangd`, or `compiledb`. `fw-context init` detects this automatically, from pyenv, venv, and common install paths. Set this parameter manually when automatic detection fails. |
+| `python` | `str` | (auto-detect) | all | The Python interpreter for pip-based CLI tools, such as `mbed-cli`, `platformio`, `keil2clangd`, or `compiledb`. `fw-context init` detects this automatically, from pyenv, venv, and common install paths. Set this parameter manually when automatic detection fails. Mbed OS requires it: without it, the build stops with an error. |
 | `activate` | `str` | (auto-detect) | all | A script that sets up the environment of the build, for example the toolchain environment of NCS, or `export.sh` for ESP-IDF. On Linux and macOS it is a shell script that fw-context sources before each build command. On Windows it is a `.bat`, `.cmd` or `.ps1` script (see [General](#general)). `fw-context init` detects this automatically. Set this parameter manually when automatic detection fails. |
 | `pre_build` | `str` | — | all | A command line that fw-context runs before the build, the convert step, or the generate step. It runs without a shell: fw-context splits it as the shell of the host does (POSIX shell words, or the rules of `CommandLineToArgvW` on Windows). For a shell, write `sh -c '…'` or `cmd /c …`. Put it in `config.toml` when the whole team uses it, or in `local.toml` when it is specific to your machine. |
 | `env` | `dict[str,str]` | `{}` | all | Environment variables for each command of the build: the builder commands, `pre_build` and `command`. |
@@ -804,9 +805,11 @@ builder, but it runs `pre_build` first and applies `[build] env`. This
 example requires `bear`, as a system package:
 `sudo pacman -S bear`.
 
-### 12. Build environment — custom Python for mbed-cli
+### 12. Build environment — the Python of mbed-cli
 
-Mbed OS CLI requires Python 3.11 or older. If your system Python is newer,
+The Mbed OS backend needs `[build] python`: the Python that has mbed-cli
+(Mbed CLI 1). Mbed CLI requires Python 3.11 or older, and the backend
+script requires Python 3.7 or later. If your system Python is newer,
 install mbed-cli into a pyenv or a venv. Then point fw-context at that
 Python interpreter.
 
@@ -816,14 +819,22 @@ Python interpreter.
 python = "/home/user/.pyenv/versions/3.11.8/bin/python"
 ```
 
-`fw-context init` detects this automatically, from pyenv, `~/mbed_venv`, and
-`~/.local/bin/mbed`. Set this parameter manually only when automatic
-detection fails.
+`fw-context init` finds this Python in pyenv and in `~/mbed_venv`. Set
+this parameter manually when `init` does not find it. Without it, the build
+stops with an error: the `mbed` command on `PATH` does not tell which
+Python has mbed-cli.
 
-When you set `python`, the builder runs:
+The builder runs:
 ```
-bear -- /path/to/python -m mbed compile -t GCC_ARM -m TARGET ...
+/path/to/python <fw-context>/data/mbed/compile_db.py record <database> -- compile -t GCC_ARM -m TARGET ...
 ```
+
+`compile_db.py` runs mbed-cli in that Python, as `python -m mbed` does.
+mbed-cli gives make.py its arguments and its environment, from `.mbed`,
+`mbed_settings.py` and the profiles. The script records the command of
+each source where the tools of mbed-os make it: the database holds the
+compiler calls of the build. The build does not need `bear`, thus it runs
+the same way on Linux, macOS and Windows.
 
 ### 13. Build environment — activation script for Zephyr/NCS
 
@@ -1019,7 +1030,8 @@ west init ~/zephyrproject
 
 ### `bear: command not found`
 
-`bear` is a system package, not a Python package:
+No builder of fw-context needs `bear`. Only a `[build] command` that you
+write can call it. `bear` is a system package, not a Python package:
 ```bash
 sudo pacman -S bear        # Arch / Manjaro
 sudo apt install bear      # Debian / Ubuntu
@@ -1059,11 +1071,12 @@ default. When a first build takes longer, set a larger value in
 pip install keil2clangd
 ```
 
-### `mbed: command not found` (Mbed OS)
+### The Mbed OS build needs `[build] python`
 
-Mbed CLI requires Python 3.11 or older. If you see this error:
+Mbed CLI requires Python 3.11 or older. If you see one of these errors:
 ```
-RuntimeError: bear is required ... (or: Build command failed: mbed compile)
+RuntimeError: The Mbed OS build needs the Python that has mbed-cli in [build] python ...
+Build command failed: mbed compile ... No module named 'mbed'
 ```
 
 **Automatic detection:** Run `fw-context init`. This command scans pyenv
