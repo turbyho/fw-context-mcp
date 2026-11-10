@@ -49,12 +49,13 @@ import re
 import shlex
 import subprocess
 import time
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import cache, lru_cache
 from pathlib import Path
 
 from ..utils import is_program, path_directories, program_file_names
+from ._program_encoding import EchoMissingError, echo_flags, gcc_decoder
 
 log = logging.getLogger(__name__)
 
@@ -404,15 +405,27 @@ def _run_query(compiler: Path, language: str, flags: tuple[str, ...], cwd: Path)
     lang = "c++" if language == "cpp" else "c"
     base = [str(compiler), *flags, "-x", lang]
     try:
-        verbose = _run_driver([*base, "-E", "-v", "-o", os.devnull, "-"], cwd)
-        defines = _run_driver([*base, "-dM", "-E", "-"], cwd)
+        raw_verbose = _run_driver([*base, "-E", "-v", *echo_flags(), "-o", os.devnull, "-"], cwd)
+        raw_defines = _run_driver([*base, "-dM", "-E", "-"], cwd)
     except (OSError, subprocess.TimeoutExpired) as error:
         log.warning("Cannot query the compiler %s for its system headers: %s", compiler, error)
         return None
-    if verbose.returncode != 0 or defines.returncode != 0:
+    if raw_verbose.returncode != 0 or raw_defines.returncode != 0:
+        # The message only: its encoding is not known before the echo.
+        message = (raw_verbose.stderr or raw_defines.stderr).decode("utf-8", "replace")
         log.warning(
             "The compiler %s did not answer the system-header query (exit %d/%d): %s",
-            compiler, verbose.returncode, defines.returncode, (verbose.stderr or defines.stderr)[-300:],
+            compiler, raw_verbose.returncode, raw_defines.returncode, message[-300:],
+        )
+        return None
+    try:
+        decode = gcc_decoder(raw_verbose.stderr)
+        verbose = _decoded(raw_verbose, decode)
+        defines = _decoded(raw_defines, decode)
+    except (EchoMissingError, UnicodeDecodeError) as error:
+        log.warning(
+            "The encoding of the text of the compiler %s is not known, thus its system headers are not "
+            "known: %s", compiler, error,
         )
         return None
     triple, dirs = parse_verbose_output(verbose.stderr, cwd)
@@ -427,17 +440,32 @@ def _run_query(compiler: Path, language: str, flags: tuple[str, ...], cwd: Path)
     return DriverInfo(triple=triple, include_dirs=tuple(dirs), macros=tuple(macros))
 
 
-def _run_driver(argv: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
-    """Run one driver query.
+def _run_driver(argv: list[str], cwd: Path) -> subprocess.CompletedProcess[bytes]:
+    """Run one driver query, and give its output as bytes.
 
     An argv list and no shell.  The input is an empty stdin (``-``), which
     works on every host — Windows has no /dev/null.  *cwd* is the directory
     of the entry, in which the build runs the same compiler.
+
+    WHY bytes: the output names directories, thus it is decoded in the
+    encoding of ``cc1`` (``_program_encoding.gcc_decoder``), not in the
+    locale.  On Windows the locale is the ANSI code page, and GCC 14 writes
+    UTF-8.
     """
     return subprocess.run(
-        argv, capture_output=True, text=True, timeout=_QUERY_TIMEOUT_S, check=False,
+        argv, capture_output=True, timeout=_QUERY_TIMEOUT_S, check=False,
         stdin=subprocess.DEVNULL, cwd=str(cwd),
     )
+
+
+def _decoded(
+    raw: subprocess.CompletedProcess[bytes], decode: Callable[[bytes], str],
+) -> subprocess.CompletedProcess[str]:
+    """Return *raw* with its stdout and stderr decoded by *decode*, with ``\\n`` for each line end."""
+    def text(data: bytes) -> str:
+        return decode(data).replace("\r\n", "\n")
+
+    return subprocess.CompletedProcess(raw.args, raw.returncode, text(raw.stdout), text(raw.stderr))
 
 
 @lru_cache(maxsize=64)

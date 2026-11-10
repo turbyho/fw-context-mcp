@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -78,13 +79,21 @@ def _clear_caches(monkeypatch):
 
 
 def _stub_driver(directory: Path, name: str, *, macros: str = XTENSA_MACROS,
-                 triple: str = "xtensa-esp32-elf", exit_code: int = 0) -> tuple[Path, list[Path]]:
+                 triple: str = "xtensa-esp32-elf", exit_code: int = 0,
+                 encoding: str | None = None) -> tuple[Path, list[Path]]:
     """Write an executable stub GCC driver and its system include directories.
 
     The stub also prints two macros of its own: ``__STUB_CWD__`` (its working
     directory) and ``__STUB_ARGS__`` (its arguments).  It is Python in the
     form of a program of the host (``tests/_stubs.py``): an ``.exe`` on
     Windows, as a real compiler there.
+
+    As GCC, ``-v`` lists each ``-I`` directory that exists before the
+    system directories, and writes ``ignoring nonexistent directory`` for
+    each other one (the echo that ``_program_encoding`` reads on Windows).
+    *encoding* is the code page of the stub for stdout and stderr (UTF-8
+    for GCC 14, the ANSI code page for GCC 12); None is the encoding of
+    each stream.
     """
     toolchain = directory / "toolchain"
     cxx = toolchain / triple / "include" / "c++" / "8.4.0"
@@ -95,26 +104,32 @@ def _stub_driver(directory: Path, name: str, *, macros: str = XTENSA_MACROS,
     (gcc_inc / "stdbool.h").write_text("#define bool _Bool\n")
     # The order is the order of GCC: libstdc++ first, the C library last.
     search = "".join(f" {p}\n" for p in (cxx, gcc_inc, libc))
-    verbose = (
-        f"Target: {triple}\n"
-        '#include "..." search starts here:\n'
-        "#include <...> search starts here:\n"
-        f"{search}"
-        "End of search list.\n"
-    )
     code = (
         "import os, sys\n"
         f"if {exit_code}:\n"
         f"    sys.exit({exit_code})\n"
-        "for argument in sys.argv[1:]:\n"
-        "    if argument == '-v':\n"
-        f"        sys.stderr.write({verbose!r})\n"
-        "        sys.exit(0)\n"
-        "    if argument == '-dM':\n"
-        f"        sys.stdout.write({macros!r})\n"
-        "        print('#define __STUB_CWD__ ' + os.getcwd())\n"
-        "        print('#define __STUB_ARGS__ ' + ' '.join(sys.argv[1:]))\n"
-        "        sys.exit(0)\n"
+        "args = sys.argv[1:]\n"
+        "given = [args[i + 1] for i, a in enumerate(args[:-1]) if a == '-I']\n"
+        "given += [a[2:] for a in args if a.startswith('-I') and len(a) > 2]\n"
+        "def write(stream, text):\n"
+        f"    if {encoding!r} is None:\n"
+        "        stream.write(text)\n"
+        "    else:\n"
+        "        stream.flush()\n"
+        f"        stream.buffer.write(text.encode({encoding!r}))\n"
+        "def err(text):\n"
+        "    write(sys.stderr, text)\n"
+        "if '-v' in args:\n"
+        "    err(''.join('ignoring nonexistent directory \"' + d + '\"\\n' for d in given if not os.path.isdir(d)))\n"
+        f"    err('Target: {triple}\\n#include \"...\" search starts here:\\n#include <...> search starts here:\\n')\n"
+        "    err(''.join(' ' + d + '\\n' for d in given if os.path.isdir(d)))\n"
+        f"    err({search!r} + 'End of search list.\\n')\n"
+        "    sys.exit(0)\n"
+        "if '-dM' in args:\n"
+        f"    write(sys.stdout, {macros!r})\n"
+        "    write(sys.stdout, '#define __STUB_CWD__ ' + os.getcwd() + '\\n')\n"
+        "    write(sys.stdout, '#define __STUB_ARGS__ ' + ' '.join(sys.argv[1:]) + '\\n')\n"
+        "    sys.exit(0)\n"
         "sys.exit(1)\n"
     )
     driver = write_python_tool(toolchain / "bin", name, code)
@@ -432,6 +447,54 @@ class TestClangResourceDir:
         args = libclang_args(self._arm(), [])
         assert "/tc/lib/gcc/arm-none-eabi/12.3.1/include" in args
         assert "-D__ARM_ACLE=200" not in args, "GCC's own arm_acle.h does not need it"
+
+
+class TestTheEncodingOfTheQuery:
+    """The names of the query come back as the files are named, in the encoding of the driver.
+
+    ``text=True`` decoded the ANSI code page of Windows, thus the UTF-8 of
+    GCC 14 gave other characters, or stopped with UnicodeDecodeError.  The
+    Windows branch runs on each system here, with cp1252 as its ANSI code
+    page.
+    """
+
+    @pytest.mark.parametrize("encoding", ["utf-8", "cp1252"], ids=["GCC 14", "GCC 12"])
+    def test_a_directory_with_a_non_ascii_name_on_windows(self, tmp_path: Path, monkeypatch, encoding: str) -> None:
+        import locale
+
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(locale, "getencoding", lambda: "cp1252")
+        own = tmp_path / "míš" / "inc"
+        own.mkdir(parents=True)
+        driver, _ = _stub_driver(tmp_path, "arm-none-eabi-gcc", triple="arm-none-eabi", encoding=encoding)
+
+        info = query_gcc_driver(driver, "c", (f"-I{own}",), tmp_path)
+
+        assert info is not None
+        assert info.include_dirs[0] == str(own.resolve())
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="the file names of POSIX")
+    def test_a_directory_with_a_non_ascii_name_on_posix(self, tmp_path: Path) -> None:
+        own = tmp_path / "měření ť" / "inc"
+        own.mkdir(parents=True)
+        driver, _ = _stub_driver(tmp_path, "arm-none-eabi-gcc", triple="arm-none-eabi", encoding="utf-8")
+
+        info = query_gcc_driver(driver, "c", (f"-I{own}",), tmp_path)
+
+        assert info is not None
+        assert info.include_dirs[0] == str(own.resolve())
+
+    def test_a_driver_without_the_echo_gives_no_answer_on_windows(
+        self, tmp_path: Path, monkeypatch, caplog,
+    ) -> None:
+        """A driver that writes no echo: its encoding is not known, and the log says so."""
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(_driver_query, "echo_flags", lambda: [])
+        driver, _ = _stub_driver(tmp_path, "arm-none-eabi-gcc", triple="arm-none-eabi")
+
+        with caplog.at_level("WARNING"):
+            assert query_gcc_driver(driver, "c", (), tmp_path) is None
+        assert "encoding of the text" in caplog.text
 
 
 class TestQueryTheDriver:
