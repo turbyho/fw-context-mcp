@@ -18,6 +18,7 @@ from fw_context_mcp.utils import (
     missing_tool_message,
     path_directories,
     program_file_names,
+    replace_file,
     run_build_command,
     run_in_process_group,
 )
@@ -997,7 +998,7 @@ class ZephyrBuildSystem:
             tmp.chmod(0o755)
             # os.replace and not Path.rename: on Windows rename refuses a
             # target that exists, thus a new version of the script failed.
-            os.replace(tmp, target)
+            replace_file(tmp, target)
         return str(target)
 
     @classmethod

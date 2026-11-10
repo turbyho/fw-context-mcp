@@ -15,7 +15,6 @@ bare Makefile (via compiledb), and bare/manual mode.
 from __future__ import annotations
 
 import logging
-import os
 import shutil
 import subprocess
 from dataclasses import dataclass, field, fields, replace
@@ -28,6 +27,7 @@ from fw_context_mcp.utils import (
     cc_staging_path,
     command_words,
     owner_is_dead,
+    replace_file,
     run_in_process_group,
     staging_owner,
 )
@@ -597,7 +597,7 @@ def generate_compile_commands(project_root: Path, cfg: BuildConfig) -> Path:
                 f"The build reported success and wrote no compilation database to {staging}"
             )
         final.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(staging, final)
+        replace_file(staging, final)
         return final
     finally:
         # A failed build leaves a partial staging file.  It must not stay —

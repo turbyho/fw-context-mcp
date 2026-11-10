@@ -38,7 +38,7 @@ import threading
 import time
 import urllib.parse
 from collections import OrderedDict
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import UTC, datetime
@@ -96,6 +96,8 @@ __all__ = [
     "program_file_names",
     "read_file_lines",
     "record_build_groups",
+    "remove_file",
+    "replace_file",
     "resolve_project_root",
     "run_in_process_group",
     "sqlite_file_uri",
@@ -497,7 +499,7 @@ def _write_group_record(record: Path, pgid: int, program: str) -> None:
     }
     try:
         temporary.write_text(json.dumps(payload), encoding="utf-8")
-        os.replace(temporary, record)
+        replace_file(temporary, record)
     except OSError as exc:
         # The record helps only after a SIGKILL.  A build must not fail for it.
         log.warning("Cannot record the build process group in %s: %s", record, exc)
@@ -1645,6 +1647,50 @@ def owner_is_dead(token: str) -> bool:
 _TMP_OWNER = re.compile(r"\.(\d+@[A-Za-z0-9._-]+)\.tmp$")
 
 
+#: The longest time that :func:`replace_file` and :func:`remove_file` try
+#: again on Windows.  Measured on Windows 11: with three processes that read
+#: the target in a loop, the longest wait was 0.11 s.
+_SHARED_FILE_RETRY_S = 2.0
+#: The pause between two tries.
+_SHARED_FILE_STEP_S = 0.005
+
+
+def replace_file(source: str | os.PathLike[str], target: str | os.PathLike[str]) -> None:
+    """``os.replace(source, target)``, which on Windows waits for a short read of *target* by another process.
+
+    WHY: Windows does not replace or remove a file that a process holds
+    open, also when that process opened it with ``FILE_SHARE_DELETE``
+    (measured on Windows 11: 1779 of 2000 replaces failed while three
+    processes read the file in a loop).  The readers of fw-context hold a
+    file open for a short read only: an MCP server reads ``daemon.port``,
+    the manifest or a config.  The function tries again for at most
+    ``_SHARED_FILE_RETRY_S``, then the ``PermissionError`` goes to the
+    caller: a file that stays open, or a real lack of permission.  POSIX
+    replaces an open file, thus there it is ``os.replace``.
+    """
+    _retry_while_shared(lambda: os.replace(source, target))
+
+
+def remove_file(path: Path) -> None:
+    """``path.unlink(missing_ok=True)``, which on Windows waits for a short read of *path* (see :func:`replace_file`)."""
+    _retry_while_shared(lambda: path.unlink(missing_ok=True))
+
+
+def _retry_while_shared(action: Callable[[], None]) -> None:
+    if sys.platform != "win32":
+        action()
+        return
+    deadline = time.monotonic() + _SHARED_FILE_RETRY_S
+    while True:
+        try:
+            action()
+            return
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(_SHARED_FILE_STEP_S)
+
+
 def write_text_atomic(path: Path, text: str, *, mode: int | None = None) -> None:
     """Write *text* to *path* through a file in the same directory and a rename.
 
@@ -1653,8 +1699,8 @@ def write_text_atomic(path: Path, text: str, *, mode: int | None = None) -> None
     its run marker while it runs, and a run can stop at any moment.
     ``os.replace`` is atomic on POSIX and on Windows when the two names are
     in one directory, and it replaces an existing file on both.  On Windows
-    it fails while another process holds the target open (the MCP server
-    reading the manifest); the error goes to the caller.
+    it waits for a short read of the target by another process (the MCP
+    server reading the manifest, see :func:`replace_file`).
 
     The temporary name holds :func:`owner_token`, thus two writers never
     share one, and :func:`remove_stale_tmp` removes the file of a writer
@@ -1685,7 +1731,7 @@ def write_text_atomic(path: Path, text: str, *, mode: int | None = None) -> None
             with os.fdopen(os.open(tmp, flags, 0o600), "w", encoding="utf-8", newline="") as handle:
                 handle.write(text)
             os.chmod(tmp, mode)
-        os.replace(tmp, path)
+        replace_file(tmp, path)
     finally:
         tmp.unlink(missing_ok=True)
 

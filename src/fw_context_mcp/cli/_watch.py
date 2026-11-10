@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import argparse
 import sqlite3
+import sys
+from pathlib import Path
 
 
 def cmd_watch(args: argparse.Namespace) -> int:
@@ -111,10 +113,11 @@ def cmd_watch_restart(args: argparse.Namespace) -> int:
 
     from ..config import derive_project_id
     from ..config import load as load_config
+    from ..file_lock import held_by_another
     from ..mcp.background import _ensure_daemon_running
     from ..mcp.daemon import DAEMON_PORT_NAME, ping_daemon
-    from ..processes import kill_hard, pid_exists, request_stop
-    from ..utils import resolve_project_root
+    from ..processes import kill_hard, request_stop
+    from ..utils import remove_file, resolve_project_root
 
     root = resolve_project_root(args.project)
     cfg = load_config(project_root=root)
@@ -123,35 +126,48 @@ def cmd_watch_restart(args: argparse.Namespace) -> int:
 
     pid_file = db_dir / "watcher.pid"
     port_file = db_dir / DAEMON_PORT_NAME
+    lock_file = db_dir / "watcher.lock"
 
-    # Kill existing daemon
-    if pid_file.exists():
+    # The daemon holds watcher.lock for its whole life, thus the lock and
+    # not the PID file tells if a daemon runs.  WHY: a PID file of a daemon
+    # that a SIGKILL or a reboot ended can name a different process now
+    # (Windows uses PIDs again soon), and that process must not get a stop
+    # or a kill.  The lock is free when the process ended: also a daemon
+    # that its MCP server did not reap yet (a zombie, whose PID still
+    # exists) has no lock, and on Windows the lock was free at once after
+    # the end (measured, 20 of 20 times).
+    if held_by_another(lock_file):
         try:
             pid = int(pid_file.read_text(encoding="utf-8").strip())
-            print(f"Stopping daemon (pid {pid})...")
-            # The request runs the SIGTERM handler of the daemon, also on
-            # Windows (processes.request_stop), where os.kill(pid, SIGTERM)
-            # is TerminateProcess and os.kill(pid, 0) sends Ctrl+C.
-            request_stop(pid)
-            # Wait for shutdown
-            for _ in range(30):  # 3 seconds max
-                if not pid_exists(pid):
-                    break
-                _time.sleep(0.1)
-            else:
-                print("Daemon did not stop, ending it...")
+        except (OSError, ValueError) as exc:
+            print(f"error: a daemon holds {lock_file}, and its PID file cannot be read: {exc}", file=sys.stderr)
+            return 1
+        print(f"Stopping daemon (pid {pid})...")
+        # The request runs the SIGTERM handler of the daemon, also on
+        # Windows (processes.request_stop).
+        request_stop(pid)
+        if not _wait_for_free_lock(lock_file, _STOP_WAIT_S):
+            print("Daemon did not stop, ending it...")
+            try:
                 kill_hard(pid)
-                _time.sleep(0.5)
-            print("Old daemon stopped.")
-        except (ValueError, OSError) as e:
-            print(f"Could not read/stop old daemon: {e}")
+            except OSError as exc:
+                print(f"error: cannot end the daemon (pid {pid}): {exc}", file=sys.stderr)
+                return 1
+            # SIGKILL and TerminateProcess end the process after they
+            # return: a new daemon that came before the end found the lock
+            # held and did not start.
+            if not _wait_for_free_lock(lock_file, _KILL_WAIT_S):
+                print(f"error: the daemon (pid {pid}) did not end", file=sys.stderr)
+                return 1
+        print("Old daemon stopped.")
 
     # Clean up leftover files.  Not watcher.lock: the daemons exclude each
     # other with a flock on that file, and a removed file gives the new
     # daemon a new inode, thus a lock of its own beside an old daemon that
     # survived its SIGKILL: two daemons.  A lock of a dead process is free.
-    pid_file.unlink(missing_ok=True)
-    port_file.unlink(missing_ok=True)
+    # remove_file: on Windows an MCP server can read daemon.port just now.
+    remove_file(pid_file)
+    remove_file(port_file)
 
     # Spawn new daemon
     print("Starting new daemon...")
@@ -165,6 +181,26 @@ def cmd_watch_restart(args: argparse.Namespace) -> int:
         print("Daemon may still be starting — check 'fw-context watch status' in a moment.")
 
     return 0
+
+
+#: How long a daemon gets to release its lock after the stop request, and
+#: how long the system gets to end it after ``kill_hard``.
+_STOP_WAIT_S = 3.0
+_KILL_WAIT_S = 5.0
+
+
+def _wait_for_free_lock(lock_file: Path, timeout: float) -> bool:
+    """Return True when no process holds *lock_file* within *timeout* seconds."""
+    import time
+
+    from ..file_lock import held_by_another
+
+    deadline = time.monotonic() + timeout
+    while held_by_another(lock_file):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
+    return True
 
 
 def _print_modified_counts(db_path, project_id: str, root) -> None:

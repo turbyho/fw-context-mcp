@@ -60,6 +60,8 @@ from functools import cache
 from importlib.resources.abc import Traversable
 from pathlib import Path, PurePosixPath
 
+from ..utils import replace_file
+
 log = logging.getLogger(__name__)
 
 #: Overrides where the bundled archive is unpacked; the test suite sets it,
@@ -230,7 +232,7 @@ def install_managed(major: int) -> Path:
         os.chmod(staging, 0o755)  # nosec B103
         if target.exists() and not _is_current(target, source):
             shutil.rmtree(target)  # a broken copy: an earlier run was killed
-        os.replace(staging, target)
+        replace_file(staging, target)
     except OSError as error:
         shutil.rmtree(staging, ignore_errors=True)
         if _is_current(target, source):

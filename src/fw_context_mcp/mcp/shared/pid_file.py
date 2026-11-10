@@ -21,12 +21,15 @@ the background reindex.  PID-based ownership prevents this.
 
 from __future__ import annotations
 
+import logging
 import os
 import tempfile
 from pathlib import Path
 
 from ...processes import pid_exists
-from ...utils import owner_token
+from ...utils import owner_token, remove_file, replace_file
+
+log = logging.getLogger(__name__)
 
 
 class PidFile:
@@ -98,7 +101,7 @@ class PidFile:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(str(self._pid))
             os.chmod(tmp, 0o644)
-            os.replace(tmp, self._path)
+            replace_file(tmp, self._path)
         except OSError:
             Path(tmp).unlink(missing_ok=True)
             raise
@@ -115,9 +118,12 @@ class PidFile:
             if self._path.exists():
                 content = self._path.read_text(encoding="utf-8").strip()
                 if content == str(self._pid):
-                    self._path.unlink(missing_ok=True)
-        except OSError:
-            pass
+                    # remove_file: on Windows an MCP server can read the
+                    # marker just now.  A marker that stays tells "pending"
+                    # to each query, thus the failure is logged.
+                    remove_file(self._path)
+        except OSError as exc:
+            log.warning("Cannot remove the marker %s: %s", self._path, exc)
 
     # ── Static helpers ──────────────────────────────────────────────
 
@@ -160,11 +166,11 @@ class PidFile:
             # writer made after this read, thus a live marker.
             return False
         except (OSError, ValueError):
-            path.unlink(missing_ok=True)
+            _remove_dead_marker(path)
             return False
         if PidFile._pid_exists(pid):
             return True
-        path.unlink(missing_ok=True)
+        _remove_dead_marker(path)
         return False
 
     @staticmethod
@@ -199,5 +205,20 @@ class PidFile:
             # See is_active: no unlink of a file that a writer made since.
             return None
         except (OSError, ValueError):
-            path.unlink(missing_ok=True)
+            _remove_dead_marker(path)
             return None
+
+
+def _remove_dead_marker(path: Path) -> None:
+    """Remove the marker *path* of a process that is gone, or with no PID in it.
+
+    WHY ``remove_file`` and no exception: on Windows a different MCP server
+    can read the marker just now, and the removal waits for that.  The
+    marker is dead either way, thus a removal that still fails changes no
+    answer of the caller: the failure is logged, and the next check removes
+    the marker.
+    """
+    try:
+        remove_file(path)
+    except OSError as exc:
+        log.warning("Cannot remove the dead marker %s: %s", path, exc)

@@ -93,7 +93,7 @@ from ..exit_codes import EXIT_ALREADY_RUNNING, EXIT_SUPERSEDED
 from ..file_lock import try_lock, unlock
 from ..indexer.db._locking import index_run_lock_held
 from ..processes import STOP_TOKEN_ENV, install_stop_listener, new_stop_token, request_stop
-from ..utils import HEADER_EXTENSIONS, O_NOFOLLOW, TU_EXTENSIONS, remove_stale_tmp, write_text_atomic
+from ..utils import HEADER_EXTENSIONS, O_NOFOLLOW, TU_EXTENSIONS, remove_file, remove_stale_tmp, write_text_atomic
 from .background import PENDING_MARKER
 from .shared.pid_file import PidFile
 
@@ -284,7 +284,8 @@ async def daemon_main(project_root: Path) -> None:
     # A marker that is there now is from a daemon that a SIGKILL stopped,
     # and a new process with its old PID makes it read as work that comes.
     # The startup check of the reindex loop finds that work again.
-    (db_dir / PENDING_MARKER).unlink(missing_ok=True)
+    # remove_file: on Windows an MCP server can read the marker just now.
+    remove_file(db_dir / PENDING_MARKER)
     # A kill between the write and the rename of a marker leaves its
     # temporary file (`PidFile.write`).  Only the file of a dead writer goes.
     remove_stale_tmp(db_dir)
@@ -295,7 +296,7 @@ async def daemon_main(project_root: Path) -> None:
         wfd = os.open(str(pid_file), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
     except FileExistsError:
         # Stale PID file from a previous crash — clean up and retry
-        pid_file.unlink(missing_ok=True)
+        remove_file(pid_file)
         wfd = os.open(str(pid_file), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
     with os.fdopen(wfd, "w", encoding="utf-8") as pf:
         pf.write(str(os.getpid()))
@@ -317,7 +318,7 @@ async def daemon_main(project_root: Path) -> None:
     except OSError:
         unlock(lock_fd)
         os.close(lock_fd)
-        pid_file.unlink(missing_ok=True)
+        remove_file(pid_file)
         sys.exit(1)
 
     # ── Signal handlers ──────────────────────────────────────────────────
@@ -955,14 +956,15 @@ def _load_build_patterns(db_dir: Path) -> list[str]:
 def _cleanup_files(port_file: Path, pid_file: Path) -> None:
     """Remove daemon runtime files.
 
-    A port file that cannot go (on Windows a pinger can have it open) stays:
-    its token reads as no daemon, and the next daemon replaces it.
+    On Windows a pinger can read the port file just now: ``remove_file``
+    waits for that read.  A port file that still cannot go stays: its token
+    reads as no daemon, and the next daemon replaces it.
     """
-    try:
-        port_file.unlink(missing_ok=True)
-    except OSError as exc:
-        log.warning("Cannot remove %s: %s — the next daemon replaces it", port_file, exc)
-    pid_file.unlink(missing_ok=True)
+    for path in (port_file, pid_file):
+        try:
+            remove_file(path)
+        except OSError as exc:
+            log.warning("Cannot remove %s: %s — the next daemon replaces it", path, exc)
 
 
 # ── Staleness check at the start of the daemon ───────────────────────────────

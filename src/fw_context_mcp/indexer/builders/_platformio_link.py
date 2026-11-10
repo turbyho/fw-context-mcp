@@ -46,7 +46,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from fw_context_mcp.utils import clear_dead_temporaries, owner_token
+from fw_context_mcp.utils import clear_dead_temporaries, owner_token, replace_file
 
 from . import _link_command
 from ._linker import _output_paths
@@ -486,7 +486,7 @@ def record_link(
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary.write_text(json.dumps(payload, indent=1), encoding="utf-8")
-        os.replace(temporary, target)
+        replace_file(temporary, target)
     except OSError as exc:
         log.warning("Cannot write %s, thus it is removed: %s", target, exc)
         forget(target)

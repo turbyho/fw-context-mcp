@@ -33,12 +33,11 @@ import hashlib
 import inspect
 import json
 import logging
-import os
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-from fw_context_mcp.utils import clear_dead_temporaries, owner_token
+from fw_context_mcp.utils import clear_dead_temporaries, owner_token, replace_file
 
 from .builders._linker import LinkRecord
 from .linker_script import LinkerResult, LinkerScript, parse, store_scripts
@@ -231,7 +230,7 @@ def write_state(path: Path, state: PassState) -> None:
     clear_dead_temporaries(path.parent, "linker_pass", path.suffix)
     try:
         temporary.write_text(json.dumps(state.__dict__), encoding="utf-8")
-        os.replace(temporary, path)
+        replace_file(temporary, path)
     except OSError as exc:
         log.warning("Cannot write %s: %s", path, exc)
     finally:

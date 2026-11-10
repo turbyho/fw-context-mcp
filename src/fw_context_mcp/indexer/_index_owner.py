@@ -23,6 +23,7 @@ from pathlib import Path
 
 from ..mcp.shared.pid_file import PidFile
 from ..processes import kill_hard, process_argv_windows, request_stop
+from ..utils import remove_file, replace_file
 
 # How long a run that was asked to stop (SIGTERM) gets to release the index
 # lock, and how long a run that got SIGKILL gets after that.  A cooperative
@@ -173,7 +174,7 @@ def write_takeover_marker(db_dir: Path, victim: int) -> None:
     temporary = marker.with_name(f".{marker.name}.{os.getpid()}")
     payload = {"taker": os.getpid(), "thread": threading.get_ident(), "victim": victim}
     temporary.write_text(json.dumps(payload), encoding="utf-8")
-    os.replace(temporary, marker)
+    replace_file(temporary, marker)
 
 
 def remove_takeover_marker(db_dir: Path) -> None:
@@ -187,7 +188,8 @@ def remove_takeover_marker(db_dir: Path) -> None:
     marker = db_dir / TAKEOVER_MARKER
     data = read_takeover_marker(marker)
     if data.get("taker") == os.getpid() and data.get("thread", threading.get_ident()) == threading.get_ident():
-        marker.unlink(missing_ok=True)
+        # remove_file: the victim reads the marker, also on Windows.
+        remove_file(marker)
 
 
 def read_takeover_marker(marker: Path) -> dict[str, int]:
