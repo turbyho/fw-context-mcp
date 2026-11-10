@@ -25,6 +25,7 @@ from fw_context_mcp.mcp.shared.stale import (
     annotate_stale,
     find_unindexed_sources,
 )
+from tests._stubs import remove_tree
 from tests._toml import toml_string
 
 _CONFIG_HASH = "hash-deadbeef"
@@ -501,7 +502,7 @@ class TestGitCandidates:
         from fw_context_mcp.mcp.shared.stale import find_unindexed_sources
 
         root, cc = _git_project(tmp_path)
-        shutil.rmtree(root / ".git")
+        remove_tree(root / ".git")
         (root / "src" / "new.c").write_text("void n(void){}\n", encoding="utf-8")
 
         conn = open_db(tmp_path / "index.db")

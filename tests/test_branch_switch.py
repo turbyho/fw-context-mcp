@@ -1062,10 +1062,10 @@ class TestTheCacheOfTheHeadPath:
         assert read_head(Path(repo)) == "ref: refs/heads/main"
 
     def test_a_git_directory_that_went_away_is_asked_again(self, repo):
-        import shutil
+        from tests._stubs import remove_tree
 
         assert head_path(repo) is not None
-        shutil.rmtree(repo / ".git")
+        remove_tree(repo / ".git")
         assert head_path(repo) is None, "the cache kept the path of a removed git directory"
 
 

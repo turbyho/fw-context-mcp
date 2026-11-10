@@ -15,7 +15,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import shutil
 import subprocess
 import sys
 import time
@@ -28,6 +27,7 @@ from fw_context_mcp.exit_codes import EXIT_ALREADY_RUNNING, EXIT_SUPERSEDED
 from fw_context_mcp.file_lock import try_lock
 from fw_context_mcp.mcp.background import PENDING_MARKER
 from fw_context_mcp.mcp.shared.pid_file import PidFile
+from tests._stubs import remove_tree
 
 DLOG = logging.LoggerAdapter(logging.getLogger("test.daemon"), {})
 
@@ -1031,7 +1031,7 @@ class TestTheHeadWatcher:
         monkeypatch.setattr(daemon_mod, "_WATCH_TIMEOUT", 1)
 
         def _replace() -> None:
-            shutil.rmtree(tmp_path / ".git")
+            remove_tree(tmp_path / ".git")
             _git(tmp_path, "init", "-q", "-b", "fresh")
             _git(tmp_path, "commit", "-q", "--allow-empty", "-m", "new")
 

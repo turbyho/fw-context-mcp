@@ -1,6 +1,7 @@
 """Tests for build artifact validator."""
 
 import json
+import os
 from pathlib import Path
 
 from fw_context_mcp.indexer.validator import is_compile_commands_stale, validate_and_fix
@@ -50,10 +51,13 @@ class TestIsCompileCommandsStale:
                 ]
             )
         )
-        # Make platformio.ini newer than compile_commands.json
+        # Make platformio.ini newer than compile_commands.json.  WHY utime and
+        # not a write after the other one: on Windows two writes in a row can
+        # get the same mtime, because the clock of the file system moves in
+        # coarse steps.
         pio_ini.write_text("[env:uno]\n")
-        # Touch pio_ini after cc
-        pio_ini.touch()
+        cc_mtime = cc.stat().st_mtime
+        os.utime(pio_ini, (cc_mtime + 10, cc_mtime + 10))
         stale, reasons = is_compile_commands_stale(cc, tmp_path)
         assert stale is True
         assert any("platformio.ini" in r for r in reasons)

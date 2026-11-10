@@ -11,11 +11,14 @@ thus one test runs on each system.
   stub that must read its arguments (a compiler driver, ``nrfutil``).
 - ``write_activate``: an activate script that puts directories at the
   start of PATH, sets variables, or fails.
+- ``remove_tree``: remove a directory tree that holds read-only files, as
+  the objects of a git repository.
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 import stat
 import sys
 from collections.abc import Sequence
@@ -163,3 +166,29 @@ def symlink_or_skip(link: Path, target: Path) -> None:
         link.symlink_to(target)
     except OSError as exc:
         pytest.skip(f"this system makes no symbolic link: {exc}")
+
+
+def remove_tree(path: Path) -> None:
+    """Remove the directory tree *path*, also its read-only files.
+
+    WHY: git writes its objects read-only.  Windows does not delete a
+    read-only file, and ``shutil.rmtree`` stops with WinError 5: the
+    handler then makes the file writable and deletes it again.  POSIX
+    deletes a read-only file in a writable directory, thus the handler
+    gets no error from such a file there.  An error that is not a
+    ``PermissionError`` stays an error.
+    """
+
+    def _make_writable_and_retry(function, name, error) -> None:
+        # *error* is the exception (onexc of Python 3.12) or its exc_info
+        # (onerror of Python 3.11).
+        exc = error if isinstance(error, BaseException) else error[1]
+        if not isinstance(exc, PermissionError):
+            raise exc
+        os.chmod(name, stat.S_IWRITE)
+        function(name)
+
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=_make_writable_and_retry)
+    else:
+        shutil.rmtree(path, onerror=_make_writable_and_retry)

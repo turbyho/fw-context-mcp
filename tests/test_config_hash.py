@@ -1,5 +1,6 @@
 """Tests for fw_context_mcp.indexer.config_hash."""
 
+import os
 from pathlib import Path
 
 from fw_context_mcp.indexer.config_hash import DEFAULT_TRANSIENT_DEFINES, _normalize_entry
@@ -82,6 +83,17 @@ class _FakeUnit:
 
 
 _ROOT = Path("/tmp/proj")
+
+
+def _outside(path: str) -> str:
+    """Return the absolute *path* of a directory outside ``_ROOT``, in the form of this system.
+
+    WHY: ``normalize_args`` makes each include path absolute before the
+    hash reads it.  On Windows ``/opt/sdk`` is not absolute (it has no
+    drive), and ``normalize_args`` gives ``C:\\opt\\sdk``.  ``abspath`` does
+    the same here, and it changes nothing on POSIX.
+    """
+    return os.path.abspath(path)
 
 
 def _cfg_hash(units: list[_FakeUnit]) -> str:
@@ -172,8 +184,8 @@ class TestConfigHashIdentity:
         Two toolchains must map to two config_hash values.  Rows parsed
         against different system headers cannot share one build.
         """
-        base = [_FakeUnit("/tmp/proj/src/main.c", ["-DFOO=1", "-I/opt/gcc-9/include"])]
-        moved = [_FakeUnit("/tmp/proj/src/main.c", ["-DFOO=1", "-I/opt/gcc-13/include"])]
+        base = [_FakeUnit("/tmp/proj/src/main.c", ["-DFOO=1", f"-I{_outside('/opt/gcc-9/include')}"])]
+        moved = [_FakeUnit("/tmp/proj/src/main.c", ["-DFOO=1", f"-I{_outside('/opt/gcc-13/include')}"])]
         assert _cfg_hash(moved) != _cfg_hash(base)
 
     def test_a_separated_sysroot_is_kept(self):
@@ -217,8 +229,8 @@ class TestConfigHashIdentity:
             _FakeUnit("/tmp/proj/src/b.c", ["-DFOO=1"]),
         ]
         with_sdk = [
-            _FakeUnit("/tmp/proj/src/a.c", ["-DFOO=1", "-I/opt/sdk/include"]),
-            _FakeUnit("/tmp/proj/src/b.c", ["-DFOO=1", "-I/opt/sdk/include"]),
+            _FakeUnit("/tmp/proj/src/a.c", ["-DFOO=1", f"-I{_outside('/opt/sdk/include')}"]),
+            _FakeUnit("/tmp/proj/src/b.c", ["-DFOO=1", f"-I{_outside('/opt/sdk/include')}"]),
         ]
         assert _cfg_hash(with_sdk) != _cfg_hash(without)
 

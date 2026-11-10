@@ -14,6 +14,7 @@ the `cmake` backend finds it with no vendor knowledge.
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -267,6 +268,7 @@ class TestTheRunReachesThePass:
             "the script's definition of _estack is missing"
         )
 
+    @pytest.mark.skipif(shutil.which("clang") is None, reason="the preprocessor of assembly is clang")
     def test_slot_zero_is_not_reported_as_code(
         self, ninja_project, tmp_path
     ):

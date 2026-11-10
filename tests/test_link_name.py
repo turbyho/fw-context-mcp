@@ -9,6 +9,7 @@ measured with libclang 22 (probe s9 of the call edge plan).
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import pytest
@@ -164,6 +165,7 @@ class TestResolution:
         ], "f") is None
 
 
+@pytest.mark.skipif(shutil.which("clang") is None, reason="the preprocessor of assembly is clang")
 class TestAssemblyLabels:
     def test_only_an_exported_label_has_a_link_name(self, tmp_path: Path):
         from fw_context_mcp.indexer.asm import store_units

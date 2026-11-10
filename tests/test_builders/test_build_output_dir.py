@@ -14,6 +14,7 @@ the user replaces.
 
 from __future__ import annotations
 
+import re
 import shutil
 from dataclasses import replace
 from pathlib import Path
@@ -150,7 +151,8 @@ class TestESPIDFOutputDirectory:
         monkeypatch.setattr(shutil, "which", lambda n, path=None: f"/usr/bin/{n}")
         monkeypatch.setattr(mod, "build_tool_available", lambda *a, **kw: True, raising=False)
 
-        with pytest.raises(RuntimeError, match=r"default/out"):
+        # The message names the directory in the form of the system.
+        with pytest.raises(RuntimeError, match=re.escape(str(Path("default", "out")))):
             ESPIDFBuildSystem().build(root, replace(BuildConfig(), clean=False))
 
 

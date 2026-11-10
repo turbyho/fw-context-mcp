@@ -221,10 +221,15 @@ def test_without_the_available_ram_the_reserve_of_8_gib_applies():
 
 
 def _pci(tmp_path: Path, *devices: tuple[str, str]) -> Path:
-    """Make a /sys/bus/pci/devices of *devices* (vendor, class)."""
+    """Make a /sys/bus/pci/devices of *devices* (vendor, class).
+
+    The check reads no device name.  WHY a name without a colon: a name of
+    sysfs is a PCI address such as ``0000:01:00.0``, and Windows does not
+    let a file name hold a colon (WinError 123).
+    """
     root = tmp_path / "devices"
     for number, (vendor, device_class) in enumerate(devices):
-        device = root / f"0000:0{number}:00.0"
+        device = root / f"0000-0{number}-00.0"
         device.mkdir(parents=True)
         (device / "vendor").write_text(f"{vendor}\n", encoding="ascii")
         (device / "class").write_text(f"{device_class}\n", encoding="ascii")
