@@ -145,3 +145,69 @@ def test_a_space_is_a_part_of_a_posix_path_entry():
 @windows_only
 def test_a_quoted_windows_path_entry_is_a_directory():
     assert utils.path_directories({"Path": ' "C:\\Program Files\\x" ;C:\\y'}) == [Path(r"C:\Program Files\x"), Path(r"C:\y")]
+
+
+# ── The command field of compile_commands.json ────────────────────────────
+
+WINDOWS_COMMAND = r'"C:\Program Files\tc\bin\arm-none-eabi-gcc.exe" -IC:\proj\inc -DX=1 -c C:\proj\src\main.c'
+
+
+def test_the_compiler_of_a_windows_command_field(monkeypatch):
+    """The build started the compiler with the rules of Windows; shlex removed each backslash of a bare name."""
+    from fw_context_mcp.indexer._driver_query import compiler_token
+
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    assert compiler_token({"command": WINDOWS_COMMAND}) == r"C:\Program Files\tc\bin\arm-none-eabi-gcc.exe"
+    assert compiler_token({"command": r"C:\tc\gcc.exe -c a.c"}) == r"C:\tc\gcc.exe"
+
+
+def test_the_flags_of_a_windows_command_field_keep_their_backslashes(monkeypatch):
+    """The identity of a build (config_hash) read -IC:projinc before."""
+    from fw_context_mcp.indexer.config_hash import DEFAULT_TRANSIENT_DEFINES, _normalize_entry
+
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    entry = {"directory": r"C:\proj", "file": r"C:\proj\src\main.c", "command": WINDOWS_COMMAND}
+    args = _normalize_entry(entry, DEFAULT_TRANSIENT_DEFINES)["args"]
+
+    assert r"-IC:\proj\inc" in args
+
+
+@windows_only
+def test_a_windows_command_field_gives_the_include_directory(tmp_path: Path):
+    """The parse of compile_commands.json: the unit gets the directory as the build wrote it."""
+    from fw_context_mcp.indexer.compile_commands import parse
+
+    include = tmp_path / "inc"
+    include.mkdir()
+    source = tmp_path / "main.c"
+    source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    database = tmp_path / "compile_commands.json"
+    database.write_text(json.dumps([{
+        "directory": str(tmp_path), "file": str(source),
+        "command": f'"{sys.executable}" "-I{include}" -c "{source}"',
+    }]), encoding="utf-8")
+
+    unit = next(parse(database))
+
+    assert f"-I{include}" in unit.clang_args
+
+
+def test_the_defines_of_a_command_field_lose_their_quotes():
+    """str.split kept the quotes: -DVERSION=\\"1.2\\" gave \\"1.2\\", and "a b" gave two words."""
+    from fw_context_mcp.indexer.compile_commands import _defines_of_entry
+
+    entry = {"command": 'cc -DVERSION=\\"1.2\\" "-DNAME=a b" -c a.c'}
+
+    assert _defines_of_entry(entry) == {"VERSION": '"1.2"', "NAME": "a b"}
+
+
+def test_an_output_path_with_a_space_is_one_word():
+    from types import SimpleNamespace
+
+    from fw_context_mcp.indexer.builders._linker import _output_paths
+
+    unit = SimpleNamespace(raw_entry={"command": 'cc -c a.c -o "out dir/a.o"'})
+
+    assert _output_paths(unit) == ["out dir/a.o"]

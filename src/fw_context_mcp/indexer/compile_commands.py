@@ -28,7 +28,7 @@ from fw_context_mcp.indexer._driver_query import (
     resolve_compiler,
 )
 from fw_context_mcp.path_key import canonical_path
-from fw_context_mcp.utils import CPP_SOURCE_EXTENSIONS, TU_EXTENSIONS
+from fw_context_mcp.utils import CPP_SOURCE_EXTENSIONS, TU_EXTENSIONS, command_words
 
 # Flags libclang does not support — drop silently
 _DROP_FLAGS = frozenset({
@@ -618,9 +618,10 @@ def parse(path: Path) -> Iterator[CompilationUnit]:
         # spelling then differed from the key of its own file.
         file = canonical_path(cwd / entry["file"])
 
-        raw_args: list[str] = entry.get("arguments") or shlex.split(
-            entry.get("command", "")
-        )
+        # The arguments as the compiler got them, by the rules of the host:
+        # shlex removed each backslash of a Windows command
+        # (utils.command_words).
+        raw_args: list[str] = entry.get("arguments") or command_words(entry.get("command", ""))
 
         # Extract compiler binary before stripping it
         compiler: Path | None = None
@@ -653,8 +654,11 @@ def _defines_of_entry(entry: dict) -> dict[str, str]:
     """
     tokens = entry.get("arguments")
     if not isinstance(tokens, list):
+        # The words of the command as ``parse`` reads them.  ``str.split``
+        # kept the quotes: `-DVERSION=\\"1.2\\"` gave the value `\\"1.2\\"`,
+        # and `-DNAME="a b"` gave two words.
         command = entry.get("command")
-        tokens = str(command).split() if command else []
+        tokens = command_words(str(command)) if command else []
     found: dict[str, str] = {}
     expect_value = False
     for token in tokens:

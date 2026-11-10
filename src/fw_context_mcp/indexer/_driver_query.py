@@ -46,15 +46,15 @@ from __future__ import annotations
 import logging
 import os
 import re
-import shlex
 import subprocess
+import sys
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import cache, lru_cache
 from pathlib import Path
 
-from ..utils import is_program, path_directories, program_file_names
+from ..utils import command_program, is_program, path_directories, program_file_names
 from ._program_encoding import EchoMissingError, echo_flags, gcc_decoder
 
 log = logging.getLogger(__name__)
@@ -681,12 +681,15 @@ _SIMPLE_FIRST_WORD = re.compile(r"""[ \t\r\n]*(?:"([^"\\]*)"|'([^']*)'|([^ \t\r\
 def compiler_token(entry: Mapping[str, object]) -> str:
     """Give the first word of an entry (the compiler), or "" when the entry names none.
 
-    WHY not always ``shlex.split``: a ``command`` field of a large build
-    holds hundreds of flags, and the split of the whole line costs more than
-    the rest of the work on the entry.  Only the first word is necessary.
-    The regex gives the same word as ``shlex`` for the simple forms; a form
-    with an escape or a joined quote goes to ``shlex``, which can raise
-    ``ValueError`` on an unclosed quote.
+    The word comes by the rules of the host, as the build started the
+    compiler (``utils.command_program``).  WHY not always a split of the line: a
+    ``command`` field of a large build holds hundreds of flags, and the
+    split of the whole line costs more than the rest of the work on the
+    entry.  Only the first word is necessary.  On POSIX the regex gives the
+    same word as ``shlex`` for the simple forms; a form with an escape or a
+    joined quote goes to ``shlex``, which can raise ``ValueError`` on an
+    unclosed quote.  On Windows the regex does not apply: a backslash is a
+    separator of a path there, and a single quote is no quote.
     """
     arguments = entry.get("arguments")
     if isinstance(arguments, list) and arguments:
@@ -694,7 +697,9 @@ def compiler_token(entry: Mapping[str, object]) -> str:
     command = entry.get("command")
     if not isinstance(command, str) or not command.strip():
         return ""
+    if sys.platform == "win32":
+        return command_program(command)
     simple = _SIMPLE_FIRST_WORD.match(command)
     if simple:
         return next(group for group in simple.groups() if group is not None)
-    return shlex.split(command)[0]
+    return command_program(command)

@@ -73,6 +73,7 @@ __all__ = [
     "cc_output_path",
     "cc_staging_path",
     "clear_dead_temporaries",
+    "command_program",
     "command_words",
     "compute_content_hash",
     "compute_source_hash",
@@ -1072,12 +1073,19 @@ def _windows_program_word(text: str) -> tuple[str, str]:
 
 
 def command_words(text: str) -> list[str]:
-    """Split a command line of the config (``[build] pre_build``, ``command``) into its arguments.
+    """Split a command line into its arguments, by the rules of the host.
 
-    The rules of the host, as its shell gives the arguments to the program:
-    POSIX shell words (``shlex``) on POSIX, ``CommandLineToArgvW`` on
-    Windows.  WHY not ``shlex`` on Windows: it removes each backslash, thus
-    ``C:\\tools\\pre.bat`` became ``C:toolspre.bat``.
+    The command lines of the config (``[build] pre_build``, ``command``),
+    and the ``command`` field of ``compile_commands.json``: the arguments
+    as the program got them.  POSIX shell words (``shlex``) on POSIX.  On
+    Windows the rules of ``CreateProcess`` for the program name and of the
+    C runtime (``CommandLineToArgvW``) for the arguments.  clang reads the
+    ``command`` field with the rules of Windows on a Windows host too
+    (``JSONCompilationDatabase``); for the program name its rules differ
+    only for forms that no build tool writes (a quoted name that ends with
+    a backslash, a quote in the middle of the name).  WHY not ``shlex`` on
+    Windows: it removes each backslash, thus ``C:\\tools\\pre.bat``
+    became ``C:toolspre.bat``.
 
     Raises ``ValueError`` for a POSIX command line with a quote that does
     not end, as ``shlex.split`` does.
@@ -1088,6 +1096,19 @@ def command_words(text: str) -> list[str]:
     if not program and not rest.strip():
         return []
     return [program, *windows_words(rest)]
+
+
+def command_program(text: str) -> str:
+    """Return the first word (the program) of the command line *text* by the rules of the host, or "".
+
+    The first word of :func:`command_words`, without the split of the
+    rest: a ``command`` field of a large build holds hundreds of flags.
+    Raises ``ValueError`` as :func:`command_words` does.
+    """
+    if sys.platform == "win32":
+        return _windows_program_word(text)[0]
+    words = shlex.split(text)
+    return words[0] if words else ""
 
 
 def build_cfg_env(build_cfg: BuildConfig | None, env: dict[str, str] | None = None) -> dict[str, str]:
