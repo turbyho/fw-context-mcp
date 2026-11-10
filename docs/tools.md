@@ -709,7 +709,8 @@ its LLM analysis, for example an API for a full `--force-llm` run:
   started with `&`), not with `--background`, only when the run makes the
   LLM analysis (also through `--force-llm` or `--analyze`), and only when
   two profiles or more can run. Enter keeps the profile of the project,
-  and so does no answer in 60 seconds (on Windows the question waits).
+  and so does no answer in 60 seconds. On Windows the question comes only
+  when stdin is the console (not `< NUL`).
   `fw-context analyze` also tells how many definitions the analysis
   reads, and how many of them have no analysis.
 - `--llm` of a run without the LLM analysis (`--no-analyze`) has no

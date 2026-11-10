@@ -30,6 +30,37 @@ brew install python@3.12 uv bear llvm
 echo 'export PATH="/opt/homebrew/opt/python@3.12/libexec/bin:$PATH"' >> ~/.zshrc
 ```
 
+### Windows
+
+Install these programs, and make sure that each one is on `PATH`:
+
+- Python 3.11 or later, from [python.org](https://www.python.org/downloads/windows/).
+- [Git for Windows](https://git-scm.com/download/win). fw-context uses `git` to find new source files.
+- The compiler toolchain of your project, for example the
+  [Arm GNU Toolchain](https://developer.arm.com/downloads/-/arm-gnu-toolchain-downloads).
+- [LLVM](https://github.com/llvm/llvm-project/releases), when the project has assembly files (`.S`):
+  fw-context runs `clang -E` to preprocess them. Without `clang` on `PATH`, the index has no symbols
+  of the assembly files.
+
+What was tested on Windows 11 (Python 3.11):
+
+- The full test suite.
+- A project in `bare` mode with `arm-none-eabi-gcc` 12.2 and 14.2, in a directory with a space
+  and characters above 127 in its name: `fw-context init`, `fw-context index`, `fw-context search`,
+  and the MCP server through an MCP client over stdio.
+
+The other build systems (Zephyr and NCS, ESP-IDF, PlatformIO, CMake, Makefile, Mbed OS, Arduino,
+Keil, IAR) were not tried on Windows with a real project. The tests cover their Windows code: the
+activate scripts (`.bat`, `.cmd`, `.ps1`), the lookup of the tools through `PATHEXT`, and the
+command lines of Windows.
+
+A GCC older than version 13 on Windows cannot open a file whose path has a character outside the
+ANSI code page of the system (measured with GCC 12.2: "ě" became "e", and GCC did not find the
+file). GCC 13 and later declare the code page UTF-8 in their manifest
+([GCC PR108865](https://gcc.gnu.org/bugzilla/show_bug.cgi?id=108865); measured with 14.2). Use
+GCC 13 or later, or keep such a project in a path without these characters.
+`bear` is not available on Windows.
+
 | What | Why |
 |------|-----|
 | Python 3.11+ | Runtime |
