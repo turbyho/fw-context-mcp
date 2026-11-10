@@ -35,7 +35,7 @@ from typing import Any
 import tomlkit
 import tomlkit.exceptions
 
-from .utils import SAFE_EXCEPT, write_text_atomic
+from .utils import SAFE_EXCEPT, sqlite_file_uri, write_text_atomic
 
 log = logging.getLogger(__name__)
 
@@ -686,10 +686,10 @@ def _open_index_readonly(db_path: Path) -> sqlite3.Connection:
     """Open the index read-only: no migration, no write lock.
 
     The same open as ``mcp.shared.connection._quick_open_readonly``, which
-    this layer must not import.  ``as_uri()`` encodes a space, '?' and '#'
-    in the path, which break a plain ``file:`` URI.
+    this layer must not import.  ``sqlite_file_uri`` gives the URI of each
+    path, also of a network path of Windows.
     """
-    conn = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+    conn = sqlite3.connect(sqlite_file_uri(db_path.resolve(), "ro"), uri=True)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA query_only = ON")
     return conn

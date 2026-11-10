@@ -36,12 +36,13 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 from collections import OrderedDict
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import TYPE_CHECKING, AnyStr
 
 if TYPE_CHECKING:
@@ -97,6 +98,7 @@ __all__ = [
     "record_build_groups",
     "resolve_project_root",
     "run_in_process_group",
+    "sqlite_file_uri",
     "staging_owner",
     "stop_process_group",
     "temporary_owner",
@@ -289,6 +291,39 @@ def is_db_exception(exc: BaseException) -> bool:
 # interactive, so make recipes and cmake sub-shells were never touched.
 # The whole vector is our own ``bash -c``.
 _SHELL_STARTUP_VARS: frozenset[str] = frozenset({"BASH_ENV"})
+
+
+def sqlite_file_uri(path: Path, mode: str) -> str:
+    """Return the SQLite URI that opens the database file *path* with ``?mode=<mode>`` (``ro``, ``rw``, ``rwc``).
+
+    *path* becomes absolute; links stay as the caller gives them.  WHY
+    a URI: ``mode=ro`` exists only there.  WHY this function and not
+    ``Path.as_uri()`` alone: ``as_uri`` gives a Windows UNC path
+    (``\\\\server\\share\\x.db``) the authority of the server
+    (``file://server/share/x.db``), and SQLite takes only an empty
+    authority or ``localhost`` ("invalid uri authority", measured on
+    Windows 11 with SQLite 3.54).  ``resolve()`` turns a mapped network
+    drive into such a path (``H:\\`` gave ``\\\\VBoxSvr\\Documents\\``),
+    thus an index on a network drive could not be opened read-only.
+    """
+    absolute = path.absolute()
+    uri = _unc_file_uri(absolute) if absolute.drive.startswith("\\\\") else absolute.as_uri()
+    return f"{uri}?mode={mode}"
+
+
+def _unc_file_uri(path: PurePath) -> str:
+    """Return the ``file:`` URI of the UNC path *path* in the form that SQLite takes.
+
+    An empty authority and the server in the path:
+    ``file:////server/share/x.db`` (measured on Windows 11).  The same form
+    opens a long path (``\\\\?\\C:\\...``, ``\\\\?\\UNC\\server\\...``) and a
+    device path (``\\\\.\\C:\\...``), whose drive also starts with two
+    backslashes, and for which ``as_uri`` of Python 3.11 gave the authority
+    ``%3F`` or ``.`` (measured: each one opens).  ``quote``
+    percent-encodes a space, ``#``, ``?``, ``%`` and each character above
+    127, as ``as_uri`` does for each other path.
+    """
+    return f"file://{urllib.parse.quote(path.as_posix())}"
 
 
 def build_env(overrides: dict[str, str] | None = None) -> dict[str, str]:
