@@ -50,8 +50,7 @@ def _terminal(monkeypatch, answer: str | None) -> list[str]:
         asked.append(prompt)
         return answer
 
-    monkeypatch.setattr(choice, "_stdin_is_terminal", lambda: True)
-    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr(choice, "_is_terminal", lambda stream: True)
     monkeypatch.setattr(choice, "_in_foreground", lambda: True)
     monkeypatch.setattr(choice, "_ask", _input)
     return asked
@@ -102,7 +101,7 @@ def test_enter_keeps_the_profile_of_the_project(cfg, monkeypatch):
 ])
 def test_no_question_without_a_reason(cfg, monkeypatch, background, analyses, tty):
     _terminal(monkeypatch, None)
-    monkeypatch.setattr(choice, "_stdin_is_terminal", lambda: tty)
+    monkeypatch.setattr(choice, "_is_terminal", lambda stream: tty)
 
     assert choice.llm_for_run(argparse.Namespace(llm=None), cfg, background=background, analyses=analyses) is cfg
 
@@ -336,17 +335,24 @@ def test_only_a_manual_index_run_measures_the_context_of_the_analysis(cfg, tmp_p
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="the console of Windows")
-def test_nul_on_windows_is_no_terminal_to_ask():
-    """CPython gives isatty() True for NUL, and kbhit reads the console: a run with < NUL waited 60 s."""
+@pytest.mark.parametrize("stream", ["stdin", "stdout"])
+def test_nul_on_windows_is_no_terminal_to_ask(stream: str):
+    """CPython gives isatty() True for NUL.
+
+    With < NUL the question waited 60 s (kbhit reads the console, not
+    stdin); with > NUL it asked a question that nobody saw.
+    """
     import subprocess
 
     probe = (
         "import sys\n"
-        "from fw_context_mcp.cli._llm_choice import _stdin_is_terminal\n"
-        "print(sys.stdin.isatty(), _stdin_is_terminal())\n"
+        "from fw_context_mcp.cli._llm_choice import _is_terminal\n"
+        f"stream = sys.{stream}\n"
+        "sys.stderr.write(f'{stream.isatty()} {_is_terminal(stream)}')\n"
     )
     result = subprocess.run(
-        [sys.executable, "-c", probe], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60,
+        [sys.executable, "-c", probe], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE, text=True, timeout=60,
     )
 
-    assert result.stdout.split() == ["True", "False"], result.stderr
+    assert result.stderr.split()[-2:] == ["True", "False"], result.stderr

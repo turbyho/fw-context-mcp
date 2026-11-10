@@ -30,6 +30,7 @@ import os
 import sys
 import time
 from dataclasses import replace
+from typing import TextIO
 
 #: The seconds that the question waits; then the profile of the project applies.
 QUESTION_TIMEOUT_S = 60
@@ -37,18 +38,19 @@ QUESTION_TIMEOUT_S = 60
 
 def may_ask(background: bool) -> bool:
     """Return True when a run can ask for its profile: not a background run, a terminal on stdin and stdout, the foreground."""
-    return not background and _stdin_is_terminal() and sys.stdout.isatty() and _in_foreground()
+    return not background and _is_terminal(sys.stdin) and _is_terminal(sys.stdout) and _in_foreground()
 
 
-def _stdin_is_terminal() -> bool:
-    """Return True when stdin is a terminal that a person can type into.
+def _is_terminal(stream: TextIO) -> bool:
+    """Return True when *stream* (stdin or stdout) is a terminal of a person.
 
     Windows: the console (``GetConsoleMode`` succeeds on its handle).  WHY
     not ``isatty``: CPython on Windows gives True for each character
     device, also for ``NUL`` (measured on Windows 11: ``< NUL`` gives
     ``isatty`` True and no console).  ``msvcrt.kbhit`` reads the keyboard
     of the console and not stdin, thus a run with ``< NUL`` waited the
-    whole time of the question.
+    whole time of the question, and a run with ``> NUL`` asked a question
+    that nobody saw.
     """
     if sys.platform == "win32":
         import ctypes
@@ -60,12 +62,12 @@ def _stdin_is_terminal() -> bool:
         kernel32.GetConsoleMode.restype = wintypes.BOOL
         mode = wintypes.DWORD()
         try:
-            handle = msvcrt.get_osfhandle(sys.stdin.fileno())
+            handle = msvcrt.get_osfhandle(stream.fileno())
         except (OSError, ValueError):
-            # No file descriptor (stdin closed, or replaced by an object without one).
+            # No file descriptor (the stream is closed, or an object without one).
             return False
         return bool(kernel32.GetConsoleMode(handle, ctypes.byref(mode)))
-    return sys.stdin.isatty()
+    return stream.isatty()
 
 
 def _in_foreground() -> bool:
