@@ -35,7 +35,7 @@ def test_without_an_answer_init_names_the_setting(tmp_path: Path, written, capsy
 
     out = capsys.readouterr().out
     assert "The Mbed OS build needs [build] python" in out
-    assert "pip install mbed-cli" in out
+    assert "install mbed-cli" in out
     assert written == []
 
 

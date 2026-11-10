@@ -80,8 +80,16 @@ def test_the_help_shows_the_venv_of_windows(home: Path, monkeypatch):
     text = MbedOSBuildSystem.environment_help()
 
     assert "py -3.11 -m venv" in text
-    assert str(home / "mbed_venv" / "Scripts" / "pip.exe") in text
-    assert str(Path("/path/to/pio/venv") / "Scripts" / "python.exe") in PlatformIOBuildSystem.environment_help()
+    assert f"{home / 'mbed_venv' / 'Scripts' / 'pip.exe'} install mbed-cli" in text
+    assert _setting_of(text) == {"build": {"python": str(home / "mbed_venv" / "Scripts" / "python.exe")}}
+    assert _setting_of(PlatformIOBuildSystem.environment_help()) == {
+        "build": {"python": str(Path("/path/to/pio/venv") / "Scripts" / "python.exe")}
+    }
+
+
+def _setting_of(help_text: str) -> dict:
+    """Return the TOML that the help gives after "local.toml:", as the user copies it."""
+    return tomllib.loads(textwrap.dedent(help_text.split("local.toml:\n", 1)[1]))
 
 
 def test_the_setting_in_the_help_is_valid_toml_for_a_windows_path():
