@@ -1,17 +1,18 @@
-"""Driver: resolve expanded macro values via ``clang -dM -E``.
+"""Driver: get the definition of each macro at the end of a unit via ``clang -dM -E``.
 
-Uses the compiler's built-in preprocessor to obtain fully expanded macro
-values — no need to build a macro dependency graph ourselves.
-
-Usage:
-    `clang -dM -E <flags> <file>` dumps all defined macros as:
-    ``#define NAME value`` where ``value`` is fully expanded.
+``clang -dM -E <flags> <file>`` prints each macro that is defined at the
+end of the unit, as ``#define NAME definition``: the predefined macros of
+the target, the ``-D`` macros of the flags, and the last ``#define`` of
+each name in the files of the unit.  The preprocessor does not expand the
+macros in a definition: ``#define B 42`` and ``#define A B`` give
+``#define A B`` (measured with clang 23).  Thus ``expanded_value`` holds
+the definition that is in force at the end of the unit, and not the
+value of a chain of macros.
 
 The flags are taken from ``compile_commands.json`` (the same flags used
 for symbol indexing), so ``#ifdef``-conditional macros resolve correctly
 for the indexed build configuration.
 """
-
 from __future__ import annotations
 
 import logging
@@ -33,14 +34,14 @@ def resolve_macros_via_preprocessor(
     timeout: float = 30.0,
     cwd: str | Path | None = None,
 ) -> dict[str, str]:
-    """Run ``clang -dM -E`` and return {name: expanded_value}.
+    """Run ``clang -dM -E`` and return {name: definition at the end of the unit}.
 
-    WHY ``clang -dM -E`` instead of parsing macros from the AST: libclang's
-    AST only exposes macro names and raw values from ``#define`` directives.
-    Fully expanded values require preprocessing — ``clang -dM -E`` uses the
-    compiler's built-in preprocessor, correctly expanding chains like
-    ``#define A B`` + ``#define B 42`` to ``A=42``.  No need to build and
-    maintain a macro dependency graph ourselves.
+    WHY ``clang -dM -E`` and not only the AST: libclang gives the text of
+    each ``#define`` directive in a file.  The preprocessor of the unit
+    tells which definition of a name is in force at its end (after
+    ``#undef`` and a new ``#define``), and it adds the ``-D`` macros of the
+    flags and the predefined macros of the target.  It does not expand the
+    macros in a definition (see the docstring of the module).
 
     Uses the same compiler flags as the translation unit so that
     ``-D`` defines and ``-I`` include paths are honoured.
@@ -55,8 +56,8 @@ def resolve_macros_via_preprocessor(
             correctly.  Defaults to ``None`` (process CWD).
 
     Returns:
-        Dict mapping macro names to their fully expanded values, or an
-        empty dict on failure.
+        Dict mapping macro names to their definitions at the end of the
+        unit, or an empty dict on failure.
     """
     cmd = [clang_binary, "-dM", "-E", *flags, str(file_path)]
 

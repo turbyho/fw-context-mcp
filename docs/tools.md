@@ -1651,8 +1651,12 @@ Output: [{"total": 1, "offset": 0, "shown": 1, "more": false},
 ```
 
 A macro result has the page notice of a symbol result, and its
-`qualified_name` is the name of the macro. `expanded_value` is absent when
-the index holds no expanded value.
+`qualified_name` is the name of the macro. `expanded_value` is the
+definition of the name that is in force at the end of a unit, from
+`clang -dM -E` (after `#undef` and a new `#define`, and with the `-D`
+macros of the build). The preprocessor does not expand the macros in it:
+`#define A B` gives `B`. `expanded_value` is absent when the index holds
+no such value.
 
 A function-like macro shows its parameters in `signature`, and `value` holds
 the replacement text alone:

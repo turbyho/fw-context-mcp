@@ -1203,9 +1203,11 @@ CREATE INDEX IF NOT EXISTS idx_overrides_base    ON overrides(config_hash, base_
 -- Why UNIQUE(config_hash, file_id, line): a macro at a given line in a
 -- given file is unique.  The name alone is not unique — the same name
 -- can be #define'd differently in different files or #ifdef branches.
--- Why expanded_value: populated by clang -dM -E — gives the preprocessor-
--- resolved value, which is different from the raw #define body (e.g.,
--- concatenation and stringification are applied).
+-- Why expanded_value: populated by clang -dM -E of each unit — the
+-- definition of the name that is in force at the end of the unit (after
+-- #undef and a new #define, and with the -D macros of the flags).  It
+-- differs from value, the body of the #define on this line.  clang -dM -E
+-- does not expand the macros in a definition: #define A B gives B.
 -- Why is_function_like: distinguishes object-like from function-like
 -- macros — needed because function-like macros participate in search
 -- differently (they accept arguments).

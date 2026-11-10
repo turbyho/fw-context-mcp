@@ -158,7 +158,9 @@ def lookup_symbol(
         ``signature`` (how the macro is invoked: ``#define NAME``,
         ``#define NAME()`` or ``#define NAME(a, b)``), ``is_function_like``,
         ``value`` (the replacement text ALONE — the parameter list is not
-        part of it), and ``expanded_value`` (preprocessor-resolved value).
+        part of it), and ``expanded_value`` (the definition that is in force
+        at the end of a unit, from ``clang -dM -E``; the macros in it are not
+        expanded).
         May also include ``template_usr``,
         ``parent_usr``, and ``llm_analysis`` (``{summary, inputs,
         outputs}``) when available.  A model wrote the text in
