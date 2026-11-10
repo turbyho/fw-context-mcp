@@ -97,7 +97,7 @@ def resolve_macros_via_preprocessor(
         try:
             cmd = _sanitize_flags(cmd)
             result = subprocess.run(
-                cmd, capture_output=True, timeout=timeout,
+                cmd, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout,
                 cwd=file_path.parent if file_path.parent.exists() else Path.cwd(),
             )
         except FileNotFoundError:
@@ -113,7 +113,7 @@ def resolve_macros_via_preprocessor(
         cmd = _sanitize_flags(cmd)
         try:
             result = subprocess.run(
-                cmd, capture_output=True, timeout=timeout, cwd=cwd,
+                cmd, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout, cwd=cwd,
             )
         except FileNotFoundError:
             log.debug("clang binary not found: %s — macro expansion skipped", clang_binary)

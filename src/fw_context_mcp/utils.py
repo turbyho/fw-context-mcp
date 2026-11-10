@@ -471,7 +471,7 @@ def process_start_time(pid: int) -> str | None:
     try:
         result = subprocess.run(  # noqa: S603 — fixed argv, no shell
             ["ps", "-o", "lstart=", "-p", str(pid)],
-            capture_output=True, text=True, timeout=5, check=False, env=env,
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5, check=False, env=env,
         )
     except (OSError, subprocess.SubprocessError):
         return None

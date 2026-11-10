@@ -46,6 +46,7 @@ def get_git_description(project_root: Path) -> str:
     try:
         branch = subprocess.check_output(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            stdin=subprocess.DEVNULL,
             cwd=str(project_root),
             text=True,
             encoding=_GIT_ENCODING,
@@ -63,6 +64,7 @@ def get_git_description(project_root: Path) -> str:
     try:
         tag = subprocess.check_output(
             ["git", "describe", "--tags", "--abbrev=0"],
+            stdin=subprocess.DEVNULL,
             cwd=str(project_root),
             text=True,
             encoding=_GIT_ENCODING,
@@ -136,6 +138,7 @@ def head_path(project_root: Path) -> Path | None:
     try:
         out = subprocess.check_output(
             ["git", "rev-parse", "--git-path", "HEAD"],
+            stdin=subprocess.DEVNULL,
             cwd=str(root),
             text=True,
             encoding=_GIT_ENCODING,

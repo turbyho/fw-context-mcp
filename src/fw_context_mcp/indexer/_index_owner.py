@@ -66,7 +66,7 @@ def process_argv(pid: int) -> list[str] | None:
     try:
         result = subprocess.run(  # noqa: S603 — fixed argv, no shell
             ["ps", "-o", "command=", "-p", str(pid)],
-            capture_output=True, text=True, timeout=5, check=False,
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5, check=False,
         )
     except (OSError, subprocess.SubprocessError):
         return None

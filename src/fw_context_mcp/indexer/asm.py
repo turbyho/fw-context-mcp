@@ -208,6 +208,7 @@ def preprocess(unit) -> AsmSource | None:
             # irq_cm4f.S, 63 of 228 lines, including the @brief block that
             # search_content is supposed to find.
             ["clang", "-E", "-C", *args, str(unit.file)],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             timeout=PREPROCESS_TIMEOUT_S,
             cwd=str(unit.directory) if unit.directory else None,

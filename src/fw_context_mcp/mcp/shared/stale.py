@@ -564,6 +564,7 @@ def _git_tu_candidates(root: Path, tu_exts: frozenset[str]) -> list[str] | None:
     try:
         result = subprocess.run(
             ["git", "-C", str(root), "ls-files", "-z", "-co", "--exclude-standard"],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             timeout=_GIT_LS_TIMEOUT_S,
             check=False,

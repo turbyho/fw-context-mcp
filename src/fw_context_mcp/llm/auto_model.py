@@ -75,7 +75,7 @@ def _gpu_available() -> bool:
     try:
         result = subprocess.run(
             ["nvidia-smi", "-L"],
-            capture_output=True, text=True, timeout=3,
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=3,
         )
         return result.returncode == 0 and "GPU" in result.stdout
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
@@ -95,7 +95,7 @@ def _apple_silicon_gpu() -> bool:
     try:
         result = subprocess.run(
             ["sysctl", "-n", "machdep.cpu.brand_string"],
-            capture_output=True, text=True, timeout=2,
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=2,
         )
         if result.returncode != 0:
             return False

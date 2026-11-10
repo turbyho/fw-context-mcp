@@ -1134,6 +1134,7 @@ async def _run_index_async(
         return await asyncio.create_subprocess_exec(
             sys.executable, "-u", "-m", "fw_context_mcp.cli", "index", "--background",
             cwd=str(project_root),
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=log_target,
             stderr=asyncio.subprocess.STDOUT,
             env=env,

@@ -67,6 +67,7 @@ def _pip(arguments: list[str]) -> tuple[bool, str]:
     try:
         result = subprocess.run(
             cmd,
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             encoding="utf-8",
             errors="replace",
@@ -175,6 +176,7 @@ def _pull_via_cli(model: str, url: str) -> tuple[bool, str]:
 
     proc = subprocess.Popen(
         ["ollama", "pull", model],
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         env={**os.environ, "OLLAMA_HOST": url},
