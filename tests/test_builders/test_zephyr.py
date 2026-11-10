@@ -145,18 +145,22 @@ class TestNcsEnvScript:
 
     @pytest.mark.parametrize("batch", [False, pytest.param(True, marks=pytest.mark.skipif(
         not WINDOWS, reason="a batch shim is a form of Windows"))], ids=["program", "batch-shim"])
-    def test_the_script_sets_the_toolchain_and_zephyr_base(self, tmp_path: Path, batch: bool):
+    @pytest.mark.parametrize("tools", ["bin", "bin a%PATH%c"], ids=["plain", "percent"])
+    def test_the_script_sets_the_toolchain_and_zephyr_base(self, tmp_path: Path, batch: bool, tools: str):
         """The script runs as each build runs it: through activate.
 
         A batch shim of nrfutil (nrfutil.bat) must run through `call`: without
-        it the shim ended ncs-env.cmd, and the build got no toolchain.
+        it the shim ended ncs-env.cmd, and the build got no toolchain.  A
+        ``%`` of the path of nrfutil: ``call`` expands ``%`` a second time,
+        thus ``%%`` gave ``%PATH%``, which cmd.exe expanded (measured on
+        Windows 11: "the system cannot find the path").
         """
         import sys
 
         from fw_context_mcp.indexer.build import BuildConfig
         from fw_context_mcp.utils import run_build_command
 
-        nrfutil = self._fake_toolchain_env(tmp_path / "bin", batch=batch)
+        nrfutil = self._fake_toolchain_env(tmp_path / tools, batch=batch)
         project = tmp_path / "project"
         project.mkdir()
         script = ZephyrBuildSystem._write_ncs_env_script(project, str(nrfutil), "v3.2.3", str(tmp_path / "ncs"))

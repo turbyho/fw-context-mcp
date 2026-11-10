@@ -275,8 +275,11 @@ def _ncs_env_cmd(nrfutil: str, version: str, zephyr_base: str) -> str:
 
     nrfutil runs through ``call``: a shim ``nrfutil.bat`` started without
     ``call`` would end this script.  ``call`` doubles each ``^`` of a path,
-    thus a path with ``^`` is refused (``ValueError``).  A ``%`` is ``%%``:
-    a batch file expands ``%NAME%``.
+    thus a path with ``^`` is refused (``ValueError``).  A batch file
+    expands ``%NAME%``, thus a ``%`` of a value is ``%%`` in a ``set`` line.
+    ``call`` expands ``%`` a second time, thus a ``%`` is ``%%%%`` in the
+    line of ``call`` (measured on Windows 11: ``%%`` gave "the system cannot
+    find the path" for a directory ``a%b%c``).
 
     The lines end with ``\\n``: the text mode of Windows writes ``\\r\\n``.
     """
@@ -285,12 +288,17 @@ def _ncs_env_cmd(nrfutil: str, version: str, zephyr_base: str) -> str:
             raise ValueError(f"ncs-env.cmd cannot hold the path {value}: cmd.exe changes ^ and \"")
 
     def literal(text: str) -> str:
+        """*text* for a ``set`` line: one expansion of ``%``."""
         return text.replace("%", "%%")
+
+    def call_literal(text: str) -> str:
+        """*text* for the line of ``call``: two expansions of ``%``."""
+        return text.replace("%", "%%%%")
 
     return (
         "@echo off\n"
         'set "FWCTX_NCS_ENV=%~dp0.ncs-toolchain-env-%FWCTX_ACTIVATION_ID%%RANDOM%.cmd"\n'
-        f'call "{literal(nrfutil)}" sdk-manager toolchain env --ncs-version "{literal(version)}" '
+        f'call "{call_literal(nrfutil)}" sdk-manager toolchain env --ncs-version "{call_literal(version)}" '
         '--as-script cmd > "%FWCTX_NCS_ENV%"\n'
         'if errorlevel 1 (del "%FWCTX_NCS_ENV%" & exit /b 1)\n'
         'call "%FWCTX_NCS_ENV%"\n'
