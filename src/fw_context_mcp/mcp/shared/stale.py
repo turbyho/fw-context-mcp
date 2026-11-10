@@ -553,11 +553,18 @@ def _git_tu_candidates(root: Path, tu_exts: frozenset[str]) -> list[str] | None:
     """
     import subprocess
 
+    # WHY -z and bytes: without -z git quotes a name with a byte above 127
+    # ("src/\\305\\276lu\\305\\245.c"), and the test of the extension then
+    # read `.c"`.  With -z git gives each name as it is, after a NUL.  git
+    # stores a name as the bytes of the file system, thus ``os.fsdecode``
+    # gives the name that the other code of this process uses: UTF-8 with
+    # surrogateescape on POSIX, UTF-8 on Windows (Git for Windows writes
+    # UTF-8).  ``text=True`` decoded it in the locale, the ANSI code page
+    # on Windows.
     try:
         result = subprocess.run(
-            ["git", "-C", str(root), "ls-files", "-co", "--exclude-standard"],
+            ["git", "-C", str(root), "ls-files", "-z", "-co", "--exclude-standard"],
             capture_output=True,
-            text=True,
             timeout=_GIT_LS_TIMEOUT_S,
             check=False,
         )
@@ -565,10 +572,8 @@ def _git_tu_candidates(root: Path, tu_exts: frozenset[str]) -> list[str] | None:
         return None
     if result.returncode != 0:
         return None
-    return [
-        rel for rel in result.stdout.splitlines()
-        if Path(rel).suffix in tu_exts
-    ]
+    names = (os.fsdecode(raw) for raw in result.stdout.split(b"\0") if raw)
+    return [rel for rel in names if Path(rel).suffix in tu_exts]
 
 
 def _vendor_roots(conn, config_hash: str) -> set[str]:

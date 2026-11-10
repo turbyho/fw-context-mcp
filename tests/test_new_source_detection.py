@@ -431,6 +431,26 @@ class TestGitCandidates:
             "for it and reported nothing"
         )
 
+    def test_a_file_with_a_non_ascii_name_is_reported(self, tmp_path: Path):
+        """git quotes a name with a byte above 127 ("src/\\305\\276lu\\305\\245.c") without -z.
+
+        The quoted name ended with `.c"`, thus the test of the extension
+        dropped the file: on each system, measured with git 2.5x.
+        """
+        from fw_context_mcp.indexer.db import open_db
+        from fw_context_mcp.mcp.shared.stale import find_unindexed_sources
+
+        root, cc = _git_project(tmp_path)
+        (root / "src" / "žluťoučký.c").write_text("void z(void){}\n", encoding="utf-8")
+
+        conn = open_db(tmp_path / "index.db")
+        try:
+            found = find_unindexed_sources(conn, "ch", root, cc)
+        finally:
+            conn.close()
+
+        assert "src/žluťoučký.c" in found
+
     def test_a_gitignored_directory_is_not_reported(self, tmp_path: Path):
         from fw_context_mcp.indexer.db import open_db
         from fw_context_mcp.mcp.shared.stale import find_unindexed_sources
