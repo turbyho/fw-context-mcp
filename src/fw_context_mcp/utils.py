@@ -886,7 +886,13 @@ if sys.platform == "win32":
         """The command line that runs the activate *script*, then writes the environment that it leaves.
 
         The script writes its own output to stderr, and Python
-        (``_DUMP_ENVIRONMENT``) writes the environment to stdout:
+        (``_DUMP_ENVIRONMENT``) writes the environment to stdout.  Python
+        runs with ``-I``: the script can set ``PYTHONHOME`` or
+        ``PYTHONPATH`` for the Python of its SDK, and the Python of
+        fw-context must not load the standard library of that one.  The
+        dump needs only ``json`` and ``os``, and ``json.dumps`` writes
+        ASCII.
+
 
         - ``.bat``, ``.cmd``: ``cmd.exe`` runs the script with ``call`` and
           ``1>&2``.  ``/s`` removes only the outer quotes of the command,
@@ -905,7 +911,7 @@ if sys.platform == "win32":
         if suffix in (".bat", ".cmd"):
             batch = _cmd_safe_path(str(script), "activate script")
             interpreter = _cmd_safe_path(python, "the Python of fw-context")
-            line = f'call "{batch}" 1>&2 && "{interpreter}" -c "{_DUMP_ENVIRONMENT}"'
+            line = f'call "{batch}" 1>&2 && "{interpreter}" -I -c "{_DUMP_ENVIRONMENT}"'
             return f'"{_system_program("cmd.exe")}" /d /e:on /v:off /s /c "{line}"'
         if suffix == ".ps1":
             def literal(text: str) -> str:
@@ -914,7 +920,7 @@ if sys.platform == "win32":
             command = (
                 "$ErrorActionPreference = 'Stop'; "
                 f". {literal(str(script))} *>&1 | ForEach-Object {{ [Console]::Error.WriteLine([string]$_) }}; "
-                f"& {literal(python)} -c {literal(_DUMP_ENVIRONMENT)}; "
+                f"& {literal(python)} -I -c {literal(_DUMP_ENVIRONMENT)}; "
                 "exit $LASTEXITCODE"
             )
             encoded = base64.b64encode(command.encode("utf-16-le")).decode("ascii")

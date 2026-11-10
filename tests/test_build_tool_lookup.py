@@ -74,6 +74,25 @@ def test_a_tool_that_only_the_activate_script_gives_is_found(tmp_path: Path) -> 
     assert build_tool_available(TOOL, tmp_path, BuildConfig(activate=str(script)))
 
 
+@windows_only
+@pytest.mark.usefixtures("path_without_west")
+def test_an_activate_script_that_sets_the_python_of_its_sdk(tmp_path: Path) -> None:
+    """The script sets PYTHONHOME and PYTHONPATH for its own Python.
+
+    The Python of fw-context writes the environment after the script, and
+    without -I it loaded the standard library of PYTHONHOME: it stopped,
+    and no tool of the script was found.
+    """
+    tools = _tool_dir(tmp_path, TOOL)
+    other_python = tmp_path / "sdk python"
+    script = write_activate(
+        tmp_path / activate_name(), prepend_path=[tools],
+        variables={"PYTHONHOME": str(other_python), "PYTHONPATH": str(other_python / "Lib")},
+    )
+
+    assert build_tool_available(TOOL, tmp_path, BuildConfig(activate=str(script)))
+
+
 @pytest.mark.usefixtures("path_without_west")
 def test_without_activate_the_tool_of_that_script_is_not_found(tmp_path: Path) -> None:
     _tool_dir(tmp_path, TOOL)
