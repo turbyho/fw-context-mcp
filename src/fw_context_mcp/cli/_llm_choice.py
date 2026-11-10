@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from dataclasses import replace
 
 #: The seconds that the question waits; then the profile of the project applies.
@@ -36,35 +37,90 @@ QUESTION_TIMEOUT_S = 60
 
 def may_ask(background: bool) -> bool:
     """Return True when a run can ask for its profile: not a background run, a terminal on stdin and stdout, the foreground."""
-    return not background and sys.stdin.isatty() and sys.stdout.isatty() and _in_foreground()
+    return not background and _stdin_is_terminal() and sys.stdout.isatty() and _in_foreground()
+
+
+def _stdin_is_terminal() -> bool:
+    """Return True when stdin is a terminal that a person can type into.
+
+    Windows: the console (``GetConsoleMode`` succeeds on its handle).  WHY
+    not ``isatty``: CPython on Windows gives True for each character
+    device, also for ``NUL`` (measured on Windows 11: ``< NUL`` gives
+    ``isatty`` True and no console).  ``msvcrt.kbhit`` reads the keyboard
+    of the console and not stdin, thus a run with ``< NUL`` waited the
+    whole time of the question.
+    """
+    if sys.platform == "win32":
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.GetConsoleMode.restype = wintypes.BOOL
+        mode = wintypes.DWORD()
+        try:
+            handle = msvcrt.get_osfhandle(sys.stdin.fileno())
+        except (OSError, ValueError):
+            # No file descriptor (stdin closed, or replaced by an object without one).
+            return False
+        return bool(kernel32.GetConsoleMode(handle, ctypes.byref(mode)))
+    return sys.stdin.isatty()
 
 
 def _in_foreground() -> bool:
     """Return False for a process of a background job of the shell (``&``): its read of the terminal stops it.
 
-    Windows has no process groups of a terminal: True.
+    Windows has no job control of the shell, thus no background job that
+    a read stops: True.  An ``OSError`` (stdin is no terminal of this
+    process) also gives True: ``may_ask`` checks the terminal itself.
     """
+    if sys.platform == "win32":
+        return True
     try:
         return os.tcgetpgrp(sys.stdin.fileno()) == os.getpgrp()
-    except (AttributeError, OSError):
+    except OSError:
         return True
 
 
 def _ask(prompt: str) -> str:
-    """Read the answer; "" when the user gives none in ``QUESTION_TIMEOUT_S`` (Linux and macOS; Windows waits)."""
+    """Read the answer; "" when the user gives none in ``QUESTION_TIMEOUT_S``."""
     from . import _init_interactive as ui
 
-    try:
-        import select
-
-        print(prompt, end="", flush=True)
-        ready, _, _ = select.select([sys.stdin], [], [], QUESTION_TIMEOUT_S)
-    except (ImportError, OSError, ValueError):
-        return ui._input(prompt)
-    if not ready:
+    print(prompt, end="", flush=True)
+    if not _answer_starts(QUESTION_TIMEOUT_S):
         print(f"\nNo answer in {QUESTION_TIMEOUT_S} s: the run uses the profile of the project")
         return ""
     return ui._input("")
+
+
+#: The seconds between two looks at the keyboard of the Windows console.
+_KEY_POLL_S = 0.05
+
+
+def _answer_starts(timeout_s: float) -> bool:
+    """Return True when the user types into the terminal in *timeout_s*, else False.
+
+    POSIX: ``select`` on stdin.  Windows: ``select`` takes only sockets
+    there (measured: ``OSError`` 10093 on the stdin of a console), thus
+    the function looks at the keyboard of the console with
+    ``msvcrt.kbhit``, which does not take the key: ``input`` then reads
+    the whole line (measured on Windows 11 through a pseudo console).
+    ``may_ask`` asks on Windows only when stdin is that console.
+    """
+    if sys.platform == "win32":
+        import msvcrt
+
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if msvcrt.kbhit():
+                return True
+            time.sleep(_KEY_POLL_S)
+        return False
+    import select
+
+    ready, _, _ = select.select([sys.stdin], [], [], timeout_s)
+    return bool(ready)
 
 
 def index_analyses(args, cfg) -> bool:
