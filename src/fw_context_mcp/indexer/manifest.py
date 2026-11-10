@@ -1281,9 +1281,12 @@ def check_tu_staleness(
         is False.
     """
     # ── Check source file hash ──
-    source_file = Path(entry["file"])
-    if not source_file.is_absolute():
-        source_file = canonical_path(key_path(entry["file"], project_root))
+    # WHY key_path alone: a key of the manifest is canonical already (the
+    # case of the disk, links resolved), and ``key_path`` makes its path
+    # with no call of the file system.  ``canonical_path`` resolved each of
+    # the tens of thousands of header records of a large project again in
+    # each check, and on macOS also opened each one.
+    source_file = key_path(entry["file"], project_root)
 
     current_source_hash = source_hash if source_hash is not None else compute_source_hash(source_file)
     if current_source_hash != entry.get("source_hash", ""):
@@ -1296,8 +1299,7 @@ def check_tu_staleness(
 
     # ── Check header hashes ──
     for h in headers or ():
-        header_path = h["path"]
-        p = canonical_path(key_path(header_path, project_root))
+        p = key_path(h["path"], project_root)
 
         if _hash_with_cache(p, hash_cache) != h.get("hash", ""):
             return True, current_source_hash
@@ -1331,7 +1333,8 @@ def collect_stale_headers(
     stale: set[str] = set()
 
     for header_path, record in (manifest.get("headers") or {}).items():
-        p = canonical_path(key_path(header_path, project_root))
+        # key_path alone: see check_tu_staleness.
+        p = key_path(header_path, project_root)
 
         if _hash_with_cache(p, hash_cache) != record.get("hash", ""):
             stale.add(header_path)

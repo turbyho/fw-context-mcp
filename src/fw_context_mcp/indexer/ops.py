@@ -89,10 +89,9 @@ from fw_context_mcp.indexer.db import (
     store_unit_places,
     upsert_file,
 )
-from fw_context_mcp.path_key import canonical_path, index_key
+from fw_context_mcp.path_key import canonical_key, canonical_path, index_key, key_path
 from fw_context_mcp.utils import (
     CPP_EXTENSIONS,
-    abs_path,
     compute_content_hash,
     decode_source_lines,
     read_file_lines,
@@ -912,8 +911,10 @@ def _store_symbol_rows(
         sym_file = s.file
         normalized_sym_file = keys.get(sym_file)
         if normalized_sym_file is None:
-            normalized_sym_file = keys[sym_file] = _normalize_file_path(sym_file, project_root)
+            # The canonical path one time: the key is made from it, and
+            # not from a second canonical_path inside index_key.
             resolved_paths[sym_file] = canonical_path(sym_file)
+            normalized_sym_file = keys[sym_file] = canonical_key(resolved_paths[sym_file], project_root)
             classes[sym_file] = classify_key(normalized_sym_file, vendor_patterns, project_patterns)
         resolved_sym = resolved_paths[sym_file]
         if normalized_sym_file not in file_id_cache:
@@ -1115,8 +1116,13 @@ def _detect_moved_symbols(
                 old_row["docstring"],
             )
         else:
-            old_abs_path = abs_path(project_root, old_row["file_path"])
-            old_lines = _cached_read_lines(old_abs_path)
+            # WHY key_path and canonical_path: ``skipped`` is keyed by
+            # ``canonical_path`` (skipped_ranges), which gives the case of
+            # the disk.  ``Path.resolve()`` keeps the case of the spelling on
+            # macOS, thus a header reached through ``-I`` in another case
+            # found no ranges, and a pure move read as a change.
+            old_path = key_path(old_row["file_path"], project_root)
+            old_lines = _cached_read_lines(str(old_path))
             if old_lines is None:
                 continue
             old_ch = _compute_content_hash(
@@ -1126,11 +1132,11 @@ def _detect_moved_symbols(
                 old_row["signature"],
                 old_row["qualified_name"],
                 old_row["docstring"],
-                skipped.get(Path(old_abs_path).resolve(), frozenset()),
+                skipped.get(old_path, frozenset()),
             )
         new_ch = _compute_content_hash(
             lines, s.line, s.end_line, s.signature, s.qualified_name, s.docstring,
-            skipped.get(Path(s.file).resolve(), frozenset()),
+            skipped.get(canonical_path(s.file), frozenset()),
         )
         if old_ch != new_ch:
             continue
@@ -1328,9 +1334,10 @@ def _store_macros_for_unit(
             # source_hash for the same reason as in _store_symbol_rows: a
             # file whose mtime moves must carry the hash of the text that
             # the macros come from, and that is the text of the parse.
+            # canonical_path: the key of ``parsed_hashes`` (see above).
             file_id_cache[m_path] = upsert_file(
                 conn, config_hash, m_path, lang, mtime=m_mtime,
-                source_hash=(file_hashes or {}).get(Path(m_raw).resolve(), ""),
+                source_hash=(file_hashes or {}).get(canonical_path(m_raw), ""),
             )
         m_file_id = file_id_cache[m_path]
         macro_rows.append(

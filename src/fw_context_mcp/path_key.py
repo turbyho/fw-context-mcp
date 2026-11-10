@@ -34,6 +34,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 
 __all__ = [
     "ABSOLUTE_KEY_SQL",
+    "canonical_key",
     "canonical_path",
     "index_key",
     "is_absolute_key",
@@ -136,7 +137,17 @@ def index_key(path: str | os.PathLike[str], project_root: Path) -> str:
     prefix of the canonical path of its own file, and the file would get an
     absolute key.
     """
-    canonical = canonical_path(path)
+    return canonical_key(canonical_path(path), project_root)
+
+
+def canonical_key(canonical: Path, project_root: Path) -> str:
+    """Return the index key of *canonical*, a path that :func:`canonical_path` gave.
+
+    The second half of :func:`index_key`, for a caller that needs the
+    canonical path too: it makes the path canonical one time, and not a
+    second time inside ``index_key`` (on macOS an open and an ``fcntl``
+    for each call).
+    """
     try:
         relative = canonical.relative_to(_canonical_root(os.fspath(project_root)))
     except ValueError:

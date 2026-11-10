@@ -14,7 +14,7 @@ import pytest
 
 import fw_context_mcp  # noqa: F401 — the sqlite3 redirect runs first
 from fw_context_mcp.indexer.sdk_detect import classify_key
-from fw_context_mcp.path_key import ABSOLUTE_KEY_SQL, canonical_path, index_key, is_absolute_key
+from fw_context_mcp.path_key import ABSOLUTE_KEY_SQL, canonical_key, canonical_path, index_key, is_absolute_key
 
 
 @pytest.fixture
@@ -39,6 +39,13 @@ def test_a_file_outside_the_root_gets_an_absolute_key_with_slashes(project: Path
     assert key == canonical_path(sdk / "hal.h").as_posix()
     assert "\\" not in key
     assert is_absolute_key(key)
+
+
+def test_the_key_of_a_canonical_path_is_the_index_key(project: Path, tmp_path: Path) -> None:
+    """canonical_key is the second half of index_key, for a caller that has the canonical path already."""
+    outside = tmp_path / "sdk" / "hal.h"
+    for path in (project / "Src" / "Drv" / ".." / "Drv" / "Uart.c", outside):
+        assert canonical_key(canonical_path(path), project) == index_key(path, project)
 
 
 def test_dot_dot_and_a_relative_spelling_give_the_same_key(project: Path) -> None:
