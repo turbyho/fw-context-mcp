@@ -231,7 +231,8 @@ xcode-select --install   # ships clang as part of Command Line Tools
 `fw-context` runs `pio run --target compiledb` plus a real build for `.d` files.
 
 > **`fw-context init`** detects PlatformIO automatically, from
-> `~/.platformio/penv/bin/python` (the bundled venv) or from `pio` on PATH.
+> `~/.platformio/penv/bin/python` (the bundled venv; on Windows
+> `%USERPROFILE%\.platformio\penv\Scripts\python.exe`) or from `pio` on PATH.
 > When automatic detection fails, set `python = "/path/to/python"` in
 > `.fw-context/local.toml`.
 
@@ -350,7 +351,7 @@ bear -- eclipse -nosplash -application com.ti.ccstudio.apps.projectBuild ...
 |---|---|---|---|
 | **Zephyr** | `west` | — | Zephyr SDK |
 | **PlatformIO** | `pio` | — | no |
-| **Mbed OS** | `bear`, `mbed` | `mbed-cli` | ARM GCC |
+| **Mbed OS** | — | `mbed-cli` (in `[build] python`) | ARM GCC |
 | **Arduino** | `arduino-cli` | — | Arduino CLI |
 | **ESP-IDF** | `idf.py` | — | ESP-IDF |
 | **CMake (generic)** | `cmake` | — | no |

@@ -105,6 +105,7 @@ __all__ = [
     "stop_process_group",
     "temporary_owner",
     "truncate_path_middle",
+    "venv_program",
     "windows_words",
 ]
 
@@ -642,6 +643,20 @@ def program_file_names(name: str, env: Mapping[str, str] | None = None) -> list[
     if Path(name).suffix.lower() in extensions:
         return [name]
     return [name + ext for ext in extensions]
+
+
+def venv_program(venv: Path, name: str) -> Path:
+    """Return the path of the program *name* in the virtual environment *venv*.
+
+    The ``venv`` module puts the programs of an environment into
+    ``Scripts`` with the extension ``.exe`` on Windows (the interpreter and
+    the launchers of the console scripts that pip writes), and into
+    ``bin`` without an extension on POSIX.  A detection that looks only
+    for ``bin/python`` finds no environment on Windows.
+    """
+    if sys.platform == "win32":
+        return venv / "Scripts" / f"{name}.exe"
+    return venv / "bin" / name
 
 
 def run_in_process_group(

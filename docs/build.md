@@ -819,7 +819,8 @@ Python interpreter.
 python = "/home/user/.pyenv/versions/3.11.8/bin/python"
 ```
 
-`fw-context init` finds this Python in pyenv and in `~/mbed_venv`. Set
+`fw-context init` finds this Python in pyenv and in `~/mbed_venv`, when the
+`mbed` command is there (on Windows `Scripts\mbed.exe` of the venv). Set
 this parameter manually when `init` does not find it. Without it, the build
 stops with an error: the `mbed` command on `PATH` does not tell which
 Python has mbed-cli.
@@ -1093,6 +1094,10 @@ pip install mbed-cli
 # Or using a venv:
 python3.11 -m venv ~/mbed_venv
 ~/mbed_venv/bin/pip install mbed-cli
+
+# Or using a venv on Windows (PowerShell):
+py -3.11 -m venv $HOME\mbed_venv
+& $HOME\mbed_venv\Scripts\pip.exe install mbed-cli
 ```
 Then set this value in `.fw-context/local.toml`:
 ```toml

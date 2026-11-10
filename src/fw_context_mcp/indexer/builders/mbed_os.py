@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import logging
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from fw_context_mcp.utils import cc_output_path, run_build_command
+from fw_context_mcp.utils import cc_output_path, run_build_command, venv_program
 
 from ..build_layout import BuildLayout
 from . import registry
+from ._environment_help import build_setting
 from .protocol import BuildIssue
 
 if TYPE_CHECKING:
@@ -239,8 +241,7 @@ class MbedOSBuildSystem:
         The database comes from the commands of the build itself, thus no
         check of this builder can find more than those checks.
         """
-        issues: list[BuildIssue] = []
-        return issues
+        return []
 
     # ── Auto-fix ──
 
@@ -262,6 +263,16 @@ class MbedOSBuildSystem:
 
     @classmethod
     def detect_environment(cls, project_root: Path) -> dict[str, str | None]:
+        """Return the Python of a pyenv version or a venv that has the ``mbed`` command.
+
+        Each place counts only when its ``mbed`` command is there, thus the
+        Python that the build gets has mbed-cli.  The pyenv versions have
+        the POSIX layout (``bin/``); pyenv-win keeps its versions in a
+        different tree, and this does not look there.  A venv has the
+        layout of its host (:func:`venv_program`).  An ``mbed`` command on
+        PATH (or in ``~/.local/bin``) does not tell which Python has
+        mbed-cli, thus it gives no Python.
+        """
         pyenv_versions = Path.home() / ".pyenv" / "versions"
         if pyenv_versions.is_dir():
             for vdir in sorted(pyenv_versions.iterdir(), reverse=True):
@@ -272,23 +283,23 @@ class MbedOSBuildSystem:
             Path.home() / "mbed_venv",
             Path.home() / ".virtualenvs" / "mbed",
         ]:
-            python_bin = venv_dir / "bin" / "python"
-            if python_bin.exists():
-                return {"python": str(python_bin), "activate": None}
+            if venv_program(venv_dir, "mbed").exists():
+                return {"python": str(venv_program(venv_dir, "python")), "activate": None}
 
-        # An `mbed` command on PATH (or in ~/.local/bin) does not tell
-        # which Python has mbed-cli, and the build needs that Python.
         return {"python": None, "activate": None}
 
     @classmethod
     def environment_help(cls) -> str:
+        """Return the commands that make a venv with mbed-cli, in the form of this host."""
+        venv = Path.home() / "mbed_venv"
+        make_venv = "py -3.11 -m venv" if sys.platform == "win32" else "python3.11 -m venv"
         return (
             "mbed-cli requires Python 3.11 or older.\n"
             "Install into a venv or pyenv:\n"
-            "  python3.11 -m venv ~/mbed_venv\n"
-            "  ~/mbed_venv/bin/pip install mbed-cli\n"
+            f"  {make_venv} {venv}\n"
+            f"  {venv_program(venv, 'pip')} install mbed-cli\n"
             "Or set in .fw-context/local.toml:\n"
-            '  [build]\n  python = "/path/to/python3.11/bin/python"'
+            + build_setting("python", str(venv_program(venv, "python")))
         )
 
 
