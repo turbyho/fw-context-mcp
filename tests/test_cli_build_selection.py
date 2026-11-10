@@ -546,6 +546,40 @@ def test_db_delete_makes_no_new_index_when_the_index_went_away_meanwhile(two_bui
     assert not db_path.exists()
 
 
+def test_db_delete_holds_no_connection_while_the_person_reads(two_builds, monkeypatch):  # noqa: F811
+    """An open connection keeps the index file open: Windows then lets no other command delete it."""
+    import builtins
+    import sqlite3
+
+    import fw_context_mcp.cli._db as db_module
+
+    root, _db_path = two_builds
+    hash_a = _hash_of(root, "a")
+    opened: list[sqlite3.Connection] = []
+    asked: list[str] = []
+    real_open = db_module.open_for_reading
+
+    def recording_open(path):
+        conn = real_open(path)
+        opened.append(conn)
+        return conn
+
+    def answer(prompt):
+        asked.append(prompt)
+        for conn in opened:
+            with pytest.raises(sqlite3.ProgrammingError):
+                conn.execute("SELECT 1")
+        return "n"
+
+    monkeypatch.setattr(db_module, "open_for_reading", recording_open)
+    monkeypatch.setattr(builtins, "input", answer)
+    args = argparse.Namespace(project=str(root), all=False, config_hash=hash_a, force=True, yes=False)
+
+    assert db_module.cmd_db_delete(args) == 0
+    assert asked and opened, "the question did not come after the build was read"
+    assert _hash_of(root, "a") == hash_a, "the answer 'n' deleted the build"
+
+
 def test_analyze_gives_one_choice_of_the_context_to_each_build(two_builds, monkeypatch):  # noqa: F811
     """Nothing that the search of the context measures changes between the builds of one run."""
     import fw_context_mcp.indexer._llm_analysis as llm_mod
