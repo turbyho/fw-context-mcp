@@ -10,10 +10,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Windows is not supported yet: the file locks, the daemon socket and
-        # the process groups use POSIX calls.  test-cross-platform.yml runs
-        # Windows by hand.
-        os: [ubuntu-latest, macos-latest]
+        # Windows is in the matrix since the suite passed on Windows 11
+        # (Python 3.11, no failure, 2026-11-10).
+        os: [ubuntu-latest, macos-latest, windows-latest]
         # The oldest version of requires-python and the newest Python.
         python-version: ['3.11', '3.14']
     runs-on: ${{ matrix.os }}
