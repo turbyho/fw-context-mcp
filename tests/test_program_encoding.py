@@ -57,6 +57,24 @@ def test_no_echo_is_an_error(windows):
         gcc_decoder(b"Target: arm-none-eabi\r\n")
 
 
+def test_a_translated_message_still_gives_the_code_page(windows):
+    """A GCC with translated messages (LANG=cs) writes no English "ignoring nonexistent directory"."""
+    stderr = (
+        b"COLLECT_GCC_OPTIONS='-E' '-v' '-I' 'C:\\py\\python.exe\\fwctx-\xc3\xa9-probe'\r\n"
+        b'ignoruje se neexistuj\xc3\xadc\xc3\xad adres\xc3\xa1\xc5\x99 "C:\\py\\python.exe\\fwctx-\xc3\xa9-probe"\r\n'
+    )
+
+    assert gcc_decoder(stderr)("ř".encode()) == "ř"
+
+
+def test_echoes_in_two_code_pages_are_an_error(windows):
+    """The driver and cc1 do not agree: no code page is known."""
+    stderr = _echo("fwctx-é-probe".encode()) + _echo(b"fwctx-\xe9-probe")
+
+    with pytest.raises(EchoMissingError):
+        gcc_decoder(stderr)
+
+
 def test_posix_needs_no_echo(monkeypatch):
     monkeypatch.setattr(sys, "platform", "linux")
 
