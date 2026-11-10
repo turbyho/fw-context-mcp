@@ -59,11 +59,18 @@ def _pip(arguments: list[str]) -> tuple[bool, str]:
     else:
         cmd = [sys.executable, "-m", "pip", *arguments]
 
+    # WHY PYTHONIOENCODING and UTF-8: pip writes the ANSI code page to a
+    # pipe on Windows, and a character outside it (a path of the profile)
+    # stopped pip with UnicodeEncodeError (measured on Windows 11 with a
+    # Python child).  uv writes UTF-8.  Only a person reads the output, thus
+    # a byte that is no UTF-8 becomes U+FFFD.
     try:
         result = subprocess.run(
             cmd,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
             timeout=180,
         )
         if result.returncode == 0:
