@@ -300,8 +300,19 @@ def build_env(overrides: dict[str, str] | None = None) -> dict[str, str]:
     those variables deliberately — in ``[build] env`` or ``extra_env`` —
     still gets it.  Configuration is a declared intent; inheritance from
     whoever started fw-context is an accident.
+
+    On Windows a Python tool of the build (pio, west, idf.py, a script that
+    CMake runs) writes its stdout and stderr in UTF-8: ``PYTHONIOENCODING``
+    is ``utf-8`` unless the environment already sets it (decision of the
+    user, 2026-11-10).  WHY: to a pipe Python writes the ANSI code page
+    there, and a character that the code page does not hold stopped the
+    tool with ``UnicodeEncodeError`` (measured on Windows 11: no output at
+    all).  The output of a build is read as UTF-8 (``run_in_process_group``).
+    Linux and macOS write UTF-8 already, thus nothing changes there.
     """
     env = {k: v for k, v in os.environ.items() if k not in _SHELL_STARTUP_VARS}
+    if sys.platform == "win32":
+        env.setdefault("PYTHONIOENCODING", "utf-8")
     if overrides:
         env.update(overrides)
     return env
@@ -602,11 +613,13 @@ def run_in_process_group(
     env: dict[str, str],
     timeout: float | None,
     capture_output: bool,
+    encoding: str = "utf-8",
+    errors: str = "replace",
 ) -> subprocess.CompletedProcess:
     """Run *cmd* in a new session, and stop its whole process group on any exit but its own.
 
-    Same result as ``subprocess.run(..., text=True)``: a timeout raises
-    ``TimeoutExpired`` with the output so far.  Any exception while the
+    Same result as ``subprocess.run(..., encoding=encoding, errors=errors)``
+    for stdout: a timeout raises ``TimeoutExpired`` with the output so far.  Any exception while the
     command runs (the timeout, ``IndexStopped`` from a SIGTERM handler,
     ``KeyboardInterrupt``) first stops the group, then goes on.
 
@@ -628,12 +641,30 @@ def run_in_process_group(
 
     Windows has no process group that a stop can reach: there the build
     runs in a job object (:func:`_run_in_job`).
+
+    The output is read as bytes and decoded after the end of the command,
+    with *encoding* and *errors*.  The default is the output of a build
+    for a person: UTF-8, and a byte that is no UTF-8 becomes U+FFFD.  stderr
+    is always decoded with replacement: it holds messages for a person,
+    also from a command whose stdout a caller parses.  WHY
+    UTF-8: the tools of a build write it on Linux and macOS, and on
+    Windows clang, GCC 13 and later, and each Python tool
+    (``PYTHONIOENCODING`` of :func:`build_env`) write it too.  An older GCC
+    writes the ANSI code page; its characters above 127 become U+FFFD in a
+    message, and the build is not affected.  A caller that parses the
+    output gives ``errors="strict"``, and a byte of stdout that is no UTF-8
+    then raises ``UnicodeDecodeError``.  WHY not the decode of ``text=True``: it
+    used the locale (the ANSI code page of Windows), and it decoded in the
+    reader threads of ``communicate`` on Windows, where an error left an
+    ``IndexError`` and no output.  The output of a timeout is always
+    decoded with replacement: it can end in the middle of a character.
     """
     if sys.platform == "win32":
-        return _run_in_job(cmd, cwd=cwd, env=env, timeout=timeout, capture_output=capture_output)
+        raw = _run_in_job(cmd, cwd=cwd, env=env, timeout=timeout, capture_output=capture_output)
+        return _decoded_result(raw, encoding, errors)
     pipe = subprocess.PIPE if capture_output else None
     proc = subprocess.Popen(  # noqa: S603 — argv list, no shell
-        cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=pipe, stderr=pipe, text=True,
+        cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=pipe, stderr=pipe,
         start_new_session=True,
     )
     record = _BUILD_GROUP_RECORD.get()
@@ -644,7 +675,7 @@ def run_in_process_group(
     except subprocess.TimeoutExpired:
         stop_process_group(proc.pid, leader=proc)
         stdout, stderr = proc.communicate()
-        raise subprocess.TimeoutExpired(cmd, timeout or 0, output=stdout, stderr=stderr) from None
+        raise _decoded_timeout(subprocess.TimeoutExpired(cmd, timeout or 0, output=stdout, stderr=stderr)) from None
     except BaseException:
         stop_process_group(proc.pid, leader=proc)
         proc.wait()
@@ -652,7 +683,39 @@ def run_in_process_group(
     finally:
         if record is not None and process_group_is_gone(proc.pid, proc):
             _remove_group_record(record, proc.pid)
-    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+    return _decoded_result(subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr), encoding, errors)
+
+
+def _decoded_output(data: bytes | None, encoding: str, errors: str) -> str | None:
+    """Return the captured *data* as ``subprocess`` text mode gives it: decoded, with universal newlines.
+
+    WHY universal newlines: ``text=True`` turned ``\\r\\n`` into ``\\n``,
+    and the callers read lines with that end.  A program of Windows ends
+    each line with ``\\r\\n``.
+    """
+    if data is None:
+        return None
+    return io.TextIOWrapper(io.BytesIO(data), encoding=encoding, errors=errors).read()
+
+
+def _decoded_result(raw: subprocess.CompletedProcess, encoding: str, errors: str) -> subprocess.CompletedProcess:
+    """Return *raw* with its captured bytes decoded: stdout with *errors*, stderr with replacement.
+
+    See :func:`run_in_process_group`.
+    """
+    return subprocess.CompletedProcess(
+        raw.args, raw.returncode,
+        _decoded_output(raw.stdout, encoding, errors), _decoded_output(raw.stderr, encoding, "replace"),
+    )
+
+
+def _decoded_timeout(raw: subprocess.TimeoutExpired) -> subprocess.TimeoutExpired:
+    """Return *raw* with the output so far decoded as UTF-8 with replacement (see :func:`run_in_process_group`)."""
+    return subprocess.TimeoutExpired(
+        raw.cmd, raw.timeout,
+        output=_decoded_output(raw.output, "utf-8", "replace"),
+        stderr=_decoded_output(raw.stderr, "utf-8", "replace"),
+    )
 
 
 if sys.platform == "win32":
@@ -894,7 +957,8 @@ if sys.platform == "win32":
     ) -> subprocess.CompletedProcess:
         """Windows form of :func:`run_in_process_group`: the build runs in a job object.
 
-        The same result and the same exceptions, and ``JobObjectError`` (a
+        The same result as bytes (the caller decodes them), the same
+        exceptions, and ``JobObjectError`` (a
         ``RuntimeError``) when Windows refuses the job.  A stop (the timeout,
         an exception while the build runs) closes the job, and Windows ends
         each process of the build at once; ``job_object.py`` gives the
@@ -920,7 +984,9 @@ if sys.platform == "win32":
             except subprocess.TimeoutExpired:
                 job.close()
                 stdout, stderr = proc.communicate()
-                raise subprocess.TimeoutExpired(cmd, timeout or 0, output=stdout, stderr=stderr) from None
+                raise _decoded_timeout(
+                    subprocess.TimeoutExpired(cmd, timeout or 0, output=stdout, stderr=stderr),
+                ) from None
             except BaseException:
                 job.close()
                 proc.wait()
@@ -1072,6 +1138,7 @@ def run_build_command(
     description: str = "",
     env: dict[str, str] | None = None,
     build_cfg: BuildConfig | None = None,
+    errors: str = "replace",
 ) -> subprocess.CompletedProcess:
     """Run a build command with consistent timeout and output capture.
 
@@ -1108,12 +1175,18 @@ def run_build_command(
         build_cfg: Optional BuildConfig — when set, ``activate`` wraps the
             command in ``bash -c "source <activate> && <cmd>"``, and
             ``extra_path`` / ``extra_env`` are merged into the environment.
+        errors: The decode of the UTF-8 stdout (see
+            :func:`run_in_process_group`).  ``"replace"`` for output that a
+            person reads, ``"strict"`` for output that the caller parses:
+            a parse must not read a name with U+FFFD in it.  stderr is
+            always decoded with replacement.
 
     Returns:
         CompletedProcess with captured stdout/stderr.
 
     Raises:
-        RuntimeError: On non-zero exit.  BuildTimeoutError (a RuntimeError)
+        RuntimeError: On non-zero exit, and with *errors* ``"strict"`` on
+            a stdout that is not UTF-8.  BuildTimeoutError (a RuntimeError)
             on timeout.
     """
     if timeout is None:
@@ -1141,8 +1214,12 @@ def run_build_command(
     try:
         # In its own process group — see run_in_process_group.
         result = run_in_process_group(
-            cmd, cwd=cwd, env=merged_env, timeout=timeout, capture_output=True
+            cmd, cwd=cwd, env=merged_env, timeout=timeout, capture_output=True, errors=errors,
         )
+    except UnicodeDecodeError as e:
+        raise RuntimeError(
+            f"Build command wrote output that is not UTF-8: {description or ' '.join(cmd)}: {e}"
+        ) from e
     except subprocess.TimeoutExpired as e:
         # Quote what the build managed to say.  A timeout with no output
         # gives the reader nothing to act on, and the last lines usually

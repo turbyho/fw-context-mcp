@@ -135,7 +135,10 @@ class PlatformIOBuildSystem:
         its build does.  See ``_platformio_link.run_environments``.
         """
         cmd = self._pio_prefix(cfg) + ["project", "config", "--project-dir", str(project_root), "--json-output"]
-        result = run_build_command(cmd, cwd=project_root, description="pio project config", build_cfg=cfg)
+        # strict: the JSON names the environments (see run_build_command).
+        result = run_build_command(
+            cmd, cwd=project_root, description="pio project config", build_cfg=cfg, errors="strict",
+        )
         names = _platformio_link.run_environments(result.stdout or "")
         if not names:
             raise RuntimeError("pio project config names no environment that pio run builds")
@@ -431,7 +434,7 @@ class PlatformIOBuildSystem:
         try:
             result = run_build_command(
                 cmd, cwd=project_root, description=f"pio run -e {env_name} --target envdump",
-                build_cfg=cfg, env=dump_env,
+                build_cfg=cfg, env=dump_env, errors="strict",
             )
         except RuntimeError as exc:
             # BuildTimeoutError is a RuntimeError too.

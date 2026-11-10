@@ -308,11 +308,19 @@ def _run_nrfutil(cmd: list[str], *, timeout: float) -> subprocess.CompletedProce
     with the arguments that ``cmd.exe`` cannot misread.
     """
     try:
-        return run_in_process_group(cmd, cwd=Path.cwd(), env=dict(os.environ), timeout=timeout, capture_output=True)
+        # strict: the caller parses the output (the version, the JSON of
+        # `sdk-manager list` with the paths of the toolchains), thus a path
+        # with U+FFFD in it must not reach it.
+        return run_in_process_group(
+            cmd, cwd=Path.cwd(), env=dict(os.environ), timeout=timeout, capture_output=True, errors="strict",
+        )
     except (OSError, subprocess.SubprocessError) as exc:
         # The file cannot run (a .vbs of PATHEXT, a broken binary) or does
         # not answer in time: no SDK manager, and the caller says so.
         log.debug("nrfutil candidate %s did not run: %s", cmd[0], exc)
+        return None
+    except UnicodeDecodeError as exc:
+        log.warning("The nrfutil candidate %s wrote output that is not UTF-8, thus it is not used: %s", cmd[0], exc)
         return None
     except (RuntimeError, ValueError) as exc:
         # Windows refused the job object, or cmd.exe cannot take the path

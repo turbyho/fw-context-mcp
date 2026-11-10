@@ -185,8 +185,11 @@ if sys.platform == "win32":
 
         def start(
             self, cmd: list[str] | str, *, cwd: Path, env: dict[str, str], stdout: int | None, stderr: int | None,
-        ) -> subprocess.Popen[str]:
-            """Start *cmd* suspended (text mode), put it into this job, then let it run.
+        ) -> subprocess.Popen[bytes]:
+            """Start *cmd* suspended, put it into this job, then let it run.
+
+            The output is bytes, because the caller knows its encoding
+            (``utils.run_in_process_group``).
 
             *cmd* is a list of arguments, or a Windows command line for a
             program whose command line has rules of its own (``cmd.exe /c``
@@ -198,7 +201,7 @@ if sys.platform == "win32":
             is the JSON-RPC pipe of the client.
             """
             return self._started(lambda: subprocess.Popen(  # noqa: S603 — argv list or a command line of fw-context
-                cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, text=True,
+                cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
                 creationflags=CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP,
             ))
 
