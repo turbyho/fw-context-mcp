@@ -61,6 +61,21 @@ class TestKeywordCache:
         c.set(("q", "h"), ["test"])
         assert c.get(("q", "h")) is None
 
+    def test_zero_ttl_is_expired_on_a_coarse_clock(self, monkeypatch):
+        """On Windows ``time.monotonic()`` moves in steps of about 15.6 ms.
+
+        A ``get`` right after the ``set`` then reads the age 0, and the
+        entry of a TTL of 0 came back.
+        """
+        from types import SimpleNamespace
+
+        import fw_context_mcp.search.cache as cache_module
+
+        monkeypatch.setattr(cache_module, "time", SimpleNamespace(monotonic=lambda: 1000.0))
+        c = KeywordCache(ttl_s=0)
+        c.set(("q", "h"), ["test"])
+        assert c.get(("q", "h")) is None
+
     def test_negative_ttl_always_expired(self):
         c = KeywordCache(ttl_s=-1)
         c.set(("q", "h"), ["test"])
