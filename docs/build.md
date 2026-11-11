@@ -4,6 +4,9 @@
 systems. Configure everything in `.fw-context/config.toml`, under the
 `[build]` section. You do not need shell one-liners.
 
+The examples use the paths of Linux. For the paths of macOS and Windows,
+and for a Windows path in TOML, see [Platforms](platforms.md).
+
 ## How it works
 
 When you run `fw-context index --build`, the system picks one of four paths:
@@ -778,6 +781,12 @@ This is the generic CMake builder. This builder runs
 `-G`, and CMake uses its default generator. This builder works for any
 CMake project that is not Zephyr or ESP-IDF.
 
+Only the Makefile and Ninja generators write `compile_commands.json`. On
+Windows, the default of CMake is a Visual Studio generator when Visual
+Studio is installed, thus set `cmake_generator = "Ninja"` there. When the
+generator writes no database, the builder stops after the configure step,
+names the generator, and removes its build tree.
+
 ### 11. Shell override — bear wrapping a custom build
 
 ```toml
@@ -786,8 +795,10 @@ command = "bear -- make -j8"
 ```
 
 When no other builder fits, `command` runs as-is, without a shell.
-fw-context splits the text into words as a shell does (`shlex.split`), and
-then starts the first word as the program. Thus a pipe (`|`), `&&`, a
+fw-context splits the text into words by the rules of the host, and then
+starts the first word as the program: on Linux and macOS as a POSIX shell
+does (`shlex.split`), on Windows as `CreateProcess` and the C runtime do
+(a backslash in a path stays). Thus a pipe (`|`), `&&`, a
 redirection (`>`) and a shell variable (`$VAR`) do not work in `command`.
 For a command that needs a shell, write the command into a script file, and
 set the script as `command`. You can also give the shell as the program:
@@ -795,6 +806,8 @@ set the script as `command`. You can also give the shell as the program:
 ```toml
 [build]
 command = "bash -c 'make clean && bear -- make -j8'"
+# Windows: a script that writes compile_commands.json, run by cmd.exe
+# command = 'cmd /c gen-compile-commands.bat'
 ```
 
 `bear` intercepts the
@@ -802,8 +815,9 @@ build, records the compile commands, and writes `compile_commands.json`
 into the project root. fw-context copies that file to
 `out/compile_commands.json`. fw-context ignores the settings of the
 builder, but it runs `pre_build` first and applies `[build] env`. This
-example requires `bear`, as a system package:
-`sudo pacman -S bear`.
+example requires `bear`, as a system package of Linux or macOS:
+`sudo pacman -S bear`, `sudo apt install bear` or `brew install bear`.
+`bear` for Windows exists only as a build from source in MSYS2.
 
 ### 12. Build environment — the Python of mbed-cli
 

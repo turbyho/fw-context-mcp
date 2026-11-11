@@ -4071,6 +4071,9 @@ def check_ollama(
         of the embeddings, "openrouter" or "openai_compatible"),
         embedding_compliance_warning (str, when the embeddings go to an
         external API: the code and each search query leave the machine),
+        version_problem (str, when the Ollama server of ``ollama_url`` is
+        older than the oldest version of one of its uses: 0.40.15 for the
+        embeddings, 0.30.1 for the chat),
         message (str, when status is not "ok"), model_details (list[dict]),
         suggest_cloud (bool), vec_available (bool),
         vec_error (str, optional), debug_log (str, optional — only when
@@ -4119,6 +4122,9 @@ def check_ollama(
       ``semantic_search`` does not work, and give the cause from
       ``message``.
     - ``"error"``: give ``message`` to the operator.
+    - ``version_problem``, with each status: give it to the operator.  An
+      index run does not do the use that it names (no embeddings, or no
+      LLM analysis) until the operator updates Ollama.
 
     WHY these rules are here and not only in the server instructions: an
     LLM client can cut the instructions of a server (Claude Code keeps
@@ -4156,6 +4162,18 @@ def check_ollama(
     # lists installed models, and determines the status string.
     result = check_setup(cfg.llm)
     result["ollama_enabled"] = True
+    if result.get("ollama_running"):
+        # The index run stops a use for an Ollama that is too old for it
+        # (OllamaUse): the check tells it before the run.  Not in
+        # check_setup: semantic_search calls it on each query.
+        from ...llm.ollama import ollama_url_uses, ollama_version_problem
+
+        try:
+            problem = ollama_version_problem(cfg.llm.ollama_url, ollama_url_uses(cfg.llm))
+        except ValueError as exc:
+            problem = f"the version check of {cfg.llm.ollama_url} did not run: {exc}"
+        if problem is not None:
+            result["version_problem"] = problem
 
     # sqlite-vec is needed for semantic_search embeddings.
     # Report availability so tools can degrade gracefully.

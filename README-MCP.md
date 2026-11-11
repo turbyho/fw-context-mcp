@@ -59,11 +59,16 @@ Server → Client:  {"jsonrpc":"2.0","id":99,"result":{"tools":[{…},…]}}
 ### Claude Code
 
 ```bash
-# pip install (binary in ~/.local/bin or venv bin/)
+# uv tool / pipx install (the program in ~/.local/bin)
 claude mcp add --scope user fw-context fw-context-mcp
 
-# source install
+# source install, Linux and macOS
 claude mcp add --scope user fw-context ~/.fw-context/.venv/bin/fw-context-mcp
+```
+
+```powershell
+# source install, Windows
+claude mcp add --scope user fw-context $HOME\.fw-context\.venv\Scripts\fw-context-mcp.exe
 ```
 
 Run `fw-context init` to do this automatically. This command also adds usage instructions to `CLAUDE.md` of the project (the default `--scope project`). With `--scope global`, it writes them to `~/.claude/CLAUDE.md`. With `--scope all`, it writes them to the two files.
@@ -84,8 +89,17 @@ Add to `~/.config/opencode/opencode.json`:
 }
 ```
 If `fw-context-mcp` is not on your PATH, use the full path:
-`"command": ["/home/<user>/.local/bin/fw-context-mcp"]` (pip) or
-`"command": ["/home/<user>/.fw-context/.venv/bin/fw-context-mcp"]` (source).
+
+| Installation | `command` |
+|---|---|
+| `uv tool` / `pipx`, Linux | `["/home/<user>/.local/bin/fw-context-mcp"]` |
+| `uv tool` / `pipx`, macOS | `["/Users/<user>/.local/bin/fw-context-mcp"]` |
+| `uv tool` / `pipx`, Windows | `["C:\\Users\\<user>\\.local\\bin\\fw-context-mcp.exe"]` |
+| Source, Linux | `["/home/<user>/.fw-context/.venv/bin/fw-context-mcp"]` |
+| Source, Windows | `["C:\\Users\\<user>\\.fw-context\\.venv\\Scripts\\fw-context-mcp.exe"]` |
+
+JSON reads a backslash as the start of an escape sequence, thus a Windows
+path in JSON has two backslashes (`\\`) or forward slashes.
 
 ### Other MCP clients
 
@@ -95,10 +109,13 @@ Start the server as a subprocess:
 fw-context-mcp
 ```
 
-If the binary is not on your PATH, use the full path. For pip installs
-the binary is typically at `~/.local/bin/fw-context-mcp`. For source
-installs it is at `~/.fw-context/.venv/bin/fw-context-mcp`. Run
-`which fw-context-mcp` to find the exact path on your system.
+If the program is not on your PATH, use the full path. For a `uv tool`
+or `pipx` install, the program is at `~/.local/bin/fw-context-mcp`. For a
+source install, it is at `~/.fw-context/.venv/bin/fw-context-mcp`. On
+Windows the program has the extension `.exe`, and the venv has its
+programs in `Scripts`. To find the path on your system, run
+`which fw-context-mcp` on Linux and macOS, and `where.exe fw-context-mcp`
+on Windows.
 
 ## Error handling
 
@@ -166,7 +183,7 @@ To find if the database is damaged, call `check_dependencies`. Its check `db-int
 
 ## Environment
 
-- **CWD:** The server resolves the project root from `$PWD` when the request does not provide `project_root`. Launch the server from the firmware project root.
+- **CWD:** The server resolves the project root from its working directory when the request does not provide `project_root`. Launch the server from the firmware project root.
 - **The core tools need no network connection** (search, lookup, source, graph). `smart_search` and `explain_symbol` can optionally use a local Ollama server.
 - **The server asks PyPI for a newer release** in a background thread at server start. After a request that succeeded, it asks again only after 24 hours. A request that failed has no effect on the tools, and the next server start tries again. No tool waits for the request. `[updates] check = false` in the global config, or `FW_CONTEXT_NO_UPDATE_CHECK=1`, stops it. See [`[updates]`](docs/configuration.md#updates--release-check).
 - **The server keeps one connection for the queries of each index database.** It opens that connection again after a reindex or an error of the connection. A call reads the config of the build through a short read-only connection.
@@ -178,9 +195,7 @@ To find if the database is damaged, call `check_dependencies`. Its check `db-int
 echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' \
   | fw-context-mcp
 
-# Verbose logging
-FW_CONTEXT_LOG_LEVEL=DEBUG fw-context-mcp
-
 # Ollama debug log (when debug_log is set in config)
+# (Windows PowerShell: Get-Content -Wait -Encoding utf8 $HOME\.fw-context\llm-debug.jsonl)
 tail -f ~/.fw-context/llm-debug.jsonl
 ```

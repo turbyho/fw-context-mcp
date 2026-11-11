@@ -20,9 +20,12 @@ import shlex
 import shutil
 import subprocess
 import sys
+import sysconfig
 import tomllib
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from ..utils import executable_name, venv_program
 
 if TYPE_CHECKING:
     from ..config.tools import MarkerUpdate
@@ -32,27 +35,45 @@ def _resolve_mcp_bin() -> str | None:
     """Find the fw-context-mcp binary, preferring canonical install over dev venv.
 
     Search order (priority):
-    1. ``~/.local/bin/fw-context-mcp`` — canonical user install (pipx / pip --user)
-    2. ``~/.fw-context/.venv/bin/fw-context-mcp`` — managed venv
+    1. ``~/.local/bin/fw-context-mcp`` — canonical user install of pipx and
+       ``uv tool``, which use this directory on each host, also on Windows
+       (``%USERPROFILE%\\.local\\bin``).
+    2. The program in the managed venv ``~/.fw-context/.venv``
+       (``bin/`` on POSIX, ``Scripts\\`` on Windows: :func:`venv_program`).
     3. ``shutil.which("fw-context-mcp")`` — system PATH
-    4. ``sys.executable / fw-context-mcp`` — dev venv (editable install)
+    4. The scripts directory of the Python that runs this code
+       (``sysconfig``): a venv, an editable install, or a system Python
+       (``C:\\Python3xx\\Scripts`` on Windows).
+    5. The scripts directory of the user scheme of that Python, where
+       ``pip install --user`` writes: ``~/.local/bin`` on Linux,
+       ``~/Library/Python/3.x/bin`` on macOS, ``%APPDATA%\\Python\\...\\Scripts``
+       on Windows.
+
+    On Windows each program has the extension ``.exe``
+    (:func:`executable_name`).  Without it, no candidate exists, and init
+    registered no MCP server when the ``Scripts`` directory was not on PATH.
 
     WHY canonical install first: the managed venv and system PATH may point
     to different versions or stale installations.  The canonical path is
     the most likely to match the currently installed package.
     """
+    name = executable_name("fw-context-mcp")
     for candidate in [
-        Path.home() / ".local" / "bin" / "fw-context-mcp",
-        Path.home() / ".fw-context" / ".venv" / "bin" / "fw-context-mcp",
+        Path.home() / ".local" / "bin" / name,
+        venv_program(Path.home() / ".fw-context" / ".venv", "fw-context-mcp"),
     ]:
         if candidate.exists():
             return str(candidate)
     mcp_bin = shutil.which("fw-context-mcp")
     if mcp_bin:
         return mcp_bin
-    dev_candidate = Path(sys.executable).parent / "fw-context-mcp"
-    if dev_candidate.exists():
-        return str(dev_candidate)
+    for directory in (
+        sysconfig.get_path("scripts"),
+        sysconfig.get_path("scripts", sysconfig.get_preferred_scheme("user")),
+    ):
+        candidate = Path(directory) / name
+        if candidate.exists():
+            return str(candidate)
     return None
 
 

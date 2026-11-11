@@ -287,9 +287,10 @@ def _analysis_contexts(client: ChatClient, llm_config) -> tuple[int, int] | None
     Each request of the run has the whole of it.  Before 2026-10-22 such a
     run had ``num_ctx`` of the config (16384), an Ollama key, thus the
     sentinel ``skip:toolarge:16384`` of an API never cleared.  None when the
-    Ollama server does not answer, or does not have the model, or the
-    context of an API model is not known (an error that names the fix):
-    the run then makes no analysis.
+    Ollama server does not answer, is older than the minimum of the analysis
+    (``OllamaUse.ANALYSIS``) or does not have the model, or when the
+    context of an API model is not known (an error that names the fix): the
+    run then makes no analysis.
     """
     if not client.counts_tokens:
         from ..llm.model_list import ModelContextError, model_context
@@ -302,6 +303,15 @@ def _analysis_contexts(client: ChatClient, llm_config) -> tuple[int, int] | None
         log.info("LLM analysis: the context of %s is %d tokens (the model list of the provider, or the profile)",
                  llm_config.model, context)
         return context, context
+    # Ollama: a server older than the minimum of the analysis gives a wrong
+    # token count or cuts a prompt, thus the run makes no analysis with it.
+    from ..llm.ollama import OllamaClient, OllamaUse, ollama_version_problem
+
+    if isinstance(client, OllamaClient):
+        too_old = ollama_version_problem(client.server_url, [OllamaUse.ANALYSIS])
+        if too_old is not None:
+            log.error("LLM analysis: %s — no analysis in this run", too_old)
+            return None
     largest = client.trained_context()
     if largest is None and llm_config.auto_pull:
         # /api/show gives 404 for a model that is not installed.

@@ -212,6 +212,13 @@ The build is not in the session of the terminal, thus it does not get the
 foreign `SIGTERM`: `Terminated`, exit code 143, and the build group stops
 too.
 
+The signals and the process group of this section apply to Linux and
+macOS. On Windows, fw-context asks a run to stop through a named stop event
+in place of `SIGTERM`, and stops it with `TerminateProcess` in place of
+`SIGKILL`. A build runs in a job object in place of a process group, and
+the job object stops each process of the build. See
+[File watcher and processes](platforms.md#file-watcher-and-processes).
+
 **The global registry:**
 
 `fw-context index` and `fw-context init` write this project into the global
@@ -941,9 +948,13 @@ without `config` does not repair the config files.
   install needs root. `skipped` without an NVIDIA GPU, when no model of
   the config runs on the Ollama of this machine, and on Windows and macOS.
 - `ollama` — the Ollama server answers. `skipped` when the LLM is off.
-  `degraded` when the version of the server is older than 0.30.1: the LLM
-  analysis then cannot count the tokens of a prompt, and the server can
-  cut a long input without an error.
+  `degraded` when the server is older than the version of one of its uses:
+  0.40.15 when it runs the embeddings (an older server can stop its runner
+  on a long embedding input), 0.30.1 when it runs the chat model (an older
+  server can cut a long prompt without an error, or give a wrong token
+  count). `fw-context index` then does not do that use with the server.
+  `error` when `chat_api_format` is not valid: the chat use of the server
+  is then not known, and the version check did not run.
 - `chat-model` — the chat model is installed on the Ollama server of the
   chat calls. When that server is not the server of the check `ollama`,
   the check is `degraded` for a version older than 0.30.1. For an API
@@ -1083,11 +1094,19 @@ line, not the quoted tool output below it.
 
 #### `fw-context watch restart`
 
-Stop the current watcher daemon, with `SIGTERM`. If the daemon does not
-stop, this command falls back to `SIGKILL` after 3 seconds. This command
-cleans up leftover socket, pid, and lock files, and spawns a fresh daemon.
-This command verifies that the new daemon responds to a ping, before it
-returns.
+Stop the current watcher daemon, and start a new one. The command uses
+the lock of the daemon (`watcher.lock`), and not the PID in its PID file:
+a PID file that a stopped daemon left can name another process now.
+
+1. When another process holds the lock, the command asks the daemon to
+   stop: `SIGTERM` on Linux and macOS, the stop event on Windows.
+2. When the lock is not free after 3 seconds, the command stops the daemon
+   with `SIGKILL` (on Windows `TerminateProcess`), and waits 5 seconds
+   more for the lock.
+3. The command removes the PID file and the port file, and starts a new
+   daemon. After 0.5 seconds it sends one ping. When the daemon does not
+   answer yet, the command tells you to run `fw-context watch status` a
+   moment later.
 
 ```bash
 $ fw-context watch restart
@@ -3819,6 +3838,14 @@ missing model. The command sets `OLLAMA_HOST` to the server of the check,
 in the syntax of PowerShell on Windows and of a POSIX shell on other
 systems. `status: "error"` also means that the Ollama server of the chat
 profile gives no model list.
+
+`version_problem` is there when the Ollama server of `ollama_url` answers
+and is older than the oldest version of one of its uses: 0.40.15 when it
+runs the embeddings, 0.30.1 when it runs the chat model. An index run does
+not do the use that it names until you update Ollama (see
+[Install Ollama](installation.md#install-ollama)). When `chat_api_format`
+is not valid, the chat use of the server is not known, and
+`version_problem` says that the version check did not run.
 
 `embedding_backend` is `"ollama"` for an Ollama embedding model, and
 `"local"` for a sentence-transformers or `ft://` model. For an API profile

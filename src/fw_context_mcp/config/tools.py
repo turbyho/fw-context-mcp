@@ -894,7 +894,12 @@ TOOLS: dict[str, AiTool] = {
     "kilocode": AiTool(
         id="kilocode",
         name="Kilo Code",
-        detection_dirs=["~/.kilocode"],
+        # ~/.config/kilo: the global config of the Kilo CLI on each host
+        # (kilo.ai/docs/getting-started/settings: ~/.config/kilo/kilo.jsonc,
+        # on Windows C:\Users\<user>\.config\kilo; kilo.ai/docs/cli lists
+        # kilo.json[c] there, thus mcp_config_file kilo.json is read).
+        # ~/.kilocode: the directory of the older Kilo Code releases.
+        detection_dirs=["~/.config/kilo", "~/.kilocode"],
         inherits_from="opencode",
         mcp_config_file="~/.config/kilo/kilo.json",
         mcp_config_key="fw-context",

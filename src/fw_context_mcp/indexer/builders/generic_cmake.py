@@ -22,6 +22,25 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
+def _cached_generator(build_dir: Path) -> str | None:
+    """Return the generator that CMake recorded in ``CMakeCache.txt`` of *build_dir*, or None.
+
+    The entry is ``CMAKE_GENERATOR:INTERNAL=<name>``.  It is the generator
+    that the configure step used: the one of ``-G``, of the environment
+    variable ``CMAKE_GENERATOR``, or the default of CMake on this host.
+    """
+    cache = build_dir / "CMakeCache.txt"
+    try:
+        lines = cache.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        key, sep, value = line.partition("=")
+        if sep and key.split(":", 1)[0] == "CMAKE_GENERATOR":
+            return value.strip()
+    return None
+
+
 class GenericCMakeBuildSystem:
     """Generic CMake build system (``cmake -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON``).
 
@@ -62,7 +81,10 @@ class GenericCMakeBuildSystem:
     def build(self, project_root: Path, cfg: BuildConfig) -> Path:
         """Generate compile_commands.json via CMake configure + build."""
         if not shutil.which("cmake"):
-            raise RuntimeError("cmake is required.  Install it:  sudo pacman -S cmake")
+            raise RuntimeError(
+                "cmake is required.  Install CMake (https://cmake.org/download/, or the package "
+                "manager of the system) and put it on PATH."
+            )
 
         build_dir = BuildLayout(project_root).out_dir(cfg.variant_name)
 
@@ -82,17 +104,33 @@ class GenericCMakeBuildSystem:
         log.info("cmake configure: %s", " ".join(configure_cmd))
         run_build_command(configure_cmd, cwd=project_root, description="cmake configure", build_cfg=cfg)
 
+        # The Makefile and Ninja generators write the database when CMake
+        # generates the build system, thus it exists after this step
+        # (measured with CMake 4 for Unix Makefiles and Ninja).  The other
+        # generators ignore CMAKE_EXPORT_COMPILE_COMMANDS ("implemented only
+        # by Makefile Generators and Ninja Generators"), and the default of
+        # CMake on Windows is a Visual Studio generator when Visual Studio is
+        # installed.  The build then ran to its end and gave no database.
+        # Stop here, and remove the build tree: a run with another generator
+        # in the same tree fails in CMake ("Does not match the generator used
+        # previously").
+        cc_in_build = build_dir / "compile_commands.json"
+        if not cc_in_build.exists():
+            generator = _cached_generator(build_dir)
+            shutil.rmtree(build_dir, ignore_errors=True)
+            raise RuntimeError(
+                f"CMake configured {build_dir} with the generator {generator or '(unknown)'!r}, and it wrote "
+                "no compile_commands.json: only the Makefile and Ninja generators write it.  Set one in "
+                ".fw-context/config.toml, for example:\n"
+                '  [build]\n  cmake_generator = "Ninja"'
+            )
+
         # Build
         build_cmd: list[str] = ["cmake", "--build", str(build_dir)]
         log.info("cmake build: %s", " ".join(build_cmd))
         run_build_command(build_cmd, cwd=project_root, description="cmake build", build_cfg=cfg)
 
         # The database stays beside build.ninja, which the linker pass reads.
-        cc_in_build = build_dir / "compile_commands.json"
-        if not cc_in_build.exists():
-            raise RuntimeError(
-                f"compile_commands.json not found in {build_dir}. Ensure CMAKE_EXPORT_COMPILE_COMMANDS is enabled."
-            )
         return cc_in_build
 
     def background_build_safe(self, cfg: BuildConfig) -> bool:

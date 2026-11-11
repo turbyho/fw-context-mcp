@@ -10,28 +10,33 @@ This document explains **how** to start using fw-context.
 
 Before you index a project, you need:
 
--   Python 3.11+
--   `clang` on the `PATH` (for macro values and assembly units).
-    `make install` installs libclang.
+-   Linux, macOS or Windows (see [Platforms](platforms.md))
+-   Python 3.11+, and `uv` or `pipx`
+-   `git`, and `clang` for the macro values and the assembly units.
+    The installation of fw-context installs libclang.
 -   The build tool of the project (fw-context runs it to get
     `compile_commands.json`), or a `compile_commands.json` of your own
 -   Optional: an LLM service (for semantic search and symbol explanation):
     a local Ollama, or a cloud service such as OpenRouter, DeepSeek or the
     ChatGPT plan
 
-See the installation guide for platform-specific instructions.
+For the steps of each platform, see [Installation](installation.md#install).
 
 ## Installation
 
-Clone the repository. Then install fw-context:
+Install fw-context. The same commands work on Linux, macOS and Windows
+(PowerShell):
 
 ``` bash
-git clone git@github.com:turbyho/fw-context-mcp.git ~/.fw-context/src
-cd ~/.fw-context/src
-make install
+uv tool install fw-context-mcp
+uv tool update-shell        # one time, then open a new terminal
+fw-context doctor --fix --only clang-resource
 ```
 
-Register the MCP server with your preferred LLM client:
+For the install from source, see
+[From source](installation.md#from-source).
+
+In your project, register the MCP server with your preferred LLM client:
 
 ``` bash
 fw-context init

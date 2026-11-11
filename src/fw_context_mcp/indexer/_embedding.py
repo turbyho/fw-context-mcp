@@ -601,14 +601,6 @@ def _build_embeddings(
     # Suppress httpx INFO logs (one per batch — noisy during embedding)
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
-    # The chat model of the analysis holds the GPU memory for its
-    # keep_alive: the embedding model must get it.  Before get_embedder:
-    # its first property (max_tokens) sends an embedding request, which
-    # loads the model.  Here and not in a step: reindex_file (MCP) calls
-    # this function too.
-    from ..llm.ollama import release_other_model
-
-    release_other_model(llm_config, "embeddings")
     embedder = get_embedder(llm_config)
 
     from ..llm.auto_model import _model_installed
@@ -625,6 +617,14 @@ def _build_embeddings(
             raise EmbeddingsIncomplete(
                 f"Ollama at {llm_config.ollama_url} is not reachable ({e}); no embeddings were written"
             ) from e
+        # An Ollama older than the minimum of the embeddings stops its runner
+        # on a long input, after part of the embeddings: stop before the
+        # first batch.
+        from ..llm.ollama import OllamaUse, ollama_version_problem
+
+        too_old = ollama_version_problem(llm_config.ollama_url, [OllamaUse.EMBEDDINGS])
+        if too_old is not None:
+            raise EmbeddingsIncomplete(f"{too_old}; no embeddings were written")
         # Model-not-installed guard for reindex_file: report and skip.  WHY
         # the repair names `doctor --fix`: `auto_pull` is off by default,
         # thus `fw-context index` does not install the model, and the full
@@ -634,6 +634,15 @@ def _build_embeddings(
                 f"the embedding model {llm_config.embed_model} is not installed; "
                 "run 'fw-context doctor --fix'"
             )
+    # The chat model of the analysis holds the GPU memory for its
+    # keep_alive: the embedding model must get it.  Before the first
+    # property of the embedder (max_tokens): it sends an embedding request,
+    # which loads the model.  After the checks of the server: a step that
+    # stops there sends no request, thus it must not unload the chat model.
+    # Here and not in a step: reindex_file (MCP) calls this function too.
+    from ..llm.ollama import release_other_model
+
+    release_other_model(llm_config, "embeddings")
     model = _embed_model_key(embedder.name, True)
     # The two inputs of each description that are not fields of the symbol
     # (see _embed_content_hash).

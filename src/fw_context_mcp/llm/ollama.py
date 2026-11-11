@@ -61,6 +61,7 @@ Module-level state
 from __future__ import annotations
 
 import dataclasses
+import enum
 import itertools
 import json
 import logging
@@ -70,7 +71,7 @@ import shlex
 import sys
 import threading
 import time
-from collections.abc import Generator
+from collections.abc import Generator, Iterable
 from contextlib import contextmanager
 from datetime import UTC, datetime
 
@@ -272,7 +273,7 @@ def _ollama_usage(answer: dict) -> Usage:
     """Return the token counts of an ``/api/generate`` answer.
 
     ``prompt_eval_count`` includes the tokens that the server took from its
-    prompt cache (from Ollama 0.30.1, see ``MIN_OLLAMA_VERSION``);
+    prompt cache (from Ollama 0.30.1, see ``OllamaUse.ANALYSIS``);
     ``prompt_eval_cached_count`` is that part.  A field that the answer
     does not carry is None.
     """
@@ -590,28 +591,91 @@ class OllamaClient:
         return select_context(measure, key, check=check)
 
 
-# The oldest Ollama that the LLM analysis and the embeddings can use.  Read
-# from the source of Ollama:
-# * v0.30.0 runs GGUF models in llama-server, and a prompt longer than the
-#   context then gets HTTP 400 with the count of its tokens
-#   (``exceed_context_size_error``, ``n_prompt_tokens``).
-# * v0.30.1 counts the cached tokens of a prompt in ``prompt_eval_count``.
-#   In v0.30.0 the count of a prompt that shares a start with the prompt
-#   before it was too small, thus the answer budget too.
-# The analysis counts each prompt from the two (``OllamaClient.count_tokens``).
-# Before them, a ``/api/generate`` request with ``truncate: false`` (v0.12.6)
-# got an error without a count, and a server before v0.12.6 cut the prompt
-# without an error.  ``/api/ps`` names the context of a loaded model from
-# v0.10.0.  Tested with v0.35.1.
-MIN_OLLAMA_VERSION = (0, 30, 1)
+class OllamaUse(enum.Enum):
+    """A use of an Ollama server by fw-context: each use has its own oldest server.
+
+    WHY one minimum for each use, and not one for the server: a defect of
+    one request type does not stop the other.  The runner crash below
+    occurs only in the embedding mode of llama-server, thus one minimum
+    stopped the LLM analysis on servers that run it correctly.
+    """
+
+    # The LLM analysis (``/api/generate``).  Read from the source of Ollama:
+    # * v0.30.0 runs GGUF models in llama-server, and a prompt longer than
+    #   the context then gets HTTP 400 with the count of its tokens
+    #   (``exceed_context_size_error``, ``n_prompt_tokens``).
+    # * v0.30.1 counts the cached tokens of a prompt in ``prompt_eval_count``.
+    #   In v0.30.0 the count of a prompt that shares a start with the prompt
+    #   before it was too small, thus the answer budget too.
+    # The analysis counts each prompt from the two
+    # (``OllamaClient.count_tokens``).  Before them, a ``/api/generate``
+    # request with ``truncate: false`` (v0.12.6) got an error without a
+    # count, and a server before v0.12.6 cut the prompt without an error.
+    # ``/api/ps`` names the context of a loaded model from v0.10.0.  The
+    # analysis was tested with v0.35.1.
+    ANALYSIS = (
+        (0, 30, 1),
+        "the LLM analysis cannot count the tokens of a prompt, and the server can cut a long prompt "
+        "without an error",
+    )
+    # The embeddings (``/api/embed``).  Measured 2026-11-11: v0.30.10 on macOS
+    # (Metal) stopped its runner (``llama-server --embedding``, "signal:
+    # trace/BPT trap") on each input of more than 2048 tokens (the physical
+    # batch), and 10 batches of two firmware projects failed.  Ollama issue
+    # #16582 reports it from v0.30.6 on, and it is open.  The same inputs
+    # passed with v0.40.15 (Linux, CUDA) and v0.40.16 (macOS, Metal, and
+    # Windows on the CPU).  No release note of Ollama names the version with
+    # the repair, thus the minimum is the oldest version that we tested.
+    EMBEDDINGS = (
+        (0, 40, 15),
+        "the server can stop its runner on an embedding input of more than 2048 tokens",
+    )
+
+    def __init__(self, minimum: tuple[int, int, int], risk: str) -> None:
+        self.minimum = minimum
+        self.risk = risk
 
 
-def ollama_version(base_url: str) -> tuple[int, int, int] | None:
+@dataclasses.dataclass(frozen=True, order=True)
+class OllamaVersion:
+    """The version of an Ollama server: ``X.Y.Z`` and if it is a pre-release.
+
+    WHY the pre-release flag: ``0.40.15-rc0`` comes before the release
+    ``0.40.15``, thus it is older than a minimum of ``0.40.15``.  The order
+    of the fields gives that: ``release`` is False for a pre-release.
+    ``text`` is the version as the server gives it, for the messages; it
+    does not count in the order.
+    """
+
+    major: int
+    minor: int
+    patch: int
+    release: bool = True
+    text: str = dataclasses.field(default="", compare=False)
+
+    @property
+    def core(self) -> tuple[int, int, int]:
+        """The numbers ``X.Y.Z`` without the pre-release flag."""
+        return (self.major, self.minor, self.patch)
+
+    def __str__(self) -> str:
+        return self.text or ".".join(map(str, self.core))
+
+
+# The suffix that ``git describe --long`` adds to the version of a build of
+# the scripts of Ollama (``scripts/env.sh``): the count of commits after the
+# tag, the commit, and "-dirty" for changed files.  ``0.40.15-0-g1a2b3c4``
+# is the release 0.40.15 or a later commit, not a pre-release.
+_GIT_DESCRIBE_SUFFIX = re.compile(r"-\d+-g[0-9a-f]+(?:-dirty)?$")
+
+
+def ollama_version(base_url: str) -> OllamaVersion | None:
     """Return the version of the Ollama server at *base_url* (``/api/version``), or None.
 
     None when the server does not answer, or gives a version that is not
     ``X.Y.Z`` (a build from source gives ``0.0.0``, which is a valid answer).
-    A suffix such as ``-rc0`` does not count.
+    A suffix after ``X.Y.Z`` (``-rc0``) marks a pre-release, except the
+    suffix of ``git describe`` (``-3-g1a2b3c4``), which comes after the tag.
     """
     try:
         resp = net.get(base_url.rstrip("/") + "/api/version", timeout=5.0)
@@ -619,26 +683,53 @@ def ollama_version(base_url: str) -> tuple[int, int, int] | None:
         version = resp.json().get("version")
     except (httpx.HTTPError, OSError, ValueError, AttributeError):
         return None
-    match = re.match(r"(\d+)\.(\d+)\.(\d+)", version) if isinstance(version, str) else None
-    return (int(match[1]), int(match[2]), int(match[3])) if match else None
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(.*)", version) if isinstance(version, str) else None
+    if match is None:
+        return None
+    # What stays after the suffix of git describe is a pre-release ("-rc0").
+    prerelease = _GIT_DESCRIBE_SUFFIX.sub("", match[4])
+    return OllamaVersion(int(match[1]), int(match[2]), int(match[3]), release=not prerelease, text=version)
 
 
-def ollama_version_problem(base_url: str) -> str | None:
-    """Return a sentence about an Ollama server that is too old for fw-context, or None.
+def ollama_url_uses(cfg: LLMConfig) -> list[OllamaUse]:
+    """Return the uses of the Ollama server of ``ollama_url``: the embeddings, the chat, or the two.
 
-    None also when the version is not known: the check of the server
-    reports a server that does not answer.  ``0.0.0`` (a build from source)
-    is not known to be old, thus it is None too.
+    WHY: each use has its own oldest server (``OllamaUse``).  The check of
+    a server that runs only the chat must not apply the minimum of the
+    embeddings.
+
+    Raises:
+        ValueError: ``chat_api_format`` is not valid, thus the chat use of
+            the server is not known.
+    """
+    from .chat_router import chat_on_ollama_url
+    from .embedder_factory import uses_ollama
+
+    uses = [OllamaUse.EMBEDDINGS] if uses_ollama(cfg) else []
+    if chat_on_ollama_url(cfg):
+        uses.append(OllamaUse.ANALYSIS)
+    return uses
+
+
+def ollama_version_problem(base_url: str, uses: Iterable[OllamaUse]) -> str | None:
+    """Return a sentence about an Ollama server that is too old for *uses*, or None.
+
+    The sentence names the minimum and the risk of each use that the
+    version does not reach.  None also when the version is not known: the
+    check of the server reports a server that does not answer.  ``0.0.0``
+    (a build from source) is not known to be old, thus it is None too.
     """
     version = ollama_version(base_url)
-    if version is None or version == (0, 0, 0) or version >= MIN_OLLAMA_VERSION:
+    if version is None or version.core == (0, 0, 0):
         return None
-    have, need = ".".join(map(str, version)), ".".join(map(str, MIN_OLLAMA_VERSION))
-    return (
-        f"Ollama {have} at {base_url} is older than {need}: the LLM analysis cannot count the tokens "
-        f"of a prompt, and the server can cut a long prompt or a long embedding input without an error. "
-        f"Update Ollama"
+    wanted = set(uses)
+    too_old = [use for use in OllamaUse if use in wanted and version < OllamaVersion(*use.minimum)]
+    if not too_old:
+        return None
+    reasons = "; ".join(
+        f"older than {'.'.join(map(str, use.minimum))}: {use.risk}" for use in too_old
     )
+    return f"Ollama {version} at {base_url} is too old for fw-context ({reasons}). Update Ollama"
 
 
 def _call_ollama_embed_impl(
@@ -860,12 +951,12 @@ def release_other_model(cfg: LLMConfig, phase: str) -> None:
     """
     if os.environ.get(NO_RELEASE_ENV) or cfg.provider != "ollama" or not cfg.embed_model:
         return
-    from .chat_router import chat_ollama_server
+    from .chat_router import chat_on_ollama_url
     from .embedder_factory import uses_ollama
 
-    server = chat_ollama_server(cfg)
-    if not uses_ollama(cfg) or not server or server.rstrip("/") != cfg.ollama_url.rstrip("/"):
+    if not uses_ollama(cfg) or not chat_on_ollama_url(cfg):
         return
+    server = cfg.ollama_url
     if phase == "analysis":
         model = cfg.embed_model
     else:

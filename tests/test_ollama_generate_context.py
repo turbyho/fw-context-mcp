@@ -155,18 +155,46 @@ def _version_server(version):
     return mock.patch.object(ollama.net, "get", side_effect=get)
 
 
-@pytest.mark.parametrize(("version", "old"), [
-    # 0.30.0 counted a prompt without its cached tokens.
-    ("0.29.9", True), ("0.12.6", True), ("0.30.0", True), ("0.30.1", False), ("0.35.1", False),
-    ("0.40.2-rc0", False),
-    ("0.0.0", False),  # a build from source: not known to be old
+_EMBED, _ANALYSIS = ollama.OllamaUse.EMBEDDINGS, ollama.OllamaUse.ANALYSIS
+
+
+@pytest.mark.parametrize(("version", "use", "old"), [
+    # The analysis: 0.30.0 counted a prompt without its cached tokens.
+    ("0.12.6", _ANALYSIS, True), ("0.30.0", _ANALYSIS, True), ("0.30.1-rc2", _ANALYSIS, True),
+    ("0.30.1", _ANALYSIS, False), ("0.30.10", _ANALYSIS, False), ("0.35.1", _ANALYSIS, False),
+    # The embeddings: 0.30.10 stopped its runner on an input over 2048
+    # tokens (measured on macOS); 0.40.15 is the oldest version that passed.
+    ("0.30.10", _EMBED, True), ("0.35.1", _EMBED, True), ("0.40.14", _EMBED, True),
+    # A pre-release comes before its release.
+    ("0.40.15-rc0", _EMBED, True), ("0.40.15-rc0-3-g1a2b3c4", _EMBED, True),
+    # A build of the scripts of Ollama: git describe gives the commits after
+    # the tag, thus the version is the release or later.
+    ("0.40.15-0-g1a2b3c4", _EMBED, False), ("0.40.15-2-gdeadbee-dirty", _EMBED, False),
+    ("0.40.14-5-g1a2b3c4", _EMBED, True),
+    ("0.40.15", _EMBED, False), ("0.40.16", _EMBED, False), ("0.41.0-rc0", _EMBED, False),
+    # A build from source: not known to be old.
+    ("0.0.0", _EMBED, False), ("0.0.0", _ANALYSIS, False),
 ])
-def test_an_ollama_older_than_the_minimum_is_named(version, old):
+def test_an_ollama_older_than_the_minimum_of_its_use_is_named(version, use, old):
     with _version_server(version):
-        problem = ollama.ollama_version_problem("http://localhost:11434")
+        problem = ollama.ollama_version_problem("http://localhost:11434", [use])
     assert (problem is not None) is old
     if old:
-        assert version in problem and "Update Ollama" in problem
+        # The version as the server gives it: the operator compares it with `ollama --version`.
+        assert f"Ollama {version} at" in problem and "Update Ollama" in problem
+        assert use.risk in problem
+
+
+def test_the_sentence_names_only_the_uses_that_the_version_does_not_reach():
+    with _version_server("0.35.1"):
+        problem = ollama.ollama_version_problem("http://localhost:11434", [_EMBED, _ANALYSIS])
+    assert problem is not None
+    assert _EMBED.risk in problem and _ANALYSIS.risk not in problem
+
+
+def test_no_use_gives_no_problem():
+    with _version_server("0.12.6"):
+        assert ollama.ollama_version_problem("http://localhost:11434", []) is None
 
 
 def test_a_server_that_does_not_answer_gives_no_version_problem():
@@ -175,7 +203,7 @@ def test_a_server_that_does_not_answer_gives_no_version_problem():
 
     with mock.patch.object(ollama.net, "get", side_effect=get):
         assert ollama.ollama_version("http://localhost:11434") is None
-        assert ollama.ollama_version_problem("http://localhost:11434") is None
+        assert ollama.ollama_version_problem("http://localhost:11434", [_EMBED, _ANALYSIS]) is None
 
 
 def test_doctor_and_init_report_an_old_ollama():
@@ -184,9 +212,60 @@ def test_doctor_and_init_report_an_old_ollama():
 
     with mock.patch("fw_context_mcp.llm._diag.check_setup", return_value={"status": "ok"}), \
             _version_server("0.20.0"):
-        result = _checks.check_ollama_running(LLMConfig())
+        result = _checks.check_ollama_running(LLMConfig(embed_model="qwen3-embedding:0.6b"))
     assert result.status == "degraded"
     assert "0.20.0" in result.message
+    assert _EMBED.risk in result.message and _ANALYSIS.risk in result.message
+
+
+@pytest.mark.parametrize(("cfg", "degraded"), [
+    # Embeddings on this server: the minimum of the embeddings applies.
+    (LLMConfig(embed_model="qwen3-embedding:0.6b"), True),
+    # Embeddings on the CPU (sentence-transformers), the chat on this
+    # server: only the minimum of the analysis applies.
+    (LLMConfig(embed_model="BAAI/bge-small-en-v1.5"), False),
+    # Embeddings on the CPU, the chat on another Ollama: no use of this server.
+    (LLMConfig(embed_model="BAAI/bge-small-en-v1.5", chat_api_base="http://chat.example.test:11434"), False),
+])
+def test_the_check_of_ollama_url_applies_the_minimum_of_each_of_its_uses(cfg, degraded):
+    from fw_context_mcp.deps import _checks
+
+    with mock.patch("fw_context_mcp.llm._diag.check_setup", return_value={"status": "ok"}), \
+            _version_server("0.35.1"):
+        result = _checks.check_ollama_running(cfg)
+    assert (result.status == "degraded") is degraded
+
+
+def test_doctor_reports_that_the_version_check_did_not_run_for_a_bad_chat_format():
+    """An unknown chat use of ollama_url is an error of the check, not a pass."""
+    from fw_context_mcp.deps import _checks
+
+    cfg = LLMConfig(chat_api_base="http://localhost:11434", chat_api_format="bad")
+    with mock.patch("fw_context_mcp.llm._diag.check_setup", return_value={"status": "ok"}), \
+            _version_server("0.29.0"):
+        result = _checks.check_ollama_running(cfg)
+    assert result.status == "error"
+    assert "did not run" in result.message and "chat_api_format" in result.message
+
+
+@pytest.mark.parametrize(("version", "expected"), [
+    ("0.35.1", True), ("0.40.15", False),
+])
+def test_the_mcp_check_names_an_old_ollama(monkeypatch, version, expected):
+    """check_ollama of the MCP server tells it before an index run stops the embeddings."""
+    from fw_context_mcp.config.settings import Config
+    from fw_context_mcp.mcp.handlers import maintenance
+
+    cfg = Config()
+    cfg.llm = LLMConfig(embed_model="qwen3-embedding:0.6b")
+    monkeypatch.setattr(maintenance, "_resolve_context", lambda root: (None, cfg, None, None))
+    monkeypatch.setattr(maintenance, "check_setup", lambda llm: {"status": "ok", "ollama_running": True})
+    with _version_server(version):
+        result = maintenance.check_ollama()
+    assert result["status"] == "ok"
+    assert ("version_problem" in result) is expected
+    if expected:
+        assert _EMBED.risk in result["version_problem"]
 
 
 def test_doctor_reports_an_old_ollama_of_the_chat_server():
@@ -199,6 +278,18 @@ def test_doctor_reports_an_old_ollama_of_the_chat_server():
         result = _checks.check_ollama_chat_model(cfg)
     assert result.status == "degraded"
     assert "chat.example.test" in result.message
+    assert _ANALYSIS.risk in result.message and _EMBED.risk not in result.message
+
+
+def test_a_chat_server_older_than_the_embeddings_minimum_is_applicable():
+    """The runner crash of 0.30.x occurs only in the embedding mode: the chat server needs 0.30.1."""
+    from fw_context_mcp.deps import _checks
+
+    cfg = LLMConfig(chat_api_base="http://chat.example.test:11434")
+    with mock.patch("fw_context_mcp.llm._diag.installed_models", return_value=[cfg.model]), \
+            _version_server("0.35.1"):
+        result = _checks.check_ollama_chat_model(cfg)
+    assert result.status == "ok"
 
 
 @pytest.mark.parametrize("stream", [False, True])

@@ -832,7 +832,7 @@ def _nvidia_gpu_present() -> bool:
 
 
 def check_ollama_running(cfg) -> DepCheckResult:
-    """Verify Ollama is reachable."""
+    """Verify Ollama is reachable, and that its version is applicable to its uses."""
     if not cfg.enabled:
         return DepCheckResult(name="ollama", status="skipped", message="LLM disabled in config", critical=False)
 
@@ -848,10 +848,20 @@ def check_ollama_running(cfg) -> DepCheckResult:
             instructions=ollama_instructions(platform_ctx),
             critical=False,
         )
-    from ..llm.ollama import ollama_version_problem
+    from ..llm.ollama import ollama_url_uses, ollama_version_problem
 
     # Also in `fw-context init`, which runs these checks.
-    problem = ollama_version_problem(cfg.ollama_url)
+    try:
+        uses = ollama_url_uses(cfg)
+    except ValueError as exc:
+        # The chat use of the server is not known: the version check did
+        # not run, and the check says so (the check "chat-model" names the
+        # same error).
+        return DepCheckResult(
+            name="ollama", status="error", critical=False,
+            message=f"the version check of {cfg.ollama_url} did not run: {exc}",
+        )
+    problem = ollama_version_problem(cfg.ollama_url, uses)
     if problem:
         return DepCheckResult(
             name="ollama",
@@ -910,9 +920,9 @@ def check_ollama_chat_model(cfg) -> DepCheckResult:
         )
     if server.rstrip("/") != cfg.ollama_url.rstrip("/"):
         # The check "ollama" reports the version of ollama_url only.
-        from ..llm.ollama import ollama_version_problem
+        from ..llm.ollama import OllamaUse, ollama_version_problem
 
-        problem = ollama_version_problem(server)
+        problem = ollama_version_problem(server, [OllamaUse.ANALYSIS])
         if problem:
             return DepCheckResult(name="chat-model", status="degraded", message=problem, critical=False)
     if not any(_model_name_matches(m, cfg.model) for m in models):

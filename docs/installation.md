@@ -1,108 +1,176 @@
 # Installation
 
-This is the complete installation guide. This guide covers prerequisites, setup, Ollama, the LLM setup, and AI assistant integration.
+This is the complete installation guide. It covers the installation on
+Linux, macOS and Windows, the tools of each build system, Ollama, the LLM
+setup, and the setup of the AI assistant. For what was tested on each
+platform and what is different there, see [Platforms](platforms.md).
 
 ## Prerequisites
 
-### Linux
-
-```bash
-# Ubuntu / Debian
-sudo apt install python3
-
-# Arch / Manjaro
-sudo pacman -S python
-
-# Fedora / RHEL
-sudo dnf install python3
-
-# uv (all distros)
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
-### macOS
-
-```bash
-# Homebrew (install from https://brew.sh if not present)
-brew install python@3.12 uv llvm
-
-# Add Homebrew Python to PATH
-echo 'export PATH="/opt/homebrew/opt/python@3.12/libexec/bin:$PATH"' >> ~/.zshrc
-```
-
-### Windows
-
-Install these programs, and make sure that each one is on `PATH`:
-
-- Python 3.11 or later, from [python.org](https://www.python.org/downloads/windows/).
-- [Git for Windows](https://git-scm.com/download/win). fw-context uses `git` to find new source files.
-- The compiler toolchain of your project, for example the
-  [Arm GNU Toolchain](https://developer.arm.com/downloads/-/arm-gnu-toolchain-downloads).
-- [LLVM](https://github.com/llvm/llvm-project/releases), when the project has assembly files (`.S`):
-  fw-context runs `clang -E` to preprocess them. Without `clang` on `PATH`, the index has no symbols
-  of the assembly files.
-
-What was tested on Windows 11 (Python 3.11):
-
-- The full test suite.
-- A project in `bare` mode with `arm-none-eabi-gcc` 12.2 and 14.2, in a directory with a space
-  and characters above 127 in its name: `fw-context init`, `fw-context index`, `fw-context search`,
-  and the MCP server through an MCP client over stdio.
-
-The other build systems (Zephyr and NCS, ESP-IDF, PlatformIO, CMake, Makefile, Mbed OS, Arduino,
-Keil, IAR) were not tried on Windows with a real project. The tests cover their Windows code: the
-activate scripts (`.bat`, `.cmd`, `.ps1`), the lookup of the tools through `PATHEXT`, and the
-command lines of Windows.
-
-A GCC older than version 13 on Windows cannot open a file whose path has a character outside the
-ANSI code page of the system (measured with GCC 12.2: "ě" became "e", and GCC did not find the
-file). GCC 13 and later declare the code page UTF-8 in their manifest
-([GCC PR108865](https://gcc.gnu.org/bugzilla/show_bug.cgi?id=108865); measured with 14.2). Use
-GCC 13 or later, or keep such a project in a path without these characters.
-
 | What | Why |
 |------|-----|
-| Python 3.11+ | Runtime |
-| [`uv`](https://docs.astral.sh/uv/) *(optional)* | Fast package installer. Without a working `uv`, `make install` uses `python -m venv` and `pip`. |
-| Compiler toolchain (for example ARM GCC or the Zephyr SDK) | libclang needs system headers to parse cross-compiled code |
-| [`bear`](https://github.com/rizsotto/Bear) *(optional)* | Records the compiler calls of a `[build] command` that you write. No builder of fw-context needs it. |
-| [Ollama](https://ollama.com) *(optional)* | Computes the vector embeddings (`semantic_search`, `smart_search` re-rank) and the symbol analysis (`explain_symbol`). The core index does not need it. See [Ollama (optional)](#ollama-optional). |
+| Python 3.11 or later | Runtime |
+| [`uv`](https://docs.astral.sh/uv/) or [`pipx`](https://pipx.pypa.io/) | Installs fw-context in an environment of its own, and puts its programs on `PATH` |
+| `git` | fw-context uses `git` to find new source files |
+| `clang` (the program, not libclang) | Gives the values of the macros (`clang -dM -E`), and preprocesses the assembly files (`.S`). Without it, the index has no symbols of the assembly files. |
+| The toolchain of your project, for example Arm GCC or the Zephyr SDK | libclang reads the system headers of the cross compiler |
+| [Ollama](https://ollama.com) *(optional)* | Computes the vector embeddings and the symbol analysis. The core index does not need it. See [Ollama (optional)](#ollama-optional). |
+
+The `libclang-ng` wheel holds the libclang library and its Python binding.
+Thus you do not install libclang yourself.
 
 ## Install
 
-### pip (recommended)
+Each installation gives two programs: `fw-context` (the CLI) and
+`fw-context-mcp` (the MCP server). Install fw-context with `uv tool` or
+`pipx`: each makes an environment of its own for fw-context, and puts the
+two programs in `~/.local/bin` on each platform.
 
-```bash
-pip install fw-context-mcp
-# or via uv:
-uv pip install fw-context-mcp
-```
+A plain `pip install fw-context-mcp` can fail or install the programs in a
+directory that is not on `PATH`. The Python of Debian, Ubuntu and
+Homebrew stops it with the error `externally-managed-environment`
+(PEP 668).
 
-This command installs the latest release from PyPI with all dependencies
-(libclang-ng, pysqlite3, sqlite-vec, watchfiles, httpx, mcp, tomli-w, tomlkit,
-keyring, pyjwt, packaging, PyYAML).  The `libclang-ng` wheel holds the
-libclang library and its Python binding, thus no system libclang package is
-necessary.
+### Linux
 
-The `fw-context` binary lands in your active Python environment's `bin/`
-directory — typically `~/.local/bin` for user installs, or the virtual
-environment's `bin/` if you use one. Ensure that directory is on your
-`PATH`.
+1. Install Python, git and clang:
+
+   ```bash
+   # Ubuntu / Debian
+   sudo apt install python3 git clang
+   # Arch / Manjaro
+   sudo pacman -S python git clang
+   # Fedora / RHEL
+   sudo dnf install python3 git clang
+   ```
+
+2. Install `uv`:
+
+   ```bash
+   curl -LsSf https://astral.sh/uv/install.sh | sh
+   ```
+
+3. Install fw-context:
+
+   ```bash
+   uv tool install fw-context-mcp
+   ```
+
+4. If `~/.local/bin` is not on `PATH`, run `uv tool update-shell`, then
+   open a new terminal.
+5. Install the clang headers that the index needs:
+
+   ```bash
+   fw-context doctor --fix --only clang-resource
+   ```
+
+With `pipx`, use `pipx install fw-context-mcp` in step 3, and
+`pipx ensurepath` in step 4.
+
+### macOS
+
+1. Install the Command Line Tools of Xcode. They give `git` and `clang`:
+
+   ```bash
+   xcode-select --install
+   ```
+
+2. Install `uv` with [Homebrew](https://brew.sh):
+
+   ```bash
+   brew install uv
+   ```
+
+3. Install fw-context. `uv` gets a Python 3.11 or later when the system
+   has none:
+
+   ```bash
+   uv tool install fw-context-mcp
+   ```
+
+4. `~/.local/bin` is not on `PATH` by default. Run `uv tool update-shell`,
+   then open a new terminal.
+5. Install the clang headers that the index needs:
+
+   ```bash
+   fw-context doctor --fix --only clang-resource
+   ```
+
+On Apple Silicon, a toolchain that exists only for x86_64 (for example an
+old Arm GCC) runs through Rosetta 2. To install Rosetta 2, run
+`softwareupdate --install-rosetta --agree-to-license`.
+
+### Windows
+
+Run these commands in PowerShell.
+
+1. Install Python, git and LLVM (for `clang`):
+
+   ```powershell
+   winget install Python.Python.3.11
+   winget install Git.Git
+   winget install LLVM.LLVM
+   ```
+
+   `winget install LLVM.LLVM` does not put LLVM on `PATH`. fw-context
+   also finds `clang.exe` in `C:\Program Files\LLVM\bin`.
+2. Install `uv`:
+
+   ```powershell
+   winget install astral-sh.uv
+   ```
+
+3. Open a new terminal, then install fw-context:
+
+   ```powershell
+   uv tool install fw-context-mcp
+   ```
+
+4. `uv` puts the programs in `%USERPROFILE%\.local\bin`. Run
+   `uv tool update-shell` one time, then open a new terminal.
+5. Install the clang headers that the index needs:
+
+   ```powershell
+   fw-context doctor --fix --only clang-resource
+   ```
+
+6. Install the toolchain of your project and put it on `PATH`, for example
+   the [Arm GNU Toolchain](https://developer.arm.com/downloads/-/arm-gnu-toolchain-downloads).
+
+On Windows, use GCC 13 or later when a path of the project has a character
+outside the ANSI code page of the system. See [Platforms](platforms.md#windows).
 
 ### From source
 
-```bash
-# Clone
-git clone git@github.com:turbyho/fw-context-mcp.git ~/.fw-context/src
+The source install puts fw-context in the venv `~/.fw-context/.venv`, in
+editable mode: a `git pull` changes the installed code at once.
 
-# Install (creates venv, installs package, symlinks binaries into ~/.local/bin)
+On Linux and macOS:
+
+```bash
+git clone https://github.com/turbyho/fw-context-mcp.git ~/.fw-context/src
 cd ~/.fw-context/src && make install
 ```
 
 `make install` uses `uv` when `uv --version` runs. When `uv` is missing,
 or is a shim that cannot run (pyenv, asdf), it uses `python3 -m venv` and
-`pip` in the venv `~/.fw-context/.venv`. The package is installed in
-editable mode.
+`pip`. It puts symbolic links to `fw-context` and `fw-context-mcp` in
+`~/.local/bin`, and installs the clang headers.
+
+On Windows, the `Makefile` does not work. Run these commands in
+PowerShell:
+
+```powershell
+git clone https://github.com/turbyho/fw-context-mcp.git $HOME\.fw-context\src
+py -3.11 -m venv $HOME\.fw-context\.venv
+& $HOME\.fw-context\.venv\Scripts\python.exe -m pip install -e $HOME\.fw-context\src
+& $HOME\.fw-context\.venv\Scripts\fw-context.exe doctor --fix --only clang-resource
+```
+
+Then put `%USERPROFILE%\.fw-context\.venv\Scripts` on `PATH` (Settings,
+System, About, Advanced system settings, Environment Variables), and open
+a new terminal. `fw-context init` finds `fw-context-mcp.exe` in this
+directory also when it is not on `PATH`.
 
 **File watcher (auto-reindex on save):**
 
@@ -125,7 +193,9 @@ The LLM profiles (server, model, API key variable) are in the global config `~/.
 
 A config file never holds an API key. fw-context gets the key of a profile from the environment variable that `api_key_env` names, then from the keyring of the system, then from `secrets.toml` in `~/.fw-context`. To store a key, run `fw-context llm key set <profile>`. See [API keys](configuration.md#api-keys).
 
-For the full reference, see **[Configuration →](configuration.md)**.
+For the full reference, see **[Configuration →](configuration.md)**. For a
+Windows path in a TOML file, see
+[A Windows path in TOML](platforms.md#a-windows-path-in-toml).
 
 ### Zephyr
 
@@ -177,10 +247,17 @@ defines = [
 
 ## Dependencies by Build System
 
-Install only the tools that your build system needs. `pip install fw-context-mcp`
-installs the core Python packages automatically: `libclang-ng`, `pysqlite3`,
+Install only the tools that your build system needs. The installation of
+fw-context installs the core Python packages: `libclang-ng`, `pysqlite3`,
 `sqlite-vec`, `watchfiles`, `httpx`, `mcp`, `tomli-w`, `tomlkit`, `keyring`,
 `pyjwt`, `packaging`, and `PyYAML`.
+
+A Python tool of a build system (`compiledb`, `keil2clangd`, `platformio`)
+must be on `PATH`, or in `[build] python`. `uv tool` and `pipx` install
+fw-context in an environment of its own, thus a `pip install` does not
+reach that environment. Install such a tool with
+`uv tool install <tool>` (or `pipx install <tool>`), which puts it on
+`PATH`.
 
 ### Core (All Projects)
 
@@ -198,6 +275,11 @@ sudo apt install clang
 sudo dnf install clang
 # macOS
 xcode-select --install   # ships clang as part of Command Line Tools
+```
+
+```powershell
+# Windows (fw-context also finds clang.exe in C:\Program Files\LLVM\bin)
+winget install LLVM.LLVM
 ```
 
 ### Zephyr RTOS
@@ -219,14 +301,16 @@ xcode-select --install   # ships clang as part of Command Line Tools
 > Then it asks for the script that sets up the environment of the project:
 > Enter keeps the script that it found, and a path selects the script of
 > your project. Each build, and each lookup of `west`, runs after
-> `source <activate>`.
+> `source <activate>`. On Windows the script is `.fw-context/ncs-env.cmd`,
+> and fw-context runs the build in the environment that it makes (see
+> [Activate scripts](platforms.md#activate-scripts)).
 > See [Build Configuration](build.md#13-build-environment--activation-script-for-zephyrncs).
 
 ### PlatformIO
 
 | Tool | Why | Install |
 |------|-----|---------|
-| **pio** / **platformio** | Build + compile_commands.json | `pip install platformio` |
+| **pio** / **platformio** | Build + compile_commands.json | The [installer of PlatformIO Core](https://docs.platformio.org/en/latest/core/installation/methods/installer-script.html) (`~/.platformio/penv`), or `uv tool install platformio` |
 
 `fw-context` runs `pio run --target compiledb` plus a real build for `.d` files.
 
@@ -234,7 +318,8 @@ xcode-select --install   # ships clang as part of Command Line Tools
 > `~/.platformio/penv/bin/python` (the bundled venv; on Windows
 > `%USERPROFILE%\.platformio\penv\Scripts\python.exe`) or from `pio` on PATH.
 > When automatic detection fails, set `python = "/path/to/python"` in
-> `.fw-context/local.toml`.
+> `.fw-context/local.toml` (on Windows, for example
+> `python = 'C:\Users\<user>\.platformio\penv\Scripts\python.exe'`).
 
 ### Mbed OS
 
@@ -249,14 +334,18 @@ each source (`data/mbed/compile_db.py`). It does not need `bear`, on Linux, macO
 > **`fw-context init`** detects the Python interpreter for `mbed-cli` automatically,
 > from pyenv versions (`~/.pyenv/versions/*/bin/mbed`) and common venv paths
 > (`~/mbed_venv`). When `fw-context init` detects the interpreter, it writes the
-> path to `.fw-context/local.toml`. Without it, the build stops with an error. For
+> path to `.fw-context/local.toml`. Without it, the build stops with an error. On
+> Windows, the venv has its Python in `Scripts`, for example
+> `python = 'C:\Users\<user>\mbed_venv\Scripts\python.exe'`. `init` does not
+> look in the versions of pyenv-win. The compiler of `mbed` comes from
+> `GCC_ARM_PATH` in `.mbed` of the project. For
 > details, see **[Build Configuration →](build.md#12-build-environment--the-python-of-mbed-cli)**.
 
 ### Arduino CLI
 
 | Tool | Why | Install |
 |------|-----|---------|
-| **arduino-cli** | Compile + compile_commands.json | `curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh \| sh` |
+| **arduino-cli** | Compile + compile_commands.json | Linux: `curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh \| sh` / macOS: `brew install arduino-cli` / Windows: `winget install ArduinoSA.CLI` |
 
 This build system requires `fqbn` (fully qualified board name) in
 `.fw-context/config.toml`. Example: `fqbn = "arduino:avr:uno"`.
@@ -274,10 +363,14 @@ the libclang token stream. This build system does not need `.d` files.
 | cmake | Build system | Bundled with ESP-IDF |
 
 `fw-context` runs `idf.py build`. This command requires the ESP-IDF environment:
-`. ./export.sh`, or `idf.py` on PATH.
+the export script of ESP-IDF (`export.sh`, on Windows `export.bat`), or `idf.py`
+on PATH.
 
 > **`fw-context init`** detects the ESP-IDF export script automatically, from
-> `$IDF_PATH/export.sh`, `~/esp/esp-idf/export.sh`, or `idf.py` on PATH. When
+> `$IDF_PATH/export.sh`, `~/esp/esp-idf/export.sh`, or `idf.py` on PATH. On
+> Windows it looks for `export.bat`. It does not detect the scripts of the
+> ESP-IDF Installation Manager (EIM) on Windows: set `activate` yourself to a
+> `.bat`, `.cmd` or `.ps1` script that prepares the environment of ESP-IDF. When
 > `fw-context init` detects the script, it writes `activate` to
 > `.fw-context/local.toml`. Then builds work without you sourcing the
 > environment manually.
@@ -286,19 +379,27 @@ the libclang token stream. This build system does not need `.d` files.
 
 | Tool | Why | Install |
 |------|-----|---------|
-| **cmake** | Build + compile_commands.json | `sudo pacman -S cmake` / `sudo apt install cmake` / `sudo dnf install cmake` / `brew install cmake` |
+| **cmake** | Build + compile_commands.json | `sudo pacman -S cmake` / `sudo apt install cmake` / `sudo dnf install cmake` / `brew install cmake` / Windows: `winget install Kitware.CMake` |
+| **ninja** *(Windows)* | A generator that writes compile_commands.json | `winget install Ninja-build.Ninja` |
 
 Use this build system for any CMake project that is not Zephyr or ESP-IDF.
 `fw-context` runs `cmake -B <out> -DCMAKE_EXPORT_COMPILE_COMMANDS=ON && cmake --build <out>`.
 `<out>` is `.fw-context/build/<variant>/out`. With `[build] cmake_generator`,
 the configure step also gets `-G <generator>`.
 
+Only the Makefile and Ninja generators of CMake write
+`compile_commands.json`. On Windows, CMake uses a Visual Studio generator
+by default when Visual Studio is installed. Thus set
+`cmake_generator = "Ninja"` on Windows. When the generator writes no
+database, fw-context stops after the configure step and tells which
+generator CMake used.
+
 ### Makefile
 
 | Tool | Why | Install |
 |------|-----|---------|
-| **make** | Build tool | `sudo pacman -S make` / `sudo apt install make` / `sudo dnf install make` / macOS: bundled with Xcode CLT |
-| **compiledb** | Generate compile_commands.json from make output | `pip install compiledb` |
+| **make** | Build tool | `sudo pacman -S make` / `sudo apt install make` / `sudo dnf install make` / macOS: bundled with Xcode CLT / Windows: GNU make on `PATH` (not tested on Windows) |
+| **compiledb** | Generate compile_commands.json from make output | `uv tool install compiledb` |
 
 `fw-context` runs `compiledb -n -o compile_commands.json make` (dry-run by default).
 
@@ -306,7 +407,7 @@ the configure step also gets `-G <generator>`.
 
 | Tool | Why | Install |
 |------|-----|---------|
-| **keil2clangd** | Converts `.uvprojx` → compile_commands.json | `pip install keil2clangd` |
+| **keil2clangd** | Converts `.uvprojx` → compile_commands.json | `uv tool install keil2clangd` |
 
 **You do not need a Keil installation.** `keil2clangd` parses the XML project file statically.
 
@@ -314,7 +415,7 @@ the configure step also gets `-G <generator>`.
 
 | Tool | Why | Install |
 |------|-----|---------|
-| **keil2clangd** | Converts `.ewp` → compile_commands.json | `pip install keil2clangd` |
+| **keil2clangd** | Converts `.ewp` → compile_commands.json | `uv tool install keil2clangd` |
 
 **You do not need an IAR installation.** `keil2clangd` parses the XML project file statically.
 
@@ -322,7 +423,7 @@ the configure step also gets `-G <generator>`.
 
 | Tool | Why | Install |
 |------|-----|---------|
-| **gcc** (or any C/C++ compiler) | Syntax-only compilation for `.d` files | `sudo pacman -S gcc` / `sudo apt install gcc` / `sudo dnf install gcc` / `brew install gcc` (or Xcode CLT clang) |
+| The compiler of the project (for example `arm-none-eabi-gcc`) | Syntax-only compilation for `.d` files | The toolchain of your target, for example the [Arm GNU Toolchain](https://developer.arm.com/downloads/-/arm-gnu-toolchain-downloads) on each platform |
 
 This mode needs no build system. Configure `source_dirs`, `include_dirs`, and
 `defines` in `.fw-context/config.toml`. `fw-context` scans the sources and
@@ -339,7 +440,7 @@ Then run `fw-context index compile_commands.json` with the generated file.
 
 ### TI Code Composer Studio (Manual Setup)
 
-This setup needs no CLI tools. Enable JSON Compilation Database in Project Settings. Or use `bear`:
+This setup needs no CLI tools. Enable JSON Compilation Database in Project Settings. Or, on Linux and macOS, use `bear`:
 
 ```bash
 bear -- eclipse -nosplash -application com.ti.ccstudio.apps.projectBuild ...
@@ -358,18 +459,24 @@ bear -- eclipse -nosplash -application com.ti.ccstudio.apps.projectBuild ...
 | **Makefile** | `make` | `compiledb` | no |
 | **Keil MDK** | — | `keil2clangd` | **no** (static parse) |
 | **IAR EWARM** | — | `keil2clangd` | **no** (static parse) |
-| **Manual (bare)** | `gcc` (any compiler) | — | any C/C++ compiler |
+| **Manual (bare)** | the compiler of the project | — | the toolchain of the target |
 | **STM32CubeIDE** | — | — | STM32CubeIDE (manual) |
 | **TI CCS** | — | — | TI CCS (manual) |
 
 ## Update
 
-```bash
-cd ~/.fw-context/src && make update
-```
+Update fw-context with the tool that installed it:
+
+| Installation | Update command |
+|---|---|
+| `uv tool` | `uv tool upgrade fw-context-mcp` |
+| `pipx` | `pipx upgrade fw-context-mcp` |
+| From source, Linux and macOS | `cd ~/.fw-context/src && make update` |
+| From source, Windows | `git -C $HOME\.fw-context\src pull`, then `& $HOME\.fw-context\.venv\Scripts\python.exe -m pip install -e $HOME\.fw-context\src` |
 
 `make update` runs `git pull`, and then the same editable install as
-`make install`.
+`make install`. After an update, restart the AI assistant: the MCP server
+is a child process of the assistant, and it runs the old code until then.
 
 An update from a release that used the `libclang` package leaves that
 package installed. Run `fw-context doctor --fix`: it removes the old
@@ -411,6 +518,59 @@ Do these steps in this order:
    [`fw-context analyze`](tools.md#fw-context-analyze)). On a paid LLM
    profile, this run costs more than a usual run.
 
+## Uninstall
+
+Do these steps in this order. Steps 1 and 2 use the programs of
+fw-context, thus do them before step 3.
+
+1. Remove the stored API key and the sign-in of each LLM profile. The
+   keyring of the system keeps them after the uninstall:
+
+   ```bash
+   fw-context llm list                    # the profiles
+   fw-context llm remove <profile>        # the profile, its own key and its sign-in
+   fw-context llm key delete <profile>    # the key of a profile that is in use
+   fw-context llm logout <profile>        # the sign-in of a chatgpt profile that is in use
+   ```
+
+   `fw-context llm remove` does not remove a profile that the config
+   uses. For such a profile, use `llm key delete` and `llm logout`.
+
+2. Remove the MCP server from each AI assistant:
+   - Claude Code: `claude mcp remove --scope user fw-context`
+   - Codex: `codex mcp remove fw-context`
+   - OpenCode, Kilo and Cursor: remove the entry `fw-context` from
+     `~/.config/opencode/opencode.json`, `~/.config/kilo/kilo.json` or
+     `~/.cursor/mcp.json`.
+3. Remove the programs:
+
+   | Installation | Command |
+   |---|---|
+   | `uv tool` | `uv tool uninstall fw-context-mcp` |
+   | `pipx` | `pipx uninstall fw-context-mcp` |
+   | From source, Linux and macOS | `cd ~/.fw-context/src && make uninstall` (it also does step 4) |
+   | From source, Windows | Remove `%USERPROFILE%\.fw-context\.venv` and `%USERPROFILE%\.fw-context\src`, and remove the `Scripts` directory from `PATH` |
+
+4. Remove the global directory `~/.fw-context` (on Windows
+   `%USERPROFILE%\.fw-context`).
+
+   > WARNING: THE GLOBAL DIRECTORY HOLDS THE INDEX OF EACH PROJECT, THE
+   > GLOBAL CONFIG, THE LLM CACHE AND `secrets.toml`. YOU CANNOT RECOVER
+   > THEM AFTER YOU REMOVE THE DIRECTORY.
+
+5. In each project, remove the files that `fw-context init` wrote: the
+   directory `.fw-context`, the section between the `fw-context` markers
+   in `CLAUDE.md` or `AGENTS.md`, and the agents and skills of
+   fw-context in `.claude`, `.opencode`, `.kilo`, `.codex`, `.cursor`
+   and `.agents`.
+6. If you used `fw-context init --scope global` or `--scope all`, remove
+   the global files too: the section between the `fw-context` markers in
+   `~/.claude/CLAUDE.md`, the files `fw-context.md` or `fw-context.mdc`
+   in `~/.config/opencode/rules`, `~/.kilo/rules`, `~/.codex/rules` and
+   `~/.cursor/rules`, and the agents and skills of fw-context in
+   `~/.claude`, `~/.config/opencode`, `~/.kilo`, `~/.codex`, `~/.cursor`
+   and `~/.agents`.
+
 ## Verify
 
 ```bash
@@ -450,10 +610,15 @@ Alternatives:
   to a model of that API. See
   [Embeddings through an API](configuration.md#embeddings-through-an-api).
 - **Embeddings without Ollama.** Install the `st` extra
-  (`pip install "fw-context-mcp[st]"`) and set `embed_model` to a
+  (`uv tool install "fw-context-mcp[st]"`, or
+  `pipx install "fw-context-mcp[st]"`) and set `embed_model` to a
   sentence-transformers model, for example `"BAAI/bge-small-en-v1.5"`.
-  `fw-context index` then stores the vectors without Ollama, and
-  `semantic_search` embeds the query locally too.
+  `fw-context index` then stores the vectors without Ollama, on the CPU
+  when the machine has no GPU, and `semantic_search` embeds the query
+  locally too. The extra installs PyTorch (some GB on Linux). At the first
+  use, sentence-transformers downloads the model from Hugging Face (for
+  `BAAI/bge-small-en-v1.5` about 130 MB), and logs a warning when
+  `HF_TOKEN` is not set. A download without a token works.
 - **No LLM.** Set `enabled = false` in `[llm]`. The LLM-calling tools then
   return raw prompts, and the AI assistant processes the results with its
   own model. `fw-context index` then skips the embeddings and the symbol
@@ -465,32 +630,54 @@ Alternatives:
 ### Install Ollama
 
 ```bash
-# Linux / macOS (all distros)
+# Linux (each distribution)
 curl -fsSL https://ollama.com/install.sh | sh
-
 # Arch / Manjaro
 sudo pacman -S ollama
-# or: yay -S ollama
-
 # Fedora / RHEL
 sudo dnf install ollama
 
-# Verify
-ollama --version
+# macOS: the app from https://ollama.com/download, or Homebrew
+brew install ollama
+brew services start ollama
 ```
 
-Ollama runs a daemon on `http://localhost:11434`. This daemon must run when
-you run `fw-context index` (embeddings, symbol analysis), and when you call
-`semantic_search`, `smart_search`, or `explain_symbol`.
-
-```bash
-ollama serve &   # start daemon if not running as a service
+```powershell
+# Windows
+winget install Ollama.Ollama
 ```
 
-fw-context needs Ollama 0.30.1 or later. An older server cannot give the
-count of the tokens of a prompt to the LLM analysis, and it can cut a long
-prompt or a long embedding input without an error. `fw-context doctor`
-reports an older server (the checks `ollama` and `chat-model`).
+To make sure that Ollama runs, run `ollama --version`.
+
+Ollama runs a server on `http://localhost:11434`. This server must run
+when you run `fw-context index` (embeddings, symbol analysis), and when
+you call `semantic_search`, `smart_search`, or `explain_symbol`:
+
+- The installer of Linux starts the server as a `systemd` service. Without
+  a service, run `ollama serve`.
+- The app of macOS and Windows starts the server when you log in to the
+  system. With Homebrew on macOS, `brew services start ollama` starts it.
+- In a session without a desktop (an SSH session on a server), run
+  `ollama serve` yourself.
+
+Without a GPU, Ollama runs the model on the CPU. `qwen3-embedding:0.6b` is
+the automatic embedding model on a machine without a GPU. The symbol
+analysis runs a chat model one time for each symbol. To index without it,
+set `[llm] analyze_symbols = false`. To run it on another computer, use an
+API profile or a remote Ollama.
+
+Each use of Ollama has its own oldest version:
+
+| Use | Oldest Ollama | Risk of an older server |
+|---|---|---|
+| Embeddings | 0.40.15 | Ollama 0.30.10 on macOS stopped its runner on each embedding input of more than 2048 tokens. 0.40.15 is the oldest version that the embeddings passed with. |
+| LLM analysis | 0.30.1 | The server cannot give the count of the tokens of a prompt, and it can cut a long prompt without an error. |
+
+With a server that is older than the version of a use, `fw-context index`
+does not do that use: it writes no embeddings, or it makes no LLM analysis.
+The status tools tell it. `fw-context doctor` reports an older server (the
+checks `ollama` and `chat-model`). To update Ollama, use the installer of
+your platform again, or `brew upgrade ollama`.
 
 ### Pull models
 
@@ -671,9 +858,15 @@ shows the result.
 |------|-----------|--------|
 | **Claude Code** (`claude-code`) | `claude` on `PATH`, or `~/.claude` | Adds `<!-- fw-context -->` to `CLAUDE.md`. Installs the `code-explorer` and `general-purpose` agents. Installs the `fw-review` skill. |
 | **OpenCode** (`opencode`) | `~/.config/opencode` | Adds a marked section to `AGENTS.md`. Installs the skill. |
-| **Kilo Code** (`kilocode`) | `~/.kilocode` | Reads the instructions of OpenCode (`AGENTS.md`). |
+| **Kilo Code** (`kilocode`) | `~/.config/kilo` or `~/.kilocode` | Reads the instructions of OpenCode (`AGENTS.md`). |
 | **Codex** (`codex`) | `~/.codex` | Writes `.codex/rules/fw-context.md`. |
 | **Cursor** (`cursor`) | `~/.cursor` or `~/.config/Cursor` | Writes `.cursor/rules/fw-context.mdc`. |
+
+These directories are in the home directory on each platform, on Windows in
+`%USERPROFILE%`, for example `C:\Users\<user>\.claude`. `fw-context init`
+registers the program `fw-context-mcp` that it finds in `~/.local/bin`
+(`uv tool`, `pipx`), in `~/.fw-context/.venv`, on `PATH`, or in the scripts
+directory of its own Python. On Windows it registers `fw-context-mcp.exe`.
 
 **Project agents:** `fw-context init` creates two subagent definitions in `.claude/agents/`:
 - `code-explorer`: this subagent includes a `CRITICAL — C/C++ source access` block. This block enforces fw-context for all C/C++ code reading

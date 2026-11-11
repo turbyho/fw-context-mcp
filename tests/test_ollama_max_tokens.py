@@ -44,6 +44,9 @@ class _FakeServer:
             return httpx.Response(200, json={"models": models}, request=request)
         if url.endswith("/api/tags"):
             return httpx.Response(200, json={"models": [{"name": self.name}]}, request=request)
+        if url.endswith("/api/version"):
+            # At least the oldest version of the embeddings (OllamaUse.EMBEDDINGS).
+            return httpx.Response(200, json={"version": "0.40.16"}, request=request)
         if url.endswith("/api/embed"):
             self.embeds += 1
             self.keep_alive.append(body.get("keep_alive"))

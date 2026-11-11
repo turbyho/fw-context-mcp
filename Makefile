@@ -107,11 +107,21 @@ link-add:
 	done
 
 # ---- remove old PATH entries from shell rc files ----
+# No `sed -i`: GNU sed and the BSD sed of macOS read its argument in two
+# ways (BSD sed takes the script as the suffix of a backup), a suffix
+# (`-i.bak`) would overwrite a backup of the user, and both replace a
+# symlinked rc file with a regular file.  sed writes to a temporary file, and
+# `cat >` writes the result back into the rc file itself, thus a symlink and
+# the permissions stay.  The message comes only when a line went away.
 clean-path:
 	@for rc in $(HOME)/.zshrc $(HOME)/.bashrc; do \
 		if [ -f "$$rc" ] && grep -q '.fw-context/.venv/bin' "$$rc" 2>/dev/null; then \
-			sed -i '\|export PATH="$$HOME/.fw-context/.venv/bin:$$PATH"|d' "$$rc"; \
-			echo "  Removed old PATH entry from $$rc"; \
+			tmp=$$(mktemp) || exit 1; \
+			if sed '\|export PATH="$$HOME/.fw-context/.venv/bin:$$PATH"|d' "$$rc" > "$$tmp" \
+				&& ! cmp -s "$$rc" "$$tmp" && cat "$$tmp" > "$$rc"; then \
+				echo "  Removed old PATH entry from $$rc"; \
+			fi; \
+			rm -f "$$tmp"; \
 		fi; \
 	done
 

@@ -82,6 +82,7 @@ __all__ = [
     "compute_source_hash",
     "decode_source_lines",
     "env_value",
+    "executable_name",
     "fmt_count",
     "format_number_ranges",
     "is_compile_commands_stale",
@@ -699,6 +700,15 @@ def response_file(args: Sequence[str]) -> Iterator[Path]:
             log.warning("The response file %s stays in the temporary directory: %s", path, exc)
 
 
+def executable_name(name: str) -> str:
+    """Return the file name of the program *name* that pip, a venv, pipx or uv writes on this host.
+
+    On Windows each of them writes ``<name>.exe`` (the interpreter, and a
+    launcher for each console script).  On POSIX the file has no extension.
+    """
+    return f"{name}.exe" if sys.platform == "win32" else name
+
+
 def venv_program(venv: Path, name: str) -> Path:
     """Return the path of the program *name* in the virtual environment *venv*.
 
@@ -708,9 +718,8 @@ def venv_program(venv: Path, name: str) -> Path:
     ``bin`` without an extension on POSIX.  A detection that looks only
     for ``bin/python`` finds no environment on Windows.
     """
-    if sys.platform == "win32":
-        return venv / "Scripts" / f"{name}.exe"
-    return venv / "bin" / name
+    directory = "Scripts" if sys.platform == "win32" else "bin"
+    return venv / directory / executable_name(name)
 
 
 def run_in_process_group(

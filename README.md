@@ -6,6 +6,11 @@
 
 fw-context builds a persistent semantic index from `compile_commands.json` and the libclang AST, then exposes it to coding agents through MCP. Instead of reconstructing your firmware through repeated file reads and text searches, the agent can query the program structure that one build produces.
 
+> **New: Linux, macOS and Windows.** fw-context now runs on macOS and Windows, next to Linux.
+> The CI runs the tests on the three platforms with Python 3.11 and 3.14. Three firmware
+> projects (ESP32 and STM32 with PlatformIO, nRF52 with Mbed OS) gave the same index on each
+> platform. See [Platforms](docs/platforms.md) for what was tested and what is different.
+
 It helps agents answer questions such as:
 
 - Which implementation is active in this build?
@@ -34,8 +39,9 @@ The case study includes the review output, methodology and per-tool token analys
 
 ### Prerequisites
 
-- Python 3.11 or newer
-- `clang` on the `PATH` (for macro values and assembly units). `pip install fw-context-mcp` installs libclang.
+- Linux, macOS or Windows
+- Python 3.11 or newer, and [`uv`](https://docs.astral.sh/uv/) (or `pipx`)
+- `git`, and `clang` for the macro values and the assembly units. The installation of fw-context installs libclang.
 - a project that can produce `compile_commands.json`
 - an MCP-capable coding agent such as Claude Code or OpenCode
 
@@ -43,19 +49,18 @@ Ollama is optional for the core index: symbols, full-text search, call graph and
 
 Ollama is not the only LLM service. The symbol analysis can also use Ollama Cloud, OpenRouter, DeepSeek, the ChatGPT plan, or another OpenAI-compatible API. The embeddings can also use OpenRouter or another OpenAI-compatible API. A cloud service gets the source code. See [LLM setup](docs/installation.md#llm-setup).
 
-### Install via pip (recommended)
+### Install
+
+The same commands work on Linux, macOS and Windows (PowerShell):
 
 ```bash
-pip install fw-context-mcp
+uv tool install fw-context-mcp
+uv tool update-shell        # one time: puts ~/.local/bin on PATH, then open a new terminal
+fw-context doctor --fix --only clang-resource
 ```
 
-### Install the current source version
-
-```bash
-git clone https://github.com/turbyho/fw-context-mcp.git ~/.fw-context/src
-cd ~/.fw-context/src
-make install
-```
+`pipx install fw-context-mcp` works too. For the steps of each platform (Python, git, clang, the
+toolchain) and the install from source, see [Installation](docs/installation.md#install).
 
 Register fw-context with the supported coding agents detected in your project:
 
@@ -75,7 +80,7 @@ fw-context index --build
 
 Then restart the coding agent and ask it questions about the project. The index is persistent and incremental; after the initial run, changed translation units are reprocessed instead of rebuilding the entire index.
 
-See the [Quick Start](docs/README.md) and [Installation Guide](docs/installation.md) for platform-specific setup and supported build systems.
+See the [Quick Start](docs/README.md), the [Installation Guide](docs/installation.md) and [Platforms](docs/platforms.md) for the setup of each platform and the supported build systems.
 
 ## What fw-context changes
 
@@ -170,6 +175,7 @@ Use clangd for interactive editing. Use fw-context when an AI agent needs struct
 
 - [Quick Start](docs/README.md)
 - [Installation](docs/installation.md)
+- [Platforms: Linux, macOS, Windows](docs/platforms.md)
 - [Configuration](docs/configuration.md)
 - [MCP tool reference](docs/tools.md)
 - [MCP server notes](README-MCP.md)

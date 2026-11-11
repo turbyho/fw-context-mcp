@@ -142,6 +142,21 @@ def chat_ollama_server(cfg: LLMConfig) -> str | None:
     return endpoint[: -len("/api/generate")]
 
 
+def chat_on_ollama_url(cfg: LLMConfig) -> bool:
+    """Return True when the chat model runs on the Ollama server of ``ollama_url``.
+
+    WHY one function: the release of a model between the phases and the
+    version check of a server both need this rule, and two copies of it
+    can disagree about which server runs the chat.
+
+    Raises:
+        ValueError: ``chat_api_format`` is not valid (see
+            :func:`chat_ollama_server`).
+    """
+    server = chat_ollama_server(cfg)
+    return server is not None and server.rstrip("/") == cfg.ollama_url.rstrip("/")
+
+
 def chat_api_key(cfg: LLMConfig) -> str | None:
     """Return the API key of the chat: ``chat_api_key`` when a caller set it, else the stored key of the profile.
 
