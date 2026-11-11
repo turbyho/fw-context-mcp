@@ -122,19 +122,73 @@ class TestTripleLoading:
 
 
 class TestDisagreementMiningEmpty:
-    def test_empty_db_returns_clean_result(self) -> None:
-        """Mining on a nonexistent DB returns empty MiningResult without crash."""
+    def test_empty_db_returns_clean_result(self, tmp_path: Path) -> None:
+        """Mining on a nonexistent DB returns an empty MiningResult, and makes no database.
+
+        The mining only reads.  ``sqlite3.connect`` made the file, and the
+        mining then failed on a missing table.  The path ``/nonexistent.db``
+        of this test hid it on Linux, where a user cannot write to ``/``:
+        on Windows the file appeared in ``C:\\``.
+        """
         from fw_context_mcp.config.settings import Config
 
-        cfg = Config()
+        missing = tmp_path / "nonexistent.db"
         result = finetune.mine_disagreements(
-            cfg, Path("/nonexistent.db"),
-            None,  # type: ignore[arg-type]
+            Config(), missing,
+            None,  # type: ignore[arg-type]  # the mining stops before it uses the embedder
             sample_limit=10,
         )
         assert isinstance(result, finetune.MiningResult)
         assert result.triples == []
         assert result.disagreements_found == 0
+        assert not missing.exists()
+
+    def test_an_index_without_sqlite_vec_stops_before_the_embedding(self, tmp_path: Path, monkeypatch) -> None:
+        """The dense search needs sqlite-vec: without it the mining must stop at once.
+
+        It embedded each query first (up to 2000), and the first dense
+        search then stopped with "no such module: vec0".
+        """
+        from fw_context_mcp.config.settings import Config
+        from fw_context_mcp.indexer.db import (
+            _connection,
+            insert_symbols_batch,
+            open_db,
+            split_tokens,
+            transaction,
+            upsert_build_config,
+            upsert_file,
+            upsert_project,
+        )
+
+        # One built index with one documented function: the mining makes a
+        # query of it, thus it reaches the embedding.
+        db_path = tmp_path / "index.db"
+        conn = open_db(db_path)
+        try:
+            with transaction(conn):
+                upsert_project(conn, "p" * 32, "mining", str(tmp_path))
+                upsert_build_config(conn, "h", "p" * 32, str(tmp_path / "compile_commands.json"))
+                file_id = upsert_file(conn, "h", "src/uart.c", "c")
+                insert_symbols_batch(conn, [
+                    ("h", file_id, "src/uart.c", split_tokens("uart_init", "uart_init"),
+                     "c:@F@uart_init", "uart_init", "uart_init", "function",
+                     1, 1, 3, 1, "void uart_init(void)", "Start the UART.", None, 0, 0, "", 0, "", 1, 0.0, "", 0),
+                ])
+        finally:
+            conn.close()
+        monkeypatch.setattr(_connection, "_load_sqlite_vec", lambda conn: None)
+
+        class _NoEmbedding:
+            def embed_queries(self, texts):
+                raise AssertionError("the mining embedded without sqlite-vec")
+
+        result = finetune.mine_disagreements(
+            Config(), db_path,
+            _NoEmbedding(),  # type: ignore[arg-type]  # only embed_queries can be called
+            sample_limit=10,
+        )
+        assert result.triples == []
 
 
 class TestTrainStepTypeCheck:

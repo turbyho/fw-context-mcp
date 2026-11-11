@@ -65,6 +65,7 @@ from contextlib import nullcontext
 from pathlib import Path
 
 from ..mcp.shared.pid_file import PidFile
+from ..path_key import index_key, is_absolute_key
 from ..utils import SAFE_EXCEPT, is_fatal
 from . import _force_llm_marker as force_llm_marker
 from ._embedding import _build_embeddings
@@ -294,10 +295,12 @@ def _step_purge_missing_files(conn: sqlite3.Connection, ctx: dict) -> None:
             continue
         if any(pat in db_path for pat in build_patterns):
             continue
-        abs_p = abs_path(project_root, db_path)
-        # Absolute paths outside project_root: skip (system headers etc.)
-        if os.path.isabs(db_path) and not abs_p.startswith(str(project_root)):
+        # An absolute key is a file outside project_root (system headers
+        # etc.): skip it.  path_key.index_key gives a relative key to each
+        # file inside the root.
+        if is_absolute_key(db_path):
             continue
+        abs_p = abs_path(project_root, db_path)
         candidates.append((r["id"], db_path, abs_p))
 
     if not candidates:
@@ -367,54 +370,40 @@ def _step_orphan_cleanup(conn: sqlite3.Connection, ctx: dict) -> None:
 def _step_align_is_project(conn: sqlite3.Connection, ctx: dict) -> None:
     """Mark project files in the ``files`` table based on project/vendor patterns.
 
-    Two-phase marking:
+    A file row with ``is_project = 0`` gets 1 when
+    :func:`~fw_context_mcp.indexer.sdk_detect.classify_key` gives 1 for its
+    key: a project pattern matches it, or it is inside the project root and
+    no vendor pattern matches it.  A key outside the root (a system header,
+    an SDK outside the project) stays 0 unless a project pattern claims it.
 
-    1. **Explicit project patterns** (``project_patterns_list`` from config):
-       files matching globs like ``src/%`` are unconditionally marked
-       ``is_project = 1``.  This handles the typical directory structure
-       where all source under ``src/`` and ``lib/`` is project code.
-
-    2. **Exclusion-based remainder**: all files that do NOT match any
-       vendor pattern are marked as project code.  Vendor patterns come
-       from the detected build system (e.g. ``mbed-os/%`` for Mbed OS,
-       ``zephyr/%`` for Zephyr).  Files with absolute paths (system
-       headers) are excluded from this phase — they are neither project
-       nor vendor.
-
-    The two-phase approach ensures custom project directory layouts are
-    supported while still auto-detecting project-vs-vendor boundaries
-    from the build system.
+    WHY this step after the symbols: a file row can come from the content
+    pass or from a macro header, which set no ``is_project`` of their own.
+    The step never lowers 1 to 0: a file that holds a project symbol stays
+    project code.
     """
     config_hash = ctx["config_hash"]
     project_patterns_list: list[str] = ctx["project_patterns_list"]
     vendor_patterns: list[str] = ctx["vendor_patterns"]
 
-    for pp in project_patterns_list:
-        fn_pp = pp.replace("%", "*")
-        conn.execute(
-            """UPDATE files SET is_project = 1
-               WHERE config_hash = ? AND is_project = 0 AND path GLOB ?""",
-            (config_hash, fn_pp),
-        )
-    external_guard = "AND path NOT LIKE '/%'"
-    if vendor_patterns:
-        sql_vendor_patterns = [p.replace("_", "\\_") for p in vendor_patterns]
-        not_like_clauses = " AND ".join(
-            ["path NOT LIKE ? ESCAPE '\\'"] * len(vendor_patterns)
-        )
-        conn.execute(
-            f"""UPDATE files SET is_project = 1
-                WHERE config_hash = ? AND is_project = 0
-                  AND ({not_like_clauses}) {external_guard}""",
-            [config_hash] + sql_vendor_patterns,
-        )
-    else:
-        conn.execute(
-            f"""UPDATE files SET is_project = 1
-               WHERE config_hash = ? AND is_project = 0
-                 {external_guard}""",
-            [config_hash],
-        )
+    # The rule of classify_key, the rule that set is_project of each symbol.
+    # WHY not SQL: the step had a second copy of the rule, with GLOB for the
+    # project patterns (case-sensitive), LIKE for the vendor patterns (not
+    # case-sensitive) and "NOT LIKE '/%'" for a key outside the root, which
+    # missed the Windows keys ("C:/...").  The step only raises 0 to 1: a
+    # file with a project symbol keeps 1.
+    from .sdk_detect import classify_key
+
+    rows = conn.execute(
+        "SELECT id, path FROM files WHERE config_hash = ? AND is_project = 0",
+        (config_hash,),
+    ).fetchall()
+    project_ids = [
+        row["id"] for row in rows
+        if classify_key(row["path"], vendor_patterns, project_patterns_list) == 1
+    ]
+    for batch in chunked(project_ids):
+        marks = ",".join("?" * len(batch))
+        conn.execute(f"UPDATE files SET is_project = 1 WHERE id IN ({marks})", batch)
     conn.commit()
 
 
@@ -491,10 +480,7 @@ def _build_coverage_set(units: list, manifest: dict | None, project_root: Path) 
 
     tu_paths: set[str] = set()
     for unit in units:
-        try:
-            tu_paths.add(str(unit.file.resolve().relative_to(project_root)))
-        except ValueError:
-            tu_paths.add(str(unit.file.resolve()))
+        tu_paths.add(index_key(unit.file, project_root))
 
     covered = set(tu_paths)
     saw_headers = False
@@ -660,9 +646,14 @@ def _step_expand_macros(conn: sqlite3.Connection, ctx: dict) -> None:
     # TUs that include project config headers.
     for unit in ctx["units"]:
         try:
+            # The directory of the compilation (the "directory" of its entry
+            # in compile_commands.json): a relative path in the flags is
+            # relative to it, as for the compiler, and as the preprocessor of
+            # the assembly units runs it.  The project root is the directory
+            # only when the build ran there.
             resolve_and_update(
                 conn, ctx["config_hash"], unit.clang_args,
-                unit.file.resolve(), cwd=ctx.get("project_root"),
+                unit.file.resolve(), cwd=unit.directory or ctx.get("project_root"),
             )
         except SAFE_EXCEPT as e:
             if is_fatal(e):

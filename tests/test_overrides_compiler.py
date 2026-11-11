@@ -15,6 +15,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._toml import toml_string
+
 pytest.importorskip("clang.cindex", reason="libclang not available")
 pytestmark = pytest.mark.libclang
 
@@ -129,7 +131,7 @@ def test_an_incremental_run_follows_a_changed_override(tmp_path: Path):
     root = tmp_path / "proj"
     (root / ".fw-context").mkdir(parents=True)
     (root / ".fw-context" / "config.toml").write_text(
-        f'[project]\nid = "proj-overrides"\n\n[build]\n\n[index]\ndb_dir = "{tmp_path}"\n', encoding="utf-8",
+        f'[project]\nid = "proj-overrides"\n\n[build]\n\n[index]\ndb_dir = {toml_string(tmp_path)}\n', encoding="utf-8",
     )
     source = root / "main.cpp"
     source.write_text(BEFORE, encoding="utf-8")

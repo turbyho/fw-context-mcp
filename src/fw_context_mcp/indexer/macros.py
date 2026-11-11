@@ -1,54 +1,30 @@
-"""Driver: resolve expanded macro values via ``clang -dM -E``.
+"""Driver: get the definition of each macro at the end of a unit via ``clang -dM -E``.
 
-Uses the compiler's built-in preprocessor to obtain fully expanded macro
-values — no need to build a macro dependency graph ourselves.
-
-Usage:
-    `clang -dM -E <flags> <file>` dumps all defined macros as:
-    ``#define NAME value`` where ``value`` is fully expanded.
+``clang -dM -E <flags> <file>`` prints each macro that is defined at the
+end of the unit, as ``#define NAME definition``: the predefined macros of
+the target, the ``-D`` macros of the flags, and the last ``#define`` of
+each name in the files of the unit.  The preprocessor does not expand the
+macros in a definition: ``#define B 42`` and ``#define A B`` give
+``#define A B`` (measured with clang 23).  Thus ``expanded_value`` holds
+the definition that is in force at the end of the unit, and not the
+value of a chain of macros.
 
 The flags are taken from ``compile_commands.json`` (the same flags used
 for symbol indexing), so ``#ifdef``-conditional macros resolve correctly
 for the indexed build configuration.
 """
-
 from __future__ import annotations
 
 import logging
-import shutil
 import subprocess
-import sys
 import tempfile
-from functools import lru_cache
 from pathlib import Path
 
+from ._clang_cli import clang_binary as _clang_binary
+from ._clang_cli import run_clang
+from ._parsed_text import decode_lines
+
 log = logging.getLogger(__name__)
-
-
-@lru_cache(maxsize=1)
-def _find_clang_binary() -> str:
-    """Find the clang CLI binary.
-
-    Tries PATH first, then common Windows LLVM install locations.
-    Returns ``"clang"`` as fallback (will fail gracefully via
-    ``FileNotFoundError`` in the caller).
-    """
-    # 1. Check PATH
-    found = shutil.which("clang")
-    if found:
-        return found
-
-    # 2. Check common Windows LLVM install locations
-    if sys.platform == "win32":
-        for candidate in (
-            r"C:\Program Files\LLVM\bin\clang.exe",
-            r"C:\Program Files (x86)\LLVM\bin\clang.exe",
-        ):
-            if Path(candidate).exists():
-                return candidate
-
-    # 3. Fallback — caller handles FileNotFoundError
-    return "clang"
 
 
 def resolve_macros_via_preprocessor(
@@ -58,14 +34,14 @@ def resolve_macros_via_preprocessor(
     timeout: float = 30.0,
     cwd: str | Path | None = None,
 ) -> dict[str, str]:
-    """Run ``clang -dM -E`` and return {name: expanded_value}.
+    """Run ``clang -dM -E`` and return {name: definition at the end of the unit}.
 
-    WHY ``clang -dM -E`` instead of parsing macros from the AST: libclang's
-    AST only exposes macro names and raw values from ``#define`` directives.
-    Fully expanded values require preprocessing — ``clang -dM -E`` uses the
-    compiler's built-in preprocessor, correctly expanding chains like
-    ``#define A B`` + ``#define B 42`` to ``A=42``.  No need to build and
-    maintain a macro dependency graph ourselves.
+    WHY ``clang -dM -E`` and not only the AST: libclang gives the text of
+    each ``#define`` directive in a file.  The preprocessor of the unit
+    tells which definition of a name is in force at its end (after
+    ``#undef`` and a new ``#define``), and it adds the ``-D`` macros of the
+    flags and the predefined macros of the target.  It does not expand the
+    macros in a definition (see the docstring of the module).
 
     Uses the same compiler flags as the translation unit so that
     ``-D`` defines and ``-I`` include paths are honoured.
@@ -80,26 +56,28 @@ def resolve_macros_via_preprocessor(
             correctly.  Defaults to ``None`` (process CWD).
 
     Returns:
-        Dict mapping macro names to their fully expanded values, or an
-        empty dict on failure.
+        Dict mapping macro names to their definitions at the end of the
+        unit, or an empty dict on failure.
     """
     cmd = [clang_binary, "-dM", "-E", *flags, str(file_path)]
 
     # Workaround: if the source file doesn't exist (e.g., virtual indexing),
     # create a temporary empty C file so clang doesn't error.
     if not file_path.exists():
-        with tempfile.NamedTemporaryFile(suffix=".c", mode="w", delete=False) as tmp:
+        with tempfile.NamedTemporaryFile(suffix=".c", mode="w", encoding="utf-8", delete=False) as tmp:
             tmp.write("/* empty */\n")
             tmp_path = tmp.name
         cmd = [clang_binary, "-dM", "-E", *flags, tmp_path]
         try:
             cmd = _sanitize_flags(cmd)
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=timeout,
+            result = run_clang(
+                cmd[0], cmd[1:], timeout=timeout,
                 cwd=file_path.parent if file_path.parent.exists() else Path.cwd(),
             )
-        except FileNotFoundError:
-            log.debug("clang binary not found: %s — macro expansion skipped", clang_binary)
+        except FileNotFoundError as exc:
+            # The text of the error: clang can be missing, and the temporary
+            # directory of the response file can be missing too.
+            log.debug("clang -dM -E cannot run for %s: %s — macro expansion skipped", file_path.name, exc)
             return {}
         except subprocess.TimeoutExpired:
             log.debug("clang -dM -E timed out after %.1fs for %s", timeout, file_path.name)
@@ -110,11 +88,9 @@ def resolve_macros_via_preprocessor(
         # Strip flags that clang -E doesn't need (or that cause issues with -dM)
         cmd = _sanitize_flags(cmd)
         try:
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd,
-            )
-        except FileNotFoundError:
-            log.debug("clang binary not found: %s — macro expansion skipped", clang_binary)
+            result = run_clang(cmd[0], cmd[1:], timeout=timeout, cwd=cwd)
+        except FileNotFoundError as exc:
+            log.debug("clang -dM -E cannot run for %s: %s — macro expansion skipped", file_path.name, exc)
             return {}
         except subprocess.TimeoutExpired:
             log.debug("clang -dM -E timed out after %.1fs for %s", timeout, file_path.name)
@@ -123,12 +99,16 @@ def resolve_macros_via_preprocessor(
     if result.returncode != 0:
         log.debug(
             "clang -dM -E failed for %s (exit %d): %s",
-            file_path.name, result.returncode, result.stderr[:200],
+            file_path.name, result.returncode, result.stderr.decode("utf-8", "replace")[:200],
         )
         return {}
 
+    # WHY bytes and decode_lines: a value is text of the sources, decoded as
+    # the content fill decodes them (UTF-8 with replacement).  ``text=True``
+    # decoded it in the locale: on Windows the ANSI code page, and a byte
+    # that is no UTF-8 stopped the run with UnicodeDecodeError on Linux.
     macros: dict[str, str] = {}
-    for line in result.stdout.splitlines():
+    for line in decode_lines(result.stdout):
         line = line.strip()
         if not line.startswith("#define "):
             continue
@@ -259,7 +239,7 @@ def resolve_and_update(
     """
     expanded = resolve_macros_via_preprocessor(
         flags, file_path,
-        clang_binary if clang_binary != "clang" else _find_clang_binary(),
+        clang_binary if clang_binary != "clang" else _clang_binary(),
         cwd=cwd,
     )
     if not expanded:

@@ -37,6 +37,7 @@ from fw_context_mcp.indexer.git_context import (
     head_path,
     read_head,
 )
+from tests._toml import toml_string
 
 
 class TestReadingTheStoredBranch:
@@ -310,7 +311,7 @@ def indexed_repo(repo: Path, tmp_path_factory):
     )
     # Keep the index out of the real database directory.
     (config_dir / "local.toml").write_text(
-        f'[index]\ndb_dir = "{index_dir}"\n', encoding="utf-8"
+        f'[index]\ndb_dir = {toml_string(index_dir)}\n', encoding="utf-8"
     )
 
     run(
@@ -487,7 +488,7 @@ class TestThePlanTakesTheBranch:
             encoding="utf-8",
         )
         (config_dir / "local.toml").write_text(
-            f'[index]\ndb_dir = "{tmp_path / "index"}"\n', encoding="utf-8"
+            f'[index]\ndb_dir = {toml_string(tmp_path / "index")}\n', encoding="utf-8"
         )
         return db_dir / "index.db"
 
@@ -864,7 +865,7 @@ class TestEachBuildIsChecked:
         (config_dir / "config.toml").write_text(
             f'[project]\nid = "{pid}"\n[build]\nsystem = "cmake"\n', encoding="utf-8")
         (config_dir / "local.toml").write_text(
-            f'[index]\ndb_dir = "{tmp_path / "index"}"\n', encoding="utf-8")
+            f'[index]\ndb_dir = {toml_string(tmp_path / "index")}\n', encoding="utf-8")
 
         keys, config, reason = _plan_auto_build(
             repo, db_dir / "index.db", load_config(project_root=repo), None, background=True)
@@ -1061,10 +1062,10 @@ class TestTheCacheOfTheHeadPath:
         assert read_head(Path(repo)) == "ref: refs/heads/main"
 
     def test_a_git_directory_that_went_away_is_asked_again(self, repo):
-        import shutil
+        from tests._stubs import remove_tree
 
         assert head_path(repo) is not None
-        shutil.rmtree(repo / ".git")
+        remove_tree(repo / ".git")
         assert head_path(repo) is None, "the cache kept the path of a removed git directory"
 
 

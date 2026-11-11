@@ -2,7 +2,7 @@
 
 TOCTOU note: ``os.kill(pid, 0)`` has an inherent race — the PID may be
 reused between the check and the action.  Risk is low on Linux (PID wrap
-at 4M), and :func:`fcntl.flock` is used where correctness matters
+at 4M), and :mod:`fw_context_mcp.file_lock` is used where correctness matters
 (``watcher.lock``).  The helpers in this module are for **coordination
 markers** (pause, reindex-in-progress), not mutual exclusion.
 
@@ -21,11 +21,15 @@ the background reindex.  PID-based ownership prevents this.
 
 from __future__ import annotations
 
+import logging
 import os
 import tempfile
 from pathlib import Path
 
-from ...utils import owner_token
+from ...processes import pid_exists
+from ...utils import owner_token, remove_file, replace_file
+
+log = logging.getLogger(__name__)
 
 
 class PidFile:
@@ -97,7 +101,7 @@ class PidFile:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(str(self._pid))
             os.chmod(tmp, 0o644)
-            os.replace(tmp, self._path)
+            replace_file(tmp, self._path)
         except OSError:
             Path(tmp).unlink(missing_ok=True)
             raise
@@ -114,47 +118,39 @@ class PidFile:
             if self._path.exists():
                 content = self._path.read_text(encoding="utf-8").strip()
                 if content == str(self._pid):
-                    self._path.unlink(missing_ok=True)
-        except OSError:
-            pass
+                    # remove_file: on Windows an MCP server can read the
+                    # marker just now.  A marker that stays tells "pending"
+                    # to each query, thus the failure is logged.
+                    remove_file(self._path)
+        except OSError as exc:
+            log.warning("Cannot remove the marker %s: %s", self._path, exc)
 
     # ── Static helpers ──────────────────────────────────────────────
 
     @staticmethod
     def _pid_exists(pid: int) -> bool:
-        """Check whether a process with *pid* is running.
+        """Check whether a process with *pid* is running (:func:`fw_context_mcp.processes.pid_exists`).
 
-        Uses ``os.kill(pid, 0)`` — signal 0 is an existence check only
-        (no signal is actually delivered).  The three outcomes mean different
-        things and must not be collapsed:
+        A process of another user is alive.  Reporting it as dead made
+        :meth:`is_active` delete its PID file: a pause marker written by
+        another user's process was removed by a mere liveness check,
+        resuming a background reindex that was deliberately held, or letting
+        retention delete the build that process is still writing.
 
-        - success — the process exists and we may signal it.
-        - ``ProcessLookupError`` (ESRCH) — no such process.
-        - ``PermissionError`` (EPERM) — the process EXISTS, we simply may not
-          signal it.  It belongs to another user.
-
-        Catching bare ``OSError`` reported that last case as dead, and
-        :meth:`is_active` deletes the PID file when the process reads as dead.
-        A pause marker written by another user's process would therefore be
-        removed by a mere liveness check, resuming a background reindex that
-        was deliberately held, or letting retention delete the build that
-        process is still writing.
+        WHY not ``os.kill(pid, 0)`` here: on Windows signal 0 is
+        ``CTRL_C_EVENT``, which sends Ctrl+C to a process group and tests
+        nothing.
 
         **TOCTOU:** the PID may be reused between the check and the
         action.  Risk is low on Linux (PID wrap at 4M).  Use
-        :func:`fcntl.flock` where correctness matters.
+        :mod:`fw_context_mcp.file_lock` where correctness matters.
         """
         try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
+            return pid_exists(pid)
         except OSError:
-            # Anything else (EINVAL on a bad signal number, for instance) is
-            # not evidence of life; treat it as gone rather than guess.
+            # Another error (EINVAL from a sandbox, for instance) is not
+            # evidence of life; treat it as gone rather than guess.
             return False
-        return True
 
     @staticmethod
     def is_active(path: Path) -> bool:
@@ -170,11 +166,11 @@ class PidFile:
             # writer made after this read, thus a live marker.
             return False
         except (OSError, ValueError):
-            path.unlink(missing_ok=True)
+            _remove_dead_marker(path)
             return False
         if PidFile._pid_exists(pid):
             return True
-        path.unlink(missing_ok=True)
+        _remove_dead_marker(path)
         return False
 
     @staticmethod
@@ -209,5 +205,20 @@ class PidFile:
             # See is_active: no unlink of a file that a writer made since.
             return None
         except (OSError, ValueError):
-            path.unlink(missing_ok=True)
+            _remove_dead_marker(path)
             return None
+
+
+def _remove_dead_marker(path: Path) -> None:
+    """Remove the marker *path* of a process that is gone, or with no PID in it.
+
+    WHY ``remove_file`` and no exception: on Windows a different MCP server
+    can read the marker just now, and the removal waits for that.  The
+    marker is dead either way, thus a removal that still fails changes no
+    answer of the caller: the failure is logged, and the next check removes
+    the marker.
+    """
+    try:
+        remove_file(path)
+    except OSError as exc:
+        log.warning("Cannot remove the dead marker %s: %s", path, exc)

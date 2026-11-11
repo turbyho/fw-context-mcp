@@ -9,7 +9,9 @@ The shapes that the dumps copy, each one measured:
 * One `Processing <env> (...)` line before each environment.
 * A `pprint` of a dict: the first line starts with `{`, a long string is
   split into `('a' 'b')`, and most values are SCons objects.
-* A shell-escaped path in `LINKFLAGS` and `LIBPATH`: `\\(` for `(`.
+* A shell-escaped path in `LINKFLAGS` and `LIBPATH`: `\\(` for `(`.  On
+  Windows the STM32 framework does not escape (read in its source
+  `platformio-build.py`, not measured).
 * `-Wl,--default-script` with the path in the NEXT token (STM32).
 * `-T <name>` with no directory, found through `LIBPATH` (ESP32).
 * `$BUILD_DIR` in `LIBPATH`, which the dump defines through two variables.
@@ -61,18 +63,41 @@ def _env_block(env: str, entries: str, before: str = "") -> str:
     )
 
 
+def _q(text: object) -> str:
+    """Return *text* as `pprint` writes a string into the dump: its `repr`.
+
+    WHY: a path of Windows holds backslashes, and the dump doubles each one
+    (`'C:\\\\Users\\\\...'`).  A path that goes into the dump as it is
+    gives `\\U`, which is not a valid escape, and the value is no literal.
+    """
+    return repr(str(text))
+
+
 def _escaped(path: Path) -> str:
-    """Return *path* with `(` and `)` escaped for the shell, as the dump holds them."""
-    return str(path).replace("(", "\\\\(").replace(")", "\\\\)")
+    """Return *path* as the STM32 framework writes it into the dump.
+
+    The framework escapes `(` and `)` for the shell, but not on Windows:
+    `platformio-build.py` of framework-arduinoststm32 does it only
+    `if not IS_WINDOWS`.
+    """
+    if os.name == "nt":
+        return str(path)
+    return str(path).replace("(", "\\(").replace(")", "\\)")
+
+
+# `BUILD_DIR` as the builder of PlatformIO defines it (`builder/main.py`):
+# `os.path.join("$PROJECT_BUILD_DIR", "$PIOENV")`, thus with a backslash on
+# Windows.
+_BUILD_DIR = f"  'BUILD_DIR': {_q(os.path.join('$PROJECT_BUILD_DIR', '$PIOENV'))},\n"
 
 
 def _stm32_block(root: Path, env: str = "nucleo") -> str:
     variant = root / "pkg" / "variants" / "L4(C-E)T"
     return _env_block(env, (
-        "  'BUILD_DIR': '$PROJECT_BUILD_DIR/$PIOENV',\n"
-        f"  'LIBPATH': ['$BUILD_DIR', '{_escaped(variant)}'],\n"
+        f"{_BUILD_DIR}"
+        f"  'LIBPATH': ['$BUILD_DIR', {_q(_escaped(variant))}],\n"
         "  'LINKFLAGS': [ '-T',\n"
-        f"                 '{root}/pkg/system/ldscript.ld',\n"
+        f"                 {_q(root / 'pkg' / 'system' / 'ldscript.ld')},\n"
         "                 '-mcpu=cortex-m4',\n"
         "                 '-Wl,--gc-sections,--relax',\n"
         "                 '-Wl,--defsym=LD_MAX_SIZE=1048576',\n"
@@ -80,9 +105,9 @@ def _stm32_block(root: Path, env: str = "nucleo") -> str:
         "                 '-Wl,-Map=\"${BUILD_DIR}/${PROGNAME}.map\"',\n"
         "                 '-Wl,--defsym=LD_FLASH_OFFSET=0x0',\n"
         "                 '-Wl,--default-script',\n"
-        f"                 '{_escaped(variant)}/ldscript.ld'],\n"
-        f"  'PROJECT_BUILD_DIR': '{root}/.pio/build',\n"
-        f"  'PROJECT_DIR': '{root}',\n"
+        f"                 {_q(os.path.join(_escaped(variant), 'ldscript.ld'))}],\n"
+        f"  'PROJECT_BUILD_DIR': {_q(root / '.pio' / 'build')},\n"
+        f"  'PROJECT_DIR': {_q(root)},\n"
     ))
 
 
@@ -99,10 +124,10 @@ def _stm32_files(root: Path) -> tuple[Path, Path]:
 
 def _esp32_block(root: Path) -> str:
     return _env_block("esp32dev", (
-        "  'BUILD_DIR': '$PROJECT_BUILD_DIR/$PIOENV',\n"
+        f"{_BUILD_DIR}"
         "  'LIBPATH': [ '$BUILD_DIR',\n"
-        f"               '{root}/sdk/lib',\n"
-        f"               '{root}/sdk/ld'],\n"
+        f"               {_q(root / 'sdk' / 'lib')},\n"
+        f"               {_q(root / 'sdk' / 'ld')}],\n"
         "  'LINKFLAGS': [ '-mlongcalls',\n"
         "                 '-T',\n"
         "                 'memory.ld',\n"
@@ -110,8 +135,8 @@ def _esp32_block(root: Path) -> str:
         "                 'sections.ld',\n"
         "                 '-T',\n"
         "                 'rom.ld'],\n"
-        f"  'PROJECT_BUILD_DIR': '{root}/.pio/build',\n"
-        f"  'PROJECT_DIR': '{root}',\n"
+        f"  'PROJECT_BUILD_DIR': {_q(root / '.pio' / 'build')},\n"
+        f"  'PROJECT_DIR': {_q(root)},\n"
     ))
 
 
@@ -131,18 +156,18 @@ class TestParseEnvdump:
         link = envs["nucleo"]
         assert link.linkflags[0] == "-T"
         assert link.cwd == str(tmp_path)
-        assert link.build_dir == f"{tmp_path}/.pio/build/nucleo"
+        assert link.build_dir == str(tmp_path / ".pio" / "build" / "nucleo")
 
     def test_two_environments(self, tmp_path):
         text = _stm32_block(tmp_path, "one") + _stm32_block(tmp_path, "two")
         envs = pl.parse_envdump(text)
         assert sorted(envs) == ["one", "two"]
-        assert envs["two"].build_dir.endswith("/two")
+        assert envs["two"].build_dir.endswith(os.sep + "two")
 
     def test_libpath_is_expanded(self, tmp_path):
         link = pl.parse_envdump(_esp32_block(tmp_path))["esp32dev"]
         assert link.libpath == [
-            f"{tmp_path}/.pio/build/esp32dev", f"{tmp_path}/sdk/lib", f"{tmp_path}/sdk/ld",
+            str(tmp_path / ".pio" / "build" / "esp32dev"), str(tmp_path / "sdk" / "lib"), str(tmp_path / "sdk" / "ld"),
         ]
 
     def test_an_unexpandable_libpath_entry_stays_as_none(self, tmp_path):
@@ -302,7 +327,10 @@ class TestExpand:
         variables = {"D": "/a b", "Q": '"/a b/x.ld"'}
         assert pl.expand('-T"$D/x.ld"', variables, one_word=True) == '-T"/a b/x.ld"'
         assert pl.expand("-T$Q", variables, one_word=True) == '-T"/a b/x.ld"'
-        assert pl.expand('-T"$D', variables, one_word=True) is None
+        # An open quote: the shell of POSIX refuses the line.  Windows
+        # (CommandLineToArgvW) reads the rest of the line as one argument.
+        open_quote = pl.expand('-T"$D', variables, one_word=True)
+        assert open_quote == ('-T"/a b' if os.name == "nt" else None)
 
 
 # ── Link options ───────────────────────────────────────────────────────────
@@ -550,7 +578,7 @@ class TestResolve:
         directory.mkdir()
         (directory / "a.ld").write_text("", encoding="utf-8")
         link = pl.EnvLink(
-            linkflags=["-T", "a.ld"], libpath=[str(directory).replace("(", "\\(").replace(")", "\\)")],
+            linkflags=["-T", "a.ld"], libpath=[_escaped(directory)],
             cwd=str(tmp_path / "none"),
         )
         assert pl.resolve_scripts(link, tmp_path) == [(directory / "a.ld").resolve()]
@@ -580,7 +608,7 @@ class TestResolve:
         (tmp_path / "variant.ld").write_text("MEMORY { RAM : ORIGIN = 0, LENGTH = 8 }\n", encoding="utf-8")
         text = _env_block("x", (
             "  'LINKFLAGS': ['-T', '$LDSCRIPT', '-Wl,--default-script', 'variant.ld'],\n"
-            f"  'PROJECT_DIR': '{tmp_path}',\n"
+            f"  'PROJECT_DIR': {_q(tmp_path)},\n"
         ))
         link = pl.parse_envdump(text)["x"]
         assert link.unknown
@@ -599,9 +627,9 @@ class TestResolve:
         (tmp_path / "sdk").mkdir()
         (tmp_path / "sdk" / "x.ld").write_text("", encoding="utf-8")
         text = _env_block("x", (
-            f"  'LIBPATH': ['{tmp_path}/sdk'],\n"
+            f"  'LIBPATH': [{_q(tmp_path / 'sdk')}],\n"
             "  'LINKFLAGS': ['-L$PRIVATE', '-T', 'x.ld'],\n"
-            f"  'PROJECT_DIR': '{tmp_path}/none',\n"
+            f"  'PROJECT_DIR': {_q(tmp_path / 'none')},\n"
         ))
         assert pl.resolve_scripts(pl.parse_envdump(text)["x"], tmp_path) is None
 

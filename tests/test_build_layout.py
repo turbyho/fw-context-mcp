@@ -25,6 +25,7 @@ from fw_context_mcp.indexer.build_layout import (
     check_variant_names,
     validate_variant_name,
 )
+from tests._toml import toml_string
 
 
 class TestPaths:
@@ -361,7 +362,7 @@ class TestIndexRemovesLegacyOutput:
         (root / ".fw-context" / "config.toml").write_text(
             f'[project]\nid = "{project_id}"\n[build]\nsystem = "cmake"\n', encoding="utf-8")
         (root / ".fw-context" / "local.toml").write_text(
-            f'[index]\ndb_dir = "{tmp_path / "index"}"\n', encoding="utf-8")
+            f'[index]\ndb_dir = {toml_string(tmp_path / "index")}\n', encoding="utf-8")
         flat = root / BUILD_ROOT_REL / "compile_commands.json"
         flat.parent.mkdir(parents=True)
         flat.write_text("[]", encoding="utf-8")
@@ -376,7 +377,6 @@ class TestIndexRemovesLegacyOutput:
 
         monkeypatch.setattr(index_mod, "_run_single", lambda *a, **k: exit_code)
         monkeypatch.setattr(index_mod, "_build_run_kwargs", lambda *a, **kw: {})
-        monkeypatch.setattr(index_mod, "_ensure_watcher_after_index", lambda root: None)
         monkeypatch.setattr(index_mod, "_refuse_without_build", lambda *a, **k: "")
         args = SimpleNamespace(
             verbose=False, project=str(root), background=False, build=True,

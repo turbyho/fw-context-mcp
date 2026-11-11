@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from fw_context_mcp import config
+from fw_context_mcp.utils import sqlite_file_uri
 
 from .executor import SyncQueryExecutor, get_executor
 
@@ -62,8 +63,9 @@ def _quick_open_readonly(db_path: Path) -> sqlite3.Connection:
     ``count_refs`` in ``_resolve_handler_context``).  NOT for general
     queries — those go through the ``SyncQueryExecutor``.
 
-    ``as_uri()`` percent-encodes spaces, '?' and '#' — a plain
-    ``f"file:{path}"`` URI breaks on such paths.
+    ``sqlite_file_uri`` gives the URI of each path: a plain
+    ``f"file:{path}"`` URI breaks on a space, '?' or '#', and
+    ``Path.as_uri()`` on a network path of Windows.
 
     WAL caveat: a read-only open of a WAL database needs a writable
     ``-shm`` file (wal-index); otherwise SQLite falls back to a heap
@@ -74,8 +76,7 @@ def _quick_open_readonly(db_path: Path) -> sqlite3.Connection:
     ``with conn:`` — the connection is read-only, there is nothing to
     commit.
     """
-    abs_path = db_path.resolve()
-    conn = sqlite3.connect(f"{abs_path.as_uri()}?mode=ro", uri=True)
+    conn = sqlite3.connect(sqlite_file_uri(db_path.resolve(), "ro"), uri=True)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA query_only = ON")
     return conn

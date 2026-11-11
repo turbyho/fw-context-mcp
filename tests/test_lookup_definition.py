@@ -19,6 +19,7 @@ from fw_context_mcp.indexer.db import (
     upsert_project,
 )
 from fw_context_mcp.mcp.handlers.source import _lookup_definition
+from tests._toml import toml_string
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -89,7 +90,7 @@ def _init_project_config(root, db_dir_override=None):
         "[build]\n"
         "\n"
         "[index]\n"
-        f"db_dir = \"{db_dir_override}\"\n",
+        f"db_dir = {toml_string(db_dir_override)}\n",
         encoding="utf-8",
     )
 

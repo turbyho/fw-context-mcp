@@ -20,6 +20,8 @@ import sys
 import httpx
 import pytest
 
+from fw_context_mcp import net
+
 LOCAL = "http://localhost:11434"
 REMOTE = "http://gpu-box:11434"
 EMBED = "qwen3-embedding:0.6b"
@@ -54,7 +56,7 @@ def servers(monkeypatch):
             raise httpx.ConnectError("connection refused")
         return _Tags(known[server])
 
-    monkeypatch.setattr(httpx, "get", _get)
+    monkeypatch.setattr(net, "get", _get)
     monkeypatch.setattr(sys, "platform", "linux")
     return known
 
@@ -175,7 +177,7 @@ def test_auto_pull_of_a_chat_call_pulls_onto_the_ollama_server(monkeypatch, chat
     answers = [_Answer(404), _Answer(200)]
     posted = []
     pulled = []
-    monkeypatch.setattr(ollama.httpx, "post", lambda url, json, timeout: posted.append(url) or answers.pop(0))
+    monkeypatch.setattr(ollama.net, "post", lambda url, json, timeout: posted.append(url) or answers.pop(0))
     monkeypatch.setattr(ollama, "_pull_model", lambda model, url: pulled.append((model, url)))
 
     cfg = _cfg(chat_api_base=chat_api_base, auto_pull=True, stream=False)

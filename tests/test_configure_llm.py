@@ -103,7 +103,7 @@ def _mock_openai_response(
 
 
 class TestConfigureLlmWrite:
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_writes_the_profile_to_local_toml(self, mock_post, tmp_path):
         mock_post.return_value = _mock_openai_response()
         root = _make_project(tmp_path)
@@ -111,7 +111,7 @@ class TestConfigureLlmWrite:
         local = (root / ".fw-context" / "local.toml").read_text(encoding="utf-8")
         assert 'profile = "api"' in local
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_the_api_key_comes_from_its_variable_and_is_not_written(self, mock_post, tmp_path):
         """The profile names the variable; the key itself never goes into a file."""
         mock_post.return_value = _mock_openai_response()
@@ -123,7 +123,7 @@ class TestConfigureLlmWrite:
         assert "sk-from-the-environment" not in local
         assert "chat_api_key" not in local
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_the_test_call_uses_the_model_of_the_profile(self, mock_post, tmp_path):
         """The model is a key of the profile, not of local.toml."""
         mock_post.return_value = _mock_openai_response()
@@ -133,7 +133,7 @@ class TestConfigureLlmWrite:
         assert kwargs["json"]["model"] == "api-chat"
         assert "model" not in _local_llm(root)
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_writes_embed_model_to_local_toml(self, mock_post, tmp_path):
         mock_post.return_value = _mock_openai_response()
         root = _make_project(tmp_path)
@@ -141,7 +141,7 @@ class TestConfigureLlmWrite:
         local = (root / ".fw-context" / "local.toml").read_text(encoding="utf-8")
         assert 'embed_model = "other-embed:1b"' in local
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_does_not_modify_config_toml(self, mock_post, tmp_path, global_config):
         mock_post.return_value = _mock_openai_response()
         root = _make_project(tmp_path)
@@ -151,7 +151,7 @@ class TestConfigureLlmWrite:
         assert config_path.read_text(encoding="utf-8") == original
         assert global_config.read_text(encoding="utf-8") == GLOBAL_PROFILES
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_partial_params_only_write_provided(self, mock_post, tmp_path):
         mock_post.return_value = _mock_openai_response()
         root = _make_project(tmp_path)
@@ -167,14 +167,14 @@ class TestConfigureLlmWrite:
 
 
 class TestConfigureLlmTestCall:
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_test_call_success_returns_status_ok(self, mock_post, tmp_path):
         mock_post.return_value = _mock_openai_response(content="OK")
         root = _make_project(tmp_path)
         result = configure_llm(project_root=str(root), profile="api")
         assert result["status"] == "ok"
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_test_call_returns_latency(self, mock_post, tmp_path):
         mock_post.return_value = _mock_openai_response()
         root = _make_project(tmp_path)
@@ -182,7 +182,7 @@ class TestConfigureLlmTestCall:
         assert "test_latency_s" in result
         assert result["test_latency_s"] >= 0
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_test_call_failure_returns_error_status(self, mock_post, tmp_path):
         mock_post.return_value = httpx.Response(
             status_code=500,
@@ -195,14 +195,14 @@ class TestConfigureLlmTestCall:
         assert result["status"] == "error"
         assert "message" in result
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_test_call_connect_error_returns_error(self, mock_post, tmp_path):
         mock_post.side_effect = httpx.ConnectError("refused")
         root = _make_project(tmp_path)
         result = configure_llm(project_root=str(root), profile="api")
         assert result["status"] == "error"
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_test_call_uses_simple_prompt(self, mock_post, tmp_path):
         mock_post.return_value = _mock_openai_response()
         root = _make_project(tmp_path)
@@ -210,7 +210,7 @@ class TestConfigureLlmTestCall:
         _, kwargs = mock_post.call_args
         assert kwargs["json"]["messages"][0]["content"] == "Reply with exactly: OK"
 
-    @patch("fw_context_mcp.llm.ollama.httpx.post")
+    @patch("fw_context_mcp.llm.ollama.net.post")
     def test_an_ollama_profile_is_tested_on_its_server(self, mock_post, tmp_path):
         """The other provider: the test call goes to /api/generate of the Ollama profile."""
         mock_post.return_value = httpx.Response(
@@ -241,7 +241,7 @@ class TestASettingThatFailsItsTestIsNotKept:
     model rather than against what the operator asked for.
     """
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_a_failed_test_restores_the_previous_settings(self, mock_post, tmp_path):
         mock_post.side_effect = httpx.ConnectError("refused")
         root = _make_project(tmp_path)
@@ -257,7 +257,7 @@ class TestASettingThatFailsItsTestIsNotKept:
             f"a setting that failed its own test stayed behind: {text}"
         )
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_the_message_says_that_nothing_changed(self, mock_post, tmp_path):
         mock_post.side_effect = httpx.ConnectError("refused")
         root = _make_project(tmp_path)
@@ -267,7 +267,7 @@ class TestASettingThatFailsItsTestIsNotKept:
         assert "nothing was changed" in result["message"], result["message"]
         assert "Configuration written" not in result["message"], result["message"]
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_a_passing_test_keeps_the_new_settings(self, mock_post, tmp_path):
         """The rollback must not touch a write that verified."""
         mock_post.return_value = _mock_openai_response()
@@ -284,7 +284,7 @@ class TestASettingThatFailsItsTestIsNotKept:
 
 
 class TestConfigureLlmResult:
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_returns_chat_api_dict(self, mock_post, tmp_path):
         """An openai_compatible profile always uses the OpenAI format: the provider names it."""
         mock_post.return_value = _mock_openai_response()
@@ -298,14 +298,14 @@ class TestConfigureLlmResult:
         }
         assert (result["profile"], result["provider"]) == ("api", "openai_compatible")
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_returns_model(self, mock_post, tmp_path):
         mock_post.return_value = _mock_openai_response()
         root = _make_project(tmp_path)
         result = configure_llm(project_root=str(root), profile="api")
         assert result["model"] == "api-chat"
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_compliance_warning_external_url(self, mock_post, tmp_path):
         mock_post.return_value = _mock_openai_response()
         root = _make_project(tmp_path)
@@ -314,7 +314,7 @@ class TestConfigureLlmResult:
         assert "external" in result["compliance_warning"].lower()
         assert "'api'" in result["compliance_warning"], "the warning names the profile"
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_no_warning_loopback_url(self, mock_post, tmp_path):
         mock_post.return_value = _mock_openai_response()
         root = _make_project(tmp_path)
@@ -322,7 +322,7 @@ class TestConfigureLlmResult:
         assert result["status"] == "ok", result
         assert "compliance_warning" not in result
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_no_changes_returns_error(self, mock_post, tmp_path):
         root = _make_project(tmp_path)
         result = configure_llm(project_root=str(root))
@@ -330,7 +330,7 @@ class TestConfigureLlmResult:
         assert "No configuration changes" in result["message"]
         mock_post.assert_not_called()
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_the_current_profile_is_no_change(self, mock_post, tmp_path):
         """The global config selects "local": selecting it again writes nothing."""
         root = _make_project(tmp_path)
@@ -340,7 +340,7 @@ class TestConfigureLlmResult:
         assert (root / ".fw-context" / "local.toml").read_text(encoding="utf-8") == ""
         mock_post.assert_not_called()
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_an_unknown_profile_is_refused(self, mock_post, tmp_path):
         """The tool cannot make a profile: the error names the ones that exist."""
         root = _make_project(tmp_path)
@@ -351,7 +351,7 @@ class TestConfigureLlmResult:
         assert (root / ".fw-context" / "local.toml").read_text(encoding="utf-8") == ""
         mock_post.assert_not_called()
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_never_raises_when_the_backend_answers_garbage(self, mock_post, tmp_path):
         """An answer without ``choices`` is a structured error, not a traceback through the tool."""
         mock_post.return_value = httpx.Response(
@@ -387,7 +387,7 @@ class TestConfigureLlmUninitialized:
 
 
 class TestConfigureLlmTimeout:
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_test_call_uses_short_timeout(self, mock_post, tmp_path):
         """The profile has ``timeout = 600.0``; the test call uses its own 30 s."""
         mock_post.return_value = _mock_openai_response()
@@ -401,7 +401,7 @@ class TestConfigureLlmTimeout:
 
 
 class TestOmittedParametersKeepTheirValue:
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_an_embedding_model_change_keeps_the_selected_profile(self, mock_post, tmp_path):
         mock_post.return_value = _mock_openai_response()
         root = _make_project(tmp_path)

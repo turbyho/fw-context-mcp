@@ -219,7 +219,7 @@ def install_launchd_plist(plist_text: str) -> None:
     """
     plist_path = Path.home() / "Library" / "LaunchAgents" / "com.fwcontext.cache-server.plist"
     plist_path.parent.mkdir(parents=True, exist_ok=True)
-    plist_path.write_text(plist_text)
+    plist_path.write_text(plist_text, encoding="utf-8")
     print(f"Plist written to {plist_path}")
     print("To load:")
     print(f"  launchctl load {plist_path}")

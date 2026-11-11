@@ -1,6 +1,7 @@
 """Tests for fw_context_mcp.indexer.compile_commands."""
 
 import json
+import os
 from pathlib import Path
 
 from fw_context_mcp.indexer.compile_commands import (
@@ -160,11 +161,17 @@ class TestNormalizeArgs:
         assert "-DKEEP=1" in result
 
     def test_a_flag_that_changes_meaning_is_kept(self):
-        """The strip list must stay narrow — these decide what compiles."""
+        """The strip list must stay narrow — these decide what compiles.
+
+        The include directory is absolute in the form of this system:
+        ``normalize_args`` gives ``/inc`` on Windows the drive of the
+        directory of the unit, as the compiler does.
+        """
+        include = f"-I{os.path.abspath('/inc')}"
         result = normalize_args(
-            ["-DFOO=1", "-I/inc", "-std=c11", "-mcpu=cortex-m4", "main.c"], Path.cwd()
+            ["-DFOO=1", include, "-std=c11", "-mcpu=cortex-m4", "main.c"], Path.cwd()
         )
-        for keep in ("-DFOO=1", "-I/inc", "-std=c11", "-mcpu=cortex-m4"):
+        for keep in ("-DFOO=1", include, "-std=c11", "-mcpu=cortex-m4"):
             assert keep in result, f"{keep} decides what the compiler sees"
 
     def test_drops_specs(self):

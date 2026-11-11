@@ -35,6 +35,7 @@ from fw_context_mcp.indexer.db import (
     upsert_file,
     upsert_project,
 )
+from tests._toml import toml_string
 
 # ── helpers ──────────────────────────────────────────────────────────
 
@@ -88,7 +89,7 @@ def _isolate_index_db(project_root: Path, tmp_dir: Path) -> None:
     local_toml = local_config_dir / "local.toml"
     index_dir = tmp_dir / "index"
     local_toml.write_text(
-        f'[index]\ndb_dir = "{index_dir}"\n',
+        f'[index]\ndb_dir = {toml_string(index_dir)}\n',
         encoding="utf-8",
     )
 
@@ -1750,6 +1751,23 @@ class TestReindexFileImplEdgeCases:
             _write_file(header, original)
             _advance_mtime(header)
             reindex_file("src/utils.c", str(indexed_project), with_analysis=False)
+
+    def test_tu_for_header_finds_a_header_outside_the_root(self, tmp_path: Path):
+        """The manifest holds the absolute key of an SDK header, with "/" on each system.
+
+        The match compared ``str(target)`` with the key.  On Windows that is
+        ``C:\\sdk\\board.h`` against ``C:/sdk/board.h``, thus a header
+        outside the root never found its unit.
+        """
+        from fw_context_mcp.mcp.handlers.maintenance import _tu_for_header
+        from fw_context_mcp.path_key import index_key
+
+        root = tmp_path / "proj"
+        root.mkdir()
+        target = (tmp_path / "sdk" / "inc" / "board.h").resolve()
+        manifest = {"entries": [{"file": "src/main.c", "headers": [index_key(target, root)]}]}
+
+        assert _tu_for_header(target, manifest, root) == root.resolve() / "src" / "main.c"
 
     def test_tu_for_header_returns_none_when_nothing_includes_it(self, tmp_path: Path):
         """No manifest, or no unit that includes the header, means no answer."""

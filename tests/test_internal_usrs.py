@@ -16,6 +16,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._toml import toml_string
+
 pytest.importorskip("clang.cindex", reason="libclang not available")
 pytestmark = pytest.mark.libclang
 
@@ -72,7 +74,7 @@ def _write(root: Path, units: dict[str, str], headers: dict[str, str] | None = N
     (root / ".fw-context").mkdir(parents=True, exist_ok=True)
     db_dir = root.parent / "db"
     (root / ".fw-context" / "config.toml").write_text(
-        f'[project]\nid = "proj-internal"\n\n[build]\n\n[index]\ndb_dir = "{db_dir}"\n', encoding="utf-8",
+        f'[project]\nid = "proj-internal"\n\n[build]\n\n[index]\ndb_dir = {toml_string(db_dir)}\n', encoding="utf-8",
     )
     for file, text in {"hdr.h": HEADER, "tpl.hpp": TEMPLATE, **(headers or {}), **units}.items():
         (root / file).write_text(text, encoding="utf-8")

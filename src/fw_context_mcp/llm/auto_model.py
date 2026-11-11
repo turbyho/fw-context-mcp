@@ -75,7 +75,7 @@ def _gpu_available() -> bool:
     try:
         result = subprocess.run(
             ["nvidia-smi", "-L"],
-            capture_output=True, text=True, timeout=3,
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=3,
         )
         return result.returncode == 0 and "GPU" in result.stdout
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
@@ -95,7 +95,7 @@ def _apple_silicon_gpu() -> bool:
     try:
         result = subprocess.run(
             ["sysctl", "-n", "machdep.cpu.brand_string"],
-            capture_output=True, text=True, timeout=2,
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=2,
         )
         if result.returncode != 0:
             return False
@@ -137,8 +137,10 @@ def _model_installed(ollama_url: str, model: str) -> bool:
     """
     import httpx
 
+    from .. import net
+
     try:
-        resp = httpx.get(
+        resp = net.get(
             ollama_url.rstrip("/") + "/api/tags",
             timeout=httpx.Timeout(connect=3.0, read=5.0, write=3.0, pool=3.0),
         )
@@ -162,9 +164,11 @@ def _try_pull(model: str, ollama_url: str) -> bool:
 
     import httpx
 
+    from .. import net
+
     url = ollama_url.rstrip("/") + "/api/pull"
     try:
-        with httpx.stream(
+        with net.stream(
             "POST", url, json={"name": model},
             timeout=httpx.Timeout(connect=5.0, read=300.0, write=5.0, pool=5.0),
         ) as resp:

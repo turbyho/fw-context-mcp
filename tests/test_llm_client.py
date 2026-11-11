@@ -52,7 +52,7 @@ def test_a_trailing_slash_of_the_url_still_gives_the_trained_context():
         posted.append(url)
         return _response(200, show, url)
 
-    with mock.patch.object(ollama.httpx, "post", side_effect=post):
+    with mock.patch.object(ollama.net, "post", side_effect=post):
         assert get_chat_client(LLMConfig(ollama_url="http://gpu:11434/")).trained_context() == 32768
     assert posted == ["http://gpu:11434/api/show"]
 
@@ -83,14 +83,14 @@ def test_an_unknown_api_format_is_an_error():
 
 def test_an_ollama_answer_gives_its_token_counts():
     answer = {"response": "ok", "prompt_eval_count": 2500, "prompt_eval_cached_count": 1952, "eval_count": 180}
-    with mock.patch.object(ollama.httpx, "post", return_value=_response(200, answer)):
+    with mock.patch.object(ollama.net, "post", return_value=_response(200, answer)):
         result = get_chat_client(LLMConfig()).generate("p")
 
     assert result == ChatResult("ok", Usage(prompt_tokens=2500, cached_tokens=1952, completion_tokens=180))
 
 
 def test_an_ollama_answer_without_counts_gives_none():
-    with mock.patch.object(ollama.httpx, "post", return_value=_response(200, {"response": "ok"})):
+    with mock.patch.object(ollama.net, "post", return_value=_response(200, {"response": "ok"})):
         result = get_chat_client(LLMConfig()).generate("p")
 
     assert result.usage == Usage()
@@ -115,7 +115,7 @@ def test_a_streamed_ollama_answer_takes_the_counts_of_its_last_line():
         def iter_lines(self):
             return iter(lines)
 
-    with mock.patch.object(ollama.httpx, "stream", return_value=_Stream()):
+    with mock.patch.object(ollama.net, "stream", return_value=_Stream()):
         result = get_chat_client(LLMConfig(stream=True)).generate("p")
 
     assert result == ChatResult("ok", Usage(prompt_tokens=40, completion_tokens=2))
@@ -142,7 +142,7 @@ def _openai(usage: dict) -> dict:
 ])
 def test_an_openai_answer_gives_its_usage(usage, expected):
     cfg = LLMConfig(chat_api_base="https://api.example.test/v1")
-    with mock.patch.object(chat_router.httpx, "post", return_value=_response(200, _openai(usage))):
+    with mock.patch.object(chat_router.net, "post", return_value=_response(200, _openai(usage))):
         result = get_chat_client(cfg).generate("p")
 
     assert result == ChatResult("ok", expected)
@@ -151,13 +151,13 @@ def test_an_openai_answer_gives_its_usage(usage, expected):
 def test_an_openai_answer_without_usage_gives_none():
     cfg = LLMConfig(chat_api_base="https://api.example.test/v1")
     body = {"choices": [{"message": {"content": "ok"}}]}
-    with mock.patch.object(chat_router.httpx, "post", return_value=_response(200, body)):
+    with mock.patch.object(chat_router.net, "post", return_value=_response(200, body)):
         assert get_chat_client(cfg).generate("p").usage == Usage()
 
 
 def test_call_llm_returns_only_the_text():
     cfg = LLMConfig(chat_api_base="https://api.example.test/v1")
-    with mock.patch.object(chat_router.httpx, "post", return_value=_response(200, _openai({"prompt_tokens": 1}))):
+    with mock.patch.object(chat_router.net, "post", return_value=_response(200, _openai({"prompt_tokens": 1}))):
         assert call_llm("p", cfg) == "ok"
 
 
@@ -176,7 +176,7 @@ def test_an_api_error_that_passes_through_keeps_its_own_cause():
     cfg = LLMConfig(chat_api_base="https://api.example.test/v1")
     sse = httpx.Response(200, text="data: [DONE]\n", headers={"content-type": "text/event-stream"},
                          request=httpx.Request("POST", "https://api.example.test/v1/chat/completions"))
-    with mock.patch.object(chat_router.httpx, "post", return_value=sse), pytest.raises(ChatApiError) as caught:
+    with mock.patch.object(chat_router.net, "post", return_value=sse), pytest.raises(ChatApiError) as caught:
         get_chat_client(cfg).generate("p")
 
     assert caught.value.__cause__ is not caught.value
@@ -184,7 +184,7 @@ def test_an_api_error_that_passes_through_keeps_its_own_cause():
 
 def test_a_timeout_of_the_api_hides_the_httpx_error_as_the_ollama_client_does():
     cfg = LLMConfig(chat_api_base="https://api.example.test/v1")
-    with mock.patch.object(chat_router.httpx, "post", side_effect=httpx.ReadTimeout("slow")), \
+    with mock.patch.object(chat_router.net, "post", side_effect=httpx.ReadTimeout("slow")), \
             pytest.raises(ChatApiError, match="timed out") as caught:
         get_chat_client(cfg).generate("p")
 
@@ -198,7 +198,7 @@ def test_a_stop_of_the_run_passes_the_api_client_unchanged(stream):
 
     stop = StopRequested("stop")
     cfg = LLMConfig(chat_api_base="https://api.example.test/v1", stream=stream)
-    with mock.patch.object(chat_router.httpx, "stream" if stream else "post", side_effect=stop), \
+    with mock.patch.object(chat_router.net, "stream" if stream else "post", side_effect=stop), \
             pytest.raises(StopRequested) as caught:
         get_chat_client(cfg).generate("p")
 

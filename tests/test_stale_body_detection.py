@@ -26,6 +26,7 @@ from fw_context_mcp.mcp.handlers.source import (
     _read_probe_lines,
     _stored_file_state,
 )
+from tests._toml import toml_string
 
 
 def _read_verified_body(row, file_path: str, stored_state: tuple[float, str]):
@@ -454,7 +455,7 @@ def _indexed_project(tmp_path: Path) -> tuple[Path, Path]:
     # computes db_dir / project_id / index.db, and db_dir points at tmp_path.
     project_id = "proj-001"
     (root / ".fw-context" / "config.toml").write_text(
-        f'[project]\nid = "{project_id}"\n\n[build]\n\n[index]\ndb_dir = "{tmp_path}"\n',
+        f'[project]\nid = "{project_id}"\n\n[build]\n\n[index]\ndb_dir = {toml_string(tmp_path)}\n',
         encoding="utf-8",
     )
     src = root / "src" / "main.c"

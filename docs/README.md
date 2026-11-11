@@ -13,7 +13,8 @@ Before you index a project, you need:
 -   Python 3.11+
 -   `clang` on the `PATH` (for macro values and assembly units).
     `make install` installs libclang.
--   Bear (or another way to generate `compile_commands.json`)
+-   The build tool of the project (fw-context runs it to get
+    `compile_commands.json`), or a `compile_commands.json` of your own
 -   Optional: an LLM service (for semantic search and symbol explanation):
     a local Ollama, or a cloud service such as OpenRouter, DeepSeek or the
     ChatGPT plan

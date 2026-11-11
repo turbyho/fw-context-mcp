@@ -10,10 +10,11 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from fw_context_mcp.utils import run_build_command
+from fw_context_mcp.utils import run_build_command, venv_program
 
 from ..build_layout import COMPILE_COMMANDS_NAME, BuildLayout
 from . import _link_command, _platformio_link, registry
+from ._environment_help import build_setting
 from ._linker import LinkRecord
 from .protocol import BuildIssue
 
@@ -74,7 +75,8 @@ def _libdeps_dir(project_root: Path) -> str:
         rel = candidate.resolve().relative_to(project_root.resolve())
     except (ValueError, OSError):
         return default
-    return str(rel) if str(rel) != "." else default
+    # "/" on each system: the pattern matches the index keys (path_key).
+    return rel.as_posix() if rel != Path(".") else default
 
 
 def _first_line(exc: RuntimeError) -> str:
@@ -134,7 +136,10 @@ class PlatformIOBuildSystem:
         its build does.  See ``_platformio_link.run_environments``.
         """
         cmd = self._pio_prefix(cfg) + ["project", "config", "--project-dir", str(project_root), "--json-output"]
-        result = run_build_command(cmd, cwd=project_root, description="pio project config", build_cfg=cfg)
+        # strict: the JSON names the environments (see run_build_command).
+        result = run_build_command(
+            cmd, cwd=project_root, description="pio project config", build_cfg=cfg, errors="strict",
+        )
         names = _platformio_link.run_environments(result.stdout or "")
         if not names:
             raise RuntimeError("pio project config names no environment that pio run builds")
@@ -430,7 +435,7 @@ class PlatformIOBuildSystem:
         try:
             result = run_build_command(
                 cmd, cwd=project_root, description=f"pio run -e {env_name} --target envdump",
-                build_cfg=cfg, env=dump_env,
+                build_cfg=cfg, env=dump_env, errors="strict",
             )
         except RuntimeError as exc:
             # BuildTimeoutError is a RuntimeError too.
@@ -593,22 +598,27 @@ class PlatformIOBuildSystem:
 
     @classmethod
     def detect_environment(cls, project_root: Path) -> dict[str, str | None]:
-        pio_python = Path.home() / ".platformio" / "penv" / "bin" / "python"
+        """Return the Python of the venv that the installer of PlatformIO makes.
+
+        ``~/.platformio/penv`` is a venv, thus its Python has the layout of
+        the host: ``Scripts\\python.exe`` on Windows (:func:`venv_program`).
+        """
+        pio_python = venv_program(Path.home() / ".platformio" / "penv", "python")
         if pio_python.exists():
             return {"python": str(pio_python), "activate": None}
-
-        if shutil.which("pio") or shutil.which("platformio"):
-            return {"python": None, "activate": None}
-
+        # Without the venv the build runs `pio` from PATH (_pio_prefix), and
+        # it needs no Python for that.
         return {"python": None, "activate": None}
 
     @classmethod
     def environment_help(cls) -> str:
+        """Return how to install PlatformIO, with the path of the venv Python of this host."""
+        example = venv_program(Path("/path/to/pio/venv"), "python")
         return (
             "Install PlatformIO CLI:\n"
             "  pip install platformio\n"
             "Or set in .fw-context/local.toml:\n"
-            '  [build]\n  python = "/path/to/pio/venv/bin/python"'
+            + build_setting("python", str(example))
         )
 
 

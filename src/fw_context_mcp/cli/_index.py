@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING
 from ..indexer import _force_llm_marker as force_llm_marker
 from ..indexer import _index_owner as index_owner
 from ..indexer import autobuild
+from ..processes import HANGUP_SIGNAL, install_stop_listener
 from ..utils import (
     SAFE_EXCEPT,
     build_dir_patterns_with_fw_context,
@@ -740,7 +741,7 @@ def _owned_index(db_dir: Path, args: argparse.Namespace, *, pid_marker: bool = T
     def _stopped(signum: int, frame: object) -> None:
         # SIGHUP too: a signal during the unwinding would interrupt it.
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        signal.signal(HANGUP_SIGNAL, signal.SIG_IGN)
         if _taken_over(db_dir):
             raise IndexSuperseded("terminated by another index run that took the index over")
         raise IndexTerminated("a SIGTERM that no index run sent stopped this run")
@@ -750,22 +751,28 @@ def _owned_index(db_dir: Path, args: argparse.Namespace, *, pid_marker: bool = T
         # its own session (see utils.run_in_process_group), thus the kernel
         # no longer sends it SIGHUP with the terminal.  The default action
         # stopped this process with no cleanup, and the build ran on.  Now
-        # the run unwinds, and the unwinding stops the build group.
-        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        # the run unwinds, and the unwinding stops the build group.  On
+        # Windows the signal is SIGBREAK (processes.HANGUP_SIGNAL): the C
+        # runtime gives it for the close of the console.
+        signal.signal(HANGUP_SIGNAL, signal.SIG_IGN)
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        raise IndexTerminated("the terminal closed (SIGHUP)")
+        raise IndexTerminated(f"the terminal closed ({HANGUP_SIGNAL.name})")
 
     previous = signal.signal(signal.SIGTERM, _stopped)
     # A SIGHUP that the caller ignores stays ignored: `nohup fw-context index`
     # asks the run to live on after the terminal closes, and the build does
     # (it has its own session).
-    previous_hup = signal.getsignal(signal.SIGHUP)
+    previous_hup = signal.getsignal(HANGUP_SIGNAL)
     if previous_hup is not signal.SIG_IGN:
-        signal.signal(signal.SIGHUP, _hung_up)
+        signal.signal(HANGUP_SIGNAL, _hung_up)
+    # The stop event on Windows (processes.request_stop) for each owner of
+    # the index, also one that enters here without cmd_index.  A second
+    # call does nothing.
+    install_stop_listener()
 
     def _restore_handler() -> None:
         signal.signal(signal.SIGTERM, signal.SIG_DFL if previous is None else previous)
-        signal.signal(signal.SIGHUP, signal.SIG_DFL if previous_hup is None else previous_hup)
+        signal.signal(HANGUP_SIGNAL, signal.SIG_DFL if previous_hup is None else previous_hup)
 
     with ExitStack() as stack:
         try:
@@ -825,7 +832,13 @@ def _reap_orphan_build_group(db_dir: Path) -> None:
     while a member lives, thus it needs no leader checks.  Such a group can
     also be a member that a build left on purpose (a compiler server); it
     stops too, because it writes to the build directory of this run.
+
+    POSIX only.  On Windows the build runs in a job object, and Windows
+    ends it when the run that holds the job dies (``job_object.py``).  Thus
+    a Windows run writes no record, and nothing is left to stop here.
     """
+    if sys.platform == "win32":
+        return
     from ..utils import stop_process_group
 
     record = db_dir / _BUILD_GROUP_RECORD
@@ -1344,30 +1357,6 @@ def _build_run_kwargs(
     )
 
 
-def _ensure_watcher_after_index(project_root: Path) -> None:
-    """Start the watcher daemon after an index run that was successful.
-
-    WHY: an MCP server spawns the daemon only at startup, and only when
-    ``index.db`` already exists.  A server that starts before the first
-    index takes an early return and spawns no daemon.  The daemon is the
-    only component that starts a background reindex, thus that project
-    gets no automatic reindex.
-
-    This function closes that window.  After the index run, ``index.db``
-    exists, which is the only precondition of ``_ensure_daemon_running``.
-    The call does nothing when a daemon already runs.
-    """
-    try:
-        from ..mcp.background import _ensure_daemon_running
-
-        _ensure_daemon_running(project_root)
-    except (RuntimeError, OSError):
-        # Not fatal — the index is complete and usable.  Only the
-        # automatic reindex of changed files is not available.  The
-        # command `fw-context watch restart` corrects this.
-        log.debug("Could not start the watcher daemon for %s", project_root, exc_info=True)
-
-
 class _SigtermOutsideTheLock:
     """The SIGTERM handler of ``cmd_index`` while this run does not own the index.
 
@@ -1436,6 +1425,10 @@ def cmd_index(args: argparse.Namespace) -> int:
     """
     outside = _SigtermOutsideTheLock()
     previous = signal.signal(signal.SIGTERM, outside)
+    # On Windows a takeover or a stop of the daemon sets the stop event of
+    # this process (processes.request_stop): the listener then runs the
+    # SIGTERM handler that is installed at that time.
+    install_stop_listener()
     try:
         return _cmd_index(args, outside)
     except Exception as exc:
@@ -1541,14 +1534,14 @@ def _cmd_index(args: argparse.Namespace, outside: _SigtermOutsideTheLock) -> int
         # of treating either as a broken run.
         print(f"{exc.label}: {exc}", file=sys.stderr)
         return exc.exit_code
-    if exit_code != 0:
-        return exit_code
-
-    # Outside the index lock.  The daemon does a staleness check when it
-    # starts, thus a daemon that starts inside the lock could start a second
-    # index run against the database that this run still changes.
-    _ensure_watcher_after_index(project_root)
-    return 0
+    # No watcher daemon from here: only an MCP server starts it (its ping
+    # thread, ``mcp/server.py``), because the daemon serves the MCP clients
+    # of the project.  A daemon of an index run without a client lived 60 s
+    # for nobody, made its staleness check, and held its files open: on
+    # Windows a removal of the index directory then failed.  An MCP server
+    # that started before the first index starts the daemon on its next
+    # ping, at most PING_INTERVAL after the index exists.
+    return exit_code
 
 
 def _index_owned(

@@ -12,10 +12,10 @@ timestamps, output paths, or dependency file names.
 from __future__ import annotations
 
 import hashlib
-import shlex
 from collections.abc import Collection
 from pathlib import Path
 
+from ..utils import command_words
 from .compile_commands import _DROP_WITH_ARG, expand_response_file
 
 # Arguments that vary per-build but don't affect compilation semantics
@@ -100,7 +100,8 @@ def _normalize_entry(entry: dict, transient_defines: Collection[str]) -> dict:
     same hash for the same build configuration regardless of timestamps or
     output paths.
     """
-    raw_args: list[str] = entry.get("arguments") or shlex.split(entry.get("command", ""))
+    # The arguments as the compiler got them (utils.command_words).
+    raw_args: list[str] = entry.get("arguments") or command_words(entry.get("command", ""))
 
     entry_file = entry.get("file", "")
     source_basename = Path(entry_file).name

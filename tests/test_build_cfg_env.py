@@ -9,6 +9,7 @@ hashes and one environment.
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 from fw_context_mcp.indexer.build import BuildConfig, _generate_into, _run_pre_build
@@ -29,9 +30,23 @@ def test_build_cfg_env_merges_the_build_config():
     assert env["PATH"].split(os.pathsep)[0] == "/opt/fw-test/bin"
 
 
+def _python_line(code: str) -> str:
+    """A command line of the config that runs the Python *code* (no ``"`` in it), on each system.
+
+    WHY not ``sh -c``: Windows has no sh.  The config holds a command line,
+    which fw-context splits by the rules of the host (``utils.command_words``).
+    """
+    return f'"{sys.executable}" -c "{code}"'
+
+
 def test_the_pre_build_hook_gets_the_build_environment(tmp_path: Path):
     out = tmp_path / "env.txt"
-    cfg = _cfg(pre_build=f'sh -c \'echo "$FW_TEST_ENV $FW_TEST_EXTRA ${{PATH%%:*}}" > {out}\'')
+    code = (
+        "import os, pathlib; e = os.environ; "
+        f"pathlib.Path(r'{out}').write_text(' '.join([e['FW_TEST_ENV'], e['FW_TEST_EXTRA'], "
+        "e['PATH'].split(os.pathsep)[0]]))"
+    )
+    cfg = _cfg(pre_build=_python_line(code))
 
     _run_pre_build(cfg, tmp_path)
 
@@ -40,7 +55,12 @@ def test_the_pre_build_hook_gets_the_build_environment(tmp_path: Path):
 
 def test_the_command_override_gets_the_build_environment(tmp_path: Path):
     out = tmp_path / "env.txt"
-    cfg = _cfg(command=f'sh -c \'echo "$FW_TEST_ENV" > {out}; echo [] > compile_commands.json\'')
+    code = (
+        "import os, pathlib; "
+        f"pathlib.Path(r'{out}').write_text(os.environ['FW_TEST_ENV']); "
+        "pathlib.Path('compile_commands.json').write_text('[]')"
+    )
+    cfg = _cfg(command=_python_line(code))
 
     _generate_into(tmp_path.resolve(), cfg)
 

@@ -8,13 +8,13 @@ This is the complete installation guide. This guide covers prerequisites, setup,
 
 ```bash
 # Ubuntu / Debian
-sudo apt install python3 bear
+sudo apt install python3
 
 # Arch / Manjaro
-sudo pacman -S python bear
+sudo pacman -S python
 
 # Fedora / RHEL
-sudo dnf install python3 bear
+sudo dnf install python3
 
 # uv (all distros)
 curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -24,18 +24,48 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 ```bash
 # Homebrew (install from https://brew.sh if not present)
-brew install python@3.12 uv bear llvm
+brew install python@3.12 uv llvm
 
 # Add Homebrew Python to PATH
 echo 'export PATH="/opt/homebrew/opt/python@3.12/libexec/bin:$PATH"' >> ~/.zshrc
 ```
+
+### Windows
+
+Install these programs, and make sure that each one is on `PATH`:
+
+- Python 3.11 or later, from [python.org](https://www.python.org/downloads/windows/).
+- [Git for Windows](https://git-scm.com/download/win). fw-context uses `git` to find new source files.
+- The compiler toolchain of your project, for example the
+  [Arm GNU Toolchain](https://developer.arm.com/downloads/-/arm-gnu-toolchain-downloads).
+- [LLVM](https://github.com/llvm/llvm-project/releases), when the project has assembly files (`.S`):
+  fw-context runs `clang -E` to preprocess them. Without `clang` on `PATH`, the index has no symbols
+  of the assembly files.
+
+What was tested on Windows 11 (Python 3.11):
+
+- The full test suite.
+- A project in `bare` mode with `arm-none-eabi-gcc` 12.2 and 14.2, in a directory with a space
+  and characters above 127 in its name: `fw-context init`, `fw-context index`, `fw-context search`,
+  and the MCP server through an MCP client over stdio.
+
+The other build systems (Zephyr and NCS, ESP-IDF, PlatformIO, CMake, Makefile, Mbed OS, Arduino,
+Keil, IAR) were not tried on Windows with a real project. The tests cover their Windows code: the
+activate scripts (`.bat`, `.cmd`, `.ps1`), the lookup of the tools through `PATHEXT`, and the
+command lines of Windows.
+
+A GCC older than version 13 on Windows cannot open a file whose path has a character outside the
+ANSI code page of the system (measured with GCC 12.2: "ě" became "e", and GCC did not find the
+file). GCC 13 and later declare the code page UTF-8 in their manifest
+([GCC PR108865](https://gcc.gnu.org/bugzilla/show_bug.cgi?id=108865); measured with 14.2). Use
+GCC 13 or later, or keep such a project in a path without these characters.
 
 | What | Why |
 |------|-----|
 | Python 3.11+ | Runtime |
 | [`uv`](https://docs.astral.sh/uv/) *(optional)* | Fast package installer. Without a working `uv`, `make install` uses `python -m venv` and `pip`. |
 | Compiler toolchain (for example ARM GCC or the Zephyr SDK) | libclang needs system headers to parse cross-compiled code |
-| [`bear`](https://github.com/rizsotto/Bear) | Intercepts build commands → `compile_commands.json` |
+| [`bear`](https://github.com/rizsotto/Bear) *(optional)* | Records the compiler calls of a `[build] command` that you write. No builder of fw-context needs it. |
 | [Ollama](https://ollama.com) *(optional)* | Computes the vector embeddings (`semantic_search`, `smart_search` re-rank) and the symbol analysis (`explain_symbol`). The core index does not need it. See [Ollama (optional)](#ollama-optional). |
 
 ## Install
@@ -77,6 +107,8 @@ editable mode.
 **File watcher (auto-reindex on save):**
 
 The MCP server starts a background watcher daemon automatically. When you save a C/C++ file, this daemon waits 2 s for more changes. Then it starts `fw-context index --background`, which updates the index. A change of the checkout (another branch, a tag, or a commit on a detached HEAD) also starts such a run. You do not need separate configuration.
+
+Only an MCP server starts the daemon. `fw-context index` does not start it. Each MCP server of the project sends a ping to the daemon every 15 s, and the daemon stops when it gets no ping for 60 s.
 
 ## Configure your project
 
@@ -199,7 +231,8 @@ xcode-select --install   # ships clang as part of Command Line Tools
 `fw-context` runs `pio run --target compiledb` plus a real build for `.d` files.
 
 > **`fw-context init`** detects PlatformIO automatically, from
-> `~/.platformio/penv/bin/python` (the bundled venv) or from `pio` on PATH.
+> `~/.platformio/penv/bin/python` (the bundled venv; on Windows
+> `%USERPROFILE%\.platformio\penv\Scripts\python.exe`) or from `pio` on PATH.
 > When automatic detection fails, set `python = "/path/to/python"` in
 > `.fw-context/local.toml`.
 
@@ -207,17 +240,17 @@ xcode-select --install   # ships clang as part of Command Line Tools
 
 | Tool | Why | Install |
 |------|-----|---------|
-| **bear** | Intercepts build → compile_commands.json | `sudo pacman -S bear` / `sudo apt install bear` / `sudo dnf install bear` / `brew install bear` |
-| **mbed** CLI | `mbed compile` | `pip install mbed-cli` (requires Python 3.11 or older — use pyenv or venv) |
+| **mbed** CLI | `mbed compile` | `pip install mbed-cli` into a Python 3.7 to 3.11 (use pyenv or venv), and set it in `[build] python` |
 | ARM GCC | Cross-compiler toolchain | [ARM GNU Toolchain](https://developer.arm.com/downloads/-/arm-gnu-toolchain-downloads) |
 
-`fw-context` runs `bear --output compile_commands.json -- mbed compile -t GCC_ARM -m <target>`.
+`fw-context` runs `mbed compile -t GCC_ARM -m <target>` in the Python of `[build] python`, and records the command of
+each source (`data/mbed/compile_db.py`). It does not need `bear`, on Linux, macOS and Windows.
 
 > **`fw-context init`** detects the Python interpreter for `mbed-cli` automatically,
-> from pyenv versions (`~/.pyenv/versions/*/bin/mbed`), common venv paths
-> (`~/mbed_venv`), and `~/.local/bin/mbed`. When `fw-context init` detects the
-> interpreter, it writes the path to `.fw-context/local.toml`. For details, see
-> **[Build Configuration →](build.md#12-build-environment--custom-python-for-mbed-cli)**.
+> from pyenv versions (`~/.pyenv/versions/*/bin/mbed`) and common venv paths
+> (`~/mbed_venv`). When `fw-context init` detects the interpreter, it writes the
+> path to `.fw-context/local.toml`. Without it, the build stops with an error. For
+> details, see **[Build Configuration →](build.md#12-build-environment--the-python-of-mbed-cli)**.
 
 ### Arduino CLI
 
@@ -318,7 +351,7 @@ bear -- eclipse -nosplash -application com.ti.ccstudio.apps.projectBuild ...
 |---|---|---|---|
 | **Zephyr** | `west` | — | Zephyr SDK |
 | **PlatformIO** | `pio` | — | no |
-| **Mbed OS** | `bear`, `mbed` | `mbed-cli` | ARM GCC |
+| **Mbed OS** | — | `mbed-cli` (in `[build] python`) | ARM GCC |
 | **Arduino** | `arduino-cli` | — | Arduino CLI |
 | **ESP-IDF** | `idf.py` | — | ESP-IDF |
 | **CMake (generic)** | `cmake` | — | no |

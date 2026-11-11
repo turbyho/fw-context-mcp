@@ -20,6 +20,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ...utils import command_words
 from . import _link_command
 
 log = logging.getLogger(__name__)
@@ -376,8 +377,10 @@ def _output_paths(unit: object) -> list[str]:
     if isinstance(arguments, list):
         tokens = [str(item) for item in arguments]
     else:
+        # The words of the command as ``compile_commands.parse`` reads
+        # them.  ``str.split`` cut `-o "out dir/x.o"` into two words.
         command = raw.get("command")
-        tokens = str(command).split() if command else []
+        tokens = command_words(str(command)) if command else []
     found = []
     for index, token in enumerate(tokens):
         if token == "-o" and index + 1 < len(tokens):

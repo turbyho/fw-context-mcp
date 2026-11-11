@@ -77,6 +77,10 @@ class TestIsActiveOther:
         assert path.exists(), "another process's marker must survive our cleanup"
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="the POSIX probe is os.kill(pid, 0); the Windows probe (OpenProcess) has its tests in test_processes.py",
+)
 class TestPidLiveness:
     """``os.kill(pid, 0)`` has three outcomes and they mean different things.
 
@@ -125,3 +129,29 @@ class TestPidLiveness:
         root it succeeds — either way the answer must be "alive".
         """
         assert PidFile._pid_exists(1) is True
+
+
+class TestDeadMarkerOnWindows:
+    """The removal of a dead marker can fail on Windows: another MCP server reads it just now.
+
+    Before, the PermissionError went up to the MCP tool that asked
+    ``is_active``.  The marker is dead either way, thus the answer stays,
+    and the next check removes the marker.
+    """
+
+    @pytest.fixture
+    def removal_fails(self, monkeypatch):
+        import fw_context_mcp.mcp.shared.pid_file as pid_file
+
+        def refuse(path):
+            raise PermissionError(13, "the file is open in another process")
+
+        monkeypatch.setattr(pid_file, "remove_file", refuse)
+
+    @pytest.mark.usefixtures("removal_fails")
+    def test_a_dead_marker_reads_as_not_active(self, tmp_path):
+        marker = tmp_path / "reindex.pending"
+        marker.write_text("not a pid", encoding="utf-8")
+
+        assert PidFile.is_active(marker) is False
+        assert PidFile.read_pid(marker) is None

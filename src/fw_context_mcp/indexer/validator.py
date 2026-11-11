@@ -19,9 +19,9 @@ from __future__ import annotations
 
 import json
 import logging
-import shlex
 from pathlib import Path
 
+from ..utils import command_words
 from .build import BuildConfig
 from .builders.protocol import BuildIssue, BuildSystem
 
@@ -137,9 +137,8 @@ def validate_and_fix(
         try:
             cwd = Path(entry.get("directory", str(root)))
             file_path = entry.get("file", "")
-            raw_args: list[str] = entry.get("arguments") or shlex.split(
-                entry.get("command", "")
-            )
+            # The arguments as the compiler got them (utils.command_words).
+            raw_args: list[str] = entry.get("arguments") or command_words(entry.get("command", ""))
             if raw_args and not raw_args[0].startswith("-"):
                 compiler = Path(raw_args[0])
                 raw_args = raw_args[1:]

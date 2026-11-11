@@ -23,6 +23,7 @@ from fw_context_mcp.indexer.db import (
     upsert_file,
 )
 from fw_context_mcp.indexer.runner import _hand_over
+from fw_context_mcp.path_key import canonical_path
 
 A = ("src/a.c", "fa")
 B = ("src/b.c", "fb")
@@ -164,8 +165,15 @@ def test_numbered_keys_keep_the_order_of_the_listings():
 
 
 def test_skip_form_resolves_project_paths(tmp_path: Path):
-    assert skip_form({"src/a.h", "/abs/b.h"}, tmp_path) == {
-        str((tmp_path / "src" / "a.h").resolve()), "/abs/b.h",
+    """A relative key joins the canonical root, and an absolute key is a path of the system.
+
+    The absolute key comes from a real path, thus it has the form of this
+    system: ``/abs/b.h`` on POSIX, ``C:/.../abs/b.h`` on Windows.
+    """
+    root = tmp_path / "proj"
+    outside = canonical_path(tmp_path / "abs" / "b.h")
+    assert skip_form({"src/a.h", outside.as_posix()}, root) == {
+        str(canonical_path(root / "src" / "a.h")), str(outside),
     }
 
 

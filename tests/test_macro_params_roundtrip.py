@@ -17,6 +17,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._toml import toml_string
+
 pytestmark = pytest.mark.libclang
 
 HEADER = """\
@@ -63,7 +65,7 @@ def indexed(tmp_path: Path):
     (root / "src").mkdir(parents=True)
     (root / ".fw-context").mkdir()
     (root / ".fw-context" / "config.toml").write_text(
-        f'[project]\nid = "{PROJECT_ID}"\n\n[build]\n\n[index]\ndb_dir = "{tmp_path}"\n',
+        f'[project]\nid = "{PROJECT_ID}"\n\n[build]\n\n[index]\ndb_dir = {toml_string(tmp_path)}\n',
         encoding="utf-8",
     )
     (root / "src" / "conf.h").write_text(HEADER, encoding="utf-8")

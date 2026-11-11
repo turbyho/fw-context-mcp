@@ -1106,16 +1106,7 @@ def _is_project_file(
     is under ~/.platformio/packages — and calling it project code would put
     its symbols into `find_dead_code(project_only=True)`.
     """
-    from fw_context_mcp.indexer.sdk_detect import _path_matches
+    from fw_context_mcp.indexer.sdk_detect import classify_key
+    from fw_context_mcp.path_key import index_key
 
-    resolved = Path(path).resolve()
-    try:
-        relative = str(resolved.relative_to(project_root.resolve()))
-    except ValueError:
-        # Outside the project: vendor unless a project pattern claims it.
-        return 1 if any(
-            _path_matches(str(resolved), p) for p in project_patterns
-        ) else 0
-    if any(_path_matches(relative, p) for p in project_patterns):
-        return 1
-    return 0 if any(_path_matches(relative, p) for p in vendor_patterns) else 1
+    return classify_key(index_key(path, project_root), vendor_patterns, project_patterns)

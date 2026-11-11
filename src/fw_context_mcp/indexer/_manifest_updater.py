@@ -25,6 +25,7 @@ import logging
 from collections.abc import Collection, Mapping, Sequence
 from pathlib import Path
 
+from ..path_key import index_key
 from ..utils import compute_source_hash
 from .config_hash import compute_flags_hash
 
@@ -451,10 +452,7 @@ def _update_manifest_after_index(
         # These are what fills header_table, so the decision for a carried
         # entry must wait until the table is final.
         for idx, unit in enumerate(units):
-            try:
-                tu_rel = str(unit.file.resolve().relative_to(project_root))
-            except ValueError:
-                tu_rel = str(unit.file.resolve())
+            tu_rel = index_key(unit.file, project_root)
 
             # Fresh hashes only from TUs that were really re-parsed —
             # see *reparsed_tus* in the docstring.
@@ -535,10 +533,7 @@ def _update_manifest_after_index(
         updated = 0
 
         for idx, unit in enumerate(units):
-            try:
-                tu_rel = str(unit.file.resolve().relative_to(project_root))
-            except ValueError:
-                tu_rel = str(unit.file.resolve())
+            tu_rel = index_key(unit.file, project_root)
 
             if tu_rel in old_entries:
                 carried.append((idx, old_entries.take(tu_rel, _flags_hash(idx, unit))))

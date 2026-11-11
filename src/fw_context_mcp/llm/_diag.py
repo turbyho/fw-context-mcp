@@ -68,9 +68,11 @@ def check_setup(cfg: LLMConfig) -> dict:
 
     from fw_context_mcp.llm.ollama import ollama_pull_command
 
+    from .. import net
+
     base_url = cfg.ollama_url.rstrip("/")
     try:
-        resp = httpx.get(base_url + "/api/tags", timeout=5.0)
+        resp = net.get(base_url + "/api/tags", timeout=5.0)
         resp.raise_for_status()
     except httpx.ConnectError:
         return {
@@ -149,8 +151,10 @@ def remote_hosts(url: str) -> dict[str, str] | None:
     """
     import httpx
 
+    from .. import net
+
     try:
-        resp = httpx.get(url.rstrip("/") + "/api/tags", timeout=5.0)
+        resp = net.get(url.rstrip("/") + "/api/tags", timeout=5.0)
         resp.raise_for_status()
     except (httpx.HTTPError, httpx.InvalidURL, OSError, ValueError):
         return None
@@ -170,8 +174,10 @@ def installed_models(url: str) -> list[str] | None:
     """
     import httpx
 
+    from .. import net
+
     try:
-        resp = httpx.get(url.rstrip("/") + "/api/tags", timeout=5.0)
+        resp = net.get(url.rstrip("/") + "/api/tags", timeout=5.0)
         resp.raise_for_status()
     except (httpx.HTTPError, httpx.InvalidURL, OSError, ValueError):
         return None

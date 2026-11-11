@@ -15,6 +15,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
+from fw_context_mcp import net
 from fw_context_mcp.config.settings import LLMConfig
 from fw_context_mcp.llm import chatgpt_plan, model_list
 from fw_context_mcp.llm.model_list import ModelContextError, ModelInfo, ModelListError
@@ -49,7 +50,7 @@ def server(monkeypatch) -> dict:
             return httpx.Response(status, text=body, request=request)
         return httpx.Response(status, json=body, request=request)
 
-    monkeypatch.setattr(httpx, "get", _get)
+    monkeypatch.setattr(net, "get", _get)
     return {"answers": answers, "sent": sent}
 
 

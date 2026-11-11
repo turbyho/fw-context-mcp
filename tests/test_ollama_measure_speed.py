@@ -12,6 +12,7 @@ from contextlib import contextmanager
 import httpx
 import pytest
 
+from fw_context_mcp import net
 from fw_context_mcp.config.settings import LLMConfig
 from fw_context_mcp.llm import hardware, ollama
 from fw_context_mcp.llm.calibration import Key
@@ -40,8 +41,8 @@ def _server(monkeypatch, *, answer=lambda request: (200, TIMES), tags=None, vers
         models = tags if tags is not None else [{"name": "m:1b", "digest": "abc"}]
         return httpx.Response(200, json={"models": models}, request=request)
 
-    monkeypatch.setattr(httpx, "post", _post)
-    monkeypatch.setattr(httpx, "get", _get)
+    monkeypatch.setattr(net, "post", _post)
+    monkeypatch.setattr(net, "get", _get)
     return sent
 
 
@@ -121,7 +122,7 @@ def test_a_server_that_does_not_answer_is_a_failure(monkeypatch):
     def _down(*args, **kwargs):
         raise httpx.ConnectError("down")
 
-    monkeypatch.setattr(httpx, "post", _down)
+    monkeypatch.setattr(net, "post", _down)
 
     result = _measure()
 

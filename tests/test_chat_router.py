@@ -288,14 +288,14 @@ class TestDetectChatEndpointEdgeCases:
 
 
 class TestCallOpenaiChatSuccess:
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_returns_response_content(self, mock_post):
         mock_post.return_value = _mock_response(json_body={"choices": [{"message": {"content": "hello world"}}]})
         cfg = _cfg("https://api.example.com/v1", chat_api_key="sk-test")
         result = OpenAIChatClient(cfg, "https://api.example.com/v1/chat/completions").generate("test prompt").text
         assert result == "hello world"
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_sends_content_type_header(self, mock_post):
         mock_post.return_value = _mock_response()
         cfg = _cfg("https://api.example.com/v1")
@@ -303,7 +303,7 @@ class TestCallOpenaiChatSuccess:
         _, kwargs = mock_post.call_args
         assert kwargs["headers"]["Content-Type"] == "application/json"
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_sends_authorization_when_key_set(self, mock_post):
         mock_post.return_value = _mock_response()
         cfg = _cfg("https://api.example.com/v1", chat_api_key="sk-secret")
@@ -311,7 +311,7 @@ class TestCallOpenaiChatSuccess:
         _, kwargs = mock_post.call_args
         assert kwargs["headers"]["Authorization"] == "Bearer sk-secret"
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_no_authorization_when_key_none(self, mock_post):
         mock_post.return_value = _mock_response()
         cfg = _cfg("https://api.example.com/v1", chat_api_key=None)
@@ -319,7 +319,7 @@ class TestCallOpenaiChatSuccess:
         _, kwargs = mock_post.call_args
         assert "Authorization" not in kwargs["headers"]
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_payload_has_model_and_messages(self, mock_post):
         mock_post.return_value = _mock_response()
         cfg = _cfg("https://api.example.com/v1", model="gpt-4o")
@@ -329,7 +329,7 @@ class TestCallOpenaiChatSuccess:
         assert payload["model"] == "gpt-4o"
         assert payload["messages"] == [{"role": "user", "content": "hello"}]
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_payload_has_stream_false(self, mock_post):
         mock_post.return_value = _mock_response()
         cfg = _cfg("https://api.example.com/v1")
@@ -337,7 +337,7 @@ class TestCallOpenaiChatSuccess:
         _, kwargs = mock_post.call_args
         assert kwargs["json"]["stream"] is False
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_payload_has_temperature(self, mock_post):
         mock_post.return_value = _mock_response()
         cfg = _cfg("https://api.example.com/v1")
@@ -345,7 +345,7 @@ class TestCallOpenaiChatSuccess:
         _, kwargs = mock_post.call_args
         assert kwargs["json"]["temperature"] == 0.7
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_payload_has_max_tokens_when_num_predict_set(self, mock_post):
         mock_post.return_value = _mock_response()
         cfg = _cfg("https://api.example.com/v1")
@@ -353,7 +353,7 @@ class TestCallOpenaiChatSuccess:
         _, kwargs = mock_post.call_args
         assert kwargs["json"]["max_tokens"] == 500
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_payload_no_max_tokens_when_num_predict_none(self, mock_post):
         mock_post.return_value = _mock_response()
         cfg = _cfg("https://api.example.com/v1")
@@ -361,7 +361,7 @@ class TestCallOpenaiChatSuccess:
         _, kwargs = mock_post.call_args
         assert "max_tokens" not in kwargs["json"]
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_payload_excludes_keep_alive(self, mock_post):
         mock_post.return_value = _mock_response()
         cfg = _cfg("https://api.example.com/v1")
@@ -369,7 +369,7 @@ class TestCallOpenaiChatSuccess:
         _, kwargs = mock_post.call_args
         assert "keep_alive" not in kwargs["json"]
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_payload_excludes_num_ctx_and_options(self, mock_post):
         mock_post.return_value = _mock_response()
         cfg = _cfg("https://api.example.com/v1")
@@ -378,7 +378,7 @@ class TestCallOpenaiChatSuccess:
         assert "options" not in kwargs["json"]
         assert "num_ctx" not in kwargs["json"]
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_uses_cfg_timeout(self, mock_post):
         mock_post.return_value = _mock_response()
         cfg = _cfg("https://api.example.com/v1", timeout=42.0)
@@ -386,7 +386,7 @@ class TestCallOpenaiChatSuccess:
         _, kwargs = mock_post.call_args
         assert kwargs["timeout"] == 42.0
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_posts_to_detected_endpoint(self, mock_post):
         mock_post.return_value = _mock_response()
         cfg = _cfg("https://api.example.com/v1")
@@ -395,7 +395,7 @@ class TestCallOpenaiChatSuccess:
         args, _ = mock_post.call_args
         assert args[0] == endpoint
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_temperature_default_zero(self, mock_post):
         mock_post.return_value = _mock_response()
         cfg = _cfg("https://api.example.com/v1")
@@ -408,28 +408,28 @@ class TestCallOpenaiChatSuccess:
 
 
 class TestCallOpenaiChatErrors:
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_connect_error_wrapped_as_ollama_error(self, mock_post):
         mock_post.side_effect = httpx.ConnectError("refused")
         cfg = _cfg("https://api.example.com/v1")
         with pytest.raises(LLMError, match="Cannot connect"):
             OpenAIChatClient(cfg, "endpoint").generate("p")
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_timeout_wrapped_as_ollama_error(self, mock_post):
         mock_post.side_effect = httpx.TimeoutException("slow")
         cfg = _cfg("https://api.example.com/v1")
         with pytest.raises(LLMError, match="timed out"):
             OpenAIChatClient(cfg, "endpoint").generate("p")
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_404_raises_ollama_error_no_pull(self, mock_post):
         mock_post.return_value = _mock_response(status_code=404, json_body={"error": "not found"}, text="not found")
         cfg = _cfg("https://api.example.com/v1")
         with pytest.raises(LLMError, match="not found"):
             OpenAIChatClient(cfg, "endpoint").generate("p")
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_500_raises_ollama_error(self, mock_post):
         mock_post.return_value = _mock_response(
             status_code=500, json_body={"error": "server error"}, text="server error"
@@ -438,28 +438,28 @@ class TestCallOpenaiChatErrors:
         with pytest.raises(LLMError, match="500"):
             OpenAIChatClient(cfg, "endpoint").generate("p")
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_missing_choices_key_raises(self, mock_post):
         mock_post.return_value = _mock_response(json_body={})
         cfg = _cfg("https://api.example.com/v1")
         with pytest.raises(LLMError, match="Unexpected chat API response format"):
             OpenAIChatClient(cfg, "endpoint").generate("p")
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_empty_choices_list_raises(self, mock_post):
         mock_post.return_value = _mock_response(json_body={"choices": []})
         cfg = _cfg("https://api.example.com/v1")
         with pytest.raises(LLMError, match="Unexpected chat API response format"):
             OpenAIChatClient(cfg, "endpoint").generate("p")
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_missing_message_key_raises(self, mock_post):
         mock_post.return_value = _mock_response(json_body={"choices": [{}]})
         cfg = _cfg("https://api.example.com/v1")
         with pytest.raises(LLMError, match="Unexpected chat API response format"):
             OpenAIChatClient(cfg, "endpoint").generate("p")
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_missing_content_key_returns_empty(self, mock_post):
         """Empty message dict (no content, no reasoning_content) returns empty string.
 
@@ -471,7 +471,7 @@ class TestCallOpenaiChatErrors:
         result = OpenAIChatClient(cfg, "endpoint").generate("p").text
         assert result == ""
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_ollama_error_passes_through(self, mock_post):
         err = LLMError("pre-existing")
         mock_post.side_effect = err
@@ -490,7 +490,7 @@ class TestCallOpenaiChatErrors:
         {"error": {"message": "Provider returned error", "code": 400,
                    "metadata": {"raw": "This endpoint's maximum context length is 8192 tokens."}}},
     ], ids=["openai-code", "deepseek-message", "openrouter-raw"])
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_a_refusal_for_the_context_is_a_prompt_that_is_too_long(self, mock_post, body):
         """The analysis marks such a symbol at once: the same request fails again at each run."""
         from fw_context_mcp.llm.errors import ChatPromptTooLong
@@ -500,7 +500,7 @@ class TestCallOpenaiChatErrors:
         with pytest.raises(ChatPromptTooLong, match="do not fit the context"):
             OpenAIChatClient(cfg, "endpoint").generate("p", max_tokens=1024)
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_another_400_is_no_prompt_that_is_too_long(self, mock_post):
         from fw_context_mcp.llm.errors import ChatApiError, ChatPromptTooLong
 
@@ -511,7 +511,7 @@ class TestCallOpenaiChatErrors:
             OpenAIChatClient(cfg, "endpoint").generate("p")
         assert not isinstance(info.value, ChatPromptTooLong)
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_generic_exception_wrapped(self, mock_post):
         mock_post.side_effect = RuntimeError("boom")
         cfg = _cfg("https://api.example.com/v1")
@@ -523,7 +523,7 @@ class TestCallOpenaiChatErrors:
 
 
 class TestCallOpenaiChatDebugLog:
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_debug_log_written_when_set(self, mock_post, tmp_path):
         mock_post.return_value = _mock_response()
         log_path = tmp_path / "debug.jsonl"
@@ -539,7 +539,7 @@ class TestCallOpenaiChatDebugLog:
         assert "latency_s" in entry
         assert "endpoint" in entry
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_no_debug_log_when_none(self, mock_post, tmp_path):
         mock_post.return_value = _mock_response()
         cfg = _cfg("https://api.example.com/v1", debug_log=None)

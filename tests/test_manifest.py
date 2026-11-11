@@ -246,6 +246,35 @@ class TestSaveAndLoad:
 
 
 class TestCheckTuStaleness:
+    def test_the_check_makes_no_key_canonical_again(self, tmp_path: Path, monkeypatch):
+        """A key of the manifest is canonical already: key_path gives its path with no call of the file system.
+
+        canonical_path resolved each header record of each entry again (and
+        opened it on macOS), in each status check of a large project.
+        """
+        import hashlib
+
+        from fw_context_mcp.indexer import manifest
+        from fw_context_mcp.indexer.manifest import check_tu_staleness, collect_stale_headers
+
+        src = tmp_path / "src" / "main.c"
+        src.parent.mkdir(parents=True)
+        src.write_text("int main(void) { return 0; }", encoding="utf-8")
+        header = tmp_path / "sdk" / "board.h"
+        header.parent.mkdir()
+        header.write_text("#define B 1\n", encoding="utf-8")
+        digest = hashlib.sha256(header.read_bytes()).hexdigest()
+
+        def refuse(path):
+            raise AssertionError(f"canonical_path of a key that is canonical already: {path}")
+
+        monkeypatch.setattr(manifest, "canonical_path", refuse)
+        entry = {"file": "src/main.c", "source_hash": hashlib.sha256(src.read_bytes()).hexdigest()}
+        headers = [{"path": header.as_posix(), "hash": digest}]
+
+        assert check_tu_staleness(entry, tmp_path, headers=headers) == (False, None)
+        assert collect_stale_headers({"headers": {header.as_posix(): {"hash": digest}}}, tmp_path) == set()
+
     def test_source_hash_changed(self, tmp_path: Path):
         from fw_context_mcp.indexer.manifest import check_tu_staleness
 
@@ -1002,7 +1031,7 @@ class TestOneEntryForEachListing:
             if unit.clang_args not in arg_sets:
                 arg_sets.append(list(unit.clang_args))
             entries.append({
-                "file": str(unit.file.relative_to(tmp_path)),
+                "file": unit.file.relative_to(tmp_path).as_posix(),
                 "directory": str(tmp_path),
                 "arg_set": arg_sets.index(unit.clang_args),
                 "source_hash": "stored-source",
@@ -1555,7 +1584,7 @@ class TestNoHeaderIsTrusted:
                     continue
                 # The rule read as: skip when the record says generated.
                 if re.search(r'\.get\("generated"\)', line):
-                    offenders.append(f"{path.relative_to(src)}:{lineno}: {line.strip()}")
+                    offenders.append(f"{path.relative_to(src).as_posix()}:{lineno}: {line.strip()}")
 
         allowed = {
             # merge_header_records keeps the flag; it decides nothing.

@@ -37,6 +37,7 @@ from dataclasses import dataclass
 
 import httpx
 
+from .. import net
 from ..config.settings import LLMConfig
 from .errors import LLMError
 
@@ -190,7 +191,7 @@ def _get(llm: LLMConfig, url: str) -> dict:
     if key:
         headers["Authorization"] = f"Bearer {key}"
     try:
-        resp = httpx.get(url, headers=headers, timeout=30.0)
+        resp = net.get(url, headers=headers, timeout=30.0)
         resp.raise_for_status()
         body = resp.json()
     except httpx.HTTPStatusError as exc:

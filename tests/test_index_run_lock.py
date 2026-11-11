@@ -27,6 +27,20 @@ from fw_context_mcp.exit_codes import EXIT_ALREADY_RUNNING, EXIT_SUPERSEDED, EXI
 from fw_context_mcp.indexer.db._locking import (
     index_run_lock,
 )
+from fw_context_mcp.processes import STOP_TOKEN_ENV, new_stop_token, request_stop
+
+
+class _TokenPopen(subprocess.Popen):
+    """A child process with its stop token (``processes.STOP_TOKEN_ENV``) and its own PID.
+
+    WHY the own PID: on Windows the ``python.exe`` of a virtual environment
+    is a launcher, and ``Popen.pid`` is the PID of the launcher.  The child
+    writes ``os.getpid()`` into its markers, thus a test that compares a
+    marker reads the PID that the child printed.
+    """
+
+    stop_token: str = ""
+    own_pid: int = 0
 
 
 class TestIndexRunLock:
@@ -227,7 +241,9 @@ class TestTakeover:
     """A manual run takes the index over; see _acquire_index."""
 
     @staticmethod
-    def _holder(db_dir: Path, kind: str, *, ignore_sigterm: bool = False) -> subprocess.Popen:
+    def _holder(
+        db_dir: Path, kind: str, *, ignore_sigterm: bool = False, raise_hangup: bool = False,
+    ) -> _TokenPopen:
         """A real process that owns the index the way cmd_index does.
 
         It enters _owned_index and then calls raise_if_superseded in a loop,
@@ -242,6 +258,13 @@ class TestTakeover:
         `nohup fw-context index` contract).  Without the reset, a pytest that
         runs under nohup gives an ignored SIGHUP to the holder, and the
         SIGHUP test fails on a timeout.
+
+        The holder gets a stop token (``processes.STOP_TOKEN_ENV``), thus
+        ``_send_stop`` reaches it on Windows too, where the ``python.exe`` of
+        a virtual environment is a launcher with a different PID.  With
+        *raise_hangup* the holder gives itself the signal of a closed
+        terminal (``processes.HANGUP_SIGNAL``): a test session on Windows has
+        no console that a test could close.
         """
         extra = ["-m", "fw_context_mcp.cli", "index"] + (["--background"] if kind == "background" else [])
         script = textwrap.dedent(
@@ -252,15 +275,19 @@ class TestTakeover:
             sys.path.insert(0, {str(Path(__file__).resolve().parents[1] / "src")!r})
             from fw_context_mcp.cli._index import _owned_index
             from fw_context_mcp.indexer.runner import IndexStopped
+            from fw_context_mcp.processes import HANGUP_SIGNAL
 
             # Not the disposition of the caller: see the docstring of _holder.
-            signal.signal(signal.SIGHUP, signal.SIG_DFL)
+            signal.signal(HANGUP_SIGNAL, signal.SIG_DFL)
             args = SimpleNamespace(background={kind == "background"!r}, takeover=False)
             try:
                 with _owned_index(Path({str(db_dir)!r}), args):
                     if {ignore_sigterm!r}:
                         signal.signal(signal.SIGTERM, signal.SIG_IGN)
-                    print("HOLDING", flush=True)
+                    import os
+                    print("HOLDING", os.getpid(), flush=True)
+                    if {raise_hangup!r}:
+                        signal.raise_signal(HANGUP_SIGNAL)
                     deadline = time.monotonic() + 30.0
                     while time.monotonic() < deadline:
                         time.sleep(0.05)
@@ -269,13 +296,17 @@ class TestTakeover:
             sys.exit(0)
             """
         )
-        proc = subprocess.Popen(  # noqa: S603 — fixed argv, no shell
+        token = new_stop_token()
+        proc = _TokenPopen(  # noqa: S603 — fixed argv, no shell
             [sys.executable, "-c", script, *extra],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env={**os.environ, STOP_TOKEN_ENV: token},
         )
+        proc.stop_token = token
         assert proc.stdout is not None
         line = proc.stdout.readline()
-        assert line.strip() == "HOLDING", line + (proc.stderr.read() if proc.poll() is not None else "")
+        assert line.split()[:1] == ["HOLDING"], line + (proc.stderr.read() if proc.poll() is not None else "")
+        proc.own_pid = int(line.split()[1])
         return proc
 
     @staticmethod
@@ -289,6 +320,11 @@ class TestTakeover:
         if proc.poll() is None:
             proc.kill()
         proc.wait(timeout=10)
+
+    @staticmethod
+    def _send_stop(proc: _TokenPopen) -> None:
+        """A SIGTERM that no index run sent: SIGTERM on POSIX, the stop event on Windows."""
+        assert request_stop(proc.pid, token=proc.stop_token)
 
     def test_a_background_run_is_taken_over(self, tmp_path: Path):
         """SIGTERM → the holder unwinds as superseded, and the lock is ours."""
@@ -314,7 +350,8 @@ class TestTakeover:
         try:
             with index_mod._owned_index(tmp_path, self._args()):
                 pass
-            assert holder.wait(timeout=10) == -signal.SIGKILL
+            # The hard stop: SIGKILL on POSIX, TerminateProcess (exit code 1) on Windows.
+            assert holder.wait(timeout=10) == (1 if os.name == "nt" else -signal.SIGKILL)
         finally:
             self._stop(holder)
 
@@ -328,7 +365,7 @@ class TestTakeover:
             with pytest.raises(IndexRunLocked, match="--takeover"), _owned_index(tmp_path, self._args()):
                 pass
             assert holder.poll() is None, "the holder must not have been signalled"
-            assert (tmp_path / "reindex.pause").read_text().strip() == str(holder.pid), (
+            assert (tmp_path / "reindex.pause").read_text().strip() == str(holder.own_pid), (
                 "the refused run overwrote the holder's pause marker"
             )
         finally:
@@ -382,11 +419,10 @@ class TestTakeover:
         The daemon retries 75, thus it did again the work that somebody
         wanted stopped.
         """
-        import signal
 
         holder = self._holder(tmp_path, "background")
         try:
-            holder.send_signal(signal.SIGTERM)
+            self._send_stop(holder)
             assert holder.wait(timeout=10) == EXIT_TERMINATED
         finally:
             self._stop(holder)
@@ -410,8 +446,10 @@ class TestTakeover:
 class TestSigtermOutsideTheLock:
     """``cmd_index`` after it released the index, or before it took it."""
 
+    _send_stop = staticmethod(TestTakeover._send_stop)
+
     @staticmethod
-    def _runner(db_dir: Path) -> subprocess.Popen:
+    def _runner(db_dir: Path) -> _TokenPopen:
         """A process under the handler of cmd_index, outside the lock."""
         script = textwrap.dedent(
             f"""
@@ -420,20 +458,29 @@ class TestSigtermOutsideTheLock:
             sys.path.insert(0, {str(Path(__file__).resolve().parents[1] / "src")!r})
             from fw_context_mcp.cli._index import _SigtermOutsideTheLock
 
+            from fw_context_mcp.processes import install_stop_listener
+
             outside = _SigtermOutsideTheLock()
             outside.db_dir = Path({str(db_dir)!r})
             signal.signal(signal.SIGTERM, outside)
-            print("READY", flush=True)
+            install_stop_listener()
+            import os
+            print("READY", os.getpid(), flush=True)
             time.sleep(1.5)
             sys.exit(0)
             """
         )
-        proc = subprocess.Popen(  # noqa: S603 — fixed argv, no shell
+        token = new_stop_token()
+        proc = _TokenPopen(  # noqa: S603 — fixed argv, no shell
             [sys.executable, "-c", script],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env={**os.environ, STOP_TOKEN_ENV: token},
         )
+        proc.stop_token = token
         assert proc.stdout is not None
-        assert proc.stdout.readline().strip() == "READY"
+        word, pid = proc.stdout.readline().split()
+        assert word == "READY"
+        proc.own_pid = int(pid)
         return proc
 
     def test_a_late_takeover_signal_does_not_kill_a_run_that_released(self, tmp_path: Path):
@@ -442,14 +489,13 @@ class TestSigtermOutsideTheLock:
         With the default action that run died with -15 in the middle of its
         work after the lock, and the daemon logged it as a failure.
         """
-        import signal
 
         from fw_context_mcp.cli._index import _write_takeover_marker
 
         runner = self._runner(tmp_path)
         try:
-            _write_takeover_marker(tmp_path, runner.pid)
-            runner.send_signal(signal.SIGTERM)
+            _write_takeover_marker(tmp_path, runner.own_pid)
+            self._send_stop(runner)
             assert runner.wait(timeout=10) == 0
         finally:
             if runner.poll() is None:
@@ -457,11 +503,10 @@ class TestSigtermOutsideTheLock:
             runner.wait(timeout=10)
 
     def test_a_foreign_sigterm_outside_the_lock_stops_with_143(self, tmp_path: Path):
-        import signal
 
         runner = self._runner(tmp_path)
         try:
-            runner.send_signal(signal.SIGTERM)
+            self._send_stop(runner)
             assert runner.wait(timeout=10) == EXIT_TERMINATED
             assert runner.stderr is not None
             assert "Terminated:" in runner.stderr.read()
@@ -472,14 +517,13 @@ class TestSigtermOutsideTheLock:
 
     def test_a_marker_for_another_victim_is_no_takeover(self, tmp_path: Path):
         """A SIGTERM that a different run gets at the same time is still foreign."""
-        import signal
 
         from fw_context_mcp.cli._index import _write_takeover_marker
 
         runner = self._runner(tmp_path)
         try:
-            _write_takeover_marker(tmp_path, runner.pid + 1)
-            runner.send_signal(signal.SIGTERM)
+            _write_takeover_marker(tmp_path, runner.own_pid + 1)
+            self._send_stop(runner)
             assert runner.wait(timeout=10) == EXIT_TERMINATED
         finally:
             if runner.poll() is None:
@@ -488,16 +532,15 @@ class TestSigtermOutsideTheLock:
 
     def test_a_marker_of_a_dead_taker_is_no_takeover(self, tmp_path: Path):
         import json
-        import signal
 
         from fw_context_mcp.cli._index import _TAKEOVER_MARKER
 
         runner = self._runner(tmp_path)
         try:
             (tmp_path / _TAKEOVER_MARKER).write_text(
-                json.dumps({"taker": 2147483646, "victim": runner.pid}), encoding="utf-8"
+                json.dumps({"taker": 2147483646, "victim": runner.own_pid}), encoding="utf-8"
             )
-            runner.send_signal(signal.SIGTERM)
+            self._send_stop(runner)
             assert runner.wait(timeout=10) == EXIT_TERMINATED
         finally:
             if runner.poll() is None:
@@ -802,11 +845,9 @@ def test_a_closed_terminal_stops_the_run_as_terminated(tmp_path: Path):
     The default action stopped the index run with no cleanup, and the build
     ran on.  The run now unwinds, and the unwinding stops the build group.
     """
-    import signal
 
-    holder = TestTakeover._holder(tmp_path, "background")
+    holder = TestTakeover._holder(tmp_path, "background", raise_hangup=True)
     try:
-        holder.send_signal(signal.SIGHUP)
         assert holder.wait(timeout=10) == EXIT_TERMINATED
     finally:
         TestTakeover._stop(holder)

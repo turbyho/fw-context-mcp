@@ -35,6 +35,7 @@ from fw_context_mcp.indexer.db import (
     upsert_project,
 )
 from fw_context_mcp.mcp.handlers.source import get_file_map, read_file
+from fw_context_mcp.path_key import canonical_path
 
 PROJECT_ID = "a" * 32
 CONFIG_HASH = "hash-paths"
@@ -42,11 +43,16 @@ CONFIG_HASH = "hash-paths"
 # The project file, and the four vendor paths that end with its name or
 # with a name that merely ends the same way.  The order here is the order
 # they go into the table, so the test does not depend on rowid order.
+#
+# Each vendor path is the key that the index gives to a file of /opt: on
+# Windows that key has the drive (C:/opt/...).  A key without a drive is
+# not a key of Windows, because index_key resolves each path.
+_OPT = canonical_path("/opt").as_posix()
 VENDOR = [
-    "/opt/sdk/framework/libraries/wrapper/inc/hw_config.h",
-    "/opt/sdk/framework/libraries/wrapper/inc/pinconfig.h",
-    "/opt/toolchain/include/c++/12/bits/c++config.h",
-    "/opt/sdk/framework/system/config.h",
+    f"{_OPT}/sdk/framework/libraries/wrapper/inc/hw_config.h",
+    f"{_OPT}/sdk/framework/libraries/wrapper/inc/pinconfig.h",
+    f"{_OPT}/toolchain/include/c++/12/bits/c++config.h",
+    f"{_OPT}/sdk/framework/system/config.h",
 ]
 PROJECT_FILE = "src/config.h"
 
@@ -128,7 +134,7 @@ class TestTheMatchIsOnAPathSegment:
 
         conn = open_db(_db_of(indexed))
         try:
-            resolved = _resolve_indexed_file(conn, CONFIG_HASH, "config.h")
+            resolved = _resolve_indexed_file(conn, CONFIG_HASH, "config.h", "config.h")
         finally:
             conn.close()
         assert resolved == PROJECT_FILE
@@ -139,17 +145,17 @@ class TestTheMatchIsOnAPathSegment:
 
         conn = open_db(_db_of(indexed))
         try:
-            resolved = _resolve_indexed_file(conn, CONFIG_HASH, "pinconfig.h")
+            resolved = _resolve_indexed_file(conn, CONFIG_HASH, "pinconfig.h", "pinconfig.h")
         finally:
             conn.close()
-        assert resolved == "/opt/sdk/framework/libraries/wrapper/inc/pinconfig.h"
+        assert resolved == VENDOR[1]
 
     def test_a_name_nothing_holds_resolves_to_nothing(self, indexed: Path):
         from fw_context_mcp.mcp.handlers.source import _resolve_indexed_file
 
         conn = open_db(_db_of(indexed))
         try:
-            assert _resolve_indexed_file(conn, CONFIG_HASH, "no_such_file.h") is None
+            assert _resolve_indexed_file(conn, CONFIG_HASH, "no_such_file.h", "no_such_file.h") is None
         finally:
             conn.close()
 
@@ -159,8 +165,8 @@ class TestTheMatchIsOnAPathSegment:
 
         conn = open_db(_db_of(indexed))
         try:
-            assert _resolve_indexed_file(conn, CONFIG_HASH, "%config.h") is None
-            assert _resolve_indexed_file(conn, CONFIG_HASH, "_onfig.h") is None
+            assert _resolve_indexed_file(conn, CONFIG_HASH, "%config.h", "%config.h") is None
+            assert _resolve_indexed_file(conn, CONFIG_HASH, "_onfig.h", "_onfig.h") is None
         finally:
             conn.close()
 

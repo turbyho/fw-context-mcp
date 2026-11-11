@@ -12,6 +12,7 @@ and holding Enter therefore walks every section without modifying anything.
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 _BUILD_SYSTEM_CHOICES: list[tuple[str, str]] = [
@@ -964,6 +965,27 @@ def resolve_build_params(
                     print(f"  [ok] Target: {val}")
 
 
+def _mbed_cli_problem(python: str) -> str | None:
+    """Return why *python* cannot run the Mbed OS build, or None when it can.
+
+    The build runs mbed-cli in this Python (data/mbed/compile_db.py
+    imports ``mbed.mbed``).  init checks the path that the user typed now,
+    thus a typing error shows here and not at the first index run.
+    """
+    if not Path(python).is_file():
+        return "the file does not exist"
+    try:
+        result = subprocess.run(
+            [python, "-c", "import mbed.mbed"],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False,
+        )
+    except OSError as exc:
+        return f"it does not start ({exc})"
+    if result.returncode != 0:
+        return "it cannot import mbed-cli (mbed.mbed)"
+    return None
+
+
 def resolve_build_env(
     project_root: Path,
     cfg,
@@ -1004,7 +1026,10 @@ def resolve_build_env(
             return
         if b.activate:
             print(f"  Build activate: {b.activate} (already configured)")
-        return
+        if system != "mbed-os" or b.python:
+            return
+        # Mbed OS with activate or idf_path but without python: the build
+        # stops without python, thus the search and the question below run.
 
     if not system:
         return
@@ -1051,26 +1076,29 @@ def resolve_build_env(
         print(f"  [ok] Build activate: {detected_activate} ({origin})")
 
     if system == "esp-idf" and not detected.get("activate"):
+        from ..indexer.builders.esp_idf import EXPORT_SCRIPT
+
         val = prompt_text(
-            "Path to ESP-IDF (directory containing export.sh) (or Enter to skip)",
+            f"Path to ESP-IDF (directory containing {EXPORT_SCRIPT}) (or Enter to skip)",
             non_interactive=non_interactive,
         )
         if val:
             idf_dir = Path(val).expanduser()
-            export_sh = idf_dir / "export.sh"
+            export_script = idf_dir / EXPORT_SCRIPT
             if not dry_run:
-                # idf_path sets IDF_PATH for the build; activate sources the
-                # export.sh so idf.py/ninja/toolchain are on PATH.  Both are
+                # idf_path sets IDF_PATH for the build; activate runs the
+                # export script of the host (export.sh, or export.bat on
+                # Windows) so idf.py/ninja/toolchain are on PATH.  Both are
                 # machine-specific and belong in local.toml.
                 _write_build_key(project_root, "idf_path", str(idf_dir))
-                if export_sh.exists():
-                    _write_build_key(project_root, "activate", str(export_sh))
-                    detected["activate"] = str(export_sh)
+                if export_script.exists():
+                    _write_build_key(project_root, "activate", str(export_script))
+                    detected["activate"] = str(export_script)
                 else:
                     detected["activate"] = val
             print(f"  [ok] Build idf_path: {idf_dir}")
-            if export_sh.exists():
-                print(f"  [ok] Build activate: {export_sh}")
+            if export_script.exists():
+                print(f"  [ok] Build activate: {export_script}")
 
     if not detected.get("python") and not detected.get("activate") and system in ("zephyr", "esp-idf"):
         print("  SDK environment script not found.")
@@ -1082,3 +1110,24 @@ def resolve_build_env(
             if not dry_run:
                 _write_build_key(project_root, "activate", val)
             print(f"  [ok] Build activate: {val}")
+
+    if system == "mbed-os" and not detected.get("python") and builder_cls:
+        # The Mbed OS build stops without [build] python (the `mbed` command
+        # on PATH does not tell which Python has mbed-cli).  Thus init asks
+        # now, and not the first build.
+        print("  No Python with mbed-cli found.")
+        val = prompt_text(
+            "Path to the Python that has mbed-cli (or Enter to skip)",
+            non_interactive=non_interactive,
+        )
+        problem = _mbed_cli_problem(val) if val else None
+        if val and problem is None:
+            if not dry_run:
+                _write_build_key(project_root, "python", val)
+            print(f"  [ok] Build python: {val}")
+        else:
+            if problem:
+                print(f"  [warn] {val}: {problem}. Nothing was written.")
+            print("  [warn] The Mbed OS build needs [build] python in .fw-context/local.toml.")
+            for line in builder_cls.environment_help().splitlines():
+                print(f"    {line}")

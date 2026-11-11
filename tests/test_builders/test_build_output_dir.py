@@ -14,6 +14,7 @@ the user replaces.
 
 from __future__ import annotations
 
+import re
 import shutil
 from dataclasses import replace
 from pathlib import Path
@@ -150,7 +151,8 @@ class TestESPIDFOutputDirectory:
         monkeypatch.setattr(shutil, "which", lambda n, path=None: f"/usr/bin/{n}")
         monkeypatch.setattr(mod, "build_tool_available", lambda *a, **kw: True, raising=False)
 
-        with pytest.raises(RuntimeError, match=r"default/out"):
+        # The message names the directory in the form of the system.
+        with pytest.raises(RuntimeError, match=re.escape(str(Path("default", "out")))):
             ESPIDFBuildSystem().build(root, replace(BuildConfig(), clean=False))
 
 
@@ -315,15 +317,31 @@ class TestEveryBackendBuildsIntoTheOutputDirectory:
         import fw_context_mcp.indexer.builders.mbed_os as mod
 
         def on_call(cmd, env, cwd):
-            Path(cmd[cmd.index("--output") + 1]).write_text("[]", encoding="utf-8")
+            Path(cmd[cmd.index("record") + 1]).write_text("[]", encoding="utf-8")
 
         calls = self._record(monkeypatch, mod, on_call)
+        python = "/opt/mbed/bin/python"
 
-        result = mod.MbedOSBuildSystem().build(tmp_path, BuildConfig(target="NRF52840_DK", clean=False))
+        result = mod.MbedOSBuildSystem().build(
+            tmp_path, BuildConfig(target="NRF52840_DK", clean=False, python=python)
+        )
 
         [(cmd, _env)] = calls
+        # The Python of mbed-cli runs the script, and the script runs `mbed compile`.
+        assert cmd[:3] == [python, str(mod._COMPILE_DB_SCRIPT), "record"]
+        assert cmd[4:7] == ["--", "compile", "-t"]
         assert cmd[cmd.index("--build") + 1] == str(_out(tmp_path))
         assert result == _out(tmp_path) / "compile_commands.json"
+
+    def test_mbed_without_its_python_stops(self, tmp_path: Path, monkeypatch):
+        """The `mbed` command on PATH does not tell which Python has mbed-cli."""
+        import fw_context_mcp.indexer.builders.mbed_os as mod
+
+        calls = self._record(monkeypatch, mod, lambda cmd, env, cwd: None)
+
+        with pytest.raises(RuntimeError, match=r"\[build\] python"):
+            mod.MbedOSBuildSystem().build(tmp_path, BuildConfig(target="NRF52840_DK", clean=False))
+        assert calls == []
 
     def test_manual_writes_its_dependency_files_there(self, tmp_path: Path, monkeypatch):
         import fw_context_mcp.indexer.builders.manual as mod

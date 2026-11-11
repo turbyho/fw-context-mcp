@@ -69,13 +69,14 @@ variant and stays, also when its name is `deps`. The first index run
 gives the files of the index their new paths, thus it indexes the
 project again.
 
-A tool that fw-context gives the output path to (bear, compiledb,
-keil2clangd, the manual backend) does not write the file directly. It writes
-a staging file in the directory of the variant,
+A tool that fw-context gives the output path to (the Mbed OS backend,
+compiledb, keil2clangd, the manual backend) does not write the file
+directly. It writes a staging file in the directory of the variant,
 `<variant>/.compile_commands.<pid>@<tag>.json`, and one rename then gives
 `out/compile_commands.json` the new content. Thus a reader never gets a
 database that a build still writes. The staging file is beside `out/` and
-not in it, because `mbed compile --clean` removes `out/` while bear writes.
+not in it, because `mbed compile --clean` removes `out/` while the build
+runs.
 
 Only a build that a signal stops leaves a staging file. The next build in
 that directory deletes it when its process no longer runs. The `<tag>` is
@@ -255,9 +256,9 @@ Exceptions:
 | `system` | `str` | (auto-detect) | all | Build system: `mbed-os`, `zephyr`, `platformio`, `esp-idf`, `arduino`, `cmake`, `keil-mdk`, `iar-ewarm`, `makefile`, `bare`, `stm32cubeide`, `ti-ccs` |
 | `clean` | `bool` | `true` | Mbed OS, PlatformIO, Zephyr, ESP-IDF, Arduino, CMake | Run a clean build before fw-context generates the file. **Recommended.** A clean build makes sure that `compile_commands.json` is complete. The other builders do not read this key. A Zephyr sysbuild variant does not read it either: it always builds with `--pristine=auto`. |
 | `command` | `str` | — | all | A command that replaces the build of the builder. Highest priority: fw-context ignores the settings of the builder. It runs `pre_build` first, and it applies `[build] env` to the command. The command must write `compile_commands.json` into the project root. `timeout` does not apply: the command has no time limit. The command runs without a shell, see [example 11](#11-shell-override--bear-wrapping-a-custom-build). |
-| `python` | `str` | (auto-detect) | all | The Python interpreter for pip-based CLI tools, such as `mbed-cli`, `platformio`, `keil2clangd`, or `compiledb`. `fw-context init` detects this automatically, from pyenv, venv, and common install paths. Set this parameter manually when automatic detection fails. |
-| `activate` | `str` | (auto-detect) | all | A shell script that fw-context sources before the build, for example the toolchain environment of NCS, or `export.sh` for ESP-IDF. `fw-context init` detects this automatically. Set this parameter manually when automatic detection fails. |
-| `pre_build` | `str` | — | all | A shell command that fw-context runs before the build, the convert step, or the generate step. Put it in `config.toml` when the whole team uses it, or in `local.toml` when it is specific to your machine. |
+| `python` | `str` | (auto-detect) | all | The Python interpreter for pip-based CLI tools, such as `mbed-cli`, `platformio`, `keil2clangd`, or `compiledb`. `fw-context init` detects this automatically, from pyenv, venv, and common install paths. Set this parameter manually when automatic detection fails. Mbed OS requires it: without it, the build stops with an error. |
+| `activate` | `str` | (auto-detect) | all | A script that sets up the environment of the build, for example the toolchain environment of NCS, or `export.sh` for ESP-IDF. On Linux and macOS it is a shell script that fw-context sources before each build command. On Windows it is a `.bat`, `.cmd` or `.ps1` script (see [General](#general)). `fw-context init` detects this automatically. Set this parameter manually when automatic detection fails. |
+| `pre_build` | `str` | — | all | A command line that fw-context runs before the build, the convert step, or the generate step. It runs without a shell: fw-context splits it as the shell of the host does (POSIX shell words, or the rules of `CommandLineToArgvW` on Windows). For a shell, write `sh -c '…'` or `cmd /c …`. Put it in `config.toml` when the whole team uses it, or in `local.toml` when it is specific to your machine. |
 | `env` | `dict[str,str]` | `{}` | all | Environment variables for each command of the build: the builder commands, `pre_build` and `command`. |
 | `timeout` | `float` | `7200` | all | The maximum time in seconds of each build command and of `pre_build`. When a command runs longer, fw-context stops it, and the build fails. |
 
@@ -279,6 +280,15 @@ it looks in the `PATH` of the build, which includes `extra_path`. The
 a `west` from outside the environment of the project can name a different
 workspace. A sysbuild variant with its own `activate` looks in its own
 environment.
+
+On Windows there is no `source`. fw-context runs the `activate` script
+(`.bat` or `.cmd` through `cmd.exe`, `.ps1` through PowerShell) before each
+build command, reads the environment that the script leaves, and runs the
+command with that environment, without a shell. The script and the command
+share one `timeout`. fw-context looks for a tool in the `PATH` and the
+`PATHEXT` of that environment, and not in the current directory. Another
+kind of script (`.sh`), or a `.bat` path that holds `%` or `^`, stops the
+build with an error that names the script.
 
 The Zephyr and ESP-IDF builds ask for no dependency (`.d`) files: the
 manifest of the index records the headers of each unit. An older version
@@ -746,9 +756,10 @@ Before the conversion step, `pre_build` runs a script that generates
 `version.h`. The script is part of the repository, as the build files are.
 
 `pre_build`, `command` and each build command run in a new session with no
-controlling terminal. Thus fw-context can stop the whole build, the
-compilers included. Output to the terminal still works. A hook that opens
-`/dev/tty` fails: a password prompt (`sudo`, `ssh`) or a curses screen
+controlling terminal (on Windows: in a job object). Thus fw-context can stop
+the whole build, the compilers included. Output to the terminal still
+works. The build gets no input: a hook that opens `/dev/tty` or reads its
+stdin fails, thus a password prompt (`sudo`, `ssh`) or a curses screen
 (`menuconfig`) does not work there.
 
 ### 10. CMake with Ninja
@@ -794,9 +805,11 @@ builder, but it runs `pre_build` first and applies `[build] env`. This
 example requires `bear`, as a system package:
 `sudo pacman -S bear`.
 
-### 12. Build environment — custom Python for mbed-cli
+### 12. Build environment — the Python of mbed-cli
 
-Mbed OS CLI requires Python 3.11 or older. If your system Python is newer,
+The Mbed OS backend needs `[build] python`: the Python that has mbed-cli
+(Mbed CLI 1). Mbed CLI requires Python 3.11 or older, and the backend
+script requires Python 3.7 or later. If your system Python is newer,
 install mbed-cli into a pyenv or a venv. Then point fw-context at that
 Python interpreter.
 
@@ -806,14 +819,23 @@ Python interpreter.
 python = "/home/user/.pyenv/versions/3.11.8/bin/python"
 ```
 
-`fw-context init` detects this automatically, from pyenv, `~/mbed_venv`, and
-`~/.local/bin/mbed`. Set this parameter manually only when automatic
-detection fails.
+`fw-context init` finds this Python in pyenv and in `~/mbed_venv`, when the
+`mbed` command is there (on Windows `Scripts\mbed.exe` of the venv). Set
+this parameter manually when `init` does not find it. Without it, the build
+stops with an error: the `mbed` command on `PATH` does not tell which
+Python has mbed-cli.
 
-When you set `python`, the builder runs:
+The builder runs:
 ```
-bear -- /path/to/python -m mbed compile -t GCC_ARM -m TARGET ...
+/path/to/python <fw-context>/data/mbed/compile_db.py record <database> -- compile -t GCC_ARM -m TARGET ...
 ```
+
+`compile_db.py` runs mbed-cli in that Python, as `python -m mbed` does.
+mbed-cli gives make.py its arguments and its environment, from `.mbed`,
+`mbed_settings.py` and the profiles. The script records the command of
+each source where the tools of mbed-os make it: the database holds the
+compiler calls of the build. The build does not need `bear`, thus it runs
+the same way on Linux, macOS and Windows.
 
 ### 13. Build environment — activation script for Zephyr/NCS
 
@@ -825,14 +847,15 @@ setup script. fw-context must source this script before `west build`.
 1. An `activate` that the config already holds. A new run of
    `fw-context init` shows it and keeps it by default.
 2. The Zephyr SDK of the current environment: the `environment-setup-*`
-   script of `ZEPHYR_SDK_INSTALL_DIR`.
+   script of `ZEPHYR_SDK_INSTALL_DIR`. Not on Windows: it is a shell script.
 3. The nRF Connect SDK versions that `nrfutil sdk-manager list` gives. You
    select the version, and `fw-context init` writes
    `.fw-context/ncs-env.sh` from `nrfutil sdk-manager toolchain env` and
-   `ZEPHYR_BASE`. The default version comes from `ZEPHYR_BASE` of your
-   shell.
-4. `zephyr-env.sh` in the `ZEPHYR_BASE` of your shell, or
-   `~/zephyr-sdk-*/environment-setup-*`.
+   `ZEPHYR_BASE`. On Windows it writes `.fw-context/ncs-env.cmd`, which runs
+   `nrfutil sdk-manager toolchain env --as-script cmd` each time. The
+   default version comes from `ZEPHYR_BASE` of your shell.
+4. `zephyr-env.sh` in the `ZEPHYR_BASE` of your shell (`zephyr-env.cmd` on
+   Windows), or `~/zephyr-sdk-*/environment-setup-*` (not on Windows).
 5. When it finds nothing, `fw-context init` asks for the path of the
    script.
 
@@ -860,6 +883,10 @@ For the nRF Connect SDK, `nrfutil` writes such a script:
 nrfutil sdk-manager toolchain env --ncs-version v3.2.3 --as-script sh > ~/ncs-v3.2.3-env.sh
 ```
 
+On Windows, write a script for Command Prompt (`--as-script cmd`) to a
+`.cmd` file: there `activate` must be a `.bat`, `.cmd` or `.ps1` file (see
+[General](#general)).
+
 When you set `activate`, the builder wraps the command:
 ```
 bash -c "source /path/to/setup.sh && west build -b nrf52840dk ..."
@@ -886,10 +913,12 @@ activate = "/home/user/esp/esp-idf/export.sh"
 `fw-context init` finds the script in this order:
 
 1. A `~/.espressif/tools/activate_idf_*.sh` of the Espressif Installation
-   Manager (EIM), the last one in name order
+   Manager (EIM), the last one in name order (not on Windows)
 2. `export.sh` in `$IDF_PATH`
 3. `~/esp/esp-idf/export.sh`
 4. `~/esp-idf/export.sh`.
+
+On Windows it looks for `export.bat` in the same directories.
 
 When it finds none of them, `init` sets no `activate`. As for Zephyr,
 fw-context looks for `idf.py` after it sources `activate` (see
@@ -1002,7 +1031,8 @@ west init ~/zephyrproject
 
 ### `bear: command not found`
 
-`bear` is a system package, not a Python package:
+No builder of fw-context needs `bear`. Only a `[build] command` that you
+write can call it. `bear` is a system package, not a Python package:
 ```bash
 sudo pacman -S bear        # Arch / Manjaro
 sudo apt install bear      # Debian / Ubuntu
@@ -1042,11 +1072,12 @@ default. When a first build takes longer, set a larger value in
 pip install keil2clangd
 ```
 
-### `mbed: command not found` (Mbed OS)
+### The Mbed OS build needs `[build] python`
 
-Mbed CLI requires Python 3.11 or older. If you see this error:
+Mbed CLI requires Python 3.11 or older. If you see one of these errors:
 ```
-RuntimeError: bear is required ... (or: Build command failed: mbed compile)
+RuntimeError: The Mbed OS build needs the Python that has mbed-cli in [build] python ...
+Build command failed: mbed compile ... No module named 'mbed'
 ```
 
 **Automatic detection:** Run `fw-context init`. This command scans pyenv
@@ -1063,6 +1094,10 @@ pip install mbed-cli
 # Or using a venv:
 python3.11 -m venv ~/mbed_venv
 ~/mbed_venv/bin/pip install mbed-cli
+
+# Or using a venv on Windows (PowerShell):
+py -3.11 -m venv $HOME\mbed_venv
+& $HOME\mbed_venv\Scripts\pip.exe install mbed-cli
 ```
 Then set this value in `.fw-context/local.toml`:
 ```toml
@@ -1093,3 +1128,7 @@ For the nRF Connect SDK, `nrfutil` writes such a script:
 ```bash
 nrfutil sdk-manager toolchain env --ncs-version v3.2.3 --as-script sh > ~/ncs-v3.2.3-env.sh
 ```
+
+On Windows, write a script for Command Prompt (`--as-script cmd`) to a
+`.cmd` file: there `activate` must be a `.bat`, `.cmd` or `.ps1` file (see
+[General](#general)).

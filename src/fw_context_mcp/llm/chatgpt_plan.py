@@ -26,13 +26,11 @@ from __future__ import annotations
 
 import base64
 import contextlib
-import errno
 import hashlib
 import json
 import logging
 import os
 import secrets as token_random
-import sys
 import threading
 import time
 import uuid
@@ -46,6 +44,8 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
 
+from .. import net
+from ..file_lock import lock, unlock
 from ..utils import fw_context_home, is_fatal, write_text_atomic
 from .client import ChatResult, Usage
 from .errors import ChatApiError, ChatPromptTooLong, LLMError, LLMStopRun
@@ -151,38 +151,18 @@ def _refresh_lock(profile: str) -> Iterator[None]:
 
     The refresh token rotates: a second process that refreshed the old one
     at the same time made the sign-in unusable (``refresh_token_reused``).
-    ``fcntl.flock`` on Linux and macOS, ``msvcrt.locking`` on Windows; the
-    kernel releases the lock when the process ends.
+    :mod:`fw_context_mcp.file_lock` (``flock`` on Linux and macOS,
+    ``LockFileEx`` on Windows); the kernel releases the lock when the process
+    ends.
     """
     path = credentials_path(profile).with_suffix(".lock")
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a+b") as handle:
-        if sys.platform == "win32":
-            import msvcrt
-
-            handle.seek(0)
-            while True:
-                try:
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-                    break
-                except OSError as exc:
-                    # LK_LOCK gives up after 10 s with EDEADLOCK: wait again.
-                    # Another error does not pass by a wait.
-                    if exc.errno not in (errno.EDEADLOCK, errno.EACCES):
-                        raise
-            try:
-                yield
-            finally:
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        lock(handle.fileno())
+        try:
+            yield
+        finally:
+            unlock(handle.fileno())
 
 
 # ── The ID token ──
@@ -232,7 +212,7 @@ class _KeysUnavailableError(Exception):
 def _revoke(client_id: str, refresh_token: str) -> bool:
     """Revoke *refresh_token*; return True when OpenAI confirms it (HTTP 200, also for a token that is not valid)."""
     try:
-        response = httpx.post(REVOKE_URL, data={
+        response = net.post(REVOKE_URL, data={
             "token": refresh_token, "token_type_hint": "refresh_token", "client_id": client_id,
         }, timeout=30)
     except httpx.HTTPError as exc:
@@ -359,7 +339,7 @@ def login(profile: str, *, open_url: Callable[[str, str], None], timeout_s: floa
         with _refresh_lock(profile):
             save_credentials(profile, PlanCredentials(client_id=issued_client, host_id=host_id))
 
-    response = httpx.post(TOKEN_URL, data={
+    response = net.post(TOKEN_URL, data={
         "grant_type": "authorization_code", "client_id": issued_client, "code": result.get("code", ""),
         "code_verifier": verifier, "redirect_uri": redirect, "resource": API_BASE,
     }, timeout=60)
@@ -419,7 +399,7 @@ def access_token(profile: str, *, force_refresh: bool = False) -> str:
         if not force_refresh and credentials.expires_at - REFRESH_MARGIN_S > time.time():
             return credentials.access_token
         try:
-            response = httpx.post(TOKEN_URL, data={
+            response = net.post(TOKEN_URL, data={
                 "grant_type": "refresh_token", "client_id": credentials.client_id,
                 "refresh_token": credentials.refresh_token, "resource": API_BASE,
             }, timeout=60)
@@ -531,7 +511,7 @@ def _listed_models(profile: str) -> list[dict]:
     """Return the entries of the model list of the plan that it lists for a user (``visibility`` "list")."""
     token = access_token(profile)
     try:
-        response = httpx.get(MODELS_URL, headers={"Authorization": f"Bearer {token}"}, timeout=30)
+        response = net.get(MODELS_URL, headers={"Authorization": f"Bearer {token}"}, timeout=30)
         response.raise_for_status()
         body = response.json()
     except (httpx.HTTPError, ValueError) as exc:
@@ -641,7 +621,7 @@ class ChatGPTPlanClient:
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         chunks: list[str] = []
         try:
-            with httpx.stream("POST", RESPONSES_URL, headers=headers, json=body, timeout=self.cfg.timeout) as resp:
+            with net.stream("POST", RESPONSES_URL, headers=headers, json=body, timeout=self.cfg.timeout) as resp:
                 if resp.status_code >= 400:
                     resp.read()
                     raise self._refusal(resp.status_code, _parse_error(resp))

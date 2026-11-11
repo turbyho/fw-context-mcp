@@ -214,7 +214,8 @@ class BuildSystem(Protocol):
     def environment_help(cls) -> str:
         """Human-readable instructions for manual environment setup.
 
-        Shown by ``fw-context init`` when ``detect_environment()``
-        returns no results and ``required_tools()`` are not on PATH.
+        Shown by ``fw-context init`` for Mbed OS when
+        ``detect_environment()`` finds no Python: that build needs
+        ``[build] python``.
         """
         return ""

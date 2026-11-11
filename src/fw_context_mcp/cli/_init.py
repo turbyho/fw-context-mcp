@@ -1024,7 +1024,7 @@ def _check_config_file(project_root: Path, rel_path: str, template: str, fix: bo
     if not path.exists():
         if fix:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(template)
+            path.write_text(template, encoding="utf-8")
             print(f"  [fix] created {path}")
         else:
             print(f"  [warn] {path} missing — run with --fix to create")

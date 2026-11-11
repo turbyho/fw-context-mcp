@@ -9,6 +9,24 @@ from fw_context_mcp.indexer.builders.stubs import (
 )
 
 
+@pytest.fixture
+def stub_gcc(tmp_path, monkeypatch):
+    """A ``gcc`` at the start of PATH, in the form of the host (``tests/_stubs.py``).
+
+    The manual builder looks the compiler up (``manual.py``) and writes its
+    path into ``compile_commands.json``; it does not run it.  WHY a stub and
+    not the gcc of the machine: Windows has none, and the tests need only
+    a program of that name.
+    """
+    import os
+
+    from tests._stubs import write_tool
+
+    tools = tmp_path / "stub-bin"
+    write_tool(tools, "gcc")
+    monkeypatch.setenv("PATH", f"{tools}{os.pathsep}{os.environ.get('PATH', '')}")
+    return tools
+
 class TestSTM32CubeIDEStub:
     def test_detected_cproject(self, tmp_path):
         (tmp_path / ".cproject").write_text("<?xml version='1.0'?>\n")
@@ -52,6 +70,7 @@ class TestManualBuildSystem:
         with pytest.raises(RuntimeError, match="source_dirs"):
             ManualBuildSystem().build(tmp_path, cfg)
 
+    @pytest.mark.usefixtures("stub_gcc")
     def test_generate_creates_compile_commands(self, tmp_path):
         from fw_context_mcp.indexer.build import BuildConfig
 
@@ -61,9 +80,7 @@ class TestManualBuildSystem:
         (src_dir / "main.c").write_text("int main() { return 0; }\n")
         (src_dir / "utils.cpp").write_text("void f() {}\n")
 
-        import shutil
-
-        compiler = "gcc" if shutil.which("gcc") else "cc"
+        compiler = "gcc"
         cfg = BuildConfig(
             system="bare",
             source_dirs=["src"],
@@ -102,6 +119,7 @@ class TestManualBuildSystem:
         with pytest.raises(RuntimeError, match="No source files"):
             ManualBuildSystem().generate(tmp_path, cfg)
 
+    @pytest.mark.usefixtures("stub_gcc")
     def test_generate_include_dirs_become_dash_i(self, tmp_path):
         from fw_context_mcp.indexer.build import BuildConfig
 
@@ -123,6 +141,7 @@ class TestManualBuildSystem:
         assert "include" in args
         assert "lib/CMSIS/Include" in args
 
+    @pytest.mark.usefixtures("stub_gcc")
     def test_generate_system_include_dirs_become_isystem(self, tmp_path):
         from fw_context_mcp.indexer.build import BuildConfig
 

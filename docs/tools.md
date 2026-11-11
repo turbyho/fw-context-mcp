@@ -246,7 +246,7 @@ every variant. Use `--variant`, `--variants`, `--image`, or
 |-------------|---------|
 | **Zephyr** | `west build -b <board> -- -DCMAKE_EXPORT_COMPILE_COMMANDS=ON` |
 | **PlatformIO** | `pio run --target compiledb` |
-| **Mbed OS** | `bear -- mbed compile --profile release` |
+| **Mbed OS** | `fw-context index --build` (the Mbed OS backend records the commands of `mbed compile`) |
 | **CMake** | `bear -- cmake --build build` or `cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON` |
 | **Make** | `bear -- make` |
 | **Custom** | `bear -- <your-build-command>` |
@@ -709,7 +709,8 @@ its LLM analysis, for example an API for a full `--force-llm` run:
   started with `&`), not with `--background`, only when the run makes the
   LLM analysis (also through `--force-llm` or `--analyze`), and only when
   two profiles or more can run. Enter keeps the profile of the project,
-  and so does no answer in 60 seconds (on Windows the question waits).
+  and so does no answer in 60 seconds. On Windows the question comes only
+  when stdin is the console (not `< NUL`).
   `fw-context analyze` also tells how many definitions the analysis
   reads, and how many of them have no analysis.
 - `--llm` of a run without the LLM analysis (`--no-analyze`) has no
@@ -1067,7 +1068,7 @@ Project:    my-zephyr-app
 Path:       /home/user/zephyr-app
 DB dir:     /home/user/.fw-context/index/a1b2c3d4
 Daemon:     running (pid 12345, uptime 3600s)
-Socket:     /home/user/.fw-context/index/a1b2c3d4/daemon.sock (active)
+Port file:  /home/user/.fw-context/index/a1b2c3d4/daemon.port (port 50731) (active)
 Modified:   3 file(s) in build nrf52840-dev/app
 Modified:   0 file(s) in build nrf52840-dev/mcuboot
 Index:      idle
@@ -1650,8 +1651,12 @@ Output: [{"total": 1, "offset": 0, "shown": 1, "more": false},
 ```
 
 A macro result has the page notice of a symbol result, and its
-`qualified_name` is the name of the macro. `expanded_value` is absent when
-the index holds no expanded value.
+`qualified_name` is the name of the macro. `expanded_value` is the
+definition of the name that is in force at the end of a unit, from
+`clang -dM -E` (after `#undef` and a new `#define`, and with the `-D`
+macros of the build). The preprocessor does not expand the macros in it:
+`#define A B` gives `B`. `expanded_value` is absent when the index holds
+no such value.
 
 A function-like macro shows its parameters in `signature`, and `value` holds
 the replacement text alone:

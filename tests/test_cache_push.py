@@ -477,10 +477,9 @@ def _remote_init(monkeypatch, tmp_path: Path, stats_answer) -> int:
             return httpx.Response(200, json={"status": "ok"})
         return stats_answer
 
-    real_client = httpx.Client
     monkeypatch.setattr(
-        cache_mod.httpx, "Client",
-        lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw),
+        cache_mod.net, "client",
+        lambda url, **kw: httpx.Client(transport=httpx.MockTransport(handler), **kw),
     )
     return cache_mod.cmd_cache_remote_init(SimpleNamespace())
 

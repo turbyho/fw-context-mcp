@@ -60,12 +60,12 @@ def db(tmp_path):
 
 def _handler_db(tmp_path: Path):
     from fw_context_mcp.mcp.handlers._base import BaseHandler, DbContext
-    from fw_context_mcp.mcp.shared.executor import SyncQueryExecutor
+    from fw_context_mcp.mcp.shared.context import get_executor
 
     db_path = tmp_path / "test.db"
     ctx = DbContext(
         db_path=db_path,
-        executor=SyncQueryExecutor(str(db_path.resolve()), db_path),
+        executor=get_executor(db_path),
         config_hash=CH,
         project_id="proj-001",
         root=tmp_path,
@@ -123,7 +123,7 @@ def test_no_hotspot_with_references_says_so(db, tmp_path):
 def test_absolute_sites(tmp_path):
     sites = callgraph._absolute_sites("src/a.c:10, /abs/b.c:20", tmp_path)
 
-    assert sites == f"{tmp_path / 'src/a.c'}:10, /abs/b.c:20"
+    assert sites == f"{(tmp_path / 'src/a.c').as_posix()}:10, /abs/b.c:20"
 
 
 def test_absolute_vector_paths_reach_the_nested_entries(tmp_path):
@@ -137,11 +137,11 @@ def test_absolute_vector_paths_reach_the_nested_entries(tmp_path):
 
     out = callgraph._absolute_vector_paths([row, build_row, {"coverage": "…"}], tmp_path)
 
-    assert out[0]["file"] == str(tmp_path / "src/timer.c")
-    assert out[0]["table_file"] == str(tmp_path / "startup.S")
-    assert out[0]["overridden"]["file"] == str(tmp_path / "startup.S")
-    assert out[0]["aliases"]["file"] == str(tmp_path / "startup.S")
-    assert out[0]["installed"][0]["file"] == str(tmp_path / "src/h.c")
-    assert out[0]["installed"][0]["at"] == f"{tmp_path / 'src/init.c'}:9"
+    assert out[0]["file"] == (tmp_path / "src/timer.c").as_posix()
+    assert out[0]["table_file"] == (tmp_path / "startup.S").as_posix()
+    assert out[0]["overridden"]["file"] == (tmp_path / "startup.S").as_posix()
+    assert out[0]["aliases"]["file"] == (tmp_path / "startup.S").as_posix()
+    assert out[0]["installed"][0]["file"] == (tmp_path / "src/h.c").as_posix()
+    assert out[0]["installed"][0]["at"] == f"{(tmp_path / 'src/init.c').as_posix()}:9"
     assert out[1]["file"] == ""
     assert out[2] == {"coverage": "…"}

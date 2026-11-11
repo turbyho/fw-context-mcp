@@ -27,7 +27,8 @@ from fw_context_mcp.indexer._driver_query import (
     query_gcc_driver,
     resolve_compiler,
 )
-from fw_context_mcp.utils import CPP_SOURCE_EXTENSIONS, TU_EXTENSIONS
+from fw_context_mcp.path_key import canonical_path
+from fw_context_mcp.utils import CPP_SOURCE_EXTENSIONS, TU_EXTENSIONS, command_words
 
 # Flags libclang does not support — drop silently
 _DROP_FLAGS = frozenset({
@@ -295,7 +296,7 @@ def expand_response_file(token: str, cwd: Path | None = None) -> list[str]:
         rsp = cwd / rsp
     if not rsp.exists():
         return []
-    return shlex.split(rsp.read_text())
+    return shlex.split(rsp.read_text(encoding="utf-8"))
 
 
 def _is_source_file(token: str) -> bool:
@@ -608,15 +609,19 @@ def parse(path: Path) -> Iterator[CompilationUnit]:
     # without it in others; see known_compilers().
     known = known_compilers(entries)
     for entry in entries:
-        file = Path(entry["file"])
         cwd = Path(entry.get("directory", path.parent))
+        # The identity of the file: links resolved, the case of the disk
+        # (path_key.canonical_path).  A build tool can spell a file of a
+        # case-insensitive file system in a different case, and each later
+        # resolve() of a canonical path keeps it canonical.  An absolute
+        # entry gets the same form: it was not resolved before, and its
+        # spelling then differed from the key of its own file.
+        file = canonical_path(cwd / entry["file"])
 
-        if not file.is_absolute():
-            file = (cwd / file).resolve()
-
-        raw_args: list[str] = entry.get("arguments") or shlex.split(
-            entry.get("command", "")
-        )
+        # The arguments as the compiler got them, by the rules of the host:
+        # shlex removed each backslash of a Windows command
+        # (utils.command_words).
+        raw_args: list[str] = entry.get("arguments") or command_words(entry.get("command", ""))
 
         # Extract compiler binary before stripping it
         compiler: Path | None = None
@@ -649,8 +654,11 @@ def _defines_of_entry(entry: dict) -> dict[str, str]:
     """
     tokens = entry.get("arguments")
     if not isinstance(tokens, list):
+        # The words of the command as ``parse`` reads them.  ``str.split``
+        # kept the quotes: `-DVERSION=\\"1.2\\"` gave the value `\\"1.2\\"`,
+        # and `-DNAME="a b"` gave two words.
         command = entry.get("command")
-        tokens = str(command).split() if command else []
+        tokens = command_words(str(command)) if command else []
     found: dict[str, str] = {}
     expect_value = False
     for token in tokens:

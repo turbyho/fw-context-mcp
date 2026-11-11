@@ -16,6 +16,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._toml import toml_string
+
 pytest.importorskip("clang.cindex", reason="libclang not available")
 pytestmark = pytest.mark.libclang
 
@@ -25,7 +27,7 @@ HEADER = "struct B { virtual void f(); virtual ~B() {} };\nstruct D : B { void f
 def _write(root: Path, files: dict[str, str], units: list[str]) -> None:
     (root / ".fw-context").mkdir(parents=True, exist_ok=True)
     (root / ".fw-context" / "config.toml").write_text(
-        f'[project]\nid = "proj-move"\n\n[build]\n\n[index]\ndb_dir = "{root.parent / "db"}"\n', encoding="utf-8",
+        f'[project]\nid = "proj-move"\n\n[build]\n\n[index]\ndb_dir = {toml_string(root.parent / "db")}\n', encoding="utf-8",
     )
     for file, text in files.items():
         (root / file).write_text(text, encoding="utf-8")

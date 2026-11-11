@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..utils import sqlite_file_uri
 from . import DepCheckResult
 from ._instructions import (
     clang_resource_instructions,
@@ -1086,7 +1087,9 @@ def check_db_integrity(project_root: str | Path | None = None) -> DepCheckResult
         )
 
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        # sqlite_file_uri: a space, "#", "?" or "%" of the path is a
+        # character of a name, and a network path of Windows has its own form.
+        conn = sqlite3.connect(sqlite_file_uri(db_path.resolve(), "ro"), uri=True)
         try:
             row = conn.execute("PRAGMA quick_check").fetchone()
             if row and row[0] == "ok":

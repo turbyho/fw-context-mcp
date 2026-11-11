@@ -22,6 +22,9 @@ from typing import TYPE_CHECKING
 
 import httpx
 
+from .. import net
+from ..utils import replace_file
+
 if TYPE_CHECKING:
     from ..cache_client import CacheClient
 
@@ -326,7 +329,7 @@ def cmd_cache_remote_init(args: argparse.Namespace) -> int:
     # --- Step 3: Verify connection ---
     print(f"\nVerifying connection to {url} ...")
     try:
-        with httpx.Client(base_url=url, timeout=10.0) as client:
+        with net.client(url, base_url=url, timeout=10.0) as client:
             # Check health first
             health_resp = client.get("/health")
             if health_resp.status_code != 200:
@@ -414,7 +417,7 @@ def cmd_cache_remote_init(args: argparse.Namespace) -> int:
         os.write(fd, token.encode("utf-8"))
     finally:
         os.close(fd)
-    os.replace(tmp_file, token_file)
+    replace_file(tmp_file, token_file)
 
     from fw_context_mcp.config._toml_editor import set_key
     set_key(config_path, "cache_server", "url", url)

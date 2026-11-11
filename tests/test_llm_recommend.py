@@ -15,6 +15,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from fw_context_mcp import net
 from fw_context_mcp.config import settings
 from fw_context_mcp.llm import _diag, calibration, ollama, recommend
 from fw_context_mcp.llm.calibration import EmbedMeasure, Key, Measure, Speed
@@ -555,7 +556,7 @@ def _embed_server(monkeypatch, body: dict, status: int = 200) -> list[dict]:
         sent.append(json)
         return httpx.Response(status, json=body, request=httpx.Request("POST", url))
 
-    monkeypatch.setattr(httpx, "post", _post)
+    monkeypatch.setattr(net, "post", _post)
     return sent
 
 

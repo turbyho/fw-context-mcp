@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -140,14 +141,19 @@ class TestNormalizePatterns:
     """Tests for _normalize_patterns — batch normalization."""
 
     def test_mixed_patterns(self):
-        result = _normalize_patterns(["third_party", "mbed-os/%", "/abs/path"])
-        assert result == ["third_party/%", "mbed-os/%", "/abs/path/%"]
+        root = Path("/nonexistent-root")
+        result = _normalize_patterns(["third_party", "mbed-os/%", "/abs/path"], root)
+        # An absolute path of the user gets the key form of this system:
+        # "/abs/path" on POSIX, "<drive>:/abs/path" on Windows, where a path
+        # without a drive is on the drive of the current directory.
+        drive = Path.cwd().drive if os.name == "nt" else ""
+        assert result == ["third_party/%", "mbed-os/%", f"{drive}/abs/path/%"]
 
     def test_empty_list(self):
-        assert _normalize_patterns([]) == []
+        assert _normalize_patterns([], Path("/nonexistent-root")) == []
 
     def test_all_already_normalized(self):
-        result = _normalize_patterns(["a/%", "b/%"])
+        result = _normalize_patterns(["a/%", "b/%"], Path("/nonexistent-root"))
         assert result == ["a/%", "b/%"]
 
 

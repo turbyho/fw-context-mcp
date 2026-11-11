@@ -223,7 +223,7 @@ class TestPlatformIOIsolatesObjectFiles:
         (root / "platformio.ini").write_text("[env:x]\n", encoding="utf-8")
         envs: list[dict] = []
 
-        def fake_run(cmd, cwd=None, description="", env=None, build_cfg=None, timeout=None):
+        def fake_run(cmd, cwd=None, description="", env=None, build_cfg=None, timeout=None, errors="replace"):
             envs.append(dict(env or {}))
             if "compiledb" in cmd:
                 env_name = cmd[cmd.index("--environment") + 1]

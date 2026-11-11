@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import os
 import platform
-import pwd
 import re
 import secrets
 import shutil
@@ -45,6 +44,13 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Any
+
+# The wizard runs sudo, useradd, systemd or launchd and nginx, and it reads
+# the users of the system through ``pwd``: Linux and macOS only.  WHY a
+# guard of the module: ``cli.cmd_setup`` refuses Windows before the import,
+# and mypy checks the rest of the module only for POSIX.
+if sys.platform == "win32":
+    raise ImportError("the setup wizard of the cache server supports Linux and macOS only")
 
 
 def setup_wizard() -> int:
@@ -344,6 +350,8 @@ def _ensure_server_venv() -> bool:
 
     # Ensure fw-cache system user exists before chown.
     # The user must exist so the systemd service can run as fw-cache.
+    import pwd
+
     try:
         pwd.getpwnam("fw-cache")
     except KeyError:
@@ -568,7 +576,7 @@ def _save_credentials(password: str) -> None:
     home_parent = Path.home() / ".fw-context"
     home_parent.mkdir(parents=True, exist_ok=True)
     home_path = home_parent / "db.env"
-    home_path.write_text(db_url_line)
+    home_path.write_text(db_url_line, encoding="utf-8")
     home_path.chmod(0o600)
     print(f"  [✓] Credentials saved to {home_path}")
     os.environ["FW_CACHE_DB_URL"] = db_url
@@ -591,7 +599,7 @@ def _find_db_url() -> str:
         return db_url
     for env_path in (Path("/var/lib/fw-cache-server/db.env"), Path.home() / ".fw-context" / "db.env"):
         if env_path.exists():
-            content = env_path.read_text()
+            content = env_path.read_text(encoding="utf-8")
             m = re.search(r'FW_CACHE_DB_URL="([^"]+)"', content)
             if m:
                 os.environ["FW_CACHE_DB_URL"] = m.group(1)

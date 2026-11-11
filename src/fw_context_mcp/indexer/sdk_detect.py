@@ -50,6 +50,39 @@ def _path_matches(file_path: str, pattern: str) -> bool:
     return bool(re.match("^.*/" + regex.lstrip("^"), "/" + file_path))
 
 
+def classify_key(key: str, vendor_patterns: list[str], project_patterns: list[str]) -> int:
+    """Return ``is_project`` (1 or 0) of the file with the index key *key*.
+
+    The rule for C, assembly and linker scripts:
+
+    - A key inside the project root is project code (1), unless a vendor
+      pattern matches it and no project pattern matches it.  A project
+      pattern wins, because a project directory can match a general vendor
+      pattern.
+    - A key outside the root (an SDK, a framework package) is vendor code
+      (0), unless a project pattern matches it.
+
+    *key* comes from :func:`fw_context_mcp.path_key.index_key`.  WHY one
+    function: the three file kinds had a copy each, and each copy found
+    "outside the root" again through ``Path.relative_to``.
+
+    A relative pattern (``src/%``) is relative to the project root, thus it
+    does not match a key outside the root.  WHY: ``_path_matches`` also
+    matches a pattern at a deeper level (``*/src/%``), and an SDK header
+    ``/home/u/.platformio/packages/framework-x/src/foo.h`` became project
+    code through the project pattern ``src/%``.  Outside the root, only an
+    absolute pattern or a pattern that starts with ``%`` can match.
+    """
+    from ..path_key import is_absolute_key
+
+    if is_absolute_key(key):
+        outside = [p for p in project_patterns if p.startswith("%") or is_absolute_key(p)]
+        return 1 if any(_path_matches(key, p) for p in outside) else 0
+    if any(_path_matches(key, p) for p in project_patterns):
+        return 1
+    return 0 if any(_path_matches(key, p) for p in vendor_patterns) else 1
+
+
 def _normalize_path_pattern(pattern: str) -> str:
     """Append '/%' to patterns without a wildcard so _path_matches (regex) matches subdirectories.
 
@@ -62,19 +95,27 @@ def _normalize_path_pattern(pattern: str) -> str:
     return pattern
 
 
-def _normalize_patterns(patterns: list[str]) -> list[str]:
-    # NOTE: vendor_patterns from _build_sdk_excludes() already contain % wildcards
-    # and do NOT go through this function. Only user-supplied paths need normalization.
-    """Normalize patterns for _path_matches — each wildcard-less pattern gets '/%' appended.
+def _normalize_patterns(patterns: list[str], project_root: Path) -> list[str]:
+    """Normalize the vendor or project paths of the user config into patterns for _path_matches.
 
-    Centralized wrapper calling _normalize_path_pattern for each pattern.
-    Used by both runner.py and maintenance.py.
+    Each pattern without a wildcard gets ``/%`` (:func:`_normalize_path_pattern`),
+    and then the form of the index keys (:func:`fw_context_mcp.path_key.pattern_key`).
+    Used by both runner.py and maintenance.py.  The patterns of the builders
+    get the key form in :func:`_build_sdk_excludes`.
 
     ``"third_party"`` → ``"third_party/%"``
     ``"/home/user/esp/components/muj_fork"`` → ``"/home/user/esp/components/muj_fork/%"``
     ``"mbed-os/%"`` → ``"mbed-os/%"`` (already has wildcard, unchanged)
+
+    WHY the separator before ``_normalize_path_pattern``: it strips a
+    trailing ``/``, and a Windows path of the user can end with ``\\``.
     """
-    return [_normalize_path_pattern(p) for p in patterns]
+    import os
+
+    from ..path_key import pattern_key
+
+    separators = [p.replace("\\", "/") if os.name == "nt" else p for p in patterns]
+    return [pattern_key(_normalize_path_pattern(p), project_root) for p in separators]
 
 
 def _build_sdk_excludes(
@@ -119,7 +160,7 @@ def _build_sdk_excludes(
         )
         return []
     try:
-        return builder_cls().get_vendor_patterns(root, units=units)
+        patterns = builder_cls().get_vendor_patterns(root, units=units)
     except (OSError, ValueError, TypeError, RuntimeError):
         # A builder that cannot answer must not stop the index run or the
         # query.  An empty list means "no in-tree vendor tree", which is the
@@ -127,6 +168,11 @@ def _build_sdk_excludes(
         # the team's own code.
         log.warning("Builder %s failed to give vendor patterns", key, exc_info=True)
         return []
+    # The patterns must match the index keys (path_key.index_key): a builder
+    # that joins a relative path with "/%" gives "deps\\ncs/%" on Windows.
+    from ..path_key import pattern_key
+
+    return [pattern_key(p, root) for p in patterns]
 
 
 def vendor_patterns_for_build(

@@ -255,8 +255,8 @@ def test_a_missing_database_and_a_degraded_index_name_the_action_of_the_reason(t
 
 def test_an_old_schema_names_its_command(tmp_path, monkeypatch):
     """Each reason names its action, thus a caller that reads only the reasons finds it."""
-    from fw_context_mcp.mcp.handlers import maintenance
     from fw_context_mcp.indexer.db import CURRENT_SCHEMA_VERSION
+    from fw_context_mcp.mcp.handlers import maintenance
 
     conn, root = _index(tmp_path)
     monkeypatch.setattr(maintenance, "get_db_schema_version", lambda conn: 0)
@@ -269,8 +269,8 @@ def test_an_old_schema_names_its_command(tmp_path, monkeypatch):
 @pytest.mark.parametrize("run_state", ["pending", "reindexing"])
 def test_an_old_schema_and_row_format_ask_to_wait_for_a_run(tmp_path, monkeypatch, run_state):
     """Each index run writes the rows again, thus a second run asks for the same work."""
-    from fw_context_mcp.mcp.handlers import maintenance
     from fw_context_mcp.indexer.db import CURRENT_SCHEMA_VERSION
+    from fw_context_mcp.mcp.handlers import maintenance
 
     conn, root = _index(tmp_path)
     monkeypatch.setattr(maintenance, "get_db_schema_version", lambda conn: 0)

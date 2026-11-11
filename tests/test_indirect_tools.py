@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from tests._paging import assert_whole_and_once, notice, walk_pages, with_project
+from tests._toml import toml_string
 
 pytest.importorskip("clang.cindex", reason="libclang not available")
 pytestmark = pytest.mark.libclang
@@ -86,7 +87,7 @@ def _index(root: Path, base: Path, project_id: str, name: str, source: str, comp
 
     (root / ".fw-context").mkdir(parents=True)
     (root / ".fw-context" / "config.toml").write_text(
-        f'[project]\nid = "{project_id}"\n\n[build]\n\n[index]\ndb_dir = "{base}"\n', encoding="utf-8",
+        f'[project]\nid = "{project_id}"\n\n[build]\n\n[index]\ndb_dir = {toml_string(base)}\n', encoding="utf-8",
     )
     (root / name).write_text(source, encoding="utf-8")
     (root / "compile_commands.json").write_text(json.dumps([{

@@ -453,11 +453,12 @@ def pytest_runtest_protocol(item, nextitem):
 def _stop_leftover_processes(marker_value: str) -> list[str]:
     """Stop each process that this session started and that still runs; return a line for each.
 
-    A test that runs ``fw-context index`` as a process starts the watcher
-    daemon (``cli._index._ensure_watcher_after_index``), and no test stops
-    it.  Measured 2026-10-21: the daemon of a test project lived on after
-    the session, saw the file that the test deleted, and started
-    ``fw-context index --background``.
+    A process of a test can live after the test, for example a watcher
+    daemon that a query handler started (``_ensure_daemon_running`` of the
+    stale recovery).  Measured 2026-10-21: the daemon of a test project
+    lived on after the session, saw the file that the test deleted, and
+    started ``fw-context index --background``.  At that time
+    ``fw-context index`` also started the daemon.
 
     WHY the environment and not the PID files: a test can set its own
     ``db_dir``, and a PID file can hold a PID that a test wrote on purpose.
@@ -519,6 +520,32 @@ def _running(pid: int) -> bool:
     except (OSError, IndexError):
         return False
     return state != "Z"
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_call(item):
+    """Close the connections of the query executors after the call of each test.
+
+    WHY: ``SyncQueryExecutor`` holds one connection to each database for
+    the life of the process (``mcp/shared/executor.py``), which is right for
+    an MCP server with a few databases.  A test session makes hundreds of
+    databases in temporary directories, and each one kept three file
+    descriptors (the database, ``-wal`` and ``-shm``).  Measured on Linux
+    2026-11-09: 803 open database files at the end of the fast suite.  On
+    macOS the default limit of 256 descriptors stopped the session at 40 %
+    ("unable to open database file", then EMFILE), and on Windows the open
+    files stopped the cleanup of the temporary directories (WinError 32).
+
+    WHY a wrapper of the call and not an autouse fixture: the teardown of an
+    autouse fixture comes after the teardown of the fixtures of the test,
+    thus a temporary directory went before its database was closed.
+    """
+    try:
+        return (yield)
+    finally:
+        from fw_context_mcp.mcp.shared.context import invalidate_executor
+
+        invalidate_executor()
 
 
 @pytest.fixture(autouse=True)

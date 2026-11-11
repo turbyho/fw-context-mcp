@@ -161,6 +161,8 @@ from typing import NamedTuple
 
 import clang.cindex as cx
 
+from ..path_key import canonical_path
+
 
 class Place(NamedTuple):
     """The place of the definition of a type: the key of its file (``file_key``), its line and its column.
@@ -301,7 +303,7 @@ _CHARACTER_KINDS: weakref.WeakKeyDictionary[cx.TranslationUnit, dict[str, str]] 
 @functools.lru_cache(maxsize=16384)
 def file_key(path: str) -> str:
     """The key of the file *path* in a USR: ``<base name>~<8 hex digits of the SHA-1 of the resolved path>``."""
-    resolved = os.path.realpath(path)
+    resolved = str(canonical_path(path))
     digest = hashlib.sha1(resolved.encode("utf-8", "surrogateescape"), usedforsecurity=False).hexdigest()
     return f"{os.path.basename(resolved)}~{digest[:8]}"
 

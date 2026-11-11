@@ -23,6 +23,7 @@ from typing import Any
 
 import httpx
 
+from .. import net
 from ..config.settings import DESCRIPTION_VERSION
 from ..llm.embedder import Embedder, EmbedderContextUnknown, EmbedderInputTooLong
 from ..llm.embedder_factory import get_embedder
@@ -614,7 +615,7 @@ def _build_embeddings(
     from ..llm.ollama import OllamaEmbedder
     if isinstance(embedder, OllamaEmbedder):
         try:
-            resp = httpx.get(llm_config.ollama_url.rstrip("/") + "/api/tags", timeout=5.0)
+            resp = net.get(llm_config.ollama_url.rstrip("/") + "/api/tags", timeout=5.0)
             resp.raise_for_status()
         except (httpx.HTTPError, *SAFE_EXCEPT) as e:
             # httpx.HTTPError: a refused connection and a status error are

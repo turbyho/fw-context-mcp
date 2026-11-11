@@ -12,6 +12,8 @@ from __future__ import annotations
 import httpx
 import pytest
 
+from fw_context_mcp import net
+
 REMOTE = "http://gpu-box:11434"
 
 
@@ -68,7 +70,7 @@ def linux(monkeypatch):
 def test_the_check_of_the_embedding_model_names_the_server(monkeypatch, linux):
     from fw_context_mcp.deps._checks import check_ollama_embed_model
 
-    monkeypatch.setattr(httpx, "get", lambda url, timeout: _Tags([]))
+    monkeypatch.setattr(net, "get", lambda url, timeout: _Tags([]))
 
     result = check_ollama_embed_model(_cfg())
 
@@ -80,7 +82,7 @@ def test_the_check_of_the_chat_model_names_the_server_of_the_chat_calls(monkeypa
     from fw_context_mcp.deps._checks import check_ollama_chat_model
 
     other = "http://chat-box:11434"
-    monkeypatch.setattr(httpx, "get", lambda url, timeout: _Tags([]))
+    monkeypatch.setattr(net, "get", lambda url, timeout: _Tags([]))
 
     result = check_ollama_chat_model(_cfg(chat_api_base=other))
 
@@ -96,7 +98,7 @@ def test_a_stalled_pull_names_the_server(monkeypatch):
     def _stalls(*args, **kwargs):
         raise httpx.ReadTimeout("no bytes")
 
-    monkeypatch.setattr(httpx, "stream", _stalls)
+    monkeypatch.setattr(net, "stream", _stalls)
 
     ok, message = _fixes._pull_via_api("emb:1", REMOTE)
 

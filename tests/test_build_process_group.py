@@ -23,6 +23,13 @@ import pytest
 
 from fw_context_mcp.utils import process_start_time, record_build_groups, run_in_process_group
 
+#: A test of the POSIX mechanism: the session, the process group, its record,
+#: and the stop of an orphan group.  Windows has none of these: there the build
+#: runs in a job object, and tests/test_build_job.py tests that.
+posix_group = pytest.mark.skipif(
+    sys.platform == "win32", reason="POSIX process group; Windows: tests/test_build_job.py",
+)
+
 
 def _alive(pid: int) -> bool:
     try:
@@ -60,6 +67,7 @@ class _Stop(BaseException):
     """What IndexStopped does from a signal handler: an exception in communicate()."""
 
 
+@posix_group
 def test_a_timeout_stops_the_grandchild(tmp_path: Path):
     pid_file = tmp_path / "grandchild.pid"
 
@@ -72,6 +80,7 @@ def test_a_timeout_stops_the_grandchild(tmp_path: Path):
     assert _wait_gone(_read_pid(pid_file)), "the compiler of the build still runs"
 
 
+@posix_group
 def test_an_exception_while_the_build_runs_stops_the_grandchild(tmp_path: Path):
     """THE regression test: SIGTERM → IndexSuperseded inside communicate()."""
     pid_file = tmp_path / "grandchild.pid"
@@ -94,6 +103,7 @@ def test_an_exception_while_the_build_runs_stops_the_grandchild(tmp_path: Path):
     assert _wait_gone(_read_pid(pid_file)), "the compiler of the build still runs"
 
 
+@posix_group
 def test_a_build_that_ends_gives_its_output(tmp_path: Path):
     result = run_in_process_group(
         ["sh", "-c", "echo out; echo err >&2; exit 3"], cwd=tmp_path, env=dict(os.environ),
@@ -103,6 +113,7 @@ def test_a_build_that_ends_gives_its_output(tmp_path: Path):
     assert (result.returncode, result.stdout, result.stderr) == (3, "out\n", "err\n")
 
 
+@posix_group
 def test_the_build_runs_in_a_new_session(tmp_path: Path):
     """Ctrl-C then reaches this process only, and it stops the build itself."""
     result = run_in_process_group(
@@ -113,6 +124,7 @@ def test_the_build_runs_in_a_new_session(tmp_path: Path):
     assert int(result.stdout.strip()) != os.getsid(0)
 
 
+@posix_group
 def test_the_group_is_recorded_while_the_build_runs(tmp_path: Path):
     """After a SIGKILL the next run reads the record and stops the group."""
     record = tmp_path / "reindex.build"
@@ -133,6 +145,7 @@ def test_the_group_is_recorded_while_the_build_runs(tmp_path: Path):
     assert not record.exists(), "the record must go when the build ends"
 
 
+@posix_group
 def test_no_record_outside_the_block(tmp_path: Path):
     record = tmp_path / "reindex.build"
     with record_build_groups(record):
@@ -169,6 +182,7 @@ def _record(db_dir: Path, **fields) -> Path:
     return record
 
 
+@posix_group
 def test_the_build_of_a_dead_run_is_stopped(tmp_path: Path):
     """THE regression test: SIGKILL stops the index run, and its build runs on."""
     from fw_context_mcp.cli._index import _reap_orphan_build_group
@@ -190,6 +204,7 @@ def test_the_build_of_a_dead_run_is_stopped(tmp_path: Path):
         group.wait(timeout=10)
 
 
+@posix_group
 def test_a_group_whose_leader_is_another_program_stays(tmp_path: Path):
     """The PGID came back for an unrelated process: never signal it."""
     from fw_context_mcp.cli._index import _reap_orphan_build_group
@@ -207,6 +222,7 @@ def test_a_group_whose_leader_is_another_program_stays(tmp_path: Path):
         group.wait(timeout=10)
 
 
+@posix_group
 def test_the_build_of_a_live_run_stays(tmp_path: Path):
     """That run still owns its build and stops it itself."""
     from fw_context_mcp.cli._index import _reap_orphan_build_group
@@ -229,6 +245,7 @@ def test_the_build_of_a_live_run_stays(tmp_path: Path):
             proc.wait(timeout=10)
 
 
+@posix_group
 def test_a_bad_record_goes(tmp_path: Path):
     from fw_context_mcp.cli._index import _reap_orphan_build_group
 
@@ -240,6 +257,7 @@ def test_a_bad_record_goes(tmp_path: Path):
     assert not record.exists()
 
 
+@posix_group
 def test_the_owned_index_records_its_build(tmp_path: Path):
     """The wiring: a build inside _owned_index writes the record there."""
     from types import SimpleNamespace
@@ -269,6 +287,7 @@ def _group_ignoring_sigterm(pid_file: Path) -> subprocess.Popen:
     )
 
 
+@posix_group
 def test_a_group_that_ignores_sigterm_gets_sigkill(tmp_path: Path):
     from fw_context_mcp.utils import stop_process_group
 
@@ -284,6 +303,7 @@ def test_a_group_that_ignores_sigterm_gets_sigkill(tmp_path: Path):
         group.wait(timeout=10)
 
 
+@posix_group
 def test_a_second_interrupt_during_the_grace_still_kills_the_group(tmp_path: Path):
     """A second Ctrl-C left out the SIGKILL, and the build ran on."""
     from fw_context_mcp.utils import stop_process_group
@@ -309,6 +329,7 @@ def test_a_second_interrupt_during_the_grace_still_kills_the_group(tmp_path: Pat
         group.wait(timeout=10)
 
 
+@posix_group
 def test_a_leader_with_another_start_time_stays(tmp_path: Path):
     """The shell of a new terminal got the PID, and its name is the recorded one."""
     from fw_context_mcp.cli._index import _reap_orphan_build_group
@@ -328,6 +349,7 @@ def test_a_leader_with_another_start_time_stays(tmp_path: Path):
         group.wait(timeout=10)
 
 
+@posix_group
 def test_the_recorded_start_time_matches_the_live_leader(tmp_path: Path):
     """The leader writes its own start time while it runs, and the record must agree."""
     record = tmp_path / "reindex.build"
@@ -361,10 +383,13 @@ def test_a_pre_build_timeout_is_a_runtime_error(tmp_path: Path):
     """Each caller of generate_compile_commands catches RuntimeError only."""
     from fw_context_mcp.indexer.build import BuildConfig, _run_pre_build
 
+    # Python and not `sleep`: Windows has no sleep program.
+    sleep = f'"{sys.executable}" -c "import time; time.sleep(30)"'
     with pytest.raises(RuntimeError, match="timed out"):
-        _run_pre_build(BuildConfig(pre_build="sleep 30", timeout=1), tmp_path)
+        _run_pre_build(BuildConfig(pre_build=sleep, timeout=1), tmp_path)
 
 
+@posix_group
 def test_a_live_pid_that_is_no_index_run_does_not_protect_the_orphan(tmp_path: Path):
     """The system gave the PID of the dead run to an unrelated process."""
     from fw_context_mcp.cli._index import _reap_orphan_build_group
@@ -388,6 +413,7 @@ def test_a_live_pid_that_is_no_index_run_does_not_protect_the_orphan(tmp_path: P
             proc.wait(timeout=10)
 
 
+@posix_group
 def test_a_live_leader_without_a_start_time_is_not_signalled(tmp_path: Path):
     """Fail-closed: the name alone does not identify a leader."""
     from fw_context_mcp.cli._index import _reap_orphan_build_group
@@ -410,13 +436,16 @@ def test_nohup_keeps_its_sighup_ignored(tmp_path: Path):
     from types import SimpleNamespace
 
     from fw_context_mcp.cli._index import _owned_index
+    from fw_context_mcp.processes import HANGUP_SIGNAL
 
-    previous = signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    # HANGUP_SIGNAL: SIGHUP, or SIGBREAK on Windows.  raise_signal and not
+    # os.kill(os.getpid(), ...): on Windows os.kill ends the process.
+    previous = signal.signal(HANGUP_SIGNAL, signal.SIG_IGN)
     try:
         with _owned_index(tmp_path, SimpleNamespace(background=False, takeover=False)):
-            assert signal.getsignal(signal.SIGHUP) is signal.SIG_IGN
-            os.kill(os.getpid(), signal.SIGHUP)
+            assert signal.getsignal(HANGUP_SIGNAL) is signal.SIG_IGN
+            signal.raise_signal(HANGUP_SIGNAL)
             time.sleep(0.1)
-        assert signal.getsignal(signal.SIGHUP) is signal.SIG_IGN
+        assert signal.getsignal(HANGUP_SIGNAL) is signal.SIG_IGN
     finally:
-        signal.signal(signal.SIGHUP, previous)
+        signal.signal(HANGUP_SIGNAL, previous)

@@ -96,7 +96,7 @@ def _run_nvidia_smi(*query: str) -> list[list[str]]:
     try:
         result = subprocess.run(
             ["nvidia-smi", *query, "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=5, check=False,
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5, check=False,
         )
     except FileNotFoundError:
         raise NvidiaSmiProblem("nvidia-smi is not installed", missing=True) from None
@@ -178,7 +178,7 @@ def _ram_mib() -> int | None:
     """Return the RAM of this machine: ``sysctl hw.memsize`` on macOS, ``GlobalMemoryStatusEx`` on Windows, else ``sysconf``."""
     if sys.platform == "darwin":
         try:
-            result = subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=2,
+            result = subprocess.run(["sysctl", "-n", "hw.memsize"], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=2,
                                     check=False)
         except (OSError, subprocess.TimeoutExpired):
             return None

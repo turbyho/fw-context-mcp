@@ -89,8 +89,8 @@ class TestGetEmbedder:
         def refused(url, *_args, **_kwargs):
             raise httpx.ConnectError("no server in this test", request=httpx.Request("GET", url))
 
-        monkeypatch.setattr(ollama.httpx, "post", refused)
-        monkeypatch.setattr(ollama.httpx, "get", refused)
+        monkeypatch.setattr(ollama.net, "post", refused)
+        monkeypatch.setattr(ollama.net, "get", refused)
 
     def test_ollama_default(self) -> None:
         cfg = LLMConfig(embed_model="mxbai-embed-large:latest")

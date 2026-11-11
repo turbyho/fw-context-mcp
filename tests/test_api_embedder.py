@@ -10,6 +10,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from fw_context_mcp import net
 from fw_context_mcp.config import settings
 from fw_context_mcp.config.settings import ConfigError
 from fw_context_mcp.llm import api_embedder
@@ -62,7 +63,7 @@ class _Api:
             status, body = self.answer(json["input"])
             return httpx.Response(status, json=body, request=httpx.Request("POST", url))
 
-        monkeypatch.setattr(httpx, "post", _post)
+        monkeypatch.setattr(net, "post", _post)
 
 
 # ── The config ──
@@ -248,7 +249,7 @@ def _models(monkeypatch, models: list[dict]) -> list[str]:
         asked.append(url)
         return httpx.Response(200, json={"data": models}, request=httpx.Request("GET", url))
 
-    monkeypatch.setattr(httpx, "get", _get)
+    monkeypatch.setattr(net, "get", _get)
     return asked
 
 

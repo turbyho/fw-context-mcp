@@ -137,7 +137,6 @@ class TestTheBuildRunsUnderTheLock:
         monkeypatch.setattr(runner_mod, "run", lambda **kw: "0" * 64)
         monkeypatch.setattr(index_mod, "_post_index_optimize", lambda *a, **kw: None)
         monkeypatch.setattr(index_mod, "_record_still_uncovered", lambda *a, **kw: None)
-        monkeypatch.setattr(index_mod, "_ensure_watcher_after_index", lambda root: None)
         return events
 
     @staticmethod

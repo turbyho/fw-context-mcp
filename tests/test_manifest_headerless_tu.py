@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 import fw_context_mcp  # noqa: F401  — must precede sqlite3
+from tests._toml import toml_string
 
 PROJECT_ID = "0123456789abcdef0123456789abcdef"
 
@@ -44,7 +45,7 @@ def indexed(tmp_path: Path, monkeypatch) -> tuple[Path, Path, str]:
     index_dir = tmp_path / "index"
     (root / ".fw-context").mkdir()
     (root / ".fw-context" / "config.toml").write_text(f'[project]\nid = "{PROJECT_ID}"\n', encoding="utf-8")
-    (root / ".fw-context" / "local.toml").write_text(f'[index]\ndb_dir = "{index_dir}"\n', encoding="utf-8")
+    (root / ".fw-context" / "local.toml").write_text(f'[index]\ndb_dir = {toml_string(index_dir)}\n', encoding="utf-8")
 
     db_path = index_dir / PROJECT_ID / "index.db"
     config_hash = run(

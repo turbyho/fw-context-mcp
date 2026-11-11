@@ -62,7 +62,7 @@ from typing import Any
 import httpx
 
 from fw_context_mcp.cache_limits import MAX_BATCH_ENTRIES, MAX_BODY_BYTES
-from fw_context_mcp.utils import SAFE_EXCEPT, fw_context_home, is_fatal
+from fw_context_mcp.utils import SAFE_EXCEPT, fw_context_home, is_fatal, sqlite_file_uri
 
 logger = logging.getLogger(__name__)
 
@@ -74,9 +74,8 @@ def _local_cache_path() -> Path:
     A module constant took the home of the operator before the test session
     set the variable, and the tests wrote their rows into the real cache.
 
-    The path is absolute, because :func:`get_local_cache_db` puts it into a
-    ``file://`` URI.  SQLite reads a relative ``$FW_CONTEXT_HOME`` there as
-    the URI authority and stops with ``invalid uri authority``.
+    The path is absolute: :func:`get_local_cache_db` makes a ``file:`` URI
+    of it (``utils.sqlite_file_uri``).
     """
     return (fw_context_home() / "llm_cache.db").absolute()
 
@@ -231,7 +230,11 @@ def get_local_cache_db(readonly: bool = False) -> sqlite3.Connection:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     if readonly and not cache_path.exists():
         readonly = False
-    uri = f"file://{cache_path}?mode={'ro' if readonly else 'rwc'}"
+    # sqlite_file_uri and not f"file://{path}": it percent-encodes a space,
+    # "#", "?" and "%" of a name, writes a Windows path as file:///C:/...,
+    # where "file://C:\\..." has the authority "C:", and gives a network
+    # path of Windows the form that SQLite takes.
+    uri = sqlite_file_uri(cache_path, "ro" if readonly else "rwc")
     conn = sqlite3.connect(uri, uri=True)
     try:
         cache_path.chmod(0o600)
@@ -518,7 +521,10 @@ class CacheClient:
         """
         if self._session is None:
             import httpx
-            self._session = httpx.Client(
+
+            from . import net
+            self._session = net.client(
+                self.url,
                 base_url=self.url,
                 timeout=self.timeout,
                 headers={"Authorization": f"Bearer {self.token}"},

@@ -25,6 +25,8 @@ from fw_context_mcp.mcp.shared.stale import (
     annotate_stale,
     find_unindexed_sources,
 )
+from tests._stubs import remove_tree
+from tests._toml import toml_string
 
 _CONFIG_HASH = "hash-deadbeef"
 
@@ -429,6 +431,26 @@ class TestGitCandidates:
             "for it and reported nothing"
         )
 
+    def test_a_file_with_a_non_ascii_name_is_reported(self, tmp_path: Path):
+        """git quotes a name with a byte above 127 ("src/\\305\\276lu\\305\\245.c") without -z.
+
+        The quoted name ended with `.c"`, thus the test of the extension
+        dropped the file: on each system, measured with git 2.5x.
+        """
+        from fw_context_mcp.indexer.db import open_db
+        from fw_context_mcp.mcp.shared.stale import find_unindexed_sources
+
+        root, cc = _git_project(tmp_path)
+        (root / "src" / "žluťoučký.c").write_text("void z(void){}\n", encoding="utf-8")
+
+        conn = open_db(tmp_path / "index.db")
+        try:
+            found = find_unindexed_sources(conn, "ch", root, cc)
+        finally:
+            conn.close()
+
+        assert "src/žluťoučký.c" in found
+
     def test_a_gitignored_directory_is_not_reported(self, tmp_path: Path):
         from fw_context_mcp.indexer.db import open_db
         from fw_context_mcp.mcp.shared.stale import find_unindexed_sources
@@ -500,7 +522,7 @@ class TestGitCandidates:
         from fw_context_mcp.mcp.shared.stale import find_unindexed_sources
 
         root, cc = _git_project(tmp_path)
-        shutil.rmtree(root / ".git")
+        remove_tree(root / ".git")
         (root / "src" / "new.c").write_text("void n(void){}\n", encoding="utf-8")
 
         conn = open_db(tmp_path / "index.db")
@@ -669,7 +691,7 @@ class TestEveryUncoveredFileIsRecorded:
         # A project id the config resolver can find, pointing at our database.
         (root / ".fw-context").mkdir(exist_ok=True)
         (root / ".fw-context" / "config.toml").write_text(
-            f'[project]\nid = "pid"\n\n[build]\n\n[index]\ndb_dir = "{db_path.parent}"\n',
+            f'[project]\nid = "pid"\n\n[build]\n\n[index]\ndb_dir = {toml_string(db_path.parent)}\n',
             encoding="utf-8",
         )
         target = db_path.parent / "pid" / "index.db"

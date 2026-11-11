@@ -1015,7 +1015,7 @@ def check_target(target: InstructionTarget, project_root: Path | None = None) ->
         manifest = parent / ".skillshare-manifest.json"
         if manifest.exists():
             try:
-                data = json.loads(manifest.read_text())
+                data = json.loads(manifest.read_text(encoding="utf-8"))
                 managed = data.get("managed", {})
                 if managed:  # Non-empty managed dict = skillshare active here
                     collision.is_skillshare_managed = True

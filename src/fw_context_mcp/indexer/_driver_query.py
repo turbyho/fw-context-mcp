@@ -46,14 +46,16 @@ from __future__ import annotations
 import logging
 import os
 import re
-import shlex
-import shutil
 import subprocess
+import sys
 import time
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import cache, lru_cache
 from pathlib import Path
+
+from ..utils import command_program, is_program, path_directories, program_file_names
+from ._program_encoding import EchoMissingError, echo_flags, gcc_decoder
 
 log = logging.getLogger(__name__)
 
@@ -195,22 +197,41 @@ def resolve_compiler(token: str, cwd: Path, known: Mapping[str, Path]) -> Path |
     The path is made absolute and normalized, but a symbolic link is NOT
     followed: a ccache masquerade link ``/usr/lib/ccache/bin/gcc`` must run
     as ``gcc``, while its target ``/usr/bin/ccache`` rejects ``-E``.
+
+    Each step, and a token with a directory, tries the file names of the
+    program on this system (``utils.program_file_names``): on Windows a
+    build writes ``gcc`` and the file is ``gcc.exe``.  Step 3 reads the
+    ``PATH`` of this process without its current directory
+    (``utils.path_directories``), and takes only a program
+    (``utils.is_program``: on POSIX a file with the execute bit, as
+    ``shutil.which``).
     """
     if "/" in token or "\\" in token:
-        return _existing(Path(token), cwd)
-    if token in known:
-        found = _existing(known[token], cwd)
-        if found is not None:
-            return found
-    for directory in dict.fromkeys(p.parent for p in known.values()):
-        found = _existing(directory / token, cwd)
-        if found is not None:
-            return found
-    on_path = shutil.which(token)
-    if on_path is None:
+        # A path: on Windows a build can write it without ``.exe``.
+        path = Path(token)
+        for name in program_file_names(path.name):
+            found = _existing(path.with_name(name), cwd)
+            if found is not None:
+                return found
         return None
-    _warn_path_lookup(token, on_path)
-    return Path(os.path.normpath(os.path.abspath(on_path)))
+    names = program_file_names(token)
+    for name in names:
+        if name in known:
+            found = _existing(known[name], cwd)
+            if found is not None:
+                return found
+    for directory in dict.fromkeys(p.parent for p in known.values()):
+        for name in names:
+            found = _existing(directory / name, cwd)
+            if found is not None:
+                return found
+    for directory in path_directories():
+        for name in names:
+            candidate = directory / name
+            if is_program(candidate):
+                _warn_path_lookup(token, str(candidate))
+                return Path(os.path.normpath(os.path.abspath(candidate)))
+    return None
 
 
 def _existing(path: Path, cwd: Path) -> Path | None:
@@ -384,15 +405,27 @@ def _run_query(compiler: Path, language: str, flags: tuple[str, ...], cwd: Path)
     lang = "c++" if language == "cpp" else "c"
     base = [str(compiler), *flags, "-x", lang]
     try:
-        verbose = _run_driver([*base, "-E", "-v", "-o", os.devnull, "-"], cwd)
-        defines = _run_driver([*base, "-dM", "-E", "-"], cwd)
+        raw_verbose = _run_driver([*base, "-E", "-v", *echo_flags(), "-o", os.devnull, "-"], cwd)
+        raw_defines = _run_driver([*base, "-dM", "-E", "-"], cwd)
     except (OSError, subprocess.TimeoutExpired) as error:
         log.warning("Cannot query the compiler %s for its system headers: %s", compiler, error)
         return None
-    if verbose.returncode != 0 or defines.returncode != 0:
+    if raw_verbose.returncode != 0 or raw_defines.returncode != 0:
+        # The message only: its encoding is not known before the echo.
+        message = (raw_verbose.stderr or raw_defines.stderr).decode("utf-8", "replace")
         log.warning(
             "The compiler %s did not answer the system-header query (exit %d/%d): %s",
-            compiler, verbose.returncode, defines.returncode, (verbose.stderr or defines.stderr)[-300:],
+            compiler, raw_verbose.returncode, raw_defines.returncode, message[-300:],
+        )
+        return None
+    try:
+        decode = gcc_decoder(raw_verbose.stderr)
+        verbose = _decoded(raw_verbose, decode)
+        defines = _decoded(raw_defines, decode)
+    except (EchoMissingError, UnicodeDecodeError) as error:
+        log.warning(
+            "The encoding of the text of the compiler %s is not known, thus its system headers are not "
+            "known: %s", compiler, error,
         )
         return None
     triple, dirs = parse_verbose_output(verbose.stderr, cwd)
@@ -407,17 +440,32 @@ def _run_query(compiler: Path, language: str, flags: tuple[str, ...], cwd: Path)
     return DriverInfo(triple=triple, include_dirs=tuple(dirs), macros=tuple(macros))
 
 
-def _run_driver(argv: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
-    """Run one driver query.
+def _run_driver(argv: list[str], cwd: Path) -> subprocess.CompletedProcess[bytes]:
+    """Run one driver query, and give its output as bytes.
 
     An argv list and no shell.  The input is an empty stdin (``-``), which
     works on every host — Windows has no /dev/null.  *cwd* is the directory
     of the entry, in which the build runs the same compiler.
+
+    WHY bytes: the output names directories, thus it is decoded in the
+    encoding of ``cc1`` (``_program_encoding.gcc_decoder``), not in the
+    locale.  On Windows the locale is the ANSI code page, and GCC 14 writes
+    UTF-8.
     """
     return subprocess.run(
-        argv, capture_output=True, text=True, timeout=_QUERY_TIMEOUT_S, check=False,
+        argv, capture_output=True, timeout=_QUERY_TIMEOUT_S, check=False,
         stdin=subprocess.DEVNULL, cwd=str(cwd),
     )
+
+
+def _decoded(
+    raw: subprocess.CompletedProcess[bytes], decode: Callable[[bytes], str],
+) -> subprocess.CompletedProcess[str]:
+    """Return *raw* with its stdout and stderr decoded by *decode*, with ``\\n`` for each line end."""
+    def text(data: bytes) -> str:
+        return decode(data).replace("\r\n", "\n")
+
+    return subprocess.CompletedProcess(raw.args, raw.returncode, text(raw.stdout), text(raw.stderr))
 
 
 @lru_cache(maxsize=64)
@@ -633,12 +681,15 @@ _SIMPLE_FIRST_WORD = re.compile(r"""[ \t\r\n]*(?:"([^"\\]*)"|'([^']*)'|([^ \t\r\
 def compiler_token(entry: Mapping[str, object]) -> str:
     """Give the first word of an entry (the compiler), or "" when the entry names none.
 
-    WHY not always ``shlex.split``: a ``command`` field of a large build
-    holds hundreds of flags, and the split of the whole line costs more than
-    the rest of the work on the entry.  Only the first word is necessary.
-    The regex gives the same word as ``shlex`` for the simple forms; a form
-    with an escape or a joined quote goes to ``shlex``, which can raise
-    ``ValueError`` on an unclosed quote.
+    The word comes by the rules of the host, as the build started the
+    compiler (``utils.command_program``).  WHY not always a split of the line: a
+    ``command`` field of a large build holds hundreds of flags, and the
+    split of the whole line costs more than the rest of the work on the
+    entry.  Only the first word is necessary.  On POSIX the regex gives the
+    same word as ``shlex`` for the simple forms; a form with an escape or a
+    joined quote goes to ``shlex``, which can raise ``ValueError`` on an
+    unclosed quote.  On Windows the regex does not apply: a backslash is a
+    separator of a path there, and a single quote is no quote.
     """
     arguments = entry.get("arguments")
     if isinstance(arguments, list) and arguments:
@@ -646,7 +697,9 @@ def compiler_token(entry: Mapping[str, object]) -> str:
     command = entry.get("command")
     if not isinstance(command, str) or not command.strip():
         return ""
+    if sys.platform == "win32":
+        return command_program(command)
     simple = _SIMPLE_FIRST_WORD.match(command)
     if simple:
         return next(group for group in simple.groups() if group is not None)
-    return shlex.split(command)[0]
+    return command_program(command)

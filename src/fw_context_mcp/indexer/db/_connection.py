@@ -94,6 +94,7 @@ from fw_context_mcp.indexer.db._schema import (
     _run_data_migrations,
     _table_exists,
 )
+from fw_context_mcp.utils import sqlite_file_uri
 
 log = logging.getLogger(__name__)
 
@@ -229,9 +230,10 @@ def open_db_readonly(path: Path) -> sqlite3.Connection:
     index run that migrates it.
 
     The connection loads sqlite-vec as ``open_db`` does: a search reads
-    the vectors.  ``as_uri()`` encodes a space, '?' and '#' in the path.
+    the vectors.  ``sqlite_file_uri`` gives the URI of each path, also of a
+    network path of Windows.
     """
-    conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    conn = sqlite3.connect(sqlite_file_uri(path.resolve(), "ro"), uri=True)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA query_only = ON")
     conn.execute("PRAGMA busy_timeout = 10000")

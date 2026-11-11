@@ -20,6 +20,8 @@ from __future__ import annotations
 import httpx
 import pytest
 
+from fw_context_mcp import net
+
 LOCAL = "http://localhost:11434"
 REMOTE = "http://gpu-box:11434"
 EMBED = "qwen3-embedding:0.6b"
@@ -72,7 +74,7 @@ def servers(monkeypatch):
         answer = known[server]
         return answer if isinstance(answer, _Html) else _Tags(answer)
 
-    monkeypatch.setattr(httpx, "get", _get)
+    monkeypatch.setattr(net, "get", _get)
     return known
 
 
@@ -245,7 +247,7 @@ def test_a_url_that_is_not_valid_gives_no_model_list(monkeypatch):
     def _invalid(url, timeout):
         raise httpx.InvalidURL("Invalid port: 'abc'")
 
-    monkeypatch.setattr(httpx, "get", _invalid)
+    monkeypatch.setattr(net, "get", _invalid)
 
     assert installed_models("http://gpu:abc") is None
 

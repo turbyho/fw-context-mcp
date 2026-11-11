@@ -65,12 +65,20 @@ class TestAbsPath:
     def test_relative_path_joined(self, tmp_path: Path):
         root = tmp_path / "project"
         result = abs_path(root, "src/main.c")
-        assert result == str(root / "src/main.c")
+        assert result == (root / "src/main.c").as_posix()
 
     def test_absolute_path_returned_unchanged(self, tmp_path: Path):
         root = tmp_path / "project"
         result = abs_path(root, "/absolute/path/file.c")
         assert result == "/absolute/path/file.c"
+
+    def test_a_key_with_a_drive_is_absolute_on_each_system(self, tmp_path: Path):
+        """A key of Windows (C:/ncs/...) is absolute also where Path.is_absolute says no.
+
+        Before, the key was joined to the root on Linux and macOS, and on
+        Windows a key without a drive (/opt/...) got the drive of the root.
+        """
+        assert abs_path(tmp_path, "C:/ncs/zephyr/kernel/init.c") == "C:/ncs/zephyr/kernel/init.c"
 
     def test_empty_string_returned_as_is(self, tmp_path: Path):
         result = abs_path(tmp_path, "")
@@ -80,45 +88,45 @@ class TestAbsPath:
         """Root being a file path should still join correctly."""
         root = tmp_path / "somefile.txt"
         result = abs_path(root, "relative.c")
-        assert result == str(root / "relative.c")
+        assert result == (root / "relative.c").as_posix()
 
     def test_dot_dot_in_relative_path(self, tmp_path: Path):
         root = tmp_path / "project"
         result = abs_path(root, "../outside.c")
         # abs_path uses Path / operator which preserves ".." literally
-        assert result == str(root / "../outside.c")
+        assert result == (root / "../outside.c").as_posix()
 
     def test_dot_slash_relative(self, tmp_path: Path):
         root = tmp_path / "project"
         result = abs_path(root, "./src/file.c")
-        assert result == str(root / "./src/file.c")
+        assert result == (root / "./src/file.c").as_posix()
 
     def test_unicode_path(self, tmp_path: Path):
         root = tmp_path / "projekt"
         result = abs_path(root, "src/žluťoučký_kůň.c")
-        assert result == str(root / "src/žluťoučký_kůň.c")
+        assert result == (root / "src/žluťoučký_kůň.c").as_posix()
 
     def test_whitespace_only_path(self, tmp_path: Path):
         root = tmp_path / "project"
         result = abs_path(root, "   ")
         p = Path("   ")
         if p.is_absolute():
-            assert result == str(p)
+            assert result == p.as_posix()
         else:
-            assert result == str(root / "   ")
+            assert result == (root / "   ").as_posix()
 
     def test_path_with_special_chars(self, tmp_path: Path):
         root = tmp_path / "project"
         # Path with spaces and special chars
         result = abs_path(root, "src/my file (copy).c")
-        expected = str(root / "src/my file (copy).c")
+        expected = (root / "src/my file (copy).c").as_posix()
         assert result == expected
 
     def test_root_with_trailing_slash(self, tmp_path: Path):
         root = tmp_path / "project"
         # Path("/foo/bar/") == Path("/foo/bar") so trailing slash doesn't matter
         result = abs_path(Path(str(root) + "/"), "src/file.c")
-        assert result == str(root / "src/file.c")
+        assert result == (root / "src/file.c").as_posix()
 
 
 class TestMtimeTolerance:

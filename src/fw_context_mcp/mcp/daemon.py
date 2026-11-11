@@ -2,18 +2,20 @@
 changes, exits when all MCP clients disconnect.
 
 One daemon per project, shared by all MCP server instances over that project.
-Communication is via a Unix domain socket in ``<db_dir>/<project_id>/daemon.sock``.
+Communication is via a TCP socket on the loopback address 127.0.0.1.  The
+daemon writes its port and a token into ``<db_dir>/<project_id>/daemon.port``.
 
 Lifecycle
 ---------
 1. First MCP server spawns the daemon (via ``_ensure_daemon_running``).
-2. Each MCP server pings the daemon every 15 s over the socket.
+2. Each MCP server pings the daemon every 15 s over the socket, and the
+   daemon answers with its token.
 3. If no ping arrives for 60 s, the daemon exits (all clients gone).
 4. SIGTERM / SIGINT → clean shutdown, signal forwarded to index subprocess.
 
 Isolation
 ---------
-Each project has its own socket file at ``<db_dir>/<project_id>/daemon.sock``.
+Each project has its own port file at ``<db_dir>/<project_id>/daemon.port``.
 Pings from an MCP server on project A never affect project B's daemon.
 
 Design rationale
@@ -27,12 +29,22 @@ WHY a per-project daemon instead of a single system-wide watcher:
   when no MCP server pings project A's daemon for 60 s, that daemon
   exits — independent of project B's activity.
 
-WHY Unix domain sockets instead of a message queue or shared memory:
-- Sockets work on all Unix-like systems without additional dependencies.
+WHY a TCP socket on 127.0.0.1 instead of a Unix domain socket (decision of
+the user, 2026-11-08):
+- One path of code on Linux, macOS and Windows.  Python has no AF_UNIX on
+  Windows, and asyncio has no ``start_unix_server`` there.
+- No limit on the length of a path: ``sun_path`` holds 108 bytes on Linux
+  and 104 on macOS, and an index directory in a long path stopped the
+  daemon ("AF_UNIX path too long").
 - No message broker process needed (ZeroMQ, Redis, etc.).
-- Socket existence doubles as a daemon-alive indicator for ``ping_daemon``.
-- 0o600 permissions prevent other users on the same machine from sending
-  spurious pings.
+- The ping carries no data.  Another local process that connects can only
+  keep the daemon alive longer: the cost is one idle process.
+
+WHY the token in the answer: a daemon that a SIGKILL stopped leaves its
+port file, and the system can give its port to another program.  A
+connect alone then read as a live daemon, and no new daemon started.  The
+answer ``pong <token>`` with the token of the file shows that the daemon of
+this project listens on the port.
 
 WHY ``watchfiles`` instead of ``inotify`` directly:
 - ``watchfiles`` provides a cross-platform polling + inotify backend with
@@ -62,12 +74,11 @@ Four missed pings = 60 s.  This gives headroom for:
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import logging
 import os
 import re
+import secrets
 import signal
-import socket
 import sqlite3
 import sys
 import time
@@ -75,18 +86,32 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TextIO
 
+from .. import loopback
 from ..config import derive_project_id
 from ..config import load as load_config
 from ..exit_codes import EXIT_ALREADY_RUNNING, EXIT_SUPERSEDED
+from ..file_lock import try_lock, unlock
 from ..indexer.db._locking import index_run_lock_held
-from ..utils import HEADER_EXTENSIONS, TU_EXTENSIONS, remove_stale_tmp
+from ..processes import STOP_TOKEN_ENV, install_stop_listener, new_stop_token, request_stop
+from ..utils import HEADER_EXTENSIONS, O_NOFOLLOW, TU_EXTENSIONS, remove_file, remove_stale_tmp, write_text_atomic
 from .background import PENDING_MARKER
 from .shared.pid_file import PidFile
 
 log = logging.getLogger(__name__)
 
 # ── Constants ────────────────────────────────────────────────────────────────
-DAEMON_SOCK_NAME = "daemon.sock"
+DAEMON_PORT_NAME = "daemon.port"
+# The Unix domain socket of a daemon before the change to TCP: the start of
+# a daemon removes it.
+_LEGACY_SOCK_NAME = "daemon.sock"
+_LOOPBACK = "127.0.0.1"
+
+# The stop token of the index runs of this daemon (processes.STOP_TOKEN_ENV).
+# WHY: on Windows the python.exe of a virtual environment is a launcher, and
+# the PID of the Popen is not the PID of the run, thus the run cannot make an
+# event for that PID.  One token for the life of the daemon is sufficient:
+# the daemon starts a run only after the end of the run before it.
+_RUN_STOP_TOKEN = new_stop_token()
 PING_INTERVAL = 15   # How often each MCP server pings (seconds)
 PING_TIMEOUT = 60    # Exit after this long without any ping (seconds)
 _DEBOUNCE_S = 2.0    # Collect changes before spawning index
@@ -128,32 +153,53 @@ def _get_db_dir(project_root: Path) -> Path:
     return cfg.index.db_dir / project_id
 
 
-def _socket_path(db_dir: Path) -> Path:
-    """Return the Unix domain socket path for a project."""
-    return db_dir / DAEMON_SOCK_NAME
+def _port_file(db_dir: Path) -> Path:
+    """Return the file with the port and the token of the daemon of a project."""
+    return db_dir / DAEMON_PORT_NAME
+
+
+_TOKEN_PATTERN = re.compile(r"[0-9a-f]{32}")
+
+
+def _read_port_file(port_file: Path) -> tuple[int, str] | None:
+    """Return ``(port, token)`` from *port_file*, or None when it is missing or not valid.
+
+    The token must be the 32 hex digits that the daemon writes: a damaged
+    file with another text gives None, and not an error in the ping thread
+    of the MCP server.
+    """
+    try:
+        port_text, token = port_file.read_text(encoding="utf-8").split()
+        port = int(port_text)
+    except (OSError, ValueError):
+        return None
+    if not 0 < port < 65536 or not _TOKEN_PATTERN.fullmatch(token):
+        return None
+    return port, token
 
 
 def ping_daemon(project_root: Path) -> bool:
     """Send a ping to the project daemon.
 
-    Opens a connection to ``daemon.sock``, sends ``"ping\\n"``, and closes.
-    Returns ``True`` when the daemon accepted the connection; ``False`` when
-    the socket does not exist or no daemon is listening.
+    Reads ``daemon.port``, connects to 127.0.0.1 on that port, sends
+    ``"ping\\n"``, and reads the answer.  Returns ``True`` when the answer is
+    ``pong <token>`` with the token of the file; ``False`` when the file is
+    missing, no process listens, or a different program has the port.
     """
-    db_dir = _get_db_dir(project_root)
-    sock_path = _socket_path(db_dir)
-    if not sock_path.exists():
+    known = _read_port_file(_port_file(_get_db_dir(project_root)))
+    if known is None:
         return False
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    port, token = known
     try:
-        sock.settimeout(2.0)
-        sock.connect(str(sock_path))
-        sock.sendall(b"ping\n")
-        return True
+        # loopback.create_connection: a port file of a daemon that is gone
+        # names a port with no listener, and on Windows
+        # socket.create_connection needed 2 s for that refused connect.
+        with loopback.create_connection((_LOOPBACK, port), timeout=2.0) as sock:
+            sock.sendall(b"ping\n")
+            answer = sock.makefile("rb").readline(256)
     except OSError:
         return False
-    finally:
-        sock.close()
+    return answer.strip() == f"pong {token}".encode("ascii")
 
 
 # ── Pending work ─────────────────────────────────────────────────────────────
@@ -226,8 +272,11 @@ async def daemon_main(project_root: Path) -> None:
     lock_file = db_dir / "watcher.lock"
     try:
         lock_fd = os.open(lock_file, os.O_CREAT | os.O_RDWR)
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except (OSError, BlockingIOError):
+        locked = try_lock(lock_fd)
+    except OSError as exc:
+        log.error("Cannot lock %s: %s", lock_file, exc)
+        sys.exit(1)
+    if not locked:
         log.error("Daemon already running for %s", project_root)
         sys.exit(1)
 
@@ -235,7 +284,8 @@ async def daemon_main(project_root: Path) -> None:
     # A marker that is there now is from a daemon that a SIGKILL stopped,
     # and a new process with its old PID makes it read as work that comes.
     # The startup check of the reindex loop finds that work again.
-    (db_dir / PENDING_MARKER).unlink(missing_ok=True)
+    # remove_file: on Windows an MCP server can read the marker just now.
+    remove_file(db_dir / PENDING_MARKER)
     # A kill between the write and the rename of a marker leaves its
     # temporary file (`PidFile.write`).  Only the file of a dead writer goes.
     remove_stale_tmp(db_dir)
@@ -246,7 +296,7 @@ async def daemon_main(project_root: Path) -> None:
         wfd = os.open(str(pid_file), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
     except FileExistsError:
         # Stale PID file from a previous crash — clean up and retry
-        pid_file.unlink(missing_ok=True)
+        remove_file(pid_file)
         wfd = os.open(str(pid_file), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
     with os.fdopen(wfd, "w", encoding="utf-8") as pf:
         pf.write(str(os.getpid()))
@@ -258,17 +308,17 @@ async def daemon_main(project_root: Path) -> None:
     shutdown: asyncio.Event = asyncio.Event()
     index_proc: asyncio.subprocess.Process | None = None
 
-    # ── Unix socket server ───────────────────────────────────────────────
+    # ── Ping server ──────────────────────────────────────────────────────
     def _on_ping() -> None:
         nonlocal last_ping_time
         last_ping_time = time.monotonic()
 
     try:
-        server, sock_path = await _setup_unix_socket(db_dir, _on_ping)
+        server, port_file = await _setup_ping_server(db_dir, _on_ping)
     except OSError:
-        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        unlock(lock_fd)
         os.close(lock_fd)
-        pid_file.unlink(missing_ok=True)
+        remove_file(pid_file)
         sys.exit(1)
 
     # ── Signal handlers ──────────────────────────────────────────────────
@@ -281,7 +331,7 @@ async def daemon_main(project_root: Path) -> None:
         {"project_root": str(project_root), "pid": os.getpid()},
     )
 
-    dlog.info("Daemon started  socket=%s", sock_path)
+    dlog.info("Daemon started  port file=%s", port_file)
 
     watch_task: asyncio.Task | None = None
     head_task: asyncio.Task | None = None
@@ -339,7 +389,7 @@ async def daemon_main(project_root: Path) -> None:
             await _stop_watcher(watch_task)
         if head_task is not None:
             await _stop_watcher(head_task)
-        await _cleanup_daemon(index_proc, server, sock_path, pid_file, lock_fd, shutdown)
+        await _cleanup_daemon(index_proc, server, port_file, pid_file, lock_fd, shutdown)
 
 
 # ── Internal helpers ─────────────────────────────────────────────────────────
@@ -747,20 +797,34 @@ async def _index_is_free(
     return not shutdown.is_set()
 
 
-async def _setup_unix_socket(db_dir: Path, on_ping) -> tuple[asyncio.Server, Path]:
-    """Create and bind the Unix domain socket for daemon pings.
+async def _setup_ping_server(db_dir: Path, on_ping) -> tuple[asyncio.Server, Path]:
+    """Listen for pings on 127.0.0.1, and write the port and a new token into ``daemon.port``.
 
-    *on_ping* is called (no arguments) each time a valid ping arrives.
-    Returns the server and socket path.
+    *on_ping* is called (no arguments) each time a valid ping arrives.  The
+    answer is ``pong <token>`` (see the module docstring).  The system
+    selects the port (port 0), thus two daemons never need the same one.
+    The file is written after the bind and atomically: a reader sees no
+    file, or a file with a port on which this daemon listens.
+
+    Returns the server and the port file.
     """
-    sock_path = _socket_path(db_dir)
-    sock_path.unlink(missing_ok=True)
+    port_file = _port_file(db_dir)
+    # No unlink of the port file of an earlier daemon: the write below
+    # replaces it, and a stale file reads as no daemon (the token).  On
+    # Windows an unlink fails while a pinger has the file open.
+    (db_dir / _LEGACY_SOCK_NAME).unlink(missing_ok=True)
+    token = secrets.token_hex(16)
+    pong = f"pong {token}\n".encode("ascii")
 
     async def _handle_ping(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
-            data = await asyncio.wait_for(reader.read(1024), timeout=2.0)
-            if b"ping" in data:
+            # read(64) and not readline(): a client that sends 64 KiB with
+            # no newline made readline raise ValueError (LimitOverrunError).
+            data = await asyncio.wait_for(reader.read(64), timeout=2.0)
+            if data.startswith(b"ping"):
                 on_ping()
+                writer.write(pong)
+                await writer.drain()
         except (TimeoutError, OSError):
             pass
         finally:
@@ -771,38 +835,63 @@ async def _setup_unix_socket(db_dir: Path, on_ping) -> tuple[asyncio.Server, Pat
                 pass
 
     try:
-        server = await asyncio.start_unix_server(_handle_ping, path=str(sock_path))
+        server = await asyncio.start_server(_handle_ping, host=_LOOPBACK, port=0)
     except OSError as exc:
         # Not "daemon already running": this process holds `watcher.lock`,
-        # thus no other daemon of the project runs.  The error says the
-        # cause, for example "AF_UNIX path too long" for a socket path that
-        # is longer than `sun_path` (108 bytes on Linux, 104 on macOS).  The
-        # index directory sets that path.
-        log.error("Cannot bind the socket %s: %s", sock_path, exc)
+        # thus no other daemon of the project runs.  The error says the cause.
+        log.error("Cannot listen on %s for the pings: %s", _LOOPBACK, exc)
         raise
-
-    os.chmod(sock_path, 0o600)
-    return server, sock_path
+    port = server.sockets[0].getsockname()[1]
+    try:
+        # 0600: the token is for the processes of this user only.  Another
+        # user who reads it could answer on the port after a SIGKILL of the
+        # daemon, and a ping would then read as a live daemon.
+        write_text_atomic(port_file, f"{port} {token}\n", mode=0o600)
+    except OSError as exc:
+        log.error("Cannot write %s: %s", port_file, exc)
+        server.close()
+        await server.wait_closed()
+        raise
+    return server, port_file
 
 
 def _setup_signal_handlers(shutdown: asyncio.Event) -> None:
-    """Register SIGTERM / SIGINT handlers that set *shutdown*."""
+    """Register SIGTERM / SIGINT handlers that set *shutdown*, and the stop listener.
+
+    POSIX: ``loop.add_signal_handler``.  Windows has no such call (the
+    Proactor loop raises NotImplementedError), and the daemon then had no
+    handler at all: ``fw-context watch stop`` ended it with
+    ``TerminateProcess``, and a stop request (``processes.request_stop``)
+    did nothing, because ``interrupt_main`` runs only a Python handler.  On
+    Windows the handler is a ``signal.signal`` handler: the Proactor loop
+    wakes for a signal through its wakeup socket, and the handler gives
+    *shutdown* to the loop.
+    """
     loop = asyncio.get_running_loop()
 
     def _handle_signal() -> None:
         shutdown.set()
 
+    if sys.platform == "win32":
+        def _from_signal(signum: int, frame: object) -> None:
+            # The handler stays after asyncio.run() closed the loop, and a
+            # late signal must not raise "Event loop is closed" in the
+            # cleanup of the process.
+            if not loop.is_closed():
+                loop.call_soon_threadsafe(_handle_signal)
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(sig, _from_signal)
+        install_stop_listener()
+        return
     for sig in (signal.SIGTERM, signal.SIGINT):
-        try:
-            loop.add_signal_handler(sig, _handle_signal)
-        except NotImplementedError:
-            pass
+        loop.add_signal_handler(sig, _handle_signal)
 
 
 async def _cleanup_daemon(
     index_proc: asyncio.subprocess.Process | None,
     server: asyncio.Server,
-    sock_path: Path,
+    port_file: Path,
     pid_file: Path,
     lock_fd: int,
     shutdown: asyncio.Event,
@@ -811,7 +900,7 @@ async def _cleanup_daemon(
     log.info("Daemon shutting down")
     if index_proc is not None and index_proc.returncode is None:
         log.info("Terminating index subprocess (pid %d)", index_proc.pid)
-        index_proc.terminate()
+        _stop_run(index_proc)
         try:
             await asyncio.wait_for(index_proc.wait(), timeout=10)
         except TimeoutError:
@@ -823,9 +912,9 @@ async def _cleanup_daemon(
     await server.wait_closed()
     # Work that this daemon did not start goes with it.  The startup check
     # of the next daemon finds it again.
-    PidFile(sock_path.parent / PENDING_MARKER).unlink_if_ours()
-    _cleanup_files(sock_path, pid_file)
-    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    PidFile(port_file.parent / PENDING_MARKER).unlink_if_ours()
+    _cleanup_files(port_file, pid_file)
+    unlock(lock_fd)
     os.close(lock_fd)
 
 
@@ -839,9 +928,12 @@ def _is_source_file(path_str: str, build_patterns: list[str] | None = None) -> b
     p = Path(path_str)
     if p.suffix not in _SOURCE_EXTS_WATCH:
         return False
-    if _EXCLUDE_RX.search(path_str):
+    # _EXCLUDE_RX and the build patterns use "/", as the index keys do
+    # (path_key).  watchfiles gives a path of the system: "\\" on Windows.
+    posix = p.as_posix()
+    if _EXCLUDE_RX.search(posix):
         return False
-    if build_patterns and any(pat in path_str for pat in build_patterns):
+    if build_patterns and any(pat in posix for pat in build_patterns):
         return False
     return True
 
@@ -861,10 +953,18 @@ def _load_build_patterns(db_dir: Path) -> list[str]:
         return []
 
 
-def _cleanup_files(sock_path: Path, pid_file: Path) -> None:
-    """Remove daemon runtime files."""
-    sock_path.unlink(missing_ok=True)
-    pid_file.unlink(missing_ok=True)
+def _cleanup_files(port_file: Path, pid_file: Path) -> None:
+    """Remove daemon runtime files.
+
+    On Windows a pinger can read the port file just now: ``remove_file``
+    waits for that read.  A port file that still cannot go stays: its token
+    reads as no daemon, and the next daemon replaces it.
+    """
+    for path in (port_file, pid_file):
+        try:
+            remove_file(path)
+        except OSError as exc:
+            log.warning("Cannot remove %s: %s — the next daemon replaces it", path, exc)
 
 
 # ── Staleness check at the start of the daemon ───────────────────────────────
@@ -1016,8 +1116,8 @@ async def _run_index_async(
     log_file = db_dir / "reindex.log"
     log_target: int | TextIO
     try:
-        fd = os.open(log_file, os.O_NOFOLLOW | os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
-        log_target = os.fdopen(fd, "w", closefd=True)
+        fd = os.open(log_file, O_NOFOLLOW | os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        log_target = os.fdopen(fd, "w", encoding="utf-8", closefd=True)
     except OSError as exc:
         # The run does its work also without a log.
         log.warning("Cannot open %s: %s — the background index runs without a log", log_file, exc)
@@ -1026,6 +1126,7 @@ async def _run_index_async(
     env: dict[str, str] = {
         **os.environ,
         "PYTHONUNBUFFERED": "1",
+        STOP_TOKEN_ENV: _RUN_STOP_TOKEN,
     }
     if force_refs:
         env["FW_CONTEXT_FORCE_REFINDEX"] = "1"
@@ -1035,6 +1136,7 @@ async def _run_index_async(
         return await asyncio.create_subprocess_exec(
             sys.executable, "-u", "-m", "fw_context_mcp.cli", "index", "--background",
             cwd=str(project_root),
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=log_target,
             stderr=asyncio.subprocess.STDOUT,
             env=env,
@@ -1043,6 +1145,34 @@ async def _run_index_async(
         # The subprocess has its own copy of the file descriptor.
         if not isinstance(log_target, int):
             log_target.close()
+
+
+def _stop_run(proc: asyncio.subprocess.Process) -> None:
+    """Ask the index run *proc* to stop; end it at once when it cannot get the request.
+
+    POSIX: ``Process.terminate()``, which is SIGTERM and sends nothing to a
+    child that asyncio already reaped (a PID that the system can give to
+    another process).  Windows: the stop event of the token of the run
+    (``processes.request_stop``); ``Process.terminate()`` is
+    ``TerminateProcess`` there and runs no handler.
+
+    A run without a listener (on Windows a run that has not reached
+    ``cmd_index`` yet) ends at once, as SIGTERM with its default action
+    ends it on POSIX.  The caller waits for the end, and kills after 10 s.
+    """
+    if sys.platform == "win32":
+        if request_stop(proc.pid, token=_RUN_STOP_TOKEN):
+            return
+    else:
+        try:
+            proc.terminate()
+            return
+        except ProcessLookupError:
+            return
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
 
 
 async def _wait_index(
@@ -1065,11 +1195,11 @@ async def _wait_index(
     try:
         while proc.returncode is None:
             if shutdown.is_set():
-                proc.terminate()
+                _stop_run(proc)
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=10)
                 except TimeoutError:
-                    log.warning("Index subprocess did not exit after SIGTERM, killing")
+                    log.warning("Index subprocess did not exit after the stop request, killing")
                     proc.kill()
                     await proc.wait()
                 return None
@@ -1137,6 +1267,10 @@ def _optimize_db(db_dir: Path) -> None:
 
 if __name__ == "__main__":
     import sys as _sys
+
+    from ..utils import use_utf8_stdio
+
+    use_utf8_stdio()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",

@@ -16,6 +16,7 @@ it (``housekeeping.remove_unusable_values``).
 from __future__ import annotations
 
 import argparse
+import sys
 import tomllib
 from pathlib import Path
 
@@ -50,7 +51,14 @@ WRONG = [
     ("[project]\nid = 5", "[project] id must be a string, not an integer"),
     ("[index]\ndb_dir = 5", "[index] db_dir must be a string, not an integer"),
     ("[index]\ncompile_commands = []", "[index] compile_commands must be a string, not an array"),
-    ('[index]\ndb_dir = "~no-such-user-of-fw-context/x"', "[index] db_dir must be a path whose home directory (~) is known"),
+    pytest.param(
+        '[index]\ndb_dir = "~no-such-user-of-fw-context/x"', "[index] db_dir must be a path whose home directory (~) is known",
+        marks=pytest.mark.skipif(
+            sys.platform == "win32",
+            reason="Python on Windows guesses the home of ~name from the profile directory of the current user, and "
+                   "does not refuse an unknown name",
+        ),
+    ),
     ('[[build.variants]]\nname = "a"\ndefines = "X"', "[[build.variants]] 'a' defines must be an array of strings, not a string"),
     ("[index]\nvendor_paths = [1]", "[index] vendor_paths must be an array of strings, or a string, not an array with an item"),
     ('[build]\nsystem = { x = "y" }', "[build] system must be a string, not a table"),

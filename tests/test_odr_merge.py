@@ -11,11 +11,8 @@ rows change.
 
 from __future__ import annotations
 
-import contextlib
-import fcntl
 import functools
 import json
-import os
 import shutil
 import sqlite3
 from pathlib import Path
@@ -747,25 +744,15 @@ def _cli_project(cli_build, impl_header: str):
 
 @pytest.fixture
 def cli_build(tmp_path: Path):
-    """Give a call that makes a project of the CLI with no watcher daemon (see `_cli_build`).
-
-    `fw-context index` starts the watcher daemon at its end
-    (`cli._index._ensure_watcher_after_index`), and the daemon starts an
-    index run of its own when a file of the project changes.  A test that
-    changes files and compares the index with a full run then has a second
-    writer in the index directory: measured 2026-11-04, a file of the
-    daemon came between the steps of `shutil.rmtree`.
-    """
-    with contextlib.ExitStack() as stack:
-        yield functools.partial(_cli_build, tmp_path, stack)
+    """Give a call that makes a project of the CLI (see `_cli_build`)."""
+    return functools.partial(_cli_build, tmp_path)
 
 
-def _cli_build(tmp_path: Path, stack: contextlib.ExitStack, files: dict[str, str], units: list[str]):
+def _cli_build(tmp_path: Path, files: dict[str, str], units: list[str]):
     """A project of the CLI with *files* and *units*, indexed once: the project, its database, and a call that indexes it.
 
-    The test holds `watcher.lock` until *stack* closes.  The lock tells
-    that a daemon runs, thus no index run starts one
-    (`mcp.background._ensure_daemon_running`).
+    `fw-context index` starts no watcher daemon (only an MCP server starts
+    it), thus no second writer comes into the index directory.
     """
     from tests.test_incremental_reindex import _cli, _db_path_for_project, _isolate_index_db
 
@@ -775,10 +762,6 @@ def _cli_build(tmp_path: Path, stack: contextlib.ExitStack, files: dict[str, str
     _isolate_index_db(proj, tmp_path)
     assert _cli(["init", "--project", str(proj)], cwd=proj, timeout=60).returncode == 0
     db_path = _db_path_for_project(proj)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    lock = os.open(db_path.parent / "watcher.lock", os.O_CREAT | os.O_RDWR)
-    stack.callback(os.close, lock)
-    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def index() -> None:
         result = _cli(["index", "--no-analyze", "--no-embeddings", str(proj / "compile_commands.json")], cwd=proj)
@@ -789,14 +772,9 @@ def _cli_build(tmp_path: Path, stack: contextlib.ExitStack, files: dict[str, str
 
 
 def _same_as_a_full_run(db_path: Path, index) -> None:
-    """Index again from an empty index directory: the index must be the same as before.
-
-    `watcher.lock` stays, because the test holds it (see `_cli_build`).
-    """
+    """Index again from an empty index directory: the index must be the same as before."""
     incremental = _state(db_path)
     for entry in db_path.parent.iterdir():
-        if entry.name == "watcher.lock":
-            continue
         if entry.is_dir() and not entry.is_symlink():
             shutil.rmtree(entry)
         else:

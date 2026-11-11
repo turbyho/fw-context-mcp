@@ -60,8 +60,8 @@ class _FakeServer:
 
 def _max_tokens(server: _FakeServer, model: str = "qwen3-embedding:8b") -> int:
     embedder = OllamaEmbedder(LLMConfig(embed_model=model))
-    with mock.patch.object(ollama.httpx, "post", side_effect=server.post), \
-            mock.patch.object(ollama.httpx, "get", side_effect=server.get):
+    with mock.patch.object(ollama.net, "post", side_effect=server.post), \
+            mock.patch.object(ollama.net, "get", side_effect=server.get):
         return embedder.max_tokens
 
 
@@ -98,7 +98,7 @@ def _embed_payload(query: bool) -> dict:
         sent.update(json)
         return httpx.Response(200, json={"embeddings": [[0.0]]}, request=httpx.Request("POST", url))
 
-    with mock.patch.object(ollama.httpx, "post", side_effect=post):
+    with mock.patch.object(ollama.net, "post", side_effect=post):
         ollama._call_ollama_embed_impl(["text"], LLMConfig(embed_model="m"), query=query)
     return sent
 
@@ -116,7 +116,7 @@ def test_an_input_longer_than_the_context_raises_input_too_long():
             400, json={"error": "the input length exceeds the context length"}, request=httpx.Request("POST", url),
         )
 
-    with mock.patch.object(ollama.httpx, "post", side_effect=post), pytest.raises(EmbedderInputTooLong):
+    with mock.patch.object(ollama.net, "post", side_effect=post), pytest.raises(EmbedderInputTooLong):
         ollama._call_ollama_embed_impl(["text"], LLMConfig(embed_model="m"), query=False)
 
 
@@ -129,8 +129,8 @@ def test_each_read_asks_the_server():
     """A kept value differs from the value of the server after a change of its setting."""
     server = _FakeServer(loaded=False)
     embedder = OllamaEmbedder(LLMConfig(embed_model="qwen3-embedding:8b"))
-    with mock.patch.object(ollama.httpx, "post", side_effect=server.post), \
-            mock.patch.object(ollama.httpx, "get", side_effect=server.get):
+    with mock.patch.object(ollama.net, "post", side_effect=server.post), \
+            mock.patch.object(ollama.net, "get", side_effect=server.get):
         assert embedder.max_tokens == 4096
         server.served = 8192
         assert embedder.max_tokens == 8192
@@ -140,8 +140,8 @@ def test_a_keep_alive_of_zero_still_gives_the_context():
     """The second warm-up keeps the model loaded long enough for /api/ps."""
     server = _FakeServer(loaded=False)
     embedder = OllamaEmbedder(LLMConfig(embed_model="qwen3-embedding:8b", keep_alive="0"))
-    with mock.patch.object(ollama.httpx, "post", side_effect=server.post), \
-            mock.patch.object(ollama.httpx, "get", side_effect=server.get):
+    with mock.patch.object(ollama.net, "post", side_effect=server.post), \
+            mock.patch.object(ollama.net, "get", side_effect=server.get):
         assert embedder.max_tokens == 4096
     assert server.keep_alive == ["0", "30s"]
 
@@ -152,7 +152,7 @@ def test_another_error_400_is_not_input_too_long():
     def post(url, json=None, **_):
         return httpx.Response(400, json={"error": "invalid input type"}, request=httpx.Request("POST", url))
 
-    with mock.patch.object(ollama.httpx, "post", side_effect=post), pytest.raises(ollama.OllamaError) as raised:
+    with mock.patch.object(ollama.net, "post", side_effect=post), pytest.raises(ollama.OllamaError) as raised:
         ollama._call_ollama_embed_impl(["text"], LLMConfig(embed_model="m"), query=False)
     assert not isinstance(raised.value, EmbedderInputTooLong)
 
@@ -163,8 +163,8 @@ def test_without_a_value_max_tokens_raises_and_keeps_nothing():
 
     server = _FakeServer(down=True)
     embedder = OllamaEmbedder(LLMConfig(embed_model="qwen3-embedding:8b"))
-    with mock.patch.object(ollama.httpx, "post", side_effect=server.post), \
-            mock.patch.object(ollama.httpx, "get", side_effect=server.get):
+    with mock.patch.object(ollama.net, "post", side_effect=server.post), \
+            mock.patch.object(ollama.net, "get", side_effect=server.get):
         with pytest.raises(EmbedderContextUnknown):
             _ = embedder.max_tokens
         server.down = False
@@ -202,9 +202,9 @@ def test_an_unknown_context_stops_the_embedding_step(populated_db, tmpdir):
     server = _FakeServer(served=None)
     cfg = LLMConfig(embed_model="qwen3-embedding:8b")
     embedder = OllamaEmbedder(cfg)
-    with mock.patch.object(ollama.httpx, "post", side_effect=server.post), \
-            mock.patch.object(ollama.httpx, "get", side_effect=server.get), \
-            mock.patch("fw_context_mcp.indexer._embedding.httpx.get", side_effect=server.get), \
+    with mock.patch.object(ollama.net, "post", side_effect=server.post), \
+            mock.patch.object(ollama.net, "get", side_effect=server.get), \
+            mock.patch("fw_context_mcp.indexer._embedding.net.get", side_effect=server.get), \
             mock.patch("fw_context_mcp.indexer._embedding.get_embedder", return_value=embedder), \
             pytest.raises(EmbeddingsIncomplete, match="no context length"):
         _build_embeddings(populated_db, "hash-deadbeef", cfg, tmpdir)

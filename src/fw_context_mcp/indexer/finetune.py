@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .db import search_symbols
+from .db import open_db_readonly, search_symbols
 
 if TYPE_CHECKING:
     from ..config.settings import Config
@@ -190,19 +190,28 @@ def mine_disagreements(
     t0 = time.monotonic()
     result = MiningResult()
 
+    # WHY read-only: the mining only reads the index.  ``sqlite3.connect``
+    # of a path makes an empty database there when no file exists, thus a
+    # wrong path left a new file behind and failed later on a missing
+    # table.  ``open_db_readonly`` refuses a missing file.
     try:
-        import sqlite_vec
-        conn = sqlite3.connect(str(db_path))
-        conn.enable_load_extension(True)
-        sqlite_vec.load(conn)
-        conn.enable_load_extension(False)
-    except (sqlite3.OperationalError, ImportError, AttributeError) as e:
+        conn = open_db_readonly(db_path)
+    except sqlite3.Error as e:
         log.warning("Cannot open database %s: %s", db_path, e)
         return result
 
     try:
-        with conn:
-            conn.row_factory = sqlite3.Row
+        # WHY this check: the dense search reads vec_symbols, which needs
+        # sqlite-vec, and the mining has no other way to rank.
+        # ``open_db_readonly`` opens the index also without sqlite-vec
+        # (the searches of the MCP server read the vectors without it).
+        # Without the check the mining embedded each query first and then
+        # stopped with "no such module: vec0".
+        try:
+            conn.execute("SELECT vec_version()").fetchone()
+        except sqlite3.OperationalError as e:
+            log.warning("Cannot mine %s: sqlite-vec is not loaded (%s)", db_path, e)
+            return result
 
         config_hash = conn.execute(_NEWEST_COMPLETED_BUILD).fetchone()
         if config_hash is None:
@@ -431,7 +440,7 @@ def train_step(
         "desc_version": config_hash,
     }
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
+    (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     log.info("Fine-tuned model saved to %s", out_dir)
 
     return out_dir

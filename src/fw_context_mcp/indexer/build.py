@@ -15,7 +15,6 @@ bare Makefile (via compiledb), and bare/manual mode.
 from __future__ import annotations
 
 import logging
-import os
 import shutil
 import subprocess
 from dataclasses import dataclass, field, fields, replace
@@ -26,7 +25,9 @@ from fw_context_mcp.utils import (
     build_cfg_env,
     cc_output_path,
     cc_staging_path,
+    command_words,
     owner_is_dead,
+    replace_file,
     run_in_process_group,
     staging_owner,
 )
@@ -488,7 +489,6 @@ def _run_pre_build(cfg: BuildConfig, cwd: Path) -> None:
     if not cfg.pre_build:
         return
     log.info("Running pre-build hook: %s", cfg.pre_build)
-    import shlex
     # build_env, not the raw inherited environment: a hook the harness put in
     # BASH_ENV hijacks any `bash -c` the user configures here — see utils.
     # build_cfg_env adds [build] env, extra_path and extra_env, as for every
@@ -498,7 +498,7 @@ def _run_pre_build(cfg: BuildConfig, cwd: Path) -> None:
     # each caller of generate_compile_commands catches only that.
     try:
         result = run_in_process_group(
-            shlex.split(cfg.pre_build), cwd=cwd, env=build_cfg_env(cfg),
+            command_words(cfg.pre_build), cwd=cwd, env=build_cfg_env(cfg),
             timeout=cfg.timeout, capture_output=False,
         )
     except subprocess.TimeoutExpired:
@@ -597,7 +597,7 @@ def generate_compile_commands(project_root: Path, cfg: BuildConfig) -> Path:
                 f"The build reported success and wrote no compilation database to {staging}"
             )
         final.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(staging, final)
+        replace_file(staging, final)
         return final
     finally:
         # A failed build leaves a partial staging file.  It must not stay —
@@ -622,12 +622,11 @@ def _generate_into(root: Path, cfg: BuildConfig) -> Path:
     if cfg.command:
         _run_pre_build(cfg, root)
         log.info("Running custom build command: %s", cfg.command)
-        import shlex
         # Same reason as the pre-build hook: `command = "bash -c ..."` is a
         # documented override, and BASH_ENV would hijack it.
         # In its own process group — see utils.run_in_process_group.
         result = run_in_process_group(
-            shlex.split(cfg.command), cwd=root, env=build_cfg_env(cfg),
+            command_words(cfg.command), cwd=root, env=build_cfg_env(cfg),
             timeout=None, capture_output=False,
         )
         if result.returncode != 0:

@@ -58,6 +58,7 @@ from fw_context_mcp.mcp.handlers.source import (
     _collect_callers,
     _lookup_definition,
 )
+from tests._toml import toml_string
 
 CH = "hash-deadbeef"
 
@@ -1011,7 +1012,7 @@ class TestABodyOutsideTheRootIsGivenAndLabelled:
         (root / ".fw-context").mkdir()
         (root / ".fw-context" / "config.toml").write_text(
             f'[project]\nid = "{OUT_OF_ROOT_PROJECT_ID}"\n\n'
-            f'[build]\n\n[index]\ndb_dir = "{tmp_path}"\n',
+            f'[build]\n\n[index]\ndb_dir = {toml_string(tmp_path)}\n',
             encoding="utf-8",
         )
         (root / "src" / "io.cpp").write_text("// io\n" * 40, encoding="utf-8")

@@ -201,4 +201,4 @@ class TestRecursivePage:
 
     def test_the_rows_carry_an_absolute_file(self, db):
         rows = self._page(db, 0)
-        assert all(r["file"].startswith(str(ROOT)) for r in rows[1:])
+        assert all(r["file"].startswith(ROOT.as_posix()) for r in rows[1:])

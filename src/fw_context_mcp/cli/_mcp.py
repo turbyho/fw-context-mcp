@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -71,13 +72,26 @@ def _register_mcp(tool, mcp_bin: str, dry_run: bool = False) -> None:
             _register_mcp_cli(tool, mcp_bin)
 
 
+#: The longest time of one registration command (``claude mcp add``).
+_REGISTRATION_TIMEOUT_S = 60.0
+
+
 def _register_mcp_cli(tool, mcp_bin: str) -> None:
-    """Register fw-context as an MCP server via a CLI command."""
+    """Register fw-context as an MCP server via a CLI command.
+
+    The template splits into words first, then ``{bin}`` becomes the path:
+    a path with a space (``C:\\Users\\Jan Novák\\...``) stays one
+    argument.  ``run_in_process_group`` runs the command: on Windows it
+    finds ``claude.cmd`` or ``codex.cmd`` of npm through ``PATHEXT``, which
+    ``subprocess.run`` with a bare name does not start, and it gives a
+    batch file each argument as it is.  The output is UTF-8 (Node and Rust
+    write it), decoded with replacement, because only a person reads it.
+    """
     if not tool.mcp_registration:
         return
 
-    cmd_str = tool.mcp_registration.replace("{bin}", mcp_bin)
-    parts = cmd_str.split()
+    parts = [mcp_bin if word == "{bin}" else word for word in tool.mcp_registration.split()]
+    cmd_str = subprocess.list2cmdline(parts) if sys.platform == "win32" else shlex.join(parts)
     binary = parts[0]
 
     if not shutil.which(binary):
@@ -85,7 +99,16 @@ def _register_mcp_cli(tool, mcp_bin: str) -> None:
         print(f"         {cmd_str}")
         return
 
-    result = subprocess.run(parts, capture_output=True, text=True)
+    from ..utils import run_in_process_group
+
+    try:
+        result = run_in_process_group(
+            parts, cwd=Path.cwd(), env=dict(os.environ), timeout=_REGISTRATION_TIMEOUT_S, capture_output=True,
+        )
+    except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
+        print(f"  [warn] {tool.name}: {exc} — register manually:", file=sys.stderr)
+        print(f"         {cmd_str}", file=sys.stderr)
+        return
     if result.returncode == 0:
         print(f"  [ok] {tool.name}: fw-context registered ({mcp_bin})")
     else:

@@ -37,7 +37,8 @@ def _flags(unit) -> str:
 
 def _entry(root: Path, unit, **overrides) -> dict:
     entry = {
-        "file": str(unit.file.relative_to(root)),
+        # An index key: "/" on each system (path_key.index_key).
+        "file": unit.file.relative_to(root).as_posix(),
         "source_hash": hashlib.sha256(unit.file.read_bytes()).hexdigest(),
         "flags_hash": _flags(unit),
         "headers": [],
@@ -48,11 +49,11 @@ def _entry(root: Path, unit, **overrides) -> dict:
 
 def _rows(units) -> dict:
     """One ``files`` row for each file of *units*, as get_file_hashes gives them."""
-    return {str(u.file.relative_to(u.file.parents[1])): FileHashRecord(1, 0.0, "", "") for u in units}
+    return {u.file.relative_to(u.file.parents[1]).as_posix(): FileHashRecord(1, 0.0, "", "") for u in units}
 
 
 def _key(root: Path, unit) -> tuple[str, str]:
-    return str(unit.file.relative_to(root)), _flags(unit)
+    return unit.file.relative_to(root).as_posix(), _flags(unit)
 
 
 def _decide(root: Path, units, manifest, *, existing=None, force=False, stale=frozenset(), recorded=None):

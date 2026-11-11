@@ -60,6 +60,8 @@ from functools import cache
 from importlib.resources.abc import Traversable
 from pathlib import Path, PurePosixPath
 
+from ..utils import replace_file
+
 log = logging.getLogger(__name__)
 
 #: Overrides where the bundled archive is unpacked; the test suite sets it,
@@ -230,7 +232,7 @@ def install_managed(major: int) -> Path:
         os.chmod(staging, 0o755)  # nosec B103
         if target.exists() and not _is_current(target, source):
             shutil.rmtree(target)  # a broken copy: an earlier run was killed
-        os.replace(staging, target)
+        replace_file(staging, target)
     except OSError as error:
         shutil.rmtree(staging, ignore_errors=True)
         if _is_current(target, source):
@@ -317,7 +319,7 @@ def _printed_resource_dir(clang: str) -> str | None:
     if key not in _PRINTED:
         try:
             answer = subprocess.run(
-                [clang, "-print-resource-dir"], capture_output=True, text=True,
+                [clang, "-print-resource-dir"], capture_output=True,
                 timeout=_PROBE_TIMEOUT_S, check=False, stdin=subprocess.DEVNULL,
             )
         except (OSError, subprocess.TimeoutExpired) as error:
@@ -325,7 +327,11 @@ def _printed_resource_dir(clang: str) -> str | None:
             return None
         if answer.returncode != 0:
             return None
-        _PRINTED[key] = answer.stdout.strip()
+        # WHY fsdecode: clang writes a path as the bytes of the file name on
+        # POSIX and as UTF-8 on Windows (measured with clang 23), which is
+        # how this process decodes file names.  ``text=True`` decoded it in
+        # the ANSI code page of Windows.
+        _PRINTED[key] = os.fsdecode(answer.stdout).strip()
     return _PRINTED[key]
 
 

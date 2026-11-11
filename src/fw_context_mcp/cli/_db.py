@@ -469,6 +469,12 @@ def _delete_one_build(args: argparse.Namespace, cfg, project_id: str, db_path: P
             print(f"  References:   {ref_count}")
             print(f"  State:        {_row_state(target, queried)}")
 
+            # WHY close before the question: a person can answer after
+            # minutes, and an open connection keeps the file open.  Windows
+            # then does not let another command (reset_index, db delete
+            # --all) delete the index.  The ``finally`` closes it again,
+            # which does nothing.
+            conn.close()
             if not args.yes:
                 answer = input("\nDelete this build? [y/N] ").strip().lower()
                 if answer not in ("y", "yes"):

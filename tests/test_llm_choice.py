@@ -50,8 +50,7 @@ def _terminal(monkeypatch, answer: str | None) -> list[str]:
         asked.append(prompt)
         return answer
 
-    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
-    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr(choice, "_is_terminal", lambda stream: True)
     monkeypatch.setattr(choice, "_in_foreground", lambda: True)
     monkeypatch.setattr(choice, "_ask", _input)
     return asked
@@ -102,7 +101,7 @@ def test_enter_keeps_the_profile_of_the_project(cfg, monkeypatch):
 ])
 def test_no_question_without_a_reason(cfg, monkeypatch, background, analyses, tty):
     _terminal(monkeypatch, None)
-    monkeypatch.setattr(sys.stdin, "isatty", lambda: tty)
+    monkeypatch.setattr(choice, "_is_terminal", lambda stream: tty)
 
     assert choice.llm_for_run(argparse.Namespace(llm=None), cfg, background=background, analyses=analyses) is cfg
 
@@ -194,10 +193,79 @@ def test_no_answer_keeps_the_profile_of_the_project(cfg, monkeypatch, capsys):
     real_ask = choice._ask
     _terminal(monkeypatch, None)
     monkeypatch.setattr(choice, "_ask", real_ask)
+    monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setattr(select, "select", lambda r, w, x, timeout: ([], [], []))
 
     assert choice.llm_for_run(argparse.Namespace(llm=None), cfg, background=False, analyses=True) is cfg
     assert "No answer in 60 s" in capsys.readouterr().out
+
+
+class _FakeConsole:
+    """``msvcrt`` and the clock of a Windows console whose keyboard gets a key at *key_at* seconds, or never."""
+
+    def __init__(self, key_at: float | None) -> None:
+        self.now = 0.0
+        self.key_at = key_at
+
+    def kbhit(self) -> bool:
+        return self.key_at is not None and self.now >= self.key_at
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def _windows_console(monkeypatch, key_at: float | None) -> _FakeConsole:
+    """The Windows branch of the question on each system.
+
+    ``select`` takes no stdin there: it raises OSError 10093 (measured on
+    Windows 11), as the fake does.  ``raising=False``: a version of the
+    module without ``time`` must fail in the test, not in its setup.
+    """
+    import select
+    from types import SimpleNamespace
+
+    def _no_stdin(*args):
+        raise OSError(10093, "select of Windows takes only sockets")
+
+    console = _FakeConsole(key_at)
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(select, "select", _no_stdin)
+    monkeypatch.setitem(sys.modules, "msvcrt", console)
+    monkeypatch.setattr(choice, "time", SimpleNamespace(monotonic=console.monotonic, sleep=console.sleep),
+                        raising=False)
+    return console
+
+
+def test_no_answer_on_windows_keeps_the_profile_of_the_project(cfg, monkeypatch, capsys):
+    """On Windows the question waited without a limit: select raised OSError, and the read had no timeout."""
+    real_ask = choice._ask
+    _terminal(monkeypatch, None)
+    monkeypatch.setattr(choice, "_ask", real_ask)
+    console = _windows_console(monkeypatch, key_at=None)
+
+    assert choice.llm_for_run(argparse.Namespace(llm=None), cfg, background=False, analyses=True) is cfg
+    assert "No answer in 60 s" in capsys.readouterr().out
+    assert console.now >= choice.QUESTION_TIMEOUT_S
+
+
+def test_a_key_on_windows_reads_the_answer_and_shows_the_prompt_once(cfg, monkeypatch, capsys):
+    """The fallback of the OSError printed the prompt a second time."""
+    from fw_context_mcp.cli import _init_interactive as ui
+
+    real_ask = choice._ask
+    asked = _terminal(monkeypatch, "2")
+    monkeypatch.setattr(choice, "_ask", real_ask)
+    monkeypatch.setattr(ui, "_input", lambda prompt: asked.append(prompt) or "2")
+    _windows_console(monkeypatch, key_at=3.0)
+
+    run = choice.llm_for_run(argparse.Namespace(llm=None), cfg, background=False, analyses=True)
+
+    assert run.llm.profile == "remote"
+    assert asked == [""], "the prompt went out before the wait, thus the read gives none"
+    assert capsys.readouterr().out.count("> ") == 1
 
 
 # ── The usage of the run ──
@@ -264,3 +332,27 @@ def test_only_a_manual_index_run_measures_the_context_of_the_analysis(cfg, tmp_p
     kwargs = _build_run_kwargs(args, cfg, tmp_path, "id", [], [], None)
 
     assert isinstance(kwargs["context_choice"], ContextChoice) and kwargs["context_choice"].check is chooses
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the console of Windows")
+@pytest.mark.parametrize("stream", ["stdin", "stdout"])
+def test_nul_on_windows_is_no_terminal_to_ask(stream: str):
+    """CPython gives isatty() True for NUL.
+
+    With < NUL the question waited 60 s (kbhit reads the console, not
+    stdin); with > NUL it asked a question that nobody saw.
+    """
+    import subprocess
+
+    probe = (
+        "import sys\n"
+        "from fw_context_mcp.cli._llm_choice import _is_terminal\n"
+        f"stream = sys.{stream}\n"
+        "sys.stderr.write(f'{stream.isatty()} {_is_terminal(stream)}')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE, text=True, timeout=60,
+    )
+
+    assert result.stderr.split()[-2:] == ["True", "False"], result.stderr

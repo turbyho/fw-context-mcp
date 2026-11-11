@@ -28,9 +28,10 @@ import logging
 import os
 import sqlite3
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from ...indexer.manifest import _hash_with_cache, load_tu_extensions
+from ...path_key import is_absolute_key
 from ...utils import (
     MTIME_TOLERANCE_S,
     TU_EXTENSIONS,
@@ -73,9 +74,16 @@ def _invalidate_modified_cache(config_hash: str | None = None) -> None:
 
 
 def _path_matches_patterns(path: str, patterns: list[str]) -> bool:
-    """Return True if *path* contains any of the build-directory *patterns*."""
+    """Return True if *path* contains any of the build-directory *patterns*.
+
+    The patterns use ``/`` (``build/``, ``.pio/build/``), as the index keys
+    do.  *path* can also be a path of the disk (``os.walk``), which has
+    ``\\`` on Windows, thus it gets ``/`` first.
+    """
     if not patterns:
         return False
+    if os.name == "nt":
+        path = path.replace("\\", "/")
     return any(pat in path for pat in patterns)
 
 
@@ -545,11 +553,19 @@ def _git_tu_candidates(root: Path, tu_exts: frozenset[str]) -> list[str] | None:
     """
     import subprocess
 
+    # WHY -z and bytes: without -z git quotes a name with a byte above 127
+    # ("src/\\305\\276lu\\305\\245.c"), and the test of the extension then
+    # read `.c"`.  With -z git gives each name as it is, after a NUL.  git
+    # stores a name as the bytes of the file system, thus ``os.fsdecode``
+    # gives the name that the other code of this process uses: UTF-8 with
+    # surrogateescape on POSIX, UTF-8 on Windows (Git for Windows writes
+    # UTF-8).  ``text=True`` decoded it in the locale, the ANSI code page
+    # on Windows.
     try:
         result = subprocess.run(
-            ["git", "-C", str(root), "ls-files", "-co", "--exclude-standard"],
+            ["git", "-C", str(root), "ls-files", "-z", "-co", "--exclude-standard"],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
-            text=True,
             timeout=_GIT_LS_TIMEOUT_S,
             check=False,
         )
@@ -557,10 +573,8 @@ def _git_tu_candidates(root: Path, tu_exts: frozenset[str]) -> list[str] | None:
         return None
     if result.returncode != 0:
         return None
-    return [
-        rel for rel in result.stdout.splitlines()
-        if Path(rel).suffix in tu_exts
-    ]
+    names = (os.fsdecode(raw) for raw in result.stdout.split(b"\0") if raw)
+    return [rel for rel in names if Path(rel).suffix in tu_exts]
 
 
 def _vendor_roots(conn, config_hash: str) -> set[str]:
@@ -581,9 +595,9 @@ def _vendor_roots(conn, config_hash: str) -> set[str]:
         "SELECT path, is_project FROM files WHERE config_hash=?", (config_hash,)
     ):
         stored = row["path"]
-        if os.path.isabs(stored):
+        if is_absolute_key(stored):
             continue
-        parts = Path(stored).parts
+        parts = PurePosixPath(stored).parts
         first = parts[0] if len(parts) > 1 else "."
         (project if row["is_project"] else vendor).add(first)
     return vendor - project
@@ -790,8 +804,8 @@ def _indexed_paths(conn, config_hash: str) -> tuple[set[str], set[str]]:
     ):
         stored = row["path"]
         paths.add(stored)
-        if row["is_project"] and not os.path.isabs(stored):
-            parts = Path(stored).parts
+        if row["is_project"] and not is_absolute_key(stored):
+            parts = PurePosixPath(stored).parts
             scan_roots.add(parts[0] if len(parts) > 1 else ".")
     return paths, scan_roots
 

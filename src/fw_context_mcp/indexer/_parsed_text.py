@@ -34,6 +34,8 @@ from functools import cache
 from pathlib import Path
 from typing import Any
 
+from ..path_key import canonical_path
+
 log = logging.getLogger(__name__)
 
 
@@ -142,5 +144,5 @@ def parsed_hashes(tu: Any, main_file: Path) -> dict[Path, str]:
         if name in seen:
             continue
         seen.add(name)
-        hashes.setdefault(Path(name).resolve(), parsed_hash(tu, inc.include))
+        hashes.setdefault(canonical_path(name), parsed_hash(tu, inc.include))
     return hashes

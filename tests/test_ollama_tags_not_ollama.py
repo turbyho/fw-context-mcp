@@ -12,6 +12,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
+from fw_context_mcp import net
 from fw_context_mcp.config.settings import LLMConfig
 
 URL = "http://127.0.0.1:11434"
@@ -29,7 +30,7 @@ def _answer(monkeypatch, response: httpx.Response) -> None:
         response.request = httpx.Request("GET", url)
         return response
 
-    monkeypatch.setattr(httpx, "get", fake_get)
+    monkeypatch.setattr(net, "get", fake_get)
 
 
 @pytest.mark.parametrize("answer", sorted(ANSWERS))

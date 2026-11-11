@@ -14,6 +14,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests._toml import toml_string
+
 PROJECT_ID = "0123456789abcdef0123456789abcdef"
 
 
@@ -44,7 +46,7 @@ def _run(tmp_path: Path, monkeypatch, environments: list[str] | None, build_tabl
     (root / ".fw-context" / "config.toml").write_text(
         f'[project]\nid = "{PROJECT_ID}"\n[build]\nsystem = "platformio"\n{build_table}', encoding="utf-8")
     (root / ".fw-context" / "local.toml").write_text(
-        f'[index]\ndb_dir = "{tmp_path / "index"}"\n', encoding="utf-8")
+        f'[index]\ndb_dir = {toml_string(tmp_path / "index")}\n', encoding="utf-8")
 
     seen: dict = {}
     if environments is not None:
@@ -61,7 +63,6 @@ def _run(tmp_path: Path, monkeypatch, environments: list[str] | None, build_tabl
     monkeypatch.setattr(index_mod, "_run_multi", _multi)
     monkeypatch.setattr(index_mod, "_run_single", _single)
     monkeypatch.setattr(index_mod, "_build_run_kwargs", lambda *a, **kw: {})
-    monkeypatch.setattr(index_mod, "_ensure_watcher_after_index", lambda root: None)
     args = SimpleNamespace(
         verbose=False, project=str(root), background=False, build=True,
         compile_commands=None, no_clean=False, force=False, takeover=False,

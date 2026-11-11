@@ -7,6 +7,7 @@ project, or none.
 
 from __future__ import annotations
 
+import os
 import shlex
 from pathlib import Path
 
@@ -81,8 +82,10 @@ def test_the_quotes_of_powershell(monkeypatch):
     from fw_context_mcp.mcp.handlers.maintenance import _with_project
 
     monkeypatch.setattr(sys, "platform", "win32")
+    # The path keeps the separator of the host: a backslash on Windows.
+    project = r"'C:\a b\o''k'" if os.name == "nt" else "'C:/a b/o''k'"
 
-    assert _with_project("fw-context doctor --fix", Path("C:/a b/o'k")) == "fw-context doctor --fix --project 'C:/a b/o''k'"
+    assert _with_project("fw-context doctor --fix", Path("C:/a b/o'k")) == f"fw-context doctor --fix --project {project}"
 
 
 @pytest.fixture(autouse=True)

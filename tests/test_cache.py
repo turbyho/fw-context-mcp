@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -56,6 +57,21 @@ class TestKeywordCache:
         assert len(c) == 2
 
     def test_zero_ttl_always_expired(self):
+        c = KeywordCache(ttl_s=0)
+        c.set(("q", "h"), ["test"])
+        assert c.get(("q", "h")) is None
+
+    def test_zero_ttl_is_expired_on_a_coarse_clock(self, monkeypatch):
+        """On Windows ``time.monotonic()`` moves in steps of about 15.6 ms.
+
+        A ``get`` right after the ``set`` then reads the age 0, and the
+        entry of a TTL of 0 came back.
+        """
+        from types import SimpleNamespace
+
+        import fw_context_mcp.search.cache as cache_module
+
+        monkeypatch.setattr(cache_module, "time", SimpleNamespace(monotonic=lambda: 1000.0))
         c = KeywordCache(ttl_s=0)
         c.set(("q", "h"), ["test"])
         assert c.get(("q", "h")) is None
@@ -274,6 +290,26 @@ class TestLocalCachePath:
         conn.close()
 
         assert (tmp_path / "relhome" / "llm_cache.db").is_file()
+
+    @pytest.mark.parametrize("name", ["with space", "hash#mark", pytest.param("query?mark", marks=pytest.mark.skipif(os.name == "nt", reason="Windows forbids '?' in a file name")), "per%cent"])
+    def test_a_home_with_uri_characters_opens_the_cache(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+    ) -> None:
+        """A space, ``#``, ``?`` or ``%`` in the path is a character of a name, not of the URI.
+
+        ``f"file://{path}"`` made ``#mark/llm_cache.db`` a fragment and
+        ``?mark/...`` the query of the URI, and SQLite opened a different
+        file or none.  On Windows ``file://C:\\...`` has the authority
+        ``C:`` and SQLite stops with ``invalid uri authority``.
+        """
+        import fw_context_mcp.cache_client as cc_mod
+
+        home = tmp_path / name
+        monkeypatch.setenv("FW_CONTEXT_HOME", str(home))
+        conn = cc_mod.get_local_cache_db()
+        conn.close()
+
+        assert (home / "llm_cache.db").is_file()
 
     def test_session_cache_is_not_in_the_home_of_the_operator(self) -> None:
         """The session isolation of ``conftest.py`` covers the cache too."""

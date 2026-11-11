@@ -8,6 +8,11 @@ from pathlib import Path
 import pytest
 
 from fw_context_mcp.indexer.builders.zephyr import ZephyrBuildSystem
+from tests._stubs import program_name, symlink_or_skip
+
+# The probe is a mock (probe_counter), thus the content of a file does not
+# count: only its name, which is the name of the program on this system.
+NRFUTIL = program_name("nrfutil")
 
 
 @pytest.fixture
@@ -33,13 +38,13 @@ def test_a_symlinked_binary_is_probed_once(tmp_path: Path, monkeypatch, probe_co
     """
     real_dir = tmp_path / "usr" / "bin"
     real_dir.mkdir(parents=True)
-    real = real_dir / "nrfutil"
+    real = real_dir / NRFUTIL
     real.write_text("#!/bin/sh\n")
     real.chmod(0o755)
 
     link_dir = tmp_path / "bin"
     link_dir.mkdir()
-    (link_dir / "nrfutil").symlink_to(real)
+    symlink_or_skip(link_dir / NRFUTIL, real)
 
     monkeypatch.setenv("PATH", os.pathsep.join([str(link_dir), str(real_dir)]))
     monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path / "nohome"))
@@ -53,7 +58,7 @@ def test_two_different_binaries_are_both_probed(tmp_path: Path, monkeypatch, pro
     for name in ("a", "b"):
         d = tmp_path / name
         d.mkdir()
-        binary = d / "nrfutil"
+        binary = d / NRFUTIL
         binary.write_text("#!/bin/sh\n")
         binary.chmod(0o755)
 
@@ -82,7 +87,7 @@ def test_two_shims_keep_their_literal_paths(tmp_path: Path, monkeypatch, probe_c
     for name in ("pyenv", "asdf"):
         d = tmp_path / name / "shims"
         d.mkdir(parents=True)
-        (d / "nrfutil").symlink_to(dispatcher)
+        symlink_or_skip(d / NRFUTIL, dispatcher)
         dirs.append(str(d))
 
     monkeypatch.setenv("PATH", os.pathsep.join(dirs))

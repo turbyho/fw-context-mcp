@@ -18,7 +18,9 @@ Covers:
 
 from __future__ import annotations
 
+import os
 import sqlite3  # noqa: E402 — resolves to pysqlite3 after the redirect above
+import sys
 import threading  # noqa: E402
 import time  # noqa: E402
 from pathlib import Path  # noqa: E402
@@ -126,6 +128,10 @@ class TestReindexDetection:
         executor.execute_sync(lambda conn, h: conn.execute("SELECT 1"), "h")
         assert executor._conn is not conn_running
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="Windows does not rename a file over a file that SQLite holds open",
+    )
     def test_identity_change_triggers_reconnect(self, executor, db_path, tmp_path):
         """Manual 'fw-context index' leaves no pid file — the (st_ino,
         st_mtime) identity change must be detected instead."""
@@ -133,6 +139,20 @@ class TestReindexDetection:
         replacement = tmp_path / "replacement.db"
         _make_db(replacement)
         replacement.replace(db_path)
+        executor.execute_sync(lambda conn, h: conn.execute("SELECT 1"), "h")
+        assert executor._conn is not conn_before
+
+    def test_a_write_in_place_triggers_reconnect(self, executor, db_path):
+        """An index run that no check saw and that wrote the file in place.
+
+        This is the identity change of each system: an index run writes
+        the database in place, and Windows cannot replace a file that the
+        executor holds open.  WHY utime: two writes in a row can get the
+        same mtime on a file system with a coarse clock.
+        """
+        conn_before = executor._conn
+        st = db_path.stat()
+        os.utime(db_path, (st.st_atime, st.st_mtime + 10))
         executor.execute_sync(lambda conn, h: conn.execute("SELECT 1"), "h")
         assert executor._conn is not conn_before
 

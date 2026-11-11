@@ -171,14 +171,14 @@ class TestGetFileMapFuzzyFallback:
 
         from fw_context_mcp.mcp.handlers._base import BaseHandler, DbContext
         from fw_context_mcp.mcp.handlers.source import get_file_map
-        from fw_context_mcp.mcp.shared.executor import SyncQueryExecutor
+        from fw_context_mcp.mcp.shared.context import get_executor
 
         # Mock resolve_db_context to point to our tmp_path DB — bypasses
         # the global registry (~/.fw-context/projects.db) which would
         # resolve to a different path for this project_id.
         db_ctx = DbContext(
             db_path=db_path,
-            executor=SyncQueryExecutor(str(db_path.resolve()), db_path),
+            executor=get_executor(db_path),
             config_hash="hash-H3",
             project_id=project_id,
             root=tmp_path,

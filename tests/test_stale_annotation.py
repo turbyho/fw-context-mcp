@@ -69,14 +69,14 @@ class TestCollectResultPaths:
     def test_reads_a_list_of_records(self, tmp_path: Path):
         result = [{"file": "src/a.c"}, {"file": "src/b.c"}]
         paths = collect_result_paths(result, tmp_path)
-        assert paths == [str(tmp_path / "src/a.c"), str(tmp_path / "src/b.c")]
+        assert paths == [(tmp_path / "src/a.c").as_posix(), (tmp_path / "src/b.c").as_posix()]
 
     def test_reads_a_single_dict(self, tmp_path: Path):
         paths = collect_result_paths({"file": "src/a.c"}, tmp_path)
-        assert paths == [str(tmp_path / "src/a.c")]
+        assert paths == [(tmp_path / "src/a.c").as_posix()]
 
     def test_keeps_an_absolute_path(self, tmp_path: Path):
-        absolute = str(tmp_path / "src/a.c")
+        absolute = (tmp_path / "src/a.c").as_posix()
         assert collect_result_paths({"file": absolute}, tmp_path) == [absolute]
 
     def test_reads_the_file_path_key(self, tmp_path: Path):
@@ -87,21 +87,21 @@ class TestCollectResultPaths:
         detection.  Verified against an indexed the Mbed project on 2026-08-27.
         """
         result = [{"file_path": "src/a.c", "name": "dead_fn"}]
-        assert collect_result_paths(result, tmp_path) == [str(tmp_path / "src/a.c")]
+        assert collect_result_paths(result, tmp_path) == [(tmp_path / "src/a.c").as_posix()]
 
     def test_file_wins_when_a_record_holds_both_keys(self, tmp_path: Path):
         """One path per record — the two keys name the same file."""
         record = {"file": "src/a.c", "file_path": "src/a.c"}
-        assert collect_result_paths(record, tmp_path) == [str(tmp_path / "src/a.c")]
+        assert collect_result_paths(record, tmp_path) == [(tmp_path / "src/a.c").as_posix()]
 
     def test_an_empty_file_falls_through_to_file_path(self, tmp_path: Path):
         record = {"file": "", "file_path": "src/b.c"}
-        assert collect_result_paths(record, tmp_path) == [str(tmp_path / "src/b.c")]
+        assert collect_result_paths(record, tmp_path) == [(tmp_path / "src/b.c").as_posix()]
 
     def test_reads_the_source_file_key(self, tmp_path: Path):
         """trace_data_flow names the path ``source_file``."""
         record = {"source_name": "modem_init", "source_file": "src/a.c"}
-        assert collect_result_paths(record, tmp_path) == [str(tmp_path / "src/a.c")]
+        assert collect_result_paths(record, tmp_path) == [(tmp_path / "src/a.c").as_posix()]
 
     def test_reads_both_paths_of_an_indirect_target(self, tmp_path: Path):
         """find_indirect_targets names two different files in one record.
@@ -116,14 +116,14 @@ class TestCollectResultPaths:
             "stored_file": "src/setup.c",
         }
         assert collect_result_paths(record, tmp_path) == [
-            str(tmp_path / "src/isr.c"),
-            str(tmp_path / "src/setup.c"),
+            (tmp_path / "src/isr.c").as_posix(),
+            (tmp_path / "src/setup.c").as_posix(),
         ]
 
     def test_a_null_stored_file_is_skipped(self, tmp_path: Path):
         """find_indirect_targets gives stored_file=None when no place is known."""
         record = {"file": "src/isr.c", "stored_file": None}
-        assert collect_result_paths(record, tmp_path) == [str(tmp_path / "src/isr.c")]
+        assert collect_result_paths(record, tmp_path) == [(tmp_path / "src/isr.c").as_posix()]
 
     def test_reads_paths_from_a_nested_record_list(self, tmp_path: Path):
         """find_wrapper_callers keeps its paths one level down, in methods.
@@ -144,8 +144,8 @@ class TestCollectResultPaths:
         paths = collect_result_paths(result, tmp_path)
 
         assert paths == [
-            str(tmp_path / "src/transfer.cpp"),
-            str(tmp_path / "src/transfer_hal.cpp"),
+            (tmp_path / "src/transfer.cpp").as_posix(),
+            (tmp_path / "src/transfer_hal.cpp").as_posix(),
         ]
 
     def test_the_descent_stops_at_one_level(self, tmp_path: Path):
@@ -158,11 +158,11 @@ class TestCollectResultPaths:
 
         paths = collect_result_paths(result, tmp_path)
 
-        assert paths == [str(tmp_path / "src/a.c")]
+        assert paths == [(tmp_path / "src/a.c").as_posix()]
 
     def test_a_list_of_plain_values_is_not_a_record_list(self, tmp_path: Path):
         record = {"file": "src/a.c", "tags": ["one", "two"]}
-        assert collect_result_paths(record, tmp_path) == [str(tmp_path / "src/a.c")]
+        assert collect_result_paths(record, tmp_path) == [(tmp_path / "src/a.c").as_posix()]
 
     def test_a_record_without_a_file_key_adds_nothing(self, tmp_path: Path):
         """An error dict must not cost a stat() call."""

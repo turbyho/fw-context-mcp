@@ -19,12 +19,14 @@ Why a single utils module instead of topic-split utility files:
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import io
 import json
 import logging
 import os
 import re
+import secrets
 import shlex
 import shutil
 import signal
@@ -32,25 +34,30 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import urllib.parse
 from collections import OrderedDict
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import UTC, datetime
-from pathlib import Path
-from typing import TYPE_CHECKING
+from pathlib import Path, PurePath
+from typing import TYPE_CHECKING, AnyStr
 
 if TYPE_CHECKING:
     from fw_context_mcp.indexer.build import BuildConfig
 
 from fw_context_mcp import _stdlib_sqlite3
+from fw_context_mcp.path_key import is_absolute_key
+from fw_context_mcp.processes import MAX_PID, pid_exists
 
 log = logging.getLogger(__name__)
 
 __all__ = [
     "CC_STAGING_GLOB",
+    "CLANG_POSIX_RESPONSE_FILE",
     "CPP_EXTENSIONS",
     "CPP_HEADER_EXTENSIONS",
     "CPP_SOURCE_EXTENSIONS",
@@ -62,34 +69,48 @@ __all__ = [
     "TU_EXTENSIONS",
     "BuildTimeoutError",
     "abs_path",
+    "activate_script",
     "build_dir_patterns_with_fw_context",
     "build_env",
     "build_tool_available",
     "cc_output_path",
     "cc_staging_path",
     "clear_dead_temporaries",
+    "command_program",
+    "command_words",
     "compute_content_hash",
     "compute_source_hash",
     "decode_source_lines",
+    "env_value",
     "fmt_count",
     "format_number_ranges",
     "is_compile_commands_stale",
     "is_db_exception",
     "is_fatal",
+    "is_program",
     "macro_signature",
     "missing_tool_message",
     "owner_is_dead",
     "owner_token",
+    "path_directories",
     "process_group_is_gone",
     "process_start_time",
+    "program_file_names",
     "read_file_lines",
     "record_build_groups",
+    "remove_file",
+    "replace_file",
     "resolve_project_root",
+    "response_file",
+    "response_file_text",
     "run_in_process_group",
+    "sqlite_file_uri",
     "staging_owner",
     "stop_process_group",
     "temporary_owner",
     "truncate_path_middle",
+    "venv_program",
+    "windows_words",
 ]
 
 # Seconds of tolerance when comparing file mtimes to account for
@@ -279,6 +300,39 @@ def is_db_exception(exc: BaseException) -> bool:
 _SHELL_STARTUP_VARS: frozenset[str] = frozenset({"BASH_ENV"})
 
 
+def sqlite_file_uri(path: Path, mode: str) -> str:
+    """Return the SQLite URI that opens the database file *path* with ``?mode=<mode>`` (``ro``, ``rw``, ``rwc``).
+
+    *path* becomes absolute; links stay as the caller gives them.  WHY
+    a URI: ``mode=ro`` exists only there.  WHY this function and not
+    ``Path.as_uri()`` alone: ``as_uri`` gives a Windows UNC path
+    (``\\\\server\\share\\x.db``) the authority of the server
+    (``file://server/share/x.db``), and SQLite takes only an empty
+    authority or ``localhost`` ("invalid uri authority", measured on
+    Windows 11 with SQLite 3.54).  ``resolve()`` turns a mapped network
+    drive into such a path (``H:\\`` gave ``\\\\VBoxSvr\\Documents\\``),
+    thus an index on a network drive could not be opened read-only.
+    """
+    absolute = path.absolute()
+    uri = _unc_file_uri(absolute) if absolute.drive.startswith("\\\\") else absolute.as_uri()
+    return f"{uri}?mode={mode}"
+
+
+def _unc_file_uri(path: PurePath) -> str:
+    """Return the ``file:`` URI of the UNC path *path* in the form that SQLite takes.
+
+    An empty authority and the server in the path:
+    ``file:////server/share/x.db`` (measured on Windows 11).  The same form
+    opens a long path (``\\\\?\\C:\\...``, ``\\\\?\\UNC\\server\\...``) and a
+    device path (``\\\\.\\C:\\...``), whose drive also starts with two
+    backslashes, and for which ``as_uri`` of Python 3.11 gave the authority
+    ``%3F`` or ``.`` (measured: each one opens).  ``quote``
+    percent-encodes a space, ``#``, ``?``, ``%`` and each character above
+    127, as ``as_uri`` does for each other path.
+    """
+    return f"file://{urllib.parse.quote(path.as_posix())}"
+
+
 def build_env(overrides: dict[str, str] | None = None) -> dict[str, str]:
     """Return the environment for a build subprocess.
 
@@ -289,8 +343,19 @@ def build_env(overrides: dict[str, str] | None = None) -> dict[str, str]:
     those variables deliberately — in ``[build] env`` or ``extra_env`` —
     still gets it.  Configuration is a declared intent; inheritance from
     whoever started fw-context is an accident.
+
+    On Windows a Python tool of the build (pio, west, idf.py, a script that
+    CMake runs) writes its stdout and stderr in UTF-8: ``PYTHONIOENCODING``
+    is ``utf-8`` unless the environment already sets it (decision of the
+    user, 2026-11-10).  WHY: to a pipe Python writes the ANSI code page
+    there, and a character that the code page does not hold stopped the
+    tool with ``UnicodeEncodeError`` (measured on Windows 11: no output at
+    all).  The output of a build is read as UTF-8 (``run_in_process_group``).
+    Linux and macOS write UTF-8 already, thus nothing changes there.
     """
     env = {k: v for k, v in os.environ.items() if k not in _SHELL_STARTUP_VARS}
+    if sys.platform == "win32":
+        env.setdefault("PYTHONIOENCODING", "utf-8")
     if overrides:
         env.update(overrides)
     return env
@@ -413,7 +478,7 @@ def process_start_time(pid: int) -> str | None:
     try:
         result = subprocess.run(  # noqa: S603 — fixed argv, no shell
             ["ps", "-o", "lstart=", "-p", str(pid)],
-            capture_output=True, text=True, timeout=5, check=False, env=env,
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5, check=False, env=env,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -439,7 +504,7 @@ def _write_group_record(record: Path, pgid: int, program: str) -> None:
     }
     try:
         temporary.write_text(json.dumps(payload), encoding="utf-8")
-        os.replace(temporary, record)
+        replace_file(temporary, record)
     except OSError as exc:
         # The record helps only after a SIGKILL.  A build must not fail for it.
         log.warning("Cannot record the build process group in %s: %s", record, exc)
@@ -474,7 +539,12 @@ def stop_process_group(
     The SIGKILL is in ``finally``: a second Ctrl-C during the wait raises
     ``KeyboardInterrupt`` out of ``time.sleep``, and a build that ignores
     SIGTERM then ran on.
+
+    POSIX only.  On Windows a build runs in a job object, and the job stops
+    it (``job_object.py``).
     """
+    if sys.platform == "win32":
+        raise OSError("a process group is POSIX; on Windows the job object of the build stops it")
     try:
         os.killpg(pgid, signal.SIGTERM)
     except ProcessLookupError:
@@ -499,8 +569,11 @@ def process_group_is_gone(pgid: int, leader: subprocess.Popen | None = None) -> 
     """Return True when no process of the group *pgid* runs.
 
     *leader* as in :func:`stop_process_group`: it is reaped first, because
-    a zombie leader still counts as a member.
+    a zombie leader still counts as a member.  POSIX only, as
+    :func:`stop_process_group`.
     """
+    if sys.platform == "win32":
+        raise OSError("a process group is POSIX; on Windows the job object of the build holds the build")
     if leader is not None:
         leader.poll()
     try:
@@ -512,6 +585,134 @@ def process_group_is_gone(pgid: int, leader: subprocess.Popen | None = None) -> 
     return False
 
 
+#: The extensions of ``cmd.exe`` when the environment has no ``PATHEXT``.
+_CMD_DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD"
+
+
+def env_value(env: Mapping[str, str], name: str) -> str | None:
+    """The value of the variable *name* in *env*.
+
+    Windows: the names are case-insensitive, and a copy of ``os.environ``
+    can hold ``Path``.  POSIX: the name as it is.
+    """
+    if sys.platform != "win32":
+        return env.get(name)
+    upper = name.upper()
+    return next((value for key, value in env.items() if key.upper() == upper), None)
+
+
+def path_directories(env: Mapping[str, str] | None = None) -> list[Path]:
+    """The directories of the ``PATH`` of *env* (of this process when None), in their order.
+
+    An empty entry is left out.  Windows allows an entry in double quotes
+    (``"C:\\Program Files\\x"``) and with spaces around it, thus those are
+    removed there.  On POSIX a space is a part of the name of a directory,
+    as ``execvp`` reads it.
+    """
+    path = env_value(os.environ if env is None else env, "PATH") or ""
+    directories = []
+    for entry in path.split(os.pathsep):
+        if sys.platform == "win32":
+            entry = entry.strip().strip('"')
+        if entry:
+            directories.append(Path(entry))
+    return directories
+
+
+def is_program(path: Path) -> bool:
+    """Say if *path* is a file that the system can run as a program.
+
+    POSIX: a file with the execute bit for this user, as ``shutil.which``
+    and ``execvp`` require.  Windows: a file; the extension (``PATHEXT``)
+    makes it a program, and ``program_file_names`` gives the names.
+    """
+    if not path.is_file():
+        return False
+    return sys.platform == "win32" or os.access(path, os.X_OK)
+
+
+def program_file_names(name: str, env: Mapping[str, str] | None = None) -> list[str]:
+    """The file names that the program *name* can have on this system, in the order of the lookup.
+
+    POSIX: the name itself.  Windows: no program has a name without an
+    extension there.  A name with an extension of ``PATHEXT`` stays as it
+    is; else each extension of ``PATHEXT`` of *env* (of this process when
+    None) is added, as ``cmd.exe`` finds a program.  Without ``PATHEXT``,
+    the extensions of ``cmd.exe`` apply (``_CMD_DEFAULT_PATHEXT``).
+    """
+    if sys.platform != "win32":
+        return [name]
+    pathext = env_value(os.environ if env is None else env, "PATHEXT") or _CMD_DEFAULT_PATHEXT
+    extensions = [ext.lower() for ext in pathext.split(os.pathsep) if ext]
+    if Path(name).suffix.lower() in extensions:
+        return [name]
+    return [name + ext for ext in extensions]
+
+
+#: The option that makes clang read a response file with the quoting of GCC
+#: on each host.  Without it, clang on Windows reads the file with the rules
+#: of the Windows command line, and the escapes of
+#: :func:`response_file_text` mean something else there.
+CLANG_POSIX_RESPONSE_FILE = "--rsp-quoting=posix"
+
+_RESPONSE_FILE_SPECIAL = re.compile(r"""([\\\s'"])""")
+
+
+def response_file_text(args: Sequence[str]) -> str:
+    """Return *args* as the text of a response file (``@file``), one argument on each line.
+
+    The quoting is the one of GCC (libiberty ``buildargv``) and of clang
+    with :data:`CLANG_POSIX_RESPONSE_FILE`: a backslash makes the next
+    character part of the argument.  Thus each backslash, white space and
+    quote gets a backslash before it, and an empty argument is ``""``.
+    A Windows path keeps its meaning (``C:\\\\x`` reads as ``C:\\x``).
+    """
+    return "".join(('""' if arg == "" else _RESPONSE_FILE_SPECIAL.sub(r"\\\1", arg)) + "\n" for arg in args)
+
+
+@contextmanager
+def response_file(args: Sequence[str]) -> Iterator[Path]:
+    """Give a temporary response file that holds *args*, and remove it after the block.
+
+    WHY: Windows limits a command line to 32767 characters, and the flags
+    of one unit can be longer (measured: 32798 characters for one unit of
+    an ESP32 project, with its include paths).  CreateProcess then fails
+    with error 206.  A response file has no such limit.
+
+    The file is written with ``newline=""``: the text mode of Windows makes
+    each ``\\n`` a ``\\r\\n``, and an escaped line break in an argument then
+    reads as two arguments.  :func:`remove_file` removes it, because a
+    scanner of Windows can still hold the new file open.  A file that stays
+    after that is only a leftover in the temporary directory, thus it gives
+    a warning and does not take away the result of the block.
+    """
+    descriptor, name = tempfile.mkstemp(prefix="fwctx-args-", suffix=".rsp")
+    path = Path(name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as stream:
+            stream.write(response_file_text(args))
+        yield path
+    finally:
+        try:
+            remove_file(path)
+        except OSError as exc:
+            log.warning("The response file %s stays in the temporary directory: %s", path, exc)
+
+
+def venv_program(venv: Path, name: str) -> Path:
+    """Return the path of the program *name* in the virtual environment *venv*.
+
+    The ``venv`` module puts the programs of an environment into
+    ``Scripts`` with the extension ``.exe`` on Windows (the interpreter and
+    the launchers of the console scripts that pip writes), and into
+    ``bin`` without an extension on POSIX.  A detection that looks only
+    for ``bin/python`` finds no environment on Windows.
+    """
+    if sys.platform == "win32":
+        return venv / "Scripts" / f"{name}.exe"
+    return venv / "bin" / name
+
+
 def run_in_process_group(
     cmd: list[str],
     *,
@@ -519,11 +720,13 @@ def run_in_process_group(
     env: dict[str, str],
     timeout: float | None,
     capture_output: bool,
+    encoding: str = "utf-8",
+    errors: str = "replace",
 ) -> subprocess.CompletedProcess:
     """Run *cmd* in a new session, and stop its whole process group on any exit but its own.
 
-    Same result as ``subprocess.run(..., text=True)``: a timeout raises
-    ``TimeoutExpired`` with the output so far.  Any exception while the
+    Same result as ``subprocess.run(..., encoding=encoding, errors=errors)``
+    for stdout: a timeout raises ``TimeoutExpired`` with the output so far.  Any exception while the
     command runs (the timeout, ``IndexStopped`` from a SIGTERM handler,
     ``KeyboardInterrupt``) first stops the group, then goes on.
 
@@ -535,13 +738,41 @@ def run_in_process_group(
     curses screen (``menuconfig``) in a ``pre_build`` hook does not work.
     No build that fw-context starts needs one.
 
+    No stdin either (``DEVNULL``): in an MCP server the stdin of this
+    process is the JSON-RPC pipe of the client, and a build that read it
+    took the messages of the client.
+
     The record goes only when the group is gone.  An exception during the
     stop (a second Ctrl-C) can leave members alive, and the next index run
     then finds them through the record.
+
+    Windows has no process group that a stop can reach: there the build
+    runs in a job object (:func:`_run_in_job`).
+
+    The output is read as bytes and decoded after the end of the command,
+    with *encoding* and *errors*.  The default is the output of a build
+    for a person: UTF-8, and a byte that is no UTF-8 becomes U+FFFD.  stderr
+    is always decoded with replacement: it holds messages for a person,
+    also from a command whose stdout a caller parses.  WHY
+    UTF-8: the tools of a build write it on Linux and macOS, and on
+    Windows clang, GCC 13 and later, and each Python tool
+    (``PYTHONIOENCODING`` of :func:`build_env`) write it too.  An older GCC
+    writes the ANSI code page; its characters above 127 become U+FFFD in a
+    message, and the build is not affected.  A caller that parses the
+    output gives ``errors="strict"``, and a byte of stdout that is no UTF-8
+    then raises ``UnicodeDecodeError``.  WHY not the decode of ``text=True``: it
+    used the locale (the ANSI code page of Windows), and it decoded in the
+    reader threads of ``communicate`` on Windows, where an error left an
+    ``IndexError`` and no output.  The output of a timeout is always
+    decoded with replacement: it can end in the middle of a character.
     """
+    if sys.platform == "win32":
+        raw = _run_in_job(cmd, cwd=cwd, env=env, timeout=timeout, capture_output=capture_output)
+        return _decoded_result(raw, encoding, errors)
     pipe = subprocess.PIPE if capture_output else None
     proc = subprocess.Popen(  # noqa: S603 — argv list, no shell
-        cmd, cwd=cwd, env=env, stdout=pipe, stderr=pipe, text=True, start_new_session=True,
+        cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=pipe, stderr=pipe,
+        start_new_session=True,
     )
     record = _BUILD_GROUP_RECORD.get()
     try:
@@ -551,7 +782,7 @@ def run_in_process_group(
     except subprocess.TimeoutExpired:
         stop_process_group(proc.pid, leader=proc)
         stdout, stderr = proc.communicate()
-        raise subprocess.TimeoutExpired(cmd, timeout or 0, output=stdout, stderr=stderr) from None
+        raise _decoded_timeout(subprocess.TimeoutExpired(cmd, timeout or 0, output=stdout, stderr=stderr)) from None
     except BaseException:
         stop_process_group(proc.pid, leader=proc)
         proc.wait()
@@ -559,7 +790,437 @@ def run_in_process_group(
     finally:
         if record is not None and process_group_is_gone(proc.pid, proc):
             _remove_group_record(record, proc.pid)
-    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+    return _decoded_result(subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr), encoding, errors)
+
+
+def _decoded_output(data: bytes | None, encoding: str, errors: str) -> str | None:
+    """Return the captured *data* as ``subprocess`` text mode gives it: decoded, with universal newlines.
+
+    WHY universal newlines: ``text=True`` turned ``\\r\\n`` into ``\\n``,
+    and the callers read lines with that end.  A program of Windows ends
+    each line with ``\\r\\n``.
+    """
+    if data is None:
+        return None
+    return io.TextIOWrapper(io.BytesIO(data), encoding=encoding, errors=errors).read()
+
+
+def _decoded_result(raw: subprocess.CompletedProcess, encoding: str, errors: str) -> subprocess.CompletedProcess:
+    """Return *raw* with its captured bytes decoded: stdout with *errors*, stderr with replacement.
+
+    See :func:`run_in_process_group`.
+    """
+    return subprocess.CompletedProcess(
+        raw.args, raw.returncode,
+        _decoded_output(raw.stdout, encoding, errors), _decoded_output(raw.stderr, encoding, "replace"),
+    )
+
+
+def _decoded_timeout(raw: subprocess.TimeoutExpired) -> subprocess.TimeoutExpired:
+    """Return *raw* with the output so far decoded as UTF-8 with replacement (see :func:`run_in_process_group`)."""
+    return subprocess.TimeoutExpired(
+        raw.cmd, raw.timeout,
+        output=_decoded_output(raw.output, "utf-8", "replace"),
+        stderr=_decoded_output(raw.stderr, "utf-8", "replace"),
+    )
+
+
+if sys.platform == "win32":
+
+    #: The longest wait of :func:`_communicate_in_slices` before Python code runs again.
+    _WAIT_SLICE_S = 0.1
+
+    def _communicate_in_slices(
+        proc: subprocess.Popen[AnyStr], timeout: float | None,
+    ) -> tuple[AnyStr | None, AnyStr | None]:
+        """``proc.communicate(timeout=timeout)``, in waits of ``_WAIT_SLICE_S``.
+
+        WHY: on Windows ``communicate`` waits in ``WaitForSingleObject``, and
+        a Ctrl-C or a stop request (``processes.request_stop`` →
+        ``interrupt_main``) runs its handler only when Python code runs
+        again.  Measured on Windows 11 (2026-11-09): a stop request during a
+        build of 60 s came after the 60 s.  A Ctrl-C during a build thus did
+        nothing until the build ended.  A wait in slices lets the handler
+        run within ``_WAIT_SLICE_S``.  ``communicate`` loses no output when
+        it is called again after ``TimeoutExpired`` (Python documentation).
+        The cost is 10 calls each second, which is nothing beside a build.
+        WHY not a wait for the stop event of ``processes``: a Ctrl-C of the
+        console sets no such event.  POSIX needs no slices: a signal
+        interrupts the wait there.
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                raise subprocess.TimeoutExpired(proc.args, timeout or 0)
+            wait = _WAIT_SLICE_S if remaining is None else min(_WAIT_SLICE_S, remaining)
+            try:
+                return proc.communicate(timeout=wait)
+            except subprocess.TimeoutExpired:
+                continue
+
+    def _find_program(name: str, env: dict[str, str]) -> str | None:
+        """The full path of the program *name* in the ``PATH`` of *env*, with the extensions of its ``PATHEXT``.
+
+        WHY not ``shutil.which``: on Python 3.11 it looks in the current
+        directory of THIS process first (the directory of the MCP server),
+        and it takes ``PATHEXT`` from this process.  The build gets the
+        ``PATH`` and the ``PATHEXT`` of its environment, as POSIX
+        ``execvpe`` takes the ``PATH`` of the environment and no current
+        directory.
+        """
+        names = program_file_names(name, env)
+        for directory in path_directories(env):
+            for candidate in names:
+                path = directory / candidate
+                if is_program(path):
+                    return str(path)
+        return None
+
+    class ActivateScriptError(RuntimeError):
+        """The activate script cannot run on Windows: its kind or its path (a fault of the config)."""
+
+    #: The characters that ``cmd.exe`` changes in a quoted path: ``%NAME%``
+    #: expands, and ``call`` doubles each ``^``.
+    _CMD_PATH_UNSAFE = ('"', "%", "^")
+
+    def _cmd_safe_path(path: str, what: str) -> str:
+        """*path* for a quoted place in a command line of ``cmd.exe``; ``ActivateScriptError`` when cmd.exe would change it."""
+        unsafe = [char for char in _CMD_PATH_UNSAFE if char in path]
+        if unsafe:
+            raise ActivateScriptError(f"{what} {path}: cmd.exe cannot run a path that holds {' '.join(unsafe)}")
+        return path
+
+    def _batch_argument(argument: str) -> str:
+        """*argument* quoted for a batch file that ``cmd.exe /c`` runs.
+
+        The rules of the repair of CVE-2024-24576 (BatBadBut) in the Rust
+        standard library: ``cmd.exe`` parses the command line of a batch
+        file again, thus ``&``, ``|``, ``<`` or ``>`` in an argument that
+        ``subprocess.list2cmdline`` makes start a second command.  Each
+        argument goes in double quotes, where those characters are literal;
+        a ``"`` is ``""``; a ``%`` is ``%%cd:~,%``, which ``cmd.exe`` gives
+        back as ``%`` and does not expand; backslashes before the closing
+        quote are doubled.  A line break cannot go through ``cmd.exe``.
+        """
+        if any(char in argument for char in "\r\n\0"):
+            raise ValueError(f"an argument of a batch file cannot hold a line break: {argument!r}")
+        quoted = argument.replace('"', '""').replace("%", "%%cd:~,%")
+        trailing = len(quoted) - len(quoted.rstrip("\\"))
+        return f'"{quoted}{chr(92) * trailing}"'
+
+    def _windows_command(cmd: list[str], env: dict[str, str]) -> list[str] | str:
+        """The program of *cmd* as a full path, and the command line of ``cmd.exe`` for a batch file.
+
+        - A bare name: ``_find_program`` in the environment of the build.
+          WHY: ``CreateProcess`` looks in the ``PATH`` of this process, not
+          of the build, and it adds only ``.exe``: a tool of ``extra_path``
+          or of an activate script did not start.  A name that the ``PATH``
+          does not hold raises ``FileNotFoundError``, as ``Popen`` on POSIX.
+        - A ``.bat`` or ``.cmd`` program (a shim of pyenv-win, a script of a
+          SDK): ``cmd.exe`` runs it, with the arguments of
+          ``_batch_argument``.  ``Popen`` with a list quotes them with
+          ``list2cmdline``, and ``cmd.exe`` then ran the text after a ``&``
+          of an argument, for example of a project path ``C:\\R&D\\fw``.
+        """
+        program = cmd[0]
+        if not os.path.dirname(program):
+            found = _find_program(program, env)
+            if found is None:
+                raise FileNotFoundError(errno.ENOENT, f"{program} is not on the PATH of the build", program)
+            program = found
+        if Path(program).suffix.lower() not in (".bat", ".cmd"):
+            return [program, *cmd[1:]]
+        batch = _cmd_safe_path(program, "build program")
+        arguments = " ".join(_batch_argument(argument) for argument in cmd[1:])
+        return f'"{_system_program("cmd.exe")}" /d /e:on /v:off /s /c ""{batch}" {arguments}"'
+
+    def _system_program(*parts: str) -> str:
+        """The full path of a program of Windows in ``%SystemRoot%\\System32``.
+
+        WHY not the bare name: ``CreateProcess`` looks for a bare name in
+        the PATH of this process, and the PATH of an operator can name a
+        different ``cmd.exe``.
+        """
+        return str(Path(os.environ["SystemRoot"], "System32", *parts))
+
+    #: The variable that holds the ID of one activation (``_activated_environment``).
+    _ACTIVATION_ID = "FWCTX_ACTIVATION_ID"
+
+    #: Python code that writes its environment as JSON on stdout.  ASCII only
+    #: (``ensure_ascii``), thus no code page of a console or of PowerShell
+    #: changes a value on its way.  No ``"``, ``'``, ``%`` or ``^``: it goes
+    #: in quotes into the command lines of ``_activation_command_line``.
+    _DUMP_ENVIRONMENT = "import json,os,sys;sys.stdout.write(json.dumps(dict(os.environ)))"
+
+    def _activation_command_line(script: Path) -> str:
+        """The command line that runs the activate *script*, then writes the environment that it leaves.
+
+        The script writes its own output to stderr, and Python
+        (``_DUMP_ENVIRONMENT``) writes the environment to stdout.  Python
+        runs with ``-I``: the script can set ``PYTHONHOME`` or
+        ``PYTHONPATH`` for the Python of its SDK, and the Python of
+        fw-context must not load the standard library of that one.  The
+        dump needs only ``json`` and ``os``, and ``json.dumps`` writes
+        ASCII.
+
+
+        - ``.bat``, ``.cmd``: ``cmd.exe`` runs the script with ``call`` and
+          ``1>&2``.  ``/s`` removes only the outer quotes of the command,
+          ``/v:off`` keeps ``!`` literal.
+        - ``.ps1``: PowerShell dot-sources the script, with each of its
+          streams to stderr.  ``-EncodedCommand`` carries the command, thus
+          no quote of the path reaches a parser of the command line.
+
+        Raises ``ActivateScriptError`` for another kind of script, and for a
+        ``.bat`` path that ``cmd.exe`` changes (``_cmd_safe_path``).
+        """
+        import base64
+
+        python = sys.executable
+        suffix = script.suffix.lower()
+        if suffix in (".bat", ".cmd"):
+            batch = _cmd_safe_path(str(script), "activate script")
+            interpreter = _cmd_safe_path(python, "the Python of fw-context")
+            line = f'call "{batch}" 1>&2 && "{interpreter}" -I -c "{_DUMP_ENVIRONMENT}"'
+            return f'"{_system_program("cmd.exe")}" /d /e:on /v:off /s /c "{line}"'
+        if suffix == ".ps1":
+            def literal(text: str) -> str:
+                return "'" + text.replace("'", "''") + "'"
+
+            command = (
+                "$ErrorActionPreference = 'Stop'; "
+                f". {literal(str(script))} *>&1 | ForEach-Object {{ [Console]::Error.WriteLine([string]$_) }}; "
+                f"& {literal(python)} -I -c {literal(_DUMP_ENVIRONMENT)}; "
+                "exit $LASTEXITCODE"
+            )
+            encoded = base64.b64encode(command.encode("utf-16-le")).decode("ascii")
+            powershell = _system_program("WindowsPowerShell", "v1.0", "powershell.exe")
+            return f'"{powershell}" -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {encoded}'
+        raise ActivateScriptError(
+            f"activate script {script}: on Windows fw-context runs a .bat, .cmd or .ps1 script "
+            "([build] activate)",
+        )
+
+    def _parse_environment(script: Path, stdout: bytes) -> dict[str, str]:
+        """Read the environment that ``_DUMP_ENVIRONMENT`` wrote after *script*."""
+        try:
+            values = json.loads(stdout.decode("ascii"))
+        except ValueError as exc:
+            raise RuntimeError(f"activate script {script}: cannot read its environment: {exc}") from exc
+        if not isinstance(values, dict) or not all(
+            isinstance(key, str) and isinstance(value, str) for key, value in values.items()
+        ):
+            raise RuntimeError(f"activate script {script}: its environment is not a map of strings")
+        return values
+
+    def _activated_environment(
+        script: Path, *, cwd: Path, env: dict[str, str], timeout: float | None,
+    ) -> dict[str, str]:
+        """Run the activate *script* with *env*, and return the environment that it leaves.
+
+        WHY not the command after the script in one shell, as ``source``
+        on POSIX: each argument of the command would need the quoting of
+        ``cmd.exe``, and a wrong quote lets ``cmd.exe`` run a part of an
+        argument.  The build command then runs with the environment, and
+        without a shell (``_windows_command``).
+
+        The script runs in a job object, as a build: a timeout or a stop
+        ends each process that it started.  ``ActivateScriptError`` for a
+        script that cannot run on Windows, ``RuntimeError`` for a script
+        that fails (with the end of its output, in the OEM code page of
+        ``cmd.exe``), ``BuildTimeoutError`` for a timeout.
+        """
+        from .job_object import BuildJob
+
+        command_line = _activation_command_line(script)
+        # A new value for each activation: a script can name a temporary
+        # file with it, and two runs at the same time must not share one
+        # (``ncs-env.cmd`` of the Zephyr builder).  It is no part of the
+        # environment of the build.
+        activation_env = {**env, _ACTIVATION_ID: secrets.token_hex(8)}
+        with BuildJob() as job:
+            proc = job.start_command_line(command_line, cwd=cwd, env=activation_env)
+            try:
+                stdout, stderr = _communicate_in_slices(proc, timeout)
+            except subprocess.TimeoutExpired:
+                job.close()
+                proc.communicate()
+                raise BuildTimeoutError(f"activate script {script} timed out after {timeout}s") from None
+            except BaseException:
+                job.close()
+                proc.wait()
+                raise
+        if proc.returncode != 0:
+            output = (stderr or b"").decode("oem", errors="replace")
+            raise RuntimeError(
+                f"activate script {script} failed (exit {proc.returncode}){_quote_stream('output', output)}",
+            )
+        environment = _parse_environment(script, stdout or b"")
+        environment.pop(_ACTIVATION_ID, None)
+        return environment
+
+    def _run_in_job(
+        cmd: list[str],
+        *,
+        cwd: Path,
+        env: dict[str, str],
+        timeout: float | None,
+        capture_output: bool,
+    ) -> subprocess.CompletedProcess:
+        """Windows form of :func:`run_in_process_group`: the build runs in a job object.
+
+        The same result as bytes (the caller decodes them), the same
+        exceptions, and ``JobObjectError`` (a
+        ``RuntimeError``) when Windows refuses the job.  A stop (the timeout,
+        an exception while the build runs) closes the job, and Windows ends
+        each process of the build at once; ``job_object.py`` gives the
+        reason and the measurements.  WHY the close and not
+        ``TerminateJobObject``: the close cannot fail, thus an error of the
+        stop cannot replace the exception that the stop handles.
+
+        At the end, also after a build that ended by itself, the close of
+        the job ends each process that the build left (a compiler server).
+        On POSIX the next index run stops such a process through the record
+        (``cli/_index._reap_orphan_build_group``).
+
+        No record (``record_build_groups``): a run that dies closes the
+        handle of the job, and Windows ends the build then.
+        """
+        from .job_object import BuildJob
+
+        pipe = subprocess.PIPE if capture_output else None
+        with BuildJob() as job:
+            proc = job.start(_windows_command(cmd, env), cwd=cwd, env=env, stdout=pipe, stderr=pipe)
+            try:
+                stdout, stderr = _communicate_in_slices(proc, timeout)
+            except subprocess.TimeoutExpired:
+                job.close()
+                stdout, stderr = proc.communicate()
+                raise _decoded_timeout(
+                    subprocess.TimeoutExpired(cmd, timeout or 0, output=stdout, stderr=stderr),
+                ) from None
+            except BaseException:
+                job.close()
+                proc.wait()
+                raise
+        return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+
+
+def windows_words(text: str) -> list[str]:
+    """Return the arguments that a Windows program gets for the command line *text*.
+
+    The rules of `CommandLineToArgvW`, which the C runtime and thus ld and
+    gcc use.  A double quote starts or ends a quoted part anywhere in a
+    word, `""` in a quoted part is one quote, and a backslash is literal
+    unless it comes before a quote: 2n backslashes give n and keep the quote
+    as a delimiter, 2n+1 give n and a literal quote.  `shlex` with
+    `posix=False` knows a quote only at the start of a word, thus
+    `-L"C:/My Projects/x"` became two words.
+
+    The `""` rule is the rule of the C runtime since 2008: the quoted part
+    stays open after the literal quote.  The first argument of a command
+    line has other rules, and this function never gets one.  The layer of
+    `cmd.exe /C` (`^`, `%`), which CMake adds for PRE_LINK and POST_BUILD,
+    is not modelled: those commands hold no argument of the link.
+    """
+    words: list[str] = []
+    index = 0
+    while index < len(text):
+        while index < len(text) and text[index] in " \t":
+            index += 1
+        if index == len(text):
+            break
+        word: list[str] = []
+        quoted = False
+        while index < len(text) and (quoted or text[index] not in " \t"):
+            char = text[index]
+            if char == "\\":
+                end = index
+                while end < len(text) and text[end] == "\\":
+                    end += 1
+                count = end - index
+                if end < len(text) and text[end] == '"':
+                    word.append("\\" * (count // 2))
+                    if count % 2:
+                        word.append('"')
+                        end += 1
+                else:
+                    word.append("\\" * count)
+                index = end
+            elif char == '"':
+                if quoted and index + 1 < len(text) and text[index + 1] == '"':
+                    word.append('"')
+                    index += 2
+                    continue
+                quoted = not quoted
+                index += 1
+            else:
+                word.append(char)
+                index += 1
+        words.append("".join(word))
+    return words
+
+
+def _windows_program_word(text: str) -> tuple[str, str]:
+    """Split the program name from a Windows command line; return the name and the rest.
+
+    The first argument has rules of its own in ``CommandLineToArgvW``: a
+    name that starts with a double quote ends at the next double quote, and
+    each other name ends at the first space or tab.  A backslash is always
+    literal there, thus ``"C:\\tools\\"`` keeps its last backslash.
+    """
+    text = text.lstrip(" \t")
+    if text.startswith('"'):
+        end = text.find('"', 1)
+        if end < 0:
+            return text[1:], ""
+        return text[1:end], text[end + 1:]
+    end = len(text)
+    for index, char in enumerate(text):
+        if char in " \t":
+            end = index
+            break
+    return text[:end], text[end:]
+
+
+def command_words(text: str) -> list[str]:
+    """Split a command line into its arguments, by the rules of the host.
+
+    The command lines of the config (``[build] pre_build``, ``command``),
+    and the ``command`` field of ``compile_commands.json``: the arguments
+    as the program got them.  POSIX shell words (``shlex``) on POSIX.  On
+    Windows the rules of ``CreateProcess`` for the program name and of the
+    C runtime (``CommandLineToArgvW``) for the arguments.  clang reads the
+    ``command`` field with the rules of Windows on a Windows host too
+    (``JSONCompilationDatabase``); for the program name its rules differ
+    only for forms that no build tool writes (a quoted name that ends with
+    a backslash, a quote in the middle of the name).  WHY not ``shlex`` on
+    Windows: it removes each backslash, thus ``C:\\tools\\pre.bat``
+    became ``C:toolspre.bat``.
+
+    Raises ``ValueError`` for a POSIX command line with a quote that does
+    not end, as ``shlex.split`` does.
+    """
+    if sys.platform != "win32":
+        return shlex.split(text)
+    program, rest = _windows_program_word(text)
+    if not program and not rest.strip():
+        return []
+    return [program, *windows_words(rest)]
+
+
+def command_program(text: str) -> str:
+    """Return the first word (the program) of the command line *text* by the rules of the host, or "".
+
+    The first word of :func:`command_words`, without the split of the
+    rest: a ``command`` field of a large build holds hundreds of flags.
+    Raises ``ValueError`` as :func:`command_words` does.
+    """
+    if sys.platform == "win32":
+        return _windows_program_word(text)[0]
+    words = shlex.split(text)
+    return words[0] if words else ""
 
 
 def build_cfg_env(build_cfg: BuildConfig | None, env: dict[str, str] | None = None) -> dict[str, str]:
@@ -592,6 +1253,17 @@ class BuildTimeoutError(RuntimeError):
     """
 
 
+def activate_script(activate: str, cwd: Path) -> Path:
+    """The path of the activate script *activate* of a build in *cwd*.
+
+    A relative path is relative to the directory of the build.  WHY:
+    ``source env.sh``, a name without a slash, looks in PATH before the
+    current directory, thus a different ``env.sh`` on PATH won.
+    """
+    script = Path(activate).expanduser()
+    return script if script.is_absolute() else Path(cwd) / script
+
+
 def run_build_command(
     cmd: list[str],
     cwd: Path,
@@ -599,6 +1271,7 @@ def run_build_command(
     description: str = "",
     env: dict[str, str] | None = None,
     build_cfg: BuildConfig | None = None,
+    errors: str = "replace",
 ) -> subprocess.CompletedProcess:
     """Run a build command with consistent timeout and output capture.
 
@@ -614,7 +1287,8 @@ def run_build_command(
       ``timeout``, and ``env`` merge logic — a maintenance liability.
     - The ``activate`` block maps a declarative ``build_cfg.activate``
       field (a shell script path) into a ``bash -c "source <script>
-      && <cmd>"`` invocation.  Centralising this logic means only one
+      && <cmd>"`` invocation.  On Windows the command runs with the
+      environment that the script leaves (``_activated_environment``).  Centralising this logic means only one
       call site tests quoting (``shlex.quote``) and shell injection
       resistance — and only one call site has to keep the shell startup
       hooks out of that bash, which :func:`build_env` does.
@@ -634,12 +1308,18 @@ def run_build_command(
         build_cfg: Optional BuildConfig — when set, ``activate`` wraps the
             command in ``bash -c "source <activate> && <cmd>"``, and
             ``extra_path`` / ``extra_env`` are merged into the environment.
+        errors: The decode of the UTF-8 stdout (see
+            :func:`run_in_process_group`).  ``"replace"`` for output that a
+            person reads, ``"strict"`` for output that the caller parses:
+            a parse must not read a name with U+FFFD in it.  stderr is
+            always decoded with replacement.
 
     Returns:
         CompletedProcess with captured stdout/stderr.
 
     Raises:
-        RuntimeError: On non-zero exit.  BuildTimeoutError (a RuntimeError)
+        RuntimeError: On non-zero exit, and with *errors* ``"strict"`` on
+            a stdout that is not UTF-8.  BuildTimeoutError (a RuntimeError)
             on timeout.
     """
     if timeout is None:
@@ -647,23 +1327,32 @@ def run_build_command(
 
     merged_env = build_cfg_env(build_cfg, env)
 
-    if build_cfg:
-        if build_cfg.activate:
-            script = Path(build_cfg.activate).expanduser()
-            # A relative path is relative to the directory of the build.
-            # `source env.sh`, a name without a slash, looks in PATH before
-            # the current directory, thus a different env.sh on PATH won.
-            if not script.is_absolute():
-                script = Path(cwd) / script
-            expanded = str(script)
+    if build_cfg is not None and build_cfg.activate:
+        script = activate_script(build_cfg.activate, cwd)
+        if sys.platform == "win32":
+            # One timeout for the script and the command, as on POSIX, where
+            # bash runs the two under one timeout.
+            started = time.monotonic()
+            merged_env = _activated_environment(script, cwd=cwd, env=merged_env, timeout=timeout)
+            timeout -= time.monotonic() - started
+            if timeout <= 0:
+                raise BuildTimeoutError(
+                    f"Build command timed out: the activate script {script} used the whole timeout: "
+                    f"{description or ' '.join(cmd)}",
+                )
+        else:
             cmd_str = " ".join(shlex.quote(c) for c in cmd)
-            cmd = ["bash", "-c", f"source {shlex.quote(expanded)} && {cmd_str}"]
+            cmd = ["bash", "-c", f"source {shlex.quote(str(script))} && {cmd_str}"]
 
     try:
         # In its own process group — see run_in_process_group.
         result = run_in_process_group(
-            cmd, cwd=cwd, env=merged_env, timeout=timeout, capture_output=True
+            cmd, cwd=cwd, env=merged_env, timeout=timeout, capture_output=True, errors=errors,
         )
+    except UnicodeDecodeError as e:
+        raise RuntimeError(
+            f"Build command wrote output that is not UTF-8: {description or ' '.join(cmd)}: {e}"
+        ) from e
     except subprocess.TimeoutExpired as e:
         # Quote what the build managed to say.  A timeout with no output
         # gives the reader nothing to act on, and the last lines usually
@@ -708,7 +1397,26 @@ def build_tool_available(name: str, cwd: Path, build_cfg: BuildConfig | None) ->
 
     A failed activate script also gives False, and the caller names the
     script in its message.
+
+    On Windows the lookup is ``_find_program`` in the environment that the
+    script leaves, as the build gets it.  A script that cannot run on
+    Windows (its kind, its path) raises ``ActivateScriptError``: the
+    message "not on PATH" would hide a fault of the config.
     """
+    if sys.platform == "win32":
+        environment = build_cfg_env(build_cfg)
+        if build_cfg is not None and build_cfg.activate:
+            script = activate_script(build_cfg.activate, cwd)
+            try:
+                environment = _activated_environment(
+                    script, cwd=cwd, env=environment, timeout=_TOOL_LOOKUP_TIMEOUT_S,
+                )
+            except ActivateScriptError:
+                raise
+            except RuntimeError as exc:
+                log.warning("%s not found after the activate script %s: %s", name, script, exc)
+                return False
+        return _find_program(name, environment) is not None
     if build_cfg is not None and build_cfg.activate:
         try:
             run_build_command(
@@ -735,6 +1443,12 @@ def missing_tool_message(name: str, build_cfg: BuildConfig | None, install_hint:
     message names the script, because a ``west`` on the PATH of the
     operator does not help that build.
     """
+    if build_cfg is not None and build_cfg.activate and sys.platform == "win32":
+        return (
+            f"{name} is not on PATH after the activate script {build_cfg.activate} "
+            "([build] activate).  Correct the script, or set [build] activate "
+            "to the script that sets up the environment of the project."
+        )
     if build_cfg is not None and build_cfg.activate:
         return (
             f"{name} is not on PATH after `source {build_cfg.activate}` "
@@ -856,18 +1570,29 @@ def resolve_project_root(explicit: str | Path | None = None) -> Path:
 
 
 def abs_path(root: Path, path: str) -> str:
-    """Resolve a stored (potentially relative) file path to an absolute path.
+    """Return the absolute path of the index key *path*, with the separator ``/``.
 
-    Absolute paths are returned unchanged; relative paths are joined with
-    *root*.  An empty string is returned as-is (callers should guard
-    against empty paths before calling).
+    A relative key is joined to *root*.  An absolute key (``/opt/...`` or
+    ``C:/...``) stays as it is.  An empty string stays empty: the caller
+    must not give one.
+
+    WHY ``/`` on each system: the answers of the MCP tools give this path
+    as ``file``, and a client gives it back to a tool, or compares it with
+    the path of a different answer.  The index keys use ``/`` (see
+    ``path_key``), thus one file has one spelling in each answer.  On
+    Linux and macOS ``as_posix()`` is ``str()``, thus no answer changes
+    there.  Windows accepts ``/`` in each path.
+
+    WHY ``is_absolute_key`` and not ``Path.is_absolute``: the result of
+    ``Path.is_absolute`` depends on the system.  On Windows ``/opt/sdk/x.h``
+    is not absolute, and ``root / key`` put the drive of *root* in front
+    of it.  On Linux ``C:/ncs/x.h`` is not absolute.
     """
     if not path:
-        return ""  # Empty path — caller should guard before calling
-    p = Path(path)
-    if p.is_absolute():
-        return str(p)
-    return str(root / p)
+        return ""
+    if is_absolute_key(path):
+        return Path(path).as_posix()
+    return (root / path).as_posix()
 
 
 def cc_output_path(project_root: Path, cfg: BuildConfig) -> Path:
@@ -961,34 +1686,78 @@ def owner_is_dead(token: str) -> bool:
     cannot know if the owner still runs.  A token that does not parse gives
     False too, because the file then has an unknown source.
 
-    A process that runs and belongs to a different user (EPERM) is alive.
-    A PID that is too large for ``pid_t`` (OverflowError) names no process,
-    but it did not come from this code, thus the file stays.
+    A process that runs and belongs to a different user is alive.  A PID
+    outside 1 .. ``processes.MAX_PID`` (``pid_t`` on POSIX, a DWORD on
+    Windows) did not come from this code, thus the file of such a token
+    stays.  So does the file when the probe gives an error that is no
+    answer: the cost of a kept file is disk space only.
 
-    On Windows, signal 0 of ``os.kill`` is ``CTRL_C_EVENT``: the call sends
-    Ctrl+C to the process group of the PID and tests nothing.  The probe
-    there is ``_windows_process_is_gone``.
+    The probe is :func:`fw_context_mcp.processes.pid_exists`: on Windows,
+    signal 0 of ``os.kill`` is ``CTRL_C_EVENT``, which sends Ctrl+C to the
+    process group of the PID and tests nothing.
     """
     pid_text, sep, tag = token.partition("@")
     # isascii first: isdigit() also accepts digits such as "²", which int()
     # refuses with a ValueError.
     if not sep or not (pid_text.isascii() and pid_text.isdigit()) or tag != _owner_tag():
         return False
-    if _ON_WINDOWS:
-        return _windows_process_is_gone(int(pid_text))
-    try:
-        os.kill(int(pid_text), 0)
-    except ProcessLookupError:
-        return True
-    except (OSError, OverflowError):
+    pid = int(pid_text)
+    if not 0 < pid <= MAX_PID:
         return False
-    return False
+    try:
+        return not pid_exists(pid)
+    except OSError:
+        return False
 
 
 
 # The owner token at the end of a temporary name: digits, "@", then the tag
 # (see _owner_tag).  No base name holds "@", thus the match is unambiguous.
 _TMP_OWNER = re.compile(r"\.(\d+@[A-Za-z0-9._-]+)\.tmp$")
+
+
+#: The longest time that :func:`replace_file` and :func:`remove_file` try
+#: again on Windows.  Measured on Windows 11: with three processes that read
+#: the target in a loop, the longest wait was 0.11 s.
+_SHARED_FILE_RETRY_S = 2.0
+#: The pause between two tries.
+_SHARED_FILE_STEP_S = 0.005
+
+
+def replace_file(source: str | os.PathLike[str], target: str | os.PathLike[str]) -> None:
+    """``os.replace(source, target)``, which on Windows waits for a short read of *target* by another process.
+
+    WHY: Windows does not replace or remove a file that a process holds
+    open, also when that process opened it with ``FILE_SHARE_DELETE``
+    (measured on Windows 11: 1779 of 2000 replaces failed while three
+    processes read the file in a loop).  The readers of fw-context hold a
+    file open for a short read only: an MCP server reads ``daemon.port``,
+    the manifest or a config.  The function tries again for at most
+    ``_SHARED_FILE_RETRY_S``, then the ``PermissionError`` goes to the
+    caller: a file that stays open, or a real lack of permission.  POSIX
+    replaces an open file, thus there it is ``os.replace``.
+    """
+    _retry_while_shared(lambda: os.replace(source, target))
+
+
+def remove_file(path: Path) -> None:
+    """``path.unlink(missing_ok=True)``, which on Windows waits for a short read of *path* (see :func:`replace_file`)."""
+    _retry_while_shared(lambda: path.unlink(missing_ok=True))
+
+
+def _retry_while_shared(action: Callable[[], None]) -> None:
+    if sys.platform != "win32":
+        action()
+        return
+    deadline = time.monotonic() + _SHARED_FILE_RETRY_S
+    while True:
+        try:
+            action()
+            return
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(_SHARED_FILE_STEP_S)
 
 
 def write_text_atomic(path: Path, text: str, *, mode: int | None = None) -> None:
@@ -999,8 +1768,8 @@ def write_text_atomic(path: Path, text: str, *, mode: int | None = None) -> None
     its run marker while it runs, and a run can stop at any moment.
     ``os.replace`` is atomic on POSIX and on Windows when the two names are
     in one directory, and it replaces an existing file on both.  On Windows
-    it fails while another process holds the target open (the MCP server
-    reading the manifest); the error goes to the caller.
+    it waits for a short read of the target by another process (the MCP
+    server reading the manifest, see :func:`replace_file`).
 
     The temporary name holds :func:`owner_token`, thus two writers never
     share one, and :func:`remove_stale_tmp` removes the file of a writer
@@ -1031,7 +1800,7 @@ def write_text_atomic(path: Path, text: str, *, mode: int | None = None) -> None
             with os.fdopen(os.open(tmp, flags, 0o600), "w", encoding="utf-8", newline="") as handle:
                 handle.write(text)
             os.chmod(tmp, mode)
-        os.replace(tmp, path)
+        replace_file(tmp, path)
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -1052,56 +1821,6 @@ def remove_stale_tmp(directory: Path) -> int:
             tmp.unlink(missing_ok=True)
             removed += 1
     return removed
-
-
-_ON_WINDOWS = os.name == "nt"
-
-# Windows API values for the liveness probe, from the Win32 documentation.
-_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-_ERROR_INVALID_PARAMETER = 87
-_STILL_ACTIVE = 259
-
-
-def _windows_process_is_gone(pid: int) -> bool:
-    """Say if no process with *pid* runs, on Windows.
-
-    ``OpenProcess`` fails with ``ERROR_INVALID_PARAMETER`` for a PID that no
-    process has.  Another failure, such as access denied, is a process that
-    runs.  An open process whose exit code is ``STILL_ACTIVE`` runs.
-
-    On another platform the answer is False: the file then stays, which
-    costs disk space only.  The type checker reads the platform test and
-    does not check the Windows calls on another platform.
-
-    PID 0 and a PID that a DWORD cannot hold give False too, as an
-    ``OverflowError`` does on POSIX.  ctypes would cut a large PID to 32
-    bits and probe another process, and PID 0 is the idle process, for
-    which ``OpenProcess`` also fails with ``ERROR_INVALID_PARAMETER``.
-    The argument and result types are declared, so that a handle keeps
-    its full width.
-    """
-    if sys.platform != "win32" or not 0 < pid < 2**32:
-        return False
-    import ctypes
-    from ctypes import wintypes
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
-    kernel32.OpenProcess.restype = wintypes.HANDLE
-    kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
-    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
-    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
-    kernel32.CloseHandle.restype = wintypes.BOOL
-    handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-    if not handle:
-        return ctypes.get_last_error() == _ERROR_INVALID_PARAMETER
-    try:
-        code = wintypes.DWORD()
-        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
-            return False
-        return code.value != _STILL_ACTIVE
-    finally:
-        kernel32.CloseHandle(handle)
 
 
 def cc_staging_path(directory: Path) -> Path:
@@ -1380,3 +2099,49 @@ def fmt_count(n: int) -> str:
     if n < 0:
         return "-" + f"{abs(n):_d}".replace("_", " ")
     return f"{n:_d}".replace("_", " ")
+
+
+def use_utf8_stdio(*, stdout: bool = True) -> None:
+    """Write ``sys.stderr``, and ``sys.stdout`` when *stdout*, in UTF-8 on Windows.
+
+    WHY: on Windows, Python writes a pipe or a file in the ANSI code page of
+    the system (cp1252, cp1250), and ``print("✓")`` then raises
+    UnicodeEncodeError.  The daemon starts ``fw-context index --background``
+    with its output in a log file, and ``fw-context init`` under a pipe
+    stopped in its dependency audit (measured on Windows 11, 2026-11-09).
+    A console is UTF-8 already (PEP 528), and Python 3.15 makes UTF-8 the
+    default for the other streams too (PEP 686).
+
+    Call it at the start of an entry point that writes text.  The MCP server
+    gives ``stdout=False``: its transport wraps the binary
+    ``sys.stdout.buffer`` itself, and only its log on stderr needs the
+    change.
+    """
+    if sys.platform != "win32":
+        return
+    _reconfigure_utf8([sys.stderr, sys.stdout] if stdout else [sys.stderr])
+
+
+def _reconfigure_utf8(streams: list) -> None:
+    """Set UTF-8 on each text stream of *streams*, and keep its error handler.
+
+    WHY keep ``errors``: ``reconfigure(encoding=...)`` alone resets it to
+    ``strict``, and stderr has ``backslashreplace``, thus a traceback with a
+    lone surrogate (a path decoded with ``surrogateescape``) raised instead
+    of the report.
+    """
+    for stream in streams:
+        if isinstance(stream, io.TextIOWrapper):
+            stream.reconfigure(encoding="utf-8", errors=stream.errors)
+
+
+#: ``os.O_NOFOLLOW`` where the system has it, else 0 (Windows).
+#:
+#: WHY: a log in the index directory opens with it, thus a link that a
+#: different user put there cannot send the write to a different file.
+#: Windows has no such flag.  There a symlink needs the privilege
+#: ``SeCreateSymbolicLinkPrivilege`` (or the developer mode), and the ACL
+#: of the profile keeps other users out of ``~/.fw-context``.  The open
+#: raised AttributeError before, which stopped the start of the daemon and
+#: of each background index run.
+O_NOFOLLOW: int = getattr(os, "O_NOFOLLOW", 0)

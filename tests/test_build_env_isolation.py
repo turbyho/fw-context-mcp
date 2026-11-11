@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -33,7 +34,14 @@ from fw_context_mcp.indexer.build import BuildConfig
 from fw_context_mcp.utils import build_env, run_build_command
 
 BASH = shutil.which("bash")
-needs_bash = pytest.mark.skipif(BASH is None, reason="bash is not installed")
+# The wrap in `bash -c "source <script> && <cmd>"` is the activate of POSIX
+# only.  On Windows an activate script is a .bat, .cmd or .ps1 script, and
+# fw-context captures its environment without bash: a bash on PATH there (Git
+# Bash of a CI runner) does not make these tests apply.
+needs_bash = pytest.mark.skipif(
+    BASH is None or sys.platform == "win32",
+    reason="bash -c source is the activate of POSIX; Windows runs .bat, .cmd or .ps1",
+)
 
 
 @pytest.fixture

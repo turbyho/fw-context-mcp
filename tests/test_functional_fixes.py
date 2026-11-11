@@ -97,11 +97,11 @@ class TestSearchContentFts5GracefulFallback:
 
         from fw_context_mcp.mcp.handlers import search as search_mod
         from fw_context_mcp.mcp.handlers._base import BaseHandler, DbContext
-        from fw_context_mcp.mcp.shared.executor import SyncQueryExecutor
+        from fw_context_mcp.mcp.shared.context import get_executor
 
         db_ctx = DbContext(
             db_path=db_path,
-            executor=SyncQueryExecutor(str(db_path.resolve()), db_path),
+            executor=get_executor(db_path),
             config_hash="hash-F5",
             project_id=project_id,
             root=tmpdir,

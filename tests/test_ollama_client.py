@@ -96,7 +96,7 @@ def _mock_embed_response(embeddings: list[list[float]] | None = None) -> httpx.R
 
 
 class TestCallOllamaBackwardCompat:
-    @patch("fw_context_mcp.llm.ollama.httpx.post")
+    @patch("fw_context_mcp.llm.ollama.net.post")
     def test_none_chat_api_base_uses_ollama_url(self, mock_post):
         mock_post.return_value = _mock_post_response()
         cfg = _cfg(chat_api_base=None)
@@ -104,7 +104,7 @@ class TestCallOllamaBackwardCompat:
         args, _ = mock_post.call_args
         assert args[0] == "http://localhost:11434/api/generate"
 
-    @patch("fw_context_mcp.llm.ollama.httpx.post")
+    @patch("fw_context_mcp.llm.ollama.net.post")
     def test_sends_keep_alive_in_payload(self, mock_post):
         mock_post.return_value = _mock_post_response()
         cfg = _cfg(chat_api_base=None, keep_alive="5m")
@@ -112,7 +112,7 @@ class TestCallOllamaBackwardCompat:
         _, kwargs = mock_post.call_args
         assert kwargs["json"]["keep_alive"] == "5m"
 
-    @patch("fw_context_mcp.llm.ollama.httpx.post")
+    @patch("fw_context_mcp.llm.ollama.net.post")
     def test_sends_num_ctx_in_options(self, mock_post):
         mock_post.return_value = _mock_post_response()
         cfg = _cfg(chat_api_base=None, num_ctx=8192)
@@ -120,21 +120,21 @@ class TestCallOllamaBackwardCompat:
         _, kwargs = mock_post.call_args
         assert kwargs["json"]["options"]["num_ctx"] == 8192
 
-    @patch("fw_context_mcp.llm.ollama.httpx.post")
+    @patch("fw_context_mcp.llm.ollama.net.post")
     def test_returns_response_field(self, mock_post):
         mock_post.return_value = _mock_post_response(json_body={"response": "generated text"})
         cfg = _cfg(chat_api_base=None)
         result = call_llm("prompt", cfg)
         assert result == "generated text"
 
-    @patch("fw_context_mcp.llm.ollama.httpx.post")
+    @patch("fw_context_mcp.llm.ollama.net.post")
     def test_connect_error_message_mentions_ollama(self, mock_post):
         mock_post.side_effect = httpx.ConnectError("refused")
         cfg = _cfg(chat_api_base=None)
         with pytest.raises(OllamaError, match="Ollama"):
             call_llm("prompt", cfg)
 
-    @patch("fw_context_mcp.llm.ollama.httpx.post")
+    @patch("fw_context_mcp.llm.ollama.net.post")
     def test_timeout_raises_ollama_error(self, mock_post):
         mock_post.side_effect = httpx.TimeoutException("slow")
         cfg = _cfg(chat_api_base=None)
@@ -146,7 +146,7 @@ class TestCallOllamaBackwardCompat:
 
 
 class TestCallOllamaRouting:
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_chat_api_base_openai_delegates_to_openai(self, mock_openai_post):
         mock_openai_post.return_value = httpx.Response(
             status_code=200,
@@ -158,7 +158,7 @@ class TestCallOllamaRouting:
         assert result == "openai result"
         mock_openai_post.assert_called_once()
 
-    @patch("fw_context_mcp.llm.ollama.httpx.post")
+    @patch("fw_context_mcp.llm.ollama.net.post")
     def test_chat_api_base_ollama_uses_detected_endpoint(self, mock_post):
         """Remote Ollama via chat_api_base uses the detected endpoint, not cfg.ollama_url."""
         mock_post.return_value = _mock_post_response()
@@ -170,7 +170,7 @@ class TestCallOllamaRouting:
         args, _ = mock_post.call_args
         assert args[0] == "http://remote:11434/api/generate"
 
-    @patch("fw_context_mcp.llm.ollama.httpx.post")
+    @patch("fw_context_mcp.llm.ollama.net.post")
     def test_chat_api_base_ollama_preserves_keep_alive(self, mock_post):
         mock_post.return_value = _mock_post_response()
         cfg = _cfg(chat_api_base="http://remote:11434", keep_alive="5m")
@@ -178,7 +178,7 @@ class TestCallOllamaRouting:
         _, kwargs = mock_post.call_args
         assert kwargs["json"]["keep_alive"] == "5m"
 
-    @patch("fw_context_mcp.llm.chat_router.httpx.post")
+    @patch("fw_context_mcp.llm.chat_router.net.post")
     def test_explicit_format_openai_delegates(self, mock_openai_post):
         """Explicit openai format even on loopback -> openai path."""
         mock_openai_post.return_value = httpx.Response(
@@ -199,7 +199,7 @@ class TestCallOllamaRouting:
 
 
 class TestCallOllamaAutoPull:
-    @patch("fw_context_mcp.llm.ollama.httpx.post")
+    @patch("fw_context_mcp.llm.ollama.net.post")
     @patch("fw_context_mcp.llm.ollama._pull_model")
     def test_auto_pull_false_404_raises_model_not_found(self, mock_pull, mock_post):
         mock_post.return_value = _mock_post_response(status_code=404, text="not found")
@@ -208,7 +208,7 @@ class TestCallOllamaAutoPull:
             call_llm("prompt", cfg)
         mock_pull.assert_not_called()
 
-    @patch("fw_context_mcp.llm.ollama.httpx.post")
+    @patch("fw_context_mcp.llm.ollama.net.post")
     @patch("fw_context_mcp.llm.ollama._pull_model")
     def test_auto_pull_true_404_pulls_and_retries(self, mock_pull, mock_post):
         mock_post.side_effect = [
@@ -220,7 +220,7 @@ class TestCallOllamaAutoPull:
         assert result == "ok after pull"
         mock_pull.assert_called_once()
 
-    @patch("fw_context_mcp.llm.ollama.httpx.post")
+    @patch("fw_context_mcp.llm.ollama.net.post")
     @patch("fw_context_mcp.llm.ollama._pull_model")
     def test_auto_pull_true_pull_fails_raises_ollama_error(self, mock_pull, mock_post):
         mock_post.return_value = _mock_post_response(status_code=404, text="not found")
@@ -229,7 +229,7 @@ class TestCallOllamaAutoPull:
         with pytest.raises(OllamaError, match="pull failed"):
             call_llm("prompt", cfg)
 
-    @patch("fw_context_mcp.llm.ollama.httpx.post")
+    @patch("fw_context_mcp.llm.ollama.net.post")
     @patch("fw_context_mcp.llm.ollama._pull_model")
     def test_auto_pull_true_retry_still_404_raises_model_not_found(self, mock_pull, mock_post):
         mock_post.side_effect = [
@@ -240,7 +240,7 @@ class TestCallOllamaAutoPull:
         with pytest.raises(OllamaModelNotFoundError):
             call_llm("prompt", cfg)
 
-    @patch("fw_context_mcp.llm.ollama.httpx.post")
+    @patch("fw_context_mcp.llm.ollama.net.post")
     @patch("fw_context_mcp.llm.ollama._pull_model")
     def test_non_404_error_not_pulled(self, mock_pull, mock_post):
         mock_post.return_value = _mock_post_response(status_code=500, text="server error")
@@ -264,7 +264,7 @@ class TestCallOllamaAutoPull:
 
 
 class TestCallOllamaEmbedAutoPull:
-    @patch("fw_context_mcp.llm.ollama.httpx.post")
+    @patch("fw_context_mcp.llm.ollama.net.post")
     @patch("fw_context_mcp.llm.ollama._pull_model")
     def test_auto_pull_false_404_raises_model_not_found(self, mock_pull, mock_post):
         mock_post.return_value = httpx.Response(
@@ -278,7 +278,7 @@ class TestCallOllamaEmbedAutoPull:
             call_ollama_embed(["text"], cfg)
         mock_pull.assert_not_called()
 
-    @patch("fw_context_mcp.llm.ollama.httpx.post")
+    @patch("fw_context_mcp.llm.ollama.net.post")
     @patch("fw_context_mcp.llm.ollama._pull_model")
     def test_auto_pull_true_404_pulls_and_retries(self, mock_pull, mock_post):
         mock_post.side_effect = [
@@ -295,7 +295,7 @@ class TestCallOllamaEmbedAutoPull:
         assert len(result) == 1
         mock_pull.assert_called_once()
 
-    @patch("fw_context_mcp.llm.ollama.httpx.post")
+    @patch("fw_context_mcp.llm.ollama.net.post")
     @patch("fw_context_mcp.llm.ollama._pull_model")
     def test_auto_pull_true_pull_fails_raises(self, mock_pull, mock_post):
         mock_post.return_value = httpx.Response(
@@ -309,14 +309,14 @@ class TestCallOllamaEmbedAutoPull:
         with pytest.raises(OllamaError, match="pull failed"):
             call_ollama_embed(["text"], cfg)
 
-    @patch("fw_context_mcp.llm.ollama.httpx.post")
+    @patch("fw_context_mcp.llm.ollama.net.post")
     def test_successful_embed_returns_vectors(self, mock_post):
         mock_post.return_value = _mock_embed_response([[0.1, 0.2], [0.3, 0.4]])
         cfg = _cfg(chat_api_base=None)
         result = call_ollama_embed(["a", "b"], cfg)
         assert result == [[0.1, 0.2], [0.3, 0.4]]
 
-    @patch("fw_context_mcp.llm.ollama.httpx.post")
+    @patch("fw_context_mcp.llm.ollama.net.post")
     def test_embed_uses_timeout_doubled(self, mock_post):
         mock_post.return_value = _mock_embed_response()
         cfg = _cfg(chat_api_base=None, timeout=42.0)
@@ -324,7 +324,7 @@ class TestCallOllamaEmbedAutoPull:
         _, kwargs = mock_post.call_args
         assert kwargs["timeout"] == 84.0
 
-    @patch("fw_context_mcp.llm.ollama.httpx.post")
+    @patch("fw_context_mcp.llm.ollama.net.post")
     def test_embed_query_prompt_prepended(self, mock_post):
         mock_post.return_value = _mock_embed_response()
         cfg = _cfg(chat_api_base=None)
@@ -333,7 +333,7 @@ class TestCallOllamaEmbedAutoPull:
         _, kwargs = mock_post.call_args
         assert kwargs["json"]["input"] == ["QUERY: hello"]
 
-    @patch("fw_context_mcp.llm.ollama.httpx.post")
+    @patch("fw_context_mcp.llm.ollama.net.post")
     def test_embed_doc_prompt_prepended(self, mock_post):
         mock_post.return_value = _mock_embed_response()
         cfg = _cfg(chat_api_base=None)
@@ -342,7 +342,7 @@ class TestCallOllamaEmbedAutoPull:
         _, kwargs = mock_post.call_args
         assert kwargs["json"]["input"] == ["DOC: hello"]
 
-    @patch("fw_context_mcp.llm.ollama.httpx.post")
+    @patch("fw_context_mcp.llm.ollama.net.post")
     def test_embed_no_prompt_when_empty(self, mock_post):
         mock_post.return_value = _mock_embed_response()
         cfg = _cfg(chat_api_base=None)
@@ -356,7 +356,7 @@ class TestCallOllamaEmbedAutoPull:
 
 
 class TestCheckSetupStatuses:
-    @patch("fw_context_mcp.llm.ollama.httpx.get")
+    @patch("fw_context_mcp.llm.ollama.net.get")
     def test_ollama_running_model_installed_status_ok(self, mock_get):
         mock_get.return_value = _mock_get_response(
             json_body={
@@ -371,14 +371,14 @@ class TestCheckSetupStatuses:
         assert result["status"] == "ok"
         assert result["ollama_running"] is True
 
-    @patch("fw_context_mcp.llm.ollama.httpx.get")
+    @patch("fw_context_mcp.llm.ollama.net.get")
     def test_ollama_running_model_missing_status_model_missing(self, mock_get):
         mock_get.return_value = _mock_get_response(json_body={"models": [{"name": "test-embed"}]})
         cfg = _cfg(chat_api_base=None, model="test-model", embed_model="test-embed")
         result = check_setup(cfg)
         assert result["status"] == "model_missing"
 
-    @patch("fw_context_mcp.llm.ollama.httpx.get")
+    @patch("fw_context_mcp.llm.ollama.net.get")
     def test_ollama_running_embed_missing(self, mock_get):
         mock_get.return_value = _mock_get_response(json_body={"models": [{"name": "test-model"}]})
         cfg = _cfg(chat_api_base=None, model="test-model", embed_model="test-embed")
@@ -386,7 +386,7 @@ class TestCheckSetupStatuses:
         assert result["status"] == "model_missing"
         assert "test-embed" in result["message"]
 
-    @patch("fw_context_mcp.llm.ollama.httpx.get")
+    @patch("fw_context_mcp.llm.ollama.net.get")
     def test_ollama_not_running_no_chat_api_status_not_configured(self, mock_get):
         mock_get.side_effect = httpx.ConnectError("refused")
         cfg = _cfg(chat_api_base=None)
@@ -394,7 +394,7 @@ class TestCheckSetupStatuses:
         assert result["status"] == "not_configured"
         assert result["ollama_running"] is False
 
-    @patch("fw_context_mcp.llm.ollama.httpx.get")
+    @patch("fw_context_mcp.llm.ollama.net.get")
     def test_ollama_not_running_with_chat_api_status_embedding_unavailable(self, mock_get):
         mock_get.side_effect = httpx.ConnectError("refused")
         cfg = _cfg(chat_api_base="https://api.example.com/v1")
@@ -402,14 +402,14 @@ class TestCheckSetupStatuses:
         assert result["status"] == "embedding_unavailable"
         assert result["ollama_running"] is False
 
-    @patch("fw_context_mcp.llm.ollama.httpx.get")
+    @patch("fw_context_mcp.llm.ollama.net.get")
     def test_other_exception_status_error(self, mock_get):
         mock_get.side_effect = RuntimeError("unexpected")
         cfg = _cfg(chat_api_base=None)
         result = check_setup(cfg)
         assert result["status"] == "error"
 
-    @patch("fw_context_mcp.llm.ollama.httpx.get")
+    @patch("fw_context_mcp.llm.ollama.net.get")
     def test_model_prefix_match(self, mock_get):
         mock_get.return_value = _mock_get_response(
             json_body={
@@ -423,7 +423,7 @@ class TestCheckSetupStatuses:
         result = check_setup(cfg)
         assert result["status"] == "ok"
 
-    @patch("fw_context_mcp.llm.ollama.httpx.get")
+    @patch("fw_context_mcp.llm.ollama.net.get")
     def test_embed_prefix_match(self, mock_get):
         mock_get.return_value = _mock_get_response(
             json_body={
@@ -442,7 +442,7 @@ class TestCheckSetupStatuses:
 
 
 class TestCheckSetupChatApi:
-    @patch("fw_context_mcp.llm.ollama.httpx.get")
+    @patch("fw_context_mcp.llm.ollama.net.get")
     def test_chat_api_configured_false_when_no_base(self, mock_get):
         mock_get.return_value = _mock_get_response(
             json_body={
@@ -456,7 +456,7 @@ class TestCheckSetupChatApi:
         result = check_setup(cfg)
         assert result["chat_api"]["configured"] is False
 
-    @patch("fw_context_mcp.llm.ollama.httpx.get")
+    @patch("fw_context_mcp.llm.ollama.net.get")
     def test_chat_api_configured_true_when_base_set(self, mock_get):
         mock_get.return_value = _mock_get_response(json_body={"models": [{"name": "test-embed"}]})
         cfg = _cfg(chat_api_base="https://api.example.com/v1")
@@ -465,7 +465,7 @@ class TestCheckSetupChatApi:
         assert "endpoint" in result["chat_api"]
         assert result["chat_api"]["format"] == "openai"
 
-    @patch("fw_context_mcp.llm.ollama.httpx.get")
+    @patch("fw_context_mcp.llm.ollama.net.get")
     def test_compliance_warning_for_external_url(self, mock_get):
         mock_get.return_value = _mock_get_response(json_body={"models": [{"name": "test-embed"}]})
         cfg = _cfg(chat_api_base="https://api.openai.com/v1")
@@ -473,21 +473,21 @@ class TestCheckSetupChatApi:
         assert "compliance_warning" in result["chat_api"]
         assert "external" in result["chat_api"]["compliance_warning"].lower()
 
-    @patch("fw_context_mcp.llm.ollama.httpx.get")
+    @patch("fw_context_mcp.llm.ollama.net.get")
     def test_no_compliance_warning_for_loopback(self, mock_get):
         mock_get.return_value = _mock_get_response(json_body={"models": [{"name": "test-embed"}]})
         cfg = _cfg(chat_api_base="http://127.0.0.1:8080/v1")
         result = check_setup(cfg)
         assert "compliance_warning" not in result["chat_api"]
 
-    @patch("fw_context_mcp.llm.ollama.httpx.get")
+    @patch("fw_context_mcp.llm.ollama.net.get")
     def test_no_compliance_warning_for_localhost(self, mock_get):
         mock_get.return_value = _mock_get_response(json_body={"models": [{"name": "test-embed"}]})
         cfg = _cfg(chat_api_base="http://localhost:8080/v1")
         result = check_setup(cfg)
         assert "compliance_warning" not in result["chat_api"]
 
-    @patch("fw_context_mcp.llm.ollama.httpx.get")
+    @patch("fw_context_mcp.llm.ollama.net.get")
     def test_compliance_warning_when_ollama_down_external_chat(self, mock_get):
         mock_get.side_effect = httpx.ConnectError("refused")
         cfg = _cfg(chat_api_base="https://api.deepseek.com/v1")
@@ -500,7 +500,7 @@ class TestCheckSetupChatApi:
 
 
 class TestCheckSetupSuggestCloud:
-    @patch("fw_context_mcp.llm.ollama.httpx.get")
+    @patch("fw_context_mcp.llm.ollama.net.get")
     def test_suggest_cloud_true_when_no_large_model(self, mock_get):
         mock_get.return_value = _mock_get_response(
             json_body={
@@ -520,7 +520,7 @@ class TestCheckSetupSuggestCloud:
         result = check_setup(cfg)
         assert result.get("suggest_cloud") is True
 
-    @patch("fw_context_mcp.llm.ollama.httpx.get")
+    @patch("fw_context_mcp.llm.ollama.net.get")
     def test_suggest_cloud_false_when_large_model_present(self, mock_get):
         mock_get.return_value = _mock_get_response(
             json_body={
@@ -541,7 +541,7 @@ class TestCheckSetupSuggestCloud:
         assert result["status"] == "model_missing"
         assert result.get("suggest_cloud") is False
 
-    @patch("fw_context_mcp.llm.ollama.httpx.get")
+    @patch("fw_context_mcp.llm.ollama.net.get")
     def test_suggest_cloud_false_when_model_found(self, mock_get):
         mock_get.return_value = _mock_get_response(
             json_body={
@@ -562,7 +562,7 @@ class TestCheckSetupSuggestCloud:
         assert result["status"] == "ok"
         assert result.get("suggest_cloud") is False
 
-    @patch("fw_context_mcp.llm.ollama.httpx.get")
+    @patch("fw_context_mcp.llm.ollama.net.get")
     def test_model_details_included(self, mock_get):
         mock_get.return_value = _mock_get_response(
             json_body={
@@ -587,7 +587,7 @@ class TestCheckSetupSuggestCloud:
         assert result["model_details"][0]["family"] == "qwen2"
         assert result["model_details"][0]["quantization"] == "Q4_K_M"
 
-    @patch("fw_context_mcp.llm.ollama.httpx.get")
+    @patch("fw_context_mcp.llm.ollama.net.get")
     def test_does_not_estimate_download_sizes(self, mock_get):
         mock_get.return_value = _mock_get_response(json_body={"models": [{"name": "test-embed"}]})
         cfg = _cfg(chat_api_base=None, model="test-model", embed_model="test-embed")
@@ -596,7 +596,7 @@ class TestCheckSetupSuggestCloud:
         assert "estimated_size" not in result
         assert "model_download_info" not in result
 
-    @patch("fw_context_mcp.llm.ollama.httpx.get")
+    @patch("fw_context_mcp.llm.ollama.net.get")
     def test_suggest_cloud_false_when_chat_api_external(self, mock_get):
         mock_get.return_value = _mock_get_response(
             json_body={
@@ -617,7 +617,7 @@ class TestCheckSetupSuggestCloud:
 
 
 class TestCheckSetupDebugLog:
-    @patch("fw_context_mcp.llm.ollama.httpx.get")
+    @patch("fw_context_mcp.llm.ollama.net.get")
     def test_debug_log_included_when_set(self, mock_get, tmp_path):
         mock_get.return_value = _mock_get_response(
             json_body={
@@ -631,7 +631,7 @@ class TestCheckSetupDebugLog:
         result = check_setup(cfg)
         assert "debug_log" in result
 
-    @patch("fw_context_mcp.llm.ollama.httpx.get")
+    @patch("fw_context_mcp.llm.ollama.net.get")
     def test_debug_log_absent_when_none(self, mock_get):
         mock_get.return_value = _mock_get_response(
             json_body={
@@ -682,7 +682,7 @@ class TestParseParameterSize:
 
 
 class TestCheckSetupMissingDetails:
-    @patch("fw_context_mcp.llm.ollama.httpx.get")
+    @patch("fw_context_mcp.llm.ollama.net.get")
     def test_no_crash_when_details_missing(self, mock_get):
         mock_get.return_value = _mock_get_response(
             json_body={
@@ -697,7 +697,7 @@ class TestCheckSetupMissingDetails:
         assert result["status"] == "model_missing"
         assert "model_details" in result
 
-    @patch("fw_context_mcp.llm.ollama.httpx.get")
+    @patch("fw_context_mcp.llm.ollama.net.get")
     def test_suggest_cloud_true_when_all_details_missing(self, mock_get):
         mock_get.return_value = _mock_get_response(
             json_body={

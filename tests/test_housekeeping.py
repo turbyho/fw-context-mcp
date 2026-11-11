@@ -22,6 +22,7 @@ import fw_context_mcp.config.settings as settings
 from fw_context_mcp import housekeeping
 from fw_context_mcp.housekeeping import RETIRED_KEYS, clean, databases_in_use
 from fw_context_mcp.indexer.db import open_db, transaction, upsert_build_config, upsert_project
+from tests._toml import toml_string
 
 PROJECT_ID = "0123456789abcdef0123456789abcdef"
 
@@ -57,7 +58,7 @@ def _index(root: Path, index_dir: Path, database: Path) -> None:
             upsert_build_config(conn, "h", PROJECT_ID, str(database))
     finally:
         conn.close()
-    (root / ".fw-context" / "local.toml").write_text(f'[index]\ndb_dir = "{index_dir}"\n', encoding="utf-8")
+    (root / ".fw-context" / "local.toml").write_text(f'[index]\ndb_dir = {toml_string(index_dir)}\n', encoding="utf-8")
 
 
 @pytest.mark.usefixtures("home")
@@ -684,7 +685,7 @@ class TestDatabasesInUse:
         conn.commit()
         conn.close()
         (root / ".fw-context" / "local.toml").write_text(
-            f'[index]\ndb_dir = "{tmp_path / "index"}"\n', encoding="utf-8")
+            f'[index]\ndb_dir = {toml_string(tmp_path / "index")}\n', encoding="utf-8")
 
         assert databases_in_use(root) is None
 

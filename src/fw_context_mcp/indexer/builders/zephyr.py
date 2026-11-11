@@ -6,13 +6,22 @@ import json
 import logging
 import os
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path, PurePath
 from typing import TYPE_CHECKING
 
 import yaml
 
-from fw_context_mcp.utils import build_tool_available, missing_tool_message, run_build_command
+from fw_context_mcp.utils import (
+    build_tool_available,
+    missing_tool_message,
+    path_directories,
+    program_file_names,
+    replace_file,
+    run_build_command,
+    run_in_process_group,
+)
 
 from ..build_layout import COMPILE_COMMANDS_NAME, BuildLayout
 from . import _linker, registry
@@ -143,7 +152,8 @@ def _zephyr_vendor_patterns(
             continue                      # outside the project — no pattern
         if rel == Path("."):
             continue                      # project root IS the workspace
-        pattern = f"{rel}/%"
+        # "/" on each system: the patterns match the index keys (path_key).
+        pattern = f"{rel.as_posix()}/%"
         if pattern not in patterns:
             patterns.append(pattern)
     return patterns
@@ -242,6 +252,90 @@ _WEST_INSTALL_HINT = (
     "Install the Zephyr SDK and west, or set [build] activate to the script "
     "that sets up the environment of the project."
 )
+
+
+def _ncs_env_cmd(nrfutil: str, version: str, zephyr_base: str) -> str:
+    """The text of ``ncs-env.cmd``: the Windows form of ``ncs-env.sh``.
+
+    ``ncs-env.sh`` evaluates the output of ``toolchain env --as-script``
+    each time it runs, thus a new toolchain of the version applies without
+    a new script.  ``cmd.exe`` has no ``eval``: the script writes the output
+    of ``--as-script cmd`` to a file beside itself, runs it with ``call``,
+    and removes it.  WHY a file and not ``for /f``: a line of that output
+    can name ``%PATH%``, and ``for /f`` does not expand it; ``call`` runs
+    the script as nRF Util writes it.  WHY beside the script: fw-context
+    checks that path for ``cmd.exe`` (``utils._cmd_safe_path``), and
+    ``%TEMP%`` can hold a ``^`` that ``call`` doubles.
+
+    The name of the file holds ``FWCTX_ACTIVATION_ID``, which fw-context
+    sets to a new random value for each activation
+    (``utils._activated_environment``): two runs at the same time must not
+    remove the file of each other.  ``%RANDOM%`` alone is not unique, because
+    ``cmd.exe`` seeds it from the time in seconds.  A run by hand has no ID,
+    and ``%RANDOM%`` is sufficient there.
+
+    nrfutil runs through ``call``: a shim ``nrfutil.bat`` started without
+    ``call`` would end this script.  ``call`` doubles each ``^`` of a path,
+    thus a path with ``^`` is refused (``ValueError``).  A batch file
+    expands ``%NAME%``, thus a ``%`` of a value is ``%%`` in a ``set`` line.
+    ``call`` expands ``%`` a second time, thus a ``%`` is ``%%%%`` in the
+    line of ``call`` (measured on Windows 11: ``%%`` gave "the system cannot
+    find the path" for a directory ``a%b%c``).
+
+    The lines end with ``\\n``: the text mode of Windows writes ``\\r\\n``.
+    """
+    for value in (nrfutil, zephyr_base):
+        if "^" in value or '"' in value:
+            raise ValueError(f"ncs-env.cmd cannot hold the path {value}: cmd.exe changes ^ and \"")
+
+    def literal(text: str) -> str:
+        """*text* for a ``set`` line: one expansion of ``%``."""
+        return text.replace("%", "%%")
+
+    def call_literal(text: str) -> str:
+        """*text* for the line of ``call``: two expansions of ``%``."""
+        return text.replace("%", "%%%%")
+
+    return (
+        "@echo off\n"
+        'set "FWCTX_NCS_ENV=%~dp0.ncs-toolchain-env-%FWCTX_ACTIVATION_ID%%RANDOM%.cmd"\n'
+        f'call "{call_literal(nrfutil)}" sdk-manager toolchain env --ncs-version "{call_literal(version)}" '
+        '--as-script cmd > "%FWCTX_NCS_ENV%"\n'
+        'if errorlevel 1 (del "%FWCTX_NCS_ENV%" & exit /b 1)\n'
+        'call "%FWCTX_NCS_ENV%"\n'
+        'del "%FWCTX_NCS_ENV%"\n'
+        'set "FWCTX_NCS_ENV="\n'
+        f'set "ZEPHYR_BASE={literal(zephyr_base)}"\n'
+    )
+
+
+def _run_nrfutil(cmd: list[str], *, timeout: float) -> subprocess.CompletedProcess | None:
+    """Run an nrfutil candidate; None when it cannot run or does not end in *timeout*.
+
+    Through ``run_in_process_group``, as each build command: a timeout stops
+    each process that it started, and on Windows a shim ``nrfutil.bat`` runs
+    with the arguments that ``cmd.exe`` cannot misread.
+    """
+    try:
+        # strict: the caller parses the output (the version, the JSON of
+        # `sdk-manager list` with the paths of the toolchains), thus a path
+        # with U+FFFD in it must not reach it.
+        return run_in_process_group(
+            cmd, cwd=Path.cwd(), env=dict(os.environ), timeout=timeout, capture_output=True, errors="strict",
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        # The file cannot run (a .vbs of PATHEXT, a broken binary) or does
+        # not answer in time: no SDK manager, and the caller says so.
+        log.debug("nrfutil candidate %s did not run: %s", cmd[0], exc)
+        return None
+    except UnicodeDecodeError as exc:
+        log.warning("The nrfutil candidate %s wrote output that is not UTF-8, thus it is not used: %s", cmd[0], exc)
+        return None
+    except (RuntimeError, ValueError) as exc:
+        # Windows refused the job object, or cmd.exe cannot take the path
+        # of a batch file: a fault of this machine, not of the candidate.
+        log.warning("Cannot run the nrfutil candidate %s: %s", cmd[0], exc)
+        return None
 
 
 class ZephyrBuildSystem:
@@ -597,14 +691,8 @@ class ZephyrBuildSystem:
         bare ``Usage: nrfutil [OPTIONS] COMMAND [ARGS]...`` that names neither
         the script nor the binary that produced it.
         """
-        try:
-            result = subprocess.run(
-                [candidate, "sdk-manager", "--version"],
-                capture_output=True, text=True, timeout=15,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return False
-        return result.returncode == 0
+        result = _run_nrfutil([candidate, "sdk-manager", "--version"], timeout=15)
+        return result is not None and result.returncode == 0
 
     @classmethod
     def _find_nrfutil(cls) -> str | None:
@@ -629,8 +717,10 @@ class ZephyrBuildSystem:
             literal = str(path)
             if not path.is_file():
                 return
-            # pyenv and asdf put each shim in a "/shims/" directory.
-            is_shim = "/shims/" in literal
+            # pyenv, pyenv-win and asdf put each shim in a "shims" directory.
+            # A test of the parts and not of the text "/shims/": a path of
+            # Windows has backslashes.
+            is_shim = "shims" in path.parent.parts
             # A non-shim candidate is deduplicated by its REAL path.
             # /usr/bin/nrfutil and /bin/nrfutil are one binary behind a
             # symlink, and keyed by the literal string they passed as two —
@@ -653,16 +743,13 @@ class ZephyrBuildSystem:
             seen.add(key)
             (shims if is_shim else direct).append(literal)
 
-        for entry in os.environ.get("PATH", "").split(os.pathsep):
-            if not entry:
-                continue
-            for name in ("nrfutil-sdk-manager", "nrfutil"):
-                add(Path(entry) / name)
-        for cand in (
-            Path.home() / ".nrfutil" / "bin" / "nrfutil-sdk-manager",
-            Path.home() / ".nrfutil" / "bin" / "nrfutil",
-        ):
-            add(cand)
+        # The names of the host: nrfutil.exe and a shim nrfutil.bat on Windows.
+        names = [*program_file_names("nrfutil-sdk-manager"), *program_file_names("nrfutil")]
+        for directory in path_directories():
+            for name in names:
+                add(directory / name)
+        for name in names:
+            add(Path.home() / ".nrfutil" / "bin" / name)
 
         for candidate in (*direct, *shims):
             if cls._provides_sdk_manager(candidate):
@@ -696,7 +783,10 @@ class ZephyrBuildSystem:
         sdk_dir = Path(env_dir).expanduser()
         if not sdk_dir.is_dir():
             return None
-        script = next(iter(sorted(sdk_dir.glob("environment-setup-*"))), None)
+        # environment-setup-* is a shell script: on Windows it cannot be the
+        # activate of a build, thus the SDK of the environment is not usable
+        # there through it.
+        script = None if sys.platform == "win32" else next(iter(sorted(sdk_dir.glob("environment-setup-*"))), None)
         return SdkChoice(
             kind=SDK_KIND_ZEPHYR,
             version=sdk_dir.name.removeprefix("zephyr-sdk-"),
@@ -727,14 +817,8 @@ class ZephyrBuildSystem:
         nrfutil = nrfutil or cls._find_nrfutil()
         if nrfutil is None:
             return []
-        try:
-            result = subprocess.run(
-                [nrfutil, "--json", "sdk-manager", "list"],
-                capture_output=True, text=True, timeout=30,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return []
-        if result.returncode != 0:
+        result = _run_nrfutil([nrfutil, "--json", "sdk-manager", "list"], timeout=30)
+        if result is None or result.returncode != 0:
             return []
 
         # --json emits JSON Lines; the versions arrive in one "info" record.
@@ -878,6 +962,11 @@ class ZephyrBuildSystem:
         ``ZEPHYR_BASE`` is set here because ``toolchain env`` does not set it;
         that is a known gap in the Nordic tooling, not an oversight.
 
+        POSIX: ``ncs-env.sh``.  Windows: ``ncs-env.cmd`` (``_ncs_env_cmd``):
+        a ``.sh`` script cannot run there, and Command Prompt is the shell
+        that ``sdk-manager`` supports on Windows (nRF Util documentation,
+        ``toolchain env --as-script cmd``).
+
         WHY ``zephyr-env.sh`` is deliberately NOT sourced: beyond exporting
         the same ``ZEPHYR_BASE``, it does two things.  It prepends
         ``$ZEPHYR_BASE/scripts`` to PATH — tools people run by hand
@@ -892,18 +981,24 @@ class ZephyrBuildSystem:
         """
         wrapper_dir = project_root / ".fw-context"
         wrapper_dir.mkdir(parents=True, exist_ok=True)
-        target = wrapper_dir / "ncs-env.sh"
-        zephyr_base = f"{ncs_root}/{version}/zephyr"
-        content = (
-            "#!/bin/sh\n"
-            f'eval "$("{nrfutil}" sdk-manager toolchain env --ncs-version "{version}" --as-script)"\n'
-            f'export ZEPHYR_BASE="{zephyr_base}"\n'
-        )
+        if sys.platform == "win32":
+            target = wrapper_dir / "ncs-env.cmd"
+            content = _ncs_env_cmd(nrfutil, version, str(Path(ncs_root, version, "zephyr")))
+        else:
+            target = wrapper_dir / "ncs-env.sh"
+            zephyr_base = f"{ncs_root}/{version}/zephyr"
+            content = (
+                "#!/bin/sh\n"
+                f'eval "$("{nrfutil}" sdk-manager toolchain env --ncs-version "{version}" --as-script)"\n'
+                f'export ZEPHYR_BASE="{zephyr_base}"\n'
+            )
         if not target.exists() or target.read_text(encoding="utf-8") != content:
             tmp = wrapper_dir / ".ncs-env.tmp"
             tmp.write_text(content, encoding="utf-8")
             tmp.chmod(0o755)
-            tmp.rename(target)
+            # os.replace and not Path.rename: on Windows rename refuses a
+            # target that exists, thus a new version of the script failed.
+            replace_file(tmp, target)
         return str(target)
 
     @classmethod
@@ -919,16 +1014,20 @@ class ZephyrBuildSystem:
         #    shell of the operator exports.  Not `west config zephyr.base`:
         #    init runs before the environment of the project exists, and a
         #    west from outside it can name a different workspace.
+        #    Windows: zephyr-env.cmd, the script of the Zephyr repository
+        #    for Command Prompt; a .sh script cannot run there.
         zephyr_base = os.environ.get("ZEPHYR_BASE")
         if zephyr_base:
-            zephyr_env = Path(zephyr_base) / "zephyr-env.sh"
+            zephyr_env = Path(zephyr_base) / ("zephyr-env.cmd" if sys.platform == "win32" else "zephyr-env.sh")
             if zephyr_env.is_file():
                 return {"python": None, "activate": str(zephyr_env)}
 
         # 3. Plain Zephyr SDK — environment-setup-* (sets toolchain env).
-        for sdk_dir in sorted(Path.home().glob("zephyr-sdk-*"), reverse=True):
-            for env_file in sdk_dir.glob("environment-setup-*"):
-                return {"python": None, "activate": str(env_file)}
+        #    A shell script only: not on Windows.
+        if sys.platform != "win32":
+            for sdk_dir in sorted(Path.home().glob("zephyr-sdk-*"), reverse=True):
+                for env_file in sdk_dir.glob("environment-setup-*"):
+                    return {"python": None, "activate": str(env_file)}
 
         return {"python": None, "activate": None}
 

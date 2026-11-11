@@ -38,6 +38,8 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
+from ..utils import replace_file
+
 log = logging.getLogger(__name__)
 
 
@@ -160,7 +162,7 @@ def _atomic_write(path: Path, content: str) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(content)
-        os.replace(tmp_path, str(path))
+        replace_file(tmp_path, str(path))
     except Exception:
         try:
             os.unlink(tmp_path)

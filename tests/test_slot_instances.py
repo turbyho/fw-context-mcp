@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from tests._toml import toml_string
 from tests._usr_keys import base_names
 
 pytest.importorskip("clang.cindex", reason="libclang not available")
@@ -127,7 +128,7 @@ void use_b(Q &q) { q.call(B()); }
 def _project(root: Path, base: Path) -> Path:
     (root / ".fw-context").mkdir(parents=True)
     (root / ".fw-context" / "config.toml").write_text(
-        f'[project]\nid = "proj-instances"\n\n[build]\n\n[index]\ndb_dir = "{base}"\n', encoding="utf-8",
+        f'[project]\nid = "proj-instances"\n\n[build]\n\n[index]\ndb_dir = {toml_string(base)}\n', encoding="utf-8",
     )
     (root / "q.h").write_text(TEMPLATES, encoding="utf-8")
     for name, text in (("a.cpp", UNIT_A), ("b.cpp", UNIT_B), ("post.cpp", POST_C)):

@@ -49,6 +49,22 @@ def _read_mbed_gcc_arm_path() -> str:
     return ""
 
 
+def _initialized_root(tmp_path: Path) -> Path:
+    """Return the project root ``tmp_path/proj`` with a project ID, as ``fw-context init`` leaves it.
+
+    WHY not a project of ``tests/builds``: git tracks no ``.fw-context``
+    there, and the hash reads the project ID.  A test that used one passed
+    only after a test that ran ``fw-context init`` in that project, thus it
+    failed on a fresh clone, or on Windows, where that test did not run.
+    """
+    root = tmp_path / "proj"
+    config = root / ".fw-context" / "config.toml"
+    if not config.exists():
+        config.parent.mkdir(parents=True)
+        config.write_text(f'[project]\nid = "{"c" * 32}"\n', encoding="utf-8")
+    return root
+
+
 def _project_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
@@ -1009,7 +1025,9 @@ class TestConfigHashStability:
         from fw_context_mcp.indexer.compile_commands import parse as parse_cc
         from fw_context_mcp.indexer.manifest import compute_structural_hash
 
-        project_root = _BUILDS / "generic_cmake"
+        project_root = _initialized_root(tmp_path)
+        (project_root / "src").mkdir()
+        (project_root / "src" / "main.c").write_text("int main(void) { return 0; }\n", encoding="utf-8")
         cc = tmp_path / "compile_commands.json"
         cc.write_text(json.dumps([{
             "directory": str(project_root),
@@ -1023,12 +1041,10 @@ class TestConfigHashStability:
         assert h1 == h2
 
     def _hash_for(self, tmp_path, name: str, entries: list[dict]) -> str:
-        from pathlib import Path
-
         from fw_context_mcp.indexer.compile_commands import parse as parse_cc
         from fw_context_mcp.indexer.manifest import compute_structural_hash
 
-        project_root = Path(__file__).parent / "builds" / "bare"
+        project_root = _initialized_root(tmp_path)
         cc = tmp_path / name
         cc.write_text(json.dumps(entries))
         return compute_structural_hash(cc, project_root, list(parse_cc(cc)), transient_defines=DEFAULT_TRANSIENT_DEFINES)
@@ -1078,12 +1094,18 @@ class TestConfigHashStability:
 
 
 def _collect_project_stats(project_root: Path) -> dict | None:
-    """Collect indexing statistics for a single project."""
-    from fw_context_mcp.config import derive_project_id
+    """Collect indexing statistics for a single project, or None when it has no index.
+
+    A project that no test initialized has no project ID, and thus no index.
+    """
+    from fw_context_mcp.config import ProjectNotInitializedError, derive_project_id
     from fw_context_mcp.config import load as load_config
 
     cfg = load_config(project_root=project_root)
-    project_id = derive_project_id(project_root)
+    try:
+        project_id = derive_project_id(project_root)
+    except ProjectNotInitializedError:
+        return None
     db_path = cfg.index.db_dir / project_id / "index.db"
 
     if not db_path.exists():
@@ -1196,6 +1218,7 @@ def _print_stats_table(all_stats: list[dict]) -> None:
 
 
 @pytest.mark.system
+@pytest.mark.skipif(shutil.which("gcc") is None, reason="the bare backend of the test project runs gcc")
 class TestGhostRecordPurge:
     """End-to-end: delete file (same config_hash) → reindex purges ghosts.
 

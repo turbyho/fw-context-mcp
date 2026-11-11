@@ -19,7 +19,7 @@ Streaming support (Plan A + Plan B):
   transparently — no crash, no configuration needed.
 * **Plan B** (active streaming): When ``cfg.stream`` is True, the request
   sends ``stream: true`` and the response is consumed as an SSE stream
-  via ``httpx.stream()``.  This keeps the HTTP connection alive with
+  via ``net.stream()``.  This keeps the HTTP connection alive with
   continuous data flow, avoiding reverse-proxy idle timeouts.
 """
 
@@ -32,6 +32,7 @@ from datetime import UTC, datetime
 
 import httpx
 
+from .. import net
 from ..config.settings import LLMConfig
 from ..utils import is_fatal
 from ._debug import _write_debug_log
@@ -313,7 +314,7 @@ class OpenAIChatClient:
     * WHY no auto-pull: a cloud API reports 404 for a wrong model name or a
       missing deployment, and it has no ``ollama pull``.
 
-    Streaming (when ``cfg.stream`` is True, Plan B): ``httpx.stream()`` with
+    Streaming (when ``cfg.stream`` is True, Plan B): ``net.stream()`` with
     SSE chunks.  Without it, the request sends ``stream: false``; an answer
     that streams anyway is parsed as SSE (Plan A).
     """
@@ -419,7 +420,7 @@ class OpenAIChatClient:
         avoids a JSON decode error.
         """
         try:
-            resp = httpx.post(self.endpoint, json=payload, headers=headers, timeout=self.cfg.timeout)
+            resp = net.post(self.endpoint, json=payload, headers=headers, timeout=self.cfg.timeout)
             resp.raise_for_status()
             if _is_sse_response(resp):
                 log.debug("API returned SSE despite stream:false — parsing as SSE (Plan A fallback)")
@@ -438,7 +439,7 @@ class OpenAIChatClient:
     def _stream(self, headers: dict[str, str], payload: dict) -> ChatResult:
         """One streaming request (Plan B).
 
-        ``httpx.stream()`` keeps the connection busy with continuous data,
+        ``net.stream()`` keeps the connection busy with continuous data,
         thus a reverse proxy (nginx 60 s, Cloudflare 100 s) does not close
         it as idle during a long answer.  A chunk with a ``usage`` object
         gives the usage.
@@ -447,7 +448,7 @@ class OpenAIChatClient:
         chunks: list[str] = []
         usage = Usage()
         try:
-            with httpx.stream(
+            with net.stream(
                 "POST", self.endpoint, json=payload, headers=headers, timeout=self.cfg.timeout
             ) as resp:
                 # The body of an error answer, before the error: _error

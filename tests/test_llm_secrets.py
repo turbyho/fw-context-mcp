@@ -20,6 +20,7 @@ from keyring.backend import KeyringBackend
 from keyring.backends import fail
 from keyring.errors import PasswordDeleteError
 
+from fw_context_mcp import net
 from fw_context_mcp.config.settings import LLMConfig
 from fw_context_mcp.llm import secrets
 
@@ -162,7 +163,7 @@ def test_the_client_sends_the_stored_key_of_its_profile(memory, monkeypatch):
         request = httpx.Request("POST", url)
         return httpx.Response(200, json={"choices": [{"message": {"content": "OK"}}]}, request=request)
 
-    monkeypatch.setattr(httpx, "post", _post)
+    monkeypatch.setattr(net, "post", _post)
 
     assert _client(profile="work").generate("hi").text == "OK"
 
@@ -176,7 +177,7 @@ def test_a_refused_key_names_the_command_and_not_the_text_of_the_server(store, m
         request = httpx.Request("POST", url)
         return httpx.Response(401, text=f"invalid key {KEY[:10]}", request=request)
 
-    monkeypatch.setattr(httpx, "post", _post)
+    monkeypatch.setattr(net, "post", _post)
 
     from fw_context_mcp.llm.errors import ChatApiError
 
@@ -287,7 +288,7 @@ def test_a_refused_key_is_read_again_after_a_change_in_another_process(store, mo
             return httpx.Response(401, text="no", request=request)
         return httpx.Response(200, json={"choices": [{"message": {"content": "OK"}}]}, request=request)
 
-    monkeypatch.setattr(httpx, "post", _post)
+    monkeypatch.setattr(net, "post", _post)
     from fw_context_mcp.llm.errors import ChatApiError
 
     with pytest.raises(ChatApiError):
@@ -299,7 +300,7 @@ def test_a_refused_key_of_the_caller_gives_no_advice_about_the_key_store(store, 
     def _post(url, json, headers, timeout):
         return httpx.Response(401, text="no", request=httpx.Request("POST", url))
 
-    monkeypatch.setattr(httpx, "post", _post)
+    monkeypatch.setattr(net, "post", _post)
     from fw_context_mcp.llm.errors import ChatApiError
 
     with pytest.raises(ChatApiError) as error:
