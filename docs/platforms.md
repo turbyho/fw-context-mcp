@@ -23,11 +23,11 @@ and `system`. The full test suite also passed by hand on Linux, on macOS 26
 Three firmware projects were indexed on Linux, macOS and Windows, with
 the same toolchain versions on each platform:
 
-| Project | Build system | Target |
-|---|---|---|
-| Boiler control | PlatformIO, Arduino framework | ESP32 |
-| Motion control | PlatformIO, Arduino framework | STM32L476 |
-| Production firmware | Mbed OS 6 (Mbed CLI 1) | nRF52840 |
+| Build system | Target |
+|---|---|
+| PlatformIO, Arduino framework | ESP32 |
+| PlatformIO, Arduino framework | STM32L476 |
+| Mbed OS 6 (Mbed CLI 1) | nRF52840 |
 
 The indexes of each project were compared table by table. The files, the
 symbols, the references, the macros and the call graph were the same on
