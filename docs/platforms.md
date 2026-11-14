@@ -16,9 +16,30 @@ platforms and two Python versions:
 | macOS | `macos-latest` (Apple Silicon) | 3.11, 3.14 |
 | Windows | `windows-latest` | 3.11, 3.14 |
 
-The CI runs the tests without the markers `ollama`, `libclang`, `slow`
-and `system`. The full test suite also passed by hand on Linux, on macOS 26
-(Apple Silicon, APFS) and on Windows 11 (Python 3.11).
+The CI runs the tests without the markers `system`, `live`, `litellm`,
+`ollama`, `libclang`, `slow`, `sdk_project` and `extra_platforms`. One job
+(Linux, Python 3.14) also runs the tests of the marker `sdk_project`. By
+hand, the tests without the markers `system`, `slow`, `live`, `litellm`
+and `extra_platforms` also passed on Linux, on macOS 26 (Apple Silicon,
+APFS) and on Windows 11 (Python 3.11). On macOS and Windows that run had
+no Ollama, thus no test of the marker `ollama`.
+
+The tests compile their fixtures with the toolchains of embedded SDKs.
+`make test-sdk` installs these SDKs in the versions that
+`tests/sdk/versions.toml` gives. On the three platforms, the tests built
+and indexed these projects:
+
+- A Zephyr sysbuild project for `nrf52840dk/nrf52840`, in an upstream
+  Zephyr workspace without NCS.
+- A PlatformIO project for ESP32-C3 with the Arduino framework.
+- A `bare` project, a generic CMake project and a Makefile project, with
+  Arm GCC.
+
+On Linux and macOS, the extended set of the test SDKs
+(`make test-sdk-platforms`, then `make test-platforms`) also built and
+indexed PlatformIO projects for ESP32, STM32 Nucleo L476RG and Arduino
+Uno, an ESP-IDF project with its bootloader, and an Arduino CLI sketch for
+AVR.
 
 Three firmware projects were indexed on Linux, macOS and Windows, with
 the same toolchain versions on each platform:
@@ -49,11 +70,10 @@ not from the platform support of fw-context:
 A project in `bare` mode with Arm GCC 12.2 and 14.2 was also indexed on
 Windows, in a directory whose name has a space and characters above 127.
 
-These build systems were not tried with a real project on macOS and
-Windows: Zephyr and NCS, ESP-IDF, the generic CMake backend, Makefile,
-Arduino CLI, Keil and IAR. The tests cover their code for these
-platforms: the activate scripts, the lookup of the tools, and the command
-lines.
+These build systems were not tried with a real project on Windows: NCS,
+ESP-IDF, Arduino CLI, Keil and IAR. On macOS: NCS, Keil and IAR. The
+tests cover their code for these platforms: the activate scripts, the
+lookup of the tools, and the command lines.
 
 ## Paths
 
