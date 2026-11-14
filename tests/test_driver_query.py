@@ -144,6 +144,8 @@ class TestDriverName:
     @pytest.mark.parametrize("name", [
         "gcc", "g++", "cc", "c++", "gcc-12", "arm-none-eabi-gcc", "xtensa-esp32-elf-g++",
         "avr-gcc", "riscv64-zephyr-elf-gcc", "x86_64-w64-mingw32-gcc.exe",
+        # The case of PATHEXT, as shutil.which and `where` give it on Windows.
+        "arm-zephyr-eabi-gcc.EXE", "riscv32-esp-elf-g++.Exe",
     ])
     def test_a_gcc_driver_name_matches(self, name: str) -> None:
         assert is_gcc_driver_name(Path(name))
@@ -285,6 +287,19 @@ class TestPredefineFlags:
 
     def test_a_two_token_flag_without_a_value_is_left_out(self) -> None:
         assert predefine_flags(["-Os", "-B"]) == ("-Os",)
+
+    @pytest.mark.parametrize("pair", [
+        ["-Xlinker", "-O1"],
+        ["-Xassembler", "-mthumb"],
+        ["-Xpreprocessor", "-ansi"],
+        ["-o", "-O3.o"],
+    ])
+    def test_the_value_of_an_option_is_no_flag_of_the_driver(self, pair: list[str]) -> None:
+        """``-Xlinker -O1`` is an option of the linker: the query got ``-O1``, thus ``__OPTIMIZE__`` at -O0."""
+        assert predefine_flags(["-Os", *pair]) == ("-Os",)
+
+    def test_an_m_option_with_a_value_keeps_its_value(self) -> None:
+        assert predefine_flags(["-meabi", "gnu", "-Os"]) == ("-meabi", "gnu", "-Os")
 
     def test_a_signedness_synonym_reaches_the_driver(self) -> None:
         """-fno-signed-char changes __CHAR_UNSIGNED__ as -funsigned-char does."""
@@ -638,9 +653,9 @@ def test_the_macro_preprocessor_keeps_the_driver_flags() -> None:
     """macros.py runs clang -dM -E with the unit flags; it must not drop -nostdinc or -undef."""
     from fw_context_mcp.indexer.macros import _sanitize_flags
 
-    cmd = ["clang", "-dM", "-E", "--target=i386-unknown-elf", "-nostdinc", "-undef", "-malign-double",
-           "-fshort-wchar", "-funsigned-char", "-D__XTENSA__=1", "-isystem", "/tc/inc", "main.c"]
-    kept = _sanitize_flags(cmd)
+    flags = ["--target=i386-unknown-elf", "-nostdinc", "-undef", "-malign-double",
+             "-fshort-wchar", "-funsigned-char", "-D__XTENSA__=1", "-isystem", "/tc/inc"]
+    kept = _sanitize_flags(flags)
     for flag in ("-nostdinc", "-undef", "-malign-double", "-fshort-wchar", "-funsigned-char", "-D__XTENSA__=1"):
         assert flag in kept, flag
 
@@ -680,3 +695,16 @@ def test_libclang_takes_the_branch_of_the_real_target(tmp_path: Path, monkeypatc
     assert errors == []
     assert "on_target" in names and "on_host" not in names
     assert hosts == []
+
+
+def test_the_macro_preprocessor_keeps_the_directory_of_a_separated_sysroot() -> None:
+    """``--sysroot <dir>``: the flag and its directory stay together, and the flag after them stays too.
+
+    The sanitizer kept the flag and dropped its directory, thus clang took
+    ``-Iinc`` as the sysroot, and the include directory was gone.
+    """
+    from fw_context_mcp.indexer.macros import _sanitize_flags
+
+    kept = _sanitize_flags(["--sysroot", "/opt/sys", "-Iinc"])
+    assert kept[kept.index("--sysroot") + 1] == "/opt/sys"
+    assert "-Iinc" in kept

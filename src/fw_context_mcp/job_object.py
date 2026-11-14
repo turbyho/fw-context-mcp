@@ -43,90 +43,24 @@ from __future__ import annotations
 
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import TypeVar
+from typing import Any, TypeVar
 
 if sys.platform == "win32":
+    import _thread
+    import collections
     import ctypes
-    from ctypes import wintypes
+    import signal
+    import threading
+    from types import FrameType
+
+    from . import _win32
+    from .processes import HANGUP_SIGNAL
 
     #: A ``Popen`` in text mode or in bytes mode.
     _Process = TypeVar("_Process", subprocess.Popen[str], subprocess.Popen[bytes])
-
-    CREATE_SUSPENDED = 0x00000004
-    CREATE_NEW_PROCESS_GROUP = subprocess.CREATE_NEW_PROCESS_GROUP
-
-    _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
-    _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
-    _PROCESS_SET_QUOTA = 0x0100
-    _PROCESS_TERMINATE = 0x0001
-    _TH32CS_SNAPTHREAD = 0x00000004
-    _THREAD_SUSPEND_RESUME = 0x0002
-    _INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
-
-    class _IoCounters(ctypes.Structure):
-        _fields_ = [(name, ctypes.c_ulonglong) for name in (
-            "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
-            "ReadTransferCount", "WriteTransferCount", "OtherTransferCount",
-        )]
-
-    class _BasicLimitInformation(ctypes.Structure):
-        _fields_ = [
-            ("PerProcessUserTimeLimit", ctypes.c_longlong),
-            ("PerJobUserTimeLimit", ctypes.c_longlong),
-            ("LimitFlags", wintypes.DWORD),
-            ("MinimumWorkingSetSize", ctypes.c_size_t),
-            ("MaximumWorkingSetSize", ctypes.c_size_t),
-            ("ActiveProcessLimit", wintypes.DWORD),
-            ("Affinity", ctypes.c_size_t),
-            ("PriorityClass", wintypes.DWORD),
-            ("SchedulingClass", wintypes.DWORD),
-        ]
-
-    class _ExtendedLimitInformation(ctypes.Structure):
-        _fields_ = [
-            ("BasicLimitInformation", _BasicLimitInformation),
-            ("IoInfo", _IoCounters),
-            ("ProcessMemoryLimit", ctypes.c_size_t),
-            ("JobMemoryLimit", ctypes.c_size_t),
-            ("PeakProcessMemoryUsed", ctypes.c_size_t),
-            ("PeakJobMemoryUsed", ctypes.c_size_t),
-        ]
-
-
-    class _ThreadEntry32(ctypes.Structure):
-        _fields_ = [
-            ("dwSize", wintypes.DWORD),
-            ("cntUsage", wintypes.DWORD),
-            ("th32ThreadID", wintypes.DWORD),
-            ("th32OwnerProcessID", wintypes.DWORD),
-            ("tpBasePri", ctypes.c_long),
-            ("tpDeltaPri", ctypes.c_long),
-            ("dwFlags", wintypes.DWORD),
-        ]
-
-    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    _kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
-    _kernel32.CreateJobObjectW.restype = wintypes.HANDLE
-    _kernel32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
-    _kernel32.SetInformationJobObject.restype = wintypes.BOOL
-    _kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
-    _kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
-    _kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-    _kernel32.OpenProcess.restype = wintypes.HANDLE
-    _kernel32.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-    _kernel32.OpenThread.restype = wintypes.HANDLE
-    _kernel32.ResumeThread.argtypes = [wintypes.HANDLE]
-    _kernel32.ResumeThread.restype = wintypes.DWORD
-    _kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
-    _kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
-    _kernel32.Thread32First.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ThreadEntry32)]
-    _kernel32.Thread32First.restype = wintypes.BOOL
-    _kernel32.Thread32Next.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ThreadEntry32)]
-    _kernel32.Thread32Next.restype = wintypes.BOOL
-    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    _kernel32.CloseHandle.restype = wintypes.BOOL
 
     class JobObjectError(RuntimeError):
         """Windows refused a call of the job API: the build does not run (module docstring)."""
@@ -143,41 +77,123 @@ if sys.platform == "win32":
         of the primary thread, and it keeps no thread ID.  A process that
         ``CREATE_SUSPENDED`` started has one thread, its primary thread.
         """
-        snapshot = _kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPTHREAD, 0)
-        if snapshot == _INVALID_HANDLE_VALUE:
+        snapshot = _win32.kernel32.CreateToolhelp32Snapshot(_win32.TH32CS_SNAPTHREAD, 0)
+        if snapshot == _win32.INVALID_HANDLE_VALUE:
             _check(False, "CreateToolhelp32Snapshot")
         resumed = 0
         try:
-            entry = _ThreadEntry32()
+            entry = _win32.ThreadEntry32()
             entry.dwSize = ctypes.sizeof(entry)
-            more = _kernel32.Thread32First(snapshot, ctypes.byref(entry))
+            more = _win32.kernel32.Thread32First(snapshot, ctypes.byref(entry))
             while more:
                 if entry.th32OwnerProcessID == pid:
-                    thread = _kernel32.OpenThread(_THREAD_SUSPEND_RESUME, False, entry.th32ThreadID)
+                    thread = _win32.kernel32.OpenThread(_win32.THREAD_SUSPEND_RESUME, False, entry.th32ThreadID)
                     _check(thread, "OpenThread")
                     try:
-                        _check(_kernel32.ResumeThread(thread) != 0xFFFFFFFF, "ResumeThread")
+                        _check(_win32.kernel32.ResumeThread(thread) != 0xFFFFFFFF, "ResumeThread")
                     finally:
-                        _kernel32.CloseHandle(thread)
+                        _win32.kernel32.CloseHandle(thread)
                     resumed += 1
-                more = _kernel32.Thread32Next(snapshot, ctypes.byref(entry))
+                more = _win32.kernel32.Thread32Next(snapshot, ctypes.byref(entry))
         finally:
-            _kernel32.CloseHandle(snapshot)
+            _win32.kernel32.CloseHandle(snapshot)
         if resumed == 0:
             raise JobObjectError(f"process {pid} has no thread to resume")
+
+    #: The signals whose Python handler stops a run: Ctrl-C, the stop
+    #: request (``processes.request_stop`` runs the SIGTERM handler), and the
+    #: close of the console.
+    _STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM, HANGUP_SIGNAL)
+
+    @contextmanager
+    def _stops_deferred() -> Iterator[None]:
+        """Keep each stop signal until the block ends, then give it to the handler of the caller.
+
+        Python runs a signal handler in the main thread only, thus a
+        different thread gets no exception of a stop, and the block runs
+        with no change there.  In the main thread the block installs a
+        handler that only records the signal.  At the end, in this order:
+
+        1. The handler stops to record: from now on it gives each signal to
+           the handler of the caller.
+        2. The handlers of the caller come back.
+        3. ``_thread.interrupt_main`` marks each recorded signal as received,
+           in ONE call from C.  Python runs the handlers of the caller at its
+           next check, as for signals that came after the block.
+
+        WHY this order and the one call: a handler of the caller that runs
+        and raises stops the steps after it.
+
+        - A mark before step 2: ``signal.signal`` runs the pending handlers
+          first, and a handler that raised left the recording handler
+          installed for the other signals.
+        - A Python loop of marks: the first handler ran (and raised) before
+          the second signal was marked, and that signal was lost (a Ctrl-C
+          and a takeover: the run exited as interrupted, not as superseded).
+          ``map`` over the recorded signals runs no Python code between two
+          marks.  When a handler raises, CPython keeps the other marked
+          signals pending, as it does for two signals that come together.
+        - Step 1 first: a handler that still recorded took a new signal
+          that came in steps 2 and 3, and nothing marked it.
+        - Step 3 in a ``finally`` of step 2: a NEW signal that comes during
+          step 2 runs its handler in ``signal.signal``, and a handler that
+          raises stops the loop.  The recorded signals are marked all the
+          same.  A handler that the loop did not put back is the recording
+          one, and it gives each later signal to the handler of the caller.
+
+        Between step 1 and the ``try`` of step 2 there is no call, thus
+        Python runs no handler there.
+
+        WHY ``interrupt_main`` and not ``signal.raise_signal``:
+        ``raise_signal`` runs the handler at once.
+
+        Only a signal with a Python handler is kept.  WHY: the stop request
+        (``_thread.interrupt_main``) does nothing for a signal with no
+        Python handler.  The default action of a recorded signal would
+        thus be a stop that the caller did not have.
+        """
+        if threading.current_thread() is not threading.main_thread():
+            yield
+            return
+        # signal.Signals and not int: the conversion runs Python code, and
+        # the marks in the finally must run none (see above).
+        received: list[signal.Signals] = []
+        previous: dict[int, Callable[[int, FrameType | None], Any]] = {}
+        recording = True
+
+        def record(signum: int, frame: FrameType | None) -> None:
+            if recording:
+                received.append(signal.Signals(signum))
+            else:
+                previous[signum](signum, frame)
+
+        try:
+            for stop_signal in _STOP_SIGNALS:
+                handler = signal.getsignal(stop_signal)
+                if callable(handler):
+                    previous[stop_signal] = handler
+                    signal.signal(stop_signal, record)
+            yield
+        finally:
+            recording = False
+            try:
+                for kept, handler in previous.items():
+                    signal.signal(kept, handler)
+            finally:
+                collections.deque(map(_thread.interrupt_main, dict.fromkeys(received)), maxlen=0)
 
     class BuildJob:
         """A job object that ends each of its processes when it closes (module docstring)."""
 
         def __init__(self) -> None:
-            handle = _kernel32.CreateJobObjectW(None, None)
+            handle = _win32.kernel32.CreateJobObjectW(None, None)
             _check(handle, "CreateJobObjectW")
             self._handle: int | None = handle
-            info = _ExtendedLimitInformation()
-            info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            info = _win32.ExtendedLimitInformation()
+            info.BasicLimitInformation.LimitFlags = _win32.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
             try:
-                _check(_kernel32.SetInformationJobObject(
-                    handle, _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, ctypes.byref(info), ctypes.sizeof(info),
+                _check(_win32.kernel32.SetInformationJobObject(
+                    handle, _win32.JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, ctypes.byref(info), ctypes.sizeof(info),
                 ), "SetInformationJobObject")
             except JobObjectError:
                 self.close()
@@ -202,54 +218,47 @@ if sys.platform == "win32":
             """
             return self._started(lambda: subprocess.Popen(  # noqa: S603 — argv list or a command line of fw-context
                 cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
-                creationflags=CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP,
-            ))
-
-        def start_command_line(self, command_line: str, *, cwd: Path, env: dict[str, str]) -> subprocess.Popen[bytes]:
-            """Start the Windows *command_line* as :meth:`start` does, with stdout and stderr as bytes in pipes.
-
-            The output is bytes, because the caller knows its encoding.
-            """
-            return self._started(lambda: subprocess.Popen(  # noqa: S603 — a command line of fw-context
-                command_line, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                creationflags=CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP,
+                creationflags=_win32.CREATE_SUSPENDED | subprocess.CREATE_NEW_PROCESS_GROUP,
             ))
 
         def _started(self, popen: Callable[[], _Process]) -> _Process:
             """Run *popen* (a suspended start), put the process into this job, then resume it.
 
             When the process cannot go into the job, it is ended and the
-            error is raised: it has run no instruction.  The same for an
-            exception of a stop (Ctrl-C, ``IndexStopped``) that comes before
-            the process runs: a suspended process outside of the job would
-            stay forever.
+            error is raised: it has run no instruction.
+
+            A stop (Ctrl-C, ``IndexStopped``, the close of the console)
+            waits until the process is in the job (:func:`_stops_deferred`).
+            WHY: the exception of a stop that came inside ``Popen``, after
+            ``CreateProcess``, left *popen* before it returned the process.
+            Nothing then knew the process, and it stayed suspended outside
+            of the job forever.  After the start the stop runs: the caller
+            closes the job, and Windows ends the process.
             """
-            proc: _Process | None = None
-            try:
+            with _stops_deferred():
                 proc = popen()
-                self._adopt(proc.pid)
-            except BaseException:
-                if proc is not None:
+                try:
+                    self._adopt(proc.pid)
+                except BaseException:
                     proc.kill()
                     proc.wait()
-                raise
+                    raise
             return proc
 
         def _adopt(self, pid: int) -> None:
             """Put the suspended process *pid* into this job, then resume it."""
-            process = _kernel32.OpenProcess(_PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, pid)
+            process = _win32.kernel32.OpenProcess(_win32.PROCESS_SET_QUOTA | _win32.PROCESS_TERMINATE, False, pid)
             _check(process, "OpenProcess")
             try:
-                _check(_kernel32.AssignProcessToJobObject(self._require(), process), "AssignProcessToJobObject")
+                _check(_win32.kernel32.AssignProcessToJobObject(self._require(), process), "AssignProcessToJobObject")
             finally:
-                _kernel32.CloseHandle(process)
+                _win32.kernel32.CloseHandle(process)
             _resume_process(pid)
 
         def close(self) -> None:
             """Close the handle: Windows ends each process that is still in the job."""
             if self._handle is not None:
-                _kernel32.CloseHandle(self._handle)
+                _win32.kernel32.CloseHandle(self._handle)
                 self._handle = None
 
         def _require(self) -> int:

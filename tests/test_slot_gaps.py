@@ -16,16 +16,15 @@ edges of the slot resolution, as a user sees them:
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
 
 import fw_context_mcp  # noqa: F401  (pysqlite3 redirect before any sqlite3)
 from tests._toml import toml_string
+from tests._toolchains import Toolchain, parse_unit, write_compile_commands, write_sources
 from tests._usr_keys import base_names
 
-pytest.importorskip("clang.cindex", reason="libclang not available")
 pytestmark = pytest.mark.libclang
 
 INTEGER = """\
@@ -105,7 +104,9 @@ int main(void) { init(); exec(0, 1, 0); return 0; }
 """
 
 
-def _edges(tmp_path: Path, name: str, source: str, headers: dict[str, str] | None = None) -> set[tuple]:
+def _edges(
+    tmp_path: Path, toolchain: Toolchain, name: str, source: str, headers: dict[str, str] | None = None,
+) -> set[tuple]:
     """Index *source* as a project and give the edges of the slot resolution: (caller, target, origin)."""
     import sqlite3  # after fw_context_mcp (module level): the pysqlite3 redirect
 
@@ -117,13 +118,11 @@ def _edges(tmp_path: Path, name: str, source: str, headers: dict[str, str] | Non
     (root / ".fw-context" / "config.toml").write_text(
         f'[project]\nid = "proj-gaps"\n\n[build]\n\n[index]\ndb_dir = {toml_string(tmp_path)}\n', encoding="utf-8",
     )
-    (root / name).write_text(source, encoding="utf-8")
-    for header, text in (headers or {}).items():
-        (root / header).write_text(text, encoding="utf-8")
-    compiler, std = ("c++", "-std=c++17") if name.endswith(".cpp") else ("cc", "-std=gnu11")
-    (root / "compile_commands.json").write_text(json.dumps([{
-        "directory": str(root), "file": name, "arguments": [compiler, std, "-c", name, "-o", name + ".o"],
-    }]), encoding="utf-8")
+    write_sources(root, {name: source, **(headers or {})})
+    std = "-std=c++17" if name.endswith(".cpp") else "-std=gnu11"
+    write_compile_commands(root / "compile_commands.json", [{
+        "directory": str(root), "file": name, "arguments": toolchain.arguments(name, std, output=name + ".o"),
+    }])
     db_path = tmp_path / "proj-gaps" / "index.db"
     db_path.parent.mkdir(parents=True)
     run(
@@ -148,8 +147,8 @@ def _edges(tmp_path: Path, name: str, source: str, headers: dict[str, str] | Non
 
 
 @pytest.fixture(scope="module")
-def integer_edges(tmp_path_factory) -> set[tuple]:
-    return _edges(tmp_path_factory.mktemp("integer"), "integer.c", INTEGER)
+def integer_edges(tmp_path_factory, toolchain: Toolchain) -> set[tuple]:
+    return _edges(tmp_path_factory.mktemp("integer"), toolchain, "integer.c", INTEGER)
 
 
 def test_a_function_stored_as_an_integer_is_called_through_its_place(integer_edges):
@@ -169,8 +168,8 @@ def test_a_jump_of_a_bootloader_reaches_no_function_of_the_build(integer_edges):
     assert not {edge for edge in integer_edges if edge[0] in ("nul", "boot", "iap", "vtor")}, integer_edges
 
 
-def test_an_argument_of_a_virtual_call_reaches_the_override(tmp_path):
-    edges = _edges(tmp_path, "virtual.cpp", VIRTUAL)
+def test_an_argument_of_a_virtual_call_reaches_the_override(tmp_path, toolchain):
+    edges = _edges(tmp_path, toolchain, "virtual.cpp", VIRTUAL)
     assert ("run", "on_event", "slot") in edges
     assert ("use", "on_event", "slot") in edges
     # A pure virtual method has no body by design: its return holds what
@@ -192,18 +191,18 @@ int main() { Impl i; use(i); i.run(); return 0; }
 """
 
 
-def test_an_argument_of_a_virtual_call_of_a_template_interface_reaches_the_override(tmp_path):
+def test_an_argument_of_a_virtual_call_of_a_template_interface_reaches_the_override(tmp_path, toolchain):
     """The call names the member of the template `IQueue::post`, and so does the row of the override."""
-    assert ("run", "on_event", "slot") in _edges(tmp_path, "template.cpp", TEMPLATE_INTERFACE)
+    assert ("run", "on_event", "slot") in _edges(tmp_path, toolchain, "template.cpp", TEMPLATE_INTERFACE)
 
 
-def test_a_table_of_an_opaque_struct_type_fills_its_fields(tmp_path):
-    edges = _edges(tmp_path, "opaque.c", OPAQUE, {"ops.h": OPAQUE_H, "ops_internal.h": OPAQUE_INTERNAL_H})
+def test_a_table_of_an_opaque_struct_type_fills_its_fields(tmp_path, toolchain):
+    edges = _edges(tmp_path, toolchain, "opaque.c", OPAQUE, {"ops.h": OPAQUE_H, "ops_internal.h": OPAQUE_INTERNAL_H})
     assert {("run", "my_open", "slot"), ("run", "my_close", "slot")} <= edges
 
 
-def test_a_table_of_tables_reaches_its_actions(tmp_path):
-    edges = _edges(tmp_path, "tables.c", TABLES)
+def test_a_table_of_tables_reaches_its_actions(tmp_path, toolchain):
+    edges = _edges(tmp_path, toolchain, "tables.c", TABLES)
     assert {("exec", "a1", "slot"), ("exec", "a2", "slot"), ("exec", "b1", "slot")} <= edges
 
 
@@ -219,9 +218,9 @@ void fire_w() { conf.cb(1); }
 """
 
 
-def test_a_class_declared_before_its_definition_converts_into_its_place(tmp_path):
+def test_a_class_declared_before_its_definition_converts_into_its_place(tmp_path, toolchain):
     """The type gives the forward declaration, with no member: the conversion function is in the definition."""
-    assert ("fire_w", "on_w", "slot") in _edges(tmp_path, "forward.cpp", FORWARD)
+    assert ("fire_w", "on_w", "slot") in _edges(tmp_path, toolchain, "forward.cpp", FORWARD)
 
 
 COPIES = """\
@@ -265,9 +264,9 @@ void fire_field(void) { void *x = b.u[1]; ((tick_t) x)(7); }
 """
 
 
-def test_a_copy_of_a_void_pointer_place_carries_its_functions(tmp_path):
+def test_a_copy_of_a_void_pointer_place_carries_its_functions(tmp_path, toolchain):
     """A setter with a `void *` parameter, a getter, a local copy, a timer that gives its argument, an element of an array."""
-    edges = _edges(tmp_path, "copies.c", COPIES)
+    edges = _edges(tmp_path, toolchain, "copies.c", COPIES)
     assert {
         ("fire_getter", "on_get", "slot"), ("fire_copy", "on_copy", "slot"), ("tramp", "on_tramp", "slot"),
         ("fire_elem", "on_elem", "slot"), ("fire_first", "on_first", "slot"), ("fire_field", "on_field", "slot"),
@@ -276,9 +275,9 @@ def test_a_copy_of_a_void_pointer_place_carries_its_functions(tmp_path):
     assert not {edge for edge in edges if edge[2] == "type_only" and edge[1].startswith("on_")}, edges
 
 
-def test_a_copy_of_an_integer_place_carries_nothing(tmp_path):
+def test_a_copy_of_an_integer_place_carries_nothing(tmp_path, toolchain):
     """A known gap: each integer copy gave a flow, 300 times the flows of a project.  No call gets a guess."""
-    edges = _edges(tmp_path, "copies.c", COPIES)
+    edges = _edges(tmp_path, toolchain, "copies.c", COPIES)
     assert not {edge for edge in edges if edge[0] == "fire_raw"}, edges
 
 
@@ -302,7 +301,7 @@ void fire_library(void) { library_cb()(3); }
 """
 
 
-def _edges_units(tmp_path: Path, sources: dict[str, str]) -> set[tuple]:
+def _edges_units(tmp_path: Path, toolchain: Toolchain, sources: dict[str, str]) -> set[tuple]:
     """As ``_edges``, with a unit for each file of *sources*."""
     import sqlite3  # after fw_context_mcp (module level): the pysqlite3 redirect
 
@@ -314,12 +313,11 @@ def _edges_units(tmp_path: Path, sources: dict[str, str]) -> set[tuple]:
     (root / ".fw-context" / "config.toml").write_text(
         f'[project]\nid = "proj-outside"\n\n[build]\n\n[index]\ndb_dir = {toml_string(tmp_path)}\n', encoding="utf-8",
     )
-    for name, text in sources.items():
-        (root / name).write_text(text, encoding="utf-8")
-    (root / "compile_commands.json").write_text(json.dumps([
-        {"directory": str(root), "file": name, "arguments": ["cc", "-std=gnu11", "-c", name, "-o", name + ".o"]}
+    write_sources(root, sources)
+    write_compile_commands(root / "compile_commands.json", [
+        {"directory": str(root), "file": name, "arguments": toolchain.arguments(name, "-std=gnu11", output=name + ".o")}
         for name in sources
-    ]), encoding="utf-8")
+    ])
     db_path = tmp_path / "proj-outside" / "index.db"
     db_path.parent.mkdir(parents=True)
     run(
@@ -343,9 +341,9 @@ def _edges_units(tmp_path: Path, sources: dict[str, str]) -> set[tuple]:
         conn.close()
 
 
-def test_a_slot_that_no_unit_defines_reaches_its_calls_by_type(tmp_path):
+def test_a_slot_that_no_unit_defines_reaches_its_calls_by_type(tmp_path, toolchain):
     """`extern void *opaque` and a function with no body: code out of the build writes them."""
-    edges = _edges_units(tmp_path, {"a.c": OUTSIDE_A, "b.c": OUTSIDE_B})
+    edges = _edges_units(tmp_path, toolchain, {"a.c": OUTSIDE_A, "b.c": OUTSIDE_B})
     assert {("fire_opaque", "on_a", "type_only"), ("fire_opaque", "on_b", "type_only")} <= edges
     assert {("fire_library", "on_a", "type_only"), ("fire_library", "on_b", "type_only")} <= edges
 
@@ -369,13 +367,13 @@ void jump_void_array(void) { entry_t e = (entry_t)(void *)(uintptr_t) __app_vect
 """
 
 
-def test_a_jump_through_a_linker_symbol_or_the_rom_reaches_no_function_of_the_build(tmp_path):
+def test_a_jump_through_a_linker_symbol_or_the_rom_reaches_no_function_of_the_build(tmp_path, toolchain):
     """Code out of the build writes a number into an integer place, not a function: no edge by type.
 
     A cast through `void *` reads the integer place too: the type of the
     place decides, not the type of the last cast.
     """
-    edges = _edges(tmp_path, "boot.c", BOOT_OUTSIDE)
+    edges = _edges(tmp_path, toolchain, "boot.c", BOOT_OUTSIDE)
     assert not {edge for edge in edges if edge[0].startswith("jump_")}, edges
 
 
@@ -402,12 +400,12 @@ void fire_table(void) { ((cb_t)(uintptr_t) tbl[2])(3); }
 """
 
 
-def test_a_void_pointer_place_that_unseen_code_writes_reaches_its_calls_by_type(tmp_path):
+def test_a_void_pointer_place_that_unseen_code_writes_reaches_its_calls_by_type(tmp_path, toolchain):
     """`extern void *`, a library return, a write through `&msg`: a copy of the place keeps the type answer.
 
     A cast through an integer reads the `void *` place too (`fire_table`).
     """
-    edges = _edges(tmp_path, "void_outside.c", VOID_OUTSIDE)
+    edges = _edges(tmp_path, toolchain, "void_outside.c", VOID_OUTSIDE)
     assert {
         ("fire_copy", "on_a", "type_only"), ("fire_lib_copy", "on_a", "type_only"),
         ("worker", "on_msg", "type_only"), ("worker_lib", "on_msg", "type_only"),
@@ -447,18 +445,17 @@ void typed_once(cb_t f) { cb_t r = READ_ONCE(g_read); r(8); WRITE_ONCE(g_write, 
 """
 
 
-def _fact_rows(tmp_path: Path, name: str, source: str):
+def _fact_rows(tmp_path: Path, name: str, source: str, toolchain):
     """The slot facts of one unit, each row as the walk gives it (with its column)."""
     from fw_context_mcp.indexer._slots import collect_slot_facts
-    from fw_context_mcp.indexer.symbols import _get_index
 
     src = tmp_path / name
     src.write_text(source, encoding="utf-8")
-    unit = _get_index().parse(str(src), args=["-x", "c", "-std=gnu11"])
+    unit = parse_unit(src, toolchain, ["-std=gnu11"])
     return base_names(collect_slot_facts(unit, None, lambda p: Path(p).resolve()), src)
 
 
-def test_a_read_of_a_void_pointer_place_gives_each_fact_one_time(tmp_path):
+def test_a_read_of_a_void_pointer_place_gives_each_fact_one_time(tmp_path, toolchain):
     """The reference and the cast back read one place: one flow, and one `OUTSIDE` row for each place.
 
     `flag != 0` reads a `void *` place that code out of the build writes,
@@ -466,7 +463,7 @@ def test_a_read_of_a_void_pointer_place_gives_each_fact_one_time(tmp_path):
     """
     from fw_context_mcp.indexer._slots import OUTSIDE
 
-    facts = _fact_rows(tmp_path, "rows.c", ROWS)
+    facts = _fact_rows(tmp_path, "rows.c", ROWS, toolchain=toolchain)
     assert len([flow for flow in facts.flows if flow.source == "V|c:@user"]) == 1, facts.flows
     assert len([flow for flow in facts.flows if flow.source.endswith("@cells")]) == 1, facts.flows
     # `lib_table()[1]`: no visit reads an element through a pointer, but the cast back.
@@ -475,26 +472,26 @@ def test_a_read_of_a_void_pointer_place_gives_each_fact_one_time(tmp_path):
     assert sorted(outside) == ["R|c:@F@lib_ctx", "R|c:@F@lib_table", "V|c:@opaque"], facts.escapes
 
 
-def test_a_discarded_return_of_a_library_function_gives_no_escape(tmp_path):
+def test_a_discarded_return_of_a_library_function_gives_no_escape(tmp_path, toolchain):
     """`lib_copy(a, b, 4);`: the `void *` that the call gives goes nowhere, thus no row."""
-    facts = _fact_rows(tmp_path, "rows.c", ROWS)
+    facts = _fact_rows(tmp_path, "rows.c", ROWS, toolchain=toolchain)
     assert not [escape for escape in facts.escapes if escape.slot == "R|c:@F@lib_copy"], facts.escapes
 
 
-def test_an_array_of_void_pointers_as_a_whole_carries_no_function(tmp_path):
+def test_an_array_of_void_pointers_as_a_whole_carries_no_function(tmp_path, toolchain):
     """`sink(slots, …)` and `sink(a, …)` with `void *a[]` give a pointer to the place, not a value that it holds.
 
     No flow and no argument of the indirect call.  The escape "address
     taken" tells a write through it.
     """
-    facts = _fact_rows(tmp_path, "rows.c", ROWS)
+    facts = _fact_rows(tmp_path, "rows.c", ROWS, toolchain=toolchain)
     places = ("@slots", "@pass|0")
     assert not [argument for argument in facts.arguments if argument.value.endswith(places)], facts.arguments
     assert not [flow for flow in facts.flows if flow.source.endswith(places)], facts.flows
     assert "V|c:rows.c@slots" in {escape.slot for escape in facts.escapes if escape.reason == "address taken"}
 
 
-def test_a_read_through_the_address_of_a_void_pointer_place_goes_on(tmp_path):
+def test_a_read_through_the_address_of_a_void_pointer_place_goes_on(tmp_path, toolchain):
     """`READ_ONCE(once)` and `*&ctab[1]` read the value: it goes on into the local.
 
     `WRITE_ONCE(g_write, f)` writes through the pointer: an escape.  The
@@ -502,7 +499,7 @@ def test_a_read_through_the_address_of_a_void_pointer_place_goes_on(tmp_path):
     tell a read through the pointer from a write), which adds targets by
     the type and loses none.
     """
-    facts = _fact_rows(tmp_path, "rows.c", ROWS)
+    facts = _fact_rows(tmp_path, "rows.c", ROWS, toolchain=toolchain)
     for place in ("@once", "@ctab"):
         assert len([flow for flow in facts.flows if flow.source.endswith(place)]) == 1, facts.flows
     taken = {escape.slot for escape in facts.escapes if escape.reason == "address taken"}
@@ -518,12 +515,12 @@ void fire_each() { for (void *p : cbs) ((tick_t) p)(1); }
 """
 
 
-def test_a_range_for_over_a_void_pointer_array_carries_its_functions(tmp_path):
-    edges = _edges(tmp_path, "range.cpp", RANGE)
+def test_a_range_for_over_a_void_pointer_array_carries_its_functions(tmp_path, toolchain):
+    edges = _edges(tmp_path, toolchain, "range.cpp", RANGE)
     assert ("fire_each", "on_each", "slot") in edges, edges
 
 
-def test_an_extern_variable_that_an_other_unit_defines_does_not_escape(tmp_path):
+def test_an_extern_variable_that_an_other_unit_defines_does_not_escape(tmp_path, toolchain):
     """`extern cb_t g_cb` in b.c, `cb_t g_cb = on_a` in a.c: the call reaches on_a, and on_b by no guess."""
-    edges = _edges_units(tmp_path, {"a.c": OUTSIDE_A, "b.c": OUTSIDE_B})
+    edges = _edges_units(tmp_path, toolchain, {"a.c": OUTSIDE_A, "b.c": OUTSIDE_B})
     assert {edge for edge in edges if edge[0] == "fire"} == {("fire", "on_a", "slot")}

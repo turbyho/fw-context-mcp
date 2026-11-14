@@ -58,6 +58,12 @@ def esp_idf_project(tmp_path: Path, monkeypatch) -> tuple[Path, list[list[str]]]
     monkeypatch.setattr(mod, "run_build_command", fake_run)
     monkeypatch.setattr(shutil, "which", lambda n, path=None: f"/usr/bin/{n}")
     monkeypatch.setattr(mod, "build_tool_available", lambda *a, **kw: True, raising=False)
+    # The lookup of the builders (require_build_tool): Windows looks with
+    # _find_program, and a stub of shutil.which does not reach it.
+    monkeypatch.setattr(
+        mod, "require_build_tool",
+        lambda names, cwd, cfg, hint: names if isinstance(names, str) else names[0], raising=False,
+    )
     return root, calls
 
 
@@ -150,6 +156,12 @@ class TestESPIDFOutputDirectory:
         monkeypatch.setattr(mod, "run_build_command", lambda *a, **kw: _Result())  # writes nothing
         monkeypatch.setattr(shutil, "which", lambda n, path=None: f"/usr/bin/{n}")
         monkeypatch.setattr(mod, "build_tool_available", lambda *a, **kw: True, raising=False)
+        # The lookup of the builders (require_build_tool): Windows looks with
+        # _find_program, and a stub of shutil.which does not reach it.
+        monkeypatch.setattr(
+            mod, "require_build_tool",
+            lambda names, cwd, cfg, hint: names if isinstance(names, str) else names[0], raising=False,
+        )
 
         # The message names the directory in the form of the system.
         with pytest.raises(RuntimeError, match=re.escape(str(Path("default", "out")))):
@@ -187,8 +199,13 @@ class TestESPIDFLeavesSdkconfigAlone:
             encoding="utf-8"
         ), "the configuration of the user must come through untouched"
 
-    def test_a_project_without_sdkconfig_still_gets_a_target(self, tmp_path: Path, monkeypatch):
-        """A fresh clone has nothing to rename, thus set-target is safe there."""
+    def test_a_project_without_sdkconfig_gets_no_set_target(self, tmp_path: Path, monkeypatch):
+        """ESP-IDF selects the target itself: IDF_TARGET, sdkconfig.defaults, else esp32 (targets.cmake).
+
+        Measured with ESP-IDF 6.1: a project with only sdkconfig.defaults for
+        esp32s3 got esp32s3.  The set-target esp32 of an older version took
+        esp32 for each chip.
+        """
         import fw_context_mcp.indexer.builders.esp_idf as mod
         from fw_context_mcp.indexer.builders.esp_idf import ESPIDFBuildSystem
 
@@ -210,13 +227,17 @@ class TestESPIDFLeavesSdkconfigAlone:
         monkeypatch.setattr(mod, "run_build_command", fake_run)
         monkeypatch.setattr(shutil, "which", lambda n, path=None: f"/usr/bin/{n}")
         monkeypatch.setattr(mod, "build_tool_available", lambda *a, **kw: True, raising=False)
+        # The lookup of the builders (require_build_tool): Windows looks with
+        # _find_program, and a stub of shutil.which does not reach it.
+        monkeypatch.setattr(
+            mod, "require_build_tool",
+            lambda names, cwd, cfg, hint: names if isinstance(names, str) else names[0], raising=False,
+        )
 
         ESPIDFBuildSystem().build(root, replace(BuildConfig(), clean=False))
 
-        assert any("set-target" in c for c in calls), (
-            "with no sdkconfig cmake has no target to read, thus set-target "
-            "is the only way to configure — and it renames nothing"
-        )
+        assert not [c for c in calls if "set-target" in c], calls
+        assert calls[-1][-1] == "build"
 
 
 class TestESPIDFValidation:
@@ -259,6 +280,12 @@ class TestEveryBackendBuildsIntoTheOutputDirectory:
         monkeypatch.setattr(mod, "run_build_command", fake_run)
         monkeypatch.setattr(shutil, "which", lambda n, path=None: f"/usr/bin/{n}")
         monkeypatch.setattr(mod, "build_tool_available", lambda *a, **kw: True, raising=False)
+        # The lookup of the builders (require_build_tool): Windows looks with
+        # _find_program, and a stub of shutil.which does not reach it.
+        monkeypatch.setattr(
+            mod, "require_build_tool",
+            lambda names, cwd, cfg, hint: names if isinstance(names, str) else names[0], raising=False,
+        )
         return calls
 
     @staticmethod
@@ -288,11 +315,14 @@ class TestEveryBackendBuildsIntoTheOutputDirectory:
             if "--only-compilation-database" in cmd:
                 self._write_cc(Path(cmd[cmd.index("--build-path") + 1]))
 
-        self._record(monkeypatch, mod, on_call)
+        calls = self._record(monkeypatch, mod, on_call)
 
         result = mod.ArduinoBuildSystem().build(tmp_path, BuildConfig(fqbn="arduino:avr:uno"))
 
         assert result == _out(tmp_path) / "compile_commands.json"
+        # The port of sketch.yaml stays out: a board that is not attached
+        # stopped the compile (default_port with default_protocol).
+        assert all(cmd[cmd.index("--port") + 1] == "fw-context-no-upload" for cmd, _ in calls), calls
 
     def test_zephyr(self, tmp_path: Path, monkeypatch):
         import fw_context_mcp.indexer.builders.zephyr as mod
@@ -390,6 +420,12 @@ class TestPlatformIO:
         monkeypatch.setattr(mod, "run_build_command", fake_run)
         monkeypatch.setattr(shutil, "which", lambda n, path=None: f"/usr/bin/{n}")
         monkeypatch.setattr(mod, "build_tool_available", lambda *a, **kw: True, raising=False)
+        # The lookup of the builders (require_build_tool): Windows looks with
+        # _find_program, and a stub of shutil.which does not reach it.
+        monkeypatch.setattr(
+            mod, "require_build_tool",
+            lambda names, cwd, cfg, hint: names if isinstance(names, str) else names[0], raising=False,
+        )
         return calls
 
     def test_the_only_environment_builds_into_out(self, tmp_path: Path, monkeypatch):
@@ -515,6 +551,12 @@ class TestPlatformIO:
         monkeypatch.setattr(mod, "run_build_command", lambda *a, **kw: _Result())
         monkeypatch.setattr(shutil, "which", lambda n, path=None: f"/usr/bin/{n}")
         monkeypatch.setattr(mod, "build_tool_available", lambda *a, **kw: True, raising=False)
+        # The lookup of the builders (require_build_tool): Windows looks with
+        # _find_program, and a stub of shutil.which does not reach it.
+        monkeypatch.setattr(
+            mod, "require_build_tool",
+            lambda names, cwd, cfg, hint: names if isinstance(names, str) else names[0], raising=False,
+        )
 
         with pytest.raises(RuntimeError, match="COMPILATIONDB_PATH"):
             mod.PlatformIOBuildSystem().build(tmp_path, BuildConfig(clean=False, environment="esp32dev"))

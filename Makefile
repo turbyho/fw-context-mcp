@@ -25,8 +25,7 @@ PYTHON    ?= python3
 # neither uv nor this Makefile.
 #
 # So ask the binary to run.  A shim that dispatches correctly passes; a shim
-# that cannot does not.  This is the same rule utils.resolve_real_binary
-# applies to compiledb, for the same reason.
+# that cannot does not.
 UV := $(shell uv --version >/dev/null 2>&1 && command -v uv)
 
 # Every target below installs into $(VENV) and NEVER through a bare `pip`.
@@ -146,26 +145,52 @@ lint-security:
 	$(VENV)/bin/bandit -r src/ -c pyproject.toml
 
 # ---- test targets ----
-# fast subset: excludes tests needing ollama, libclang, C compiler, and slow indexing
+# The embedded SDKs of the tests (tests/sdk/versions.toml): Zephyr, the
+# Zephyr SDK and the PlatformIO packages, in ~/.fw-context-test-sdk
+# (C:\fwctx-sdk on Windows, or $FW_CONTEXT_TEST_SDK).  The tests compile
+# their fixtures with these toolchains.  The global PlatformIO directory of the user does not change.
+test-sdk:
+	$(VENV)/bin/python -m tests.sdk.provision
+
+# The extended set of the test SDKs too (tests/sdk/versions.toml, [extra]):
+# the PlatformIO projects of ESP32, Nucleo L476RG and Uno, ESP-IDF, and
+# Arduino CLI with its AVR core.  About 6 GB more.
+test-sdk-platforms:
+	$(VENV)/bin/python -m tests.sdk.provision --extra
+
+# fast subset: leaves out the tests of the markers ollama, libclang, slow,
+# sdk_project (a build and an index run of a native project of an SDK),
+# extra_platforms (the same over the extended set), and the markers that
+# addopts leaves out: system, live (the indexes of this machine) and
+# litellm (a LiteLLM proxy).  The -m here replaces the -m of addopts in
+# pyproject.toml, thus it names each marker of the two lists.
+# The pre-test of the session (tests/_environment.py) stops the run when a
+# component that the selected tests need is missing (clang, make, the C
+# headers, the test SDKs); it names the repair.
 test:
-	$(VENV)/bin/pytest tests/ -q -m "not ollama and not libclang and not slow"
+	$(VENV)/bin/pytest tests/ -q -m "not system and not live and not litellm and not ollama and not libclang and not slow and not sdk_project and not extra_platforms"
 
 lint:
 	$(VENV)/bin/ruff check src/
 	$(VENV)/bin/mypy src/
 
-# all tests except system, slow and live (each requires manual invocation)
+# all tests except system, slow, live, litellm and extra_platforms (each requires manual invocation)
 test-all:
 	$(VENV)/bin/pytest tests/ -q
+
+# the native projects of the extended set of the test SDKs (marker
+# extra_platforms): a build and an index run of each, minutes each.
+test-platforms:
+	$(VENV)/bin/pytest tests/ -q -m "extra_platforms"
 
 # slow tests only — full indexing runs, takes 30+ minutes
 test-slow:
 	$(VENV)/bin/pytest tests/ -q -m "slow"
 
 # functional tests over the indexes that THIS machine holds.  They depend
-# on local state, thus they stay out of test-all; with no indexed project
-# they skip.
+# on local state, thus they stay out of test-all.  With no indexed project,
+# or an index that a tool refuses, they fail.
 test-live:
 	$(VENV)/bin/pytest tests/ -q -m "live"
 
-.PHONY: install update uninstall venv pip-install link-add clean-path dev test lint lint-security test-all test-slow test-live
+.PHONY: install update uninstall venv pip-install link-add clean-path dev test-sdk test-sdk-platforms test lint lint-security test-all test-platforms test-slow test-live

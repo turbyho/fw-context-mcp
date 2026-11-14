@@ -138,3 +138,52 @@ class TestEspIdfDetection:
         (tools / "activate_idf_v5.2.sh").write_text("", encoding="utf-8")
 
         assert ESPIDFBuildSystem.detect_environment(tmp_path)["activate"] is None
+
+    @staticmethod
+    def _eim_script(home: Path, version: str, idf_path: Path) -> Path:
+        """An EIM script in the form of EIM (v5.2.5, measured): the variables that it sets as NAME:value lines."""
+        tools = home / ".espressif" / "tools"
+        tools.mkdir(parents=True, exist_ok=True)
+        script = tools / f"activate_idf_{version}.sh"
+        script.write_text(
+            f"#!/bin/sh\n\nget_env_var_pairs() {{\ncat << 'EOF'\nIDF_TOOLS_PATH:{tools}\nIDF_PATH:{idf_path}\nEOF\n}}\n",
+            encoding="utf-8",
+        )
+        return script
+
+    @pytest.mark.skipif(WINDOWS, reason="EIM scripts are POSIX shell scripts")
+    def test_the_esp_idf_of_the_shell_wins_over_an_eim_script(self, tmp_path: Path, home: Path, monkeypatch) -> None:
+        """IDF_PATH of the shell names an ESP-IDF that no EIM script sets up: its export.sh."""
+        from fw_context_mcp.indexer.builders.esp_idf import ESPIDFBuildSystem
+
+        self._eim_script(home, "v5.2.5", home / ".espressif" / "v5.2.5" / "esp-idf")
+        idf = tmp_path / "esp-idf-v6.1"
+        idf.mkdir()
+        (idf / "export.sh").write_text("", encoding="utf-8")
+        monkeypatch.setenv("IDF_PATH", str(idf))
+
+        assert ESPIDFBuildSystem.detect_environment(tmp_path)["activate"] == str(idf / "export.sh")
+
+    @pytest.mark.skipif(WINDOWS, reason="EIM scripts are POSIX shell scripts")
+    def test_the_eim_script_of_the_esp_idf_of_the_shell(self, tmp_path: Path, home: Path, monkeypatch) -> None:
+        """An EIM script sets up the ESP-IDF of the shell: that script, not export.sh, and not a newer script."""
+        from fw_context_mcp.indexer.builders.esp_idf import ESPIDFBuildSystem
+
+        idf = home / ".espressif" / "v5.2.5" / "esp-idf"
+        idf.mkdir(parents=True)
+        (idf / "export.sh").write_text("", encoding="utf-8")
+        script = self._eim_script(home, "v5.2.5", idf)
+        self._eim_script(home, "v5.4.1", home / ".espressif" / "v5.4.1" / "esp-idf")
+        monkeypatch.setenv("IDF_PATH", str(idf))
+
+        assert ESPIDFBuildSystem.detect_environment(tmp_path)["activate"] == str(script)
+
+    @pytest.mark.skipif(WINDOWS, reason="EIM scripts are POSIX shell scripts")
+    def test_without_idf_path_the_newest_eim_script_by_its_version(self, tmp_path: Path, home: Path) -> None:
+        """v5.10 is newer than v5.2: the version as numbers, not as text."""
+        from fw_context_mcp.indexer.builders.esp_idf import ESPIDFBuildSystem
+
+        self._eim_script(home, "v5.2.5", home / "a")
+        newest = self._eim_script(home, "v5.10.0", home / "b")
+
+        assert ESPIDFBuildSystem.detect_environment(tmp_path)["activate"] == str(newest)

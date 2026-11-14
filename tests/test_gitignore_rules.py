@@ -14,7 +14,6 @@ file asks git itself, and not this reasoning.
 
 from __future__ import annotations
 
-import shutil
 import subprocess
 
 import pytest
@@ -203,7 +202,6 @@ def _git_ignores(root, relative: str) -> bool:
     return result.returncode == 0
 
 
-@pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
 def test_the_join_keeps_the_pair_in_order(tmp_path):
     """The negation of a later block moved before an exclude outside the blocks.
 
@@ -225,7 +223,6 @@ def test_the_join_keeps_the_pair_in_order(tmp_path):
     assert lines.index(EXCLUDE) < lines.index(NEGATION)
 
 
-@pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
 def test_a_join_that_changes_what_git_ignores_does_not_happen(tmp_path, capsys):
     """A user negation between the blocks: a move across it changes the answer of git."""
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)  # noqa: S603,S607
@@ -246,7 +243,6 @@ def test_a_join_that_changes_what_git_ignores_does_not_happen(tmp_path, capsys):
     assert "[warn]" in capsys.readouterr().out
 
 
-@pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
 def test_a_new_entry_does_not_go_before_a_later_line_of_the_other_polarity(tmp_path):
     """The pair went to the end of the block, before a later ``*.toml`` of another tool.
 
@@ -268,7 +264,6 @@ def test_a_new_entry_does_not_go_before_a_later_line_of_the_other_polarity(tmp_p
     assert lines.count("# fw-context") == 1
 
 
-@pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
 def test_a_repeated_entry_keeps_its_last_place(tmp_path):
     """The first copy of X, !X, X stayed, and git then stopped to ignore X."""
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)  # noqa: S603,S607
@@ -284,7 +279,6 @@ def test_a_repeated_entry_keeps_its_last_place(tmp_path):
     assert _git_ignores(tmp_path, "LEAN-CTX.md")
 
 
-@pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
 def test_lines_that_git_reads_as_different_stay_different(tmp_path):
     """``keep.o`` and ``keep.o<TAB>`` are two patterns for git; strip() made them one."""
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)  # noqa: S603,S607
@@ -349,7 +343,6 @@ def test_a_crlf_file_stays_crlf(tmp_path):
 # ── What git actually does ─────────────────────────────────────────────
 
 
-@pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
 def test_git_agrees(tmp_path):
     """Ask git, and not this test file, whether the rules are right."""
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)  # noqa: S603,S607
@@ -379,7 +372,6 @@ def test_git_agrees(tmp_path):
     assert ignored(".fw-context/build/default/out/.link_script.ld")
 
 
-@pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
 def test_git_agrees_about_a_project_below_the_root(tmp_path):
     """A repository can hold a bootloader beside an application.
 

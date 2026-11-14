@@ -10,7 +10,6 @@ against the extraction alone would not touch it.
 import pytest
 
 import fw_context_mcp  # noqa: F401  — must precede sqlite3
-from fw_context_mcp.indexer.compile_commands import CompilationUnit
 from fw_context_mcp.indexer.db import (
     get_function_address_arrays,
     insert_refs_batch,
@@ -20,6 +19,7 @@ from fw_context_mcp.indexer.db import (
     upsert_project,
 )
 from fw_context_mcp.indexer.ops import store_symbols_for_unit
+from tests._toolchains import unit_of
 
 pytestmark = pytest.mark.libclang
 
@@ -36,7 +36,7 @@ def _open(tmp_path, *hashes):
     return conn
 
 
-def _index(tmp_path, code, filename="isr_tables.c"):
+def _index(tmp_path, code, filename="isr_tables.c", *, toolchain):
     """Store *code* the way the indexer does, and return the connection.
 
     This goes through ``store_symbols_for_unit`` rather than building rows
@@ -45,8 +45,7 @@ def _index(tmp_path, code, filename="isr_tables.c"):
     """
     src = tmp_path / filename
     src.write_text(code, encoding="utf-8")
-    unit = CompilationUnit(file=src, directory=tmp_path, language="c",
-                           clang_args=["-std=c11"])
+    unit = unit_of(src, toolchain, ["-std=c11"], directory=tmp_path, language="c")
 
     conn = _open(tmp_path, CONFIG)
     store_symbols_for_unit(conn, unit, CONFIG, tmp_path, index_refs=True)
@@ -62,7 +61,7 @@ def _slots(conn):
     return out
 
 
-def test_a_generated_table_reads_back_slot_by_slot(tmp_path):
+def test_a_generated_table_reads_back_slot_by_slot(tmp_path, toolchain):
     """The Zephyr shape: addresses cast to an integer array.
 
     ``_irq_vector_table`` is ``const uintptr_t[]``, not an array of function
@@ -77,7 +76,7 @@ const uintptr_t _irq_vector_table[3] = {
     ((uintptr_t)&_isr_wrapper),
     ((uintptr_t)&_isr_wrapper),
 };
-""")
+""", toolchain=toolchain)
     try:
         assert _slots(conn) == {"_irq_vector_table": {
             0: "z_arm_exc_spurious",
@@ -88,19 +87,19 @@ const uintptr_t _irq_vector_table[3] = {
         conn.close()
 
 
-def test_a_table_of_function_pointers_reads_back_too(tmp_path):
+def test_a_table_of_function_pointers_reads_back_too(tmp_path, toolchain):
     """The plain shape, without a cast, is the same construct."""
     conn = _index(tmp_path, """
 void reset(void); void nmi(void); void hard(void);
 void (*const vectors[])(void) = { reset, nmi, hard };
-""")
+""", toolchain=toolchain)
     try:
         assert _slots(conn) == {"vectors": {0: "reset", 1: "nmi", 2: "hard"}}
     finally:
         conn.close()
 
 
-def test_each_array_keeps_its_own_slot_numbers(tmp_path):
+def test_each_array_keeps_its_own_slot_numbers(tmp_path, toolchain):
     """Two tables in one file both start at slot 0.
 
     Without the array on every row a reader would see two slot 0 entries
@@ -117,7 +116,7 @@ void (*const fsm_steps[])(void) = {
     step_x,
     step_y,
 };
-""")
+""", toolchain=toolchain)
     try:
         assert _slots(conn) == {
             "vectors": {0: "isr_a", 1: "isr_b"},
@@ -127,19 +126,19 @@ void (*const fsm_steps[])(void) = {
         conn.close()
 
 
-def test_a_hole_leaves_a_gap_in_the_slot_numbers(tmp_path):
+def test_a_hole_leaves_a_gap_in_the_slot_numbers(tmp_path, toolchain):
     """An unused entry has no address, so its slot is simply absent."""
     conn = _index(tmp_path, """
 void reset(void); void hard(void);
 void (*const vectors[])(void) = { reset, 0, 0, hard };
-""")
+""", toolchain=toolchain)
     try:
         assert _slots(conn) == {"vectors": {0: "reset", 3: "hard"}}
     finally:
         conn.close()
 
 
-def test_a_designated_table_is_not_reported(tmp_path):
+def test_a_designated_table_is_not_reported(tmp_path, toolchain):
     """No slot was recorded for it, so the reader has nothing to report.
 
     This is the deliberate consequence of refusing to guess: the elements
@@ -149,27 +148,27 @@ def test_a_designated_table_is_not_reported(tmp_path):
     conn = _index(tmp_path, """
 void svc(void); void hard(void);
 void (*const vectors[16])(void) = { [11] = svc, [3] = hard };
-""")
+""", toolchain=toolchain)
     try:
         assert _slots(conn) == {}
     finally:
         conn.close()
 
 
-def test_an_assignment_is_not_a_table(tmp_path):
+def test_an_assignment_is_not_a_table(tmp_path, toolchain):
     """An indirect reference without a slot must not become slot 0."""
     conn = _index(tmp_path, """
 void handler(void);
 void (*cb)(void);
 void install(void) { cb = handler; }
-""")
+""", toolchain=toolchain)
     try:
         assert _slots(conn) == {}
     finally:
         conn.close()
 
 
-def test_a_macro_expansion_does_not_donate_slots_to_a_neighbour(tmp_path):
+def test_a_macro_expansion_does_not_donate_slots_to_a_neighbour(tmp_path, toolchain):
     """A driver macro puts a whole device definition on one line.
 
     Measured on a Zephyr index: ``__pinctrl_state_pins_0`` sits at line
@@ -190,14 +189,14 @@ struct dev { int (*ini)(void); void (*irq)(void); };
 typedef unsigned char pin_t;
 const pin_t pins[] = { 11, 12 }; const struct dev d = { (int (*)(void))init, isr };
 void (*const real_table[])(void) = { isr, init };
-""", filename="driver.c")
+""", filename="driver.c", toolchain=toolchain)
     try:
         assert _slots(conn) == {"real_table": {0: "isr", 1: "init"}}
     finally:
         conn.close()
 
 
-def test_two_arrays_on_one_line_report_neither(tmp_path):
+def test_two_arrays_on_one_line_report_neither(tmp_path, toolchain):
     """When a line holds two arrays, ownership is not knowable from it.
 
     The range join asks which array's extent covers the line of the
@@ -208,7 +207,7 @@ def test_two_arrays_on_one_line_report_neither(tmp_path):
     conn = _index(tmp_path, """
 void a(void); void b(void);
 void (*const t1[])(void) = { a }; void (*const t2[])(void) = { b };
-""")
+""", toolchain=toolchain)
     try:
         assert _slots(conn) == {}
     finally:
@@ -239,7 +238,7 @@ def test_an_index_without_slots_reports_nothing(tmp_path):
         conn.close()
 
 
-def test_another_build_does_not_leak_its_table(tmp_path):
+def test_another_build_does_not_leak_its_table(tmp_path, toolchain):
     """Slots are read for one configuration only.
 
     Five images of one Zephyr project each hold their own
@@ -249,7 +248,7 @@ def test_another_build_does_not_leak_its_table(tmp_path):
     conn = _index(tmp_path, """
 void isr_a(void); void isr_b(void);
 void (*const vectors[])(void) = { isr_a, isr_b };
-""")
+""", toolchain=toolchain)
     try:
         with transaction(conn):
             upsert_build_config(conn, "otherhash", "pid", "cc.json")
@@ -259,7 +258,7 @@ void (*const vectors[])(void) = { isr_a, isr_b };
         conn.close()
 
 
-def test_every_row_names_the_target_and_the_position(tmp_path):
+def test_every_row_names_the_target_and_the_position(tmp_path, toolchain):
     """One row must carry both halves a reader needs.
 
     The target says what runs; the array and the line say where the
@@ -268,7 +267,7 @@ def test_every_row_names_the_target_and_the_position(tmp_path):
     conn = _index(tmp_path, """
 void reset(void);
 void (*const vectors[])(void) = { reset };
-""")
+""", toolchain=toolchain)
     try:
         rows = get_function_address_arrays(conn, CONFIG)
         assert len(rows) == 1

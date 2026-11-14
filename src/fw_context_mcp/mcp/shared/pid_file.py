@@ -26,7 +26,7 @@ import os
 import tempfile
 from pathlib import Path
 
-from ...processes import pid_exists
+from ...processes import MAX_PID, parse_pid, pid_exists
 from ...utils import owner_token, remove_file, replace_file
 
 log = logging.getLogger(__name__)
@@ -159,19 +159,18 @@ class PidFile:
         Cleans up stale files (PID not alive or corrupt content)
         automatically — the caller never sees a stale PID file as active.
         """
-        try:
-            pid = int(path.read_text(encoding="utf-8").strip())
-        except FileNotFoundError:
-            # Nothing to clean.  An unlink here deleted the file that a
-            # writer made after this read, thus a live marker.
-            return False
-        except (OSError, ValueError):
-            _remove_dead_marker(path)
-            return False
+        return PidFile._active_pid(path) is not None
+
+    @staticmethod
+    def _active_pid(path: Path) -> int | None:
+        """Return the PID of *path* while that process lives, else None; a stale file goes (see :meth:`is_active`)."""
+        pid = PidFile.read_pid(path)
+        if pid is None:
+            return None
         if PidFile._pid_exists(pid):
-            return True
+            return pid
         _remove_dead_marker(path)
-        return False
+        return None
 
     @staticmethod
     def is_active_other(path: Path) -> bool:
@@ -186,10 +185,11 @@ class PidFile:
         Use :meth:`is_active` to answer "is anyone paused?" and this to
         answer "is someone ELSE paused?".  A guard that must not fire on our
         own marker needs the latter.
+
+        One read of the file: two reads (the check of life, then the PID)
+        could see two different writers.
         """
-        if not PidFile.is_active(path):
-            return False
-        pid = PidFile.read_pid(path)
+        pid = PidFile._active_pid(path)
         return pid is not None and pid != os.getpid()
 
     @staticmethod
@@ -197,16 +197,50 @@ class PidFile:
         """Read a PID from *path*.
 
         Returns ``None`` when the file does not exist or contains
-        garbage.  Corrupt files are cleaned up automatically.
+        garbage.  Corrupt files are cleaned up automatically.  Garbage is
+        also a number that is no PID in 1 .. ``MAX_PID``
+        (``processes.parse_pid``): ``kill`` reads 0 and -1 as process
+        groups, and a writer of a marker writes ``os.getpid()``.
         """
         try:
-            return int(path.read_text(encoding="utf-8").strip())
-        except FileNotFoundError:
-            # See is_active: no unlink of a file that a writer made since.
+            pid, problem = read_pid_file(path)
+        except OSError as exc:
+            # No answer about the content (read_pid_file): the marker
+            # stays, and the next check reads it again.
+            log.warning("Cannot read the marker %s: %s", path, exc)
             return None
-        except (OSError, ValueError):
+        if problem is not None:
             _remove_dead_marker(path)
-            return None
+        # No unlink of a file that does not exist: an unlink here deleted
+        # the file that a writer made after this read, thus a live marker.
+        return pid
+
+
+def read_pid_file(path: Path) -> tuple[int | None, str | None]:
+    """Read the PID of the file *path*, and change nothing.
+
+    Return ``(pid, None)`` for a PID, ``(None, None)`` when the file does not
+    exist, and ``(None, problem)`` when the content of the file is damaged:
+    it is not UTF-8, or its text is no PID in 1 .. ``MAX_PID``
+    (``processes.parse_pid``).  WHY the problem as text: ``fw-context watch
+    restart`` reports it, and a reader that turned an error into "no PID"
+    hid the cause.  :meth:`PidFile.read_pid` removes a file with a problem.
+
+    Raise OSError when the read fails (PermissionError, a file that a
+    different process replaces on Windows).  WHY not a problem: the error
+    tells nothing about the content, and a live marker of a different
+    process was removed because of it.
+    """
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None, None
+    except UnicodeDecodeError as exc:
+        return None, f"is not UTF-8: {exc}"
+    pid = parse_pid(text)
+    if pid is None:
+        return None, f"holds {text!r}, which is no PID in 1 .. {MAX_PID}"
+    return pid, None
 
 
 def _remove_dead_marker(path: Path) -> None:

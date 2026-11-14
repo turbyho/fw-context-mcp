@@ -618,6 +618,11 @@ def _tools():
 
 TOOLS = _tools()
 TOOL_IDS = [t.name for t in TOOLS]
+#: The tools that take each parameter.  WHY a list per parameter: a tool
+#: without the parameter was a skip in each test of it, and a skip reads
+#: as a pass.
+WITH_PROJECT_ROOT = [t for t in TOOLS if "project_root" in t.inputSchema.get("properties", {})]
+WITH_PROJECT = [t for t in TOOLS if "project" in t.inputSchema.get("properties", {})]
 
 
 def test_the_server_registers_tools():
@@ -652,28 +657,24 @@ def test_no_resource_answers_about_a_symbol():
     assert sorted(uris) == ["fw-context://projects", "fw-context://skills/fw-review", "fw-context://stats"], uris
 
 
-@pytest.mark.parametrize("tool", TOOLS, ids=TOOL_IDS)
+@pytest.mark.parametrize("tool", WITH_PROJECT_ROOT, ids=[t.name for t in WITH_PROJECT_ROOT])
 def test_a_tool_that_takes_a_project_root_also_takes_a_project(tool):
     """One tool without the parameter recreates the original failure."""
     properties = tool.inputSchema.get("properties", {})
-    if "project_root" not in properties:
-        pytest.skip(f"{tool.name} takes no project")
     assert "project" in properties, f"{tool.name} has project_root but no project"
 
 
-@pytest.mark.parametrize("tool", TOOLS, ids=TOOL_IDS)
+@pytest.mark.parametrize("tool", WITH_PROJECT, ids=[t.name for t in WITH_PROJECT])
 def test_the_project_parameter_is_described(tool):
     """The description is what the LLM reads before it calls the tool."""
     properties = tool.inputSchema.get("properties", {})
-    if "project" not in properties:
-        pytest.skip(f"{tool.name} takes no project")
     assert properties["project"].get("description")
     assert "list_projects" in properties["project"]["description"], (
         f"{tool.name}: the description does not say where the names come from"
     )
 
 
-@pytest.mark.parametrize("tool", TOOLS, ids=TOOL_IDS)
+@pytest.mark.parametrize("tool", WITH_PROJECT, ids=[t.name for t in WITH_PROJECT])
 def test_the_project_entry_sits_in_the_args_section(tool):
     """A parameter documented after Returns: is not in the parameter list.
 
@@ -681,9 +682,6 @@ def test_the_project_entry_sits_in_the_args_section(tool):
     hangs at the end of the docstring is a different kind of text, and
     every other parameter of the tool is in ``Args:``.
     """
-    properties = tool.inputSchema.get("properties", {})
-    if "project" not in properties:
-        pytest.skip(f"{tool.name} takes no project")
     doc = tool.description or ""
     entry = re.search(r"^[ \t]*project:", doc, re.MULTILINE)
     assert entry, f"{tool.name}: the docstring has no `project:` entry"
@@ -695,12 +693,10 @@ def test_the_project_entry_sits_in_the_args_section(tool):
         )
 
 
-@pytest.mark.parametrize("tool", TOOLS, ids=TOOL_IDS)
+@pytest.mark.parametrize("tool", WITH_PROJECT_ROOT, ids=[t.name for t in WITH_PROJECT_ROOT])
 def test_project_root_says_that_it_takes_a_name_too(tool):
     """resolve_project_root resolves a name and an id — the text must say so."""
     properties = tool.inputSchema.get("properties", {})
-    if "project_root" not in properties:
-        pytest.skip(f"{tool.name} takes no project_root")
     description = properties["project_root"].get("description", "")
     assert "project name or a project_id" in description, (
         f"{tool.name}: project_root still describes a path only"

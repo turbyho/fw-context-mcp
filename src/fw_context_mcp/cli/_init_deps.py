@@ -6,14 +6,15 @@ Kept separate from ``_init.py`` so ``cmd_init`` stays a thin orchestrator
 1. ``_run_deps_auto_fix`` — full check + auto-fix of pip packages.
 2. ``_model_status`` — fresh chat/embed model status (after LLM config).
 3. ``_print_checklist`` — the remaining-steps checklist.
+4. ``missing_required`` — the critical checks of the installation that
+   failed, which make ``init`` end with exit code 1.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from ..deps import DepCheckResult, run_fixes, run_full_check
-from ..deps._instructions import get_platform_info, libclang_so_instructions
+from ..deps import DepCheckResult, installation_checks, run_fixes, run_full_check
 from ._init_build import _count_cc_entries
 
 _PIP_DEPS = ("pysqlite3", "sqlite-vec", "libclang-python", "watchfiles", "tomli-w")
@@ -72,6 +73,26 @@ def _print_deps_summary(results: list[DepCheckResult]) -> None:
         else:
             cmd = f" — run: {r.fix_cmd}" if r.fix_cmd else ""
             print(f"  [✗]  {r.name}: {r.message}{cmd}")
+            # WHY: a check without a fix command (the clang program, a
+            # system package) printed no repair at all.
+            if not r.fix_cmd and r.instructions:
+                for line in r.instructions.splitlines():
+                    print(f"        {line}")
+
+
+def _failed_installation_checks(results: list[DepCheckResult]) -> list[DepCheckResult]:
+    """The checks of the installation that failed: not ok, and not skipped for a failed prerequisite."""
+    names = installation_checks()
+    return [r for r in results if r.name in names and r.status not in ("ok", "skipped")]
+
+
+def missing_required(results: list[DepCheckResult]) -> list[DepCheckResult]:
+    """The critical checks of the installation that failed after the fixes.
+
+    WHY: ``init`` printed "Setup complete" and ended with exit code 0 when
+    libclang or pysqlite3 was missing, and no index run can work then.
+    """
+    return [r for r in _failed_installation_checks(results) if r.critical]
 
 
 def _model_status(project_root: Path) -> dict[str, DepCheckResult]:
@@ -132,10 +153,12 @@ def _print_checklist(
     # items are fixed by ``fw-context index --build``, not by init.
     remaining: list[tuple[str, str]] = []
     needs_init_rerun = False
-    libclang = next((r for r in after_results if r.name == "libclang-so"), None)
-    if libclang is not None and libclang.status == "missing":
-        cmd = libclang.fix_cmd or libclang_so_instructions(get_platform_info())
-        remaining.append(("[system]", cmd))
+    # Each check of the installation that failed, with its repair.  WHY not
+    # only libclang-so: the clang program, the clang headers and a pip
+    # package whose fix failed were not in the list.
+    for failed in _failed_installation_checks(after_results):
+        repair = failed.fix_cmd or failed.instructions or "fw-context doctor"
+        remaining.append(("[system]", f"{failed.name}: {failed.message}\n" + repair))
         needs_init_rerun = True
 
     for name, label in (("chat-model", "chat model"), ("embed-model", "embedding model")):
@@ -164,6 +187,9 @@ def _print_checklist(
     if remaining:
         print("  Remaining:")
         for i, (cat, cmd) in enumerate(remaining, start=1):
-            print(f"    {cat:<10} {i}. {cmd}")
+            first, *rest = cmd.splitlines()
+            print(f"    {cat:<10} {i}. {first}")
+            for line in rest:
+                print(f"    {'':<10}    {line}")
         if needs_init_rerun:
             print("\n  (re-run `fw-context init` after fixing remaining items — it is safe to re-run)")

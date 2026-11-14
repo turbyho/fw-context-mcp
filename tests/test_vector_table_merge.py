@@ -9,6 +9,8 @@ These tests cover the merge: that both sources arrive, that each row says
 where it came from, that slot numbers stay inside their own table, and that
 a dispatcher is told apart from a handler and from an unused stub.
 """
+import json
+
 import pytest
 
 import fw_context_mcp  # noqa: F401  — must precede sqlite3
@@ -144,6 +146,13 @@ def _installs_at_runtime(conn, irq, handler, offset="16", at_line=90,
             insert_macros_batch(conn, [
                 (CONFIG, fid, "NVIC_USER_IRQ_OFFSET", offset, "", offset, 5, 0),
             ])
+            # The value that the macros step stores when each unit that
+            # reads the file has this definition (macros.store_values_of_build).
+            conn.execute(
+                "UPDATE macros SET expanded_values = ? WHERE file_id = ? AND name = 'NVIC_USER_IRQ_OFFSET'",
+                (json.dumps([{"state": "defined", "units": 1, "value": offset, "params": "",
+                              "is_function_like": False}]), fid),
+            )
 
 
 def test_both_sources_arrive(tmp_path):

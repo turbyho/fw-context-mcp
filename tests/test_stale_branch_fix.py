@@ -7,7 +7,6 @@ the safety guard, and end-to-end integration.
 
 from __future__ import annotations
 
-import json
 import shutil
 import sqlite3
 from pathlib import Path
@@ -27,6 +26,7 @@ from fw_context_mcp.indexer.db import (
     upsert_project,
 )
 from tests._toml import toml_string
+from tests._toolchains import write_compile_commands
 
 # ── schemaless helpers ───────────────────────────────────────────────
 
@@ -422,7 +422,7 @@ class TestStalenessCheck:
 class TestStepPurgeMissingFiles:
     """WP5 test 6 — integration: delete file, same config_hash, run indexer, symbols gone."""
 
-    def test_delete_file_ghost_records_purged(self, tmp_path: Path):
+    def test_delete_file_ghost_records_purged(self, tmp_path: Path, toolchain):
         """Index a project, delete a source file from disk (cc.json unchanged),
         reindex — ghost symbols must be gone."""
 
@@ -451,15 +451,11 @@ int extra_func(void) { return 42; }
 """, encoding="utf-8")
 
         cc = [
-            {"directory": str(src), "file": "main.c",
-             "arguments": ["gcc", "-std=c11", "-Isrc", "-c", "main.c", "-o", "build/main.o"]},
-            {"directory": str(src), "file": "modem.c",
-             "arguments": ["gcc", "-std=c11", "-Isrc", "-c", "modem.c", "-o", "build/modem.o"]},
-            {"directory": str(src), "file": "extra.c",
-             "arguments": ["gcc", "-std=c11", "-Isrc", "-c", "extra.c", "-o", "build/extra.o"]},
+            {"directory": str(src), "file": name,
+             "arguments": toolchain.arguments(name, "-std=c11", "-Isrc", output=f"build/{name[:-2]}.o")}
+            for name in ("main.c", "modem.c", "extra.c")
         ]
-        cc_json = proj / "compile_commands.json"
-        cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+        cc_json = write_compile_commands(proj / "compile_commands.json", cc)
 
         # Init + index
         from fw_context_mcp.config import derive_project_id

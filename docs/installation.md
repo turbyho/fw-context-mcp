@@ -249,10 +249,10 @@ defines = [
 
 Install only the tools that your build system needs. The installation of
 fw-context installs the core Python packages: `libclang-ng`, `pysqlite3`,
-`sqlite-vec`, `watchfiles`, `httpx`, `mcp`, `tomli-w`, `tomlkit`, `keyring`,
-`pyjwt`, `packaging`, and `PyYAML`.
+`sqlite-vec`, `watchfiles`, `httpx`, `httpcore`, `certifi`, `mcp`,
+`tomli-w`, `tomlkit`, `keyring`, `pyjwt`, `packaging`, and `PyYAML`.
 
-A Python tool of a build system (`compiledb`, `keil2clangd`, `platformio`)
+A Python tool of a build system (`keil2clangd`, `platformio`)
 must be on `PATH`, or in `[build] python`. `uv tool` and `pipx` install
 fw-context in an environment of its own, thus a `pip install` does not
 reach that environment. Install such a tool with
@@ -295,10 +295,14 @@ winget install LLVM.LLVM
 > `nrfutil sdk-manager list` gives, and you select one. It then writes an
 > activation script for that toolchain, `.fw-context/ncs-env.sh`, from
 > `nrfutil sdk-manager toolchain env` and `ZEPHYR_BASE`, and writes its path
-> to `.fw-context/local.toml`, as `activate`. For plain Zephyr,
-> `fw-context init` uses `ZEPHYR_SDK_INSTALL_DIR`, the `ZEPHYR_BASE` of your
-> shell (`zephyr-env.sh`) or `~/zephyr-sdk-*/` (`environment-setup-*`).
-> Then it asks for the script that sets up the environment of the project:
+> to `.fw-context/local.toml`, as `activate`. For upstream Zephyr without
+> NCS, when the `ZEPHYR_BASE` of your shell is no NCS install,
+> `fw-context init` writes `ZEPHYR_BASE` and the SDK variables of your shell
+> to `[build] env`, and the directory of your `west` to `[build] extra_path`
+> (see [Upstream Zephyr without NCS](build.md#upstream-zephyr-without-ncs)).
+> Else, for plain Zephyr, `fw-context init` uses `ZEPHYR_SDK_INSTALL_DIR`,
+> the `ZEPHYR_BASE` of your shell (`zephyr-env.sh`) or `~/zephyr-sdk-*/`
+> (`environment-setup-*`). When init finds a script, it asks for the script that sets up the environment of the project:
 > Enter keeps the script that it found, and a path selects the script of
 > your project. Each build, and each lookup of `west`, runs after
 > `source <activate>`. On Windows the script is `.fw-context/ncs-env.cmd`,
@@ -347,8 +351,9 @@ each source (`data/mbed/compile_db.py`). It does not need `bear`, on Linux, macO
 |------|-----|---------|
 | **arduino-cli** | Compile + compile_commands.json | Linux: `curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh \| sh` / macOS: `brew install arduino-cli` / Windows: `winget install ArduinoSA.CLI` |
 
-This build system requires `fqbn` (fully qualified board name) in
-`.fw-context/config.toml`. Example: `fqbn = "arduino:avr:uno"`.
+This build system needs a board: `default_fqbn` in `sketch.yaml`, or `fqbn`
+(fully qualified board name) in `.fw-context/config.toml`. Example:
+`fqbn = "arduino:avr:uno"`. The value of the config wins.
 
 `fw-context` runs `arduino-cli compile --export-compile-commands` in two passes:
 first for the database only, then for a real compile that creates object files.
@@ -398,10 +403,12 @@ generator CMake used.
 
 | Tool | Why | Install |
 |------|-----|---------|
-| **make** | Build tool | `sudo pacman -S make` / `sudo apt install make` / `sudo dnf install make` / macOS: bundled with Xcode CLT / Windows: GNU make on `PATH` (not tested on Windows) |
-| **compiledb** | Generate compile_commands.json from make output | `uv tool install compiledb` |
+| **make** | Build tool | `sudo pacman -S make` / `sudo apt install make` / `sudo dnf install make` / macOS: bundled with Xcode CLT / Windows: GNU make on `PATH` (for example `winget install ezwinports.make`) |
 
-`fw-context` runs `compiledb -n -o compile_commands.json make` (dry-run by default).
+`fw-context` runs `make -Bnkwp` (dry-run by default) and reads the compile
+commands from its log. No other tool is necessary. On Windows, make runs a
+recipe with `cmd.exe` when no `sh.exe` is on `PATH`: a recipe of a POSIX
+shell (`mkdir -p`) then fails, as in your own build.
 
 ### Keil MDK
 
@@ -456,7 +463,7 @@ bear -- eclipse -nosplash -application com.ti.ccstudio.apps.projectBuild ...
 | **Arduino** | `arduino-cli` | — | Arduino CLI |
 | **ESP-IDF** | `idf.py` | — | ESP-IDF |
 | **CMake (generic)** | `cmake` | — | no |
-| **Makefile** | `make` | `compiledb` | no |
+| **Makefile** | `make` | — | no |
 | **Keil MDK** | — | `keil2clangd` | **no** (static parse) |
 | **IAR EWARM** | — | `keil2clangd` | **no** (static parse) |
 | **Manual (bare)** | the compiler of the project | — | the toolchain of the target |
@@ -841,7 +848,16 @@ runs these steps, in order:
 12. Save the detected embedding model one time to the global config. This
     step writes nothing when a config file sets `[llm] embed_model`, or
     when the LLM is off.
-13. Print a checklist of the remaining manual steps.
+13. Print a checklist of the remaining manual steps. Each check of the
+    installation that still fails after the fixes is a step, with its
+    repair: a fix command, or the instructions to install a system
+    package (for example the clang program).
+
+When a critical check of the installation still fails after the fixes
+(for example `pysqlite3` or `libclang-so`), `fw-context init` ends with
+exit code 1: the files are written, but no index run can work. A check
+that is not critical (for example `clang`) does not change the exit
+code.
 
 When build-system detection fails, `fw-context init` asks for the missing
 value interactively (build system, board, FQBN, and so on). In a pipe, or

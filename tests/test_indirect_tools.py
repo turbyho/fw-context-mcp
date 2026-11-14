@@ -8,15 +8,14 @@ are USRs.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
 
 from tests._paging import assert_whole_and_once, notice, walk_pages, with_project
 from tests._toml import toml_string
+from tests._toolchains import Toolchain, write_compile_commands, write_sources
 
-pytest.importorskip("clang.cindex", reason="libclang not available")
 pytestmark = pytest.mark.libclang
 
 PROJECT_ID = "proj-indirect-tools"
@@ -82,18 +81,19 @@ void with_lambda() {
 """
 
 
-def _index(root: Path, base: Path, project_id: str, name: str, source: str, compiler: str, std: str) -> None:
+def _index(
+    root: Path, base: Path, project_id: str, name: str, source: str, std: str, toolchain: Toolchain,
+) -> None:
     from fw_context_mcp.indexer.runner import run
 
     (root / ".fw-context").mkdir(parents=True)
     (root / ".fw-context" / "config.toml").write_text(
         f'[project]\nid = "{project_id}"\n\n[build]\n\n[index]\ndb_dir = {toml_string(base)}\n', encoding="utf-8",
     )
-    (root / name).write_text(source, encoding="utf-8")
-    (root / "compile_commands.json").write_text(json.dumps([{
-        "directory": str(root), "file": name,
-        "arguments": [compiler, std, "-c", name, "-o", name + ".o"],
-    }]), encoding="utf-8")
+    write_sources(root, {name: source})
+    write_compile_commands(root / "compile_commands.json", [{
+        "directory": str(root), "file": name, "arguments": toolchain.arguments(name, std, output=name + ".o"),
+    }])
     db_path = base / project_id / "index.db"
     db_path.parent.mkdir(parents=True)
     run(
@@ -104,18 +104,18 @@ def _index(root: Path, base: Path, project_id: str, name: str, source: str, comp
 
 
 @pytest.fixture(scope="module")
-def project(tmp_path_factory) -> Path:
+def project(tmp_path_factory, toolchain: Toolchain) -> Path:
     base = tmp_path_factory.mktemp("indirect")
     root = base / "proj"
-    _index(root, base, PROJECT_ID, "main.c", SOURCE, "cc", "-std=gnu11")
+    _index(root, base, PROJECT_ID, "main.c", SOURCE, "-std=gnu11", toolchain)
     return root
 
 
 @pytest.fixture(scope="module")
-def cpp_project(tmp_path_factory) -> Path:
+def cpp_project(tmp_path_factory, toolchain: Toolchain) -> Path:
     base = tmp_path_factory.mktemp("indirect_cpp")
     root = base / "proj"
-    _index(root, base, PROJECT_ID + "-cpp", "main.cpp", CPP_SOURCE, "c++", "-std=c++17")
+    _index(root, base, PROJECT_ID + "-cpp", "main.cpp", CPP_SOURCE, "-std=c++17", toolchain)
     return root
 
 

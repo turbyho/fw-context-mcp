@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -13,6 +14,7 @@ from typing import TYPE_CHECKING
 
 import yaml
 
+from fw_context_mcp.path_key import canonical_path
 from fw_context_mcp.utils import (
     build_tool_available,
     missing_tool_message,
@@ -28,6 +30,8 @@ from . import _linker, registry
 from .protocol import BuildIssue
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from ..build import BuildConfig
 
 log = logging.getLogger(__name__)
@@ -242,6 +246,30 @@ class SdkChoice:
         return f"{self.label} {self.version}  {self.path}{state}"
 
 
+#: The variables of the shell that select the Zephyr tree and its toolchain,
+#: in a workflow of upstream Zephyr (``zephyr-env.sh`` and a workspace venv).
+UPSTREAM_ZEPHYR_VARIABLES = ("ZEPHYR_BASE", "ZEPHYR_SDK_INSTALL_DIR", "ZEPHYR_TOOLCHAIN_VARIANT")
+
+
+@dataclass(frozen=True)
+class UpstreamZephyr:
+    """The environment of an upstream Zephyr workspace, as the shell of the user gives it.
+
+    ``variables`` holds each of ``UPSTREAM_ZEPHYR_VARIABLES`` that the shell
+    sets, with an absolute path for a directory: a build runs in a different
+    working directory than the shell.  ``west_dir`` is the directory of the
+    ``west`` of the shell (the venv of the workspace), or None when no
+    ``west`` is on PATH.  ``unusable_sdk_dir`` is a value of
+    ``ZEPHYR_SDK_INSTALL_DIR`` that is no directory: ``variables`` does not
+    hold it, and init tells the user.
+    """
+
+    zephyr_base: Path
+    variables: dict[str, str]
+    west_dir: Path | None
+    unusable_sdk_dir: str | None = None
+
+
 # The script of the real link.  Zephyr links twice, and the pre-pass script
 # carries a suffix — `linker_zephyr_pre0.cmd`.  ninja names the pre-pass
 # first, so `get_linker_scripts` moves this name to the front.
@@ -324,8 +352,10 @@ def _run_nrfutil(cmd: list[str], *, timeout: float) -> subprocess.CompletedProce
             cmd, cwd=Path.cwd(), env=dict(os.environ), timeout=timeout, capture_output=True, errors="strict",
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        # The file cannot run (a .vbs of PATHEXT, a broken binary) or does
-        # not answer in time: no SDK manager, and the caller says so.
+        # The file cannot run (a broken binary, an executable of a different
+        # architecture) or does not answer in time: no SDK manager, and the
+        # caller says so.  A .vbs or .py of PATHEXT is no candidate:
+        # program_file_names gives only files that Windows can start.
         log.debug("nrfutil candidate %s did not run: %s", cmd[0], exc)
         return None
     except UnicodeDecodeError as exc:
@@ -793,6 +823,57 @@ class ZephyrBuildSystem:
             path=sdk_dir,
             usable=script is not None,
             env_script=script,
+        )
+
+    @staticmethod
+    def upstream_zephyr_from_environment(ncs_installs: Callable[[], list[SdkChoice]]) -> UpstreamZephyr | None:
+        """Return the upstream Zephyr workspace that the shell names, or None.
+
+        The shell names one when ``ZEPHYR_BASE`` is a directory and no
+        install of NCS of *ncs_installs* holds it.  *ncs_installs* is a
+        callable (``list_installed_ncs``), because it runs nrfutil: the
+        function calls it only after the check of ``ZEPHYR_BASE``, and the
+        caller can give the NCS picker the same answer.  The test of the NCS
+        tree compares ``canonical_path`` values: on macOS ``Path.resolve``
+        keeps the case of the text, and the disk ignores it.  WHY before the NCS
+        picker: Zephyr is also used alone, without NCS.  A machine that has
+        NCS too gave the project the environment of an NCS version, though
+        the shell of the user pointed at an other tree.  An NCS tree that
+        nrfutil does not manage (a west checkout of sdk-nrf) is a workspace
+        of the shell too: its environment is the one of the user.
+
+        WHY ``ZEPHYR_BASE`` and not the script ``environment-setup-*`` of
+        the SDK: the Zephyr SDK 1.0 has no such script (measured with
+        1.0.1), and ``zephyr-env.sh`` sets ``ZEPHYR_BASE`` alone.
+        """
+        value = os.environ.get("ZEPHYR_BASE")
+        if not value:
+            return None
+        zephyr_base = Path(value).expanduser().absolute()
+        if not zephyr_base.is_dir():
+            return None
+        canonical = canonical_path(zephyr_base)
+        for install in ncs_installs():
+            if canonical.is_relative_to(canonical_path(install.path.expanduser())):
+                return None
+        variables = {"ZEPHYR_BASE": str(zephyr_base)}
+        unusable_sdk_dir = None
+        sdk_value = os.environ.get("ZEPHYR_SDK_INSTALL_DIR")
+        if sdk_value:
+            sdk_dir = Path(sdk_value).expanduser().absolute()
+            if sdk_dir.is_dir():
+                variables["ZEPHYR_SDK_INSTALL_DIR"] = str(sdk_dir)
+            else:
+                unusable_sdk_dir = sdk_value
+        variant = os.environ.get("ZEPHYR_TOOLCHAIN_VARIANT")
+        if variant:
+            variables["ZEPHYR_TOOLCHAIN_VARIANT"] = variant
+        west = shutil.which("west")
+        return UpstreamZephyr(
+            zephyr_base=zephyr_base,
+            variables=variables,
+            west_dir=Path(west).parent.absolute() if west else None,
+            unusable_sdk_dir=unusable_sdk_dir,
         )
 
     @classmethod

@@ -1092,7 +1092,7 @@ class TestBuildRecordsTheLink:
             return Done()
 
         monkeypatch.setattr(module, "run_build_command", fake_run)
-        monkeypatch.setattr(module.shutil, "which", lambda name: "/usr/bin/pio" if name == "pio" else None)
+        monkeypatch.setattr(module, "require_build_tool", lambda names, cwd, cfg, hint: "pio")
         cfg = BuildConfig(system="platformio", clean=False, environment=environment)
         cfg.variant_name = variant
         cc_path = PlatformIOBuildSystem().build(tmp_path, cfg)

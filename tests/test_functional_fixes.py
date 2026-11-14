@@ -17,6 +17,8 @@ from unittest import mock
 
 import pytest
 
+from tests._toolchains import unit_of
+
 # ═══════════════════════════════════════════════════════════════════════════
 # F5 — FTS5 query sanitization (_expand_query)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -363,8 +365,7 @@ class TestCallbackTargetIndirectRef:
     scan of the tokens read.  That scan is gone; the AST gives the address.
     """
 
-    def test_callback_address_of_method_is_indirect_ref(self, tmpdir):
-        from fw_context_mcp.indexer.compile_commands import CompilationUnit
+    def test_callback_address_of_method_is_indirect_ref(self, tmpdir, toolchain):
         from fw_context_mcp.indexer.symbols import extract_all
 
         src = tmpdir / "cb.cpp"
@@ -380,9 +381,7 @@ class TestCallbackTargetIndirectRef:
             "}\n",
             encoding="utf-8",
         )
-        unit = CompilationUnit(
-            file=src, clang_args=["-std=c++14"], directory=tmpdir, language="cpp",
-        )
+        unit = unit_of(src, toolchain, ["-std=c++14"], directory=tmpdir, language="cpp")
         result = extract_all(unit, with_refs=True)
 
         indirect = [r for r in result.references if r.ref_kind == "indirect"]
@@ -415,7 +414,7 @@ class TestCallbackTargetIndirectRef:
 class TestCallWithoutTargetGivesNoGuess:
     """A CALL_EXPR without a target gets no call edge from a fallback."""
 
-    def test_an_unresolved_call_gives_no_constructor_edge(self, tmpdir):
+    def test_an_unresolved_call_gives_no_constructor_edge(self, tmpdir, toolchain):
         """A dependent call to an overload set passes a variable of class type.
 
         The call has no target, because the template is never instantiated.
@@ -423,7 +422,6 @@ class TestCallWithoutTargetGivesNoGuess:
         the type of the passed variable.  An unresolved call names no
         constructor, thus each of those edges was a guess.
         """
-        from fw_context_mcp.indexer.compile_commands import CompilationUnit
         from fw_context_mcp.indexer.symbols import extract_all
 
         src = tmpdir / "pass.cpp"
@@ -437,7 +435,7 @@ class TestCallWithoutTargetGivesNoGuess:
             "}\n",
             encoding="utf-8",
         )
-        unit = CompilationUnit(file=src, clang_args=["-std=c++17"], directory=tmpdir, language="cpp")
+        unit = unit_of(src, toolchain, ["-std=c++17"], directory=tmpdir, language="cpp")
         result = extract_all(unit, with_refs=True)
 
         ctor_usrs = {s.usr for s in result.symbols if s.kind == "constructor"}

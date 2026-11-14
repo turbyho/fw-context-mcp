@@ -80,18 +80,28 @@ def test_tool_has_a_docstring(module, name):
     assert doc.strip(), f"{name} has no docstring"
 
 
-@pytest.mark.parametrize(("module", "name"), TOOLS, ids=TOOL_IDS)
-def test_every_parameter_is_documented(module, name):
-    """A parameter without an Args: entry reaches the LLM as a bare name."""
-    fn = _handler(module, name)
-    doc = inspect.getdoc(fn) or ""
-    if "Args:" not in doc:
-        pytest.skip(f"{name} has no Args: section")
-    params = [
+def _parameters(module: str, name: str) -> list[str]:
+    """The parameters of a tool that its docstring must document."""
+    return [
         p
-        for p in inspect.signature(fn).parameters
+        for p in inspect.signature(_handler(module, name)).parameters
         if p not in IGNORED_PARAMS and not p.startswith("_")
     ]
+
+
+#: The tools that take a parameter.  WHY: a tool without an Args: section
+#: was a skip, also when it took parameters, thus the test passed for a
+#: tool whose parameters were documented nowhere.
+TOOLS_WITH_PARAMETERS = [(module, name) for module, name in TOOLS if _parameters(module, name)]
+
+
+@pytest.mark.parametrize(("module", "name"), TOOLS_WITH_PARAMETERS,
+                         ids=[f"{module}.{name}" for module, name in TOOLS_WITH_PARAMETERS])
+def test_every_parameter_is_documented(module, name):
+    """A parameter without an Args: entry reaches the LLM as a bare name."""
+    doc = inspect.getdoc(_handler(module, name)) or ""
+    assert "Args:" in doc, f"{name} takes parameters and has no Args: section"
+    params = _parameters(module, name)
     missing = [p for p in params if f"\n{p}:" not in doc and f"    {p}:" not in doc]
     assert not missing, f"{name}: Args: does not document {missing}"
 

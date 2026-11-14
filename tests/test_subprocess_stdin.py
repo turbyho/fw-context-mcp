@@ -17,13 +17,10 @@ to the operator.
 from __future__ import annotations
 
 import ast
-import shutil
 import subprocess
 import sys
 import threading
 from pathlib import Path
-
-import pytest
 
 import fw_context_mcp
 
@@ -99,7 +96,6 @@ print(_git_tu_candidates(Path(sys.argv[1]), frozenset({".c"})), flush=True)
 _ANSWER_TIMEOUT_S = 20
 
 
-@pytest.mark.skipif(shutil.which("git") is None, reason="the listing runs git")
 def test_git_answers_while_a_thread_reads_the_stdin_pipe(tmp_path: Path):
     """The stdin stays an open pipe, as the pipe of an MCP client.
 

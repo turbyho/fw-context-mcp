@@ -411,7 +411,12 @@ class TestTheWriteOfAConfig:
         assert [path for path, _ in report.failures] == [config]
 
     def test_a_temporary_file_of_a_dead_writer_with_the_same_pid(self, tmp_path: Path) -> None:
-        """The PID of a dead writer can come back: its file has the name of this process."""
+        """The PID of a dead writer can come back: its file holds the owner token of this process.
+
+        The write must not use that file: its mode is 0644, and the text of
+        a config of mode 0600 would be readable for all users until the
+        rename.  Each write makes a new file of its own (O_EXCL).
+        """
         from fw_context_mcp.utils import owner_token, write_text_atomic
 
         target = tmp_path / "config.toml"
@@ -424,7 +429,7 @@ class TestTheWriteOfAConfig:
 
         assert target.read_text(encoding="utf-8") == "new\n"
         assert stat.S_IMODE(target.stat().st_mode) == 0o600
-        assert not stale.exists()
+        assert stale.read_text(encoding="utf-8") == "stale", "the write used the file of a different writer"
 
     def test_a_read_only_file_stays_and_is_a_failure(self, tmp_path: Path) -> None:
         text = "[index]\nquery_driver = 1\n"

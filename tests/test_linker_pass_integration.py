@@ -14,7 +14,6 @@ the `cmake` backend finds it with no vendor knowledge.
 from __future__ import annotations
 
 import json
-import shutil
 from pathlib import Path
 
 import pytest
@@ -24,8 +23,7 @@ from fw_context_mcp.indexer.db import (
     get_memory_regions,
     open_db,
 )
-
-pytest.importorskip("clang.cindex", reason="libclang not available")
+from tests._toolchains import Toolchain, write_compile_commands, write_sources
 
 SCRIPT = """\
 MEMORY
@@ -44,6 +42,17 @@ SECTIONS
 }
 """
 
+#: A vector table as a startup file holds it.  `nop` and not a branch: the
+#: instruction is not the subject, and each toolchain of the tests (ARM,
+#: RISC-V) assembles it.
+STARTUP = (
+    '  .section .isr_vector, "a"\n'
+    "  .word _estack\n"
+    "  .word Reset_Handler\n"
+    "Reset_Handler:\n"
+    "  nop\n"
+)
+
 SOURCE = """\
 int shared_with_the_script = 0;
 
@@ -54,10 +63,9 @@ int main(void) {
 
 
 @pytest.fixture
-def ninja_project(tmp_path: Path) -> Path:
+def ninja_project(tmp_path: Path, toolchain: Toolchain) -> Path:
     """A project whose build.ninja names a linker script with `-T`."""
-    (tmp_path / "main.c").write_text(SOURCE, encoding="utf-8")
-    (tmp_path / "app.ld").write_text(SCRIPT, encoding="utf-8")
+    write_sources(tmp_path, {"main.c": SOURCE, "app.ld": SCRIPT})
     # The flag as a real ninja file writes it — TWO spaces after `-T`,
     # measured on the Zephyr project.
     (tmp_path / "build.ninja").write_text(
@@ -65,25 +73,11 @@ def ninja_project(tmp_path: Path) -> Path:
         "  command = ld $in  -T  app.ld  -o $out\n",
         encoding="utf-8",
     )
-    (tmp_path / "compile_commands.json").write_text(
-        json.dumps([
-            {
-                "directory": str(tmp_path),
-                "file": "main.c",
-                # An ELF target on each host: a GNU linker script names
-                # the symbols of ELF objects.  The `cc` of macOS has a Mach-O
-                # target, and there the link name of a C symbol starts with
-                # `_` (measured: libclang 22 gives `_main` for
-                # arm64-apple-darwin, `main` for x86_64-unknown-linux-gnu),
-                # thus no name of the script matches a compiled definition.
-                "arguments": [
-                    "cc", "--target=x86_64-unknown-linux-gnu",
-                    "-c", "main.c", "-o", "main.o",
-                ],
-            }
-        ]),
-        encoding="utf-8",
-    )
+    # The toolchains of the SDKs have ELF targets, as a GNU linker script
+    # expects: the link name of a C symbol is its name.
+    write_compile_commands(tmp_path / "compile_commands.json", [
+        {"directory": str(tmp_path), "file": "main.c", "arguments": toolchain.arguments("main.c", output="main.o")},
+    ])
     return tmp_path
 
 
@@ -214,7 +208,7 @@ class TestTheRunReachesThePass:
         assert len(regions) == 2
 
     def test_no_undefined_row_is_left_for_a_script_symbol(
-        self, ninja_project, tmp_path
+        self, ninja_project, tmp_path, toolchain
     ):
         """The reason the pass runs BEFORE assembly.
 
@@ -229,23 +223,15 @@ class TestTheRunReachesThePass:
         proves the reverse direction, that a declaration already in the
         index does not block the script.
         """
-        (ninja_project / "startup.S").write_text(
-            '  .section .isr_vector, "a"\n'
-            "  .word _estack\n"
-            "  .word Reset_Handler\n"
-            "Reset_Handler:\n"
-            "  b .\n",
-            encoding="utf-8",
-        )
+        write_sources(ninja_project, {"startup.S": STARTUP})
         cc = ninja_project / "compile_commands.json"
         entries = json.loads(cc.read_text(encoding="utf-8"))
         entries.append({
             "directory": str(ninja_project),
             "file": "startup.S",
-            "arguments": ["cc", "-x", "assembler-with-cpp", "-c", "startup.S",
-                          "-o", "startup.o"],
+            "arguments": toolchain.arguments("startup.S", "-x", "assembler-with-cpp", output="startup.o"),
         })
-        cc.write_text(json.dumps(entries), encoding="utf-8")
+        write_compile_commands(cc, entries)
 
         db_path = tmp_path / "db" / "index.db"
         db_path.parent.mkdir()
@@ -268,9 +254,8 @@ class TestTheRunReachesThePass:
             "the script's definition of _estack is missing"
         )
 
-    @pytest.mark.skipif(shutil.which("clang") is None, reason="the preprocessor of assembly is clang")
     def test_slot_zero_is_not_reported_as_code(
-        self, ninja_project, tmp_path
+        self, ninja_project, tmp_path, toolchain
     ):
         """A linker-script symbol in a vector slot is not a handler.
 
@@ -286,23 +271,15 @@ class TestTheRunReachesThePass:
         """
         from fw_context_mcp.indexer.db import get_vector_table, open_db
 
-        (ninja_project / "startup.S").write_text(
-            '  .section .isr_vector, "a"\n'
-            "  .word _estack\n"
-            "  .word Reset_Handler\n"
-            "Reset_Handler:\n"
-            "  b .\n",
-            encoding="utf-8",
-        )
+        write_sources(ninja_project, {"startup.S": STARTUP})
         cc = ninja_project / "compile_commands.json"
         entries = json.loads(cc.read_text(encoding="utf-8"))
         entries.append({
             "directory": str(ninja_project),
             "file": "startup.S",
-            "arguments": ["cc", "-x", "assembler-with-cpp", "-c", "startup.S",
-                          "-o", "startup.o"],
+            "arguments": toolchain.arguments("startup.S", "-x", "assembler-with-cpp", output="startup.o"),
         })
-        cc.write_text(json.dumps(entries), encoding="utf-8")
+        write_compile_commands(cc, entries)
 
         db_path = tmp_path / "db" / "index.db"
         db_path.parent.mkdir()

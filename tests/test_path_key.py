@@ -8,6 +8,8 @@ second spelling is a different file.
 from __future__ import annotations
 
 import os
+import socket
+import sys
 from pathlib import Path
 
 import pytest
@@ -81,6 +83,95 @@ def test_the_part_that_exists_gets_the_case_of_the_disk(project: Path) -> None:
     if not (project / "src").exists():
         pytest.skip("the file system keeps the case: a different spelling is a different file")
     assert index_key(spelled, project) == "Src/Drv/New.c"
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root opens a file of mode 000")
+def test_a_file_that_cannot_be_opened_gets_the_case_of_the_disk(project: Path) -> None:
+    """macOS: a file of mode 000 does not open, and its whole path kept the spelling of the caller.
+
+    The root then had the case of the disk and the file the case of the
+    caller: the file got an absolute key.  Its own name in the case of the
+    caller gave one file two keys.  Now the directories get the case of
+    the disk from the nearest one that opens, and the name from the entry
+    of its directory.  The test applies where a different case names the
+    same file (macOS, Windows).
+    """
+    locked = project / "Src" / "Drv" / "Locked.h"
+    locked.write_text("", encoding="utf-8")
+    spelled = Path(str(project).lower()) / "src" / "drv" / "locked.h"
+    if not spelled.exists():
+        pytest.skip("the file system keeps the case: a different spelling is a different file")
+    locked.chmod(0)
+    try:
+        assert index_key(spelled, project) == "Src/Drv/Locked.h"
+    finally:
+        locked.chmod(0o644)
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX") or sys.platform == "win32", reason="a Unix socket")
+def test_a_socket_in_the_project_gets_the_case_of_the_disk() -> None:
+    """macOS: ``open`` of a Unix socket gives EOPNOTSUPP, not EACCES, and the path kept the spelling of the caller.
+
+    A short directory in /tmp: the path of a Unix socket has at most 104
+    bytes on macOS.
+    """
+    import shutil
+    import tempfile
+
+    base = Path(tempfile.mkdtemp(prefix="fwk", dir="/tmp"))
+    try:
+        root = base / "Proj"
+        (root / "Run").mkdir(parents=True)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            listener.bind(str(root / "Run" / "Ctl.sock"))
+            spelled = Path(str(root).lower()) / "run" / "ctl.sock"
+            if not spelled.exists():
+                pytest.skip("the file system keeps the case: a different spelling is a different file")
+            assert index_key(spelled, root) == "Run/Ctl.sock"
+        finally:
+            listener.close()
+    finally:
+        shutil.rmtree(base)
+
+
+def test_a_relative_root_is_the_directory_of_each_call(tmp_path: Path, monkeypatch) -> None:
+    """A root of ``.``: the cache of the canonical root kept the directory of the first call.
+
+    A long-lived process that changes its directory then gave the keys of
+    the first project to the files of the second one.
+    """
+    first, second = tmp_path / "first", tmp_path / "second"
+    for root in (first, second):
+        (root / "src").mkdir(parents=True)
+        (root / "src" / "a.c").write_text("", encoding="utf-8")
+
+    monkeypatch.chdir(first)
+    assert index_key(first / "src" / "a.c", Path(".")) == "src/a.c"
+    monkeypatch.chdir(second)
+    assert index_key(second / "src" / "a.c", Path(".")) == "src/a.c"
+
+
+def test_a_root_with_dot_dot_after_a_link_is_the_directory_of_its_files(tmp_path: Path, monkeypatch) -> None:
+    """``build/..`` with ``build`` a link: the link first, then ``..``, as the files of the root do.
+
+    ``os.path.abspath`` removed the ``..`` from the text first, and the root
+    named the directory of the link, not the directory of its files: each
+    file got an absolute key.
+    """
+    target = tmp_path / "elsewhere" / "out"
+    target.mkdir(parents=True)
+    (tmp_path / "elsewhere" / "src").mkdir()
+    (tmp_path / "elsewhere" / "src" / "a.c").write_text("", encoding="utf-8")
+    work = tmp_path / "work"
+    work.mkdir()
+    try:
+        (work / "build").symlink_to(target, target_is_directory=True)
+    except OSError as exc:  # Windows without the privilege of a symlink
+        pytest.skip(f"no symlink on this system: {exc}")
+    monkeypatch.chdir(work)
+
+    assert index_key(Path("build/../src/a.c"), Path("build/..")) == "src/a.c"
 
 
 @pytest.mark.parametrize(("key", "absolute"), [

@@ -10,10 +10,11 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from fw_context_mcp.utils import run_build_command
+from fw_context_mcp.utils import require_build_tool, run_build_command
 
 from ..build_layout import BuildLayout
 from . import _linker, registry
+from .esp_idf import ESPIDFBuildSystem
 from .protocol import BuildIssue
 
 if TYPE_CHECKING:
@@ -63,13 +64,12 @@ class GenericCMakeBuildSystem:
         cmake_file = project_root.resolve() / "CMakeLists.txt"
         if not cmake_file.exists():
             return False
-        # Exclude ESP-IDF and Zephyr — those are detected by their own builders
+        # Exclude ESP-IDF and Zephyr — those are detected by their own
+        # builders.  ESP-IDF: its own rule, thus the two cannot differ.
+        if ESPIDFBuildSystem.detect(project_root):
+            return False
         try:
             content = cmake_file.read_text(encoding="utf-8")
-            if "idf_build" in content or "IDF" in content:
-                # Check for sdkconfig — if present, it's ESP-IDF territory
-                if (project_root / "sdkconfig").exists():
-                    return False
             if "find_package(Zephyr" in content or "zephyr" in content.lower():
                 return False
         except OSError:
@@ -80,17 +80,19 @@ class GenericCMakeBuildSystem:
 
     def build(self, project_root: Path, cfg: BuildConfig) -> Path:
         """Generate compile_commands.json via CMake configure + build."""
-        if not shutil.which("cmake"):
-            raise RuntimeError(
-                "cmake is required.  Install CMake (https://cmake.org/download/, or the package "
-                "manager of the system) and put it on PATH."
-            )
+        # The PATH of the build (activate, extra_path), not of this process;
+        # the build runs the program that the lookup found.
+        cmake = require_build_tool(
+            "cmake", project_root, cfg,
+            "Install CMake (https://cmake.org/download/, or the package manager of the system) "
+            "and put it on PATH, or its directory into [build] extra_path.",
+        )
 
         build_dir = BuildLayout(project_root).out_dir(cfg.variant_name)
 
         # Configure
         configure_cmd: list[str] = [
-            "cmake",
+            cmake,
             "-B",
             str(build_dir),
             "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
@@ -126,7 +128,7 @@ class GenericCMakeBuildSystem:
             )
 
         # Build
-        build_cmd: list[str] = ["cmake", "--build", str(build_dir)]
+        build_cmd: list[str] = [cmake, "--build", str(build_dir)]
         log.info("cmake build: %s", " ".join(build_cmd))
         run_build_command(build_cmd, cwd=project_root, description="cmake build", build_cfg=cfg)
 

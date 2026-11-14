@@ -1,7 +1,7 @@
 /**
  * Makefile hello-world test project for fw-context indexing tests.
  *
- * Indexed via: fw-context index --build  (uses compiledb)
+ * Indexed via: fw-context index --build  (reads the log of make -Bnkwp)
  */
 
 #include <stdio.h>

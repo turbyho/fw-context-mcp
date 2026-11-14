@@ -12,8 +12,16 @@ and holding Enter therefore walks every section without modifying anything.
 
 from __future__ import annotations
 
+import functools
 import subprocess
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from ..config.settings import Config
+    from ..indexer.builders.zephyr import SdkChoice
 
 _BUILD_SYSTEM_CHOICES: list[tuple[str, str]] = [
     ("mbed-os", "Mbed OS 5/6"),
@@ -103,6 +111,7 @@ def _choose_activate_script(project_root: Path, default: str, *, non_interactive
 def _configure_ncs_version(
     project_root: Path, *, dry_run: bool, non_interactive: bool,
     current: str | None = None,
+    ncs_installs: Callable[[], list[SdkChoice]] | None = None,
 ) -> str | None:
     """Pick an NCS version and write the activation script for it.
 
@@ -114,13 +123,19 @@ def _configure_ncs_version(
     Returns the script path, or None when there is nothing to configure —
     no NCS installs, or no answer in a non-interactive run.  The caller then
     falls back to the generic detection and prompt.
+
+    *ncs_installs* gives the NCS installs (``list_installed_ncs`` when
+    None).  The caller gives the one that the upstream check used, thus
+    init runs ``nrfutil sdk-manager list`` once.
     """
     from ..indexer.builders.zephyr import ZephyrBuildSystem
+
+    list_installs = ncs_installs if ncs_installs is not None else ZephyrBuildSystem.list_installed_ncs
 
     if current:
         # A configured environment is the answer until someone changes it;
         # do not let the environment scan below silently override it.
-        installs = ZephyrBuildSystem.list_installed_ncs()
+        installs = list_installs()
         version = prompt_ncs_version(
             installs, default=None, non_interactive=non_interactive, current=current
         )
@@ -143,7 +158,7 @@ def _configure_ncs_version(
         return str(zephyr_sdk.env_script)
 
     try:
-        installs = ZephyrBuildSystem.list_installed_ncs()
+        installs = list_installs()
     except Exception:  # noqa: BLE001 — detection is best-effort at init
         return None
     if not installs:
@@ -161,6 +176,112 @@ def _configure_ncs_version(
         return None
 
     return _write_ncs_script(project_root, installs, version, dry_run=dry_run)
+
+
+def _configure_upstream_zephyr(
+    project_root: Path,
+    cfg: Config,
+    *,
+    dry_run: bool,
+    non_interactive: bool,
+    ncs_installs: Callable[[], list[SdkChoice]],
+) -> bool:
+    """Configure the environment of an upstream Zephyr workspace; return True when the project uses one.
+
+    True: the config holds ``ZEPHYR_BASE`` in ``[build] env`` (written now
+    or before), thus the NCS picker must not give the project an other
+    environment.  False: the next steps of init (the NCS picker, the scan
+    of ``detect_environment``) apply.
+
+    The workspace of the shell (``upstream_zephyr_from_environment``) goes
+    into ``.fw-context/local.toml``: ``[build] env`` gets ``ZEPHYR_BASE``
+    (and ``ZEPHYR_SDK_INSTALL_DIR`` and ``ZEPHYR_TOOLCHAIN_VARIANT`` when the
+    shell sets them), and ``[build] extra_path`` the directory of the
+    ``west`` of the shell.  WHY in the config: a build in the background
+    (the daemon of an MCP client) does not have the environment of the
+    shell.  WHY no script: ``env`` and ``extra_path`` apply on Linux, macOS
+    and Windows alike, and the CMake package of the Zephyr SDK finds its
+    host tools through ``ZEPHYR_SDK_INSTALL_DIR`` (``host-tools.cmake``),
+    thus also an SDK 0.x needs no ``environment-setup-*``.
+
+    A value that the config holds stays, as an ``activate`` does: init
+    tells the user when the shell differs.  A different ``ZEPHYR_BASE``
+    is an other workspace, and only the user can switch to it (a question,
+    No by default).  Init then also replaces the other variables of the
+    workspace in ``local.toml``.
+
+    WHY ``extra_path`` gets the effective list: a list of ``local.toml``
+    replaces the list of a lower layer, thus the entries of
+    ``config.toml`` must come along, or the build loses them.
+    """
+    from ..config._toml_editor import set_key
+    from ..config.settings import read_config_file
+    from ..indexer.builders.zephyr import UPSTREAM_ZEPHYR_VARIABLES, ZephyrBuildSystem
+    from ..path_key import canonical_path
+
+    configured = cfg.build.env.get("ZEPHYR_BASE")
+    upstream = ZephyrBuildSystem.upstream_zephyr_from_environment(ncs_installs)
+    if upstream is None:
+        if configured:
+            print(f"  Build env: ZEPHYR_BASE={configured} (already configured)")
+            return True
+        return False
+
+    switch = False
+    if configured:
+        print(f"  Build env: ZEPHYR_BASE={configured} (already configured)")
+        if canonical_path(Path(configured).expanduser()) != canonical_path(upstream.zephyr_base):
+            print(f"  The shell names an other workspace: ZEPHYR_BASE={upstream.zephyr_base}")
+            if non_interactive or not _confirm("Use the workspace of the shell?", default=False):
+                return True
+            switch = True
+    else:
+        print(f"  [ok] Zephyr of the environment: {upstream.zephyr_base} (no NCS)")
+    if upstream.unusable_sdk_dir is not None:
+        print(f"  [warn] ZEPHYR_SDK_INSTALL_DIR={upstream.unusable_sdk_dir} is no directory: init does not write it.")
+
+    # Only the env table of local.toml is written: the layers merge a table
+    # key by key, thus the env of config.toml applies still, and a copy of
+    # it in local.toml would hide a later change.  A value that is not a
+    # table is a value that the config load already refused with a warning
+    # (config_warnings): the new table replaces it.
+    local = project_root / ".fw-context" / "local.toml"
+    local_build = read_config_file(local).get("build")
+    local_env = local_build.get("env") if isinstance(local_build, dict) else None
+    old_env: dict[str, str] = dict(local_env) if isinstance(local_env, dict) else {}
+    if switch:
+        env = {name: value for name, value in old_env.items() if name not in UPSTREAM_ZEPHYR_VARIABLES}
+        env.update(upstream.variables)
+    else:
+        env = dict(old_env)
+        for name, value in upstream.variables.items():
+            current = cfg.build.env.get(name)
+            if current is None:
+                env[name] = value
+            elif current != value:
+                print(f"  Build env: {name}={current} (already configured, the shell has {value})")
+
+    extra_path: list[str] | None = None
+    if upstream.west_dir is None:
+        print("  [warn] No west on PATH: activate the venv of the workspace, then run init again.")
+    else:
+        known = {canonical_path(Path(entry).expanduser()) for entry in cfg.build.extra_path}
+        if canonical_path(upstream.west_dir) not in known:
+            extra_path = [str(upstream.west_dir), *cfg.build.extra_path]
+
+    if env == old_env and extra_path is None:
+        return True
+    if dry_run:
+        print("  [dry-run] Would write [build] env and extra_path to .fw-context/local.toml")
+        return True
+    if env != old_env:
+        set_key(local, "build", "env", env)
+        changed = sorted(name for name in env if old_env.get(name) != env[name])
+        print("  [ok] Build env: " + ", ".join(f"{name}={env[name]}" for name in changed))
+    if extra_path is not None:
+        set_key(local, "build", "extra_path", extra_path)
+        print(f"  [ok] Build extra_path: {upstream.west_dir} (west)")
+    return True
 
 
 def _write_ncs_script(
@@ -921,7 +1042,9 @@ def resolve_build_params(
     if system == "zephyr":
         _ensure("board", "Board", b.board)
     elif system == "arduino":
-        _ensure("fqbn", "Board FQBN", b.fqbn)
+        # Enter writes nothing: the build then takes default_fqbn of
+        # sketch.yaml, and a later change of sketch.yaml applies.
+        _ensure("fqbn", "Board FQBN (Enter: default_fqbn of sketch.yaml)", b.fqbn)
     elif system == "keil-mdk":
         _ensure("keil_project", "Path to .uvprojx", b.keil_project)
     elif system == "iar-ewarm":
@@ -1044,8 +1167,16 @@ def resolve_build_env(
     # prompt_ncs_version.  Ask before falling back to detect_environment,
     # which can only guess when several SDKs are installed.
     if system == "zephyr":
+        from ..indexer.builders.zephyr import ZephyrBuildSystem
+
+        # One run of `nrfutil sdk-manager list` for the two steps.
+        ncs_installs = functools.cache(ZephyrBuildSystem.list_installed_ncs)
+        if _configure_upstream_zephyr(
+            project_root, cfg, dry_run=dry_run, non_interactive=non_interactive, ncs_installs=ncs_installs,
+        ):
+            return
         chosen = _configure_ncs_version(
-            project_root, dry_run=dry_run, non_interactive=non_interactive
+            project_root, dry_run=dry_run, non_interactive=non_interactive, ncs_installs=ncs_installs,
         )
         if chosen is not None:
             detected["activate"] = chosen

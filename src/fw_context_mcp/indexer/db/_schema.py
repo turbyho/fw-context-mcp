@@ -183,7 +183,20 @@ __all__ = [
 #      file in the USR of a typedef.  A C++ type with two places in files
 #      that C++ units read (a copy of a header) stays one type: the ODR
 #      makes it one, and its USR leaves out the marks (`_odr.py`).
-CURRENT_ROW_FORMAT = "fw-context-rows/16"
+# /17 — the key of a file (`files.path`, the manifest, `header_owners`, and
+#      the file key in the USR of a symbol with no external name) is the
+#      key of `path_key`: "/" on each system and the case of the disk.
+#      Before it, a key on Windows held a backslash, and a key on macOS held
+#      the case that the build or an `#include` wrote, thus one file could have
+#      two rows and a static symbol two USRs.  `files.is_project` follows
+#      `sdk_detect.classify_key`: a relative project pattern (`src/%`)
+#      marked a vendor file outside the root (`.../framework-x/src/foo.h`)
+#      as a file of the project, and no run lowers that mark.
+#      `macros.expanded_values` holds the definition of the name at the end
+#      of each unit that reads the file of the row.  Before it, the last
+#      unit of the run wrote its definition into each row of the name, also
+#      of a header that it does not read.
+CURRENT_ROW_FORMAT = "fw-context-rows/17"
 
 # The config-hash format that was current when CURRENT_ROW_FORMAT last moved.
 #
@@ -198,7 +211,7 @@ CURRENT_ROW_FORMAT = "fw-context-rows/16"
 # the build, thus a plain `fw-context index` writes every file and every
 # body again.  The two must therefore move together, and
 # `test_row_format_invalidation.py` fails when only one of them does.
-ROW_FORMAT_PAIRED_WITH = "fw-context-cc/18"
+ROW_FORMAT_PAIRED_WITH = "fw-context-cc/19"
 
 
 def _row_format_number(value: str) -> int | None:
@@ -295,6 +308,12 @@ _ROW_FORMAT_FAULTS: tuple[tuple[int, str], ...] = (
          "struct config) are one symbol, with the members of the two, and the "
          "order of the includes decides which symbol a typedef that two "
          "headers declare is"),
+    (16, "a key of a file can hold the case that the build wrote (macOS) or "
+         "a backslash (Windows), thus one file can have two rows and a static "
+         "symbol two USRs, and a vendor file outside the root can be marked as "
+         "a file of the project, thus project_only answers can hold vendor code; "
+         "and the expanded value of a macro is the definition at the end of the "
+         "last unit of the run, also of a unit that does not read its file"),
 )
 
 
@@ -597,6 +616,10 @@ _MIGRATION_ADD_COLUMNS = [
     "ALTER TABLE slot_sites ADD COLUMN unit TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE slot_arguments ADD COLUMN unit TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE slot_escapes ADD COLUMN unit TEXT NOT NULL DEFAULT ''",
+    # The definition of the name of a macro row at the end of each unit that
+    # reads its file (see the column in _SCHEMA).  A real column moves
+    # CURRENT_SCHEMA_VERSION by itself.
+    "ALTER TABLE macros ADD COLUMN expanded_values TEXT NOT NULL DEFAULT ''",
     # Schema version bump — DO NOT REMOVE. When adding new migration steps after this
     # column, also add a NEW ALTER TABLE … ADD COLUMN _schema_bump_… line. The hash
     # of _MIGRATION_ADD_COLUMNS drives CURRENT_SCHEMA_VERSION.
@@ -1203,11 +1226,24 @@ CREATE INDEX IF NOT EXISTS idx_overrides_base    ON overrides(config_hash, base_
 -- Why UNIQUE(config_hash, file_id, line): a macro at a given line in a
 -- given file is unique.  The name alone is not unique — the same name
 -- can be #define'd differently in different files or #ifdef branches.
--- Why expanded_value: populated by clang -dM -E of each unit — the
--- definition of the name that is in force at the end of the unit (after
--- #undef and a new #define, and with the -D macros of the flags).  It
--- differs from value, the body of the #define on this line.  clang -dM -E
--- does not expand the macros in a definition: #define A B gives B.
+-- Why expanded_values: the definition of the name at the end of EACH C or
+-- C++ unit of the build that reads the file of the row (an assembly unit
+-- gives none: the rows come from the parse of libclang; clang -dM -E of the
+-- unit:
+-- after #undef and a new #define, and with the -D macros of its flags).
+-- A JSON list of the distinct states with their counts of units:
+-- {"state": "defined", "value", "params", "is_function_like", "units"},
+-- {"state": "undefined", "units"} (an #undef at the end of the unit), and
+-- {"state": "no_answer", "units"} (the preprocessor of the unit failed, or
+-- the run does not know which files the unit reads).  Before, each unit
+-- wrote its definition into every row of the name in turn, thus the last
+-- unit decided the value, also of a row in a header that it does not read.
+-- Empty: no value is known (macros.store_values_of_build).  A column and
+-- not a table: each reader of a macro row reads it, and it goes with the
+-- row.  clang -dM -E does not expand the macros in a definition: #define
+-- A B gives B.
+-- Why expanded_value: the value when each unit agrees (one "defined"
+-- state), else empty.  The full-text index reads this column.
 -- Why is_function_like: distinguishes object-like from function-like
 -- macros — needed because function-like macros participate in search
 -- differently (they accept arguments).
@@ -1228,6 +1264,7 @@ CREATE TABLE IF NOT EXISTS macros (
     expanded_value   TEXT    NOT NULL DEFAULT '',
     line             INTEGER NOT NULL,
     is_function_like INTEGER NOT NULL DEFAULT 0,
+    expanded_values  TEXT    NOT NULL DEFAULT '',
     UNIQUE(config_hash, file_id, line)
 );
 CREATE INDEX IF NOT EXISTS idx_macros_name ON macros(name, config_hash);

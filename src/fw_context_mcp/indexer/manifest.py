@@ -32,7 +32,7 @@ import time
 from collections.abc import Callable, Collection
 from pathlib import Path
 
-from fw_context_mcp.indexer.compile_commands import _DROP_WITH_ARG
+from fw_context_mcp.indexer.compile_commands import _DROP_WITH_ARG, load_entries
 from fw_context_mcp.indexer.config_hash import (
     _TRANSIENT_DROP,
     compute_flags_hash,
@@ -220,7 +220,7 @@ def derive_extension_sets(
     each checkpoint).  It is not on the query path.
     """
     try:
-        raw = json.loads(compile_commands_path.read_text(encoding="utf-8"))
+        raw = load_entries(compile_commands_path)
     except (OSError, ValueError):
         raw = []
     tu = {
@@ -246,15 +246,28 @@ def _is_generated_header(header_path: str, build_dir_patterns: list[str] | None 
 
 
 
+def headers_entry(headers: list[str] | None) -> dict:
+    """Return the fields of a manifest entry for the headers that :func:`_collect_headers_from_tokens` gave.
+
+    None (libclang did not load the unit) gives no headers and
+    ``needs_reparse``: the index does not hold the unit, thus it is not
+    current until a run parses it.
+    """
+    if headers is None:
+        return {"headers": [], "needs_reparse": True}
+    return {"headers": headers}
+
+
 def _collect_headers_from_tokens(
     tu,
     project_root: Path,
     build_dir_patterns: list[str] | None = None,
     header_table: dict[str, dict] | None = None,
-) -> list[str]:
+) -> list[str] | None:
     """Collect the paths of the headers this TU includes, hashing each once.
 
-    Returns the paths as stored in the manifest.  The hash and the
+    Returns the paths as stored in the manifest, or None when libclang did
+    not load the unit (:func:`headers_entry` makes such an entry stale).  The hash and the
     ``generated`` flag go into *header_table*, keyed by path — a file included
     by 300 TUs is hashed on the first TU that reaches it and looked up by the
     other 299.  On the Mbed project that is 1 037 hashes instead of 86 686.
@@ -290,9 +303,17 @@ def _collect_headers_from_tokens(
             options=cx.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD,
         )
         includes = list(translation_unit.get_includes())
-    except (ValueError, TypeError, RuntimeError, AttributeError):
-        log.debug("_collect_headers_from_tokens: parse failed for %s", tu.file.name)
-        return []
+    except (cx.TranslationUnitLoadError, ValueError, TypeError, RuntimeError, AttributeError) as error:
+        # libclang did not load the unit (its source is not there, for
+        # example): the headers are not known.  None, not an empty list:
+        # the caller marks the entry needs_reparse, as an incomplete index
+        # is never current.  An empty list read as a unit without headers,
+        # and a change of a header then did not show.
+        # TranslationUnitLoadError derives from Exception, thus it is named.
+        log.warning(
+            "manifest: libclang did not load %s (%s); the unit is parsed again in the next run", tu.file, error,
+        )
+        return None
 
     if header_table is None:
         header_table = {}
@@ -383,7 +404,7 @@ def generate(
             "directory": str(unit.directory) if unit.directory else str(project_root),
             "arg_set": _intern_arguments(unit.clang_args, arg_sets),
             "source_hash": source_hash,
-            "headers": headers,
+            **headers_entry(headers),
             "flags_hash": (
                 compute_flags_hash(unit.raw_entry, transient_defines=transient_defines)
                 if unit.raw_entry else ""
@@ -1130,6 +1151,11 @@ def compute_config_hash(
         # /18 writes the place of the definition of each named type, and the
         # key of its target into a typedef: an unchanged unit kept the USRs
         # with no place.
+        # /19 writes each key of a file by path_key (the case of the disk, and
+        # "/" on Windows), and is_project by sdk_detect.classify_key: an
+        # unchanged unit kept the rows of the old keys, and no run lowers
+        # is_project.  It also writes the expanded values of the macros by
+        # the units that read each file (macros.store_values_of_build).
         #
         # WHY the format version belongs in THIS hash: a new config_hash
         # leaves no row for the build, thus a plain `fw-context index` writes
@@ -1140,7 +1166,7 @@ def compute_config_hash(
         #
         # Every existing index therefore gets one final reindex, which is
         # intended.
-        "_format": "fw-context-cc/18",
+        "_format": "fw-context-cc/19",
         "project_root": str(project_root),
         # WHY only these two: config_hash answers "could the same source text
         # compile to something different now?"  Macros flip #ifdef, and the

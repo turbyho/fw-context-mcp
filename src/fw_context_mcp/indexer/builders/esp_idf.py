@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -59,9 +60,10 @@ else:
 class ESPIDFBuildSystem:
     """ESP-IDF build system (``idf.py build``).
 
-    Detected by the presence of ``sdkconfig`` alongside a CMakeLists.txt
-    that references ``idf_build``.  Registered AFTER the Mbed/Zephyr/PlatformIO
-    builders so those take precedence in ambiguous setups.
+    Detected by ``sdkconfig``, or by the include of ``project.cmake`` of
+    ESP-IDF in ``CMakeLists.txt`` (:meth:`detect`).  Registered AFTER the
+    Mbed/Zephyr/PlatformIO builders so those take precedence in ambiguous
+    setups.
 
     WHY ``idf.py build`` (not raw CMake): ESP-IDF uses CMake internally
     but the project structure is non-standard — CMakeLists.txt in an
@@ -79,21 +81,24 @@ class ESPIDFBuildSystem:
 
     @classmethod
     def detect(cls, project_root: Path) -> bool:
+        """Say if *project_root* is an ESP-IDF project: ``sdkconfig``, or the ``project.cmake`` of ESP-IDF.
+
+        ``idf.py set-target`` writes ``sdkconfig`` in the root.  A project
+        that keeps only ``sdkconfig.defaults`` in git has no ``sdkconfig``
+        after a clone.  The root ``CMakeLists.txt`` of each ESP-IDF project
+        includes ``$ENV{IDF_PATH}/tools/cmake/project.cmake`` (the build
+        system guide of ESP-IDF), thus that line also marks a project.
+        A PlatformIO project with the framework ``espidf`` has the same
+        line: the registry asks the PlatformIO builder first.
+        """
         root = project_root.resolve()
-        # Primary marker: sdkconfig in root (created by idf.py set-target)
-        if not (root / "sdkconfig").exists():
+        if (root / "sdkconfig").exists():
+            return True
+        try:
+            content = (root / "CMakeLists.txt").read_text(encoding="utf-8", errors="replace")
+        except OSError:
             return False
-        # Secondary: CMakeLists.txt references idf_build (distinguishes from generic CMake)
-        cmake_file = root / "CMakeLists.txt"
-        if cmake_file.exists():
-            try:
-                content = cmake_file.read_text(encoding="utf-8")
-                if "idf_build" in content or "IDF" in content:
-                    return True
-            except OSError:
-                pass
-        # Fallback: sdkconfig alone is suggestive enough
-        return True
+        return "/tools/cmake/project.cmake" in content
 
     # ── Build ──
 
@@ -158,43 +163,15 @@ class ESPIDFBuildSystem:
         env["EXTRA_CFLAGS"] = ""
         env["EXTRA_CXXFLAGS"] = ""
 
-        # Configure the build directory when it holds no cmake cache.
-        #
-        # The gate asks about the directory THIS build writes to, not about
-        # project_root/"build": with `-B` those are different, and asking
-        # about the wrong one left the isolated directory unconfigured while
-        # the build of the user made it look ready.
-        #
-        # `set-target` runs only when there is no sdkconfig, and that is a
-        # correctness rule, not a saving.  It renames <project>/sdkconfig to
-        # sdkconfig.old — `-B` does not move that, because
-        # tools/cmake/project.cmake takes ${CMAKE_SOURCE_DIR}/sdkconfig and
-        # renames it whenever _IDF_PY_SET_TARGET_ACTION is set — and that
-        # file is usually committed.  An automatic build would have deleted
-        # it, and the target it passed comes from the guess below, read out
-        # of that same file with esp32 as the fallback, so it could also
-        # regenerate the configuration for a different chip.
-        #
-        # Nothing is lost by skipping it: ensure_build_directory() in
-        # idf_py_actions/tools.py creates the directory and runs cmake on
-        # its own, and project.cmake takes the target from the sdkconfig
-        # that is already there.  set-target is needed only when that file
-        # does not exist — and then it renames nothing.
-        sdkconfig = project_root / "sdkconfig"
-        if not build_dir.exists() and not sdkconfig.exists():
-            target = "esp32"
-            log.warning(
-                "No sdkconfig in %s — defaulting the ESP-IDF target to esp32. "
-                "Run 'idf.py set-target <chip>' yourself if this project uses "
-                "a different variant.", project_root,
-            )
-            set_target_cmd = [idf_py, *build_dir_flag, "set-target", target]
-            log.info("esp-idf set-target: %s", " ".join(set_target_cmd))
-            try:
-                run_build_command(set_target_cmd, cwd=project_root, description="idf.py set-target", build_cfg=cfg)
-            except RuntimeError:
-                log.warning("idf.py set-target failed — build may use wrong target")
-
+        # No `idf.py set-target`: ESP-IDF selects the target itself
+        # (__target_init in tools/cmake/targets.cmake): IDF_TARGET of the
+        # environment, the sdkconfig, CONFIG_IDF_TARGET of
+        # sdkconfig.defaults, else esp32 (measured with ESP-IDF 6.1: a
+        # project with only sdkconfig.defaults for esp32s3 got esp32s3).
+        # An older version ran `set-target esp32` without an sdkconfig, and
+        # that took esp32 also for a project of an other chip.
+        # ensure_build_directory() of idf.py runs cmake in a new build
+        # directory on its own.
         log.info("esp-idf build: %s", " ".join(cmd))
         run_build_command(cmd, cwd=project_root, description="idf.py build", env=env, build_cfg=cfg)
 
@@ -369,28 +346,44 @@ class ESPIDFBuildSystem:
 
     @classmethod
     def detect_environment(cls, project_root: Path) -> dict[str, str | None]:
-        # EIM (Espressif Installation Manager) activation scripts take
-        # priority.  They set IDF_PATH / IDF_TOOLS_PATH / the toolchain
-        # PATH directly without running idf_tools.py's full install check,
-        # which fails on target-only installs (e.g. ``eim install -t esp32``
-        # without the RISC-V toolchain).  ``export.sh`` by contrast runs
-        # that check and aborts the build when any declared tool is absent.
-        #
-        # Windows: export.bat of ESP-IDF, for Command Prompt.  A .sh script
-        # cannot run there, and the form of the EIM scripts on Windows is
-        # not known here, thus they are left out.
+        """Return the script that activates the ESP-IDF of this user.
+
+        The sequence:
+
+        1. The ESP-IDF of the shell (``IDF_PATH``): the EIM script of that
+           ESP-IDF, else its ``export.sh``.  WHY first: the user selected
+           it, and a build in the background must use the same ESP-IDF
+           (measured: with IDF_PATH on v6.1, init took an EIM script of
+           v5.2.5).
+        2. The newest EIM script, by its version as numbers (v5.10 is
+           newer than v5.2).
+        3. ``export.sh`` in ``~/esp/esp-idf`` or ``~/esp-idf``.
+
+        WHY the EIM script before ``export.sh`` of the same ESP-IDF: an EIM
+        (Espressif Installation Manager) script sets IDF_PATH, IDF_TOOLS_PATH
+        and the PATH of the toolchain without the full install check of
+        ``idf_tools.py``.  That check fails on an install for some targets
+        only (``eim install -t esp32`` without the RISC-V toolchain), and
+        ``export.sh`` runs it.
+
+        Windows: export.bat of ESP-IDF, for Command Prompt.  A .sh script
+        cannot run there, and the form of the EIM scripts on Windows is not
+        known here, thus they are left out.
+        """
         windows = sys.platform == "win32"
-        if not windows:
-            tools_dir = Path.home() / ".espressif" / "tools"
-            eim_scripts = sorted(tools_dir.glob("activate_idf_*.sh"), reverse=True)
-            if eim_scripts:
-                return {"python": None, "activate": str(eim_scripts[0])}
+        eim_scripts = [] if windows else _eim_scripts()
 
         idf_path = os.environ.get("IDF_PATH")
         if idf_path:
+            for script, script_idf_path in eim_scripts:
+                if script_idf_path is not None and _same_path(script_idf_path, idf_path):
+                    return {"python": None, "activate": str(script)}
             export_script = Path(idf_path) / EXPORT_SCRIPT
             if export_script.exists():
                 return {"python": None, "activate": str(export_script)}
+
+        if eim_scripts:
+            return {"python": None, "activate": str(eim_scripts[0][0])}
 
         for candidate in [
             Path.home() / "esp" / "esp-idf" / EXPORT_SCRIPT,
@@ -413,6 +406,39 @@ class ESPIDFBuildSystem:
             "Or set in .fw-context/local.toml:\n"
             '  [build]\n  activate = "~/esp/esp-idf/export.sh"'
         )
+
+
+_EIM_VERSION = re.compile(r"^activate_idf_v(?P<version>\d+(?:\.\d+)*)")
+_EIM_IDF_PATH = re.compile(r"^IDF_PATH:(?P<path>.+)$", re.MULTILINE)
+
+
+def _eim_scripts() -> list[tuple[Path, str | None]]:
+    """Return the EIM scripts of this user, the newest version first, each with the IDF_PATH that it sets.
+
+    The EIM script lists the variables that it sets as ``NAME:value`` lines
+    (``get_env_var_pairs``; measured on EIM scripts of v5.2.5).  A script
+    without that line has no IDF_PATH here.
+    """
+    scripts: list[tuple[tuple[int, ...], Path, str | None]] = []
+    for script in (Path.home() / ".espressif" / "tools").glob("activate_idf_*.sh"):
+        found = _EIM_VERSION.match(script.name)
+        version = tuple(int(part) for part in found.group("version").split(".")) if found else ()
+        try:
+            text = script.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        pair = _EIM_IDF_PATH.search(text)
+        scripts.append((version, script, pair.group("path").strip() if pair else None))
+    scripts.sort(key=lambda item: (item[0], item[1].name), reverse=True)
+    return [(script, idf_path) for _, script, idf_path in scripts]
+
+
+def _same_path(first: str, second: str) -> bool:
+    """Say if two paths name the same directory (links resolved, the case of the file system)."""
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return os.path.normcase(os.path.normpath(first)) == os.path.normcase(os.path.normpath(second))
 
 
 # Register

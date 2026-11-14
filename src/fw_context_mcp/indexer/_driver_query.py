@@ -52,9 +52,10 @@ import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import cache, lru_cache
-from pathlib import Path
+from pathlib import Path, PurePath
 
 from ..utils import command_program, is_program, path_directories, program_file_names
+from ._driver_options import DRIVER_TAKES_NEXT
 from ._program_encoding import EchoMissingError, echo_flags, gcc_decoder
 
 log = logging.getLogger(__name__)
@@ -67,7 +68,37 @@ _QUERY_TIMEOUT_S = 30.0
 #: (``arm-none-eabi-gcc``, ``xtensa-esp32-elf-g++``, ``gcc-12``, ``cc``).
 #: It keeps the query away from a binary that is not a GCC driver: a clang
 #: or a vendor compiler does not answer the query in the GCC format.
-_GCC_DRIVER_NAME = re.compile(r"(?:^|-)(?:gcc|g\+\+|cc|c\+\+)(?:-\d+(?:\.\d+)*)?(?:\.exe)?$")
+#:
+#: The extension ``.exe`` in any case, as Windows reads it: ``shutil.which``
+#: and ``where`` give the case of ``PATHEXT`` (``gcc.EXE``).  WHY: a unit
+#: whose compiler had the name ``arm-zephyr-eabi-gcc.EXE`` got no query,
+#: thus libclang parsed it with the target and the headers of the host,
+#: and ``<string.h>`` of the toolchain was not found (2026-11-12).
+_DRIVER_SUFFIX = r"(?:-\d+(?:\.\d+)*)?(?i:\.exe)?$"
+_GCC_DRIVER_NAME = re.compile(r"(?:^|-)(?:gcc|g\+\+|cc|c\+\+)" + _DRIVER_SUFFIX)
+
+#: A C++ driver of GCC or clang, with the version suffix and the extension
+#: of a GCC driver name.  It compiles a `.c`, `.h` or `.i` file as C++:
+#: `man gcc` ("g++ ... treats .c, .h and .i files as C++ source files
+#: instead of C source files unless -x is used"); clang++ does the same,
+#: with a warning.  WHY one suffix grammar: the driver query and the
+#: language of a unit must agree about one compiler.
+_CXX_DRIVER_NAME = re.compile(r"(?:^|-)(?:g\+\+|c\+\+|clang\+\+)" + _DRIVER_SUFFIX)
+
+#: The drivers of GCC and clang, without a triple, a version and ``.exe``.
+#: WHY one list: the name of a compiler and the name of a cross-compiler
+#: must know the same drivers.
+_DRIVERS = r"(?:gcc|g\+\+|cc|c\+\+|clang|clang\+\+)"
+
+#: The name of a compiler driver of GCC or clang, with a triple or not
+#: (``gcc``, ``arm-none-eabi-g++``, ``clang``, ``aarch64-none-elf-clang++``),
+#: with the version suffix and the extension of a GCC driver name.
+_COMPILER_DRIVER_NAME = re.compile(r"(?:^|-)" + _DRIVERS + _DRIVER_SUFFIX)
+
+#: The name of a cross-compiler of GCC or clang, ``<triple>-<driver>``
+#: (the convention of GNU: ``arm-none-eabi-g++``, ``aarch64-none-elf-clang``),
+#: with the version suffix and the extension of a GCC driver name.
+_TRIPLE_DRIVER_NAME = re.compile(r"^(?P<triple>.+)-" + _DRIVERS + _DRIVER_SUFFIX)
 
 #: Flags that can change the predefined macros or the system directories of
 #: the driver.  An include path, a ``-D`` and a warning flag cannot, and
@@ -164,6 +195,22 @@ class DriverInfo:
 def is_gcc_driver_name(compiler: Path) -> bool:
     """Say if the file name of *compiler* is the name of a GCC driver."""
     return bool(_GCC_DRIVER_NAME.search(compiler.name))
+
+
+def is_compiler_driver_name(compiler: PurePath) -> bool:
+    """Say if the file name of *compiler* is the name of a compiler driver of GCC or clang (``_COMPILER_DRIVER_NAME``)."""
+    return bool(_COMPILER_DRIVER_NAME.search(compiler.name))
+
+
+def triple_of_driver_name(compiler: Path) -> str | None:
+    """Return the target triple that the file name of *compiler* names (``_TRIPLE_DRIVER_NAME``), or None."""
+    found = _TRIPLE_DRIVER_NAME.search(compiler.name)
+    return found.group("triple") if found else None
+
+
+def is_cxx_driver_name(compiler: Path) -> bool:
+    """Say if the file name of *compiler* is the name of a C++ driver (``_CXX_DRIVER_NAME``)."""
+    return bool(_CXX_DRIVER_NAME.search(compiler.name))
 
 
 def known_compilers(entries: Iterable[Mapping[str, object]]) -> dict[str, Path]:
@@ -266,13 +313,25 @@ def predefine_flags(args: Sequence[str]) -> tuple[str, ...]:
     distinct queries small.
     """
     kept: list[str] = []
-    path_flag = ""
+    kept_option = ""
+    skip_value = False
     for token in args:
-        if path_flag:
-            kept += [path_flag, token]
-            path_flag = ""
+        if kept_option:
+            kept += [kept_option, token]
+            kept_option = ""
+        elif skip_value:
+            skip_value = False
         elif token in _PATH_WITH_VALUE:
-            path_flag = token
+            kept_option = token
+        elif token in DRIVER_TAKES_NEXT:
+            # The value of an option is no flag: `-Xlinker -O1` is an
+            # option of the linker, and gave the query `-O1`, thus
+            # `__OPTIMIZE__` for a unit of -O0.  An option of the table
+            # that changes a predefine (`-m*` with a value) keeps its value.
+            if token.startswith(_PREDEFINE_PREFIXES):
+                kept_option = token
+            else:
+                skip_value = True
         elif token.startswith(_JOINED_PATH_FLAGS):
             kept.append(token)
         elif token.startswith("-f"):

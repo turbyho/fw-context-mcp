@@ -29,6 +29,7 @@ from typing import Any
 
 from fw_context_mcp.indexer.db import _expand_query, search_symbols
 from fw_context_mcp.indexer.db._symbols import count_symbols
+from fw_context_mcp.indexer.macros import expanded_fields
 from fw_context_mcp.utils import abs_path, is_db_exception, macro_signature
 
 # ── Row → dict conversion ───────────────────────────────────────────────────
@@ -486,8 +487,8 @@ def _search_code_macros_fts(
             }
             if r["value"]:
                 extra["_macro_value"] = r["value"]
-            if r["expanded_value"]:
-                extra["_macro_expanded_value"] = r["expanded_value"]
+            for field_name, field_value in expanded_fields(r).items():
+                extra[f"_macro_{field_name}"] = field_value
             macro_dicts.append(_symbol_row_to_dict(r, root, **extra))
         return macro_dicts, "macros_fts"
     except Exception as exc:

@@ -373,7 +373,7 @@ _PROJECT_LOCAL_DEFAULTS_TEMPLATE = """\
 # Set manually only if auto-detection fails or you need a different toolchain.
 #
 # python = "/path/to/python"        # Python interpreter for pip-based CLI tools
-#                                    #   (mbed-cli, platformio, keil2clangd, compiledb)
+#                                    #   (mbed-cli, platformio, keil2clangd)
 # activate = "/path/to/setup.sh"    # shell script sourced before build
 #                                    #   (auto-detected for Zephyr/NCS/ESP-IDF; override for custom)
 
@@ -1007,6 +1007,7 @@ _BUILD_FIELDS: list[tuple[str, str, str]] = [
     ("environment", "environment", "str"),
     ("build_dir", "build_dir", "str"),
     ("env", "env", "str_table"),
+    ("extra_path", "extra_path", "list"),
 ]
 
 _INDEX_FIELDS: list[tuple[str, str, str]] = [

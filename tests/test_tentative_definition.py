@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._toolchains import unit_of
+
 pytestmark = pytest.mark.libclang
 
 _C = """\
@@ -36,17 +38,13 @@ namespace ns { cb_t g_ns; }
 """
 
 
-def _variables(tmp_path: Path, name: str, code: str) -> dict[str, tuple[str, bool, int]]:
-    from fw_context_mcp.indexer.compile_commands import CompilationUnit
+def _variables(tmp_path: Path, name: str, code: str, toolchain) -> dict[str, tuple[str, bool, int]]:
     from fw_context_mcp.indexer.symbols import extract_all
 
     src = tmp_path / name
     src.write_text(code, encoding="utf-8")
     cpp = name.endswith(".cpp")
-    unit = CompilationUnit(
-        file=src, directory=tmp_path, language="c++" if cpp else "c",
-        clang_args=["-std=c++17"] if cpp else ["-std=gnu11"],
-    )
+    unit = unit_of(src, toolchain, ["-std=c++17"] if cpp else ["-std=gnu11"], directory=tmp_path, language="cpp" if cpp else "c")
     symbols = extract_all(unit).symbols
     return {
         s.qualified_name: (s.kind, s.is_definition, s.line, s.is_tentative)
@@ -55,20 +53,20 @@ def _variables(tmp_path: Path, name: str, code: str) -> dict[str, tuple[str, boo
     }
 
 
-def test_a_file_scope_variable_with_no_initializer_is_a_definition(tmp_path: Path):
-    found = _variables(tmp_path, "t.c", _C)
+def test_a_file_scope_variable_with_no_initializer_is_a_definition(tmp_path: Path, toolchain):
+    found = _variables(tmp_path, "t.c", _C, toolchain=toolchain)
     assert found["g_cb"] == ("varglobal", True, 2, True)
     assert found["g_public"] == ("varglobal", True, 3, True)
     assert found["g_init"] == ("varglobal", True, 4, False)
     assert found["g_twice"][:2] == ("varglobal", True)
 
 
-def test_an_extern_declaration_is_no_definition(tmp_path: Path):
-    assert "g_extern" not in _variables(tmp_path, "t.c", _C)
+def test_an_extern_declaration_is_no_definition(tmp_path: Path, toolchain):
+    assert "g_extern" not in _variables(tmp_path, "t.c", _C, toolchain=toolchain)
 
 
-def test_a_definition_with_an_initializer_wins_over_the_tentative_one(tmp_path: Path):
-    assert _variables(tmp_path, "t.c", _C)["g_later"] == ("varglobal", True, 9, False)
+def test_a_definition_with_an_initializer_wins_over_the_tentative_one(tmp_path: Path, toolchain):
+    assert _variables(tmp_path, "t.c", _C, toolchain=toolchain)["g_later"] == ("varglobal", True, 9, False)
 
 
 @pytest.mark.parametrize("tentative_first", [True, False])
@@ -111,9 +109,9 @@ def test_a_definition_with_an_initializer_in_another_unit_wins(tmp_path: Path, t
         conn.close()
 
 
-def test_cpp_keeps_its_rules(tmp_path: Path):
+def test_cpp_keeps_its_rules(tmp_path: Path, toolchain):
     """In C++ a namespace-scope declaration is a definition already, and a class member declaration is not."""
-    found = _variables(tmp_path, "t.cpp", _CPP)
+    found = _variables(tmp_path, "t.cpp", _CPP, toolchain=toolchain)
     assert found["ns::g_ns"][:2] == ("varglobal", True)
     assert found["S::member"] == ("varglobal", True, 3, False)
     assert "g_extern" not in found

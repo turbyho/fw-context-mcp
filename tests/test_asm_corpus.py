@@ -3,8 +3,12 @@
 `tests/fixtures/asm/` holds one `.S` file per family of GNU as
 constructs, written from the manual rather than from whatever a given
 SDK on a given machine happens to write.  `expected.toml` beside it holds
-what each file really defines, produced by `arm-none-eabi-nm` — the only
-authority on the question — so these tests run with no toolchain at all.
+what each file really defines, produced by the `nm` of the ARM toolchain
+of the test SDKs (``arm-zephyr``) — the only authority on the question.
+The reader reads each file as the unit that the driver of that toolchain
+gives (``tests/_toolchains.py``).  WHY ARM alone: the corpus is Cortex-M
+assembly (Thumb, the comments `@` of ARM), which no other toolchain
+assembles.
 
 Two assertions, and the first one is the important one:
 
@@ -23,11 +27,9 @@ assertion on when the construct lands.
 from __future__ import annotations
 
 import importlib.util
-import shutil
 import subprocess
 import tomllib
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -37,34 +39,26 @@ from fw_context_mcp.indexer.asm import (
     extract_vectors,
     preprocess,
 )
+from tests._toolchains import Toolchain, find_driver, unit_of
 
 CORPUS = Path(__file__).parent / "fixtures" / "asm"
 EXPECTED = tomllib.loads((CORPUS / "expected.toml").read_text(encoding="utf-8"))
 
-pytestmark = pytest.mark.skipif(
-    shutil.which("clang") is None, reason="the preprocessor is clang"
-)
 
-# The toolchain PlatformIO installs.  Not on PATH, which is why it is
-# named in full rather than looked up.
-_ARM_BIN = Path.home() / ".platformio/packages/toolchain-gccarmnoneeabi/bin"
-_ARM_GCC = _ARM_BIN / "arm-none-eabi-gcc"
-_ARM_NM = _ARM_BIN / "arm-none-eabi-nm"
-
-needs_arm = pytest.mark.skipif(
-    not (_ARM_GCC.exists() and _ARM_NM.exists()),
-    reason="no ARM toolchain to assemble the corpus with",
-)
+def _tool(toolchain: Toolchain, name: str) -> str:
+    """Return the program *name* (``nm``) of *toolchain*; the pre-test checked the test SDKs."""
+    found = find_driver(toolchain.bin_dir, toolchain.prefix, name)
+    assert found is not None, f"no {toolchain.prefix}{name} in {toolchain.bin_dir}"
+    return str(found)
 
 
-def _read(path: Path) -> tuple[set[str], set[str]]:
-    """Return (symbols, vector slots) the reader finds in *path*."""
-    # The target of the oracle: `arm-none-eabi-gcc` assembles the corpus,
-    # and the reader cuts the comments of that target (`@`).
-    unit = SimpleNamespace(
-        file=path, directory=path.parent, clang_args=["--target=arm-none-eabi"]
-    )
-    source = preprocess(unit)
+def _read(path: Path, toolchain: Toolchain) -> tuple[set[str], set[str]]:
+    """Return (symbols, vector slots) the reader finds in *path*, read as the unit of *toolchain*.
+
+    The driver of the ARM toolchain gives the target, and the reader cuts
+    the comments of that target (`@`).
+    """
+    source = preprocess(unit_of(path, toolchain))
     assert source is not None, f"the preprocessor could not read {path.name}"
     return (
         {s.name for s in extract_symbols(source)},
@@ -72,16 +66,20 @@ def _read(path: Path) -> tuple[set[str], set[str]]:
     )
 
 
-def _corpus_files() -> list[str]:
-    return sorted(EXPECTED)
+def _corpus_files(*, complete: bool | None = None) -> list[str]:
+    """The files of the corpus; with *complete*, only the files of that ``complete`` flag."""
+    return sorted(name for name, entry in EXPECTED.items() if complete is None or entry["complete"] is complete)
 
 
-@pytest.mark.parametrize("name", _corpus_files())
 class TestAgainstTheAssembler:
-    def test_the_reader_invents_nothing(self, name: str):
+    """WHY each test takes the files it applies to: a file that a test does
+    not apply to was a skip, and a skip reads as a pass."""
+
+    @pytest.mark.parametrize("name", _corpus_files())
+    def test_the_reader_invents_nothing(self, name: str, arm_toolchain: Toolchain):
         """The rule that holds for every file, implemented or not."""
         entry = EXPECTED[name]
-        found, _ = _read(CORPUS / f"{name}.S")
+        found, _ = _read(CORPUS / f"{name}.S", arm_toolchain)
 
         invented = found - set(entry["defined"])
 
@@ -91,41 +89,49 @@ class TestAgainstTheAssembler:
             f"in no binary is worse than a missing one."
         )
 
-    def test_the_reader_misses_nothing(self, name: str):
-        entry = EXPECTED[name]
-        if not entry["complete"]:
-            pytest.skip(f"{name}.S covers constructs the reader does not read yet")
-        found, _ = _read(CORPUS / f"{name}.S")
+    @pytest.mark.parametrize("name", _corpus_files(complete=True))
+    def test_the_reader_misses_nothing(self, name: str, arm_toolchain: Toolchain):
+        found, _ = _read(CORPUS / f"{name}.S", arm_toolchain)
 
-        assert found == set(entry["defined"])
+        assert found == set(EXPECTED[name]["defined"])
 
-    def test_the_vector_slots_match(self, name: str):
-        entry = EXPECTED[name]
-        if "vectors" not in entry:
-            pytest.skip(f"{name}.S has no vector table")
-        _, slots = _read(CORPUS / f"{name}.S")
+    @pytest.mark.parametrize("name", _corpus_files(complete=False))
+    def test_an_incomplete_file_still_has_a_name_that_the_reader_misses(self, name: str, arm_toolchain: Toolchain):
+        """A file of ``complete = false`` covers constructs that the reader does not read yet.
 
-        assert slots == set(entry["vectors"]), (
+        When the reader learns them, this test fails: set ``complete = true``
+        in expected.toml, and the test above then holds the file.
+        """
+        found, _ = _read(CORPUS / f"{name}.S", arm_toolchain)
+
+        assert set(EXPECTED[name]["defined"]) - found, f"{name}.S: the reader reads it whole now"
+
+    @pytest.mark.parametrize("name", _corpus_files())
+    def test_the_vector_slots_match(self, name: str, arm_toolchain: Toolchain):
+        """A file without ``vectors`` in expected.toml has no vector table: the reader must find no slot."""
+        _, slots = _read(CORPUS / f"{name}.S", arm_toolchain)
+
+        assert slots == set(EXPECTED[name].get("vectors", [])), (
             "the expected set comes from the object's relocations: a "
             "`.word Sym` makes one and a reserved `.word 0` does not"
         )
 
-    def test_the_call_edges_match(self, name: str):
-        """Each call or jump relocation is an edge of the function that holds it."""
-        entry = EXPECTED[name]
-        if "calls" not in entry:
-            pytest.skip(f"{name}.S has no call to a symbol")
-        unit = SimpleNamespace(
-            file=CORPUS / f"{name}.S", directory=CORPUS, clang_args=["--target=arm-none-eabi"]
-        )
-        source = preprocess(unit)
+    @pytest.mark.parametrize("name", sorted(name for name, entry in EXPECTED.items() if "calls" in entry))
+    def test_the_call_edges_match(self, name: str, arm_toolchain: Toolchain):
+        """Each call or jump relocation is an edge of the function that holds it.
+
+        Only the files with ``calls`` in expected.toml: the oracle takes the
+        edges from the relocations, and the assembler resolves a branch to
+        a label of the same section without one.  A file without ``calls``
+        thus says nothing about its branches (``conditionals.S`` has one).
+        """
+        source = preprocess(unit_of(CORPUS / f"{name}.S", arm_toolchain))
         assert source is not None
         edges = {f"{'+'.join(call.owners)}>{call.target}" for call in extract_calls(source)}
 
-        assert edges == set(entry["calls"])
+        assert edges == set(EXPECTED[name]["calls"])
 
 
-@needs_arm
 @pytest.mark.parametrize("name", _corpus_files())
 class TestTheCorpusItself:
     """The corpus must be real assembly, and expected.toml must match it.
@@ -136,27 +142,26 @@ class TestTheCorpusItself:
     """
 
     @staticmethod
-    def _assemble(path: Path, out_dir: Path) -> subprocess.CompletedProcess:
+    def _assemble(path: Path, out_dir: Path, toolchain: Toolchain) -> subprocess.CompletedProcess:
         obj = out_dir / f"{path.stem}.o"
         return subprocess.run(
-            [str(_ARM_GCC), "-mcpu=cortex-m4", "-mthumb", "-c",
-             "-o", str(obj), str(path)],
+            [str(toolchain.driver(path)), *toolchain.flags, "-c", "-o", str(obj), str(path)],
             capture_output=True, text=True, timeout=60,
         )
 
-    def test_the_file_assembles(self, name: str, tmp_path: Path):
-        run = self._assemble(CORPUS / f"{name}.S", tmp_path)
+    def test_the_file_assembles(self, name: str, tmp_path: Path, arm_toolchain: Toolchain):
+        run = self._assemble(CORPUS / f"{name}.S", tmp_path, arm_toolchain)
 
         assert run.returncode == 0, f"{name}.S does not assemble:\n{run.stderr}"
 
     def test_expected_toml_still_matches_the_assembler(
-        self, name: str, tmp_path: Path
+        self, name: str, tmp_path: Path, arm_toolchain: Toolchain
     ):
         """Catches drift between the corpus and the file generated from it."""
         path = CORPUS / f"{name}.S"
-        assert self._assemble(path, tmp_path).returncode == 0
+        assert self._assemble(path, tmp_path, arm_toolchain).returncode == 0
         out = subprocess.run(
-            [str(_ARM_NM), str(tmp_path / f"{name}.o")],
+            [_tool(arm_toolchain, "nm"), str(tmp_path / f"{name}.o")],
             capture_output=True, text=True, timeout=60,
         )
         defined = set()
@@ -171,16 +176,16 @@ class TestTheCorpusItself:
             f"{name}.S and expected.toml disagree; regenerate the file"
         )
 
-    def test_expected_calls_still_match_the_assembler(self, name: str, tmp_path: Path):
+    def test_expected_calls_still_match_the_assembler(self, name: str, tmp_path: Path, arm_toolchain: Toolchain):
         """The call edges of expected.toml come from the relocations (regenerate.py)."""
         spec = importlib.util.spec_from_file_location("regenerate", CORPUS / "regenerate.py")
         assert spec is not None and spec.loader is not None
         regenerate = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(regenerate)
         path = CORPUS / f"{name}.S"
-        assert self._assemble(path, tmp_path).returncode == 0
+        assert self._assemble(path, tmp_path, arm_toolchain).returncode == 0
 
-        edges = regenerate.call_edges(tmp_path / f"{name}.o")
+        edges = regenerate.call_edges(tmp_path / f"{name}.o", arm_toolchain)
 
         assert edges == set(EXPECTED[name].get("calls", [])), (
             f"{name}.S and expected.toml disagree; regenerate the file"

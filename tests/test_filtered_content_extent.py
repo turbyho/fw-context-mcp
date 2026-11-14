@@ -25,15 +25,16 @@ it as commented out.  Every comment of every header was gone with it.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
 
+from tests._toolchains import Toolchain, unit_for, write_compile_commands, write_sources
+
 pytestmark = pytest.mark.libclang
 
 
-def _fill_content(root: Path, db_path: Path, files: dict[str, str], main: str) -> dict[str, str]:
+def _fill_content(toolchain: Toolchain, root: Path, db_path: Path, files: dict[str, str], main: str) -> dict[str, str]:
     """Index *files* through the real content-fill pass and return stored text.
 
     *files* maps a project-relative path to its text; *main* names the entry
@@ -51,24 +52,15 @@ def _fill_content(root: Path, db_path: Path, files: dict[str, str], main: str) -
     )
     from fw_context_mcp.indexer.ops import _build_filtered_file_content
 
-    for rel, text in files.items():
-        target = root / rel
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(text, encoding="utf-8")
+    write_sources(root, files)
 
-    cc = root / "compile_commands.json"
-    cc.write_text(
-        json.dumps(
-            [
-                {
-                    "directory": str(root),
-                    "file": str(root / main),
-                    "arguments": ["cc", "-c", str(root / main), "-I", str(root / "src")],
-                }
-            ]
-        ),
-        encoding="utf-8",
-    )
+    cc = write_compile_commands(root / "compile_commands.json", [
+        {
+            "directory": str(root),
+            "file": str(root / main),
+            "arguments": [*toolchain.arguments(str(root / main)), "-I", str(root / "src")],
+        }
+    ])
 
     conn = open_db(db_path)
     try:
@@ -99,7 +91,7 @@ def _fill_content(root: Path, db_path: Path, files: dict[str, str], main: str) -
 class TestTrailingDirectivesSurvive:
     """A file whose tail holds only directives must keep its full length."""
 
-    def test_include_guard_endif_is_not_cut(self, tmp_path: Path) -> None:
+    def test_include_guard_endif_is_not_cut(self, tmp_path: Path, toolchain) -> None:
         root = tmp_path / "proj"
         header = (
             "#ifndef API_H_\n"          # 1
@@ -110,6 +102,7 @@ class TestTrailingDirectivesSurvive:
             "#endif // API_H_\n"        # 6 — last token-free line
         )
         stored = _fill_content(
+            toolchain,
             root,
             tmp_path / "index.db",
             {
@@ -127,7 +120,7 @@ class TestTrailingDirectivesSurvive:
         )
         assert "kept" in content, "an active declaration must survive the filter"
 
-    def test_line_numbers_still_align_after_the_last_token(self, tmp_path: Path) -> None:
+    def test_line_numbers_still_align_after_the_last_token(self, tmp_path: Path, toolchain) -> None:
         """Padding the tail must not shift the lines that carry code."""
         root = tmp_path / "proj"
         header = (
@@ -138,6 +131,7 @@ class TestTrailingDirectivesSurvive:
             "\n"                        # 5
         )
         stored = _fill_content(
+            toolchain,
             root,
             tmp_path / "index.db",
             {
@@ -184,7 +178,7 @@ def _assert_lines(content: str, source: str, *, blank: set[int]) -> None:
 class TestInactiveBranchesAreFiltered:
     """A branch the preprocessor did not take must leave no text behind."""
 
-    def test_dead_branch_at_file_scope_in_a_cpp_is_blank(self, tmp_path: Path) -> None:
+    def test_dead_branch_at_file_scope_in_a_cpp_is_blank(self, tmp_path: Path, toolchain) -> None:
         """The raw lexer used to keep every line of this block.
 
         The tokens of a TU come from ``clang_tokenize``, which does no
@@ -202,13 +196,14 @@ class TestInactiveBranchesAreFiltered:
             "int live_after(void) { return 2; }\n"    # 7
         )
         stored = _fill_content(
+            toolchain,
             root, tmp_path / "index.db", {"src/main.cpp": main}, main="src/main.cpp"
         )
 
         _assert_lines(stored["src/main.cpp"], main, blank={3, 4, 5})
         assert "dead" not in stored["src/main.cpp"]
 
-    def test_dead_branch_inside_a_function_body_is_blank(self, tmp_path: Path) -> None:
+    def test_dead_branch_inside_a_function_body_is_blank(self, tmp_path: Path, toolchain) -> None:
         """The regression this whole change exists for.
 
         A dead block inside a body sits inside the extent of that body, and
@@ -230,17 +225,18 @@ class TestInactiveBranchesAreFiltered:
             "}\n"                                     # 8
         )
         stored = _fill_content(
+            toolchain,
             root, tmp_path / "index.db", {"src/main.cpp": main}, main="src/main.cpp"
         )
 
         _assert_lines(stored["src/main.cpp"], main, blank={4, 5, 6})
         assert "dead_call" not in stored["src/main.cpp"]
 
-    def test_live_else_branch_survives(self, tmp_path: Path) -> None:
+    def test_live_else_branch_survives(self, tmp_path: Path, toolchain) -> None:
         """A skipped range ends on the directive line, thus it takes no code."""
         root = tmp_path / "proj"
         main = (
-            "#define FEATURE_ON 1\n"                  # 1
+            "int live_call(void);\n"                  # 1
             "int host(void)\n"                        # 2
             "{\n"                                     # 3
             "    int x = 0;\n"                        # 4
@@ -253,6 +249,7 @@ class TestInactiveBranchesAreFiltered:
             "}\n"                                     # 11
         )
         stored = _fill_content(
+            toolchain,
             root, tmp_path / "index.db", {"src/main.cpp": main}, main="src/main.cpp"
         )
 
@@ -262,35 +259,37 @@ class TestInactiveBranchesAreFiltered:
         assert "live_call" in stored["src/main.cpp"]
         assert "dead_call" not in stored["src/main.cpp"]
 
-    def test_nested_dead_branch_keeps_the_live_inner_branch(self, tmp_path: Path) -> None:
+    def test_nested_dead_branch_keeps_the_live_inner_branch(self, tmp_path: Path, toolchain) -> None:
         root = tmp_path / "proj"
         main = (
-            "#define OUTER_ON 1\n"                    # 1
-            "int host(void)\n"                        # 2
-            "{\n"                                     # 3
-            "    int x = 0;\n"                        # 4
-            "#ifdef OUTER_ON\n"                       # 5
-            "  #ifdef INNER_OFF\n"                    # 6
-            "    x = dead_call();\n"                  # 7
-            "  #else\n"                               # 8
-            "    x = live_call();\n"                  # 9
-            "  #endif\n"                              # 10
-            "#else\n"                                 # 11
-            "    x = other_dead_call();\n"            # 12
-            "#endif\n"                                # 13
-            "    return x;\n"                         # 14
-            "}\n"                                     # 15
+            "int live_call(void);\n"                  # 1
+            "#define OUTER_ON 1\n"                    # 2
+            "int host(void)\n"                        # 3
+            "{\n"                                     # 4
+            "    int x = 0;\n"                        # 5
+            "#ifdef OUTER_ON\n"                       # 6
+            "  #ifdef INNER_OFF\n"                    # 7
+            "    x = dead_call();\n"                  # 8
+            "  #else\n"                               # 9
+            "    x = live_call();\n"                  # 10
+            "  #endif\n"                              # 11
+            "#else\n"                                 # 12
+            "    x = other_dead_call();\n"            # 13
+            "#endif\n"                                # 14
+            "    return x;\n"                         # 15
+            "}\n"                                     # 16
         )
         stored = _fill_content(
+            toolchain,
             root, tmp_path / "index.db", {"src/main.cpp": main}, main="src/main.cpp"
         )
 
-        _assert_lines(stored["src/main.cpp"], main, blank={6, 7, 8, 11, 12, 13})
+        _assert_lines(stored["src/main.cpp"], main, blank={7, 8, 9, 12, 13, 14})
         assert "live_call" in stored["src/main.cpp"]
         assert "dead_call" not in stored["src/main.cpp"]
         assert "other_dead_call" not in stored["src/main.cpp"]
 
-    def test_define_inside_a_live_branch_stays_searchable(self, tmp_path: Path) -> None:
+    def test_define_inside_a_live_branch_stays_searchable(self, tmp_path: Path, toolchain) -> None:
         """``search_content`` must still reach a ``#define``.
 
         A ``#define`` belongs to no definition, thus ``files.content`` is the
@@ -310,6 +309,7 @@ class TestInactiveBranchesAreFiltered:
             "#endif\n"                                # 9
         )
         stored = _fill_content(
+            toolchain,
             root,
             tmp_path / "index.db",
             {
@@ -326,7 +326,7 @@ class TestInactiveBranchesAreFiltered:
         assert len(content.splitlines()) == len(header.splitlines())
 
     def test_header_whose_declarations_are_all_dead_keeps_its_length(
-        self, tmp_path: Path
+        self, tmp_path: Path, toolchain
     ) -> None:
         """Every declaration goes, and the file still measures its own length.
 
@@ -349,6 +349,7 @@ class TestInactiveBranchesAreFiltered:
             "#endif\n"                                # 7
         )
         stored = _fill_content(
+            toolchain,
             root,
             tmp_path / "index.db",
             {
@@ -365,7 +366,7 @@ class TestInactiveBranchesAreFiltered:
             "the length of the file must survive — read_file reports it"
         )
 
-    def test_dead_branch_inside_an_inline_body_in_a_header(self, tmp_path: Path) -> None:
+    def test_dead_branch_inside_an_inline_body_in_a_header(self, tmp_path: Path, toolchain) -> None:
         """A header filtered its file scope already, but not its bodies.
 
         For a header the tokens of the TU give nothing — ``get_tokens`` covers
@@ -390,6 +391,7 @@ class TestInactiveBranchesAreFiltered:
             "#endif\n"                                # 11
         )
         stored = _fill_content(
+            toolchain,
             root,
             tmp_path / "index.db",
             {
@@ -430,7 +432,7 @@ class TestAHeaderReachedTwiceKeepsItsLiveCode:
     * an ``#include`` comes before the guard.
     """
 
-    def test_include_before_the_guard_keeps_the_body(self, tmp_path: Path) -> None:
+    def test_include_before_the_guard_keeps_the_body(self, tmp_path: Path, toolchain) -> None:
         """The common shape: a header that includes something before guarding."""
         root = tmp_path / "proj"
         two = (
@@ -444,6 +446,7 @@ class TestAHeaderReachedTwiceKeepsItsLiveCode:
             "#endif\n"                                 # 8
         )
         stored = _fill_content(
+            toolchain,
             root,
             tmp_path / "index.db",
             {
@@ -467,7 +470,7 @@ class TestAHeaderReachedTwiceKeepsItsLiveCode:
         )
         assert "return 42" in stored["src/two.h"]
 
-    def test_directive_after_the_guard_keeps_the_body(self, tmp_path: Path) -> None:
+    def test_directive_after_the_guard_keeps_the_body(self, tmp_path: Path, toolchain) -> None:
         """The other shape: a trailing conditional after the guard's ``#endif``."""
         root = tmp_path / "proj"
         two = (
@@ -483,6 +486,7 @@ class TestAHeaderReachedTwiceKeepsItsLiveCode:
             "#endif\n"                                 # 10
         )
         stored = _fill_content(
+            toolchain,
             root,
             tmp_path / "index.db",
             {
@@ -505,7 +509,7 @@ class TestAHeaderReachedTwiceKeepsItsLiveCode:
             "skipped this branch and it stays dead"
         )
 
-    def test_a_branch_dead_in_every_inclusion_stays_filtered(self, tmp_path: Path) -> None:
+    def test_a_branch_dead_in_every_inclusion_stays_filtered(self, tmp_path: Path, toolchain) -> None:
         """The intersection must not become a way of keeping dead code.
 
         Both inclusions skip this branch, thus it is dead under either rule.
@@ -525,6 +529,7 @@ class TestAHeaderReachedTwiceKeepsItsLiveCode:
             "#endif\n"                                 # 8
         )
         stored = _fill_content(
+            toolchain,
             root,
             tmp_path / "index.db",
             {
@@ -545,7 +550,7 @@ class TestAHeaderReachedTwiceKeepsItsLiveCode:
         assert "dead_in_header" not in stored["src/two.h"]
 
 
-def _index_bodies(root: Path, db_path: Path, source: str) -> dict[str, str]:
+def _index_bodies(toolchain: Toolchain, root: Path, db_path: Path, source: str) -> dict[str, str]:
     """Index one TU and return the stored body of each definition.
 
     Asks ``extract_all`` for the TU (``return_tu=True``), because the record
@@ -553,24 +558,20 @@ def _index_bodies(root: Path, db_path: Path, source: str) -> dict[str, str]:
     ``ExtractionResult`` with no TU gets unfiltered bodies, which is the
     documented fallback and not what these tests are about.
     """
-    from fw_context_mcp.indexer.compile_commands import CompilationUnit
     from fw_context_mcp.indexer.db import open_db, upsert_build_config, upsert_project
     from fw_context_mcp.indexer.ops import store_symbols_for_unit
     from fw_context_mcp.indexer.symbols import extract_all
 
     src_dir = root / "src"
-    src_dir.mkdir(parents=True, exist_ok=True)
-    main = src_dir / "main.cpp"
-    main.write_text(source, encoding="utf-8")
+    write_sources(src_dir, {"main.cpp": source})
+    unit = unit_for(src_dir, "main.cpp", toolchain, ["-std=c++17"])
 
     conn = open_db(db_path)
     try:
         upsert_project(conn, "pid", "p", str(root))
-        upsert_build_config(conn, "ch", "pid", str(root / "compile_commands.json"))
+        # unit_for wrote the database beside the source.
+        upsert_build_config(conn, "ch", "pid", str(src_dir / "compile_commands.json"))
 
-        unit = CompilationUnit(
-            file=main, directory=src_dir, language="cpp", clang_args=["-std=c++17"],
-        )
         result = extract_all(unit, with_refs=False, return_tu=True)
         store_symbols_for_unit(
             conn, unit, "ch", root,
@@ -600,8 +601,9 @@ class TestStoredBodiesAreFiltered:
     reach every one of those tools as live code.
     """
 
-    def test_dead_block_is_not_in_the_stored_body(self, tmp_path: Path) -> None:
+    def test_dead_block_is_not_in_the_stored_body(self, tmp_path: Path, toolchain) -> None:
         bodies = _index_bodies(
+            toolchain,
             tmp_path / "proj",
             tmp_path / "index.db",
             "int dead_call(void);\n"                  # 1
@@ -623,7 +625,7 @@ class TestStoredBodiesAreFiltered:
         )
         assert "return x;" in body, "the live code of the body must stay"
 
-    def test_the_stored_body_keeps_its_line_count(self, tmp_path: Path) -> None:
+    def test_the_stored_body_keeps_its_line_count(self, tmp_path: Path, toolchain) -> None:
         """A dead line becomes a blank line, so a cited line number holds.
 
         ``get_source`` numbers the lines of this column from ``line``.  A
@@ -641,7 +643,7 @@ class TestStoredBodiesAreFiltered:
             "    return x;\n"                         # 8
             "}\n"                                     # 9
         )
-        bodies = _index_bodies(tmp_path / "proj", tmp_path / "index.db", source)
+        bodies = _index_bodies(toolchain, tmp_path / "proj", tmp_path / "index.db", source)
 
         lines = bodies["host"].splitlines()
         # The extent of host() runs from line 2 to line 9 — eight lines.
@@ -716,7 +718,7 @@ class TestMultiLineTokensKeepEveryLine:
     firmware: five fault handlers read as dead this way.
     """
 
-    def test_a_block_comment_keeps_its_closing_marker(self, tmp_path: Path) -> None:
+    def test_a_block_comment_keeps_its_closing_marker(self, tmp_path: Path, toolchain) -> None:
         """The defect that this class exists for."""
         root = tmp_path / "proj"
         source = (
@@ -727,6 +729,7 @@ class TestMultiLineTokensKeepEveryLine:
             "int after(void) { return 0; }\n"  # 5
         )
         stored = _fill_content(
+            toolchain,
             root, tmp_path / "index.db", {"src/main.c": source}, main="src/main.c"
         )
 
@@ -736,7 +739,7 @@ class TestMultiLineTokensKeepEveryLine:
             "tell where the comment ends, and reads live code as commented out"
         )
 
-    def test_a_line_continuation_string_keeps_its_tail(self, tmp_path: Path) -> None:
+    def test_a_line_continuation_string_keeps_its_tail(self, tmp_path: Path, toolchain) -> None:
         """A backslash at the end of a line makes one token of two lines."""
         root = tmp_path / "proj"
         source = (
@@ -745,12 +748,13 @@ class TestMultiLineTokensKeepEveryLine:
             "int after(void) { return 0; }\n"  # 3
         )
         stored = _fill_content(
+            toolchain,
             root, tmp_path / "index.db", {"src/main.c": source}, main="src/main.c"
         )
 
         _assert_lines(stored["src/main.c"], source, blank=set())
 
-    def test_a_raw_string_literal_keeps_its_tail(self, tmp_path: Path) -> None:
+    def test_a_raw_string_literal_keeps_its_tail(self, tmp_path: Path, toolchain) -> None:
         """A raw string literal spans lines without a continuation marker."""
         root = tmp_path / "proj"
         source = (
@@ -759,6 +763,7 @@ class TestMultiLineTokensKeepEveryLine:
             "int after(void) { return 0; }\n"  # 3
         )
         stored = _fill_content(
+            toolchain,
             root,
             tmp_path / "index.db",
             {"src/main.cpp": source},
@@ -767,7 +772,7 @@ class TestMultiLineTokensKeepEveryLine:
 
         _assert_lines(stored["src/main.cpp"], source, blank=set())
 
-    def test_a_comment_in_a_dead_branch_stays_blank(self, tmp_path: Path) -> None:
+    def test_a_comment_in_a_dead_branch_stays_blank(self, tmp_path: Path, toolchain) -> None:
         """The opposite error must not appear with the fix.
 
         Tokenization is a raw lexer, thus it answers for a dead ``#if``
@@ -787,6 +792,7 @@ class TestMultiLineTokensKeepEveryLine:
             "int main(void) { return 0; }\n"  # 8
         )
         stored = _fill_content(
+            toolchain,
             root, tmp_path / "index.db", {"src/main.c": source}, main="src/main.c"
         )
 
@@ -810,7 +816,7 @@ class TestHeadersKeepTheirComments:
     ``read_file`` is the only way an agent can reach a C header.
     """
 
-    def test_a_header_comment_survives(self, tmp_path: Path) -> None:
+    def test_a_header_comment_survives(self, tmp_path: Path, toolchain) -> None:
         root = tmp_path / "proj"
         header = (
             "#ifndef API_H_\n"           # 1
@@ -822,6 +828,7 @@ class TestHeadersKeepTheirComments:
             "#endif\n"                   # 7
         )
         stored = _fill_content(
+            toolchain,
             root,
             tmp_path / "index.db",
             {
@@ -838,7 +845,7 @@ class TestHeadersKeepTheirComments:
             "description that exists"
         )
 
-    def test_a_header_directive_survives(self, tmp_path: Path) -> None:
+    def test_a_header_directive_survives(self, tmp_path: Path, toolchain) -> None:
         """An include guard must show, and not read as an empty line."""
         root = tmp_path / "proj"
         header = (
@@ -848,6 +855,7 @@ class TestHeadersKeepTheirComments:
             "#endif\n"                   # 4
         )
         stored = _fill_content(
+            toolchain,
             root,
             tmp_path / "index.db",
             {
@@ -859,7 +867,7 @@ class TestHeadersKeepTheirComments:
 
         _assert_lines(stored["src/guard.h"], header, blank=set())
 
-    def test_a_dead_branch_of_a_header_stays_blank(self, tmp_path: Path) -> None:
+    def test_a_dead_branch_of_a_header_stays_blank(self, tmp_path: Path, toolchain) -> None:
         """The header path must filter dead code as the main file does."""
         root = tmp_path / "proj"
         header = (
@@ -873,6 +881,7 @@ class TestHeadersKeepTheirComments:
             "#endif\n"                   # 8
         )
         stored = _fill_content(
+            toolchain,
             root,
             tmp_path / "index.db",
             {

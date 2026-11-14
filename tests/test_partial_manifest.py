@@ -14,13 +14,16 @@ answer carries a state for it.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
 
+from tests._toolchains import Toolchain, write_compile_commands, write_sources
 
-def _run(tmp_path: Path, monkeypatch, *, fail_step: str | None, source: str = "") -> tuple[Path, str]:
+
+def _run(
+    tmp_path: Path, monkeypatch, toolchain: Toolchain, *, fail_step: str | None, source: str = "",
+) -> tuple[Path, str]:
     """Index one file; *fail_step* names a postprocess step that raises.  Returns ``(db_path, verification)``.
 
     *source* is the text of ``main.c``; the default holds one function.
@@ -40,10 +43,11 @@ def _run(tmp_path: Path, monkeypatch, *, fail_step: str | None, source: str = ""
         ])
     root = tmp_path / "proj"
     root.mkdir()
-    (root / "main.c").write_text(source or "int main_value(void) { return 1; }\n", encoding="utf-8")
-    cc = root / "compile_commands.json"
-    cc.write_text(json.dumps([{"directory": str(root), "file": "main.c", "arguments": ["cc", "-c", "main.c"]}]),
-                  encoding="utf-8")
+    write_sources(root, {"main.c": source or "int main_value(void) { return 1; }\n"})
+    cc = write_compile_commands(
+        root / "compile_commands.json",
+        [{"directory": str(root), "file": "main.c", "arguments": toolchain.arguments("main.c")}],
+    )
     db_path = tmp_path / "index" / "pid" / "index.db"
     run(compile_commands=cc, db_path=db_path, project_root=root, project_id="pid",
         index_refs=False, index_embeddings=False, analyze_symbols=False)
@@ -54,15 +58,15 @@ def _run(tmp_path: Path, monkeypatch, *, fail_step: str | None, source: str = ""
         conn.close()
 
 
-def test_failed_embeddings_stamp_partial(tmp_path, monkeypatch):
+def test_failed_embeddings_stamp_partial(tmp_path, monkeypatch, toolchain):
     """The stamp read the failed steps before the loop copied them in, and wrote "full"."""
-    _, verification = _run(tmp_path, monkeypatch, fail_step="embeddings")
+    _, verification = _run(tmp_path, monkeypatch, toolchain, fail_step="embeddings")
 
     assert verification == "partial"
 
 
-def test_a_run_without_a_failure_stamps_full(tmp_path, monkeypatch):
-    _, verification = _run(tmp_path, monkeypatch, fail_step=None)
+def test_a_run_without_a_failure_stamps_full(tmp_path, monkeypatch, toolchain):
+    _, verification = _run(tmp_path, monkeypatch, toolchain, fail_step=None)
 
     assert verification == "full"
 
@@ -121,10 +125,10 @@ def test_a_partial_build_is_current(partial_build):
     assert annotate_index_state([{"name": "x"}], {"project_root": str(partial_build)}) == [{"name": "x"}]
 
 
-def test_a_failed_full_text_index_stops_the_run(tmp_path, monkeypatch):
+def test_a_failed_full_text_index_stops_the_run(tmp_path, monkeypatch, toolchain):
     """A text search of the build misses each symbol, and the integrity check does not see a missing table."""
     with pytest.raises(RuntimeError, match="fts5 failed"):
-        _run(tmp_path, monkeypatch, fail_step="fts5")
+        _run(tmp_path, monkeypatch, toolchain, fail_step="fts5")
 
 
 def test_an_ollama_that_is_not_reachable_is_reported(tmp_path, monkeypatch):
@@ -146,7 +150,7 @@ def test_an_ollama_that_is_not_reachable_is_reported(tmp_path, monkeypatch):
         _embedding._build_embeddings(None, "h", LLMConfig(), tmp_path)
 
 
-def test_a_run_with_ollama_down_ends_and_stamps_partial(tmp_path, monkeypatch):
+def test_a_run_with_ollama_down_ends_and_stamps_partial(tmp_path, monkeypatch, toolchain):
     """The refused connection is no OSError: it left the step, and the whole index run stopped."""
     import httpx
 
@@ -164,10 +168,11 @@ def test_a_run_with_ollama_down_ends_and_stamps_partial(tmp_path, monkeypatch):
     monkeypatch.setattr(_embedding.net, "get", _refused)
     root = tmp_path / "proj"
     root.mkdir()
-    (root / "main.c").write_text("int main_value(void) { return 1; }\n", encoding="utf-8")
-    cc = root / "compile_commands.json"
-    cc.write_text(json.dumps([{"directory": str(root), "file": "main.c", "arguments": ["cc", "-c", "main.c"]}]),
-                  encoding="utf-8")
+    write_sources(root, {"main.c": "int main_value(void) { return 1; }\n"})
+    cc = write_compile_commands(
+        root / "compile_commands.json",
+        [{"directory": str(root), "file": "main.c", "arguments": toolchain.arguments("main.c")}],
+    )
     db_path = tmp_path / "index" / "pid" / "index.db"
     llm = LLMConfig()
     llm.enabled = True
@@ -182,7 +187,7 @@ def test_a_run_with_ollama_down_ends_and_stamps_partial(tmp_path, monkeypatch):
         conn.close()
 
 
-def test_failed_batches_are_reported_after_the_other_batches(tmp_path, monkeypatch):
+def test_failed_batches_are_reported_after_the_other_batches(tmp_path, monkeypatch, toolchain):
     """A batch that failed after its retries was only logged: the build looked complete.
 
     Twelve functions make two batches (ten symbols at most in one).  The
@@ -193,7 +198,7 @@ def test_failed_batches_are_reported_after_the_other_batches(tmp_path, monkeypat
     from fw_context_mcp.indexer.db import open_db
 
     source = "".join(f"int fn_{i:02d}(void) {{ return {i}; }}\n" for i in range(12))
-    db_path, _ = _run(tmp_path, monkeypatch, fail_step=None, source=source)
+    db_path, _ = _run(tmp_path, monkeypatch, toolchain, fail_step=None, source=source)
 
     class _FailsOneBatch:
         name = "fake-embedder"

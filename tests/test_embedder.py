@@ -6,8 +6,6 @@ from pathlib import Path
 
 import pytest
 
-pytest.importorskip("numpy", reason="numpy not installed")
-
 from fw_context_mcp.config.settings import DESCRIPTION_VERSION, LLMConfig
 from fw_context_mcp.llm.embedder import Embedder
 from fw_context_mcp.llm.embedder_factory import get_embedder
@@ -118,10 +116,6 @@ class TestGetEmbedder:
         """ST prefix should route to ST backend.  The type is checked before
         lazy-loading — actual import failure (no sentence-transformers) is
         deferred to first embed call and not tested here."""
-        import importlib
-        st_spec = importlib.util.find_spec("sentence_transformers")
-        if st_spec is None:
-            pytest.skip("sentence-transformers not installed")
         cfg = LLMConfig(embed_model=model)
         e = get_embedder(cfg)
         assert e.name == model
@@ -223,11 +217,6 @@ class TestMRLTruncation:
     def test_embed_dim_respected_in_st_embedder_init(self) -> None:
         """embed_dim is passed through to the constructor — actual truncation
         verified during real embed calls, not here."""
-        import importlib
-
-        st_spec = importlib.util.find_spec("sentence_transformers")
-        if st_spec is None:
-            pytest.skip("sentence-transformers not installed")
         from fw_context_mcp.llm.st_embedder import SentenceTransformerEmbedder
 
         cfg = LLMConfig(embed_model="BAAI/bge-small-en-v1.5", embed_dim=64)

@@ -109,11 +109,14 @@ def write_activate(
     path_only: list[str] | None = None,
     variables: dict[str, str] | None = None,
     fail: bool = False,
+    echo: str | None = None,
 ) -> Path:
     """Write the activate script *path* (``.sh`` or ``.bat``, see ``activate_name``).
 
     *prepend_path* goes before PATH.  *path_only* replaces PATH.  *fail*
-    makes the script end with a failure after its other lines.
+    makes the script end with a failure after its other lines.  *echo* is a
+    text that the script writes to stdout without a line end, as a script
+    of a toolchain can.
     """
     lines: list[str] = []
     if WINDOWS:
@@ -124,6 +127,11 @@ def write_activate(
             lines.append(f'set "PATH={directory}{os.pathsep}%PATH%"')
         for name, value in (variables or {}).items():
             lines.append(f'set "{name}={value}"')
+        if echo is not None:
+            # `set /p` sets ERRORLEVEL 1, and `(call )` sets it to 0 again:
+            # the script must not fail because of its text.
+            lines.append(f'<nul set /p ="{echo}"')
+            lines.append("(call )")
         if fail:
             lines.append("exit /b 1")
         path.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
@@ -134,6 +142,8 @@ def write_activate(
         lines.append(f'export PATH="{directory}{os.pathsep}$PATH"')
     for name, value in (variables or {}).items():
         lines.append(f'export {name}="{value}"')
+    if echo is not None:
+        lines.append(f"printf '%s' '{echo}'")
     if fail:
         lines.append("return 1")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")

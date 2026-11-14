@@ -20,13 +20,17 @@ would block even read-only operations and requires root.
 
 from __future__ import annotations
 
+import logging
 import os
 import time as _time
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
 
-from ...file_lock import held_by_another, try_lock, unlock
+from ...file_lock import ProbedLock, held_by_another
+from ...processes import parse_pid, pid_exists
+
+_log = logging.getLogger(__name__)
 
 __all__ = [
     "IndexRunLocked",
@@ -79,32 +83,44 @@ def index_run_lock(db_dir: Path) -> Generator[None, None, None]:
 
     Raises :class:`IndexRunLocked` immediately when another run holds it.
     Waiting would be wrong: an index run takes minutes to hours, and a caller
-    that wants the work done can act on the refusal instead.
+    that wants the work done can act on the refusal instead.  The only wait
+    is for the status lock of the ``ProbedLock`` after the exclusion lock
+    is ours: a probe holds it for the time of one system call, and
+    ``file_lock.STATUS_WAIT_S`` limits the wait.
     """
     db_dir.mkdir(parents=True, exist_ok=True)
-    lock_file = db_dir / "index.lock"
-    fd = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o644)
-    acquired = False
+    run_lock = ProbedLock(db_dir / "index.lock")
     try:
-        if not try_lock(fd):
-            raise IndexRunLocked(db_dir, _read_holder_pid(lock_file))
-        acquired = True
+        if not run_lock.try_acquire():
+            raise IndexRunLocked(db_dir, _read_holder_pid(run_lock.path))
         # Record who holds it, for the refusal message the next caller prints.
-        os.ftruncate(fd, 0)
-        os.write(fd, str(os.getpid()).encode())
-        os.fsync(fd)
+        os.ftruncate(run_lock.fd, 0)
+        os.write(run_lock.fd, str(os.getpid()).encode())
+        os.fsync(run_lock.fd)
         yield
     finally:
-        if acquired:
-            os.ftruncate(fd, 0)
-            unlock(fd)
-        os.close(fd)
+        # The close also when the truncate fails (EIO on a network share):
+        # a long-lived MCP server kept the lock, and each later run failed
+        # with IndexRunLocked.  The failure is only a warning: the PID is
+        # information for the message of the next caller, and an exception
+        # here replaced the exception of the run (IndexSuperseded: the
+        # daemon then did not retry the work) or failed a run that did its
+        # work.  The next holder writes its own PID over it.
+        try:
+            if run_lock.held:
+                try:
+                    os.ftruncate(run_lock.fd, 0)
+                except OSError as exc:
+                    _log.warning("Cannot clear the holder PID in %s: %s", run_lock.path, exc)
+        finally:
+            run_lock.close()
 
 
 def index_run_lock_held(db_dir: Path) -> bool:
     """Return True while another process holds :func:`index_run_lock` of *db_dir*.
 
-    A try of the lock that releases it at once.  WHY next to the markers
+    A probe of the status lock (``file_lock.held_by_another``), thus a run
+    that starts in the same time does not fail because of it.  WHY next to the markers
     ``reindex.pause`` and ``reindex.pid``: ``fw-context analyze`` writes no
     ``reindex.pid``, and a marker can name a process that stopped while the
     lock went to another one.  The lock itself stays with its holder until
@@ -118,13 +134,28 @@ def _read_holder_pid(lock_file: Path) -> int | None:
 
     Advisory only — the lock is already known to be held.  A holder that has
     not written its PID yet, or a truncated read, simply means the message
-    says "another process".
+    says "another process".  A PID outside 1 .. ``MAX_PID`` (a damaged
+    file) gives None too: the takeover sends the PID a stop request, and
+    such a PID names a process group or, cut to 32 bits on Windows, a
+    different process.
     """
     try:
         content = lock_file.read_text(encoding="utf-8").strip()
+    except (OSError, ValueError):
+        # ValueError: UnicodeDecodeError of a damaged file.
+        return None
+    pid = parse_pid(content)
+    if pid is None:
+        return None
+    # A PID of a process that ended is no holder: a run that a kill ended
+    # cannot clear its PID, and the message named a process that was gone.
+    # An OSError of the check (EINVAL from a sandbox) is no answer: the
+    # refusal must stay IndexRunLocked, thus the PID goes out of it.
+    try:
+        alive = pid_exists(pid)
     except OSError:
         return None
-    return int(content) if content.isdigit() else None
+    return pid if alive else None
 
 
 @contextmanager
@@ -132,7 +163,7 @@ def write_lock(db_dir: Path, timeout: float = 60.0) -> Generator[None, None, Non
     """Acquire an exclusive write lock for the index directory.
 
     Serializes all write operations (symbol storage, LLM analysis, embeddings)
-    across processes.  Uses :func:`fw_context_mcp.file_lock.try_lock` — the
+    across processes.  Uses :class:`fw_context_mcp.file_lock.ProbedLock` — the
     kernel releases the lock automatically on process exit, so a crash never
     leaves a stale lock.
 
@@ -148,20 +179,19 @@ def write_lock(db_dir: Path, timeout: float = 60.0) -> Generator[None, None, Non
     Raises:
         WriteLockTimeout: Lock could not be acquired within *timeout*.
     """
-    lock_file = db_dir / "write.lock"
-    fd = os.open(lock_file, os.O_CREAT | os.O_RDWR)
+    # A ProbedLock: the MCP server probes it (background._is_bg_reindex_running).
+    held = ProbedLock(db_dir / "write.lock")
     deadline = _time.monotonic() + timeout
-    acquired = False
     try:
-        while not try_lock(fd):
+        # The rest of the time as the wait for the status lock: the try
+        # alone can wait for it (ProbedLock.try_acquire), and the wait went
+        # past *timeout* by up to STATUS_WAIT_S.
+        while not held.try_acquire(status_wait=max(0.0, deadline - _time.monotonic())):
             if _time.monotonic() > deadline:
                 raise WriteLockTimeout(
                     f"Could not acquire write lock for {db_dir} within {timeout:.0f}s"
                 )
             _time.sleep(0.5)
-        acquired = True
         yield
     finally:
-        if acquired:
-            unlock(fd)
-        os.close(fd)
+        held.close()

@@ -171,15 +171,6 @@ class AsmSource:
     defsym: bool = False
 
 
-def _args_without_source(unit) -> list[str]:
-    """Give the flags of *unit* without its own source file.
-
-    Each reader names the file once on its own.  Named twice, clang reads
-    the unit twice (see ``preprocess``).
-    """
-    return [a for a in unit.clang_args if Path(a).name != unit.file.name]
-
-
 def preprocess(unit) -> AsmSource | None:
     """Run the preprocessor on *unit* and map its output back to sources.
 
@@ -192,16 +183,16 @@ def preprocess(unit) -> AsmSource | None:
     of the unit, its target among them: a cross build gets the predefined
     macros of its target, and not the ones of the host.
     """
-    # The source file is dropped from the flags and named once at the end.
-    # `clang_args` already holds it, and appending it again handed clang
-    # the same file twice: it preprocessed the whole unit twice and
+    # The source file is named once at the end: `clang_args` does not hold
+    # it (compile_commands.normalize_args drops each token that names it).
+    # Named twice, clang got the same file twice: it preprocessed the whole unit twice and
     # concatenated the results.  The duplicate output was mistaken for a
     # habit of cpp and worked around with a dedupe, which hid it — until
     # the vector pass began carrying a section and a slot counter across
     # statements, and the second copy started at a position the first had
     # already used.  It also doubled the cost of the pass, which is 89-95%
     # preprocessor.
-    args = _args_without_source(unit)
+    args = unit.clang_args
     try:
         # -C keeps comments.  Without it cpp strips them, and every comment
         # line then reads as "the preprocessor dropped this" and gets
@@ -360,7 +351,7 @@ def read_unit_texts(unit) -> dict[Path, UnitText] | None:
     try:
         tu = _get_index().parse(
             str(unit.file),
-            args=_args_without_source(unit),
+            args=unit.clang_args,
             options=cx.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD,
         )
     except cx.TranslationUnitLoadError as exc:

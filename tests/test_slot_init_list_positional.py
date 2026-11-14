@@ -17,6 +17,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._toolchains import unit_of
+
 C_SOURCE = """\
 typedef int (*init_fn_t)(void);
 typedef void (*cb_t)(int);
@@ -135,29 +137,28 @@ static box<int> elided_box = { 1, dev_cb };
 """
 
 
-def _extract(tmp_path_factory, name: str, text: str, language: str, args: list[str]):
-    from fw_context_mcp.indexer.compile_commands import CompilationUnit
+def _extract(tmp_path_factory, name: str, text: str, language: str, args: list[str], toolchain):
     from fw_context_mcp.indexer.symbols import extract_all
 
     src: Path = tmp_path_factory.mktemp("positional") / name
     src.write_text(text, encoding="utf-8")
-    unit = CompilationUnit(file=src, directory=src.parent, language=language, clang_args=args)
+    unit = unit_of(src, toolchain, args, directory=src.parent, language=language)
     return extract_all(unit, with_refs=True)
 
 
 @pytest.fixture(scope="module")
-def c_rows(tmp_path_factory):
-    return _extract(tmp_path_factory, "pos.c", C_SOURCE, "c", ["-std=c11"])
+def c_rows(tmp_path_factory, toolchain):
+    return _extract(tmp_path_factory, "pos.c", C_SOURCE, "c", ["-std=c11"], toolchain=toolchain)
 
 
 @pytest.fixture(scope="module")
-def ms_rows(tmp_path_factory):
-    return _extract(tmp_path_factory, "ms.c", MS_SOURCE, "c", ["-std=gnu11", "-fms-extensions"])
+def ms_rows(tmp_path_factory, toolchain):
+    return _extract(tmp_path_factory, "ms.c", MS_SOURCE, "c", ["-std=gnu11", "-fms-extensions"], toolchain=toolchain)
 
 
 @pytest.fixture(scope="module")
-def cxx_rows(tmp_path_factory):
-    return _extract(tmp_path_factory, "pos.cpp", CXX_SOURCE, "cpp", ["-std=c++17"])
+def cxx_rows(tmp_path_factory, toolchain):
+    return _extract(tmp_path_factory, "pos.cpp", CXX_SOURCE, "cpp", ["-std=c++17"], toolchain=toolchain)
 
 
 def _short(key: str) -> str:

@@ -21,8 +21,7 @@ from pathlib import Path
 import pytest
 
 from fw_context_mcp.indexer.db import open_db
-
-pytest.importorskip("clang.cindex", reason="libclang not available")
+from tests._toolchains import Toolchain, write_compile_commands
 
 CASES = Path(__file__).parent / "fixtures" / "callgraph"
 Edge = tuple[str | None, str, int, str]
@@ -36,7 +35,7 @@ def _load(case_dir: Path) -> dict:
     return json.loads((case_dir / "case.json").read_text(encoding="utf-8"))
 
 
-def _index(case_dir: Path, work: Path, units: list[str]) -> list[Edge]:
+def _index(case_dir: Path, work: Path, units: list[str], toolchain: Toolchain) -> list[Edge]:
     """Index the case in *work* with *units*, and give its call, indirect and implicit_construct edges.
 
     These are the kinds that find_callers answers with.
@@ -46,17 +45,18 @@ def _index(case_dir: Path, work: Path, units: list[str]) -> list[Edge]:
     case = _load(case_dir)
     project = work / "project"
     shutil.copytree(case_dir, project)
-    compiler = case["compiler"]
-    std = ["-std=c++17"] if compiler == "c++" else ["-std=gnu11"]
+    # The case names the language through its compiler: "cc" or "c++".
+    language = "c++" if case["compiler"] == "c++" else "c"
+    std = ["-std=c++17"] if language == "c++" else ["-std=gnu11"]
     entries = [
         {
             "directory": str(project),
             "file": unit,
-            "arguments": [compiler, *std, *case.get("flags", []), "-c", unit, "-o", f"{unit}.o"],
+            "arguments": toolchain.arguments(unit, *std, *case.get("flags", []), output=f"{unit}.o", language=language),
         }
         for unit in units
     ]
-    (project / "compile_commands.json").write_text(json.dumps(entries), encoding="utf-8")
+    write_compile_commands(project / "compile_commands.json", entries)
     db_path = work / "db" / "index.db"
     db_path.parent.mkdir()
     config_hash = run(
@@ -127,13 +127,13 @@ def _params() -> list:
 
 @pytest.mark.libclang
 @pytest.mark.parametrize("case_dir", _params())
-def test_the_call_edges_equal_the_truth(case_dir: Path, tmp_path: Path):
+def test_the_call_edges_equal_the_truth(case_dir: Path, tmp_path: Path, toolchain: Toolchain):
     case = _load(case_dir)
-    _check(case, _index(case_dir, tmp_path, case["units"]))
+    _check(case, _index(case_dir, tmp_path, case["units"], toolchain))
 
 
 @pytest.mark.libclang
-def test_another_unit_does_not_change_the_edges_of_a_function(tmp_path: Path):
+def test_another_unit_does_not_change_the_edges_of_a_function(tmp_path: Path, toolchain: Toolchain):
     """The edges of Driver::off come from its code, not from the other units of the build.
 
     The runner sorts the units by path. With parser.cpp in the build, it walks
@@ -142,8 +142,8 @@ def test_another_unit_does_not_change_the_edges_of_a_function(tmp_path: Path):
     that changes with that is not a fact of the code of Driver::off.
     """
     case_dir = CASES / "skip_set_header"
-    alone = _index(case_dir, tmp_path / "a", ["zapp.cpp"])
-    with_parser = _index(case_dir, tmp_path / "b", ["parser.cpp", "zapp.cpp"])
+    alone = _index(case_dir, tmp_path / "a", ["zapp.cpp"], toolchain)
+    with_parser = _index(case_dir, tmp_path / "b", ["parser.cpp", "zapp.cpp"], toolchain)
 
     def of_off(edges: list[Edge]) -> collections.Counter:
         return collections.Counter(e for e in edges if e[0] == "Driver::off")

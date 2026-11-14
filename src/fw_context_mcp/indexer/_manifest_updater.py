@@ -248,12 +248,12 @@ def _update_manifest_after_index(
     db_dir: Path,
     compile_commands: Path,
     updated_count: int,
-    tu_headers: dict[str, list[dict]] | None = None,
+    tu_headers: Mapping[int, list[dict]] | None = None,
     build_dir_patterns: list[str] | None = None,
     vendor_patterns: list[str] | None = None,
     config_hash: str = "",
     scope: list[str] | None = None,
-    reparsed_tus: Mapping[str, str] | None = None,
+    reparsed_tus: Mapping[int, str] | None = None,
     transient_defines: Collection[str],
     checkpoint_reached: int | None = None,
     flags_hashes: Sequence[str] | None = None,
@@ -274,8 +274,15 @@ def _update_manifest_after_index(
     hashes from the main indexing loop (``tu_headers``), avoiding a second
     libclang parse for unchanged TUs.
 
-    *reparsed_tus* maps each TU that was actually re-parsed in this run to
-    the hash of its source that the decision read BEFORE the parse.  Only
+    *tu_headers* and *reparsed_tus* are keyed by the position of a listing
+    in *units*.  WHY not by file: a build can list one file more than once
+    with other flags, and each listing reads its own headers.  A key of the
+    file gave each listing the headers of the last listing, thus an entry
+    missed a header that its listing reads, and a change of that header did
+    not make the listing stale.
+
+    *reparsed_tus* maps each listing that was actually re-parsed in this run
+    to the hash of its source that the decision read BEFORE the parse.  Only
     those may contribute fresh header hashes: an entry rewritten for a TU
     that kept its previous symbols would claim the index is current while it
     still holds data parsed from the old header text.  Every other TU keeps
@@ -322,6 +329,7 @@ def _update_manifest_after_index(
         _collect_headers_from_tokens,
         _intern_arguments,
         _is_generated_header,
+        headers_entry,
         save,
     )
 
@@ -400,6 +408,11 @@ def _update_manifest_after_index(
             return ""
         return compute_flags_hash(unit.raw_entry, transient_defines=transient_defines)
 
+    # The files of the listings that the run parsed (_behind_a_parsed_listing).
+    parsed_files = (
+        None if reparsed_tus is None else {index_key(units[position].file, project_root) for position in reparsed_tus}
+    )
+
     def _behind_a_parsed_listing(idx: int, old_entry: dict) -> bool:
         """Say if a checkpoint carries the entry of a listing whose file the run parsed.
 
@@ -413,8 +426,8 @@ def _update_manifest_after_index(
         return (
             checkpoint_reached is not None
             and idx >= checkpoint_reached
-            and reparsed_tus is not None
-            and old_entry.get("file", "") in reparsed_tus
+            and parsed_files is not None
+            and old_entry.get("file", "") in parsed_files
         )
 
     def carry_over(old_entry: dict) -> dict:
@@ -457,14 +470,14 @@ def _update_manifest_after_index(
             # Fresh hashes only from TUs that were really re-parsed —
             # see *reparsed_tus* in the docstring.
             reached = checkpoint_reached is None or idx < checkpoint_reached
-            if reached and tu_rel in tu_headers and (reparsed_tus is None or tu_rel in reparsed_tus):
+            if reached and idx in tu_headers and (reparsed_tus is None or idx in reparsed_tus):
                 # The fresh entry replaces the old entry of the same flags:
                 # take it, so that a later listing of the file does not get
                 # it (A, B parsed up to A gives A fresh and B old, not A, A).
                 if tu_rel in old_entries:
                     old_entries.take(tu_rel, _flags_hash(idx, unit))
                 source_hash = (
-                    reparsed_tus[tu_rel] if reparsed_tus is not None
+                    reparsed_tus[idx] if reparsed_tus is not None
                     else compute_source_hash(unit.file.resolve())
                 )
                 entry_slots[idx] = {
@@ -472,7 +485,7 @@ def _update_manifest_after_index(
                     "directory": str(unit.directory) if unit.directory else str(project_root),
                     "arg_set": _intern_arguments(unit.clang_args, arg_sets),
                     "source_hash": source_hash,
-                    "headers": fold_headers(tu_headers[tu_rel], header_table, read_this_run),
+                    "headers": fold_headers(tu_headers[idx], header_table, read_this_run),
                     "flags_hash": _flags_hash(idx, unit),
                 }
                 updated += 1
@@ -491,7 +504,7 @@ def _update_manifest_after_index(
                     "directory": str(unit.directory) if unit.directory else str(project_root),
                     "arg_set": _intern_arguments(unit.clang_args, arg_sets),
                     "source_hash": source_hash,
-                    "headers": headers,
+                    **headers_entry(headers),
                     "flags_hash": _flags_hash(idx, unit),
                 }
                 updated += 1
@@ -548,7 +561,7 @@ def _update_manifest_after_index(
                     "directory": str(unit.directory) if unit.directory else str(project_root),
                     "arg_set": _intern_arguments(unit.clang_args, arg_sets),
                     "source_hash": source_hash,
-                    "headers": headers,
+                    **headers_entry(headers),
                     "flags_hash": _flags_hash(idx, unit),
                 }
                 updated += 1

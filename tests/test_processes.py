@@ -120,6 +120,46 @@ def test_pid_exists_refuses_a_pid_outside_the_range(pid: int) -> None:
     assert pid_exists(pid) is False
 
 
+@pytest.mark.parametrize("pid", [0, -1, 2**40])
+@pytest.mark.parametrize("stop", [request_stop, kill_hard], ids=["request_stop", "kill_hard"])
+def test_a_stop_refuses_a_pid_outside_the_range(stop, pid: int, monkeypatch) -> None:
+    """A damaged PID file must never become a signal to a process group or to a different process.
+
+    ``kill(0)`` is the process group of the caller and ``kill(-1)`` is each
+    process of the user; on Windows ctypes cuts 2**40 to 32 bits.  The fake
+    ``os.kill`` records a call that reaches the system, thus the test sends
+    no signal when the check is missing.
+    """
+    sent: list[int] = []
+    monkeypatch.setattr(os, "kill", lambda target, signum: sent.append(target))
+    with pytest.raises(ValueError, match="outside"):
+        stop(pid)
+    assert sent == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="the POSIX version")
+def test_a_request_to_a_process_of_another_user_is_false(monkeypatch) -> None:
+    """``kill`` gives PermissionError for a process of another user: False, as on Windows.
+
+    The Windows version gives False because ``OpenEventW`` fails.
+    ``fw-context watch restart`` calls the function outside of a try, and
+    stopped with a traceback.
+    """
+    def denied(target: int, signum: int) -> None:
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(os, "kill", denied)
+    assert request_stop(12345) is False
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the ctypes DWORD of Windows")
+def test_the_argv_of_a_pid_above_32_bits_is_none(child) -> None:
+    """ctypes cut the PID to 32 bits, and the argv of the process with the low bits came back."""
+    from fw_context_mcp.processes import process_argv_windows
+
+    assert process_argv_windows(child.own_pid + 2**32) is None
+
+
 def test_a_request_to_a_process_that_is_gone_is_false(child) -> None:
     kill_hard(child.pid)
     child.wait(timeout=30)
@@ -180,6 +220,60 @@ IGNORE_ONE = textwrap.dedent(f"""
 """)
 
 
+FOREIGN_EVENT = textwrap.dedent(f"""
+    import ctypes, os, signal, sys, time
+    from ctypes import wintypes
+    from fw_context_mcp.processes import install_stop_listener
+
+    signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit({HANDLER_EXIT}))
+    try:
+        install_stop_listener()
+    except OSError as exc:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenEventW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel32.OpenEventW.restype = wintypes.HANDLE
+        own = kernel32.OpenEventW(0x0002, False, "Global\\\\fw-context-stop-" + str(os.getpid()))
+        print("REFUSED", "LEAKED" if own else "CLOSED", exc, flush=True)
+        sys.exit(3)
+    print("LISTENS", flush=True)
+    time.sleep(10)
+    sys.exit(0)
+""")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the named events of Windows")
+def test_the_listener_refuses_a_stop_event_that_it_did_not_make() -> None:
+    """An event that exists before the listener is not of this process: its state and its DACL are unknown.
+
+    ``CreateEventW`` opens an event that exists.  The listener then waited
+    on it: a request that was set for an earlier process ran the SIGTERM
+    handler of a run that nobody asked to stop, and a different user that
+    made the event first could stop the runs of this user.  The event here
+    is set before the child starts.  The listener also closed no handle
+    that it made before the failure: the event of the PID stayed.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateEventW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.CreateEventW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    token = new_stop_token()
+    # Auto-reset and set: a request that waits for the next process that opens it.
+    foreign = kernel32.CreateEventW(None, False, True, f"Global\\fw-context-stop-token-{token}")
+    assert foreign, ctypes.get_last_error()
+    try:
+        proc = subprocess.run(  # noqa: S603 — fixed argv, no shell
+            [sys.executable, "-c", FOREIGN_EVENT], stdin=subprocess.DEVNULL, capture_output=True,
+            text=True, encoding="utf-8", timeout=60, env={**os.environ, STOP_TOKEN_ENV: token},
+        )
+    finally:
+        kernel32.CloseHandle(foreign)
+    assert proc.returncode == 3, (proc.returncode, proc.stdout, proc.stderr)
+    assert proc.stdout.startswith("REFUSED CLOSED"), proc.stdout
+
+
 def test_a_second_request_reaches_the_handler_after_one_that_it_ignored() -> None:
     """A handler can ignore a request (a late takeover); the next one must still run it.
 
@@ -201,3 +295,34 @@ def test_a_second_request_reaches_the_handler_after_one_that_it_ignored() -> Non
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=30)
+
+
+def test_the_token_of_the_parent_stays_readable_after_the_listener_took_it(monkeypatch) -> None:
+    """The listener removes the variable: the run reads its token through ``own_stop_token``.
+
+    The run writes its PID into ``run.<token>.pid`` (``_index_owner.claim_index``),
+    and the daemon finds the markers of a run that it killed with it.  A
+    second take (a second call of the listener) finds no variable, and the
+    token stays.
+    """
+    from fw_context_mcp import processes
+
+    monkeypatch.setattr(processes, "_own_token", None)
+    token = new_stop_token()
+    monkeypatch.setenv(STOP_TOKEN_ENV, token)
+    assert processes._take_stop_token() == token
+    assert STOP_TOKEN_ENV not in os.environ
+    assert processes._take_stop_token() is None
+    assert processes.own_stop_token() == token
+
+
+@pytest.mark.parametrize("value", ["../../outside", "A" * 32, "a" * 31, "a" * 33])
+def test_a_value_that_is_no_stop_token_is_an_error(monkeypatch, value: str) -> None:
+    """The token goes into the name of a file in the index directory: ``../`` named a file outside it."""
+    from fw_context_mcp import processes
+
+    monkeypatch.setattr(processes, "_own_token", None)
+    monkeypatch.setenv(STOP_TOKEN_ENV, value)
+    with pytest.raises(ValueError, match="no stop token"):
+        processes._take_stop_token()
+    assert processes.own_stop_token() is None

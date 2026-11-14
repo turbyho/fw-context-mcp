@@ -255,7 +255,7 @@ every variant. Use `--variant`, `--variants`, `--image`, or
 | **PlatformIO** | `pio run --target compiledb` |
 | **Mbed OS** | `fw-context index --build` (the Mbed OS backend records the commands of `mbed compile`) |
 | **CMake** | `bear -- cmake --build build` or `cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON` |
-| **Make** | `bear -- make` |
+| **Make** | `fw-context index --build` (the Makefile backend reads the log of `make -Bnkwp`), or `bear -- make` |
 | **Custom** | `bear -- <your-build-command>` |
 
 ### `fw-context search`
@@ -924,6 +924,10 @@ without `config` does not repair the config files.
 - `clang-resource` — the clang compiler headers of the libclang major
   version are there. Not critical: without them, some GCC headers do not
   parse, and the index holds the errors.
+- `clang` — the clang program runs (`clang --version`). fw-context finds
+  it in `PATH`, and on Windows also in `C:\Program Files\LLVM\bin`. Not
+  critical: without it, each macro row of the index says `no_answer`, and
+  fw-context reads no assembly unit.
 - `watchfiles` — the `watchfiles` package is installed. The background
   file watcher needs it.
 - `tomli-w` — the `tomli-w` package is installed. `fw-context init` needs
@@ -1064,7 +1068,11 @@ fw-context watch restart --project /path  # specific project
 
 Show the watcher daemon status for the current project: whether the daemon
 is running, its PID and uptime, the modified file count of each build, and
-the state of the index:
+the state of the index. The PID comes from the answer of the daemon to a
+ping, as for `watch restart`. The uptime comes from the PID file, and the
+command shows it only when the file gives the same PID.
+
+The `Index:` line gives the state of the index:
 
 - `Index:      running`: an index run holds the index, or a `reindex_file`
   or a `reset_index` writes to it.
@@ -1095,18 +1103,54 @@ line, not the quoted tool output below it.
 #### `fw-context watch restart`
 
 Stop the current watcher daemon, and start a new one. The command uses
-the lock of the daemon (`watcher.lock`), and not the PID in its PID file:
-a PID file that a stopped daemon left can name another process now.
+the lock of the daemon (`watcher.lock`) to find out if a daemon runs, and
+the answer of the daemon to a ping to get its PID. It does not use the PID
+in the PID file alone: a PID file that a stopped daemon left can name
+another process now.
 
-1. When another process holds the lock, the command asks the daemon to
-   stop: `SIGTERM` on Linux and macOS, the stop event on Windows.
-2. When the lock is not free after 3 seconds, the command stops the daemon
-   with `SIGKILL` (on Windows `TerminateProcess`), and waits 5 seconds
-   more for the lock.
-3. The command removes the PID file and the port file, and starts a new
-   daemon. After 0.5 seconds it sends one ping. When the daemon does not
-   answer yet, the command tells you to run `fw-context watch status` a
-   moment later.
+1. When another process holds the lock, the command sends a ping to the
+   daemon. The daemon answers with its PID and a proof that it knows the
+   token of the port file (`daemon.port`): an HMAC of a new random value
+   of the ping. The answer does not hold the token itself. A daemon that
+   starts holds the lock before it opens its port, thus the command waits
+   up to 15 seconds for the answer.
+2. The command asks that PID to stop: `SIGTERM` on Linux and macOS, the
+   stop event on Windows.
+3. When the lock is not free after 15 seconds, the command stops the
+   daemon with `SIGKILL` (on Windows `TerminateProcess`), and waits 5
+   seconds more for the lock. The daemon itself gives its index run 10
+   seconds to stop, and then removes the markers of the run.
+4. The command starts a new daemon. After 0.5 seconds it sends one ping.
+   When the daemon does not answer yet, the command tells you to run
+   `fw-context watch status` a moment later. The command removes no file
+   of the old daemon: an MCP server can start a new daemon at the same
+   time, and the new daemon writes the PID file and the port file again.
+
+When a process holds the lock and no daemon answers in 15 seconds, the
+command stops nothing and exits with an error. The error gives the PID in
+the PID file. That PID can be the daemon, if the daemon hangs, or a
+different process. Make sure that the PID is the daemon (its command line
+holds `fw_context_mcp.mcp.daemon`), stop it, and run the command again.
+
+A daemon of fw-context 0.36.0 or earlier answers no ping: it listens on
+`daemon.sock`. On Linux and macOS the command gets the PID and the user of
+that daemon from the system (the process that listens on the socket), and
+stops it when it runs as your user. A process of a different user on
+`daemon.sock` gets no stop: the error names its PID and its user. The LLM
+client of that version can start the old daemon again, thus after an
+upgrade:
+
+1. Restart the LLM client.
+2. Run `fw-context watch restart`.
+
+Only your user must be able to read `daemon.port`: a different user who
+reads the token can answer a ping after the daemon ended, and give a PID
+of their choice. On Linux and macOS the file has mode 0600. On Windows a
+mode does not limit the readers: the access control list of the directory
+does. The default index directory (`%USERPROFILE%\.fw-context\index`) is
+in your profile, which other users cannot read (administrators can). When
+you set `db_dir` to a directory outside of your profile, make sure that
+other users cannot read it.
 
 ```bash
 $ fw-context watch restart
@@ -1457,8 +1501,9 @@ tool automatically broadens the search in up to six steps:
    the results.
 6. *Macro FTS5 fallback* — searches the `macros_fts` table for matching
    `#define` names, parameter lists and values (`kind="macro"`,
-   `_fallback="macros_fts"`). A macro result also holds `_macro_value` and
-   `_macro_expanded_value` when they are not empty.
+   `_fallback="macros_fts"`). A macro result also holds `_macro_value`, and
+   `_macro_expanded_value` or `_macro_expanded_values` (see `lookup_symbol`)
+   when the index has them.
 
 Steps 3 to 6 ignore `kind`.
 
@@ -1670,12 +1715,27 @@ Output: [{"total": 1, "offset": 0, "shown": 1, "more": false},
 ```
 
 A macro result has the page notice of a symbol result, and its
-`qualified_name` is the name of the macro. `expanded_value` is the
-definition of the name that is in force at the end of a unit, from
-`clang -dM -E` (after `#undef` and a new `#define`, and with the `-D`
-macros of the build). The preprocessor does not expand the macros in it:
-`#define A B` gives `B`. `expanded_value` is absent when the index holds
-no such value.
+`qualified_name` is the name of the macro. The value of the macro comes
+from `clang -dM -E` of each C or C++ unit of the build that reads the
+file of the `#define`: the definition of the name at the end of the unit
+(after `#undef` and a new `#define`, and with the `-D` macros of the
+unit). An assembly unit (`.S`) that reads the file gives no value. The
+preprocessor does not expand the macros in it: `#define A B` gives `B`.
+
+- `expanded_value`: each of those units has the same definition, with the
+  parameters of the `#define`.
+- `expanded_values`: the units do not agree. Each item is one state with
+  its count of units: `{"state": "defined", "value", "params",
+  "is_function_like", "units"}`, `{"state": "undefined", "units"}` (an
+  `#undef` at the end of the unit), or `{"state": "no_answer", "units"}`
+  (the preprocessor failed for the unit, or the index run does not know
+  which files the unit reads; the state of the index and
+  `get_project_status` name the unit and the error).
+- Neither field: the index has no value for the `#define`. No unit reads
+  its file, or `reindex_file` stored the file after the last index run.
+
+The index run writes the values; `reindex_file` does not, because the
+value needs each unit of the build.
 
 A function-like macro shows its parameters in `signature`, and `value` holds
 the replacement text alone:
@@ -2079,7 +2139,8 @@ them. When the list is cut, `constants_hint` names the
 Look up a symbol and get a plain-English explanation of its purpose, inputs,
 outputs, and side effects. Falls back to a **macro explanation** when the
 name matches a macro definition. In that case, this tool returns
-`kind: "macro"`, with the expanded value.
+`kind: "macro"`, with the value of the macro in the build
+(`expanded_value` or `expanded_values`, see `lookup_symbol`).
 
 ```
 Input:  {"name": "spi_transfer", "project_root?": "/path/to/project", "context_lines?": 40}
@@ -3215,6 +3276,19 @@ command.
 - compile_commands.json changed after the last index run. Or it does not
   exist, and the check of the build above does not cover it, for example
   the file of a build variant. The reason names the command.
+- The post-processing of an index run is not complete (`the
+  post-processing of an index run is not complete (macro values)`). An
+  index run stopped, its step of the macro values failed, or
+  `reindex_file` stored rows. The macro values of those rows are not in
+  the index, and an index run writes them. The reason names the command,
+  and the daemon starts that run when it starts.
+- The preprocessor gave no macro values for some units (`the
+  preprocessor gave no macro values for N unit(s) (<unit>: <error>; …)`),
+  for example a header that the build did not make, or no clang. The
+  macro rows of the files of those units say `no_answer`. An index run
+  alone does not repair it: repair the cause, then run `fw-context index`,
+  which asks the units again. The daemon does not start a run for this
+  reason.
 - A source file on disk is missing from compile_commands.json, and
   fw-context will not build it by itself. The reason says why, and it
   names the command.
@@ -3572,7 +3646,7 @@ missing. For example, the audit skips `libclang-so` when
 
 In a project that is not initialized, only the checks of the installation
 run: `pysqlite3`, `sqlite-ext`, `sqlite-vec`, `libclang-python`,
-`libclang-so`, `clang-resource`, `watchfiles` and `tomli-w`. The checks
+`libclang-so`, `clang-resource`, `clang`, `watchfiles` and `tomli-w`. The checks
 `gpu-tools`, `ollama`, `chat-model`, `embed-model`, `llm-recommend`,
 `db-integrity`, and `disk-space` read the config. When fw-context cannot
 use a config file, the `config` check gives the error, and these checks
@@ -4157,9 +4231,10 @@ For manual recovery, use `reindex_file` or `fw-context index`.
    jump or fall into another routine (ref_kind "call", origin "asm")
 
 7. Post-process the build (indexer/_postprocess.py):
-   Expand the macro values with clang -dM -E ([index]
-   index_macros_expanded), when the run parsed a unit, when a file left
-   the index, or when an earlier run stopped before this step
+   Store the value of each macro: clang -dM -E of each unit, and for each
+   #define the definitions at the end of the units that read its file,
+   when the run parsed a unit, when a file left the index, or when an
+   earlier run stopped before this step
    Give the internal (static) functions one USR
    Resolve the slot facts and the SDK rules into call edges
    (origin "slot", "type_only", "sdk")
@@ -4207,7 +4282,7 @@ location, `out/` is this directory.
 | **PlatformIO** (`platformio`) | `platformio.ini` | `out/<env>/compile_commands.json` |
 | **Zephyr** (`zephyr`) | `west.yml`, `zephyr` | `out/compile_commands.json`; with sysbuild, `out/<image>/compile_commands.json` for each image in `domains.yaml` |
 | **Arduino** (`arduino`) | `sketch.yaml` | `out/compile_commands.json` |
-| **ESP-IDF** (`esp-idf`) | `sdkconfig` | `out/compile_commands.json`; the bootloader in `out/bootloader/compile_commands.json` |
+| **ESP-IDF** (`esp-idf`) | `sdkconfig`, or `include(.../tools/cmake/project.cmake)` in `CMakeLists.txt` | `out/compile_commands.json`; the bootloader in `out/bootloader/compile_commands.json` |
 | **CMake** (`cmake`) | `CMakeLists.txt` | `out/compile_commands.json` |
 | **STM32CubeIDE** (`stm32cubeide`) | `.cproject`, `.project` | No build: the IDE makes the file, and `[index] compile_commands` names it |
 | **TI Code Composer Studio** (`ti-ccs`) | `.projectspec` | No build: the IDE makes the file, and `[index] compile_commands` names it |

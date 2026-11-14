@@ -628,11 +628,11 @@ class TestWarningLevel:
                 f"{root / '.fw-context' / 'config.toml'}: [llm] analyze_vendor must be true or false, not a string",
             ]
 
-    def test_the_status_of_an_index_gives_the_warnings(self, tmp_path, home):
+    def test_the_status_of_an_index_gives_the_warnings(self, tmp_path, home, toolchain):
         from fw_context_mcp.mcp.handlers.maintenance import get_project_status
         from tests.test_reindex_each_build import two_builds
 
-        root, _ = two_builds.__wrapped__(tmp_path)
+        root, _ = two_builds.__wrapped__(tmp_path, toolchain)
         local = root / ".fw-context" / "local.toml"
         local.write_text(local.read_text(encoding="utf-8") + '[llm]\nanalyze_vendor = "x"\n', encoding="utf-8")
 
@@ -790,14 +790,14 @@ def test_a_section_updates_that_is_not_a_table_warns(home, tmp_path):
     assert load(_project(tmp_path)).config_warnings == [f"{home}: 'updates' must be a table ([updates]), not an integer"]
 
 
-def test_the_state_of_an_old_index_gives_the_warnings(tmp_path, home):
+def test_the_state_of_an_old_index_gives_the_warnings(tmp_path, home, toolchain):
     """`_outdated_state` returned before the notes of the project."""
     from fw_context_mcp.indexer.db import open_db
     from fw_context_mcp.mcp.handlers.maintenance import get_project_status
     from tests.test_old_index import DROPPED
     from tests.test_reindex_each_build import two_builds
 
-    root, db_path = two_builds.__wrapped__(tmp_path)
+    root, db_path = two_builds.__wrapped__(tmp_path, toolchain)
     conn = open_db(db_path, skip_integrity_check=True)
     try:
         for column in DROPPED:

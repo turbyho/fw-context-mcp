@@ -765,14 +765,21 @@ def _owned_index(db_dir: Path, args: argparse.Namespace, *, pid_marker: bool = T
     previous_hup = signal.getsignal(HANGUP_SIGNAL)
     if previous_hup is not signal.SIG_IGN:
         signal.signal(HANGUP_SIGNAL, _hung_up)
-    # The stop event on Windows (processes.request_stop) for each owner of
-    # the index, also one that enters here without cmd_index.  A second
-    # call does nothing.
-    install_stop_listener()
 
     def _restore_handler() -> None:
         signal.signal(signal.SIGTERM, signal.SIG_DFL if previous is None else previous)
         signal.signal(HANGUP_SIGNAL, signal.SIG_DFL if previous_hup is None else previous_hup)
+
+    # The stop event on Windows (processes.request_stop) for each owner of
+    # the index, also one that enters here without cmd_index.  A second
+    # call does nothing.  It raises OSError for a stop event that exists
+    # already (processes._create_own_event): the handlers of the caller
+    # then come back, as for each other failure before the lock.
+    try:
+        install_stop_listener()
+    except BaseException:
+        _restore_handler()
+        raise
 
     with ExitStack() as stack:
         try:
@@ -1425,11 +1432,13 @@ def cmd_index(args: argparse.Namespace) -> int:
     """
     outside = _SigtermOutsideTheLock()
     previous = signal.signal(signal.SIGTERM, outside)
-    # On Windows a takeover or a stop of the daemon sets the stop event of
-    # this process (processes.request_stop): the listener then runs the
-    # SIGTERM handler that is installed at that time.
-    install_stop_listener()
     try:
+        # On Windows a takeover or a stop of the daemon sets the stop event
+        # of this process (processes.request_stop): the listener then runs
+        # the SIGTERM handler that is installed at that time.  Inside the
+        # try: the listener can raise OSError (processes._create_own_event),
+        # and the finally must still put back the handler of the caller.
+        install_stop_listener()
         return _cmd_index(args, outside)
     except Exception as exc:
         if outside.db_dir is not None and not outside.index_done:

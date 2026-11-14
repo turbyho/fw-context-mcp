@@ -39,6 +39,7 @@ makes requests through the transport.
 from __future__ import annotations
 
 import functools
+import os
 import socket
 import ssl
 import typing
@@ -118,22 +119,46 @@ class _LoopbackBackend(httpcore.NetworkBackend):
         self._sync.sleep(seconds)
 
 
-@functools.cache
 def _ssl_context(trust_env: bool) -> ssl.SSLContext:
-    """The SSL context of the loopback transport, made one time in each process.
+    """The SSL context of each transport of a client, made one time for each CA bundle.
 
-    WHY one time: each request of ``get``, ``post`` and ``stream`` makes a
-    new client, and each new context loads the CA bundle again.  A context
-    can serve each connection of the process.
+    The CA bundle is the one of ``httpx.create_ssl_context`` (httpx 0.28,
+    ``_config.py``): with *trust_env*, the file of ``SSL_CERT_FILE``, else
+    the directory of ``SSL_CERT_DIR``, else the bundle of certifi.  WHY one
+    time: each request of ``get``, ``post`` and ``stream`` makes a new
+    client, and each new context loads the CA bundle again (about 6 ms).
+    WHY one read of the variables: the context comes from the values that
+    are the key of the cache.  ``httpx.create_ssl_context`` read the
+    environment a second time, and a change between the two reads put a
+    context of a different bundle under the key for the life of the
+    process.
     """
-    return httpx.create_ssl_context(trust_env=trust_env)
+    cert_file = os.environ.get("SSL_CERT_FILE") if trust_env else None
+    cert_dir = os.environ.get("SSL_CERT_DIR") if trust_env else None
+    return _ssl_context_for(cert_file or None, cert_dir or None)
+
+
+@functools.cache
+def _ssl_context_for(cert_file: str | None, cert_dir: str | None) -> ssl.SSLContext:
+    """The context that trusts the CA bundle *cert_file*, else *cert_dir*, else the bundle of certifi.
+
+    The two arguments are the key of the cache as well as the source of the
+    context, thus a context never comes from a different bundle than its
+    key.  An empty value is no value, as in httpx.
+    """
+    if cert_file:
+        return ssl.create_default_context(cafile=cert_file)
+    if cert_dir:
+        return ssl.create_default_context(capath=cert_dir)
+    import certifi
+
+    return ssl.create_default_context(cafile=certifi.where())
 
 
 class _LoopbackTransport(httpx.HTTPTransport):
     """``httpx.HTTPTransport`` whose connection pool connects through ``_LoopbackBackend``."""
 
-    def __init__(self, *, trust_env: bool, limits: httpx.Limits) -> None:
-        context = _ssl_context(trust_env)
+    def __init__(self, *, context: ssl.SSLContext, trust_env: bool, limits: httpx.Limits) -> None:
         super().__init__(verify=context, trust_env=trust_env, limits=limits)
         self._pool = httpcore.ConnectionPool(
             ssl_context=context,
@@ -169,10 +194,20 @@ def client(
     ``127.0.0.2``), that host gets the transport too.  Give *base_url* when
     the requests of the client use relative paths.
     """
-    transport = _LoopbackTransport(trust_env=trust_env, limits=limits)
+    # One context for each transport of the client: a second read of the
+    # environment could give the transports two different CA bundles.
+    context = _ssl_context(trust_env)
+    transport = _LoopbackTransport(context=context, trust_env=trust_env, limits=limits)
+    # verify: the shared context for the default transport and for each
+    # proxy transport of the environment too, for the connection to the
+    # host.  Without it each of them loaded the CA bundle again, for each
+    # request (about 6 ms each).  A proxy of the form https:// makes its
+    # own context for the connection to the proxy itself (httpcore).
+    # Such a proxy is rare, and a context for it needs a proxy object of
+    # our own, thus it keeps that cost.
     return httpx.Client(
         base_url=base_url, headers=headers, timeout=timeout, trust_env=trust_env, limits=limits,
-        mounts={key: transport for key in _loopback_mount_keys(url)},
+        verify=context, mounts={key: transport for key in _loopback_mount_keys(url)},
     )
 
 

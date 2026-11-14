@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._toolchains import unit_of
+
 _CODE = """\
 void work(int);
 void reg(void (*)(int));
@@ -32,13 +34,12 @@ void use() { file_scope(5); }
 
 
 @pytest.fixture(scope="module")
-def extracted(tmp_path_factory):
-    from fw_context_mcp.indexer.compile_commands import CompilationUnit
+def extracted(tmp_path_factory, toolchain):
     from fw_context_mcp.indexer.symbols import extract_all
 
     src: Path = tmp_path_factory.mktemp("lam") / "lam.cpp"
     src.write_text(_CODE, encoding="utf-8")
-    unit = CompilationUnit(file=src, directory=src.parent, language="cpp", clang_args=["-std=c++17"])
+    unit = unit_of(src, toolchain, ["-std=c++17"], directory=src.parent, language="cpp")
     return extract_all(unit, with_refs=True)
 
 
@@ -128,13 +129,12 @@ class TestLambdaEdges:
                    for c, t, _ in indirect), indirect
 
 
-def _extract(tmp_path: Path, code: str):
-    from fw_context_mcp.indexer.compile_commands import CompilationUnit
+def _extract(tmp_path: Path, code: str, toolchain):
     from fw_context_mcp.indexer.symbols import extract_all
 
     src = tmp_path / "m.cpp"
     src.write_text(code, encoding="utf-8")
-    unit = CompilationUnit(file=src, directory=tmp_path, language="cpp", clang_args=["-std=c++17"])
+    unit = unit_of(src, toolchain, ["-std=c++17"], directory=tmp_path, language="cpp")
     return extract_all(unit, with_refs=True)
 
 
@@ -148,7 +148,7 @@ def _calls(result) -> list[tuple[str, str, int]]:
 
 @pytest.mark.libclang
 class TestLambdasAndMacros:
-    def test_a_lambda_in_a_macro_argument_gives_one_row(self, tmp_path: Path):
+    def test_a_lambda_in_a_macro_argument_gives_one_row(self, tmp_path: Path, toolchain):
         """A lambda in a macro argument has an extent of no width: the tree,
         not the place, says which code holds a call."""
         result = _extract(tmp_path, (
@@ -157,40 +157,40 @@ class TestLambdasAndMacros:
             "#define CALL_TWICE(f) do { auto _l = f; _l(); _l(); } while (0)\n"
             "template <class T> void tf(T& d) { CALL_TWICE([&] { d.run(); work(1); }); }\n"
             "void use(Dev& d) { tf(d); }\n"
-        ))
+        ), toolchain=toolchain)
 
         rows = [row for row in _calls(result) if row[1] == "work"]
         assert rows == [("tf::<lambda>", "work", 4)], rows
 
-    def test_code_after_a_lambda_in_one_expansion_is_not_the_lambda(self, tmp_path: Path):
+    def test_code_after_a_lambda_in_one_expansion_is_not_the_lambda(self, tmp_path: Path, toolchain):
         result = _extract(tmp_path, (
             "void work(int); void note(); void post(void (*)());\n"
             "#define SCHEDULE(x) do { post([] { work(x); }); note(); } while (0)\n"
             "void a() { SCHEDULE(1); }\n"
-        ))
+        ), toolchain=toolchain)
 
         rows = _calls(result)
         assert ("a", "note", 3) in rows, rows
         assert ("a::<lambda>", "work", 3) in rows, rows
 
-    def test_a_capture_belongs_to_the_code_around_the_lambda(self, tmp_path: Path):
+    def test_a_capture_belongs_to_the_code_around_the_lambda(self, tmp_path: Path, toolchain):
         result = _extract(tmp_path, (
             "int make(); void work(int);\n"
             "void a() { auto l = [p = make()] { work(p); }; l(); }\n"
-        ))
+        ), toolchain=toolchain)
 
         rows = _calls(result)
         # The capture runs where the lambda is made: never a call of it.
         assert not [row for row in rows if row[0] == "a::<lambda>" and row[1] == "make"], rows
         assert ("a::<lambda>", "work", 2) in rows, rows
 
-    def test_a_lambda_written_in_a_macro_body_is_found(self, tmp_path: Path):
+    def test_a_lambda_written_in_a_macro_body_is_found(self, tmp_path: Path, toolchain):
         """The place of its closure is the expansion: the walk tells it."""
         result = _extract(tmp_path, (
             "void work(int);\n"
             "#define RUN(x) do { auto l = [] { work(x); }; l(); } while (0)\n"
             "void a() { RUN(3); }\n"
-        ))
+        ), toolchain=toolchain)
 
         rows = _calls(result)
         assert ("a", "a::<lambda>", 3) in rows, rows
@@ -198,13 +198,13 @@ class TestLambdasAndMacros:
 
 
 @pytest.mark.libclang
-def test_each_lambda_that_one_template_gets_has_its_edge(tmp_path: Path):
+def test_each_lambda_that_one_template_gets_has_its_edge(tmp_path: Path, toolchain):
     """The instances `post<lambda 1>` and `post<lambda 2>` have one USR."""
     result = _extract(tmp_path, (
         "void work(int);\n"
         "template <class F> void post(F f) { f(); }\n"
         "void a() { post([] { work(1); }); post([] { work(2); }); }\n"
-    ))
+    ), toolchain=toolchain)
 
     lambdas = {s.usr for s in result.symbols if s.kind == "lambda"}
     called_by_post = {

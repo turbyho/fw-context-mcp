@@ -1525,9 +1525,10 @@ def _start_ping_thread(root: Path) -> None:
     occurs when the server starts before the project has an index.
     ``_ensure_daemon_running`` corrects the two cases.  Its only
     precondition is an ``index.db`` file that exists.  It spawns a
-    daemon only when no daemon holds ``watcher.lock``.  Concurrent MCP
-    servers are thus safe — the flock serialises them, and exactly one
-    daemon starts.
+    daemon only when no daemon holds ``watcher.lock``.  Two MCP servers
+    can spawn a daemon at the same time: each daemon tries the lock with
+    no wait, the first one runs, and the other one exits before it
+    writes a file.  Thus one daemon runs.
     """
     import threading
     import time

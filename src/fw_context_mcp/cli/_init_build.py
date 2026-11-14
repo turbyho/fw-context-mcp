@@ -106,11 +106,11 @@ def _count_cc_entries(cc_path: Path) -> int:
     A partial or corrupt file from a failed build must not abort init —
     the count is only cosmetic, so 0 is returned instead of raising.
     """
-    import json
+    from ..indexer.compile_commands import load_entries
 
     try:
-        return len(json.loads(cc_path.read_text(encoding="utf-8")))
-    except (json.JSONDecodeError, OSError):
+        return len(load_entries(cc_path))
+    except (OSError, ValueError):
         return 0
 
 

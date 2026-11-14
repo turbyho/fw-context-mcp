@@ -479,13 +479,13 @@ def insert_macros_batch(
 
     Returns count of rows inserted or updated.
 
-    The ``expanded_value`` merge uses ``CASE WHEN`` to preserve existing
-    data: when a re-index overwrites the same file/line with a non-empty
-    expanded_value, the new value replaces the old one.  When the incoming
-    row has an empty expanded_value (e.g. the preprocessor could not
-    resolve the macro), the existing value is kept.  Without this guard,
-    a re-index of an unchanged file would lose resolved values obtained
-    during the first pass.
+    A row that the parse stores again loses its values (``expanded_value``
+    and ``expanded_values``): they are the definitions at the end of each
+    unit that reads the file (``macros.store_values_of_build``), and a new
+    parse can change the definition on the line.  The macros step of the
+    index run writes them again.  Before, the upsert kept the old value
+    when the new one was empty, thus a changed ``#define`` kept the value
+    of the text before.
     """
     cur = conn.executemany(
         """INSERT INTO macros
@@ -496,7 +496,8 @@ def insert_macros_batch(
                name           = excluded.name,
                value          = excluded.value,
                params         = excluded.params,
-               expanded_value = CASE WHEN excluded.expanded_value != '' THEN excluded.expanded_value ELSE macros.expanded_value END,
+               expanded_value = excluded.expanded_value,
+               expanded_values = '',
                is_function_like = excluded.is_function_like""",
         rows,
     )

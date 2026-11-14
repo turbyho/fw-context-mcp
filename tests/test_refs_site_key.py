@@ -23,6 +23,7 @@ from fw_context_mcp.indexer.db import (
     upsert_project,
 )
 from fw_context_mcp.indexer.models import Reference, RefOrigin, origin_names
+from tests._toolchains import unit_of
 from tests.test_same_name_disambiguation import CH, _symbol_row
 
 
@@ -80,9 +81,8 @@ class TestTheKeyOfASite:
 
 
 @pytest.mark.libclang
-def test_the_walk_keeps_both_callers_of_a_macro_site(tmp_path: Path):
+def test_the_walk_keeps_both_callers_of_a_macro_site(tmp_path: Path, toolchain):
     """The shape of a register macro: one line of the source defines a reader and a writer."""
-    from fw_context_mcp.indexer.compile_commands import CompilationUnit
     from fw_context_mcp.indexer.symbols import extract_all
 
     src = tmp_path / "regs.c"
@@ -92,14 +92,14 @@ def test_the_walk_keeps_both_callers_of_a_macro_site(tmp_path: Path):
         "REG(MR)\n",
         encoding="utf-8",
     )
-    unit = CompilationUnit(file=src, directory=tmp_path, language="c", clang_args=["-std=c11"])
+    unit = unit_of(src, toolchain, ["-std=c11"], directory=tmp_path, language="c")
     calls = [r for r in extract_all(unit, with_refs=True).references if r.ref_kind == "call"]
     assert sorted(r.from_usr for r in calls) == ["c:@F@readMR", "c:@F@writeMR"]
     assert {(r.from_line, r.from_col) for r in calls} == {(3, 1)}
 
 
 @pytest.mark.libclang
-def test_one_reference_in_nested_calls_is_one_row(tmp_path: Path):
+def test_one_reference_in_nested_calls_is_one_row(tmp_path: Path, toolchain):
     """``reg(wrap(f))``: the walk claims ``f`` for ``reg`` and for ``wrap``.
 
     The row of a reference is keyed on the place of the expression that
@@ -107,7 +107,6 @@ def test_one_reference_in_nested_calls_is_one_row(tmp_path: Path):
     the enclosing call they were two rows, and ``find_callers`` counted the
     reference twice.
     """
-    from fw_context_mcp.indexer.compile_commands import CompilationUnit
     from fw_context_mcp.indexer.symbols import extract_all
 
     src = tmp_path / "nested.c"
@@ -120,7 +119,7 @@ def test_one_reference_in_nested_calls_is_one_row(tmp_path: Path):
         "void h(void) { reg(f); reg(f); }\n",
         encoding="utf-8",
     )
-    unit = CompilationUnit(file=src, directory=tmp_path, language="c", clang_args=["-std=c11"])
+    unit = unit_of(src, toolchain, ["-std=c11"], directory=tmp_path, language="c")
     sites = sorted(
         (r.from_usr, r.from_line, r.from_col)
         for r in extract_all(unit, with_refs=True).references

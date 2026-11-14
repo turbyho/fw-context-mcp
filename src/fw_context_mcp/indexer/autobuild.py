@@ -263,10 +263,12 @@ def build_missing_reason(compile_commands: Path) -> str:
     real error.  A ``directory`` is read as compile_commands.json gives it,
     as ``compile_commands.parse`` reads it.
     """
+    from .compile_commands import load_entries
+
     if not compile_commands.exists():
         return f"compile_commands.json {compile_commands} does not exist"
     try:
-        entries = json.loads(compile_commands.read_text(encoding="utf-8-sig"))
+        entries = load_entries(compile_commands)
     except (OSError, ValueError):
         return ""
     if not isinstance(entries, list):

@@ -13,10 +13,11 @@ embedding, and the index still said "full".
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
+
+from tests._toolchains import Toolchain, write_compile_commands, write_sources
 
 PROJECT_ID = "e1c4e1c4e1c4e1c4e1c4e1c4e1c4e100"
 
@@ -47,7 +48,7 @@ class _FakeEmbedder:
 
 
 @pytest.fixture
-def one_build(tmp_path: Path, monkeypatch):
+def one_build(tmp_path: Path, monkeypatch, toolchain: Toolchain):
     """A project of one build with embeddings for each definition; returns ``(root, db_path)``.
 
     The LLM analysis is off in the config, thus reindex_file calls no
@@ -60,9 +61,7 @@ def one_build(tmp_path: Path, monkeypatch):
 
     monkeypatch.setattr(_embedding, "get_embedder", lambda cfg: _FakeEmbedder())
     root = tmp_path / "proj"
-    for name, text in SOURCES.items():
-        (root / name).parent.mkdir(parents=True, exist_ok=True)
-        (root / name).write_text(text, encoding="utf-8")
+    write_sources(root, SOURCES)
     index_dir = tmp_path / "index"
     (root / ".fw-context").mkdir()
     (root / ".fw-context" / "config.toml").write_text(f'[project]\nid = "{PROJECT_ID}"\n', encoding="utf-8")
@@ -71,11 +70,10 @@ def one_build(tmp_path: Path, monkeypatch):
         '[llm]\nenabled = true\nanalyze_symbols = false\nembed_model = "fake-embedder"\n',
         encoding="utf-8",
     )
-    cc = root / "compile_commands.json"
-    cc.write_text(json.dumps([
-        {"directory": str(root), "file": name, "arguments": ["cc", "-Isrc", "-c", name, "-o", f"{name}.o"]}
+    cc = write_compile_commands(root / "compile_commands.json", [
+        {"directory": str(root), "file": name, "arguments": toolchain.arguments(name, "-Isrc", output=f"{name}.o")}
         for name in ("src/util.c", "src/main.c")
-    ]), encoding="utf-8")
+    ])
     db_path = index_dir / PROJECT_ID / "index.db"
     run(
         compile_commands=cc, db_path=db_path, project_root=root, project_id=PROJECT_ID,
@@ -350,9 +348,16 @@ def test_the_status_names_the_definitions_that_a_fast_reparse_left_without_an_em
     reindex_file("src/main.c", str(root), with_analysis=False)
 
     message = _status_message(root)
+    # reindex_file stores no macro values (they need each unit of the
+    # build), thus the build needs an index run, and its message names it.
+    # The embedding note then points at that action.
+    assert message.startswith(
+        "The post-processing of an index run is not complete: the macro values of some rows are missing. "
+        "Run `fw-context index`."
+    ), message
     assert (
         " | Embeddings: 3 definition(s) have no embedding, and the search by meaning "
-        "does not find them: run `fw-context index`" in message
+        "does not find them, and the index run that the action above names does it" in message
     ), message
 
 

@@ -11,15 +11,14 @@ new parse of that unit replaces it.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
 
 from tests._toml import toml_string
+from tests._toolchains import Toolchain, unit_for, unit_of, write_compile_commands, write_sources
 from tests._usr_keys import base_names
 
-pytest.importorskip("clang.cindex", reason="libclang not available")
 pytestmark = pytest.mark.libclang
 
 TEMPLATES = """\
@@ -57,14 +56,13 @@ def _is_post(key: str, prefix: str = "") -> bool:
 
 
 @pytest.fixture(scope="module")
-def facts(tmp_path_factory):
-    from fw_context_mcp.indexer.compile_commands import CompilationUnit
+def facts(tmp_path_factory, toolchain):
     from fw_context_mcp.indexer.symbols import extract_all
 
-    src: Path = tmp_path_factory.mktemp("instances") / "shapes.cpp"
-    src.write_text(SHAPES, encoding="utf-8")
-    unit = CompilationUnit(file=src, directory=src.parent, language="cpp", clang_args=["-std=c++17"])
-    return base_names(extract_all(unit, with_refs=True).slots, src)
+    root: Path = tmp_path_factory.mktemp("instances")
+    write_sources(root, {"shapes.cpp": SHAPES})
+    unit = unit_for(root, "shapes.cpp", toolchain, ["-std=c++17"])
+    return base_names(extract_all(unit, with_refs=True).slots, root / "shapes.cpp")
 
 
 def _line(text: str) -> int:
@@ -125,18 +123,16 @@ void use_b(Q &q) { q.call(B()); }
 """
 
 
-def _project(root: Path, base: Path) -> Path:
+def _project(root: Path, base: Path, toolchain: Toolchain) -> Path:
     (root / ".fw-context").mkdir(parents=True)
     (root / ".fw-context" / "config.toml").write_text(
         f'[project]\nid = "proj-instances"\n\n[build]\n\n[index]\ndb_dir = {toml_string(base)}\n', encoding="utf-8",
     )
-    (root / "q.h").write_text(TEMPLATES, encoding="utf-8")
-    for name, text in (("a.cpp", UNIT_A), ("b.cpp", UNIT_B), ("post.cpp", POST_C)):
-        (root / name).write_text(text, encoding="utf-8")
-    (root / "compile_commands.json").write_text(json.dumps([
-        {"directory": str(root), "file": name, "arguments": ["c++", "-std=c++17", "-c", name, "-o", name + ".o"]}
+    write_sources(root, {"q.h": TEMPLATES, "a.cpp": UNIT_A, "b.cpp": UNIT_B, "post.cpp": POST_C})
+    write_compile_commands(root / "compile_commands.json", [
+        {"directory": str(root), "file": name, "arguments": toolchain.arguments(name, "-std=c++17", output=name + ".o")}
         for name in ("a.cpp", "b.cpp", "post.cpp")
-    ]), encoding="utf-8")
+    ])
     db_path = base / "proj-instances" / "index.db"
     db_path.parent.mkdir(parents=True)
     return db_path
@@ -191,9 +187,9 @@ def _edges(db_path: Path) -> set[tuple]:
 
 
 @pytest.fixture
-def indexed(tmp_path: Path) -> tuple[Path, Path]:
+def indexed(tmp_path: Path, toolchain: Toolchain) -> tuple[Path, Path]:
     root = tmp_path / "proj"
-    db_path = _project(root, tmp_path)
+    db_path = _project(root, tmp_path, toolchain)
     _index(root, db_path)
     return root, db_path
 
@@ -232,14 +228,13 @@ void use() { run<A>(); run<B>(); }
 """
 
 
-def test_a_local_variable_of_an_instance_is_the_variable_of_the_template(tmp_path):
+def test_a_local_variable_of_an_instance_is_the_variable_of_the_template(tmp_path, toolchain):
     """One call in the template is one site, also with two instances."""
-    from fw_context_mcp.indexer.compile_commands import CompilationUnit
     from fw_context_mcp.indexer.symbols import extract_all
 
     src = tmp_path / "locals.cpp"
     src.write_text(LOCALS, encoding="utf-8")
-    unit = CompilationUnit(file=src, directory=tmp_path, language="cpp", clang_args=["-std=c++17"])
+    unit = unit_of(src, toolchain, ["-std=c++17"], directory=tmp_path, language="cpp")
     slots = extract_all(unit, with_refs=True).slots
     sites = [s for s in (*slots.sites, *slots.from_instances.sites) if s.line == 2]
     assert len(sites) == 1 and "@FT@" in sites[0].slot and sites[0].slot.endswith("@local"), sites

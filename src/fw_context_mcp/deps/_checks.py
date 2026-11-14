@@ -26,6 +26,7 @@ from typing import Any
 from ..utils import sqlite_file_uri
 from . import DepCheckResult
 from ._instructions import (
+    clang_binary_instructions,
     clang_resource_instructions,
     db_integrity_instructions,
     disk_space_instructions,
@@ -297,32 +298,26 @@ def check_libclang_so() -> DepCheckResult:
             critical=True,
         )
 
-    if lib_path and "/" in lib_path and Path(lib_path).exists():
-        # Smoke test: try to actually load the library
-        try:
-            cindex.Index.create()
-            return DepCheckResult(
-                name="libclang-so",
-                status="ok",
-                message=lib_path,
-                critical=True,
-            )
-        except Exception as exc:
-            return DepCheckResult(
-                name="libclang-so",
-                status="degraded",
-                message=f"library found at {lib_path} but failed to load: {exc}",
-                fix_cmd=libclang_so_instructions(platform_ctx),
-                instructions=libclang_so_instructions(platform_ctx),
-                critical=True,
-            )
-
+    # ``Config().lib`` gives a CDLL object only after the library loaded,
+    # thus the library is there.  WHY no test of the path text: a test for
+    # "/" in the path read each Windows path (backslashes) as "not found",
+    # and `fw-context doctor` reported a missing libclang on each Windows
+    # machine.  Smoke test: libclang must also create an index.
+    try:
+        cindex.Index.create()
+    except Exception as exc:
+        return DepCheckResult(
+            name="libclang-so",
+            status="degraded",
+            message=f"library found at {lib_path} but failed to load: {exc}",
+            fix_cmd=libclang_so_instructions(platform_ctx),
+            instructions=libclang_so_instructions(platform_ctx),
+            critical=True,
+        )
     return DepCheckResult(
         name="libclang-so",
-        status="missing",
-        message=f"libclang not found at {lib_path}",
-        fix_cmd=libclang_so_instructions(platform_ctx),
-        instructions=libclang_so_instructions(platform_ctx),
+        status="ok",
+        message=lib_path,
         critical=True,
     )
 
@@ -379,6 +374,42 @@ def check_clang_resource() -> DepCheckResult:
         fix_cmd="fw-context doctor --fix --only clang-resource" if bundled_source(major) else None,
         instructions=clang_resource_instructions(get_platform_info(), major, bundled=bundled_source(major) is not None),
         critical=False,
+    )
+
+
+def check_clang_binary() -> DepCheckResult:
+    """Verify that the clang program runs: the preprocessor of the macro values and of the assembly units.
+
+    fw-context finds it as the index run does (``_clang_cli.clang_binary``:
+    PATH, else the install place of LLVM on Windows).  WHY a check: without
+    it the index run parses each unit, but each macro row says
+    ``no_answer`` and no assembly unit is read, and no check named the
+    cause.  Not critical: the parse of C and C++ works without it.
+    """
+    import subprocess
+
+    from ..indexer._clang_cli import clang_binary
+
+    binary = clang_binary()
+    try:
+        result = subprocess.run(
+            [binary, "--version"], stdin=subprocess.DEVNULL, capture_output=True, timeout=30, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return DepCheckResult(
+            name="clang", status="missing",
+            message=f"the clang program does not run ({binary}): {exc}; no macro values and no assembly units",
+            instructions=clang_binary_instructions(get_platform_info()), critical=False,
+        )
+    if result.returncode != 0:
+        return DepCheckResult(
+            name="clang", status="error",
+            message=f"`{binary} --version` ended with exit {result.returncode}",
+            instructions=clang_binary_instructions(get_platform_info()), critical=False,
+        )
+    first = result.stdout.decode("utf-8", "replace").strip().splitlines()
+    return DepCheckResult(
+        name="clang", status="ok", message=f"{binary}: {first[0] if first else 'clang'}", critical=False,
     )
 
 
@@ -1227,6 +1258,7 @@ CHECK_ORDER: list[tuple[str, Any]] = [
     ("libclang-python", check_libclang_python),
     ("libclang-so", check_libclang_so),
     ("clang-resource", check_clang_resource),
+    ("clang", check_clang_binary),
     ("watchfiles", check_watchfiles),
     ("tomli-w", check_tomli_w),
     ("config", check_config),

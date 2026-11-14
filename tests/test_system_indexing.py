@@ -9,10 +9,23 @@ Uses the minimal project fixtures under ``tests/builds/``.
 Run::
 
     # Detection only (always works, no tools needed)
-    python3 -m pytest tests/test_system_indexing.py -x -v -k "detection or registry"
+    python3 -m pytest tests/test_system_indexing.py -m system -x -v -k "detection or registry"
 
     # Full init + index tests (requires build tools)
-    python3 -m pytest tests/test_system_indexing.py -x -v -k "init_index"
+    python3 -m pytest tests/test_system_indexing.py -m system -x -v -k "InitAndIndex"
+
+``-m system``: the default options of pytest (``pyproject.toml``) leave the
+marker out.
+
+A build tool that a selected class needs and that is missing (ESP-IDF,
+arduino-cli, PlatformIO) fails the class: a skip looked like a test that
+passed.  Leave a class out with ``-k``.
+
+The Zephyr project and the PlatformIO ESP32-C3 project are in
+``tests/test_sdk_projects.py``, and the bare, CMake and Makefile projects
+in ``tests/test_builder_projects.py``: they build with the pinned test SDKs.  No
+test builds Mbed OS (decision of the user, 2026-11-12); the detection
+test of its fixture stays.
 """
 
 from __future__ import annotations
@@ -30,23 +43,14 @@ from fw_context_mcp.indexer.build import detect_build_system
 from fw_context_mcp.indexer.builders import registry as builder_registry
 from fw_context_mcp.indexer.config_hash import DEFAULT_TRANSIENT_DEFINES
 from fw_context_mcp.indexer.db import open_db
+from tests._toml import toml_string
+from tests._toolchains import write_compile_commands, write_sources
 
 pytestmark = pytest.mark.system
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 _BUILDS = Path(__file__).resolve().parent / "builds"
-
-
-def _read_mbed_gcc_arm_path() -> str:
-    """Read GCC_ARM_PATH from the global mbed config (``~/.mbed/.mbed``)."""
-    mbed_config = Path(os.path.expanduser("~/.mbed/.mbed"))
-    if not mbed_config.exists():
-        return ""
-    for line in mbed_config.read_text(encoding="utf-8").splitlines():
-        if line.startswith("GCC_ARM_PATH="):
-            return line.split("=", 1)[1].strip()
-    return ""
 
 
 def _initialized_root(tmp_path: Path) -> Path:
@@ -311,7 +315,7 @@ class TestBuildSystemDetection:
         assert detect_build_system(_BUILDS / "makefile") == "makefile"
 
     def test_detect_platformio(self):
-        assert detect_build_system(_BUILDS / "platformio") == "platformio"
+        assert detect_build_system(_BUILDS / "platformio_esp32c3") == "platformio"
 
     def test_detect_mbed_os(self):
         assert detect_build_system(_BUILDS / "mbed_os") == "mbed-os"
@@ -395,619 +399,6 @@ class TestBuilderRegistry:
         )
 
 
-# ── Init + Index tests ─────────────────────────────────────────────────────
-
-pytestmark_libclang = pytest.mark.libclang
-
-
-@pytest.mark.slow
-class TestBareInitAndIndex:
-    """End-to-end: init + index for a bare (manual mode) C project."""
-
-    @pytest.fixture(scope="class")
-    @classmethod
-    def indexed(cls):
-        proj = _init_and_index(
-            _BUILDS / "bare",
-            replacements={
-                "[build] system": '"bare"',
-                "[build] source_dirs": '["src"]',
-                "[build] include_dirs": '["src"]',
-            },
-            clean_db=True,
-        )
-        yield proj
-        _cleanup_index_db(proj)
-
-    def test_compile_commands_generated(self, indexed):
-        entries = json.loads(_cc_path(indexed).read_text())
-        assert len(entries) >= 1
-
-    def test_symbols_indexed(self, indexed):
-        db_path = _db_path_for_project(indexed)
-        conn = open_db(db_path)
-        try:
-            ch = _config_hash(conn, indexed)
-            count = conn.execute("SELECT COUNT(*) FROM symbols WHERE config_hash=?", (ch,)).fetchone()[0]
-            assert count >= 3
-        finally:
-            conn.close()
-
-    def test_key_functions_indexed(self, indexed):
-        db_path = _db_path_for_project(indexed)
-        conn = open_db(db_path)
-        try:
-            ch = _config_hash(conn, indexed)
-            functions = [
-                r[0]
-                for r in conn.execute(
-                    "SELECT name FROM symbols WHERE config_hash=? AND kind='function' AND is_definition=1",
-                    (ch,),
-                )
-            ]
-            assert "uart_init" in functions
-            assert "compute_checksum" in functions
-        finally:
-            conn.close()
-
-    def test_enum_indexed(self, indexed):
-        db_path = _db_path_for_project(indexed)
-        conn = open_db(db_path)
-        try:
-            ch = _config_hash(conn, indexed)
-            enums = [r[0] for r in conn.execute("SELECT name FROM symbols WHERE config_hash=? AND kind='enum'", (ch,))]
-            assert "OperationMode" in enums
-        finally:
-            conn.close()
-
-    def test_struct_indexed(self, indexed):
-        db_path = _db_path_for_project(indexed)
-        conn = open_db(db_path)
-        try:
-            ch = _config_hash(conn, indexed)
-            structs = [
-                r[0] for r in conn.execute("SELECT name FROM symbols WHERE config_hash=? AND kind='struct'", (ch,))
-            ]
-            assert "Config" in structs
-        finally:
-            conn.close()
-
-    def test_manifest_verification(self, indexed):
-        db_path = _db_path_for_project(indexed)
-        conn = open_db(db_path)
-        try:
-            ch = _config_hash(conn, indexed)
-            row = conn.execute(
-                "SELECT manifest_verification FROM build_configs WHERE config_hash=?",
-                (ch,),
-            ).fetchone()
-            assert row is not None, "build_config not found"
-            assert row["manifest_verification"] == "full", (
-                f"Expected full manifest verification, got '{row['manifest_verification']}'"
-            )
-        finally:
-            conn.close()
-
-
-@pytest.mark.slow
-class TestCMakeInitAndIndex:
-    """End-to-end: init + index for a CMake C project (detection works out of the box)."""
-
-    @pytest.fixture(scope="class")
-    @classmethod
-    def indexed(cls):
-        proj = _init_and_index(_BUILDS / "generic_cmake", clean_db=True)
-        yield proj
-        _cleanup_index_db(proj)
-
-    def test_compile_commands_generated(self, indexed):
-        entries = json.loads(_cc_path(indexed).read_text())
-        assert len(entries) >= 1
-
-    def test_symbols_indexed(self, indexed):
-        db_path = _db_path_for_project(indexed)
-        conn = open_db(db_path)
-        try:
-            ch = _config_hash(conn, indexed)
-            count = conn.execute("SELECT COUNT(*) FROM symbols WHERE config_hash=?", (ch,)).fetchone()[0]
-            assert count >= 1
-        finally:
-            conn.close()
-
-    def test_factorial_indexed(self, indexed):
-        db_path = _db_path_for_project(indexed)
-        conn = open_db(db_path)
-        try:
-            ch = _config_hash(conn, indexed)
-            names = [
-                r[0] for r in conn.execute("SELECT name FROM symbols WHERE config_hash=? AND kind='function'", (ch,))
-            ]
-            assert "factorial" in names
-        finally:
-            conn.close()
-
-    def test_manifest_verification(self, indexed):
-        db_path = _db_path_for_project(indexed)
-        conn = open_db(db_path)
-        try:
-            ch = _config_hash(conn, indexed)
-            row = conn.execute(
-                "SELECT manifest_verification FROM build_configs WHERE config_hash=?",
-                (ch,),
-            ).fetchone()
-            assert row is not None, "build_config not found"
-            assert row["manifest_verification"] == "full", (
-                f"Expected full manifest verification, got '{row['manifest_verification']}'"
-            )
-        finally:
-            conn.close()
-
-
-@pytest.mark.slow
-class TestMakefileInitAndIndex:
-    """End-to-end: init + index for a Makefile C project (detection works out of the box)."""
-
-    @pytest.fixture(scope="class")
-    @classmethod
-    def indexed(cls):
-        proj = _init_and_index(
-            _BUILDS / "makefile",
-            replacements={"[build] make_dry_run": "false", "[build] out_dir_var": '"BUILD_DIR"'},
-            clean_db=True,
-        )
-        yield proj
-        _cleanup_index_db(proj)
-
-    def test_compile_commands_generated(self, indexed):
-        entries = json.loads(_cc_path(indexed).read_text())
-        assert len(entries) >= 1
-
-    def test_device_functions_indexed(self, indexed):
-        db_path = _db_path_for_project(indexed)
-        conn = open_db(db_path)
-        try:
-            ch = _config_hash(conn, indexed)
-            functions = [
-                r[0]
-                for r in conn.execute(
-                    "SELECT name FROM symbols WHERE config_hash=? AND kind='function' AND is_definition=1",
-                    (ch,),
-                )
-            ]
-            assert "register_device" in functions
-            assert "find_device" in functions
-        finally:
-            conn.close()
-
-    def test_struct_indexed(self, indexed):
-        db_path = _db_path_for_project(indexed)
-        conn = open_db(db_path)
-        try:
-            ch = _config_hash(conn, indexed)
-            structs = [
-                r[0] for r in conn.execute("SELECT name FROM symbols WHERE config_hash=? AND kind='struct'", (ch,))
-            ]
-            assert "Device" in structs
-        finally:
-            conn.close()
-
-    def test_manifest_verification(self, indexed):
-        db_path = _db_path_for_project(indexed)
-        conn = open_db(db_path)
-        try:
-            ch = _config_hash(conn, indexed)
-            row = conn.execute(
-                "SELECT manifest_verification FROM build_configs WHERE config_hash=?",
-                (ch,),
-            ).fetchone()
-            assert row is not None, "build_config not found"
-            assert row["manifest_verification"] == "full", (
-                f"Expected full manifest verification, got '{row['manifest_verification']}'"
-            )
-        finally:
-            conn.close()
-
-
-@pytest.mark.slow
-class TestPlatformIOInitAndIndex:
-    """End-to-end: init + index for a PlatformIO project."""
-    @pytest.fixture(scope="class")
-    @classmethod
-    def indexed(cls):
-        proj = _init_and_index(_BUILDS / "platformio", clean_db=True)
-        yield proj
-        _cleanup_index_db(proj)
-
-    def test_compile_commands_has_entries(self, indexed):
-        entries = json.loads(_cc_path(indexed).read_text())
-        assert len(entries) > 10
-
-    def test_project_symbols_indexed(self, indexed):
-        db_path = _db_path_for_project(indexed)
-        conn = open_db(db_path)
-        try:
-            ch = _config_hash(conn, indexed)
-            count = conn.execute("SELECT COUNT(*) FROM symbols WHERE config_hash=?", (ch,)).fetchone()[0]
-            assert count > 50
-        finally:
-            conn.close()
-
-    def test_sensor_functions_indexed(self, indexed):
-        db_path = _db_path_for_project(indexed)
-        conn = open_db(db_path)
-        try:
-            ch = _config_hash(conn, indexed)
-            functions = [
-                r[0]
-                for r in conn.execute(
-                    "SELECT name FROM symbols WHERE config_hash=? AND kind='function' AND is_definition=1",
-                    (ch,),
-                )
-            ]
-            assert "sensor_init" in functions
-            assert "sensor_read" in functions
-        finally:
-            conn.close()
-
-    def test_enum_indexed(self, indexed):
-        db_path = _db_path_for_project(indexed)
-        conn = open_db(db_path)
-        try:
-            ch = _config_hash(conn, indexed)
-            enums = [r[0] for r in conn.execute("SELECT name FROM symbols WHERE config_hash=? AND kind='enum'", (ch,))]
-            assert "SensorState" in enums
-        finally:
-            conn.close()
-
-    def test_manifest_verification(self, indexed):
-        db_path = _db_path_for_project(indexed)
-        conn = open_db(db_path)
-        try:
-            ch = _config_hash(conn, indexed)
-            row = conn.execute(
-                "SELECT manifest_verification FROM build_configs WHERE config_hash=?",
-                (ch,),
-            ).fetchone()
-            assert row is not None, "build_config not found"
-            assert row["manifest_verification"] == "full", (
-                f"Expected full manifest verification, got '{row['manifest_verification']}'"
-            )
-        finally:
-            conn.close()
-
-
-@pytest.mark.slow
-class TestArduinoInitAndIndex:
-    """End-to-end: init + index for an Arduino project (needs fqbn)."""
-
-    @pytest.fixture(scope="class")
-    @classmethod
-    def indexed(cls):
-        proj = _init_and_index(
-            _BUILDS / "arduino",
-            replacements={
-                "[build] fqbn": '"arduino:avr:uno"',
-            },
-            clean_db=True,
-        )
-        yield proj
-        _cleanup_index_db(proj)
-
-    def test_compile_commands_generated(self, indexed):
-        entries = json.loads(_cc_path(indexed).read_text())
-        assert len(entries) >= 1
-
-    def test_symbols_indexed(self, indexed):
-        db_path = _db_path_for_project(indexed)
-        conn = open_db(db_path)
-        try:
-            ch = _config_hash(conn, indexed)
-            count = conn.execute("SELECT COUNT(*) FROM symbols WHERE config_hash=?", (ch,)).fetchone()[0]
-            assert count >= 3
-        finally:
-            conn.close()
-
-    def test_manifest_verification(self, indexed):
-        db_path = _db_path_for_project(indexed)
-        conn = open_db(db_path)
-        try:
-            ch = _config_hash(conn, indexed)
-            row = conn.execute(
-                "SELECT manifest_verification FROM build_configs WHERE config_hash=?",
-                (ch,),
-            ).fetchone()
-            assert row is not None, "build_config not found"
-            assert row["manifest_verification"] == "full", (
-                f"Expected full manifest verification, got '{row['manifest_verification']}'"
-            )
-        finally:
-            conn.close()
-
-
-@pytest.mark.slow
-class TestMbedOSInitAndIndex:
-    """End-to-end: init + index for an Mbed OS 6 project.
-
-    Requires bear, mbed-cli (pyenv 3.11), and ARM GCC configured in
-    ``~/.mbed/.mbed`` (GCC_ARM_PATH).  Skipped when any tool is missing.
-    """
-
-    _MBED_ENV = {
-        "PYENV_VERSION": "3.11.8",
-        "PATH": os.path.expanduser("~/.pyenv/versions/3.11.8/bin") + ":" + os.environ.get("PATH", ""),
-    }
-    _MBED_BIN = Path(os.path.expanduser("~/.pyenv/versions/3.11.8/bin/mbed"))
-    _GCC_ARM = _read_mbed_gcc_arm_path()
-
-    @pytest.fixture(scope="class")
-    @classmethod
-    def indexed(cls):
-        if not shutil.which("bear"):
-            pytest.skip("bear not installed")
-        if not cls._MBED_BIN.exists():
-            pytest.skip(f"mbed-cli not found (expected at {cls._MBED_BIN})")
-        if not cls._GCC_ARM:
-            pytest.skip("GCC_ARM_PATH not found in ~/.mbed/.mbed")
-        if not Path(cls._GCC_ARM, "arm-none-eabi-gcc").exists():
-            pytest.skip(f"ARM GCC not found at {cls._GCC_ARM}")
-        proj = _init_and_index(
-            _BUILDS / "mbed_os",
-            extra_env=cls._MBED_ENV,
-            clean_db=True,
-        )
-        yield proj
-        _cleanup_index_db(proj)
-
-    def test_compile_commands_generated(self, indexed):
-        entries = json.loads(_cc_path(indexed).read_text())
-        assert len(entries) > 100, f"Expected >100 entries, got {len(entries)}"
-
-    def test_project_symbols_indexed(self, indexed):
-        db_path = _db_path_for_project(indexed)
-        conn = open_db(db_path)
-        try:
-            ch = _config_hash(conn, indexed)
-            count = conn.execute("SELECT COUNT(*) FROM symbols WHERE config_hash=?", (ch,)).fetchone()[0]
-            # Full index including mbed-os SDK — expect thousands of symbols.
-            assert count > 20000, f"Expected >20000 symbols, got {count}"
-        finally:
-            conn.close()
-
-    def test_manifest_verification(self, indexed):
-        db_path = _db_path_for_project(indexed)
-        conn = open_db(db_path)
-        try:
-            ch = _config_hash(conn, indexed)
-            row = conn.execute(
-                "SELECT manifest_verification FROM build_configs WHERE config_hash=?",
-                (ch,),
-            ).fetchone()
-            assert row is not None, "build_config not found"
-            assert row["manifest_verification"] == "full", (
-                f"Expected full manifest verification, got '{row['manifest_verification']}'"
-            )
-        finally:
-            conn.close()
-
-
-@pytest.mark.slow
-class TestZephyrInitAndIndex:
-    """End-to-end: init + index for a Zephyr RTOS project.
-
-    Requires Nordic Connect SDK (ZEPHYR_BASE, ZEPHYR_SDK_INSTALL_DIR).
-    Skipped when the SDK is not detected.
-    """
-
-    _ZEPHYR_BASE = Path(os.path.expanduser("~/ncs/v3.2.3/zephyr"))
-    _ZEPHYR_SDK = Path(os.path.expanduser("~/ncs/toolchains/2ac5840438/opt/zephyr-sdk"))
-    _WEST_BIN = Path(os.path.expanduser("~/.pyenv/versions/3.11.8/bin/west"))
-
-    _ZEPHYR_ENV = {
-        "PYENV_VERSION": "3.11.8",
-        "ZEPHYR_BASE": str(_ZEPHYR_BASE),
-        "ZEPHYR_SDK_INSTALL_DIR": str(_ZEPHYR_SDK),
-        "ZEPHYR_TOOLCHAIN_VARIANT": "zephyr",
-        "PATH": (
-            os.path.expanduser("~/.pyenv/versions/3.11.8/bin")
-            + ":"
-            + str(_ZEPHYR_SDK / "arm-zephyr-eabi/bin")
-            + ":"
-            + os.environ.get("PATH", "")
-        ),
-    }
-
-    @pytest.fixture(scope="class")
-    @classmethod
-    def indexed(cls):
-        if not cls._ZEPHYR_BASE.is_dir():
-            pytest.skip("Zephyr base not found")
-        if not cls._ZEPHYR_SDK.is_dir():
-            pytest.skip("Zephyr SDK not found")
-        if not cls._WEST_BIN.exists():
-            pytest.skip(f"west not installed (expected at {cls._WEST_BIN})")
-        # No activate script is configured on purpose.  `fw-context init`
-        # writes .fw-context/ncs-env.sh for the chosen SDK, and that generic
-        # path is what a project without its own setup script gets — so it is
-        # the one worth covering.  Pointing the fixture at a hand-written
-        # script would test one machine's custom arrangement instead.
-        proj = _init_and_index(
-            _BUILDS / "zephyr",
-            replacements={
-                "[build] board": '"nrf52840dk/nrf52840"',
-            },
-            extra_env=cls._ZEPHYR_ENV,
-            clean_db=True,
-        )
-        yield proj
-        _cleanup_index_db(proj)
-
-    def test_compile_commands_generated(self, indexed):
-        entries = json.loads(_cc_path(indexed).read_text())
-        assert len(entries) > 50, f"Expected >50 entries, got {len(entries)}"
-
-    def test_project_symbols_indexed(self, indexed):
-        db_path = _db_path_for_project(indexed)
-        conn = open_db(db_path)
-        try:
-            ch = _config_hash(conn, indexed)
-            count = conn.execute("SELECT COUNT(*) FROM symbols WHERE config_hash=?", (ch,)).fetchone()[0]
-            # Full index including Zephyr SDK — expect thousands of symbols.
-            assert count > 5000, f"Expected >5000 symbols, got {count}"
-        finally:
-            conn.close()
-
-    def test_msg_functions_indexed(self, indexed):
-        db_path = _db_path_for_project(indexed)
-        conn = open_db(db_path)
-        try:
-            ch = _config_hash(conn, indexed)
-            functions = [
-                r[0]
-                for r in conn.execute(
-                    "SELECT name FROM symbols WHERE config_hash=? AND kind='function' AND is_definition=1",
-                    (ch,),
-                )
-            ]
-            assert "msg_init" in functions
-            assert "msg_send" in functions
-            assert "msg_recv" in functions
-        finally:
-            conn.close()
-
-    def test_manifest_verification(self, indexed):
-        db_path = _db_path_for_project(indexed)
-        conn = open_db(db_path)
-        try:
-            ch = _config_hash(conn, indexed)
-            row = conn.execute(
-                "SELECT manifest_verification FROM build_configs WHERE config_hash=?",
-                (ch,),
-            ).fetchone()
-            assert row is not None, "build_config not found"
-            assert row["manifest_verification"] == "full", (
-                f"Expected full manifest verification, got '{row['manifest_verification']}'"
-            )
-        finally:
-            conn.close()
-
-
-@pytest.mark.slow
-class TestESPIDFInitAndIndex:
-    """End-to-end: init + index for an ESP-IDF project.
-
-    Requires ESP-IDF environment (idf.py on PATH, IDF_PATH set).
-    Uses the IDF-bundled CMake 3.30 to work around CMake 4.x incompatibility.
-    Skipped when tools are not available.
-    """
-
-    _IDF_PATH = Path(os.path.expanduser("~/.espressif/v5.2.5/esp-idf"))
-    _IDF_PYTHON_ENV = Path(os.path.expanduser("~/.espressif/tools/python/v5.2.5/venv"))
-    _IDF_TOOLS = Path(os.path.expanduser("~/.espressif/tools"))
-    _IDF_PY_WRAPPER = Path(os.path.expanduser("~/.local/bin/idf.py"))
-    _IDF_TOOLCHAIN_BIN = Path(
-        os.path.expanduser("~/.espressif/tools/xtensa-esp-elf/esp-13.2.0_20230928/xtensa-esp-elf/bin")
-    )
-    _IDF_CMAKE_BIN = Path(os.path.expanduser("~/.espressif/tools/cmake/3.30.2/bin"))
-
-    _IDF_ENV = {
-        "IDF_PATH": str(_IDF_PATH),
-        "IDF_TOOLS_PATH": str(_IDF_TOOLS),
-        "IDF_PYTHON_ENV_PATH": str(_IDF_PYTHON_ENV),
-        "ESP_IDF_VERSION": "5.2",
-        "IDF_COMPONENT_LOCAL_STORAGE_URL": f"file://{_IDF_TOOLS}",
-        "PATH": (
-            str(_IDF_CMAKE_BIN)
-            + ":"
-            + str(_IDF_TOOLCHAIN_BIN)
-            + ":"
-            + str(_IDF_PYTHON_ENV / "bin")
-            + ":"
-            + os.path.expanduser("~/.local/bin")
-            + ":"
-            + os.environ.get("PATH", "")
-        ),
-    }
-
-    @pytest.fixture(scope="class")
-    @classmethod
-    def indexed(cls):
-        if not cls._IDF_PATH.is_dir():
-            pytest.skip(f"ESP-IDF not found (expected at {cls._IDF_PATH})")
-        if not cls._IDF_PY_WRAPPER.exists():
-            pytest.skip(f"idf.py wrapper not found (expected at {cls._IDF_PY_WRAPPER})")
-        # Use fw-context builder directly — CMake 3.30.2 is on PATH
-        # (via _IDF_ENV) and the idf.py wrapper also prepends it.
-        proj = _init_and_index(
-            _BUILDS / "esp_idf",
-            extra_env=cls._IDF_ENV,
-            clean_db=True,
-        )
-        yield proj
-        _cleanup_index_db(proj)
-
-    def test_compile_commands_generated(self, indexed):
-        entries = json.loads(_cc_path(indexed).read_text())
-        assert len(entries) > 100, f"Expected >100 entries, got {len(entries)}"
-
-    def test_project_symbols_indexed(self, indexed):
-        db_path = _db_path_for_project(indexed)
-        conn = open_db(db_path)
-        try:
-            ch = _config_hash(conn, indexed)
-            count = conn.execute("SELECT COUNT(*) FROM symbols WHERE config_hash=?", (ch,)).fetchone()[0]
-            # Full index including IDF components — expect thousands of symbols.
-            assert count > 20000, f"Expected >20000 symbols, got {count}"
-        finally:
-            conn.close()
-
-    def test_the_bootloader_is_a_second_image(self, indexed):
-        """idf.py builds the application and its bootloader, and each is an image of the build.
-
-        The application is indexed last, thus it is the newest build.  A
-        query names its image: without one, the query gets a refusal that
-        lists the two builds, and the server selects neither.
-        """
-        from fw_context_mcp.config import derive_project_id
-        from fw_context_mcp.config import load as load_config
-        from fw_context_mcp.mcp.shared.variants import resolve_build
-
-        conn = open_db(_db_path_for_project(indexed))
-        try:
-            project_id = derive_project_id(indexed)
-            rows = conn.execute(
-                "SELECT variant, image, config_hash FROM build_configs WHERE project_id = ?",
-                (project_id,),
-            ).fetchall()
-            assert {(r["variant"], r["image"]) for r in rows} == {
-                ("", "fwctx_test_esp_idf"), ("", "bootloader"),
-            }
-            app = next(r["config_hash"] for r in rows if r["image"] == "fwctx_test_esp_idf")
-            assert _config_hash(conn, indexed) == app
-            cfg = load_config(indexed)
-            assert resolve_build(conn, project_id, cfg, "", "fwctx_test_esp_idf") == (app, None)
-            chosen, err = resolve_build(conn, project_id, cfg)
-            assert chosen is None, f"the server selected {chosen}"
-            assert err is not None and 'image="bootloader"' in err, err
-        finally:
-            conn.close()
-
-    def test_manifest_verification(self, indexed):
-        db_path = _db_path_for_project(indexed)
-        conn = open_db(db_path)
-        try:
-            ch = _config_hash(conn, indexed)
-            row = conn.execute(
-                "SELECT manifest_verification FROM build_configs WHERE config_hash=?",
-                (ch,),
-            ).fetchone()
-            assert row is not None, "build_config not found"
-            assert row["manifest_verification"] == "full", (
-                f"Expected full manifest verification, got '{row['manifest_verification']}'"
-            )
-        finally:
-            conn.close()
-
-
 # ── Config hash tests ──────────────────────────────────────────────────────
 
 
@@ -1015,7 +406,7 @@ class TestESPIDFInitAndIndex:
 class TestConfigHashStability:
     """Verify config_hash is stable across repeated indexing of the same project."""
 
-    def test_same_project_same_config_hash(self, tmp_path):
+    def test_same_project_same_config_hash(self, tmp_path, toolchain):
         """Two parses of one database give one hash.
 
         The database is written here, and not taken from a build that an
@@ -1026,14 +417,12 @@ class TestConfigHashStability:
         from fw_context_mcp.indexer.manifest import compute_structural_hash
 
         project_root = _initialized_root(tmp_path)
-        (project_root / "src").mkdir()
-        (project_root / "src" / "main.c").write_text("int main(void) { return 0; }\n", encoding="utf-8")
-        cc = tmp_path / "compile_commands.json"
-        cc.write_text(json.dumps([{
+        write_sources(project_root, {"src/main.c": "int main(void) { return 0; }\n"})
+        cc = write_compile_commands(tmp_path / "compile_commands.json", [{
             "directory": str(project_root),
             "file": str(project_root / "src" / "main.c"),
-            "arguments": ["cc", "-DFOO=1", "-std=c11", "-c", "src/main.c"],
-        }]), encoding="utf-8")
+            "arguments": toolchain.arguments("src/main.c", "-DFOO=1", "-std=c11"),
+        }])
         units1 = list(parse_cc(cc))
         units2 = list(parse_cc(cc))
         h1 = compute_structural_hash(cc, project_root, units1, transient_defines=DEFAULT_TRANSIENT_DEFINES)
@@ -1045,28 +434,26 @@ class TestConfigHashStability:
         from fw_context_mcp.indexer.manifest import compute_structural_hash
 
         project_root = _initialized_root(tmp_path)
-        cc = tmp_path / name
-        cc.write_text(json.dumps(entries))
+        write_sources(tmp_path, {entry["file"]: f"int {Path(entry['file']).stem}_value;\n" for entry in entries})
+        cc = write_compile_commands(tmp_path / name, entries)
         return compute_structural_hash(cc, project_root, list(parse_cc(cc)), transient_defines=DEFAULT_TRANSIENT_DEFINES)
 
-    def test_config_hash_changes_with_different_dialect(self, tmp_path):
+    def test_config_hash_changes_with_different_dialect(self, tmp_path, toolchain):
         """A different macro or standard is a different build."""
         base = self._hash_for(tmp_path, "base.json", [
-            {"file": "a.c", "directory": str(tmp_path),
-             "arguments": ["gcc", "-std=c11", "-c", "a.c"]},
+            {"file": "a.c", "directory": str(tmp_path), "arguments": toolchain.arguments("a.c", "-std=c11")},
         ])
         define = self._hash_for(tmp_path, "define.json", [
             {"file": "a.c", "directory": str(tmp_path),
-             "arguments": ["gcc", "-std=c11", "-DFEATURE=1", "-c", "a.c"]},
+             "arguments": toolchain.arguments("a.c", "-std=c11", "-DFEATURE=1")},
         ])
         std = self._hash_for(tmp_path, "std.json", [
-            {"file": "a.c", "directory": str(tmp_path),
-             "arguments": ["gcc", "-std=c99", "-c", "a.c"]},
+            {"file": "a.c", "directory": str(tmp_path), "arguments": toolchain.arguments("a.c", "-std=c99")},
         ])
         assert define != base
         assert std != base
 
-    def test_config_hash_survives_a_different_file_set(self, tmp_path):
+    def test_config_hash_survives_a_different_file_set(self, tmp_path, toolchain):
         """A different set of translation units is the SAME build.
 
         config_hash identifies the compilation dialect.  Making it depend on
@@ -1075,16 +462,15 @@ class TestConfigHashStability:
         "reuse" path, which lost rows owned by headers.  Which files exist is
         the manifest's job; whether one changed is files.source_hash's.
         """
-        flags = ["gcc", "-std=c11", "-c"]
         one = self._hash_for(tmp_path, "one.json", [
-            {"file": "a.c", "directory": str(tmp_path), "arguments": [*flags, "a.c"]},
+            {"file": "a.c", "directory": str(tmp_path), "arguments": toolchain.arguments("a.c", "-std=c11")},
         ])
         renamed = self._hash_for(tmp_path, "renamed.json", [
-            {"file": "b.c", "directory": str(tmp_path), "arguments": [*flags, "b.c"]},
+            {"file": "b.c", "directory": str(tmp_path), "arguments": toolchain.arguments("b.c", "-std=c11")},
         ])
         both = self._hash_for(tmp_path, "both.json", [
-            {"file": "a.c", "directory": str(tmp_path), "arguments": [*flags, "a.c"]},
-            {"file": "b.c", "directory": str(tmp_path), "arguments": [*flags, "b.c"]},
+            {"file": "a.c", "directory": str(tmp_path), "arguments": toolchain.arguments("a.c", "-std=c11")},
+            {"file": "b.c", "directory": str(tmp_path), "arguments": toolchain.arguments("b.c", "-std=c11")},
         ])
         assert renamed == one
         assert both == one
@@ -1218,7 +604,6 @@ def _print_stats_table(all_stats: list[dict]) -> None:
 
 
 @pytest.mark.system
-@pytest.mark.skipif(shutil.which("gcc") is None, reason="the bare backend of the test project runs gcc")
 class TestGhostRecordPurge:
     """End-to-end: delete file (same config_hash) → reindex purges ghosts.
 
@@ -1227,7 +612,7 @@ class TestGhostRecordPurge:
     most teams do not regenerate cc.json on every checkout).
     """
 
-    def test_ghost_purged_after_file_deletion(self, tmp_path: Path):
+    def test_ghost_purged_after_file_deletion(self, tmp_path: Path, toolchain):
         """Scenario: bare/ project indexed → one .c deleted from disk (cc.json
         unchanged) → reindex → ghost symbols purged, survivors intact."""
         import shutil as _shutil
@@ -1247,12 +632,15 @@ int extra_init(void) {
 }
 """, encoding="utf-8")
 
+        # The bare builder compiles with [build] compiler and its flags.
         proj = _init_and_index(
             proj,
             replacements={
                 "[build] system": '"bare"',
                 "[build] source_dirs": '["src"]',
                 "[build] include_dirs": '["src"]',
+                "[build] compiler": toml_string(toolchain.driver("main.c")),
+                "[build] extra_flags": json.dumps(list(toolchain.flags)),
             },
             clean_db=True,
         )
@@ -1326,6 +714,9 @@ int extra_init(void) {
             conn.close()
 
         _cleanup_index_db(proj)
+
+
+class TestIndexStatistics:
     """Print indexing statistics for all test projects that have been indexed."""
 
     def test_print_statistics(self):

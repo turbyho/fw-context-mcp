@@ -7,9 +7,10 @@ These tests verify the full HTTP round-trip with a real LLM backend:
   - call_llm routing: chat_api_base pointing to OpenAI-compatible endpoint
   - Content-Type charset suffix handling (text/event-stream; charset=utf-8)
 
-Requires a LiteLLM proxy running at http://localhost:4000 with at least
-one chat model configured.  Tests are skipped automatically when the
-proxy is unreachable.
+Requires a LiteLLM proxy running at http://localhost:4000 with the models
+of ``tests/_environment.LITELLM_MODELS``.  The marker ``litellm`` leaves
+these tests out of a default run.  When a run selects them, the pre-test
+of the session stops the run if the proxy or a model is missing.
 
 Run manually:
     pytest tests/test_streaming_integration.py -m litellm -v -s
@@ -26,57 +27,22 @@ import pytest
 from fw_context_mcp.config.settings import LLMConfig
 from fw_context_mcp.llm.chat_router import OpenAIChatClient, detect_chat_endpoint
 from fw_context_mcp.llm.client import call_llm
+from tests import _environment
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-LITELLM_URL = "http://localhost:4000"
-LITELLM_BASE = f"{LITELLM_URL}/v1"
+LITELLM_BASE = _environment.LITELLM_BASE
+
 # Deepseek-v4-flash: standard content-only model (no reasoning_content)
-MODEL_CONTENT = "Deepseek-v4-flash"
 # glm-5.2-fp8: reasoning model that emits reasoning_content
-MODEL_REASONING = "glm-5.2-fp8"
 # glm-5.2-fp8-no-thinking: non-thinking mode, returns only content (no reasoning_content)
-MODEL_NO_THINKING = "glm-5.2-fp8-no-thinking"
+MODEL_CONTENT, MODEL_REASONING, MODEL_NO_THINKING = _environment.LITELLM_MODELS
 
 SIMPLE_PROMPT = "What is 2+3? Reply with just the number."
 LONG_PROMPT = "List the numbers 1 through 10, comma-separated."
 
 
-# ── Skip condition: detect LiteLLM proxy ────────────────────────────────────
-
-
-def _litellm_available() -> bool:
-    """Check if LiteLLM proxy is reachable and has at least one model."""
-    try:
-        resp = httpx.get(f"{LITELLM_BASE}/models", timeout=5.0)
-        if resp.status_code != 200:
-            return False
-        data = resp.json()
-        models = data.get("data", [])
-        return len(models) > 0
-    except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPError):
-        return False
-
-
-def _model_available(model: str) -> bool:
-    """Check if a specific model is available on the LiteLLM proxy."""
-    try:
-        resp = httpx.get(f"{LITELLM_BASE}/models", timeout=5.0)
-        if resp.status_code != 200:
-            return False
-        models = [m.get("id", "") for m in resp.json().get("data", [])]
-        return model in models
-    except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPError):
-        return False
-
-
-pytestmark = [
-    pytest.mark.litellm,
-    pytest.mark.skipif(
-        not _litellm_available(),
-        reason=f"LiteLLM proxy not running at {LITELLM_URL} (start with: litellm --config config.yaml)",
-    ),
-]
+pytestmark = pytest.mark.litellm
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -104,7 +70,6 @@ def _endpoint() -> str:
 class TestPlanANonStreaming:
     """Non-streaming requests with stream=false."""
 
-    @pytest.mark.skipif(not _model_available(MODEL_CONTENT), reason=f"{MODEL_CONTENT} not available")
     def test_non_streaming_returns_content(self):
         """OpenAIChatClient.generate (stream=False) returns a non-empty string."""
         cfg = _cfg(MODEL_CONTENT, stream=False)
@@ -113,7 +78,6 @@ class TestPlanANonStreaming:
         assert len(result) > 0
         assert "5" in result
 
-    @pytest.mark.skipif(not _model_available(MODEL_CONTENT), reason=f"{MODEL_CONTENT} not available")
     def test_non_streaming_content_type_is_json(self):
         """When stream=false, the API should return application/json (not SSE)."""
         resp = httpx.post(
@@ -131,7 +95,6 @@ class TestPlanANonStreaming:
         msg = resp.json()["choices"][0]["message"]
         assert msg.get("content"), f"Empty content in: {msg}"
 
-    @pytest.mark.skipif(not _model_available(MODEL_REASONING), reason=f"{MODEL_REASONING} not available")
     def test_non_streaming_glm_reasoning_fallback(self):
         """GLM model with reasoning_content: fallback extracts text."""
         cfg = _cfg(MODEL_REASONING, stream=False, timeout=90.0)
@@ -148,7 +111,6 @@ class TestPlanANonStreaming:
 class TestPlanBStreaming:
     """Active streaming with stream=true (httpx.stream)."""
 
-    @pytest.mark.skipif(not _model_available(MODEL_CONTENT), reason=f"{MODEL_CONTENT} not available")
     def test_streaming_returns_content(self):
         """OpenAIChatClient.generate (stream=True) returns a non-empty string."""
         cfg = _cfg(MODEL_CONTENT, stream=True)
@@ -157,7 +119,6 @@ class TestPlanBStreaming:
         assert len(result) > 0
         assert "5" in result
 
-    @pytest.mark.skipif(not _model_available(MODEL_CONTENT), reason=f"{MODEL_CONTENT} not available")
     def test_streaming_content_type_is_sse(self):
         """When stream=true, the API returns text/event-stream."""
         with httpx.stream(
@@ -174,7 +135,6 @@ class TestPlanBStreaming:
             ct = resp.headers.get("content-type", "").lower()
             assert "text/event-stream" in ct, f"Expected SSE, got: {ct}"
 
-    @pytest.mark.skipif(not _model_available(MODEL_CONTENT), reason=f"{MODEL_CONTENT} not available")
     def test_streaming_multi_chunk_accumulation(self):
         """Long response: multiple SSE chunks are correctly accumulated."""
         cfg = _cfg(MODEL_CONTENT, stream=True)
@@ -185,7 +145,6 @@ class TestPlanBStreaming:
         for n in ["1", "2", "3"]:
             assert n in result, f"Expected '{n}' in response: {result!r}"
 
-    @pytest.mark.skipif(not _model_available(MODEL_CONTENT), reason=f"{MODEL_CONTENT} not available")
     def test_streaming_vs_non_streaming_consistency(self):
         """Same prompt + temperature=0: streaming and non-streaming produce similar results."""
         cfg_ns = _cfg(MODEL_CONTENT, stream=False)
@@ -196,7 +155,6 @@ class TestPlanBStreaming:
         assert "5" in r_ns, f"Non-streaming missing answer: {r_ns!r}"
         assert "5" in r_s, f"Streaming missing answer: {r_s!r}"
 
-    @pytest.mark.skipif(not _model_available(MODEL_REASONING), reason=f"{MODEL_REASONING} not available")
     def test_streaming_glm_reasoning_fallback(self):
         """GLM streaming with reasoning_content: fallback extracts text."""
         cfg = _cfg(MODEL_REASONING, stream=True, timeout=90.0)
@@ -212,7 +170,6 @@ class TestPlanBStreaming:
 class TestContentTypeCharset:
     """Verify text/event-stream; charset=utf-8 is correctly detected as SSE."""
 
-    @pytest.mark.skipif(not _model_available(MODEL_CONTENT), reason=f"{MODEL_CONTENT} not available")
     def test_sse_content_type_has_charset(self):
         """LiteLLM returns 'text/event-stream; charset=utf-8' — verify charset suffix."""
         with httpx.stream(
@@ -229,7 +186,6 @@ class TestContentTypeCharset:
             ct = resp.headers.get("content-type", "")
             assert "text/event-stream" in ct.lower(), f"Expected SSE content-type, got: {ct}"
 
-    @pytest.mark.skipif(not _model_available(MODEL_CONTENT), reason=f"{MODEL_CONTENT} not available")
     def test_streaming_works_with_charset_suffix(self):
         """Full streaming call succeeds even when content-type has charset suffix."""
         cfg = _cfg(MODEL_CONTENT, stream=True)
@@ -244,7 +200,6 @@ class TestContentTypeCharset:
 class TestCallOllamaRouting:
     """call_llm with chat_api_base routes to OpenAIChatClient.generate."""
 
-    @pytest.mark.skipif(not _model_available(MODEL_CONTENT), reason=f"{MODEL_CONTENT} not available")
     def test_call_ollama_non_stream_routes_to_openai(self):
         """call_llm(stream=False) with /v1 base routes to OpenAI non-streaming."""
         cfg = _cfg(MODEL_CONTENT, stream=False)
@@ -252,7 +207,6 @@ class TestCallOllamaRouting:
         assert isinstance(result, str)
         assert "5" in result
 
-    @pytest.mark.skipif(not _model_available(MODEL_CONTENT), reason=f"{MODEL_CONTENT} not available")
     def test_call_ollama_stream_routes_to_openai_streaming(self):
         """call_llm(stream=True) with /v1 base routes to OpenAI streaming."""
         cfg = _cfg(MODEL_CONTENT, stream=True)
@@ -260,7 +214,6 @@ class TestCallOllamaRouting:
         assert isinstance(result, str)
         assert "5" in result
 
-    @pytest.mark.skipif(not _model_available(MODEL_REASONING), reason=f"{MODEL_REASONING} not available")
     def test_call_ollama_stream_glm_reasoning(self):
         """call_llm(stream=True) with GLM: reasoning_content fallback works through routing."""
         cfg = _cfg(MODEL_REASONING, stream=True, timeout=90.0)
@@ -276,7 +229,6 @@ class TestCallOllamaRouting:
 class TestSSEFormatVerification:
     """Verify the actual SSE format from LiteLLM matches our parser expectations."""
 
-    @pytest.mark.skipif(not _model_available(MODEL_CONTENT), reason=f"{MODEL_CONTENT} not available")
     def test_sse_uses_data_prefix(self):
         """SSE lines start with 'data: ' prefix."""
         resp = httpx.post(
@@ -293,7 +245,6 @@ class TestSSEFormatVerification:
         data_lines = [ln for ln in lines if ln.startswith("data: ")]
         assert len(data_lines) > 0, "No 'data: ' prefixed lines found in SSE response"
 
-    @pytest.mark.skipif(not _model_available(MODEL_CONTENT), reason=f"{MODEL_CONTENT} not available")
     def test_sse_terminates_with_done(self):
         """SSE stream ends with 'data: [DONE]'."""
         resp = httpx.post(
@@ -308,7 +259,6 @@ class TestSSEFormatVerification:
         )
         assert "data: [DONE]" in resp.text, "Missing 'data: [DONE]' terminator"
 
-    @pytest.mark.skipif(not _model_available(MODEL_CONTENT), reason=f"{MODEL_CONTENT} not available")
     def test_sse_chunks_have_delta_content(self):
         """Each SSE data chunk has choices[0].delta.content (for non-reasoning models)."""
         resp = httpx.post(
@@ -331,7 +281,6 @@ class TestSSEFormatVerification:
                     break
         assert content_found, "No chunk with delta.content found"
 
-    @pytest.mark.skipif(not _model_available(MODEL_REASONING), reason=f"{MODEL_REASONING} not available")
     def test_glm_sse_has_reasoning_content(self):
         """GLM model SSE chunks contain reasoning_content in delta."""
         resp = httpx.post(
@@ -354,9 +303,6 @@ class TestSSEFormatVerification:
                     break
         assert reasoning_found, "GLM SSE response has no reasoning_content in delta"
 
-    @pytest.mark.skipif(
-        not _model_available(MODEL_NO_THINKING), reason=f"{MODEL_NO_THINKING} not available"
-    )
     def test_no_thinking_sse_has_content_not_reasoning(self):
         """Non-thinking mode SSE: delta has content, never reasoning_content."""
         resp = httpx.post(
@@ -389,7 +335,6 @@ class TestSSEFormatVerification:
 class TestDebugLogStreaming:
     """Verify debug log entries for streaming responses."""
 
-    @pytest.mark.skipif(not _model_available(MODEL_CONTENT), reason=f"{MODEL_CONTENT} not available")
     def test_debug_log_streaming_entry(self, tmp_path: Path):
         """Plan B streaming: debug log includes streamed=true flag."""
         log_path = tmp_path / "stream_debug.jsonl"
@@ -405,7 +350,6 @@ class TestDebugLogStreaming:
         entry = json.loads(log_path.read_text(encoding="utf-8").strip().split("\n")[-1])
         assert entry.get("streamed") is True, f"Expected streamed=True, got: {entry}"
 
-    @pytest.mark.skipif(not _model_available(MODEL_CONTENT), reason=f"{MODEL_CONTENT} not available")
     def test_debug_log_non_streaming_entry(self, tmp_path: Path):
         """Non-streaming: debug log includes streamed=false flag."""
         log_path = tmp_path / "nonstream_debug.jsonl"
@@ -433,9 +377,6 @@ class TestNoThinkingMode:
     tests confirm our parser handles this clean path correctly.
     """
 
-    @pytest.mark.skipif(
-        not _model_available(MODEL_NO_THINKING), reason=f"{MODEL_NO_THINKING} not available"
-    )
     def test_no_thinking_non_streaming_returns_content(self):
         """Non-thinking non-streaming: message has content, no reasoning_content."""
         resp = httpx.post(
@@ -454,9 +395,6 @@ class TestNoThinkingMode:
         assert "reasoning_content" not in msg, f"Unexpected reasoning_content in non-thinking mode: {msg}"
         assert "5" in msg["content"]
 
-    @pytest.mark.skipif(
-        not _model_available(MODEL_NO_THINKING), reason=f"{MODEL_NO_THINKING} not available"
-    )
     def test_no_thinking_streaming_returns_content(self):
         """Non-thinking streaming: delta has content, no reasoning_content."""
         resp = httpx.post(
@@ -482,9 +420,6 @@ class TestNoThinkingMode:
         assert content_found, "No content chunks in non-thinking streaming response"
         assert not reasoning_found, "Unexpected reasoning_content in non-thinking mode"
 
-    @pytest.mark.skipif(
-        not _model_available(MODEL_NO_THINKING), reason=f"{MODEL_NO_THINKING} not available"
-    )
     def test_no_thinking_openai_client_non_streaming(self):
         """OpenAIChatClient.generate (stream=False) with non-thinking model returns content."""
         cfg = _cfg(MODEL_NO_THINKING, stream=False)
@@ -493,9 +428,6 @@ class TestNoThinkingMode:
         assert len(result) > 0
         assert "5" in result
 
-    @pytest.mark.skipif(
-        not _model_available(MODEL_NO_THINKING), reason=f"{MODEL_NO_THINKING} not available"
-    )
     def test_no_thinking_openai_client_streaming(self):
         """OpenAIChatClient.generate (stream=True) with non-thinking model returns content."""
         cfg = _cfg(MODEL_NO_THINKING, stream=True)
@@ -504,9 +436,6 @@ class TestNoThinkingMode:
         assert len(result) > 0
         assert "5" in result
 
-    @pytest.mark.skipif(
-        not _model_available(MODEL_NO_THINKING), reason=f"{MODEL_NO_THINKING} not available"
-    )
     def test_no_thinking_streaming_vs_non_streaming_consistency(self):
         """Non-thinking: streaming and non-streaming produce consistent results."""
         cfg_ns = _cfg(MODEL_NO_THINKING, stream=False)

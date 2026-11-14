@@ -35,7 +35,9 @@ from fw_context_mcp.indexer.db import (
     upsert_file,
     upsert_project,
 )
+from fw_context_mcp.path_key import ABSOLUTE_KEY_SQL
 from tests._toml import toml_string
+from tests._toolchains import Toolchain, write_compile_commands, write_entries, write_sources
 
 # ── helpers ──────────────────────────────────────────────────────────
 
@@ -54,12 +56,16 @@ def _db_path_for_project(project_root: Path) -> Path:
     return cfg.index.db_dir / project_id / "index.db"
 
 
-def _fail_or_skip_analysis(result: dict, symbol_name: str) -> None:
-    """Fail if analysis was expected but not generated; skip if Ollama unavailable."""
-    if "analysis_warning" in result:
-        pytest.skip(f"Ollama not available — cannot generate analysis for {symbol_name}: "
-                     f"{result['analysis_warning']}")
-    pytest.fail(f"No analysis generated for {symbol_name} after reindex with with_analysis=True")
+def _fail_analysis(result: dict, symbol_name: str) -> None:
+    """Fail: the analysis was expected, and the reindex did not generate it.
+
+    The tests of the marker ``ollama`` run only after the pre-test of the
+    session found Ollama (tests/_environment.py), thus a warning of the
+    analysis is a failure, not a reason to skip.
+    """
+    warning = result.get("analysis_warning")
+    detail = f": {warning}" if warning else ""
+    pytest.fail(f"No analysis generated for {symbol_name} after reindex with with_analysis=True{detail}")
 
 
 def _project_root() -> Path:
@@ -107,7 +113,7 @@ def _write_file(path: Path, content: str) -> None:
 
 
 @pytest.fixture
-def c_project(tmp_path: Path):
+def c_project(tmp_path: Path, toolchain: Toolchain):
     """Create a minimal C project with compile_commands.json, index it, return paths."""
     proj = tmp_path / "demo"
     proj.mkdir()
@@ -216,53 +222,13 @@ void log_message(const char* msg) {
     # ── compile_commands.json ──
 
     cc_json = proj / "compile_commands.json"
-    import json
 
     cc = [
-        {
-            "directory": str(src),
-            "file": "main.c",
-            "arguments": [
-                "gcc",
-                "-std=c11",
-                "-O2",
-                "-Isrc",
-                "-c",
-                "main.c",
-                "-o",
-                "build/main.o",
-            ],
-        },
-        {
-            "directory": str(src),
-            "file": "modem.c",
-            "arguments": [
-                "gcc",
-                "-std=c11",
-                "-O2",
-                "-Isrc",
-                "-c",
-                "modem.c",
-                "-o",
-                "build/modem.o",
-            ],
-        },
-        {
-            "directory": str(src),
-            "file": "utils.c",
-            "arguments": [
-                "gcc",
-                "-std=c11",
-                "-O2",
-                "-Isrc",
-                "-c",
-                "utils.c",
-                "-o",
-                "build/utils.o",
-            ],
-        },
+        {"directory": str(src), "file": name,
+         "arguments": toolchain.arguments(name, "-std=c11", "-O2", "-Isrc", output=f"build/{name[:-2]}.o")}
+        for name in ("main.c", "modem.c", "utils.c")
     ]
-    cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+    write_compile_commands(cc_json, cc)
 
     # Isolate index DB to tmp_path before init
     _isolate_index_db(proj, tmp_path)
@@ -741,7 +707,7 @@ class TestActivePathsFromRealParse:
     it from `written` and inferred it wrong.
     """
 
-    def test_a_changed_header_with_code_keeps_its_content(self, tmp_path: Path):
+    def test_a_changed_header_with_code_keeps_its_content(self, tmp_path: Path, toolchain):
         from fw_context_mcp.indexer.compile_commands import parse as parse_cc
         from fw_context_mcp.indexer.db import (
             open_db,
@@ -761,11 +727,11 @@ class TestActivePathsFromRealParse:
         src.write_text('#include "api.h"\nint main(void) { return kept(); }\n',
                        encoding="utf-8")
         cc = root / "compile_commands.json"
-        cc.write_text(json.dumps([{
+        write_compile_commands(cc, [{
             "directory": str(root),
             "file": str(src),
-            "arguments": ["cc", "-c", str(src), "-I", str(root / "src")],
-        }]), encoding="utf-8")
+            "arguments": [*toolchain.arguments(str(src)), "-I", str(root / "src")],
+        }])
 
         db_path = tmp_path / "index.db"
         conn = open_db(db_path)
@@ -826,6 +792,50 @@ class TestActivePathsFromRealParse:
 class TestIncrementalReindex:
     """End-to-end tests: index → modify → reindex → verify."""
 
+    @staticmethod
+    def _macro_values(project_root: Path) -> tuple[list[str], bool]:
+        """Return the ``expanded_values`` of each macro row, and whether the marker of the run is there."""
+        from fw_context_mcp.indexer import _run_marker
+
+        db_path = _db_path_for_project(project_root)
+        conn = open_db(db_path)
+        try:
+            config_hash = conn.execute("SELECT config_hash FROM build_configs").fetchone()[0]
+            values = [row[0] for row in conn.execute(
+                "SELECT expanded_values FROM macros WHERE config_hash = ?", (config_hash,),
+            )]
+        finally:
+            conn.close()
+        return values, _run_marker.is_pending(db_path.parent, config_hash)
+
+    def test_the_next_index_run_writes_the_macro_values_that_reindex_file_left_out(self, indexed_project: Path):
+        """reindex_file stores rows with no macro values: each needs each unit of the build.
+
+        The next index run parses nothing, thus its macros step did not run,
+        and the values stayed empty for good.  The marker of the run
+        (``_run_marker``) that reindex_file writes makes the step run.
+        """
+        from fw_context_mcp.mcp.handlers.maintenance import reindex_file
+
+        values, pending = self._macro_values(indexed_project)
+        assert values and all(values), "the index run gives each macro row its values"
+        assert not pending
+
+        for rel_path in ("src/main.c", "src/modem.c", "src/utils.c"):
+            result = reindex_file(rel_path, str(indexed_project), with_analysis=False)
+            assert "error" not in result, result
+        values, pending = self._macro_values(indexed_project)
+        assert not all(values), "reindex_file stored rows again, thus some rows have no value"
+        assert pending
+
+        cc_json = indexed_project / "compile_commands.json"
+        run = _cli(["index", "--no-refs", "--no-analyze", "--no-embeddings", str(cc_json)], cwd=indexed_project)
+        assert run.returncode == 0, run.stdout + run.stderr
+
+        values, pending = self._macro_values(indexed_project)
+        assert all(values), "the macros step of the next run did not run"
+        assert not pending
+
     def test_reindex_unchanged_file_preserves_symbols(self, indexed_project: Path):
         """Reindexing an unmodified file should keep all symbols."""
         result = _cli(
@@ -874,7 +884,6 @@ class TestIncrementalReindex:
 
     def test_reindex_after_modifying_function_body(self, indexed_project: Path):
         """Phase 3/4: modify a function body → reindex → verify old analysis dropped."""
-        import json
 
         db_path = _db_path_for_project(indexed_project)
         conn = open_db(db_path)
@@ -972,7 +981,6 @@ class TestIncrementalReindex:
 
     def test_reindex_without_analysis_deletes_llm_analysis(self, indexed_project: Path):
         """_delete_old_for_tu cleans up llm_analysis; without_analysis=True skips regeneration."""
-        import json
 
         db_path = _db_path_for_project(indexed_project)
         conn = open_db(db_path)
@@ -1232,7 +1240,6 @@ class TestMoveDetection:
 
     def test_move_detection_same_usr_different_file(self, indexed_project: Path):
         """When a symbol moves from one .c file to another, Phase 4 detects it."""
-        import json
 
         db_path = _db_path_for_project(indexed_project)
         conn = open_db(db_path)
@@ -1660,19 +1667,18 @@ class TestReindexFileImplEdgeCases:
         assert _tu_for_header(target, manifest, tmp_path) == chosen
 
     @pytest.mark.parametrize("define", ["-DA=1", "-DB=1", "-DC=1", "-DD=1"])
-    def test_a_header_goes_to_the_cpp_listing_of_its_first_includer(self, tmp_path: Path, define: str):
+    def test_a_header_goes_to_the_cpp_listing_of_its_first_includer(
+        self, tmp_path: Path, define: str, toolchain: Toolchain,
+    ):
         """`src/two.c` is listed as C and as C++ (`-std=`): the C++ listing claims first, whatever its flags hash."""
         from fw_context_mcp.mcp.handlers.maintenance import _reindex_match_tus
 
-        (tmp_path / "src").mkdir()
-        (tmp_path / "src" / "shared.h").write_text("int shared;\n", encoding="utf-8")
-        (tmp_path / "src" / "two.c").write_text('#include "shared.h"\n', encoding="utf-8")
-        cc = tmp_path / "compile_commands.json"
-        cc.write_text(json.dumps([
-            {"directory": str(tmp_path), "file": "src/two.c", "arguments": ["cc", "-std=gnu11", "-c", "src/two.c"]},
+        write_sources(tmp_path, {"src/shared.h": "int shared;\n", "src/two.c": '#include "shared.h"\n'})
+        cc = write_compile_commands(tmp_path / "compile_commands.json", [
+            {"directory": str(tmp_path), "file": "src/two.c", "arguments": toolchain.arguments("src/two.c", "-std=gnu11")},
             {"directory": str(tmp_path), "file": "src/two.c",
-             "arguments": ["cc", "-std=gnu++17", define, "-c", "src/two.c"]},
-        ]), encoding="utf-8")
+             "arguments": toolchain.arguments("src/two.c", "-std=gnu++17", define, language="c++")},
+        ])
         manifest = {"entries": [{"file": "src/two.c", "headers": ["src/shared.h"]}]}
         matching, via_header, error = _reindex_match_tus(
             (tmp_path / "src" / "shared.h").resolve(), {"compile_commands_path": str(cc)},
@@ -1682,11 +1688,16 @@ class TestReindexFileImplEdgeCases:
         assert [unit.language for unit in matching] == ["cpp"]
 
     def test_tu_for_header_takes_a_cpp_unit_before_a_c_unit(self, tmp_path: Path):
-        """The C++ units claim first (``db.claim_order``), also a `.c` file that `-std=` makes C++."""
+        """The C++ units claim first (``db.claim_order``), also a `.c` file that the compiler compiles as C++.
+
+        The libclang arguments of such a unit begin with ``-x c++``
+        (``compile_commands._with_language``): a ``g++`` or an ``-x c++`` of
+        the entry.  ``-std=`` selects no language.
+        """
         from fw_context_mcp.mcp.handlers.maintenance import _tu_for_header
 
         manifest = {
-            "arg_sets": [["-std=gnu11"], ["-std=gnu++17"]],
+            "arg_sets": [["-std=gnu11"], ["-x", "c++", "-std=gnu++17"]],
             "entries": [
                 {"file": "src/alpha.c", "arg_set": 0, "headers": ["src/shared.h"]},
                 {"file": "src/zeta.cpp", "arg_set": 1, "headers": ["src/shared.h"]},
@@ -2271,13 +2282,12 @@ class TestStoreSymbolsForUnitAnalysisRestore:
 
 
 @pytest.fixture(scope="class")
-def indexed_project_with_analysis(tmp_path_factory):
+def indexed_project_with_analysis(tmp_path_factory, toolchain: Toolchain):
     """Index the C project with LLM analysis enabled (requires Ollama).
 
     Scoped to class — indexes once for all tests in the class.
     Creates its own temp C project so it doesn't depend on function-scoped fixtures.
     """
-    import json
 
     proj = tmp_path_factory.mktemp("demo_analysis")
 
@@ -2379,24 +2389,11 @@ void log_message(const char* msg) {
     )
 
     cc = [
-        {
-            "directory": str(src),
-            "file": "main.c",
-            "arguments": ["gcc", "-std=c11", "-O2", "-Isrc", "-c", "main.c", "-o", "build/main.o"],
-        },
-        {
-            "directory": str(src),
-            "file": "modem.c",
-            "arguments": ["gcc", "-std=c11", "-O2", "-Isrc", "-c", "modem.c", "-o", "build/modem.o"],
-        },
-        {
-            "directory": str(src),
-            "file": "utils.c",
-            "arguments": ["gcc", "-std=c11", "-O2", "-Isrc", "-c", "utils.c", "-o", "build/utils.o"],
-        },
+        {"directory": str(src), "file": name,
+         "arguments": toolchain.arguments(name, "-std=c11", "-O2", "-Isrc", output=f"build/{name[:-2]}.o")}
+        for name in ("main.c", "modem.c", "utils.c")
     ]
-    cc_json = proj / "compile_commands.json"
-    cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+    cc_json = write_compile_commands(proj / "compile_commands.json", cc)
 
     # Isolate index DB to tmp_path before init
     _isolate_index_db(proj, proj.parent)
@@ -2579,7 +2576,7 @@ class TestLlvmAnalysisConsistency:
                 assert len(new["summary"]) > 10, f"Summary too short: {new['summary']!r}"
                 print(f"  New summary: {new['summary'][:120]}...")
             else:
-                _fail_or_skip_analysis(result, "modem_send")
+                _fail_analysis(result, "modem_send")
 
         finally:
             conn.close()
@@ -2698,7 +2695,7 @@ int compute_average(const int* values, int count) {
                 assert len(ana["summary"]) > 10, f"Summary too short: {ana['summary']!r}"
                 print(f"  Analysis: {ana['summary'][:120]}...")
             else:
-                _fail_or_skip_analysis(result, "compute_average")
+                _fail_analysis(result, "compute_average")
 
         finally:
             conn.close()
@@ -2895,9 +2892,8 @@ class TestBackgroundReindex:
         finally:
             modem_c.write_text(original, encoding="utf-8")
 
-    def test_reindex_picks_up_new_file(self, indexed_project: Path):
+    def test_reindex_picks_up_new_file(self, indexed_project: Path, toolchain):
         """Add a new .c file + update cc.json → reindex → new symbols appear."""
-        import json
 
         db_path = _db_path_for_project(indexed_project)
 
@@ -2937,19 +2933,10 @@ int sensor_read(void) {
             {
                 "directory": str(indexed_project / "src"),
                 "file": "sensor.c",
-                "arguments": [
-                    "gcc",
-                    "-std=c11",
-                    "-O2",
-                    "-Isrc",
-                    "-c",
-                    "sensor.c",
-                    "-o",
-                    "build/sensor.o",
-                ],
+                "arguments": toolchain.arguments("sensor.c", "-std=c11", "-O2", "-Isrc", output="build/sensor.o"),
             }
         )
-        cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+        write_compile_commands(cc_json, cc)
 
         try:
             # ── Reindex via direct API (avoids subprocess config complications) ──
@@ -2980,13 +2967,13 @@ int sensor_read(void) {
             finally:
                 conn.close()
         finally:
-            # Restore original cc.json
+            # Restore original cc.json (it compiled before; no compile here,
+            # thus an error of the restore cannot hide the failure of the test)
             cc = cc[:-1]
-            cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+            write_entries(cc_json, cc)
 
     def test_reindex_removes_deleted_file_symbols(self, indexed_project: Path):
         """Remove a .c file from cc.json → reindex → symbols from that file gone from new config."""
-        import json
 
         from fw_context_mcp.indexer.runner import run
 
@@ -3009,7 +2996,7 @@ int sensor_read(void) {
         cc_original = list(cc)
         cc = [entry for entry in cc if entry["file"] != "utils.c"]
         assert len(cc) == len(cc_original) - 1, "utils.c not removed from cc"
-        cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+        write_compile_commands(cc_json, cc)
 
         try:
             # ── Reindex via direct API ──
@@ -3058,7 +3045,8 @@ int sensor_read(void) {
             finally:
                 conn.close()
         finally:
-            cc_json.write_text(json.dumps(cc_original, indent=2), encoding="utf-8")
+            # The original compiled before: no compile in the restore.
+            write_entries(cc_json, cc_original)
 
 
 class TestStartupStalenessCheck:
@@ -3314,13 +3302,12 @@ class TestTheDecisionIsByHash:
     @staticmethod
     def _edit_compile_commands(project: Path, change) -> None:
         """Apply *change* to each entry of compile_commands.json."""
-        import json
 
         cc = project / "compile_commands.json"
         entries = json.loads(cc.read_text(encoding="utf-8"))
         for entry in entries:
             change(entry)
-        cc.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+        write_compile_commands(cc, entries)
 
     def test_a_new_time_without_an_edit_parses_nothing(self, indexed_project: Path):
         for src in (indexed_project / "src").glob("*.c"):
@@ -4468,14 +4455,13 @@ class TestHeaderScopedRowCleanup:
 # ── Build retention ───────────────────────────────────────────────────
 
 
-def _add_tu_to_compile_commands(project_root: Path, name: str) -> None:
+def _add_tu_to_compile_commands(project_root: Path, name: str, toolchain: Toolchain) -> None:
     """Add one more translation unit to the project and its compile_commands.
 
     Note this does NOT change ``config_hash`` — that hash identifies the
     compilation dialect, not the file set.  Use :func:`_change_build_dialect`
     when a test needs a new build identity.
     """
-    import json
 
     src = project_root / "src"
     _write_file(src / name, f"int {Path(name).stem}_fn(void) {{ return 1; }}\n")
@@ -4484,12 +4470,9 @@ def _add_tu_to_compile_commands(project_root: Path, name: str) -> None:
     cc.append({
         "directory": str(src),
         "file": name,
-        "arguments": [
-            "gcc", "-std=c11", "-O2", "-Isrc", "-c", name,
-            "-o", f"build/{Path(name).stem}.o",
-        ],
+        "arguments": toolchain.arguments(name, "-std=c11", "-O2", "-Isrc", output=f"build/{Path(name).stem}.o"),
     })
-    cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+    write_compile_commands(cc_json, cc)
 
 
 def _change_build_dialect(project_root: Path, define: str) -> None:
@@ -4499,13 +4482,12 @@ def _change_build_dialect(project_root: Path, define: str) -> None:
     compiles to — that is what makes a different build.  Adding or removing a
     source file does not.
     """
-    import json
 
     cc_json = project_root / "compile_commands.json"
     cc = json.loads(cc_json.read_text(encoding="utf-8"))
     for entry in cc:
         entry["arguments"] = [*entry["arguments"], f"-D{define}"]
-    cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+    write_compile_commands(cc_json, cc)
 
 
 def _build_hashes(conn) -> list[str]:
@@ -4649,10 +4631,10 @@ class TestCoveragePurge:
     symbols, macros, refs and indexed content for the life of the index.
     """
 
-    def test_removed_tu_leaves_no_rows(self, c_project: Path):
+    def test_removed_tu_leaves_no_rows(self, c_project: Path, toolchain):
         """A TU dropped from compile_commands.json keeps nothing behind."""
         db_path = _db_path_for_project(c_project)
-        _add_tu_to_compile_commands(c_project, "doomed.c")
+        _add_tu_to_compile_commands(c_project, "doomed.c", toolchain)
         assert _index_cli(c_project).returncode == 0
 
         conn = open_db(db_path)
@@ -4666,12 +4648,11 @@ class TestCoveragePurge:
 
         # Drop it from the build; the file stays on disk, so purge_missing
         # cannot be what cleans it up.
-        import json
 
         cc_json = c_project / "compile_commands.json"
         cc = [e for e in json.loads(cc_json.read_text(encoding="utf-8"))
               if e["file"] != "doomed.c"]
-        cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+        write_compile_commands(cc_json, cc)
         assert (c_project / "src" / "doomed.c").exists(), "the file must stay on disk"
 
         result = _index_cli(c_project)
@@ -4700,12 +4681,11 @@ class TestCoveragePurge:
         db_path = _db_path_for_project(c_project)
         assert _index_cli(c_project).returncode == 0
 
-        import json
 
         cc_json = c_project / "compile_commands.json"
         cc = [e for e in json.loads(cc_json.read_text(encoding="utf-8"))
               if e["file"] != "modem.c"]
-        cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+        write_compile_commands(cc_json, cc)
 
         result = _index_cli(c_project)
         assert result.returncode == 0, result.stderr
@@ -4723,7 +4703,7 @@ class TestCoveragePurge:
         finally:
             conn.close()
 
-    def test_out_of_project_headers_are_not_collateral_damage(self, c_project: Path):
+    def test_out_of_project_headers_are_not_collateral_damage(self, c_project: Path, toolchain):
         """SDK and system headers must survive a purge that targets a TU.
 
         The purge deliberately covers vendor and SDK files too — a framework
@@ -4736,7 +4716,6 @@ class TestCoveragePurge:
         The out-of-project header is a file of the test, not ``<stdio.h>``:
         libclang finds no system header on macOS without ``-isysroot``.
         """
-        import json
 
         sdk = c_project.parent / "sdk"
         sdk.mkdir()
@@ -4752,7 +4731,7 @@ class TestCoveragePurge:
         cc = json.loads(cc_json.read_text(encoding="utf-8"))
         for entry in cc:
             entry["arguments"][1:1] = ["-isystem", str(sdk)]
-        cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+        write_compile_commands(cc_json, cc)
 
         db_path = _db_path_for_project(c_project)
         assert _index_cli(c_project).returncode == 0
@@ -4761,7 +4740,7 @@ class TestCoveragePurge:
         try:
             ch = _config_hash(conn)
             before = conn.execute(
-                "SELECT COUNT(*) FROM files WHERE config_hash=? AND path LIKE '/%'",
+                f"SELECT COUNT(*) FROM files WHERE config_hash=? AND {ABSOLUTE_KEY_SQL}",
                 (ch,),
             ).fetchone()[0]
             assert before > 0, (
@@ -4772,14 +4751,13 @@ class TestCoveragePurge:
             conn.close()
 
         # A reindex that also drops a TU, so the purge definitely runs.
-        _add_tu_to_compile_commands(c_project, "transient.c")
+        _add_tu_to_compile_commands(c_project, "transient.c", toolchain)
         assert _index_cli(c_project).returncode == 0
-        import json
 
         cc_json = c_project / "compile_commands.json"
         cc = [e for e in json.loads(cc_json.read_text(encoding="utf-8"))
               if e["file"] != "transient.c"]
-        cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+        write_compile_commands(cc_json, cc)
         result = _index_cli(c_project)
         assert result.returncode == 0, result.stderr
 
@@ -4787,7 +4765,7 @@ class TestCoveragePurge:
         try:
             ch = _config_hash(conn)
             after = conn.execute(
-                "SELECT COUNT(*) FROM files WHERE config_hash=? AND path LIKE '/%'",
+                f"SELECT COUNT(*) FROM files WHERE config_hash=? AND {ABSOLUTE_KEY_SQL}",
                 (ch,),
             ).fetchone()[0]
             assert after == before, (
@@ -4902,14 +4880,13 @@ class TestDialectRoundTrip:
 
         # → back to dialect A.  Its rows were retired by retention when B was
         # built, so this is the case the reuse tier used to serve.
-        import json
 
         cc_json = c_project / "compile_commands.json"
         cc = json.loads(cc_json.read_text(encoding="utf-8"))
         for entry in cc:
             entry["arguments"] = [a for a in entry["arguments"]
                                   if a != "-DFEATURE_ON"]
-        cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+        write_compile_commands(cc_json, cc)
 
         result = _index_cli(c_project)
         assert result.returncode == 0, result.stderr
@@ -4931,14 +4908,13 @@ class TestDialectRoundTrip:
         _change_build_dialect(c_project, "FEATURE_ON")
         assert _index_cli(c_project).returncode == 0
 
-        import json
 
         cc_json = c_project / "compile_commands.json"
         cc = json.loads(cc_json.read_text(encoding="utf-8"))
         for entry in cc:
             entry["arguments"] = [a for a in entry["arguments"]
                                   if a != "-DFEATURE_ON"]
-        cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+        write_compile_commands(cc_json, cc)
 
         result = _index_cli(c_project)
         assert result.returncode == 0, result.stderr
@@ -4968,7 +4944,6 @@ class TestDialectRoundTrip:
 
 def _manifest_header_paths(db_path: Path) -> set[str]:
     """Every header path the manifest records, across all TUs."""
-    import json
 
     manifests = sorted(db_path.parent.glob("manifest.*.json"))
     assert len(manifests) == 1, f"expected one manifest, found {manifests}"
@@ -5036,7 +5011,7 @@ class TestManifestRecordsEveryInclude:
             f"recorded: {sorted(p for p in recorded if 'src/' in p)}"
         )
 
-    def test_such_a_header_is_not_purged(self, c_project: Path):
+    def test_such_a_header_is_not_purged(self, c_project: Path, toolchain):
         """The consequence: coverage must keep what the manifest now lists."""
         db_path = _db_path_for_project(c_project)
         _write_file(
@@ -5047,14 +5022,13 @@ class TestManifestRecordsEveryInclude:
         assert _index_cli(c_project).returncode == 0
 
         # Reindex after dropping a TU, so the purge definitely runs.
-        _add_tu_to_compile_commands(c_project, "transient.c")
+        _add_tu_to_compile_commands(c_project, "transient.c", toolchain)
         assert _index_cli(c_project).returncode == 0
-        import json
 
         cc_json = c_project / "compile_commands.json"
         cc = [e for e in json.loads(cc_json.read_text(encoding="utf-8"))
               if e["file"] != "transient.c"]
-        cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+        write_compile_commands(cc_json, cc)
         result = _index_cli(c_project)
         assert result.returncode == 0, result.stderr
 

@@ -9,7 +9,6 @@ measured with libclang 22 (probe s9 of the call edge plan).
 
 from __future__ import annotations
 
-import shutil
 from pathlib import Path
 
 import pytest
@@ -22,6 +21,7 @@ from fw_context_mcp.indexer.db import (
     upsert_file,
     upsert_project,
 )
+from tests._toolchains import unit_of
 from tests._usr_keys import base_names
 
 _CPP = """\
@@ -49,21 +49,20 @@ void use(void) { helper(); }
 """
 
 
-def _extract(tmp_path: Path, name: str, code: str, language: str) -> dict[str, str]:
-    from fw_context_mcp.indexer.compile_commands import CompilationUnit
+def _extract(tmp_path: Path, name: str, code: str, language: str, toolchain) -> dict[str, str]:
     from fw_context_mcp.indexer.symbols import extract_all
 
     src = tmp_path / name
     src.write_text(code, encoding="utf-8")
     args = ["-std=c++17"] if language == "cpp" else []
-    unit = CompilationUnit(file=src, directory=tmp_path, language=language, clang_args=args)
+    unit = unit_of(src, toolchain, args, directory=tmp_path, language=language)
     return base_names({s.usr: s.link_name for s in extract_all(unit).symbols}, src)
 
 
 @pytest.mark.libclang
 class TestExtraction:
-    def test_cpp(self, tmp_path: Path):
-        names = _extract(tmp_path, "a.cpp", _CPP, "cpp")
+    def test_cpp(self, tmp_path: Path, toolchain):
+        names = _extract(tmp_path, "a.cpp", _CPP, "cpp", toolchain=toolchain)
 
         assert names["c:@F@main#"] == "main"
         assert names["c:@F@SystemInit"] == "SystemInit"
@@ -80,8 +79,8 @@ class TestExtraction:
         # A member of a class template is a template: no object holds it.
         assert names["c:@ST>1#T@Box~a.cpp:11:27@count"] == ""
 
-    def test_c(self, tmp_path: Path):
-        names = _extract(tmp_path, "b.c", _C, "c")
+    def test_c(self, tmp_path: Path, toolchain):
+        names = _extract(tmp_path, "b.c", _C, "c", toolchain=toolchain)
 
         assert names["c:@F@main"] == "main"
         assert names["c:@global_var"] == "global_var"
@@ -165,9 +164,8 @@ class TestResolution:
         ], "f") is None
 
 
-@pytest.mark.skipif(shutil.which("clang") is None, reason="the preprocessor of assembly is clang")
 class TestAssemblyLabels:
-    def test_only_an_exported_label_has_a_link_name(self, tmp_path: Path):
+    def test_only_an_exported_label_has_a_link_name(self, tmp_path: Path, toolchain):
         from fw_context_mcp.indexer.asm import store_units
 
         from .test_asm_indexing import TestStoreUnits, _unit
@@ -175,6 +173,7 @@ class TestAssemblyLabels:
         unit = _unit(
             tmp_path, "s.S",
             ".global Exported\nExported:\n  nop\nLocal:\n  nop\n.weak Weak\nWeak:\n  nop\n",
+            toolchain=toolchain,
         )
         conn = TestStoreUnits._db(tmp_path)
         try:
@@ -252,8 +251,7 @@ class TestWeakness:
     """`nm` of arm-none-eabi-gcc gives `W` for each of the weak ones: a
     declaration of the object file with `weak` makes the symbol weak."""
 
-    def test_each_form_of_weak(self, tmp_path: Path):
-        from fw_context_mcp.indexer.compile_commands import CompilationUnit
+    def test_each_form_of_weak(self, tmp_path: Path, toolchain):
         from fw_context_mcp.indexer.symbols import extract_all
 
         (tmp_path / "weak.h").write_text(
@@ -261,7 +259,7 @@ class TestWeakness:
         )
         src = tmp_path / "weak.c"
         src.write_text(_WEAK, encoding="utf-8")
-        unit = CompilationUnit(file=src, directory=tmp_path, language="c", clang_args=[])
+        unit = unit_of(src, toolchain, [], directory=tmp_path, language="c")
         weak = {s.name for s in extract_all(unit).symbols if s.is_weak and s.is_definition}
 
         assert weak == {"plain_weak", "cmsis_weak", "declared_in_header", "middle", "weak_var"}
@@ -329,15 +327,14 @@ class TestOneUsrWeakAndStrong:
 
 
 @pytest.mark.libclang
-def test_a_weak_method_of_a_union(tmp_path: Path):
-    from fw_context_mcp.indexer.compile_commands import CompilationUnit
+def test_a_weak_method_of_a_union(tmp_path: Path, toolchain):
     from fw_context_mcp.indexer.symbols import extract_all
 
     src = tmp_path / "u.cpp"
     src.write_text(
         "union U { __attribute__((weak)) void m(); int i; };\nvoid U::m() {}\n", encoding="utf-8",
     )
-    unit = CompilationUnit(file=src, directory=tmp_path, language="cpp", clang_args=["-std=c++17"])
+    unit = unit_of(src, toolchain, ["-std=c++17"], directory=tmp_path, language="cpp")
     weak = {s.name for s in extract_all(unit).symbols if s.is_weak and s.is_definition}
 
     assert weak == {"m"}

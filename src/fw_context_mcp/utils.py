@@ -43,8 +43,8 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import UTC, datetime
-from pathlib import Path, PurePath
-from typing import TYPE_CHECKING, AnyStr
+from pathlib import Path, PurePath, PureWindowsPath
+from typing import TYPE_CHECKING, AnyStr, TextIO
 
 if TYPE_CHECKING:
     from fw_context_mcp.indexer.build import BuildConfig
@@ -56,20 +56,26 @@ from fw_context_mcp.processes import MAX_PID, pid_exists
 log = logging.getLogger(__name__)
 
 __all__ = [
+    "BUILD_GROUP_GRACE_S",
     "CC_STAGING_GLOB",
     "CLANG_POSIX_RESPONSE_FILE",
     "CPP_EXTENSIONS",
     "CPP_HEADER_EXTENSIONS",
     "CPP_SOURCE_EXTENSIONS",
     "C_SOURCE_EXTENSIONS",
+    "FW_CONTEXT_HOME_ENV",
     "FW_CONTEXT_REL",
     "HEADER_EXTENSIONS",
     "MTIME_TOLERANCE_S",
+    "O_NOFOLLOW",
     "SAFE_EXCEPT",
     "TU_EXTENSIONS",
+    "AmbiguousProjectError",
     "BuildTimeoutError",
+    "StopRequested",
     "abs_path",
     "activate_script",
+    "build_cfg_env",
     "build_dir_patterns_with_fw_context",
     "build_env",
     "build_tool_available",
@@ -82,9 +88,12 @@ __all__ = [
     "compute_source_hash",
     "decode_source_lines",
     "env_value",
+    "escape_like",
     "executable_name",
+    "find_build_tool",
     "fmt_count",
     "format_number_ranges",
+    "fw_context_home",
     "is_compile_commands_stale",
     "is_db_exception",
     "is_fatal",
@@ -100,18 +109,23 @@ __all__ = [
     "read_file_lines",
     "record_build_groups",
     "remove_file",
+    "remove_stale_tmp",
     "replace_file",
+    "require_build_tool",
     "resolve_project_root",
     "response_file",
     "response_file_text",
+    "run_build_command",
     "run_in_process_group",
     "sqlite_file_uri",
     "staging_owner",
     "stop_process_group",
     "temporary_owner",
     "truncate_path_middle",
+    "use_utf8_stdio",
     "venv_program",
     "windows_words",
+    "write_text_atomic",
 ]
 
 # Seconds of tolerance when comparing file mtimes to account for
@@ -576,7 +590,7 @@ def process_group_is_gone(pgid: int, leader: subprocess.Popen | None = None) -> 
     if sys.platform == "win32":
         raise OSError("a process group is POSIX; on Windows the job object of the build holds the build")
     if leader is not None:
-        leader.poll()
+        _reap_leader(leader, block=False)
     try:
         os.killpg(pgid, 0)
     except ProcessLookupError:
@@ -584,6 +598,44 @@ def process_group_is_gone(pgid: int, leader: subprocess.Popen | None = None) -> 
     except PermissionError:
         return False
     return False
+
+
+def _reap_leader(leader: subprocess.Popen, *, block: bool) -> None:
+    """Reap *leader* when it ended (with *block*: wait for its end), and set its ``returncode``.
+
+    WHY ``os.waitpid`` and not ``Popen.poll`` or ``Popen.wait``: the two
+    take ``Popen._waitpid_lock``.  An exception of a signal handler
+    (``IndexStopped``, ``KeyboardInterrupt``) that comes in ``Popen.wait``
+    between its ``acquire(False)`` and its ``try`` leaves that lock locked
+    (CPython 3.11 to 3.14, ``subprocess.py``, ``_wait``).  ``poll()`` then
+    reaped nothing, the zombie leader kept the group alive, and the
+    ``wait()`` after the stop blocked for ever: the stop of a build hung
+    (seen on macOS, 2026-11-12).  Only the thread that runs the build waits
+    for it, thus the lock protects nothing here.
+
+    POSIX only.  A leader that a different code reaped
+    (``ChildProcessError``) keeps its ``returncode``.
+
+    The limit: the exception can also come in ``Popen.wait`` after its
+    ``waitpid`` reaped the leader and before it set ``returncode``.  The PID
+    is free then, and when a different thread of this process starts a
+    child that gets the same PID in that time, the ``waitpid`` here waits
+    for that child and takes its exit status.  The ``Popen`` of that child
+    then gets ECHILD, and CPython gives it the ``returncode`` 0: a failed
+    command reads as a success.  This needs a reuse of the PID within the
+    stop of one build; ``Popen`` keeps no record of the reap that this
+    function could read.
+    """
+    if sys.platform == "win32":
+        raise OSError("a process group is POSIX; on Windows the job object of the build holds the build")
+    if leader.returncode is not None:
+        return
+    try:
+        pid, status = os.waitpid(leader.pid, 0 if block else os.WNOHANG)
+    except ChildProcessError:
+        return
+    if pid == leader.pid:
+        leader.returncode = os.waitstatus_to_exitcode(status)
 
 
 #: The extensions of ``cmd.exe`` when the environment has no ``PATHEXT``.
@@ -624,30 +676,55 @@ def is_program(path: Path) -> bool:
     """Say if *path* is a file that the system can run as a program.
 
     POSIX: a file with the execute bit for this user, as ``shutil.which``
-    and ``execvp`` require.  Windows: a file; the extension (``PATHEXT``)
-    makes it a program, and ``program_file_names`` gives the names.
+    and ``execvp`` require.  Windows: a file.  The extension makes it a
+    program there, and ``program_file_names`` gives only names with an
+    extension that Windows can start.
     """
     if not path.is_file():
         return False
     return sys.platform == "win32" or os.access(path, os.X_OK)
 
 
-def program_file_names(name: str, env: Mapping[str, str] | None = None) -> list[str]:
-    """The file names that the program *name* can have on this system, in the order of the lookup.
+#: The extensions of a program that Windows can start: ``CreateProcess``
+#: starts an ``.exe`` or a ``.com``, and a ``.bat`` or a ``.cmd`` through
+#: ``cmd.exe`` (``_windows_command`` quotes its arguments for that).
+_STARTABLE_EXTENSIONS = (".exe", ".com", ".bat", ".cmd")
 
-    POSIX: the name itself.  Windows: no program has a name without an
-    extension there.  A name with an extension of ``PATHEXT`` stays as it
-    is; else each extension of ``PATHEXT`` of *env* (of this process when
-    None) is added, as ``cmd.exe`` finds a program.  Without ``PATHEXT``,
-    the extensions of ``cmd.exe`` apply (``_CMD_DEFAULT_PATHEXT``).
+
+def program_file_names(name: str, env: Mapping[str, str] | None = None) -> list[str]:
+    """The file names of the program *name* that the system can start, in the order of the lookup.
+
+    POSIX: the name itself.  Windows: a name with an extension of
+    :data:`_STARTABLE_EXTENSIONS` stays as it is; else each such extension
+    of ``PATHEXT`` of *env* (of this process when None) is added, in the
+    order of ``PATHEXT`` and one time each, as ``cmd.exe`` finds a
+    program.  Without ``PATHEXT``, or with no such extension in it, the
+    extensions of ``cmd.exe`` apply (``_CMD_DEFAULT_PATHEXT``): a
+    ``PATHEXT`` of ``.PY`` only gave no name, and no program was found.
+
+    WHY no other extension of ``PATHEXT``: ``PATHEXT`` holds ``.PY`` after
+    an install of Python, and ``.JS`` or ``.VBS``.  Such a file needs the
+    association of the shell, and ``CreateProcess`` refused it with
+    WinError 193 ("not a valid Win32 application"), which did not tell that
+    no program was found.  WHY a name with such an extension (``idf.py``)
+    gets the extensions too: the export of ESP-IDF puts the directory of
+    ``idf.py.exe`` (``idf-exe``) on the ``PATH`` beside the directory of
+    ``idf.py``.  ``cmd.exe`` runs ``idf.py`` through the association, and a
+    build runs ``idf.py.exe``.
     """
     if sys.platform != "win32":
         return [name]
-    pathext = env_value(os.environ if env is None else env, "PATHEXT") or _CMD_DEFAULT_PATHEXT
-    extensions = [ext.lower() for ext in pathext.split(os.pathsep) if ext]
-    if Path(name).suffix.lower() in extensions:
+    if Path(name).suffix.lower() in _STARTABLE_EXTENSIONS:
         return [name]
+    pathext = env_value(os.environ if env is None else env, "PATHEXT") or ""
+    extensions = _startable_extensions(pathext) or _startable_extensions(_CMD_DEFAULT_PATHEXT)
     return [name + ext for ext in extensions]
+
+
+def _startable_extensions(pathext: str) -> list[str]:
+    """The extensions of the ``PATHEXT`` text *pathext* that Windows can start, in its order, one time each."""
+    parts = (ext.lower() for ext in pathext.split(";"))
+    return list(dict.fromkeys(ext for ext in parts if ext in _STARTABLE_EXTENSIONS))
 
 
 #: The option that makes clang read a response file with the quoting of GCC
@@ -794,7 +871,9 @@ def run_in_process_group(
         raise _decoded_timeout(subprocess.TimeoutExpired(cmd, timeout or 0, output=stdout, stderr=stderr)) from None
     except BaseException:
         stop_process_group(proc.pid, leader=proc)
-        proc.wait()
+        # Not proc.wait(): the exception can have come inside Popen.wait
+        # and left its lock locked (_reap_leader).
+        _reap_leader(proc, block=True)
         raise
     finally:
         if record is not None and process_group_is_gone(proc.pid, proc):
@@ -880,10 +959,22 @@ if sys.platform == "win32":
         """
         names = program_file_names(name, env)
         for directory in path_directories(env):
-            for candidate in names:
-                path = directory / candidate
-                if is_program(path):
-                    return str(path)
+            found = _program_in(directory, names)
+            if found is not None:
+                return str(found)
+        return None
+
+    def _program_in(directory: Path, names: list[str]) -> Path | None:
+        """The first file of *names* (``program_file_names``) in *directory* that is a program; None when none is.
+
+        The one lookup of a program, for a bare name (``_find_program``, which
+        makes *names* one time for each ``PATH`` directory) and for a path
+        with a directory (``_program_with_extension``).
+        """
+        for candidate in names:
+            path = directory / candidate
+            if is_program(path):
+                return path
         return None
 
     class ActivateScriptError(RuntimeError):
@@ -909,16 +1000,35 @@ if sys.platform == "win32":
         ``subprocess.list2cmdline`` makes start a second command.  Each
         argument goes in double quotes, where those characters are literal;
         a ``"`` is ``""``; a ``%`` is ``%%cd:~,%``, which ``cmd.exe`` gives
-        back as ``%`` and does not expand; backslashes before the closing
-        quote are doubled.  A line break cannot go through ``cmd.exe``.
+        back as ``%`` and does not expand; the backslashes before a ``"``
+        and before the closing quote are doubled.  A line break cannot go
+        through ``cmd.exe``.
+
+        WHY the backslashes before a ``"`` too: the batch file gives its
+        arguments on to a program (``tool.exe %*``), and the C runtime of
+        that program reads ``\\"`` as a quote.  The argument ``a\\"b`` came
+        to the program as ``a"b``.  ``append_bat_arg`` of Rust doubles them
+        the same way.
         """
         if any(char in argument for char in "\r\n\0"):
             raise ValueError(f"an argument of a batch file cannot hold a line break: {argument!r}")
-        quoted = argument.replace('"', '""').replace("%", "%%cd:~,%")
-        trailing = len(quoted) - len(quoted.rstrip("\\"))
-        return f'"{quoted}{chr(92) * trailing}"'
+        parts: list[str] = []
+        backslashes = 0
+        for char in argument:
+            if char == "\\":
+                backslashes += 1
+                parts.append(char)
+                continue
+            if char == '"':
+                parts.append("\\" * backslashes + '""')
+            elif char == "%":
+                parts.append("%%cd:~,%")
+            else:
+                parts.append(char)
+            backslashes = 0
+        return '"' + "".join(parts) + "\\" * backslashes + '"'
 
-    def _windows_command(cmd: list[str], env: dict[str, str]) -> list[str] | str:
+    def _windows_command(cmd: list[str], env: dict[str, str], cwd: Path) -> list[str] | str:
         """The program of *cmd* as a full path, and the command line of ``cmd.exe`` for a batch file.
 
         - A bare name: ``_find_program`` in the environment of the build.
@@ -926,6 +1036,23 @@ if sys.platform == "win32":
           of the build, and it adds only ``.exe``: a tool of ``extra_path``
           or of an activate script did not start.  A name that the ``PATH``
           does not hold raises ``FileNotFoundError``, as ``Popen`` on POSIX.
+        - A path with a directory and no drive: a relative one
+          (``tools\\gen.exe``) is joined to *cwd*, the directory of the
+          build, and one with a root (``\\tools\\gen.exe``) gets the drive
+          of *cwd*.  WHY: ``CreateProcess`` reads the two from the current
+          directory and the drive of this process, not of the build.  The
+          MCP server runs outside of the project, and the program was not
+          found; ``Popen`` on POSIX reads it from *cwd*.  WHY not
+          ``os.path.isabs``: since Python 3.13 it says False for a path
+          with a root and no drive, before that True, thus the drive came
+          from the version of Python.
+        - A path with a directory and with no extension that Windows can
+          start (``tools\\gen``, ``tools\\idf.py``): the extensions of
+          ``PATHEXT`` of the build that Windows can start, as for a bare
+          name (``program_file_names``).  WHY: ``CreateProcess`` adds only
+          ``.exe``, thus ``tools\\gen.cmd`` did not start, and a shell finds
+          it.  When no such file is there, the path stays as it is, and
+          ``Popen`` reports the error.
         - A ``.bat`` or ``.cmd`` program (a shim of pyenv-win, a script of a
           SDK): ``cmd.exe`` runs it, with the arguments of
           ``_batch_argument``.  ``Popen`` with a list quotes them with
@@ -936,13 +1063,42 @@ if sys.platform == "win32":
         if not os.path.dirname(program):
             found = _find_program(program, env)
             if found is None:
-                raise FileNotFoundError(errno.ENOENT, f"{program} is not on the PATH of the build", program)
+                raise FileNotFoundError(
+                    errno.ENOENT,
+                    f"{program} is not on the PATH of the build as a program that Windows can start "
+                    f"(a file of {', '.join(_STARTABLE_EXTENSIONS)})",
+                    program,
+                )
             program = found
+        else:
+            program = _program_with_extension(_with_drive_of(program, cwd), env)
         if Path(program).suffix.lower() not in (".bat", ".cmd"):
             return [program, *cmd[1:]]
         batch = _cmd_safe_path(program, "build program")
         arguments = " ".join(_batch_argument(argument) for argument in cmd[1:])
         return f'"{_system_program("cmd.exe")}" /d /e:on /v:off /s /c ""{batch}" {arguments}"'
+
+    def _with_drive_of(program: str, cwd: Path) -> str:
+        """*program* (a path with a directory) joined to *cwd* when it has no drive (see ``_windows_command``).
+
+        ``PureWindowsPath.joinpath`` keeps the drive of *cwd* for a path
+        with a root (``\\tools\\gen.exe`` gives ``D:\\tools\\gen.exe``) and
+        joins a relative path to *cwd*.  A path with a drive stays as it is.
+        """
+        path = PureWindowsPath(program)
+        if path.drive:
+            return program
+        return str(PureWindowsPath(cwd).joinpath(path))
+
+    def _program_with_extension(program: str, env: dict[str, str]) -> str:
+        """*program* with the first extension of ``PATHEXT`` of *env* that names a program that a build can start.
+
+        *program* itself when no file matches (``_program_in``): ``Popen``
+        then reports the missing program.
+        """
+        path = Path(program)
+        found = _program_in(path.parent, program_file_names(path.name, env))
+        return program if found is None else str(found)
 
     def _system_program(*parts: str) -> str:
         """The full path of a program of Windows in ``%SystemRoot%\\System32``.
@@ -1049,7 +1205,9 @@ if sys.platform == "win32":
         # environment of the build.
         activation_env = {**env, _ACTIVATION_ID: secrets.token_hex(8)}
         with BuildJob() as job:
-            proc = job.start_command_line(command_line, cwd=cwd, env=activation_env)
+            proc = job.start(
+                command_line, cwd=cwd, env=activation_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
             try:
                 stdout, stderr = _communicate_in_slices(proc, timeout)
             except subprocess.TimeoutExpired:
@@ -1100,7 +1258,7 @@ if sys.platform == "win32":
 
         pipe = subprocess.PIPE if capture_output else None
         with BuildJob() as job:
-            proc = job.start(_windows_command(cmd, env), cwd=cwd, env=env, stdout=pipe, stderr=pipe)
+            proc = job.start(_windows_command(cmd, env, cwd), cwd=cwd, env=env, stdout=pipe, stderr=pipe)
             try:
                 stdout, stderr = _communicate_in_slices(proc, timeout)
             except subprocess.TimeoutExpired:
@@ -1193,7 +1351,7 @@ def _windows_program_word(text: str) -> tuple[str, str]:
     return text[:end], text[end:]
 
 
-def command_words(text: str) -> list[str]:
+def command_words(text: str, *, windows: bool | None = None) -> list[str]:
     """Split a command line into its arguments, by the rules of the host.
 
     The command lines of the config (``[build] pre_build``, ``command``),
@@ -1208,10 +1366,13 @@ def command_words(text: str) -> list[str]:
     Windows: it removes each backslash, thus ``C:\\tools\\pre.bat``
     became ``C:toolspre.bat``.
 
+    *windows* selects the rules: those of the host when None.  The reader
+    of the log of make gives the host on which make ran.
+
     Raises ``ValueError`` for a POSIX command line with a quote that does
     not end, as ``shlex.split`` does.
     """
-    if sys.platform != "win32":
+    if not (sys.platform == "win32" if windows is None else windows):
         return shlex.split(text)
     program, rest = _windows_program_word(text)
     if not program and not rest.strip():
@@ -1222,9 +1383,13 @@ def command_words(text: str) -> list[str]:
 def command_program(text: str) -> str:
     """Return the first word (the program) of the command line *text* by the rules of the host, or "".
 
-    The first word of :func:`command_words`, without the split of the
-    rest: a ``command`` field of a large build holds hundreds of flags.
-    Raises ``ValueError`` as :func:`command_words` does.
+    The first word of :func:`command_words`.  Windows reads only the first
+    word: the rules of ``CommandLineToArgvW`` read the program in a way of
+    its own, and no later character changes it.  POSIX splits the whole
+    text with ``shlex``: a quote that a later flag does not close makes the
+    whole line invalid, and the function raises ``ValueError`` for it, as
+    :func:`command_words` does.  A program from a line that the shell
+    cannot read would be a guess.
     """
     if sys.platform == "win32":
         return _windows_program_word(text)[0]
@@ -1281,6 +1446,8 @@ def run_build_command(
     env: dict[str, str] | None = None,
     build_cfg: BuildConfig | None = None,
     errors: str = "replace",
+    quote_stdout: bool = True,
+    failure_hint: str = "",
 ) -> subprocess.CompletedProcess:
     """Run a build command with consistent timeout and output capture.
 
@@ -1320,8 +1487,20 @@ def run_build_command(
         errors: The decode of the UTF-8 stdout (see
             :func:`run_in_process_group`).  ``"replace"`` for output that a
             person reads, ``"strict"`` for output that the caller parses:
-            a parse must not read a name with U+FFFD in it.  stderr is
-            always decoded with replacement.
+            a parse must not read a name with U+FFFD in it.
+            ``"surrogateescape"`` for parsed output that can hold a byte
+            that is not UTF-8 in a part that the caller does not use (the
+            data base of ``make -p``): such a byte comes as a lone
+            surrogate (U+DC80 to U+DCFF), and the caller must refuse it in
+            each value that it uses.  stderr is always decoded with
+            replacement.
+        quote_stdout: False keeps stdout out of the error message of a
+            failure or a timeout.  WHY: the data base of ``make -p``
+            holds each environment variable of the build, a token too, and
+            an error message goes into the log and to the LLM client.
+        failure_hint: A sentence that the error message of a non-zero exit
+            gives after the command: what the failure means for the
+            caller, and what the user can do.
 
     Returns:
         CompletedProcess with captured stdout/stderr.
@@ -1369,7 +1548,7 @@ def run_build_command(
         raise BuildTimeoutError(
             f"Build command timed out after {timeout}s: "
             f"{description or ' '.join(cmd)}"
-            f"{_quote_stream('stdout', _as_text(e.stdout))}"
+            f"{_quote_stream('stdout', _as_text(e.stdout)) if quote_stdout else ''}"
             f"{_quote_stream('stderr', _as_text(e.stderr))}"
         ) from None
     if result.returncode != 0:
@@ -1381,7 +1560,8 @@ def run_build_command(
         raise RuntimeError(
             f"Build command failed (exit {result.returncode}): "
             f"{description or ' '.join(cmd)}"
-            f"{_quote_stream('stdout', result.stdout)}"
+            f"{f'. {failure_hint}' if failure_hint else ''}"
+            f"{_quote_stream('stdout', result.stdout) if quote_stdout else ''}"
             f"{_quote_stream('stderr', result.stderr)}"
         )
     return result
@@ -1392,19 +1572,59 @@ def run_build_command(
 _TOOL_LOOKUP_TIMEOUT_S = 60
 
 
-def build_tool_available(name: str, cwd: Path, build_cfg: BuildConfig | None) -> bool:
-    """Say if the build of *build_cfg* finds the program *name*.
+#: The line that the lookup of a tool writes before its answer.  WHY: the
+#: activate script writes to the same stdout, also a line without its end.
+_TOOL_LOOKUP_MARK = "fw-context: the path of the tool comes next"
+
+#: The lookup after ``source <activate>``: the mark, then the path of the
+#: first name that ``command -v`` finds, in one run of the script.
+_TOOL_LOOKUP_SCRIPT = (
+    'printf "\\n%s\\n" "$1"; shift; '
+    'for name in "$@"; do command -v "$name" && exit 0; done; exit 1'
+)
+
+
+def _path_of_the_build(path: str, cwd: Path) -> str:
+    """Return the PATH *path* with each relative directory made relative to *cwd*.
+
+    WHY: the build runs in *cwd*, and the system resolves a relative
+    directory of PATH against the working directory of the process
+    (``[build] extra_path = ["tools/bin"]``).  The lookup runs in the
+    process of fw-context, whose working directory is not *cwd*.
+    """
+    return os.pathsep.join(
+        entry if not entry or Path(entry).is_absolute() else str(cwd / entry)
+        for entry in path.split(os.pathsep)
+    )
+
+
+def find_build_tool(names: str | Sequence[str], cwd: Path, build_cfg: BuildConfig | None) -> str | None:
+    """Return the path of the first program of *names* that the build of *build_cfg* runs, or None when it finds none.
+
+    *names* is one name or names in the order of preference
+    (``("pio", "platformio")``).  A name with a directory
+    (``./tools/gcc``) is a path relative to *cwd*, the directory of the
+    build, and needs no PATH.
 
     With ``activate``, the answer comes from the environment of the
     project: ``command -v`` runs after ``source <activate>``, as each build
     command does (:func:`run_build_command`).  The PATH of the fw-context
     process does not count.  The activate script of NCS puts ``west`` and
     ``ninja`` on PATH, and a ``west`` from outside that environment can
-    name a different workspace.  Without ``activate``, the build gets the
-    PATH of :func:`build_cfg_env`, with ``extra_path``, and this looks
-    there.
+    name a different workspace.  One run of the script looks for each name.
+    The answer is the line after ``_TOOL_LOOKUP_MARK``, and only an
+    absolute path counts: a function or an alias of the shell has a name
+    and no file.  Without ``activate``, the build gets the PATH of
+    :func:`build_cfg_env`, with ``extra_path``, and this looks there.
 
-    A failed activate script also gives False, and the caller names the
+    WHY each builder asks here and not ``shutil.which``: ``shutil.which``
+    reads the PATH of the fw-context process.  A build in the background
+    (the daemon of an MCP client) has no PATH of a shell, and the config
+    gives the tools (``[build] extra_path``): the builder of CMake stopped
+    with "cmake is required" although ``extra_path`` held cmake
+    (measured on macOS, 2026-11-13).
+
+    A failed activate script also gives None, and the caller names the
     script in its message.
 
     On Windows the lookup is ``_find_program`` in the environment that the
@@ -1412,6 +1632,16 @@ def build_tool_available(name: str, cwd: Path, build_cfg: BuildConfig | None) ->
     Windows (its kind, its path) raises ``ActivateScriptError``: the
     message "not on PATH" would hide a fault of the config.
     """
+    candidates = (names,) if isinstance(names, str) else tuple(names)
+    for name in candidates:
+        if os.path.dirname(name):
+            # A path: the build runs it from its own directory.
+            found = shutil.which(name if Path(name).is_absolute() else str(cwd / name))
+            if found is not None:
+                return found
+    bare = [name for name in candidates if not os.path.dirname(name)]
+    if not bare:
+        return None
     if sys.platform == "win32":
         environment = build_cfg_env(build_cfg)
         if build_cfg is not None and build_cfg.activate:
@@ -1423,26 +1653,62 @@ def build_tool_available(name: str, cwd: Path, build_cfg: BuildConfig | None) ->
             except ActivateScriptError:
                 raise
             except RuntimeError as exc:
-                log.warning("%s not found after the activate script %s: %s", name, script, exc)
-                return False
-        return _find_program(name, environment) is not None
+                log.warning("%s not found after the activate script %s: %s", " or ".join(bare), script, exc)
+                return None
+        environment = {**environment, "PATH": _path_of_the_build(environment.get("PATH", ""), cwd)}
+        return next((found for name in bare if (found := _find_program(name, environment)) is not None), None)
     if build_cfg is not None and build_cfg.activate:
         try:
-            run_build_command(
-                ["command", "-v", name],
+            result = run_build_command(
+                ["sh", "-c", _TOOL_LOOKUP_SCRIPT, "sh", _TOOL_LOOKUP_MARK, *bare],
                 cwd=cwd,
                 timeout=_TOOL_LOOKUP_TIMEOUT_S,
-                description=f"look for {name}",
+                description=f"look for {' or '.join(bare)}",
                 build_cfg=build_cfg,
+                errors="strict",
             )
         except RuntimeError as exc:
             # The error of the caller names only the script.  The log keeps
             # why: a timeout, a failed script, or no such tool, with the
             # end of the output of the script.
-            log.warning("%s not found after source %s: %s", name, build_cfg.activate, exc)
-            return False
-        return True
-    return shutil.which(name, path=build_cfg_env(build_cfg).get("PATH")) is not None
+            log.warning("%s not found after source %s: %s", " or ".join(bare), build_cfg.activate, exc)
+            return None
+        lines = (result.stdout or "").splitlines()
+        if _TOOL_LOOKUP_MARK not in lines:
+            return None
+        answer = lines[len(lines) - lines[::-1].index(_TOOL_LOOKUP_MARK):]
+        found_path = answer[0].strip() if answer else ""
+        return found_path if os.path.isabs(found_path) else None
+    path = _path_of_the_build(build_cfg_env(build_cfg).get("PATH", ""), cwd)
+    return next((found for name in bare if (found := shutil.which(name, path=path)) is not None), None)
+
+
+def build_tool_available(name: str, cwd: Path, build_cfg: BuildConfig | None) -> bool:
+    """Say if the build of *build_cfg* finds the program *name* (:func:`find_build_tool`)."""
+    return find_build_tool(name, cwd, build_cfg) is not None
+
+
+def require_build_tool(
+    names: str | Sequence[str], cwd: Path, build_cfg: BuildConfig | None, install_hint: str,
+) -> str:
+    """Return the path of the program that the build of *build_cfg* runs (:func:`find_build_tool`), or raise.
+
+    WHY one function for each builder: the builders had their own lookup
+    and their own message, and five of seven did not name the activate
+    script of a build that did not find its tool.  The caller runs the
+    path that this returns, thus the lookup and the build run the same
+    program.
+
+    Raises:
+        RuntimeError: no program of *names* is there; the message
+            (:func:`missing_tool_message`) names the activate script, or
+            gives *install_hint*.
+    """
+    found = find_build_tool(names, cwd, build_cfg)
+    if found is None:
+        name = names if isinstance(names, str) else " or ".join(names)
+        raise RuntimeError(missing_tool_message(name, build_cfg, install_hint))
+    return found
 
 
 def missing_tool_message(name: str, build_cfg: BuildConfig | None, install_hint: str) -> str:
@@ -1608,8 +1874,8 @@ def cc_output_path(project_root: Path, cfg: BuildConfig) -> Path:
     """Return the file that a backend writes its compilation database to.
 
     Ensures the parent directory exists.  A backend calls this when the tool
-    that it runs takes the output path as an argument (bear, compiledb,
-    keil2clangd), or when it copies a database that the build system cannot
+    that it runs takes the output path as an argument (bear, keil2clangd),
+    when it writes the database itself (the log of make), or when it copies a database that the build system cannot
     put into the output directory.
 
     Under ``generate_compile_commands`` *cfg* has ``cc_output``, the staging
@@ -1780,34 +2046,35 @@ def write_text_atomic(path: Path, text: str, *, mode: int | None = None) -> None
     it waits for a short read of the target by another process (the MCP
     server reading the manifest, see :func:`replace_file`).
 
-    The temporary name holds :func:`owner_token`, thus two writers never
-    share one, and :func:`remove_stale_tmp` removes the file of a writer
-    that a kill stopped between the write and the rename.
+    Each call has a temporary name of its own: a random part, then
+    :func:`owner_token`.  WHY a random part: two threads of one process
+    (two MCP tools) that wrote one file at the same time shared the name of
+    the process, and the rename of the second one failed with
+    FileNotFoundError.  The owner token lets :func:`remove_stale_tmp`
+    remove the file of a writer that a kill stopped between the write and
+    the rename.
 
     The text goes to the file as it is (``newline=""``): a config file of
     the user keeps its line ends, and on Windows a text-mode write made
     each "\\r\\n" of a CRLF file "\\r\\r\\n".
 
     *mode* gives the new file these permission bits.  Without it, the file
-    gets the default of the process (0644 with the usual umask), and a
-    rewrite of a config of mode 0600 that holds a token made the token
-    readable for all users.  With *mode*, the temporary file starts as
-    0600, thus the text is never readable for more users than *mode* lets.
+    gets the default of the process (0666 less the umask, 0644 with the
+    usual umask), and a rewrite of a config of mode 0600 that holds a token
+    made the token readable for all users.  With *mode*, the temporary file
+    starts as 0600, thus the text is never readable for more users than
+    *mode* lets.
     """
-    tmp = path.with_name(f".{path.name}.{owner_token()}.tmp")
+    tmp = path.with_name(f".{path.name}.{secrets.token_hex(4)}.{owner_token()}.tmp")
+    # O_EXCL: the file is new, not a file or a link that someone put at
+    # this name.  O_BINARY: on Windows a text-mode descriptor changes each
+    # "\n".  A failed open made no file, thus nothing to remove then.
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    descriptor = os.open(tmp, flags, 0o666 if mode is None else 0o600)
     try:
-        if mode is None:
-            tmp.write_text(text, encoding="utf-8", newline="")
-        else:
-            # A file with this name is from this process, or from a dead
-            # process whose PID came back: garbage in the two cases.
-            # O_EXCL then makes sure that the file is new and of mode 0600,
-            # not a file or a link that someone put there after the unlink.
-            # O_BINARY: on Windows a text-mode descriptor changes each "\n".
-            tmp.unlink(missing_ok=True)
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
-            with os.fdopen(os.open(tmp, flags, 0o600), "w", encoding="utf-8", newline="") as handle:
-                handle.write(text)
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        if mode is not None:
             os.chmod(tmp, mode)
         replace_file(tmp, path)
     finally:
@@ -2131,7 +2398,7 @@ def use_utf8_stdio(*, stdout: bool = True) -> None:
     _reconfigure_utf8([sys.stderr, sys.stdout] if stdout else [sys.stderr])
 
 
-def _reconfigure_utf8(streams: list) -> None:
+def _reconfigure_utf8(streams: Sequence[TextIO]) -> None:
     """Set UTF-8 on each text stream of *streams*, and keep its error handler.
 
     WHY keep ``errors``: ``reconfigure(encoding=...)`` alone resets it to

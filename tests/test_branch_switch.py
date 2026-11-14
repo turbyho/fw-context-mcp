@@ -282,7 +282,7 @@ class TestTheDescriptionDescribesTheContent:
 
 
 @pytest.fixture
-def indexed_repo(repo: Path, tmp_path_factory):
+def indexed_repo(repo: Path, tmp_path_factory, toolchain):
     """A git project with an index of one file, ready for a branch switch.
 
     Writes the config directly and calls `runner.run` rather than driving the
@@ -290,18 +290,14 @@ def indexed_repo(repo: Path, tmp_path_factory):
     `make test`, and the wiring it covers is exactly what a fast suite has to
     catch.
     """
-    import json
-
     from fw_context_mcp.indexer.runner import run
+    from tests._toolchains import write_compile_commands
 
-    (repo / "compile_commands.json").write_text(
-        json.dumps([{
-            "directory": str(repo),
-            "file": "main.c",
-            "arguments": ["cc", "-c", "main.c", "-o", "main.o"],
-        }]),
-        encoding="utf-8",
-    )
+    write_compile_commands(repo / "compile_commands.json", [{
+        "directory": str(repo),
+        "file": "main.c",
+        "arguments": toolchain.arguments("main.c", output="main.o"),
+    }])
     index_dir = tmp_path_factory.mktemp("index_dir")
     config_dir = repo / ".fw-context"
     config_dir.mkdir(parents=True, exist_ok=True)
@@ -836,17 +832,15 @@ class TestTheRunDecidesWhatItRecords:
 class TestEachBuildIsChecked:
     """A project of several builds: the build that moved can be any one."""
 
-    def test_the_plan_sees_a_build_that_is_not_the_newest(self, repo, tmp_path):
-        import json
-
+    def test_the_plan_sees_a_build_that_is_not_the_newest(self, repo, tmp_path, toolchain):
         from fw_context_mcp.cli._index import _plan_auto_build
         from fw_context_mcp.config import load as load_config
+        from tests._toolchains import write_compile_commands
 
         pid = "0123456789abcdef0123456789abcdef"
         cc = repo / ".fw-context" / "build" / "default" / "out" / "compile_commands.json"
         cc.parent.mkdir(parents=True, exist_ok=True)
-        cc.write_text(json.dumps([{"directory": str(repo), "file": "main.c",
-                                   "arguments": ["cc", "-c", "main.c"]}]), encoding="utf-8")
+        write_compile_commands(cc, [{"directory": str(repo), "file": "main.c", "arguments": toolchain.arguments("main.c")}])
         db_dir = tmp_path / "index" / pid
         db_dir.mkdir(parents=True)
         conn = open_db(db_dir / "index.db")

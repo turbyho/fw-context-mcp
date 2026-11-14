@@ -82,7 +82,11 @@ def test_a_tool_that_the_path_of_the_build_does_not_hold_is_not_found(tmp_path: 
         )
 
 
-ARGUMENTS_WITH_CMD_CHARACTERS = [r"C:\R&D\fw", "100%", "%PATH%", 'a "quoted" b', "x|y<z>w", "^caret!", "trail\\"]
+# 'a\\"b': the batch file gives its arguments on to a program (%*), and the
+# C runtime of that program reads \\" as a quote; the backslash was lost.
+ARGUMENTS_WITH_CMD_CHARACTERS = [
+    r"C:\R&D\fw", "100%", "%PATH%", 'a "quoted" b', "x|y<z>w", "^caret!", "trail\\", 'a\\"b', 'c\\\\"d',
+]
 
 
 @windows_only
@@ -104,6 +108,64 @@ def test_a_batch_program_gets_each_argument_as_it_is(tmp_path: Path):
 
     assert result.returncode == 0, result.stderr
     assert json.loads(out.read_text(encoding="utf-8")) == ARGUMENTS_WITH_CMD_CHARACTERS
+
+
+@pytest.mark.parametrize(
+    ("batch", "spelling"),
+    [
+        (False, "relative"),
+        pytest.param(True, "relative", marks=windows_only),
+        pytest.param(False, "no-extension", marks=windows_only),
+        pytest.param(True, "no-extension", marks=windows_only),
+        pytest.param(False, "root-no-drive", marks=windows_only),
+    ],
+    ids=["exe", "batch", "exe-no-extension", "batch-no-extension", "root-no-drive"],
+)
+def test_a_program_with_a_directory_is_found_from_the_directory_of_the_build(
+    tmp_path: Path, monkeypatch, batch: bool, spelling: str,
+):
+    """``tools/gen`` of a build command: the directory of the build, not the directory of fw-context.
+
+    On Windows ``CreateProcess`` read it from the current directory of this
+    process.  The MCP server runs outside of the project, and the program
+    was not found.  ``Popen`` on POSIX reads it from the directory of the
+    build, and a batch file through ``cmd.exe`` did too.  ``tools\\gen``
+    with no extension found no ``gen.cmd``: ``CreateProcess`` adds only
+    ``.exe``.  ``\\tools\\gen.exe`` (a root, no drive) took the drive from
+    the version of Python.  The batch cases apply only to Windows: on POSIX
+    ``write_python_tool`` makes the same script for the two.
+    """
+    from tests._stubs import write_python_tool
+
+    build_dir = tmp_path / "project"
+    out = tmp_path / "ran.txt"
+    tool = write_python_tool(
+        build_dir / "tools", "gen", f"open({str(out)!r}, 'w').write('ran')\n", batch=batch,
+    )
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    if spelling == "relative":
+        program = str(tool.relative_to(build_dir))
+    elif spelling == "no-extension":
+        program = str(tool.relative_to(build_dir).with_suffix(""))
+    else:
+        program = str(tool)[len(tool.drive):]  # \Users\...\gen.exe: a root, no drive
+    result = utils.run_in_process_group(
+        [program], cwd=build_dir, env=dict(os.environ), timeout=60.0, capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert out.read_text(encoding="utf-8") == "ran"
+
+
+@windows_only
+def test_a_path_with_a_root_and_no_drive_gets_the_drive_of_the_build():
+    """``\\tools\\gen.exe`` with the build on D: is ``D:\\tools\\gen.exe``, on each version of Python."""
+    assert utils._with_drive_of("\\tools\\gen.exe", Path("D:/proj")) == "D:\\tools\\gen.exe"
+    assert utils._with_drive_of("tools\\gen.exe", Path("D:/proj")) == "D:\\proj\\tools\\gen.exe"
+    assert utils._with_drive_of("C:\\sdk\\gen.exe", Path("D:/proj")) == "C:\\sdk\\gen.exe"
 
 
 @windows_only
@@ -211,3 +273,79 @@ def test_an_output_path_with_a_space_is_one_word():
     unit = SimpleNamespace(raw_entry={"command": 'cc -c a.c -o "out dir/a.o"'})
 
     assert _output_paths(unit) == ["out dir/a.o"]
+
+
+@windows_only
+@pytest.mark.parametrize("spelling", ["bare-name", "relative"])
+def test_a_python_file_of_pathext_is_no_program_of_a_build(tmp_path: Path, monkeypatch, spelling: str):
+    """``PATHEXT`` holds ``.PY`` after an install of Python, and ``gen`` found ``gen.py``.
+
+    ``CreateProcess`` cannot start a ``.py`` file (WinError 193, "not a valid
+    Win32 application"), and that error did not tell that no program was
+    found.  Now the lookup takes only an ``.exe``, ``.com``, ``.bat`` or
+    ``.cmd`` file, and the build gets FileNotFoundError.
+    """
+    build_dir = tmp_path / "project"
+    (build_dir / "tools").mkdir(parents=True)
+    (build_dir / "tools" / "gen.py").write_text("print('no')\n", encoding="utf-8")
+    env = dict(os.environ)
+    env["PATHEXT"] = ".COM;.EXE;.BAT;.CMD;.PY"
+    if spelling == "bare-name":
+        env["PATH"] = str(build_dir / "tools") + os.pathsep + env.get("PATH", "")
+        program = "gen"
+    else:
+        program = "tools\\gen"
+
+    with pytest.raises(FileNotFoundError):
+        utils.run_in_process_group([program], cwd=build_dir, env=env, timeout=60.0, capture_output=True)
+
+
+@windows_only
+def test_idf_py_runs_idf_py_exe_when_pathext_holds_py(tmp_path: Path):
+    """ESP-IDF gives ``idf.py`` and ``idf.py.exe``, and ``PATHEXT`` holds ``.PY`` after an install of Python.
+
+    The name had an extension of ``PATHEXT`` and stayed as it was; the
+    filter of the files that Windows can start then left no name, and each
+    ESP-IDF build failed with "idf.py is not on the PATH".  The ``.py`` file
+    is no program of a build; ``idf.py.exe`` is.
+    """
+    from tests._stubs import write_python_tool
+
+    tools = tmp_path / "tools"
+    out = tmp_path / "ran.txt"
+    exe = write_python_tool(tools, "idf.py", f"open({str(out)!r}, 'w').write('exe')\n")
+    assert exe.name == "idf.py.exe"
+    (tools / "idf.py").write_text("raise SystemExit('the .py file ran')\n", encoding="utf-8")
+    env = dict(os.environ)
+    env["PATHEXT"] = ".COM;.EXE;.BAT;.CMD;.PY"
+    env["PATH"] = str(tools) + os.pathsep + env.get("PATH", "")
+
+    result = utils.run_in_process_group(["idf.py"], cwd=tmp_path, env=env, timeout=60.0, capture_output=True)
+
+    assert result.returncode == 0, result.stderr
+    assert out.read_text(encoding="utf-8") == "exe"
+
+
+@pytest.mark.parametrize(
+    ("name", "pathext", "expected"),
+    [
+        ("gen", ".COM;.EXE;.BAT;.CMD;.VBS;.JS;.PY", ["gen.com", "gen.exe", "gen.bat", "gen.cmd"]),
+        ("idf.py", ".COM;.EXE;.BAT;.CMD;.VBS;.JS;.PY", ["idf.py.com", "idf.py.exe", "idf.py.bat", "idf.py.cmd"]),
+        ("gcc.exe", ".COM;.EXE;.BAT;.CMD;.PY", ["gcc.exe"]),
+        ("west.CMD", ".COM;.EXE;.BAT;.CMD", ["west.CMD"]),
+        ("gcc", None, ["gcc.com", "gcc.exe", "gcc.bat", "gcc.cmd"]),
+        ("gcc", ".PY;.JS", ["gcc.com", "gcc.exe", "gcc.bat", "gcc.cmd"]),
+        ("gcc", ".EXE;.exe;.CMD;.EXE", ["gcc.exe", "gcc.cmd"]),
+    ],
+    ids=["bare", "py-name", "exe-name", "cmd-name", "no-pathext", "pathext-of-scripts", "repeated"],
+)
+def test_the_file_names_of_a_program_are_files_that_windows_can_start(monkeypatch, name, pathext, expected):
+    """``program_file_names`` on Windows: only files that Windows can start, in the order of ``PATHEXT``, one time each.
+
+    A pure function of its arguments, thus the test runs on each system with
+    the platform of Windows.  A ``PATHEXT`` of scripts only (``.PY``) gave no
+    name, and no program was found.
+    """
+    monkeypatch.setattr(utils.sys, "platform", "win32")
+    env = {} if pathext is None else {"PATHEXT": pathext}
+    assert utils.program_file_names(name, env) == expected

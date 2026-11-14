@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._toolchains import unit_of
+
 pytestmark = pytest.mark.libclang
 
 _CODE = """\
@@ -32,13 +34,12 @@ int use() {
 
 
 @pytest.fixture(scope="module")
-def extracted(tmp_path_factory):
-    from fw_context_mcp.indexer.compile_commands import CompilationUnit
+def extracted(tmp_path_factory, toolchain):
     from fw_context_mcp.indexer.symbols import extract_all
 
     src: Path = tmp_path_factory.mktemp("tmpl") / "spec.cpp"
     src.write_text(_CODE, encoding="utf-8")
-    unit = CompilationUnit(file=src, directory=src.parent, language="cpp", clang_args=["-std=c++17"])
+    unit = unit_of(src, toolchain, ["-std=c++17"], directory=src.parent, language="cpp")
     return extract_all(unit, with_refs=True)
 
 
@@ -104,13 +105,12 @@ int use(A<int>& a) { return a.put() + fwd(1) + A<int>::cnt + reg(h<int>); }
 
 
 @pytest.fixture(scope="module")
-def out_of_line(tmp_path_factory):
-    from fw_context_mcp.indexer.compile_commands import CompilationUnit
+def out_of_line(tmp_path_factory, toolchain):
     from fw_context_mcp.indexer.symbols import extract_all
 
     src: Path = tmp_path_factory.mktemp("ool") / "ool.cpp"
     src.write_text(_OUT_OF_LINE, encoding="utf-8")
-    unit = CompilationUnit(file=src, directory=src.parent, language="cpp", clang_args=["-std=c++17"])
+    unit = unit_of(src, toolchain, ["-std=c++17"], directory=src.parent, language="cpp")
     return extract_all(unit, with_refs=True)
 
 
@@ -170,14 +170,13 @@ int use(Dev& d) { return outer(d) + spec(d); }
 
 
 @pytest.fixture(scope="module")
-def instances(tmp_path_factory):
-    from fw_context_mcp.indexer.compile_commands import CompilationUnit
+def instances(tmp_path_factory, toolchain):
     from fw_context_mcp.indexer.models import origin_names
     from fw_context_mcp.indexer.symbols import extract_all
 
     src: Path = tmp_path_factory.mktemp("inst") / "inst.cpp"
     src.write_text(_INSTANCES, encoding="utf-8")
-    unit = CompilationUnit(file=src, directory=src.parent, language="cpp", clang_args=["-std=c++17"])
+    unit = unit_of(src, toolchain, ["-std=c++17"], directory=src.parent, language="cpp")
     result = extract_all(unit, with_refs=True)
     names = {s.usr: s.qualified_name for s in result.symbols}
     return {
@@ -226,13 +225,12 @@ int use(Dev& d) { return with_lambda(d) + nested(d) + local(d); }
 
 
 @pytest.fixture(scope="module")
-def lambdas(tmp_path_factory):
-    from fw_context_mcp.indexer.compile_commands import CompilationUnit
+def lambdas(tmp_path_factory, toolchain):
     from fw_context_mcp.indexer.symbols import extract_all
 
     src: Path = tmp_path_factory.mktemp("lam") / "lam.cpp"
     src.write_text(_LAMBDAS, encoding="utf-8")
-    unit = CompilationUnit(file=src, directory=src.parent, language="cpp", clang_args=["-std=c++17"])
+    unit = unit_of(src, toolchain, ["-std=c++17"], directory=src.parent, language="cpp")
     result = extract_all(unit, with_refs=True)
     names = {s.usr: s.qualified_name for s in result.symbols}
     return [

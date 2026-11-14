@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from fw_context_mcp.utils import process_start_time, record_build_groups, run_in_process_group
+from fw_context_mcp.utils import BUILD_GROUP_GRACE_S, process_start_time, record_build_groups, run_in_process_group
 
 #: A test of the POSIX mechanism: the session, the process group, its record,
 #: and the stop of an orphan group.  Windows has none of these: there the build
@@ -78,6 +78,54 @@ def test_a_timeout_stops_the_grandchild(tmp_path: Path):
         )
 
     assert _wait_gone(_read_pid(pid_file)), "the compiler of the build still runs"
+
+
+_STOP_INSIDE_WAIT = """
+import subprocess, sys, time
+from pathlib import Path
+import fw_context_mcp
+from fw_context_mcp.utils import run_in_process_group
+
+class Stop(BaseException):
+    pass
+
+def communicate_then_stop(self, input=None, timeout=None):
+    # The place of the stop in the defect: Popen.wait got its lock with
+    # acquire(False), and the exception came before its try.
+    self._waitpid_lock.acquire()
+    raise Stop
+
+subprocess.Popen.communicate = communicate_then_stop
+started = time.monotonic()
+try:
+    run_in_process_group(["sleep", "60"], cwd=Path(sys.argv[1]), env={"PATH": "/usr/bin:/bin"},
+                         timeout=30.0, capture_output=False)
+except Stop:
+    print(f"stopped after {time.monotonic() - started:.1f} s", flush=True)
+"""
+
+
+@posix_group
+def test_a_stop_inside_the_wait_of_popen_does_not_hang(tmp_path: Path):
+    """A stop that comes inside ``Popen.wait`` can leave its lock locked; the stop of the build hung.
+
+    ``poll()`` then reaped nothing, the zombie leader kept the group alive,
+    and the ``wait()`` after the stop blocked for ever (the test suite hung
+    on macOS, 2026-11-12).  The script runs in a child process with a time
+    limit: a hang is a failure, not a test suite that stops.
+    """
+    result = subprocess.run(  # noqa: S603 — fixed argv, no shell
+        [sys.executable, "-c", _STOP_INSIDE_WAIT, str(tmp_path)],
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("stopped after"), result.stdout
+    # Well below the grace of the stop: a leader that the stop does not
+    # reap keeps the group alive for the whole grace (poll() reaped nothing
+    # with the lock locked), and only the SIGKILL after it ended the wait.
+    seconds = float(result.stdout.split()[2])
+    assert seconds < BUILD_GROUP_GRACE_S / 2, f"the stop waited {seconds} s for a group with a zombie leader"
 
 
 @posix_group
@@ -159,9 +207,37 @@ def test_no_record_outside_the_block(tmp_path: Path):
 # ── The next owner stops the build that a SIGKILL left ──────────────────────
 
 
-def _orphan_group(program: str = "sleep") -> subprocess.Popen:
-    """A process group that no index run owns any more."""
-    return subprocess.Popen([program, "60"], start_new_session=True)  # noqa: S603 — fixed argv
+def _running_sleep(new_session: bool) -> subprocess.Popen:
+    """Start ``sleep 60``, and return when its argv is the argv of ``sleep``.
+
+    WHY the wait: Popen returns when execve closes the close-on-exec pipe of
+    subprocess, and the kernel sets the argv of the new program only after
+    that.  Until then the argv of the process is empty, or it is still the
+    argv of this interpreter (measured on Linux under load: 350 and 36 of
+    500 starts).  _reap_orphan_build_group reads that argv: it compares the
+    argv of the leader with the recorded leader, and it reads the argv of
+    the recorded index run.  Thus a test that read it too early took a
+    different branch: a test that expects a signal failed, and a test that
+    expects no signal passed for the wrong reason.
+    """
+    from fw_context_mcp.indexer._index_owner import process_argv
+
+    proc = subprocess.Popen(["sleep", "60"], start_new_session=new_session)  # noqa: S603 — fixed argv
+    deadline = time.monotonic() + 10.0
+    while True:
+        argv = process_argv(proc.pid)
+        if argv and Path(argv[0]).name == "sleep":
+            return proc
+        if time.monotonic() > deadline:
+            proc.kill()
+            proc.wait(timeout=10)
+            pytest.fail(f"the process did not run sleep after 10 s, its argv: {argv!r}")
+        time.sleep(0.01)
+
+
+def _orphan_group() -> subprocess.Popen:
+    """A process group that no index run owns any more, with a running ``sleep`` as its leader."""
+    return _running_sleep(new_session=True)
 
 
 def _index_run_stand_in() -> subprocess.Popen:
@@ -395,22 +471,26 @@ def test_a_live_pid_that_is_no_index_run_does_not_protect_the_orphan(tmp_path: P
     from fw_context_mcp.cli._index import _reap_orphan_build_group
 
     group = _orphan_group()
-    unrelated = subprocess.Popen(["sleep", "60"])  # noqa: S603 — fixed argv
     try:
-        _record(
-            tmp_path, index_pid=unrelated.pid, pgid=group.pid, leader="sleep",
-            started=process_start_time(group.pid),
-        )
+        unrelated = _running_sleep(new_session=False)
+        try:
+            _record(
+                tmp_path, index_pid=unrelated.pid, pgid=group.pid, leader="sleep",
+                started=process_start_time(group.pid),
+            )
 
-        _reap_orphan_build_group(tmp_path)
+            _reap_orphan_build_group(tmp_path)
 
-        assert group.wait(timeout=10) is not None
-        assert unrelated.poll() is None
+            assert group.wait(timeout=10) is not None
+            assert unrelated.poll() is None
+        finally:
+            if unrelated.poll() is None:
+                unrelated.kill()
+            unrelated.wait(timeout=10)
     finally:
-        for proc in (group, unrelated):
-            if proc.poll() is None:
-                proc.kill()
-            proc.wait(timeout=10)
+        if group.poll() is None:
+            group.kill()
+        group.wait(timeout=10)
 
 
 @posix_group

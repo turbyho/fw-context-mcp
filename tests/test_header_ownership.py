@@ -18,12 +18,12 @@ with a rebuild from an empty database (see test_index_equivalence.py for why
 """
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
 
 from fw_context_mcp.indexer.db import open_db
+from tests._toolchains import Toolchain, write_compile_commands
 
 # Fixture helpers are imported for the same reason as in
 # test_index_equivalence.py: they build the fake project there.
@@ -79,11 +79,11 @@ def _unit_source(name: str, includes: tuple[str, ...]) -> str:
     return "\n".join(lines)
 
 
-def _entry(src: Path, name: str, defines: tuple[str, ...]) -> dict:
+def _entry(src: Path, name: str, defines: tuple[str, ...], toolchain: Toolchain) -> dict:
     return {
         "directory": str(src),
         "file": f"{name}.c",
-        "arguments": ["gcc", "-std=c11", *defines, "-c", f"{name}.c", "-o", f"build/{name}.o"],
+        "arguments": toolchain.arguments(f"{name}.c", "-std=c11", *defines, output=f"build/{name}.o"),
     }
 
 
@@ -94,15 +94,14 @@ _UNITS: dict[str, tuple[str, ...]] = {
 }
 
 
-def _write_cc(proj: Path, names: list[str]) -> None:
+def _write_cc(proj: Path, names: list[str], toolchain: Toolchain) -> None:
     """Write compile_commands.json with the units in the order of *names*."""
     src = proj / "src"
-    cc = [_entry(src, name, _UNITS[name]) for name in names]
-    (proj / "compile_commands.json").write_text(json.dumps(cc, indent=2), encoding="utf-8")
+    write_compile_commands(proj / "compile_commands.json", [_entry(src, name, _UNITS[name], toolchain) for name in names])
 
 
 @pytest.fixture
-def owned_project(tmp_path: Path):
+def owned_project(tmp_path: Path, toolchain: Toolchain):
     """Create and index the project of the module docstring."""
     proj = tmp_path / "owners"
     src = proj / "src"
@@ -114,7 +113,7 @@ def owned_project(tmp_path: Path):
     _write_file(src / "c.c", _unit_source("c", ("shared.h",)))
     # compile_commands.json in reverse order: the owner must follow the path
     # of the unit, not the order of this file.
-    _write_cc(proj, ["c", "b", "a"])
+    _write_cc(proj, ["c", "b", "a"], toolchain)
     _isolate_index_db(proj, tmp_path)
     init = _cli(["init", "--project", str(proj)], cwd=proj, timeout=60)
     assert init.returncode == 0, init.stderr
@@ -217,10 +216,10 @@ def test_a_header_that_no_unit_includes_now_loses_its_rows(owned_project: Path):
     _assert_equals_rebuild(proj)
 
 
-def test_the_next_includer_takes_the_headers_of_a_unit_that_left(owned_project: Path):
+def test_the_next_includer_takes_the_headers_of_a_unit_that_left(owned_project: Path, toolchain):
     """``a.c`` leaves compile_commands.json: ``b.c`` owns ``shared.h``."""
     proj = owned_project
-    _write_cc(proj, ["c", "b"])
+    _write_cc(proj, ["c", "b"], toolchain)
     result = _index(proj)
     assert result.returncode == 0, result.stderr
     names = _names(_db_path_for_project(proj))
@@ -229,7 +228,7 @@ def test_the_next_includer_takes_the_headers_of_a_unit_that_left(owned_project: 
     _assert_equals_rebuild(proj)
 
 
-def test_the_owner_keeps_the_header_when_its_flags_change(owned_project: Path, monkeypatch):
+def test_the_owner_keeps_the_header_when_its_flags_change(owned_project: Path, monkeypatch, toolchain):
     """``a.c`` gets one more include path: a new listing of the same first file.
 
     An include path is in the flags hash of the listing and not in
@@ -240,7 +239,7 @@ def test_the_owner_keeps_the_header_when_its_flags_change(owned_project: Path, m
     proj = owned_project
     (proj / "src" / "extra").mkdir()
     monkeypatch.setitem(_UNITS, "a", ("-DUNIT_A", "-Iextra"))
-    _write_cc(proj, ["c", "b", "a"])
+    _write_cc(proj, ["c", "b", "a"], toolchain)
     result = _index(proj)
     assert "1 updated, 2 unchanged" in _summary(result)
     names = _names(_db_path_for_project(proj))
@@ -249,7 +248,7 @@ def test_the_owner_keeps_the_header_when_its_flags_change(owned_project: Path, m
     _assert_equals_rebuild(proj)
 
 
-def test_a_file_listed_two_times_with_the_same_flags_keeps_its_headers(owned_project: Path):
+def test_a_file_listed_two_times_with_the_same_flags_keeps_its_headers(owned_project: Path, toolchain):
     """Zephyr lists ``misc/empty_file.c`` so: the same flags, another ``-o``.
 
     Before number_listings, the two listings had one key, and the claims of
@@ -258,10 +257,10 @@ def test_a_file_listed_two_times_with_the_same_flags_keeps_its_headers(owned_pro
     """
     proj = owned_project
     src = proj / "src"
-    second_a = _entry(src, "a", _UNITS["a"])
+    second_a = _entry(src, "a", _UNITS["a"], toolchain)
     second_a["arguments"][-1] = "build/a_again.o"
-    cc = [_entry(src, name, _UNITS[name]) for name in ("c", "b", "a")] + [second_a]
-    (proj / "compile_commands.json").write_text(json.dumps(cc, indent=2), encoding="utf-8")
+    cc = [_entry(src, name, _UNITS[name], toolchain) for name in ("c", "b", "a")] + [second_a]
+    write_compile_commands(proj / "compile_commands.json", cc)
     first = _index(proj)
     assert first.returncode == 0, first.stderr
     _edit(src / "b.c", _unit_source("b", ("shared.h",)) + "int b_more(void) { return 5; }\n")
@@ -306,7 +305,7 @@ static inline int gated_c(void) { return 8; }
 """
 
 
-def test_a_lost_header_goes_past_an_includer_without_a_cursor(owned_project: Path, monkeypatch):
+def test_a_lost_header_goes_past_an_includer_without_a_cursor(owned_project: Path, monkeypatch, toolchain):
     """``b.c`` includes ``gated.h`` and has no cursor in it; ``c.c`` must take it.
 
     ``#pragma once`` and an inactive ``#if`` leave ``b.c`` without a cursor
@@ -320,7 +319,7 @@ def test_a_lost_header_goes_past_an_includer_without_a_cursor(owned_project: Pat
     _write_file(src / "b.c", _unit_source("b", ("shared.h", "gated.h")))
     _write_file(src / "c.c", _unit_source("c", ("shared.h", "gated.h")))
     monkeypatch.setitem(_UNITS, "c", ("-DUNIT_C",))
-    _write_cc(proj, ["c", "b", "a"])
+    _write_cc(proj, ["c", "b", "a"], toolchain)
     assert _index(proj).returncode == 0
     assert "gated_a" in _names(_db_path_for_project(proj))
 
@@ -333,12 +332,12 @@ def test_a_lost_header_goes_past_an_includer_without_a_cursor(owned_project: Pat
     _assert_equals_rebuild(proj)
 
 
-def test_a_new_order_of_compile_commands_parses_nothing(owned_project: Path):
+def test_a_new_order_of_compile_commands_parses_nothing(owned_project: Path, toolchain):
     """The order of compile_commands.json is not the order of the run."""
     proj = owned_project
     db_path = _db_path_for_project(proj)
     before = _snapshot(db_path)
-    _write_cc(proj, ["a", "c", "b"])
+    _write_cc(proj, ["a", "c", "b"], toolchain)
     result = _index(proj)
     assert result.returncode == 0, result.stderr
     assert "0 updated, 3 unchanged" in _summary(result)

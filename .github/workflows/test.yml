@@ -22,10 +22,50 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e ".[dev]"
+      # The embedded SDKs of the tests (tests/sdk/versions.toml): the
+      # pre-test of the session stops a run that needs them without them.
+      # The script installs them into the root of tests.sdk.sdk_root
+      # (C:\fwctx-sdk on Windows, ~/.fw-context-test-sdk on the other
+      # hosts), and does nothing for a part that the cache restored.  The
+      # key is the fingerprint of the pinned versions (the same that the
+      # pre-test compares), the install script and the layout of the root
+      # (tests/sdk/*.py).  The venv of the root is
+      # in the cache too: it belongs to the pinned Python of the root
+      # (tests/sdk/versions.toml, [python]), not to the Python of the job.
+      # The save comes right after the install and before the tests: with the
+      # post step of actions/cache, a failed test stopped the save, and
+      # the next run downloaded the SDKs again.
+      - id: sdk
+        shell: bash
+        run: |
+          echo "root=$(python -c 'from tests.sdk import sdk_root; print(sdk_root().as_posix())')" >> "$GITHUB_OUTPUT"
+          echo "fingerprint=$(python -c 'from tests.sdk import fingerprint; print(fingerprint())')" >> "$GITHUB_OUTPUT"
+      - id: sdk-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.sdk.outputs.root }}
+          key: test-sdk-${{ runner.os }}-${{ steps.sdk.outputs.fingerprint }}-${{ hashFiles('tests/sdk/*.py') }}
+      - run: python -m tests.sdk.provision
+      - if: steps.sdk-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.sdk.outputs.root }}
+          key: ${{ steps.sdk-cache.outputs.cache-primary-key }}
       - run: ruff check src/
       - run: mypy src/
       # Unpack the bundled clang compiler headers, as `fw-context init` does
       # on a user host.
       - run: fw-context doctor --fix --only clang-resource
         continue-on-error: true
-      - run: pytest tests/ -q -m "not ollama and not libclang and not slow and not system"
+      # The selection of make test.  The -m here replaces the -m of addopts
+      # in pyproject.toml, thus it names each marker that the job leaves
+      # out: the pre-test of the session stops the run when a selected
+      # test needs a component that the runner does not have (a LiteLLM
+      # proxy, Ollama, the extended set of the test SDKs).
+      - run: pytest tests/ -q -m "not system and not live and not litellm and not ollama and not libclang and not slow and not sdk_project and not extra_platforms"
+      # The native projects of the test SDKs (tests/test_sdk_projects.py):
+      # a build and an index run each, minutes on a runner, thus one job
+      # runs them (decision of the user, 2026-11-13).  make test-all runs
+      # them on each host.
+      - if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.14'
+        run: pytest tests/test_sdk_projects.py -q -m sdk_project

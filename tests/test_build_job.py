@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import _thread
 import os
+import signal
 import subprocess
 import sys
 import textwrap
@@ -24,7 +25,7 @@ from pathlib import Path
 
 import pytest
 
-from fw_context_mcp.processes import kill_hard, pid_exists
+from fw_context_mcp.processes import HANGUP_SIGNAL, kill_hard, pid_exists
 from fw_context_mcp.utils import run_in_process_group
 
 pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="the job object is Windows; POSIX: test_build_process_group.py")
@@ -97,6 +98,131 @@ def test_an_exception_while_the_build_runs_stops_the_grandchild(tmp_path: Path):
 
     assert stopped - interrupted[0] < 5.0, "the stop waited for the end of the build"
     assert _wait_gone(_read_pid(pid_file)), "the compiler of the build still runs"
+
+
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT, HANGUP_SIGNAL], ids=["SIGTERM", "SIGINT", "hangup"])
+def test_a_stop_during_the_start_ends_the_suspended_process(tmp_path: Path, monkeypatch, signum: int):
+    """A stop that comes inside ``Popen``, after ``CreateProcess``, must not leave a suspended process.
+
+    The exception of the stop (``IndexStopped``, ``KeyboardInterrupt``) left
+    ``popen()`` before ``Popen`` returned the process.  ``_started`` then had
+    no process to end, and the process stayed suspended outside of the job,
+    with nothing that ends it.  The fake ``Popen`` sends the signal after the
+    real start, before it returns: the place of the stop in the defect.
+    """
+    import fw_context_mcp.job_object as job_object
+
+    class Stopped(Exception):
+        pass
+
+    def handler(received: int, frame: object) -> None:
+        raise Stopped(received)
+
+    started: list[int] = []
+    real_popen = subprocess.Popen
+
+    def popen_then_stop(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        started.append(proc.pid)
+        signal.raise_signal(signum)
+        return proc
+
+    previous = signal.signal(signum, handler)
+    monkeypatch.setattr(job_object.subprocess, "Popen", popen_then_stop)
+    try:
+        with pytest.raises(Stopped), job_object.BuildJob() as job:
+            job.start(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                cwd=tmp_path, env=dict(os.environ), stdout=None, stderr=None,
+            )
+        assert signal.getsignal(signum) is handler, "the start must put back the handler of the caller"
+    finally:
+        signal.signal(signum, previous)
+    assert started
+    assert _wait_gone(started[0]), "the suspended process of the start lives on outside of the job"
+
+
+def test_each_kept_stop_reaches_its_handler(monkeypatch):
+    """Two stops during the start (a Ctrl-C and a takeover): each handler runs.
+
+    The replay ran the handler of the first signal at once.  Its exception
+    stopped the loop, and the second signal was lost: the run exited as
+    interrupted and not as superseded, and the daemon did not retry the
+    work that the takeover wanted.
+    """
+    import fw_context_mcp.job_object as job_object
+
+    class Stopped(Exception):
+        pass
+
+    ran: list[str] = []
+
+    def on_interrupt(signum: int, frame: object) -> None:
+        ran.append("SIGINT")
+        raise Stopped
+
+    def on_takeover(signum: int, frame: object) -> None:
+        ran.append("SIGTERM")
+
+    previous_int = signal.signal(signal.SIGINT, on_interrupt)
+    previous_term = signal.signal(signal.SIGTERM, on_takeover)
+    try:
+        with pytest.raises(Stopped), job_object._stops_deferred():
+            signal.raise_signal(signal.SIGINT)
+            signal.raise_signal(signal.SIGTERM)
+            assert ran == [], "a stop ran inside the start"
+        # A handler that raised leaves the other marked signals pending, as
+        # for two signals that come together: CPython runs them at its next
+        # PyErr_CheckSignals (the next signal, or a C function that checks).
+        # The test makes that check itself.
+        import ctypes
+
+        ctypes.pythonapi.PyErr_CheckSignals()
+    finally:
+        signal.signal(signal.SIGINT, previous_int)
+        signal.signal(signal.SIGTERM, previous_term)
+    assert sorted(ran) == ["SIGINT", "SIGTERM"]
+
+
+def test_a_stop_during_the_restore_of_the_handlers_keeps_the_recorded_stops(monkeypatch):
+    """A new Ctrl-C runs its handler inside ``signal.signal`` while the start puts back the handlers.
+
+    The exception stopped the loop of the restore, and the marks after it
+    did not run: a takeover that came during the start was lost.  The fake
+    ``signal.signal`` raises at the first restore, as that handler does.
+    """
+    import ctypes
+
+    import fw_context_mcp.job_object as job_object
+
+    ran: list[str] = []
+
+    def on_takeover(signum: int, frame: object) -> None:
+        ran.append("SIGTERM")
+
+    def on_interrupt(signum: int, frame: object) -> None:
+        ran.append("SIGINT")
+
+    real_signal = signal.signal
+    previous_int = real_signal(signal.SIGINT, on_interrupt)
+    previous_term = real_signal(signal.SIGTERM, on_takeover)
+
+    def restore_that_raises(signum: int, handler: object) -> object:
+        monkeypatch.setattr(signal, "signal", real_signal)
+        raise KeyboardInterrupt
+
+    try:
+        with pytest.raises(KeyboardInterrupt), job_object._stops_deferred():
+            signal.raise_signal(signal.SIGTERM)
+            monkeypatch.setattr(signal, "signal", restore_that_raises)
+        ctypes.pythonapi.PyErr_CheckSignals()
+        assert ran == ["SIGTERM"], "the takeover that came during the start was lost"
+        # A handler that the loop did not put back gives each signal to the handler of the caller.
+        signal.raise_signal(signal.SIGTERM)
+        assert ran == ["SIGTERM", "SIGTERM"]
+    finally:
+        real_signal(signal.SIGINT, previous_int)
+        real_signal(signal.SIGTERM, previous_term)
 
 
 def test_a_build_that_ends_gives_its_output(tmp_path: Path):

@@ -30,6 +30,7 @@ from __future__ import annotations
 import functools
 import os
 import sys
+import unicodedata
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 __all__ = [
@@ -40,6 +41,7 @@ __all__ = [
     "is_absolute_key",
     "key_path",
     "pattern_key",
+    "resolve_path",
 ]
 
 #: A SQL condition that is true for an absolute key in the column ``path``.
@@ -62,11 +64,29 @@ def canonical_path(path: str | os.PathLike[str]) -> Path:
     - macOS: ``Path.resolve()`` keeps the case that the caller wrote.  The
       function asks the kernel for the path of the part that exists
       (``fcntl.F_GETPATH``), and that path has the case of the disk.
+
+    The resolve is :func:`resolve_path`: a loop of links gives a path, and
+    no error, on each version of Python.
     """
-    resolved = Path(path).resolve()
+    resolved = resolve_path(path)
     if sys.platform == "darwin":
         return _disk_case_darwin(resolved)
     return resolved
+
+
+def resolve_path(path: str | os.PathLike[str]) -> Path:
+    """Return ``Path(path).resolve()``, also for a loop of links.
+
+    ``Path.resolve`` of Python 3.11 and 3.12 is ``os.path.realpath`` and a
+    ``stat`` of the result, which raises RuntimeError for a loop of links.
+    Python 3.13 removed that check: the non-strict resolve gives the path
+    with the loop not resolved.  This function gives that result on each
+    version (``os.path.realpath``, which is the same resolve without the
+    check).  WHY: a loop names no file, and an argument of a build with a
+    loop (an ``-I`` directory) stopped the parse of the whole build on 3.11
+    and 3.12, where 3.13 indexed it.
+    """
+    return Path(os.path.realpath(path))
 
 
 if sys.platform == "darwin":
@@ -79,15 +99,21 @@ if sys.platform == "darwin":
         """Return *resolved* with the case of the disk for the part that exists.
 
         ``O_EVTONLY`` opens the file for events only, and with
-        ``O_NONBLOCK`` a FIFO does not block the open.  A path that the
-        process cannot examine keeps the spelling of *resolved*: a file with
-        mode 000 (``os.open`` gives EACCES), or a path below a directory
-        without search permission (``Path.exists`` raises EACCES on Python
-        before 3.12).  The indexer cannot read such a file, and no other
-        source gives its case.  Measured on macOS 26 (APFS), 2026-11-09:
-        ``F_GETPATH`` gives the case of the disk for a file and for a
-        directory, the path of the link that the open used for a file with
-        two hard links, and the name of a FIFO.
+        ``O_NONBLOCK`` a FIFO does not block the open.  Measured on macOS 26
+        (APFS), 2026-11-09: ``F_GETPATH`` gives the case of the disk for a
+        file and for a directory, the path of the link that the open used
+        for a file with two hard links, and the name of a FIFO.
+
+        A name that exists but does not open (mode 000, a socket, a dataless
+        file of a file provider that does not come in time) gets the case of
+        the disk from the entry of its directory (:func:`_entry_name`), and
+        the directories above it from the nearest one that opens.  WHY: the
+        root of the project is in those directories, and a root of the case
+        of the disk was no prefix of a file in the case of the caller; the
+        file got an absolute key.  A name of the caller for such a file
+        gave one file two keys.  A path below a directory without search
+        permission (``Path.exists`` raises EACCES on Python before 3.12)
+        keeps the spelling of *resolved*: the process cannot examine it.
 
         WHY the compare after ``F_GETPATH``: the kernel gives one path of
         the vnode.  For a file with two hard links it can be the path of the
@@ -96,14 +122,23 @@ if sys.platform == "darwin":
         *resolved*.
         """
         existing = resolved
-        tail: list[str] = []
+        missing: list[str] = []
+        unopened: list[str] = []
         try:
             while not existing.exists():
                 if existing.parent == existing:
                     return resolved
-                tail.append(existing.name)
+                missing.append(existing.name)
                 existing = existing.parent
-            fd = os.open(existing, os.O_EVTONLY | os.O_NONBLOCK)
+            while True:
+                try:
+                    fd = os.open(existing, os.O_EVTONLY | os.O_NONBLOCK)
+                    break
+                except OSError:
+                    if existing.parent == existing:
+                        return resolved
+                    unopened.append(existing.name)
+                    existing = existing.parent
             try:
                 buffer = fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(_MAXPATHLEN))
             finally:
@@ -113,7 +148,32 @@ if sys.platform == "darwin":
         on_disk = Path(os.fsdecode(buffer.split(b"\0", 1)[0]))
         if not _same_spelling(on_disk, existing):
             return resolved
-        return on_disk.joinpath(*reversed(tail))
+        for name in reversed(unopened):
+            on_disk = on_disk / _entry_name(on_disk, name)
+        return on_disk.joinpath(*reversed(missing))
+
+    def _entry_name(directory: Path, name: str) -> str:
+        """Return the entry of *directory* that *name* spells, in the spelling of the disk.
+
+        *name* itself when the directory cannot be listed, or when no entry
+        or more than one entry differs from it only in case and Unicode
+        form (a directory of a file system that keeps the case).
+        """
+        try:
+            entries = os.listdir(directory)
+        except OSError:
+            return name
+        wanted = _folded(name)
+        matches = [entry for entry in entries if _folded(entry) == wanted]
+        return matches[0] if len(matches) == 1 else name
+
+    def _folded(text: str) -> str:
+        """*text* in the form that APFS (not case-sensitive) compares: NFD and no case.
+
+        WHY ``unicodedata`` at the import of the module: :func:`_entry_name`
+        calls this function for each entry of a directory.
+        """
+        return unicodedata.normalize("NFD", text).casefold()
 
     def _same_spelling(a: Path, b: Path) -> bool:
         """Return True when *a* and *b* differ only in case and in the Unicode form of the names.
@@ -121,12 +181,7 @@ if sys.platform == "darwin":
         These are the two differences that the default file system of macOS
         (APFS, not case-sensitive) ignores.
         """
-        import unicodedata
-
-        def folded(path: Path) -> str:
-            return unicodedata.normalize("NFD", str(path)).casefold()
-
-        return folded(a) == folded(b)
+        return _folded(str(a)) == _folded(str(b))
 
 
 def index_key(path: str | os.PathLike[str], project_root: Path) -> str:
@@ -149,10 +204,26 @@ def canonical_key(canonical: Path, project_root: Path) -> str:
     for each call).
     """
     try:
-        relative = canonical.relative_to(_canonical_root(os.fspath(project_root)))
+        relative = canonical.relative_to(_root(project_root))
     except ValueError:
         return canonical.as_posix()
     return relative.as_posix()
+
+
+def _root(project_root: Path) -> Path:
+    """Return the canonical path of *project_root*, through the cache of :func:`_canonical_root`.
+
+    The key of the cache is the absolute spelling of the root: a root of
+    ``.`` kept the directory of the first call, and a process that changed
+    its directory got the keys of a different project.  WHY
+    ``Path.absolute()`` and not ``os.path.abspath``: ``abspath`` removes a
+    ``..`` from the text before the links are resolved, and the files go
+    through ``Path.resolve()``, which resolves the link first.  A root
+    ``build/..`` with ``build`` a link then named a different directory
+    than its own files.  ``absolute()`` of an absolute root makes no call
+    to the system, thus a key of the indexer costs no ``getcwd``.
+    """
+    return _canonical_root(os.fspath(Path(project_root).absolute()))
 
 
 @functools.lru_cache(maxsize=32)
@@ -162,8 +233,13 @@ def _canonical_root(project_root: str) -> Path:
     WHY a cache: the indexer makes a key for each symbol and for each header
     of each unit (86k header records on the largest test project), and each
     call made the root canonical again.  On macOS that is an open and an
-    ``fcntl`` for each call.  A root does not move while a process works on
-    its project.
+    ``fcntl`` for each call.
+
+    Call it through :func:`_root`, which gives the absolute spelling.  The limit: a root
+    that someone renames or links again while the process runs keeps its
+    old canonical path until the process ends.  A process that works on a
+    project reads its config and its index from that root too, thus it
+    must start again after such a change anyway.
     """
     return canonical_path(project_root)
 
@@ -176,7 +252,7 @@ def key_path(key: str, project_root: Path) -> Path:
     """
     if is_absolute_key(key):
         return Path(key)
-    return _canonical_root(os.fspath(project_root)) / key
+    return _root(project_root) / key
 
 
 def is_absolute_key(key: str) -> bool:

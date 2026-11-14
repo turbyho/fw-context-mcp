@@ -9,19 +9,19 @@ of the framework that the board compiles to nothing.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
 
 import fw_context_mcp  # noqa: F401  — must precede sqlite3
 from tests._toml import toml_string
+from tests._toolchains import write_compile_commands, write_sources
 
 PROJECT_ID = "0123456789abcdef0123456789abcdef"
 
 
 @pytest.fixture
-def indexed(tmp_path: Path, monkeypatch) -> tuple[Path, Path, str]:
+def indexed(tmp_path: Path, monkeypatch, toolchain) -> tuple[Path, Path, str]:
     """Index a project of two TUs: one includes a header, one includes none."""
     import fw_context_mcp.config.settings as settings
     from fw_context_mcp.indexer.runner import run
@@ -32,16 +32,13 @@ def indexed(tmp_path: Path, monkeypatch) -> tuple[Path, Path, str]:
 
     root = tmp_path / "proj"
     root.mkdir()
-    (root / "a.h").write_text("int a(void);\n", encoding="utf-8")
-    (root / "a.c").write_text('#include "a.h"\nint a(void) { return 1; }\n', encoding="utf-8")
-    (root / "b.c").write_text("int b(void) { return 2; }\n", encoding="utf-8")
-    (root / "compile_commands.json").write_text(
-        json.dumps([
-            {"directory": str(root), "file": name, "arguments": ["cc", "-c", name, "-o", name + ".o"]}
-            for name in ("a.c", "b.c")
-        ]),
-        encoding="utf-8",
-    )
+    write_sources(root, {
+        "a.h": "int a(void);\n", "a.c": '#include "a.h"\nint a(void) { return 1; }\n', "b.c": "int b(void) { return 2; }\n",
+    })
+    write_compile_commands(root / "compile_commands.json", [
+        {"directory": str(root), "file": name, "arguments": toolchain.arguments(name, output=name + ".o")}
+        for name in ("a.c", "b.c")
+    ])
     index_dir = tmp_path / "index"
     (root / ".fw-context").mkdir()
     (root / ".fw-context" / "config.toml").write_text(f'[project]\nid = "{PROJECT_ID}"\n', encoding="utf-8")

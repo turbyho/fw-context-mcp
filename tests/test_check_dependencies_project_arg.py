@@ -54,7 +54,7 @@ def test_a_project_before_init_gets_each_check_of_the_installation(tmp_path, mon
     names = {row["name"] for row in check_dependencies(project_root=str(root))}
 
     assert names == {
-        "pysqlite3", "sqlite-ext", "sqlite-vec", "libclang-python", "libclang-so", "clang-resource", "watchfiles",
+        "pysqlite3", "sqlite-ext", "sqlite-vec", "libclang-python", "libclang-so", "clang-resource", "clang", "watchfiles",
         "tomli-w",
     }
 
@@ -94,3 +94,54 @@ def _no_cloud_model_list(monkeypatch):
     from fw_context_mcp.llm import _diag
 
     monkeypatch.setattr(_diag, "remote_hosts", lambda url: {})
+
+
+def test_a_clang_program_that_does_not_run_is_named_with_its_repair(monkeypatch):
+    """Without the clang program each macro row says no_answer and no assembly unit is read; no check named it."""
+    from fw_context_mcp.deps import _checks
+    from fw_context_mcp.indexer import _clang_cli
+
+    monkeypatch.setattr(_clang_cli, "clang_binary", lambda: "fw-context-no-such-clang")
+
+    [result] = [row for row in _checks.CHECK_ORDER if row[0] == "clang"]
+    outcome = result[1]()
+
+    assert outcome.status == "missing"
+    assert "no macro values and no assembly units" in outcome.message
+    assert "clang" in outcome.instructions
+
+
+def test_a_windows_path_of_the_loaded_libclang_is_ok(monkeypatch):
+    """A test for "/" in the path read each Windows path as "not found", also when the library loaded."""
+    from types import SimpleNamespace
+
+    from fw_context_mcp.deps import _checks
+    from fw_context_mcp.indexer._libclang import cindex
+
+    path = r"C:\Users\u\venv\Lib\site-packages\clang\native\libclang.dll"
+    class LoadedConfig:
+        """``Config().lib`` of a binding that loaded the DLL of a Windows venv."""
+
+        lib = SimpleNamespace(_name=path)
+
+    monkeypatch.setattr(cindex, "Config", LoadedConfig)
+    monkeypatch.setattr(cindex.Index, "create", staticmethod(lambda: object()))
+
+    result = _checks.check_libclang_so()
+
+    assert (result.status, result.message) == ("ok", path)
+
+
+def test_a_libclang_that_creates_no_index_is_degraded(monkeypatch):
+    from fw_context_mcp.deps import _checks
+    from fw_context_mcp.indexer._libclang import cindex
+
+    def fail():
+        raise cindex.LibclangError("no symbol clang_createIndex")
+
+    monkeypatch.setattr(cindex.Index, "create", staticmethod(fail))
+
+    result = _checks.check_libclang_so()
+
+    assert result.status == "degraded"
+    assert "clang_createIndex" in result.message

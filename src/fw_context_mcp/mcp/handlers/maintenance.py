@@ -38,6 +38,7 @@ from ...config import ConfigError, derive_project_id
 from ...config import load as load_config
 from ...config.settings import Config
 from ...indexer import _index_owner as index_owner
+from ...indexer import _run_marker
 from ...indexer.autobuild import AutobuildState, build_advice, build_missing_reason
 from ...indexer.autobuild import clear_problem as clear_build_problem
 from ...indexer.autobuild import project_state as project_autobuild_state
@@ -86,11 +87,14 @@ from ..shared.context import (
 )
 from ..shared.index_state import RUN_STATES, WAIT_ADVICE, index_state, manifest_reason
 from ..shared.stale import (
+    MACRO_NO_ANSWER_ACTION,
+    POST_PROCESSING_REASON,
     _check_header_staleness,
     _count_modified_files,
     build_label,
     find_unindexed_sources,
     latest_builds,
+    macro_no_answer_fact,
     outdated_index_fact,
     outdated_index_reason,
     stored_row_format,
@@ -680,12 +684,24 @@ def _build_health(
         root,
     )
     checkout_moved = bool(indexed_checkout)
+    # Rows that no post-processing of the build saw (`_run_marker`, rows
+    # unseen): their macro values are not in the index, and an index run
+    # writes them.  Units to which the preprocessor gave no macro values
+    # (the state no answer): the cause must be repaired first.
+    marker_state = _run_marker.read_state(target.db_path.parent, config_hash)
+    post_processing_pending = marker_state is not None and marker_state.rows_unseen
+    macro_no_answer = macro_no_answer_fact(marker_state)
     # Modified source files are handled per query and do NOT force a
     # reindex.
-    needs_reindex = bool(
+    # A run (after a repair, if a reason names one) updates the index.
+    # The units with no macro answer are apart: a plain run repairs nothing
+    # for them, thus the advice of the analysis and the embeddings must not
+    # wait for their repair (`run_named_above`).
+    needs_run = bool(
         cc_changed or schema_old or row_format_old or blocked_sources or checkout_moved
-        or build_problem or build_missing
+        or build_problem or build_missing or post_processing_pending
     )
+    needs_reindex = needs_run or bool(macro_no_answer)
     # A missing compile_commands.json needs the action that makes it again
     # (`_compile_commands_reason`), and a plain run reads the same missing
     # file.
@@ -778,6 +794,12 @@ def _build_health(
             "run `fw-context index`",
             bg_running,
         ))
+    # The texts are the ones of each query answer (`quick_structural_reasons`
+    # and `index_state`).
+    if post_processing_pending:
+        reindex_reasons.append(_with_action(POST_PROCESSING_REASON, "run `fw-context index`", bg_running))
+    if macro_no_answer:
+        reindex_reasons.append(_with_action(macro_no_answer, MACRO_NO_ANSWER_ACTION, bg_running))
     # A missing database of a build of fw-context is the missing build,
     # and the build reason above (or the marker of the run that found it)
     # already names it with its command.
@@ -927,6 +949,15 @@ def _build_health(
     elif compile_commands_text:
         # The reason text, thus the message and the reason name one action.
         index_message = f"{compile_commands_text} Queries still work on existing data."
+    elif post_processing_pending:
+        index_message = _with_action(
+            "The post-processing of an index run is not complete: the macro values of some rows are missing",
+            "run `fw-context index`", bg_running,
+        ) + " Queries still work on existing data."
+    elif macro_no_answer:
+        index_message = _with_action(
+            macro_no_answer[0].upper() + macro_no_answer[1:], MACRO_NO_ANSWER_ACTION, bg_running,
+        ) + " Queries still work on existing data."
     else:
         index_message = "Compile commands changed — run fw-context index. Queries still work on existing data."
 
@@ -1014,7 +1045,7 @@ def _build_health(
     # newer row format needs a restart and no run.  Not "partial": its
     # warning is advice in `_warning`, and `index_message` names no run
     # for it.
-    run_named_above = needs_reindex or manifest_verification not in ("full", "partial")
+    run_named_above = needs_run or manifest_verification not in ("full", "partial")
     # LLM-analysis coverage, split by project/vendor, so the LLM reads
     # unanalyzed vendor symbols as expected (analyze_vendor=false), not as
     # a defect.
@@ -2497,11 +2528,11 @@ def _decisions_of_manifest(
     The index run decides from the units of compile_commands.json and the
     files that each one reads (``runner._settle_odr_merge``).  The manifest
     holds the same: an entry for each unit, its arguments (the language of
-    the unit, ``compile_commands._detect_language``) and its headers.  Thus
+    the unit, ``compile_commands.unit_language``) and its headers.  Thus
     the two give one answer, and ``_odr.decide_types`` applies the rules.
     """
     from ...indexer._odr import StoredPlace, decide_types
-    from ...indexer.compile_commands import _detect_language
+    from ...indexer.compile_commands import unit_language
     from ...indexer.manifest import path_resolver, tu_arguments
 
     resolve = path_resolver(root)
@@ -2510,7 +2541,7 @@ def _decisions_of_manifest(
     for entry in manifest.get("entries") or ():
         source = resolve(entry.get("file", ""))
         main_files.add(source)
-        if _detect_language(source, tu_arguments(manifest, entry)) == "cpp":
+        if unit_language(source, tu_arguments(manifest, entry)) == "cpp":
             cxx_files.add(source)
             cxx_files.update(resolve(header) for header in entry.get("headers") or ())
     stored = [StoredPlace(resolve(path), key, line, column) for path, key, line, column in places]
@@ -2653,6 +2684,18 @@ def _reindex_parse_and_store(
         # in a single transaction per TU.  Each TU gets its own
         # transaction so partial failures don't roll back all work.
         with db_write_lock(db_path.parent, timeout=60.0):
+            # The marker of rows that no post-processing of the build saw
+            # (indexer._run_marker), before the first row.  The stored rows
+            # have no macro values: those need each unit of the build
+            # (macros.store_values_of_build).  The next index run parses
+            # nothing for them, and only this marker makes its macros step
+            # run.  Before, the values of the rows stayed empty for good.
+            # No marker, no rows: without it nothing says that the values
+            # of these rows are missing.
+            try:
+                _run_marker.mark_pending(db_path.parent, config_hash)
+            except OSError as exc:
+                return 0, {"error": f"Cannot write the marker of the run, thus no row was stored: {exc}"}
             # The header records of each store, for the manifest below:
             # their hashes are the ones of the text that the parse read.
             unit_headers: list[list[dict] | None] = []
@@ -2694,17 +2737,13 @@ def _reindex_parse_and_store(
                         keeps_lost_files.add(index)
                 unit_headers.append(headers)
 
-            # Phase 3: resolve macro definitions after all TUs are stored.
-            # Macro resolution needs the clang flags from one TU (they
-            # are identical for TUs of the same file) and runs a
-            # best-effort pass — failure is silently ignored.
-            if parsed_units:
-                try:
-                    from ...indexer.macros import resolve_and_update
-                    first_unit = parsed_units[0][0]
-                    resolve_and_update(conn, config_hash, first_unit.clang_args, first_unit.file.resolve(), cwd=root)
-                except Exception:  # nosec B110 — macro expansion is best-effort
-                    pass
+            # No macro values here.  The value of a macro row is the
+            # definition of its name at the end of EACH unit of the build
+            # that reads its file (macros.store_values_of_build), and this
+            # call parses some units.  A row that it stored again has no
+            # value until the next index run.  Before, the first unit of
+            # the call wrote its definitions into each row of each name of
+            # the build, and an error of that pass was silently ignored.
 
             # Phase 4: clean up orphan files — files that existed in
             # the previous index but are now absent from the TU list.
@@ -3775,7 +3814,7 @@ def _tu_for_header(
     the first entry: a C++ unit before a C unit, then the lowest stored
     path in sort order (``db.claim_order``).  The language of an entry is
     the one of its arguments, as compile_commands.json gives it to the run
-    (``compile_commands._detect_language``).  The caller uses this function
+    (``compile_commands.unit_language``).  The caller uses this function
     only for a header that no listing owns: a header with an owner goes to
     its owner first.
 
@@ -3788,7 +3827,7 @@ def _tu_for_header(
     ``str(Path)``: on Windows it gives ``C:\\ncs\\x.h`` for the key
     ``C:/ncs/x.h``, and a header outside the root never matched.
     """
-    from ...indexer.compile_commands import _detect_language
+    from ...indexer.compile_commands import unit_language
     from ...indexer.db import claim_order
     from ...indexer.manifest import tu_arguments
 
@@ -3804,7 +3843,7 @@ def _tu_for_header(
             if header != target_key:
                 continue
             # No flags hash: the caller orders the listings of the file that this gives.
-            position = claim_order((tu_file, ""), _detect_language(Path(tu_file), tu_arguments(manifest, entry)))
+            position = claim_order((tu_file, ""), unit_language(Path(tu_file), tu_arguments(manifest, entry)))
             if best is None or position < best:
                 best = position
             break

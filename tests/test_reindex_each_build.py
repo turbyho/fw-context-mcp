@@ -14,10 +14,11 @@ The fixture indexes two builds in-process (`runner.run`), as
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
+
+from tests._toolchains import Toolchain, write_compile_commands, write_sources
 
 PROJECT_ID = "5e1ec7ab1d5e1ec7ab1d5e1ec7ab1d00"
 
@@ -29,22 +30,20 @@ SOURCES = {
 }
 
 
-def _units(root: Path, files: list[str], define: str) -> list[dict]:
+def _units(root: Path, files: list[str], define: str, toolchain: Toolchain) -> list[dict]:
     return [
-        {"directory": str(root), "file": name, "arguments": ["cc", f"-D{define}", "-c", name, "-o", f"{name}.o"]}
+        {"directory": str(root), "file": name, "arguments": toolchain.arguments(name, f"-D{define}", output=f"{name}.o")}
         for name in files
     ]
 
 
 @pytest.fixture
-def two_builds(tmp_path: Path):
+def two_builds(tmp_path: Path, toolchain: Toolchain):
     """A project of the two builds ``a`` and ``b``; returns ``(root, db_path)``."""
     from fw_context_mcp.indexer.runner import run
 
     root = tmp_path / "proj"
-    for name, text in SOURCES.items():
-        (root / name).parent.mkdir(parents=True, exist_ok=True)
-        (root / name).write_text(text, encoding="utf-8")
+    write_sources(root, SOURCES)
     index_dir = tmp_path / "index"
     (root / ".fw-context").mkdir()
     (root / ".fw-context" / "config.toml").write_text(f'[project]\nid = "{PROJECT_ID}"\n', encoding="utf-8")
@@ -54,8 +53,7 @@ def two_builds(tmp_path: Path):
         ("a", ["src/main.c", "src/shared.c", "src/only_a.c"], "BOARD_A"),
         ("b", ["src/main.c", "src/shared.c"], "BOARD_B"),
     ):
-        cc = root / f"cc_{variant}.json"
-        cc.write_text(json.dumps(_units(root, files, define)), encoding="utf-8")
+        cc = write_compile_commands(root / f"cc_{variant}.json", _units(root, files, define, toolchain))
         run(
             compile_commands=cc, db_path=db_path, project_root=root, project_id=PROJECT_ID,
             index_refs=False, index_embeddings=False, analyze_symbols=False,
@@ -253,7 +251,7 @@ def test_the_top_level_sums_the_units_that_did_not_parse(tmp_path):
     assert answer["translation_units"] == 4 and answer["symbols_updated"] == 7
 
 
-def test_a_unit_that_does_not_parse_is_skipped_as_in_the_index_run(tmp_path):
+def test_a_unit_that_does_not_parse_is_skipped_as_in_the_index_run(tmp_path, toolchain):
     """The index run skips a unit whose parse raises ValueError, and reindex_file let the ValueError leave the tool.
 
     The parse raises ValueError when `__WCHAR_TYPE__` is no integer type:
@@ -264,19 +262,20 @@ def test_a_unit_that_does_not_parse_is_skipped_as_in_the_index_run(tmp_path):
 
     root = tmp_path / "proj"
     (root / "src").mkdir(parents=True)
-    (root / "src/ok.cpp").write_text("int ok_value(void) { return 1; }\n", encoding="utf-8")
-    (root / "src/wide.cpp").write_text("typedef wchar_t wide_t;\nint wide_value(wide_t c) { return (int)c; }\n", encoding="utf-8")
+    write_sources(root, {
+        "src/ok.cpp": "int ok_value(void) { return 1; }\n",
+        "src/wide.cpp": "typedef wchar_t wide_t;\nint wide_value(wide_t c) { return (int)c; }\n",
+    })
     index_dir = tmp_path / "index"
     (root / ".fw-context").mkdir()
     (root / ".fw-context" / "config.toml").write_text(f'[project]\nid = "{PROJECT_ID}"\n', encoding="utf-8")
     (root / ".fw-context" / "local.toml").write_text(f'[index]\ndb_dir = "{index_dir.as_posix()}"\n', encoding="utf-8")
     db_path = index_dir / PROJECT_ID / "index.db"
-    cc = root / "cc_a.json"
-    cc.write_text(json.dumps([
+    cc = write_compile_commands(root / "cc_a.json", [
         {"directory": str(root), "file": name,
-         "arguments": ["c++", "-U__WCHAR_TYPE__", "-D__WCHAR_TYPE__=float", "-c", name, "-o", f"{name}.o"]}
+         "arguments": toolchain.arguments(name, "-U__WCHAR_TYPE__", "-D__WCHAR_TYPE__=float", output=f"{name}.o")}
         for name in ("src/ok.cpp", "src/wide.cpp")
-    ]), encoding="utf-8")
+    ])
     run(
         compile_commands=cc, db_path=db_path, project_root=root, project_id=PROJECT_ID,
         index_refs=False, index_embeddings=False, analyze_symbols=False, variant="a",

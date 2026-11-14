@@ -21,10 +21,11 @@ level and miss two.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
+
+from tests._toolchains import Toolchain, write_compile_commands, write_sources
 
 pytestmark = pytest.mark.libclang
 
@@ -48,7 +49,7 @@ int use(void) { return twice<int>(2) + box_of_int.get(); }
 """
 
 
-def _extract(tmp_path: Path, text: str) -> list:
+def _extract(tmp_path: Path, text: str, toolchain: Toolchain) -> list:
     """Run the real extractor over *text* and give its symbols."""
     from fw_context_mcp.indexer.compile_commands import parse as parse_cc
     from fw_context_mcp.indexer.symbols import extract_all
@@ -56,56 +57,51 @@ def _extract(tmp_path: Path, text: str) -> list:
     root = tmp_path / "proj"
     (root / "src").mkdir(parents=True)
     main = root / "src" / "main.cpp"
-    main.write_text(text, encoding="utf-8")
+    write_sources(root, {"src/main.cpp": text})
 
-    cc = root / "compile_commands.json"
-    cc.write_text(
-        json.dumps([{
-            "directory": str(root),
-            "file": str(main),
-            "arguments": ["c++", "-std=c++17", "-c", str(main)],
-        }]),
-        encoding="utf-8",
+    cc = write_compile_commands(
+        root / "compile_commands.json",
+        [{"directory": str(root), "file": str(main), "arguments": toolchain.arguments(str(main), "-std=c++17")}],
     )
     unit = next(iter(parse_cc(cc)))
     return extract_all(unit).symbols
 
 
 class TestTemplateUsrIsFilled:
-    def test_at_least_one_instance_is_linked(self, tmp_path: Path) -> None:
+    def test_at_least_one_instance_is_linked(self, tmp_path: Path, toolchain) -> None:
         # The defect was invisible one symbol at a time: an empty
         # template_usr is the right answer for a symbol that instantiates
         # nothing, and every answer was empty.  A count is what shows it.
-        linked = [s for s in _extract(tmp_path, SOURCE) if s.template_usr]
+        linked = [s for s in _extract(tmp_path, SOURCE, toolchain) if s.template_usr]
         assert linked, "no symbol links to a template"
 
-    def test_a_variable_links_through_its_type(self, tmp_path: Path) -> None:
+    def test_a_variable_links_through_its_type(self, tmp_path: Path, toolchain) -> None:
         # `Box<int> box_of_int;` — the implicit specialization is not a child
         # of the translation unit, thus only the type declaration reaches it.
-        extracted = _extract(tmp_path, SOURCE)
+        extracted = _extract(tmp_path, SOURCE, toolchain)
         symbols = {s.name: s for s in extracted if s.template_usr}
         assert "box_of_int" in symbols
         template = next(s for s in extracted if s.is_template and s.name == "Box")
         assert symbols["box_of_int"].template_usr == template.usr
 
-    def test_two_instances_of_one_template_share_its_usr(self, tmp_path: Path) -> None:
-        symbols = {s.name: s for s in _extract(tmp_path, SOURCE) if s.template_usr}
+    def test_two_instances_of_one_template_share_its_usr(self, tmp_path: Path, toolchain) -> None:
+        symbols = {s.name: s for s in _extract(tmp_path, SOURCE, toolchain) if s.template_usr}
         assert symbols["box_of_int"].template_usr == symbols["box_of_double"].template_usr
 
-    def test_the_template_itself_is_not_an_instance(self, tmp_path: Path) -> None:
+    def test_the_template_itself_is_not_an_instance(self, tmp_path: Path, toolchain) -> None:
         # A primary template instantiates nothing.  Its own row must stay
         # empty, or query_template_instances answers with the template.
-        templates = [s for s in _extract(tmp_path, SOURCE) if s.is_template]
+        templates = [s for s in _extract(tmp_path, SOURCE, toolchain) if s.is_template]
         assert templates, "the primary templates must be in the extraction"
         assert all(not s.template_usr for s in templates)
 
-    def test_a_plain_type_links_to_nothing(self, tmp_path: Path) -> None:
+    def test_a_plain_type_links_to_nothing(self, tmp_path: Path, toolchain) -> None:
         plain = """\
 struct Plain { int value; };
 Plain plain_value;
 int use(void) { return plain_value.value; }
 """
-        assert not [s for s in _extract(tmp_path, plain) if s.template_usr]
+        assert not [s for s in _extract(tmp_path, plain, toolchain) if s.template_usr]
 
 
 class TestBindingEntryPoint:

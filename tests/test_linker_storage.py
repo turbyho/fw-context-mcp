@@ -20,6 +20,7 @@ from fw_context_mcp.indexer.db import (
     upsert_project,
 )
 from fw_context_mcp.indexer.linker_script import store_scripts
+from fw_context_mcp.path_key import ABSOLUTE_KEY_SQL
 
 SCRIPT = """\
 MEMORY
@@ -443,7 +444,7 @@ class TestTheContentOfTheScript:
             with transaction(conn):
                 store_scripts(conn, "ch", [_script(tmp_path)], tmp_path)
             empty = conn.execute(
-                "SELECT 1 FROM files WHERE config_hash = 'ch' AND content = '' AND path NOT LIKE '/%' LIMIT 1"
+                f"SELECT 1 FROM files WHERE config_hash = 'ch' AND content = '' AND NOT {ABSOLUTE_KEY_SQL} LIMIT 1"
             ).fetchone()
         finally:
             conn.close()

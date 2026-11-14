@@ -36,10 +36,9 @@ class TestIARBuildSystem:
 
     def test_convert_no_ewp_found_raises(self, tmp_path, monkeypatch):
         """When no .ewp exists and none configured, raise helpful error."""
-        import shutil
 
         from fw_context_mcp.indexer.build import BuildConfig
-        monkeypatch.setattr(shutil, "which", lambda x: "/usr/bin/keil2clangd")
+        monkeypatch.setattr("fw_context_mcp.indexer.builders.iar.require_build_tool", lambda names, cwd, cfg, hint: "keil2clangd")
 
         cfg = BuildConfig(system="iar-ewarm")
         builder = IARBuildSystem()
@@ -48,10 +47,9 @@ class TestIARBuildSystem:
 
     def test_convert_missing_project_file_raises(self, tmp_path, monkeypatch):
         """When specified .ewp doesn't exist, raise error."""
-        import shutil
 
         from fw_context_mcp.indexer.build import BuildConfig
-        monkeypatch.setattr(shutil, "which", lambda x: "/usr/bin/keil2clangd")
+        monkeypatch.setattr("fw_context_mcp.indexer.builders.iar.require_build_tool", lambda names, cwd, cfg, hint: "keil2clangd")
 
         cfg = BuildConfig(system="iar-ewarm", iar_project="Nonexistent.ewp")
         builder = IARBuildSystem()

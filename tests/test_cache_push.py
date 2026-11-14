@@ -574,7 +574,6 @@ def test_no_request_goes_after_the_first_that_failed():
 )
 def test_the_client_and_the_server_apply_the_same_limits(field, length, ok):
     """The two sides take their limits from one module, thus they cannot drift."""
-    pytest.importorskip("fastapi")
     import pydantic
 
     from fw_context_mcp.cache_limits import entry_violation
@@ -594,7 +593,6 @@ def test_the_client_and_the_server_apply_the_same_limits(field, length, ok):
 
 @pytest.mark.parametrize("bad_hash", ["a", "A" * 64, "g" * 64, "a" * 63])
 def test_a_bad_hash_breaks_the_limit_on_both_sides(bad_hash):
-    pytest.importorskip("fastapi")
     import pydantic
 
     from fw_context_mcp.cache_limits import entry_violation

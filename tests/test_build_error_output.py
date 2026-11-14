@@ -153,6 +153,36 @@ def test_a_timeout_that_captured_bytes_does_not_raise_again(monkeypatch, tmp_pat
     assert "partial" in str(exc.value)
 
 
+# ── An output that must not reach the message ──────────────────────────
+
+
+def test_a_failure_without_stdout_keeps_its_stderr_and_hint(monkeypatch, tmp_path):
+    """The data base of make -p holds each environment variable: a token must not reach the log."""
+    _fake_run(monkeypatch, _Result(2, stdout="API_TOKEN = secret-value\n", stderr="make: *** No rule to make target\n"))
+
+    with pytest.raises(RuntimeError) as exc:
+        run_build_command(
+            ["make"], cwd=tmp_path, description="make -Bnkwp", quote_stdout=False,
+            failure_hint="fw-context writes no compilation database.",
+        )
+
+    message = str(exc.value)
+    assert "secret-value" not in message
+    assert "No rule to make target" in message
+    assert "make -Bnkwp. fw-context writes no compilation database." in message
+
+
+def test_a_timeout_without_stdout(monkeypatch, tmp_path):
+    def _raise(*a, **kw):
+        raise subprocess.TimeoutExpired(cmd=["make"], timeout=1, output="API_TOKEN = secret-value\n", stderr="")
+
+    monkeypatch.setattr(utils_mod, "run_in_process_group", _raise)
+    with pytest.raises(RuntimeError) as exc:
+        run_build_command(["make"], cwd=tmp_path, description="make", timeout=1, quote_stdout=False)
+
+    assert "secret-value" not in str(exc.value)
+
+
 # ── Against a real subprocess ──────────────────────────────────────────
 
 

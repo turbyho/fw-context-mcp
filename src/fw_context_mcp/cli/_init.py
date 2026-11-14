@@ -1005,6 +1005,16 @@ def cmd_init(args: argparse.Namespace) -> int:
     if args.dry_run:
         print("\nDry-run complete. Run without --dry-run to apply changes.")
         return 0
+    from ._init_deps import missing_required
+
+    # A required dependency that is still missing: no index run can work,
+    # thus the setup is not complete, also when the files were written.
+    missing = missing_required(after_results)
+    if missing:
+        names = ", ".join(r.name for r in missing)
+        print(f"\nSetup incomplete: a required dependency does not work ({names}) — see the checklist above.",
+              file=sys.stderr)
+        return 1
     if quick:
         if not provisioned:
             print("\nProvisioning incomplete — see errors above.", file=sys.stderr)

@@ -22,8 +22,8 @@ from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 from ..mcp.shared.pid_file import PidFile
-from ..processes import kill_hard, process_argv_windows, request_stop
-from ..utils import remove_file, replace_file
+from ..processes import kill_hard, own_stop_token, process_argv_windows, request_stop
+from ..utils import remove_file, write_text_atomic
 
 # How long a run that was asked to stop (SIGTERM) gets to release the index
 # lock, and how long a run that got SIGKILL gets after that.  A cooperative
@@ -170,11 +170,12 @@ def write_takeover_marker(db_dir: Path, victim: int) -> None:
     victim, and only to classify a signal, thus a run that loses harms
     nothing with it.
     """
-    marker = db_dir / TAKEOVER_MARKER
-    temporary = marker.with_name(f".{marker.name}.{os.getpid()}")
+    # write_text_atomic: a temporary name of its own for each call.  The
+    # name of the process alone was one name for two tools of one MCP
+    # server that took the index over at the same time, and the rename of
+    # the second one failed (remove_takeover_marker).
     payload = {"taker": os.getpid(), "thread": threading.get_ident(), "victim": victim}
-    temporary.write_text(json.dumps(payload), encoding="utf-8")
-    replace_file(temporary, marker)
+    write_text_atomic(db_dir / TAKEOVER_MARKER, json.dumps(payload))
 
 
 def remove_takeover_marker(db_dir: Path) -> None:
@@ -321,6 +322,18 @@ def wait_for_the_lock(db_dir: Path, stack: ExitStack, pid: int, say: Callable[[s
     return False
 
 
+def run_pid_path(db_dir: Path, token: str) -> Path:
+    """Return the file in which a run with the stop *token* writes its own PID (``processes.own_stop_token``).
+
+    WHY: the daemon knows its run by the PID of ``Popen``.  On Windows the
+    ``python.exe`` of a virtual environment is a launcher, and the run is
+    its child with a different PID.  The markers of the run hold the PID of
+    the run, thus the daemon found no marker of its run to remove after a
+    kill.  The daemon knows the token, and this file gives it the PID.
+    """
+    return db_dir / f"run.{token}.pid"
+
+
 def claim_index(db_dir: Path, *, pid_marker: bool = True) -> None:
     """Write the pause marker and the pid marker.
 
@@ -329,9 +342,16 @@ def claim_index(db_dir: Path, *, pid_marker: bool = True) -> None:
     the pid marker tells every other process which run owns the index.  Both
     are claims, and a process that lost the lock owns nothing.
 
+    A run with a stop token (a run of the daemon) first writes its PID into
+    :func:`run_pid_path`: the daemon then finds each marker of the run, also
+    the markers of a run that it killed.
+
     Creates no directory: index_run_lock already does that before it takes
     the lock.
     """
+    token = own_stop_token()
+    if token is not None:
+        PidFile(run_pid_path(db_dir, token)).write()
     PidFile(db_dir / "reindex.pause").write()
     if pid_marker:
         PidFile(db_dir / "reindex.pid").write()
@@ -341,9 +361,14 @@ def release_index(db_dir: Path) -> None:
     """Drop the markers this process wrote, and only those.
 
     unlink_if_ours checks the PID, so a marker another run owns survives.
+    The file of :func:`run_pid_path` goes last: until the markers are gone,
+    the daemon needs it.
     """
     PidFile(db_dir / "reindex.pid").unlink_if_ours()
     PidFile(db_dir / "reindex.pause").unlink_if_ours()
+    token = own_stop_token()
+    if token is not None:
+        PidFile(run_pid_path(db_dir, token)).unlink_if_ours()
 
 
 def holder_kind(pid: int | None) -> str:

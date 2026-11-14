@@ -13,11 +13,24 @@ from fw_context_mcp.indexer.manifest import MANIFEST_FORMAT
 from fw_context_mcp.utils import compute_source_hash
 
 
-def _parsed(root: Path, tus: set[str] | None) -> dict[str, str] | None:
-    """``reparsed_tus`` as the runner gives it: each re-parsed TU with its source hash."""
+def _key(root: Path, unit) -> str:
+    """The key of the file of *unit*, as the manifest writes it."""
+    return Path(unit.file).relative_to(root).as_posix()
+
+
+def _parsed(root: Path, units: list, tus: set[str] | None) -> dict[int, str] | None:
+    """``reparsed_tus`` as the runner gives it: each re-parsed listing (its position in *units*) with its source hash.
+
+    Each listing of a file in *tus* counts as re-parsed.
+    """
     if tus is None:
         return None
-    return {tu: compute_source_hash(root / tu) for tu in tus}
+    return {i: compute_source_hash(root / _key(root, u)) for i, u in enumerate(units) if _key(root, u) in tus}
+
+
+def _listings(root: Path, units: list, headers: dict[str, list[dict]]) -> dict[int, list[dict]]:
+    """``tu_headers`` as the runner gives it: the headers of each listing (its position in *units*), from a list by file."""
+    return {i: headers[_key(root, u)] for i, u in enumerate(units) if _key(root, u) in headers}
 
 
 class TestComputeConfigHash:
@@ -793,12 +806,12 @@ class TestVendorPatternCarrier:
             db_dir=tmp_path / "index",
             compile_commands=tmp_path / "compile_commands.json",
             updated_count=1,
-            tu_headers={"src/main.cpp": [
+            tu_headers={0: [
                 {"path": "src/config.h", "hash": "FRESH", "generated": False}
             ]},
             vendor_patterns=vendor_patterns,
             config_hash="deadbeef",
-            reparsed_tus=_parsed(tmp_path, {"src/main.cpp"}),
+            reparsed_tus=_parsed(tmp_path, [unit], {"src/main.cpp"}),
             transient_defines=DEFAULT_TRANSIENT_DEFINES,
         )
 
@@ -939,9 +952,9 @@ class TestManifestEntryRefreshGuard:
             db_dir=tmp_path / "index",
             compile_commands=tmp_path / "compile_commands.json",
             updated_count=updated_count,
-            tu_headers={"src/main.cpp": [{"path": "src/config.h", "hash": "FRESH", "generated": False}]},
+            tu_headers={0: [{"path": "src/config.h", "hash": "FRESH", "generated": False}]},
             config_hash="deadbeef",
-            reparsed_tus=_parsed(tmp_path, reparsed),
+            reparsed_tus=_parsed(tmp_path, [unit], reparsed),
             transient_defines=DEFAULT_TRANSIENT_DEFINES,
         )
 
@@ -1054,9 +1067,9 @@ class TestOneEntryForEachListing:
             db_dir=tmp_path / "index",
             compile_commands=tmp_path / "compile_commands.json",
             updated_count=1,
-            tu_headers={"src/main.c": []} if with_tu_headers else None,
+            tu_headers=_listings(tmp_path, units, {"src/main.c": []}) if with_tu_headers else None,
             config_hash="deadbeef",
-            reparsed_tus=_parsed(tmp_path, {"src/main.c"}),
+            reparsed_tus=_parsed(tmp_path, units, {"src/main.c"}),
             transient_defines=DEFAULT_TRANSIENT_DEFINES,
         )
         assert result is not None
@@ -1151,8 +1164,8 @@ class TestManifestCheckpoint:
         result = _update_manifest_after_index(
             manifest=manifest, units=[main, new], project_root=tmp_path, db_dir=tmp_path / "index",
             compile_commands=tmp_path / "compile_commands.json", updated_count=1,
-            tu_headers={"src/main.c": []}, config_hash="deadbeef",
-            reparsed_tus=_parsed(tmp_path, {"src/main.c"}),
+            tu_headers={0: []}, config_hash="deadbeef",
+            reparsed_tus=_parsed(tmp_path, [main], {"src/main.c"}),
             transient_defines=DEFAULT_TRANSIENT_DEFINES, checkpoint_reached=2,
         )
 
@@ -1163,9 +1176,9 @@ class TestManifestCheckpoint:
     def test_a_listing_after_the_reached_position_keeps_its_old_entry(self, tmp_path: Path):
         """A file listed twice: the run stored the first listing, and stopped before the second.
 
-        tu_headers and reparsed_tus are keyed by file, thus the second
-        listing got a fresh entry with ITS new flags, and the next run kept
-        both listings as unchanged while the rows came from the first one.
+        The second listing got a fresh entry with ITS new flags, and the
+        next run kept both listings as unchanged while the rows came from
+        the first one.  Only the first listing was parsed.
         """
         from fw_context_mcp.indexer._manifest_updater import _update_manifest_after_index
 
@@ -1179,8 +1192,8 @@ class TestManifestCheckpoint:
         result = _update_manifest_after_index(
             manifest=manifest, units=[a, b_new], project_root=tmp_path, db_dir=tmp_path / "index",
             compile_commands=tmp_path / "compile_commands.json", updated_count=1,
-            tu_headers={"misc/empty.c": []}, config_hash="deadbeef",
-            reparsed_tus=_parsed(tmp_path, {"misc/empty.c"}),
+            tu_headers={0: []}, config_hash="deadbeef",
+            reparsed_tus={0: compute_source_hash(tmp_path / "misc/empty.c")},
             transient_defines=DEFAULT_TRANSIENT_DEFINES, checkpoint_reached=1,
         )
 
@@ -1205,8 +1218,8 @@ class TestManifestCheckpoint:
         result = _update_manifest_after_index(
             manifest=manifest, units=[a_new, b], project_root=tmp_path, db_dir=tmp_path / "index",
             compile_commands=tmp_path / "compile_commands.json", updated_count=1,
-            tu_headers={"misc/empty.c": []}, config_hash="deadbeef",
-            reparsed_tus=_parsed(tmp_path, {"misc/empty.c"}),
+            tu_headers={0: []}, config_hash="deadbeef",
+            reparsed_tus={0: compute_source_hash(tmp_path / "misc/empty.c")},
             transient_defines=DEFAULT_TRANSIENT_DEFINES, checkpoint_reached=1,
         )
 
@@ -1670,12 +1683,12 @@ class TestNeedsReparse:
             db_dir=tmp_path / "index",
             compile_commands=tmp_path / "compile_commands.json",
             updated_count=1,
-            tu_headers={
+            tu_headers=_listings(tmp_path, units, {
                 "src/a.c": [{"path": "src/shared.h", "hash": "FRESH", "generated": generated}],
                 "src/b.c": [{"path": "src/shared.h", "hash": "FRESH", "generated": generated}],
-            },
+            }),
             config_hash="deadbeef",
-            reparsed_tus=_parsed(tmp_path, reparsed),
+            reparsed_tus=_parsed(tmp_path, units, reparsed),
             transient_defines=DEFAULT_TRANSIENT_DEFINES,
         )
 
@@ -2080,8 +2093,8 @@ def test_an_incremental_update_keeps_the_extension_sets(tmp_path: Path):
     _update_manifest_after_index(
         manifest=listing._manifest(tmp_path, [main]), units=[main], project_root=tmp_path,
         db_dir=tmp_path / "index", compile_commands=cc, updated_count=1,
-        tu_headers={"src/main.c": []}, config_hash="deadbeef",
-        reparsed_tus=_parsed(tmp_path, {"src/main.c"}), transient_defines=DEFAULT_TRANSIENT_DEFINES,
+        tu_headers={0: []}, config_hash="deadbeef",
+        reparsed_tus=_parsed(tmp_path, [main], {"src/main.c"}), transient_defines=DEFAULT_TRANSIENT_DEFINES,
     )
 
     assert load_tu_extensions(tmp_path / "index", "deadbeef") == frozenset({".c", ".S"})

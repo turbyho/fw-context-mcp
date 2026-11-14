@@ -19,14 +19,16 @@ the query.
 import pytest
 
 import fw_context_mcp  # noqa: F401  — must precede sqlite3
-from fw_context_mcp.indexer.compile_commands import CompilationUnit
 from fw_context_mcp.indexer.db import open_db, transaction, upsert_build_config, upsert_project
 from fw_context_mcp.indexer.db._callgraph import (
     _runtime_registrations,
     _user_irq_offset,
 )
+from fw_context_mcp.indexer.macros import MacroDefinition, UnitMacros, store_values_of_build
 from fw_context_mcp.indexer.nvic import RUNTIME_VECTOR_REF_KIND
 from fw_context_mcp.indexer.ops import store_symbols_for_unit
+from fw_context_mcp.path_key import canonical_path
+from tests._toolchains import unit_of
 
 pytestmark = pytest.mark.libclang
 
@@ -48,17 +50,22 @@ void RTC1_IRQHandler(void);
 """
 
 
-def _index(tmp_path, code, filename="us_ticker.c"):
+def _index(tmp_path, code, filename="us_ticker.c", *, toolchain):
     """Store *code* through the indexer, and return the connection."""
     src = tmp_path / filename
     src.write_text(_PRELUDE + code, encoding="utf-8")
-    unit = CompilationUnit(file=src, directory=tmp_path, language="c",
-                           clang_args=["-std=c11"])
+    unit = unit_of(src, toolchain, ["-std=c11"], directory=tmp_path, language="c")
     conn = open_db(tmp_path / "index.db")
     with transaction(conn):
         upsert_project(conn, "pid", "p", str(tmp_path))
         upsert_build_config(conn, CONFIG, "pid", "cc.json")
     store_symbols_for_unit(conn, unit, CONFIG, tmp_path, index_refs=True)
+    # The macros step of the run: the definition at the end of the one unit.
+    # A fake gives the answer of clang -dM -E for this file, thus the test
+    # needs no clang binary.
+    answer = UnitMacros({"NVIC_USER_IRQ_OFFSET": MacroDefinition("16", "", False)}, frozenset({canonical_path(src)}))
+    with transaction(conn):
+        store_values_of_build(conn, CONFIG, [unit], canonical_path(tmp_path), answer_of=lambda _unit: answer)
     conn.commit()
     return conn
 
@@ -81,19 +88,19 @@ def _refs(conn):
 class TestWhatTheIndexerRecords:
     """The pass over the call, and what it refuses to guess at."""
 
-    def test_a_registration_becomes_a_reference(self, tmp_path):
+    def test_a_registration_becomes_a_reference(self, tmp_path, toolchain):
         """The Mbed shape: the handler address cast to an integer."""
         conn = _index(tmp_path, """
 void us_ticker_init(void) {
     NVIC_SetVector(TIMER1_IRQn, (unsigned int) us_ticker_irq_handler);
 }
-""")
+""", toolchain=toolchain)
         try:
             assert _refs(conn) == [(9, "us_ticker_irq_handler")]
         finally:
             conn.close()
 
-    def test_the_irq_number_is_stored_unshifted(self, tmp_path):
+    def test_the_irq_number_is_stored_unshifted(self, tmp_path, toolchain):
         """The offset belongs to the reader, so the data holds the IRQ.
 
         Storing slot 25 here would write a target constant into the
@@ -103,13 +110,13 @@ void us_ticker_init(void) {
 void init(void) {
     NVIC_SetVector(RTC1_IRQn, (unsigned int) RTC1_IRQHandler);
 }
-""")
+""", toolchain=toolchain)
         try:
             assert _refs(conn) == [(17, "RTC1_IRQHandler")]
         finally:
             conn.close()
 
-    def test_two_call_sites_are_two_references(self, tmp_path):
+    def test_two_call_sites_are_two_references(self, tmp_path, toolchain):
         """Two drivers register the same slot, and both places count.
 
         Measured: the I2C/SPI slots are registered from ``spi_api.c`` and
@@ -122,7 +129,7 @@ void first(void) {
 void second(void) {
     NVIC_SetVector(TIMER1_IRQn, (unsigned int) us_ticker_irq_handler);
 }
-""")
+""", toolchain=toolchain)
         try:
             assert _refs(conn) == [
                 (9, "us_ticker_irq_handler"), (9, "us_ticker_irq_handler"),
@@ -130,7 +137,7 @@ void second(void) {
         finally:
             conn.close()
 
-    def test_two_irqs_on_one_line_are_two_references(self, tmp_path):
+    def test_two_irqs_on_one_line_are_two_references(self, tmp_path, toolchain):
         """One handler for two IRQs on one line: two slots, thus two rows.
 
         The key of a row once had no slot, thus the second IRQ was lost.
@@ -139,7 +146,7 @@ void second(void) {
 void init(void) {
     NVIC_SetVector(TIMER1_IRQn, (unsigned int) us_ticker_irq_handler); NVIC_SetVector(RTC1_IRQn, (unsigned int) us_ticker_irq_handler);
 }
-""")
+""", toolchain=toolchain)
         try:
             assert _refs(conn) == [
                 (9, "us_ticker_irq_handler"), (17, "us_ticker_irq_handler"),
@@ -147,33 +154,33 @@ void init(void) {
         finally:
             conn.close()
 
-    def test_a_computed_irq_records_nothing(self, tmp_path):
+    def test_a_computed_irq_records_nothing(self, tmp_path, toolchain):
         """A loop over interrupts names no slot, and a guess would lie."""
         conn = _index(tmp_path, """
 void init(void) {
     for (int i = 0; i < 4; i++)
         NVIC_SetVector((IRQn_Type) i, (unsigned int) us_ticker_irq_handler);
 }
-""")
+""", toolchain=toolchain)
         try:
             assert _refs(conn) == []
         finally:
             conn.close()
 
-    def test_an_address_that_is_not_a_function_records_nothing(self, tmp_path):
+    def test_an_address_that_is_not_a_function_records_nothing(self, tmp_path, toolchain):
         """A number in the second argument names no handler."""
         conn = _index(tmp_path, """
 void init(void) {
     NVIC_SetVector(TIMER1_IRQn, 0x20000100);
 }
-""")
+""", toolchain=toolchain)
         try:
             assert _refs(conn) == []
         finally:
             conn.close()
 
     def test_another_function_with_the_same_arguments_is_not_a_vector(
-        self, tmp_path,
+        self, tmp_path, toolchain,
     ):
         """Only the CMSIS names write the table.
 
@@ -185,7 +192,7 @@ void register_callback(IRQn_Type which, unsigned int fn);
 void init(void) {
     register_callback(TIMER1_IRQn, (unsigned int) us_ticker_irq_handler);
 }
-""")
+""", toolchain=toolchain)
         try:
             assert _refs(conn) == []
         finally:
@@ -195,12 +202,12 @@ void init(void) {
 class TestWhatTheReaderMakesOfIt:
     """The IRQ number becomes a slot, or nothing at all."""
 
-    def test_the_offset_comes_from_the_macro_table(self, tmp_path):
+    def test_the_offset_comes_from_the_macro_table(self, tmp_path, toolchain):
         conn = _index(tmp_path, """
 void init(void) {
     NVIC_SetVector(TIMER1_IRQn, (unsigned int) us_ticker_irq_handler);
 }
-""")
+""", toolchain=toolchain)
         try:
             assert _user_irq_offset(conn, CONFIG) == 16
             # IRQ 9 plus the offset is the slot of the table.
@@ -212,7 +219,7 @@ void init(void) {
         finally:
             conn.close()
 
-    def test_without_the_offset_no_slot_is_reported(self, tmp_path):
+    def test_without_the_offset_no_slot_is_reported(self, tmp_path, toolchain):
         """An index that never saw the macro must not assume 16.
 
         The registration is still in ``refs``; what cannot be done is
@@ -222,7 +229,7 @@ void init(void) {
 void init(void) {
     NVIC_SetVector(TIMER1_IRQn, (unsigned int) us_ticker_irq_handler);
 }
-""")
+""", toolchain=toolchain)
         try:
             conn.execute(
                 "DELETE FROM macros WHERE name = 'NVIC_USER_IRQ_OFFSET'")
@@ -232,7 +239,7 @@ void init(void) {
         finally:
             conn.close()
 
-    def test_two_call_sites_become_one_slot_with_two_entries(self, tmp_path):
+    def test_two_call_sites_become_one_slot_with_two_entries(self, tmp_path, toolchain):
         conn = _index(tmp_path, """
 void first(void) {
     NVIC_SetVector(TIMER1_IRQn, (unsigned int) us_ticker_irq_handler);
@@ -240,7 +247,7 @@ void first(void) {
 void second(void) {
     NVIC_SetVector(TIMER1_IRQn, (unsigned int) us_ticker_irq_handler);
 }
-""")
+""", toolchain=toolchain)
         try:
             found = _runtime_registrations(conn, CONFIG)
             assert set(found) == {25}

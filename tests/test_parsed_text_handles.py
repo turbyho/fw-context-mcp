@@ -12,19 +12,22 @@ Two reads of the disk stayed in the content fill after the parse:
 
 from __future__ import annotations
 
-import json
 import os
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
+from tests._toolchains import Toolchain, unit_of, write_compile_commands, write_sources
+
 pytestmark = pytest.mark.libclang
 
 MAIN = '#include "h.h"\nint main(void) { return 0; }\n'
 
 
-def _fill_after(root: Path, header_dir: str, include_dir: str, header: str, change: Callable[[Path], None]) -> str:
+def _fill_after(
+    root: Path, header_dir: str, include_dir: str, header: str, change: Callable[[Path], None], toolchain: Toolchain,
+) -> str:
     """Parse the unit, apply *change* to the header, run the content fill, return the stored header text."""
     from fw_context_mcp.indexer.compile_commands import parse as parse_cc
     from fw_context_mcp.indexer.db import open_db, transaction, upsert_build_config, upsert_file, upsert_project
@@ -33,14 +36,12 @@ def _fill_after(root: Path, header_dir: str, include_dir: str, header: str, chan
 
     (root / header_dir).mkdir(parents=True, exist_ok=True)
     header_path = root / header_dir / "h.h"
-    header_path.write_text(header, encoding="utf-8")
-    (root / "main.c").write_text(MAIN, encoding="utf-8")
-    cc = root / "compile_commands.json"
-    cc.write_text(json.dumps([{
+    write_sources(root, {f"{header_dir}/h.h": header, "main.c": MAIN})
+    cc = write_compile_commands(root / "compile_commands.json", [{
         "directory": str(root),
         "file": str(root / "main.c"),
-        "arguments": ["cc", "-c", str(root / "main.c"), "-I", str(root / include_dir)],
-    }]), encoding="utf-8")
+        "arguments": [*toolchain.arguments(str(root / "main.c")), "-I", str(root / include_dir)],
+    }])
 
     unit = next(iter(parse_cc(cc)))
     tu = extract_all(unit, return_tu=True).tu
@@ -71,18 +72,18 @@ def _rename_save(path: Path) -> None:
     os.replace(tmp, path)
 
 
-def test_a_header_reached_through_a_symlink_keeps_the_text_of_the_parse(tmp_path: Path) -> None:
+def test_a_header_reached_through_a_symlink_keeps_the_text_of_the_parse(tmp_path: Path, toolchain: Toolchain) -> None:
     root = tmp_path / "proj"
     root.mkdir()
     (root / "inc").symlink_to("real", target_is_directory=True)
     header = "/* header comment */\nint h_parsed(void);\n"
 
-    content = _fill_after(root, "real", "inc", header, _rename_save)
+    content = _fill_after(root, "real", "inc", header, _rename_save, toolchain)
 
     assert content == header
 
 
-def test_a_file_that_the_parse_did_not_load_is_read_from_the_disk(tmp_path: Path) -> None:
+def test_a_file_that_the_parse_did_not_load_is_read_from_the_disk(tmp_path: Path, toolchain) -> None:
     """``TranslationUnit.get_file`` raised AssertionError for a missing file.
 
     The constructor of ``File`` asserts a non-null pointer, thus the
@@ -91,7 +92,6 @@ def test_a_file_that_the_parse_did_not_load_is_read_from_the_disk(tmp_path: Path
     parse did not load gets a handle, and no text of the parse.
     """
     from fw_context_mcp.indexer._parsed_text import file_of_parse, parsed_bytes
-    from fw_context_mcp.indexer.compile_commands import CompilationUnit
     from fw_context_mcp.indexer.ops import _cached_read_lines, _clear_body_cache
     from fw_context_mcp.indexer.symbols import extract_all
 
@@ -99,7 +99,7 @@ def test_a_file_that_the_parse_did_not_load_is_read_from_the_disk(tmp_path: Path
     src.write_text(MAIN.replace('#include "h.h"\n', ""), encoding="utf-8")
     other = tmp_path / "other.c"
     other.write_text("int other(void) { return 1; }\n", encoding="utf-8")
-    unit = CompilationUnit(file=src, directory=tmp_path, language="c", clang_args=["-std=gnu11"])
+    unit = unit_of(src, toolchain, ["-std=gnu11"], directory=tmp_path, language="c")
     tu = extract_all(unit, return_tu=True).tu
 
     # libclang knows a file on the disk by its name, but holds no text of it.
@@ -110,7 +110,7 @@ def test_a_file_that_the_parse_did_not_load_is_read_from_the_disk(tmp_path: Path
     assert _cached_read_lines(str(tmp_path / "missing.h"), tu) is None
 
 
-def test_a_header_cut_after_the_parse_keeps_its_comment_lines(tmp_path: Path) -> None:
+def test_a_header_cut_after_the_parse_keeps_its_comment_lines(tmp_path: Path, toolchain: Toolchain) -> None:
     root = tmp_path / "proj"
     root.mkdir()
     header = "int h_decl(void);\n/* tail comment 1 */\n/* tail comment 2 */\n"
@@ -118,6 +118,6 @@ def test_a_header_cut_after_the_parse_keeps_its_comment_lines(tmp_path: Path) ->
     def cut(path: Path) -> None:
         path.write_text("int h_decl(void);\n", encoding="utf-8")
 
-    content = _fill_after(root, "src", "src", header, cut)
+    content = _fill_after(root, "src", "src", header, cut, toolchain)
 
     assert content == header

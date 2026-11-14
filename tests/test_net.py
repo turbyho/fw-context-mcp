@@ -207,3 +207,56 @@ def test_each_http_request_of_the_product_goes_through_net():
                     and node.value.id == "httpx" and node.attr in _HTTPX_REQUESTS):
                 found.append(f"{path.relative_to(SRC)}:{node.lineno} httpx.{node.attr}")
     assert found == []
+
+
+def test_a_client_loads_the_ca_bundle_no_more(monkeypatch):
+    """Each request makes a new client: its default transport and each proxy transport loaded the CA bundle again.
+
+    The loopback transport had the shared context already, but
+    ``httpx.Client`` got no ``verify``, thus each other transport made its
+    own (about 6 ms for each request).  The fake records each load of CA
+    certificates after the shared context exists.
+    """
+    import ssl
+
+    net._ssl_context(True)  # the one load of the process
+    loads: list[object] = []
+    real_load = ssl.SSLContext.load_verify_locations
+
+    def counting_load(self, *args, **kwargs):
+        loads.append(args or kwargs)
+        return real_load(self, *args, **kwargs)
+
+    monkeypatch.setattr(ssl.SSLContext, "load_verify_locations", counting_load)
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:3128")
+    for _ in range(3):
+        net.client("https://example.invalid/").close()
+    assert loads == []
+
+
+def test_a_change_of_the_ca_bundle_of_the_environment_gets_a_new_context(monkeypatch, tmp_path):
+    """SSL_CERT_FILE selects the CA bundle: the context of the process kept the bundle of the first request.
+
+    The same value gives the same context (one load), a new value a context
+    that trusts that bundle: here one CA, the first one of certifi.  A
+    context that only differs as an object, and still trusts the bundle of
+    certifi, ignored the variable again.
+    """
+    import certifi
+
+    pem = Path(certifi.where()).read_text(encoding="ascii")
+    end = "-----END CERTIFICATE-----"
+    bundle = tmp_path / "ca.pem"
+    bundle.write_text(pem[: pem.index(end) + len(end)] + "\n", encoding="ascii")
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+
+    default = net._ssl_context(True)
+    assert net._ssl_context(True) is default
+    assert len(default.get_ca_certs()) > 1, "the bundle of certifi"
+
+    monkeypatch.setenv("SSL_CERT_FILE", str(bundle))
+    own = net._ssl_context(True)
+    assert own is not default
+    assert len(own.get_ca_certs()) == 1, "only the CA of SSL_CERT_FILE"
+    assert net._ssl_context(False) is default, "without trust_env the variable does not count"

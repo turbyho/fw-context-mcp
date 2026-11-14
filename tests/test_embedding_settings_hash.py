@@ -144,7 +144,6 @@ def test_the_ollama_backend_names_its_document_prompt():
 
 
 def test_the_sentence_transformers_backend_names_its_prompt_and_its_dimension():
-    pytest.importorskip("numpy")
     from fw_context_mcp.llm.st_embedder import SentenceTransformerEmbedder
 
     assert SentenceTransformerEmbedder(LLMConfig()).document_settings == ""

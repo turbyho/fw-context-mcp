@@ -12,12 +12,12 @@ it — and both losses look like an ordinary empty answer.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
 
 from tests._toml import toml_string
+from tests._toolchains import write_compile_commands, write_sources
 
 pytestmark = pytest.mark.libclang
 
@@ -46,7 +46,7 @@ CONFIG_HASH = "hash-macro-params"
 
 
 @pytest.fixture
-def indexed(tmp_path: Path):
+def indexed(tmp_path: Path, toolchain):
     """Index the two files above and give the open connection and the root.
 
     The project carries a real ``.fw-context/config.toml``, thus a tool that
@@ -68,21 +68,13 @@ def indexed(tmp_path: Path):
         f'[project]\nid = "{PROJECT_ID}"\n\n[build]\n\n[index]\ndb_dir = {toml_string(tmp_path)}\n',
         encoding="utf-8",
     )
-    (root / "src" / "conf.h").write_text(HEADER, encoding="utf-8")
-    (root / "src" / "main.c").write_text(MAIN, encoding="utf-8")
+    write_sources(root, {"src/conf.h": HEADER, "src/main.c": MAIN})
 
-    cc = root / "compile_commands.json"
-    cc.write_text(
-        json.dumps([{
-            "directory": str(root),
-            "file": str(root / "src" / "main.c"),
-            "arguments": [
-                "cc", "-std=c11", "-c", str(root / "src" / "main.c"),
-                "-I", str(root / "src"),
-            ],
-        }]),
-        encoding="utf-8",
-    )
+    cc = write_compile_commands(root / "compile_commands.json", [{
+        "directory": str(root),
+        "file": str(root / "src" / "main.c"),
+        "arguments": [*toolchain.arguments(str(root / "src" / "main.c"), "-std=c11"), "-I", str(root / "src")],
+    }])
 
     db_path = tmp_path / PROJECT_ID / "index.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)

@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from tests._toolchains import parse_unit, unit_of
 from tests._usr_keys import base_names
 
 SOURCE = """\
@@ -40,13 +41,12 @@ CONVERSION = "R|c:@S@Wrap~s.cpp:12:8@F@operator void (*)(int)#1"
 
 
 @pytest.fixture(scope="module")
-def facts(tmp_path_factory):
-    from fw_context_mcp.indexer.compile_commands import CompilationUnit
+def facts(tmp_path_factory, toolchain):
     from fw_context_mcp.indexer.symbols import extract_all
 
     src: Path = tmp_path_factory.mktemp("syntactic") / "s.cpp"
     src.write_text(SOURCE, encoding="utf-8")
-    unit = CompilationUnit(file=src, directory=src.parent, language="cpp", clang_args=["-std=c++20"])
+    unit = unit_of(src, toolchain, ["-std=c++20"], directory=src.parent, language="cpp")
     return base_names(extract_all(unit, with_refs=True).slots, src)
 
 
@@ -86,14 +86,13 @@ def test_a_conversion_in_scalar_braces_flows_into_the_place(facts, text, target)
 
 
 @pytest.mark.libclang
-def test_a_long_list_with_no_class_element_reads_its_fields_a_few_times(tmp_path, monkeypatch):
+def test_a_long_list_with_no_class_element_reads_its_fields_a_few_times(tmp_path, monkeypatch, toolchain):
     """The type of the place reads all the fields of the list: one element must not ask it each time.
 
     A positional list of N scalars took time in N squared (3000 bytes: 113 s).
     """
     from fw_context_mcp.indexer import symbols
     from fw_context_mcp.indexer._slots import collect_slot_facts
-    from fw_context_mcp.indexer.symbols import _get_index
 
     src = tmp_path / "big.c"
     values = ", ".join(["1"] * 200)
@@ -111,6 +110,6 @@ def test_a_long_list_with_no_class_element_reads_its_fields_a_few_times(tmp_path
         return original(init_list)
 
     monkeypatch.setattr(symbols, "_positional_struct_fields", counted)
-    tu = _get_index().parse(str(src), args=["-x", "c", "-std=c11"])
+    tu = parse_unit(src, toolchain, ["-std=c11"])
     collect_slot_facts(tu, None, lambda p: Path(p).resolve())
     assert calls["n"] < 10, calls

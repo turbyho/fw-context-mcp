@@ -80,3 +80,22 @@ def test_a_checkpoint_that_cannot_write_does_not_stop_the_run(tmp_path: Path, mo
     )
 
     assert "manifest checkpoint not written" in caplog.text
+
+
+def test_the_two_states_of_the_marker(tmp_path: Path):
+    """Rows unseen (an index run repairs it) and no answer (the cause must be repaired first)."""
+    _run_marker.mark_pending(tmp_path, "cafe")
+    assert _run_marker.rows_unseen(tmp_path, "cafe")
+    assert _run_marker.no_answer_units(tmp_path, "cafe") == []
+
+    _run_marker.mark_no_answer(tmp_path, "cafe", [("src/b.c", "'missing.h' file not found")])
+    assert _run_marker.is_pending(tmp_path, "cafe"), "the next run asks the units again"
+    assert not _run_marker.rows_unseen(tmp_path, "cafe")
+    assert _run_marker.no_answer_units(tmp_path, "cafe") == [("src/b.c", "'missing.h' file not found")]
+
+
+def test_a_marker_that_cannot_be_read_is_rows_unseen(tmp_path: Path):
+    """The safe direction: the next run runs the macros step, and the daemon starts it."""
+    _run_marker.marker_path(tmp_path, "cafe").write_bytes(b"\xff{")
+
+    assert _run_marker.rows_unseen(tmp_path, "cafe")

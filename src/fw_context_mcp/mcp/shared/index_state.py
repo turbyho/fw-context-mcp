@@ -236,6 +236,7 @@ def _annotate(result, kw: dict, root: Path, db_path: Path):
     """Do the work of :func:`annotate_index_state` for a project with an index."""
     from ...indexer.autobuild import read_problem
     from ..background import read_reindex_state
+    from .stale import MACRO_NO_ANSWER_ACTION
 
     problem = read_problem(db_path.parent)
     run_state = read_reindex_state(root)
@@ -255,16 +256,20 @@ def _annotate(result, kw: dict, root: Path, db_path: Path):
         if problem is None or run_state in RUN_STATES:
             return result
         return _with_failed_text(result, problem.text)
-    reasons, checkout_moved = found
-    reasons += known
+    reasons = found.reasons + known
     state = index_state(bool(reasons), run_state=run_state, failed=problem is not None)
     if state is None:
         return result
     action = PLAIN_ACTION
-    if state == "not_scheduled" and (checkout_moved or facts.needs_build):
+    if state == "not_scheduled" and (found.checkout_moved or facts.needs_build):
         # The function reads the config and the markers of the build
         # system, thus the code asks it only here.
-        action = _build_action(root, checkout_moved=checkout_moved)
+        action = _build_action(root, checkout_moved=found.checkout_moved)
+    elif state == "not_scheduled" and reasons == [found.no_answer]:
+        # The only reason is a unit that the preprocessor cannot read: an
+        # index run alone repairs nothing, thus the advice is not "run the
+        # index" (the reason names the action).
+        action = MACRO_NO_ANSWER_ACTION
     advice = index_state_advice(
         state, reasons, problem_text=problem.text if problem is not None else "", action=action,
     )
@@ -292,19 +297,37 @@ def _with_failed_text(result, text: str):
     return result
 
 
+@dataclass(frozen=True)
+class _BuildReasons:
+    """The reasons why the index of a build is not current, and the facts that select the action."""
+
+    reasons: list[str]
+    checkout_moved: bool
+    #: The reason of the marker of the run in the state no answer (or "").
+    no_answer: str
+
+
 def _build_reasons(
     db_path: Path, root: Path, variant: str, image: str, *, count_files: bool,
-) -> tuple[list[str], bool] | None:
+) -> _BuildReasons | None:
     """Return the reasons why the index of the build of the query is not current.
 
-    The result is ``(reasons, checkout_moved)``, or None when the arguments
-    name no build: the handler then gave the refusal.  *count_files* adds
-    the count of the changed files of the build.
+    The result is None when the arguments name no build: the handler then
+    gave the refusal.  *count_files* adds the count of the changed files of
+    the build.
     """
     from ...config import load as load_config
+    from ...indexer._run_marker import read_state
     from ...indexer.git_context import read_head
     from .context import get_executor
-    from .stale import _count_modified_files, checkout_reason, outdated_index_fact, quick_structural_reasons
+    from .stale import (
+        MACRO_NO_ANSWER_ACTION,
+        _count_modified_files,
+        checkout_reason,
+        macro_no_answer_fact,
+        outdated_index_fact,
+        quick_structural_reasons,
+    )
     from .variants import resolve_build
 
     cfg = load_config(root)
@@ -336,6 +359,12 @@ def _build_reasons(
         manifest = manifest_reason(row["manifest_verification"] or "none")
         if manifest:
             reasons.append(manifest)
+        # The same for units to which the preprocessor gave no macro values
+        # (the marker of the run): a run repairs it only after the cause.
+        no_answer = macro_no_answer_fact(read_state(db_path.parent, config_hash))
+        if no_answer:
+            no_answer = f"{no_answer} — {MACRO_NO_ANSWER_ACTION}"
+            reasons.append(no_answer)
         moved = checkout_reason(row, live_head, root)
         if moved:
             reasons.append(moved)
@@ -343,6 +372,6 @@ def _build_reasons(
             modified = _count_modified_files(conn, config_hash, root, use_cache=False)
             if modified:
                 reasons.append(f"{modified} file(s) changed after the last index run")
-        return reasons, bool(moved)
+        return _BuildReasons(reasons, bool(moved), no_answer)
 
     return get_executor(db_path).execute_sync(_query, "")

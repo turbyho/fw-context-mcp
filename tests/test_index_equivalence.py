@@ -20,6 +20,7 @@ import shutil
 from pathlib import Path
 
 from fw_context_mcp.indexer.db import open_db
+from fw_context_mcp.path_key import ABSOLUTE_KEY_SQL
 
 # Fixtures are imported, not moved to conftest: `c_project` builds the whole
 # fake C project and depends on three module-level helpers there, so the move
@@ -134,7 +135,7 @@ def _content_snapshot(db_path: Path) -> dict[str, str]:
             row[0]: row[1]
             for row in conn.execute(
                 "SELECT path, content FROM files "
-                "WHERE config_hash=? AND path NOT LIKE '/%'",
+                f"WHERE config_hash=? AND NOT {ABSOLUTE_KEY_SQL}",
                 (_active_config_hash(conn),),
             ).fetchall()
         }

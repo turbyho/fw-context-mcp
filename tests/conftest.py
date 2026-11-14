@@ -2,7 +2,7 @@
 
 Provides:
 - Standard fixtures: tmpdir, temp_db, populated_db, isolation, etc.
-- Auto-skip for missing dependencies (Ollama, gcc/libclang)
+- The pre-test of the environment (tests/_environment.py): a missing component stops the run
 - Test result logging to tests/results/
 """
 
@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shutil
 import tempfile
 import time
 from collections.abc import Iterator
@@ -34,47 +33,21 @@ def _ensure_results_dir() -> Path:
     return _RESULTS_DIR
 
 
-def _check_ollama() -> bool:
-    """Check if Ollama is running and reachable."""
-    try:
-        import httpx
-        resp = httpx.get("http://127.0.0.1:11434/api/tags", timeout=2.0)
-        return resp.status_code == 200
-    except Exception:
-        return False
-
-
-def _check_gcc() -> bool:
-    """Check if gcc is available on PATH."""
-    return shutil.which("gcc") is not None
-
-
-# Cache checks so we don't spawn subprocesses / HTTP calls for every test
-_OLLAMA_AVAILABLE: bool | None = None
-_GCC_AVAILABLE: bool | None = None
-
-
-def ollama_available() -> bool:
-    global _OLLAMA_AVAILABLE
-    if _OLLAMA_AVAILABLE is None:
-        _OLLAMA_AVAILABLE = _check_ollama()
-    return _OLLAMA_AVAILABLE
-
-
-def gcc_available() -> bool:
-    global _GCC_AVAILABLE
-    if _GCC_AVAILABLE is None:
-        _GCC_AVAILABLE = _check_gcc()
-    return _GCC_AVAILABLE
-
-
-# ── Auto-skip hooks ────────────────────────────────────────────────────────
+# ── Session hooks ──────────────────────────────────────────────────────────
 
 _SESSION_START: float | None = None
 
 
 def pytest_configure(config):
-    """Ensure results directory exists, and isolate the session (``_isolate_session``)."""
+    """Ensure results directory exists, and isolate the session (``_isolate_session``).
+
+    The root of the test SDKs is read first (``tests.sdk.sdk_root`` keeps
+    it): it comes from the environment of the operator, and no later
+    change of the environment by a test or by the isolation moves it.
+    """
+    from tests.sdk import sdk_root
+
+    sdk_root()
     _ensure_results_dir()
     _isolate_session()
 
@@ -99,23 +72,73 @@ def pytest_sessionstart(session):
     _SESSION_START = time.monotonic()
 
 
-def pytest_collection_modifyitems(config, items):
-    """Auto-skip tests that require unavailable dependencies.
+# ── Toolchains of the embedded SDKs ───────────────────────────────────────
 
-    - Tests marked ``ollama`` are skipped when Ollama is not running.
-    - Tests marked ``libclang`` are skipped when gcc is not on PATH.
+
+def _toolchain_ids() -> list[str]:
+    from tests._toolchains import toolchain_ids
+
+    return toolchain_ids()
+
+
+@pytest.fixture(scope="session", params=_toolchain_ids())
+def toolchain(request):
+    """A toolchain of the test SDKs (``tests/_toolchains.py``); a test that takes it runs once with each.
+
+    Session scope: a fixture of a module or of a class can take it, and
+    pytest then groups the tests by toolchain.
     """
-    skip_ollama = pytest.mark.skip(reason="Ollama not available — install and start it for these tests")
-    skip_libclang = pytest.mark.skip(reason="gcc not available — install gcc for indexing tests")
+    from tests._toolchains import load_toolchain
 
-    for item in items:
-        if item.get_closest_marker("ollama"):
-            if not ollama_available():
-                item.add_marker(skip_ollama)
+    return load_toolchain(request.param)
 
-        if item.get_closest_marker("libclang"):
-            if not gcc_available():
-                item.add_marker(skip_libclang)
+
+@pytest.fixture(scope="session")
+def arm_toolchain():
+    """The ARM toolchain of the test SDKs (``arm-zephyr``), for a test of ARM code alone.
+
+    The assembly corpus (``tests/fixtures/asm``) is Cortex-M assembly, which
+    only an ARM toolchain assembles.  The pre-test checks the test SDKs for
+    a test that takes this fixture too (``tests/_environment.py``).
+    """
+    from tests._toolchains import ARM_TOOLCHAIN_ID, load_toolchain
+
+    return load_toolchain(ARM_TOOLCHAIN_ID)
+
+
+@pytest.fixture(scope="session")
+def sdk_toolchain():
+    """Give the toolchain of the test SDKs of an id (``sdk_toolchain("riscv-esp")``), for a test of one architecture.
+
+    WHY a function and not a parameter: a test of the comments of RISC-V
+    assembly applies to the RISC-V toolchain alone.  The pre-test checks
+    the test SDKs for a test that takes this fixture too.
+    """
+    from tests._toolchains import load_toolchain
+
+    return load_toolchain
+
+
+def pytest_collection_finish(session):
+    """Stop the run when a component that the selected tests need is missing (``tests/_environment.py``).
+
+    WHY after the collection: the markers and the fixtures of the selected
+    tests tell which components the run needs (``make``, ``ollama``, the
+    test SDKs of the fixtures ``toolchain``, ``arm_toolchain`` and
+    ``sdk_toolchain``), and ``-m`` and
+    ``-k`` select the tests before this hook.
+    WHY a stop and not a skip: a skipped test looks like a test that
+    passed, and the run then did not verify what it seemed to verify.
+    ``--collect-only`` runs no test, thus it needs no component.
+    """
+    if session.config.option.collectonly:
+        return
+    from tests._environment import check_environment, report
+
+    problems = check_environment(session.items, os.environ.get(_OPERATOR_HOME_ENV))
+    _isolation["environment_problems"] = [problem.component for problem in problems]
+    if problems:
+        pytest.exit(report(problems), returncode=pytest.ExitCode.USAGE_ERROR)
 
 
 def pytest_sessionfinish(session, exitstatus):
@@ -141,8 +164,7 @@ def pytest_sessionfinish(session, exitstatus):
         "tests_failed": failed,
         "tests_collected": collected,
         "duration_s": duration,
-        "ollama_available": ollama_available(),
-        "gcc_available": gcc_available(),
+        "environment_problems": _isolation.get("environment_problems"),
     }
 
     result_file.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")

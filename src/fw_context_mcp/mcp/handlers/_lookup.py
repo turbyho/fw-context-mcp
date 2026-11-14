@@ -24,6 +24,7 @@ from typing import Annotated
 from pydantic import Field
 
 from fw_context_mcp.indexer.db import count_macros, lookup_macro
+from fw_context_mcp.indexer.macros import expanded_fields
 from fw_context_mcp.mcp.handlers._search_fallbacks import _symbol_row_to_dict
 from fw_context_mcp.mcp.shared.context import _db_path
 from fw_context_mcp.mcp.shared.paging import clamp_offset, page_hint, page_notice, selector_args
@@ -158,9 +159,15 @@ def lookup_symbol(
         ``signature`` (how the macro is invoked: ``#define NAME``,
         ``#define NAME()`` or ``#define NAME(a, b)``), ``is_function_like``,
         ``value`` (the replacement text ALONE — the parameter list is not
-        part of it), and ``expanded_value`` (the definition that is in force
-        at the end of a unit, from ``clang -dM -E``; the macros in it are not
+        part of it).  The value of the macro in the build: the definition
+        of the name at the end of each C or C++ unit that reads the file
+        of the ``#define`` (``clang -dM -E``; the macros in it are not
         expanded).
+        ``expanded_value`` when all of those units agree, else
+        ``expanded_values``: a list of ``{state, units}`` items, ``state``
+        ``"defined"`` (with ``value``, ``params``, ``is_function_like``),
+        ``"undefined"`` or ``"no_answer"``.  Neither: the index has no
+        value (``reindex_file`` stored the file after the last index run).
         May also include ``template_usr``,
         ``parent_usr``, and ``llm_analysis`` (``{summary, inputs,
         outputs}``) when available.  A model wrote the text in
@@ -300,7 +307,7 @@ def lookup_symbol(
                             ),
                             "is_function_like": bool(m["is_function_like"]),
                             "value": m["value"],
-                            **({"expanded_value": m["expanded_value"]} if m["expanded_value"] else {}),
+                            **expanded_fields(m),
                         }
                         for m in _macro_rows
                     ]

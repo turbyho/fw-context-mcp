@@ -206,6 +206,30 @@ def clang_resource_instructions(ctx: dict, major: int, *, bundled: bool = True) 
     return "\n".join(lines)
 
 
+def clang_binary_instructions(ctx: dict) -> str:
+    """How to install the clang program (the preprocessor of the macro values and of the assembly units).
+
+    Any version: fw-context runs it as a preprocessor with the flags of each
+    unit, and the target of the flags selects the predefined macros.
+    """
+    system = ctx.get("system", sys.platform)
+    pkg = ctx.get("pkg_manager", "unknown")
+    lines = ["Install the clang program, and make sure that it is in PATH:"]
+    if system == "darwin":
+        lines.append("  xcode-select --install   (the Command Line Tools hold clang)")
+    elif system == "win32":
+        lines.append("  winget install LLVM.LLVM   (or the LLVM installer of https://github.com/llvm/llvm-project/releases)")
+    elif pkg == "apt":
+        lines.append("  sudo apt install clang")
+    elif pkg == "pacman":
+        lines.append("  sudo pacman -S clang")
+    elif pkg == "dnf":
+        lines.append("  sudo dnf install clang")
+    else:
+        lines.append("  the clang package of your distribution")
+    return "\n".join(lines)
+
+
 def ollama_instructions(ctx: dict) -> str:
     """How to install Ollama."""
     system = ctx.get("system", sys.platform)

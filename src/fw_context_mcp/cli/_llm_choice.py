@@ -57,16 +57,15 @@ def _is_terminal(stream: TextIO) -> bool:
         import msvcrt
         from ctypes import wintypes
 
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
-        kernel32.GetConsoleMode.restype = wintypes.BOOL
+        from .. import _win32
+
         mode = wintypes.DWORD()
         try:
             handle = msvcrt.get_osfhandle(stream.fileno())
         except (OSError, ValueError):
             # No file descriptor (the stream is closed, or an object without one).
             return False
-        return bool(kernel32.GetConsoleMode(handle, ctypes.byref(mode)))
+        return bool(_win32.kernel32.GetConsoleMode(handle, ctypes.byref(mode)))
     return stream.isatty()
 
 

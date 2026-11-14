@@ -297,8 +297,9 @@ def search_code(
         (``{summary, inputs, outputs}`` — written by a model, not by the
         code.  ``get_build_info().analysis.model`` names it). Fallback
         results include ``_fallback`` with the method name.  A macro
-        result also holds ``_macro_value`` and ``_macro_expanded_value``
-        when they are not empty.
+        result also holds ``_macro_value``, and ``_macro_expanded_value``
+        or ``_macro_expanded_values`` (see ``lookup_symbol``) when the
+        index has them.
 
         No match gives ``[]``.  A dict with ``error`` means the query
         failed.  When FTS5 refuses the query and no LIKE step finds a row,

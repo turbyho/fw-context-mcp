@@ -19,12 +19,11 @@ units behind them were never read.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
 
-pytest.importorskip("clang.cindex", reason="libclang not available")
+from tests._toolchains import write_compile_commands, write_sources
 
 GOOD = """\
 int reachable_after_the_bad_unit(void) {
@@ -64,24 +63,21 @@ class TestTheExceptionIsRecoverable:
 
 
 @pytest.fixture
-def project_with_a_missing_source(tmp_path: Path) -> Path:
+def project_with_a_missing_source(tmp_path: Path, toolchain) -> Path:
     """A compile_commands.json that lists a file which is not on disk.
 
     The shape a branch switch leaves behind: the database still names the
     generated source, and the tree no longer holds it.
     """
-    (tmp_path / "first.c").write_text(FIRST, encoding="utf-8")
-    (tmp_path / "good.c").write_text(GOOD, encoding="utf-8")
+    write_sources(tmp_path, {"first.c": FIRST, "good.c": GOOD})
     entries = [
-        {"directory": str(tmp_path), "file": name,
-         "arguments": ["cc", "-c", name, "-o", f"{name}.o"]}
+        {"directory": str(tmp_path), "file": name, "arguments": toolchain.arguments(name, output=f"{name}.o")}
         # `gone.c` sits in the middle: a run that stops on it leaves the
         # units behind it unread, which is what the failure looked like.
         for name in ("first.c", "gone.c", "good.c")
     ]
-    (tmp_path / "compile_commands.json").write_text(
-        json.dumps(entries), encoding="utf-8"
-    )
+    # The compiler must refuse gone.c: the file is not there.
+    write_compile_commands(tmp_path / "compile_commands.json", entries, broken={"gone.c": "gone.c"})
     return tmp_path
 
 
@@ -167,3 +163,32 @@ class TestTheRunSurvives:
         assert any("gone.c" in message for message in messages), (
             f"no log line names the skipped unit: {messages}"
         )
+
+
+class TestTheManifestMarksTheUnit:
+    """The manifest step parses a unit again when the run collected no headers of it: a unit libclang does not load is stale.
+
+    Rule of the index: an incomplete index is never valid.  Before, the
+    TranslationUnitLoadError left the manifest step and the run wrote no
+    manifest, thus the status showed no unit to parse again.
+    """
+
+    def test_the_full_manifest_marks_a_unit_that_does_not_load(self, project_with_a_missing_source, tmp_path):
+        from fw_context_mcp.indexer import manifest
+        from fw_context_mcp.indexer.compile_commands import parse
+
+        cc = project_with_a_missing_source / "compile_commands.json"
+        # generate() reads the project id of the config.
+        (project_with_a_missing_source / ".fw-context").mkdir()
+        (project_with_a_missing_source / ".fw-context" / "config.toml").write_text(
+            '[project]\nid = "testpid"\n', encoding="utf-8",
+        )
+        units = list(parse(cc))
+        db_dir = tmp_path / "db"
+        db_dir.mkdir()
+
+        config_hash = manifest.generate(cc, db_dir, project_with_a_missing_source, units, transient_defines=())
+
+        entries = {entry["file"]: entry for entry in manifest.load(db_dir, config_hash)["entries"]}
+        assert entries["gone.c"].get("needs_reparse") is True
+        assert not entries["first.c"].get("needs_reparse")

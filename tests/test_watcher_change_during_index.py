@@ -74,7 +74,7 @@ class TestChangeDuringIndex:
                 shutdown=asyncio.Event(),
                 dlog=DLOG,
                 ping_expired=ping_expired,
-                on_index_proc=lambda proc: None,
+                on_index_run=lambda run: None,
             )
         )
 

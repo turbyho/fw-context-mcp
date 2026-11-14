@@ -22,7 +22,7 @@ from pathlib import Path
 import pytest
 
 from fw_context_mcp.indexer.build import BuildConfig
-from fw_context_mcp.utils import build_tool_available, missing_tool_message, run_build_command
+from fw_context_mcp.utils import build_tool_available, find_build_tool, missing_tool_message, run_build_command
 from tests._stubs import WINDOWS, activate_name, system_path, write_activate, write_tool
 
 # A name that no system has, so that a west of the system cannot answer.
@@ -304,3 +304,150 @@ def test_the_id_of_the_activation_is_no_part_of_the_build_environment(tmp_path: 
     probe = [sys.executable, "-c", "import os, sys; sys.exit(1 if 'FWCTX_ACTIVATION_ID' in os.environ else 0)"]
 
     assert run_build_command(probe, cwd=tmp_path, build_cfg=BuildConfig(activate=str(script))).returncode == 0
+
+
+@pytest.mark.usefixtures("path_without_west")
+def test_the_path_of_a_tool_of_extra_path(tmp_path: Path) -> None:
+    """``find_build_tool`` gives the path of the program that the build runs, from the PATH of the build."""
+    tools = _tool_dir(tmp_path, TOOL)
+
+    found = find_build_tool(TOOL, tmp_path, BuildConfig(extra_path=[str(tools)]))
+
+    assert found is not None
+    assert Path(found).parent == tools
+
+
+@pytest.mark.usefixtures("path_without_west")
+def test_the_path_of_a_tool_of_the_activate_script(tmp_path: Path) -> None:
+    tools = _tool_dir(tmp_path, TOOL)
+    script = write_activate(tmp_path / activate_name(), prepend_path=[tools])
+
+    found = find_build_tool(TOOL, tmp_path, BuildConfig(activate=str(script)))
+
+    assert found is not None
+    assert Path(found).parent == tools
+
+
+def _cmake(root: Path, cfg: BuildConfig) -> None:
+    from fw_context_mcp.indexer.builders.generic_cmake import GenericCMakeBuildSystem
+
+    GenericCMakeBuildSystem().build(root, cfg)
+
+
+def _arduino(root: Path, cfg: BuildConfig) -> None:
+    from fw_context_mcp.indexer.builders.arduino import ArduinoBuildSystem
+
+    ArduinoBuildSystem().build(root, cfg)
+
+
+def _keil(root: Path, cfg: BuildConfig) -> None:
+    from fw_context_mcp.indexer.builders.keil import KeilBuildSystem
+
+    KeilBuildSystem().convert(root, cfg)
+
+
+def _iar(root: Path, cfg: BuildConfig) -> None:
+    from fw_context_mcp.indexer.builders.iar import IARBuildSystem
+
+    IARBuildSystem().convert(root, cfg)
+
+
+def _platformio(root: Path, cfg: BuildConfig) -> None:
+    from fw_context_mcp.indexer.builders.platformio import PlatformIOBuildSystem
+
+    PlatformIOBuildSystem().build(root, cfg)
+
+
+def _manual(root: Path, cfg: BuildConfig) -> None:
+    from fw_context_mcp.indexer.builders.manual import ManualBuildSystem
+
+    (root / "src").mkdir(exist_ok=True)
+    (root / "src" / "main.c").write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    cfg.source_dirs = ["src"]
+    cfg.compiler = "fwctx-test-cc"
+    ManualBuildSystem().generate(root, cfg)
+
+
+@pytest.mark.parametrize(("tool", "run", "missing"), [
+    pytest.param("cmake", _cmake, "cmake is required", id="cmake"),
+    pytest.param("arduino-cli", _arduino, "arduino-cli is required", id="arduino"),
+    pytest.param("keil2clangd", _keil, "keil2clangd is required", id="keil"),
+    pytest.param("keil2clangd", _iar, "keil2clangd is required", id="iar"),
+    pytest.param("pio", _platformio, "pio or platformio is required", id="platformio"),
+    pytest.param("fwctx-test-cc", _manual, "fwctx-test-cc is required", id="manual"),
+])
+def test_each_builder_finds_its_tool_on_the_path_of_the_build(tmp_path: Path, monkeypatch, tool, run, missing) -> None:
+    """A builder looked for its tool on the PATH of the fw-context process, and not of the build.
+
+    A build in the background (the daemon of an MCP client) has no PATH of
+    a shell, and ``[build] extra_path`` gives the tools.  Measured on macOS
+    (2026-11-13): "cmake is required" with cmake in ``extra_path``.  WHY
+    an empty PATH: the system directories of a host can hold cmake or
+    arduino-cli.
+    """
+    (tmp_path / "empty").mkdir()
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    project = tmp_path / "project"
+    project.mkdir()
+    with pytest.raises(RuntimeError, match=missing):
+        run(project, BuildConfig())
+
+    tools = _tool_dir(tmp_path, tool)
+    try:
+        run(project, BuildConfig(extra_path=[str(tools)]))
+    except RuntimeError as exc:
+        # The stub of the tool does nothing, thus a later step can fail:
+        # the lookup must not.
+        assert missing not in str(exc)
+
+
+@pytest.mark.usefixtures("path_without_west")
+def test_the_output_of_the_activate_script_is_no_path(tmp_path: Path) -> None:
+    """An activate script that writes a line without its end: the answer is the line after the mark alone."""
+    tools = _tool_dir(tmp_path, TOOL)
+    script = write_activate(tmp_path / activate_name(), prepend_path=[tools], echo="env ready")
+
+    found = find_build_tool(TOOL, tmp_path, BuildConfig(activate=str(script)))
+
+    assert found is not None
+    assert Path(found).parent == tools
+
+
+@pytest.mark.usefixtures("path_without_west")
+def test_the_first_of_the_names_that_the_build_finds(tmp_path: Path) -> None:
+    """``("pio", "platformio")``: the second name when the first is not there, from one lookup."""
+    tools = _tool_dir(tmp_path, "fwctx-test-platformio")
+    script = write_activate(tmp_path / activate_name(), prepend_path=[tools])
+
+    found = find_build_tool(("fwctx-test-pio", "fwctx-test-platformio"), tmp_path, BuildConfig(activate=str(script)))
+
+    assert found is not None
+    assert Path(found).stem == "fwctx-test-platformio"
+
+
+@pytest.mark.usefixtures("path_without_west")
+def test_a_relative_directory_of_extra_path_is_relative_to_the_build(tmp_path: Path, monkeypatch) -> None:
+    """The build runs in its own directory, and the system resolves a relative PATH entry there."""
+    project = tmp_path / "project"
+    _tool_dir(project, TOOL)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    found = find_build_tool(TOOL, project, BuildConfig(extra_path=["toolchain/bin"]))
+
+    assert found is not None
+    assert Path(found).parent == project / "toolchain" / "bin"
+
+
+def test_a_relative_compiler_is_relative_to_the_build(tmp_path: Path, monkeypatch) -> None:
+    project = tmp_path / "project"
+    tool = write_tool(project / "tools", "fwctx-test-cc")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    found = find_build_tool(f"tools/{tool.name}", project, BuildConfig())
+
+    assert found is not None
+    assert Path(found) == tool

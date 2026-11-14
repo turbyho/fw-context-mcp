@@ -9,7 +9,7 @@ then delegate to the appropriate backend to produce a fresh, complete
 compile_commands.json.
 
 Supports Mbed OS, Zephyr, PlatformIO, CMake, Arduino, Keil MDK, IAR EWARM,
-bare Makefile (via compiledb), and bare/manual mode.
+bare Makefile (via the log of make -Bnkwp), and bare/manual mode.
 """
 
 from __future__ import annotations
@@ -73,7 +73,7 @@ class BuildConfig:
         makefile: Path to Makefile (default: ``Makefile`` in project root).
         make_target: Make build target (default: ``"all"``).
         make_vars: Extra variables passed to make (e.g. ``{V: "1"}``).
-        make_dry_run: Use ``compiledb -n`` dry-run instead of real build.
+        make_dry_run: Read only the log of ``make -Bnkwp`` (dry run), no real build.
         out_dir_var: The Makefile variable of the output directory; a real build needs it.
         environment: The PlatformIO environment of the build (``pio run -e``).
         toolchain_path: Path to toolchain binaries (shared by Keil, IAR, Makefile).
@@ -140,11 +140,11 @@ class BuildConfig:
     iar_project: str | None = None  # path to .ewp
     iar_target: str | None = None  # target name within the project
 
-    # ── Makefile (generate via compiledb) ──
+    # ── Makefile (generate from the log of make -Bnkwp) ──
     makefile: str | None = None  # path to Makefile (default: project_root/Makefile)
     make_target: str = "all"  # build target
     make_vars: dict[str, str] = field(default_factory=dict)  # extra vars for make
-    make_dry_run: bool = True  # use compiledb -n (dry-run, no real build)
+    make_dry_run: bool = True  # only the log of make -Bnkwp (dry run, no real build)
     # The variable of the Makefile that names its output directory.  A real
     # build (make_dry_run = false) gets <out_dir_var>=<the absolute output
     # directory of the variant>, and it needs the name, because no variable
@@ -445,12 +445,12 @@ def check_completeness(cc_path: Path, project_root: Path) -> list[str]:
     Heuristic: count source files (.c, .cpp) in common directories and
     compare with the number of entries in compile_commands.json.
     """
-    import json
+    from .compile_commands import load_entries
 
     warnings: list[str] = []
     try:
-        data = json.loads(cc_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+        data = load_entries(cc_path)
+    except (OSError, ValueError):
         return ["Cannot parse compile_commands.json"]
 
     cc_count = len(data)
@@ -554,14 +554,14 @@ def generate_compile_commands(project_root: Path, cfg: BuildConfig) -> Path:
     WHY four paths: different build systems produce compile_commands.json
     differently.  Some require a full build (PlatformIO), others can convert
     their project files statically (Keil, IAR), and bare Makefiles can use
-    ``compiledb`` dry-run.  This function picks the cheapest available path.
+    ``make -Bnkwp`` dry run.  This function picks the cheapest available path.
 
     Auto-detects the build system when ``cfg.system`` is ``None``.
     The generation path is chosen by builder capability:
 
     1. **Shell override** — ``cfg.command`` runs as-is, highest priority.
     2. **Convert** — builder has ``convert()`` (Keil, IAR — no build).
-    3. **Generate** — builder has ``generate()`` (Makefile/compiledb, manual/bare).
+    3. **Generate** — builder has ``generate()`` (Makefile, manual/bare).
     4. **Build** — builder has ``build()`` (PlatformIO, Zephyr, Mbed OS, …).
 
     Raises ``RuntimeError`` when detection or generation fails.
@@ -674,7 +674,7 @@ def _generate_into(root: Path, cfg: BuildConfig) -> Path:
         log.info("Using convert path for %s", system)
         return builder.convert(root, cfg)
 
-    # ── Path 3: Generate (Makefile/compiledb, manual/bare) ──
+    # ── Path 3: Generate (Makefile, manual/bare) ──
     if hasattr(builder, "generate") and _can_generate(cfg, system):
         log.info("Using generate path for %s", system)
         return builder.generate(root, cfg)
@@ -853,7 +853,7 @@ def _can_convert(cfg: BuildConfig, system: str) -> bool:
 def _can_generate(cfg: BuildConfig, system: str) -> bool:
     """Check whether the configuration supports the generate path."""
     if system == "makefile":
-        # compiledb needs a Makefile
+        # The Makefile backend needs a Makefile
         return True  # Makefile builder always supports generate
     if system == "bare":
         return bool(cfg.source_dirs)

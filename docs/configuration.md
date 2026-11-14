@@ -116,7 +116,7 @@ This section controls how `fw-context index` generates `compile_commands.json`. 
 | `clean` | `true` | project | Always run a clean build before fw-context generates `compile_commands.json`. **Recommended.** A clean build ensures a complete `compile_commands.json` file. Set this key to `false`, or use `--no-clean`, for incremental builds. Note: a clean build always forces a full re-index. |
 | `command` | *(none)* | project | A full override for the build command. This key bypasses all automatic detection. Example: `"bear -- make -j4"`. |
 | `timeout` | `7200` | project | The build timeout, in seconds. Long first builds (Zephyr, ESP-IDF) must not fail at the previous 600 s limit. |
-| `python` | *(auto-detect)* | local | The Python interpreter for pip-based build tools, such as `mbed-cli`, `platformio`, `keil2clangd`, or `compiledb`. `fw-context init` detects this automatically. Set this key manually when automatic detection fails. Mbed OS requires it: without it, the build stops with an error. |
+| `python` | *(auto-detect)* | local | The Python interpreter for pip-based build tools, such as `mbed-cli`, `platformio`, or `keil2clangd`. `fw-context init` detects this automatically. Set this key manually when automatic detection fails. Mbed OS requires it: without it, the build stops with an error. |
 | `activate` | *(auto-detect)* | local | A script that sets up the environment of the build, for example the Zephyr/NCS toolchain script or the ESP-IDF export script. On Linux and macOS it is a shell script that fw-context sources before the build. On Windows it is a `.bat`, `.cmd` or `.ps1` script (see [Activate scripts](platforms.md#activate-scripts)). `fw-context init` detects this automatically. Set this key manually when automatic detection fails. |
 | `target` | *(auto-detect)* | project | The Mbed OS target board. fw-context detects this automatically from `.mbed` or `custom_targets.json`. |
 | `toolchain` | *(auto-detect)* | project | The Mbed OS toolchain. fw-context detects this automatically from `.mbed`. |
@@ -125,7 +125,7 @@ This section controls how `fw-context index` generates `compile_commands.json`. 
 | `extra_profiles` | `["lto.json"]` | project | Additional Mbed OS profiles. fw-context resolves these paths relative to `mbed-os/tools/profiles/extensions/`. |
 | `defines` | `[]` | project | Extra preprocessor macros that fw-context passes to the compiler as `-D` flags. Example: `["VERSION_FW_MAJOR=4", "DEV"]`. This key is useful for conditional code paths, because it makes fw-context index `#ifdef DEV` branches too. |
 | `board` | *(required)* | project | The Zephyr board name. You must set this key explicitly for Zephyr projects. |
-| `fqbn` | *(none)* | project | The Arduino fully qualified board name, for example `"arduino:avr:uno"`. `fw-context init` asks for this value when you select the Arduino build system interactively. |
+| `fqbn` | *(none)* | project | The Arduino fully qualified board name, for example `"arduino:avr:uno"`. Without it, `arduino-cli` uses `default_fqbn` of `sketch.yaml`. `fw-context init` asks for this value when you select the Arduino build system interactively. |
 | `keil_project` | *(none)* | project | The path to the Keil MDK `.uvprojx` project file. `keil2clangd` converts this file to `compile_commands.json`. |
 | `iar_project` | *(none)* | project | The path to the IAR EWARM `.ewp` project file. `keil2clangd` converts this file to `compile_commands.json`. |
 | `source_dirs` | *(none)* | project | The source directories for the manual (bare) mode. `fw-context init` asks for this value when you select the bare mode interactively. |
@@ -570,11 +570,12 @@ no caller in the code. The SDK model gives the missing step. The built-in
 rules cover FreeRTOS, ESP-IDF, lwIP, POSIX `pthread_once`, the NVM of
 Nanostack (`platform_nvm_*`), the stdio of picolibc and avr-libc (the
 `put` function of a `FILE`, also from `fdevopen`), Zephyr threads, CMSIS
-(`NVIC_SetVector`, the RTX `osThreadNew` and `svcRtxThreadNew` up to RTX
-5.7) and the mbed `EventQueue` (an event goes through memory as
-`void *`). From CMSIS-RTX 5.8, the frame of a thread starts
-`osThreadEntry`, and that function gets no caller from the model. The
-rules of the `EventQueue`
+(`NVIC_SetVector`, the RTX `osThreadNew` and `svcRtxThreadNew`) and the
+mbed `EventQueue` (an event goes through memory as `void *`). From
+CMSIS-RTX 5.8, the frame of a thread starts `osThreadEntry`, which calls
+the function of the thread in C: when the build has `osThreadEntry`, the
+function of the thread gets `osThreadEntry` as its caller, and
+`osThreadEntry` itself has no caller. The rules of the `EventQueue`
 cover `call`, `call_in` and `call_every`. A handler of
 `queue.event(handler)` gets no caller from the model: the call graph loses
 the function where `EventQueue::event` gives it to the constructor of

@@ -30,6 +30,7 @@ import sqlite3
 import time
 from pathlib import Path, PurePosixPath
 
+from ...indexer import _run_marker
 from ...indexer.manifest import _hash_with_cache, load_tu_extensions
 from ...path_key import is_absolute_key
 from ...utils import (
@@ -187,7 +188,51 @@ def quick_structural_reasons(conn, cfg) -> list[str]:
         reasons.append(
             f"row format {stored_format or '(none)'} != {CURRENT_ROW_FORMAT}"
         )
+
+    # 4. Rows that no post-processing of the build saw (`_run_marker`, the
+    # state rows unseen): a run that stopped, a macros step that failed, or
+    # rows that reindex_file stored.  Their macro values are not in the
+    # index, and an index run writes them.  WHY here: the status tools and
+    # each query answer said "current", and the daemon did not start the
+    # run.  The state "no answer" is not here (see `macro_no_answer_fact`).
+    # One stat of a file.  An in-memory database (a test) has no marker.
+    db_dir = _database_directory(conn)
+    if db_dir is not None and _run_marker.rows_unseen(db_dir, cfg["config_hash"]):
+        reasons.append(POST_PROCESSING_REASON)
     return reasons
+
+
+#: The reason of the marker of the run in the state rows unseen.
+POST_PROCESSING_REASON = "the post-processing of an index run is not complete (macro values)"
+
+
+def _database_directory(conn) -> Path | None:
+    """Return the directory of the database of *conn*, or None for an in-memory database."""
+    db_file = conn.execute("PRAGMA database_list").fetchone()[2]
+    return Path(db_file).parent if db_file else None
+
+
+#: The action of the marker of the run in the state no answer.
+MACRO_NO_ANSWER_ACTION = "repair the cause, then run `fw-context index`"
+
+
+def macro_no_answer_fact(state: _run_marker.MarkerState | None) -> str:
+    """Return the fact of the marker of the run *state* (``_run_marker.read_state``) in the state no answer, or "".
+
+    The preprocessor of the last macros step gave no answer for some units
+    (a missing header, no clang): their macro rows say ``no_answer``.  An
+    index run alone repairs nothing, thus the fact names the units and the
+    errors, and the action (:data:`MACRO_NO_ANSWER_ACTION`) is to repair the
+    cause first.  WHY not in `quick_structural_reasons`: the start check of
+    the daemon reads that function, and a run at each start of the daemon
+    repaired nothing.
+    """
+    units = [] if state is None else list(state.no_answer)
+    if not units:
+        return ""
+    shown = "; ".join(f"{unit}: {reason}" for unit, reason in units[:3])
+    more = f"; and {len(units) - 3} more" if len(units) > 3 else ""
+    return f"the preprocessor gave no macro values for {len(units)} unit(s) ({shown}{more})"
 
 
 def checkout_reason(cfg, live_head: str, root: Path) -> str:

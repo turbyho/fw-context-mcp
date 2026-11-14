@@ -8,37 +8,35 @@ the entry ``needs_reparse``.
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from pathlib import Path
 
 import pytest
 
-pytest.importorskip("clang.cindex", reason="libclang not available")
+from tests._toolchains import write_compile_commands, write_sources
+
 pytestmark = pytest.mark.libclang
 
 PROJECT_ID = "fa11ed0afa11ed0afa11ed0afa11ed00"
 
 
 @pytest.fixture
-def project(tmp_path: Path):
+def project(tmp_path: Path, toolchain):
     """A project of two C units, indexed once with success; returns ``(root, db_path)``."""
     from fw_context_mcp.indexer.runner import run
 
     root = tmp_path / "proj"
     (root / "src").mkdir(parents=True)
-    (root / "src/a.c").write_text("int a_value(void) { return 1; }\n", encoding="utf-8")
-    (root / "src/b.c").write_text("int b_value(void) { return 2; }\n", encoding="utf-8")
+    write_sources(root, {"src/a.c": "int a_value(void) { return 1; }\n", "src/b.c": "int b_value(void) { return 2; }\n"})
     index_dir = tmp_path / "index"
     (root / ".fw-context").mkdir()
     (root / ".fw-context" / "config.toml").write_text(f'[project]\nid = "{PROJECT_ID}"\n', encoding="utf-8")
     (root / ".fw-context" / "local.toml").write_text(f'[index]\ndb_dir = "{index_dir.as_posix()}"\n', encoding="utf-8")
     db_path = index_dir / PROJECT_ID / "index.db"
-    cc = root / "compile_commands.json"
-    cc.write_text(json.dumps([
-        {"directory": str(root), "file": name, "arguments": ["cc", "-c", name, "-o", f"{name}.o"]}
+    cc = write_compile_commands(root / "compile_commands.json", [
+        {"directory": str(root), "file": name, "arguments": toolchain.arguments(name, output=f"{name}.o")}
         for name in ("src/a.c", "src/b.c")
-    ]), encoding="utf-8")
+    ])
     run(
         compile_commands=cc, db_path=db_path, project_root=root, project_id=PROJECT_ID,
         index_refs=False, index_embeddings=False, analyze_symbols=False, variant="a",

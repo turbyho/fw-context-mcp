@@ -21,17 +21,18 @@ inside ``value``, glued to the replacement text — ``MBED_ASSERT`` read
 
 from __future__ import annotations
 
-import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from tests._toolchains import parse_unit, write_sources
+
 pytestmark = pytest.mark.libclang
 
 
-def _macros(text: str) -> dict[str, object]:
-    """Extract the macros of *text* through the real extractor.
+def _macros(text: str, root: Path, toolchain) -> dict[str, object]:
+    """Extract the macros of *text* (written to ``root/probe.c``) through the real extractor.
 
     The return maps a macro name to its ``Macro`` record.
     """
@@ -39,14 +40,10 @@ def _macros(text: str) -> dict[str, object]:
 
     from fw_context_mcp.indexer.symbols import _extract_macros
 
-    path = Path(tempfile.mkdtemp()) / "probe.c"
-    path.write_text(text, encoding="utf-8")
+    path = root / "probe.c"
+    write_sources(root, {"probe.c": text})
 
-    tu = cx.Index.create().parse(
-        str(path),
-        args=["-std=c11"],
-        options=cx.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD,
-    )
+    tu = parse_unit(path, toolchain, ["-std=c11"], options=cx.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD)
     # A translation unit carries the macros of every builtin and every
     # system header as well.  Keep the ones this file defines.
     return {
@@ -69,31 +66,37 @@ int main(void) { return OBJ; }
 """
 
 
+@pytest.fixture(scope="module")
+def source_macros(tmp_path_factory, toolchain) -> dict[str, object]:
+    """The macros of SOURCE, parsed one time for each toolchain."""
+    return _macros(SOURCE, tmp_path_factory.mktemp("macros"), toolchain)
+
+
 class TestFunctionLikeFlag:
     @pytest.mark.parametrize("name", ["FN", "NOARGS", "VARIADIC", "MULTI"])
-    def test_macro_that_takes_arguments(self, name: str) -> None:
-        assert _macros(SOURCE)[name].is_function_like is True
+    def test_macro_that_takes_arguments(self, name: str, source_macros) -> None:
+        assert source_macros[name].is_function_like is True
 
     @pytest.mark.parametrize("name", ["EMPTY", "OBJ"])
-    def test_macro_that_takes_none(self, name: str) -> None:
-        assert _macros(SOURCE)[name].is_function_like is False
+    def test_macro_that_takes_none(self, name: str, source_macros) -> None:
+        assert source_macros[name].is_function_like is False
 
-    def test_a_space_before_the_paren_makes_it_object_like(self) -> None:
+    def test_a_space_before_the_paren_makes_it_object_like(self, source_macros) -> None:
         # The whole reason the rule reads offsets and not spelling.  The
         # value of SPACED is the text "(x)", not a parameter list.
-        macro = _macros(SOURCE)["SPACED"]
+        macro = source_macros["SPACED"]
         assert macro.is_function_like is False
         assert macro.value == "( x )"
 
-    def test_a_tab_before_the_paren_makes_it_object_like(self) -> None:
-        macro = _macros("#define TABBED\t(y)\nint main(void) { return 0; }\n")["TABBED"]
+    def test_a_tab_before_the_paren_makes_it_object_like(self, tmp_path, toolchain) -> None:
+        macro = _macros("#define TABBED\t(y)\nint main(void) { return 0; }\n", tmp_path, toolchain)["TABBED"]
         assert macro.is_function_like is False
 
-    def test_the_flag_is_not_always_false(self) -> None:
+    def test_the_flag_is_not_always_false(self, source_macros) -> None:
         # The defect this module is about was invisible one macro at a time:
         # False is a legitimate answer for an object-like macro, and every
         # answer was False.  A count is what shows it.
-        macros = _macros(SOURCE)
+        macros = source_macros
         assert sum(1 for m in macros.values() if m.is_function_like) == 4
 
 
@@ -107,29 +110,29 @@ class TestParameterListIsItsOwnField:
             ("MULTI", "a, b"),
         ],
     )
-    def test_params_holds_the_list(self, name: str, params: str) -> None:
-        assert _macros(SOURCE)[name].params == params
+    def test_params_holds_the_list(self, name: str, params: str, source_macros) -> None:
+        assert source_macros[name].params == params
 
-    def test_a_mixed_variadic_keeps_both(self) -> None:
-        macro = _macros("#define MIXED(a, ...) g(a, __VA_ARGS__)\n")["MIXED"]
+    def test_a_mixed_variadic_keeps_both(self, tmp_path, toolchain) -> None:
+        macro = _macros("#define MIXED(a, ...) g(a, __VA_ARGS__)\n", tmp_path, toolchain)["MIXED"]
         assert macro.params == "a, ..."
 
-    def test_value_no_longer_holds_the_list(self) -> None:
+    def test_value_no_longer_holds_the_list(self, source_macros) -> None:
         # The exact shape the V001 round reported: `value` opened with the
         # parameter list, thus the replacement text could not be read.
-        macro = _macros(SOURCE)["FN"]
+        macro = source_macros["FN"]
         assert macro.value == "( ( x ) + 1 )"
         assert not macro.value.startswith("( x )")
 
-    def test_an_object_like_macro_has_no_params(self) -> None:
-        macros = _macros(SOURCE)
+    def test_an_object_like_macro_has_no_params(self, source_macros) -> None:
+        macros = source_macros
         assert macros["OBJ"].params == ""
         assert macros["SPACED"].params == ""
 
-    def test_the_flag_separates_NAME_from_NAME_parens(self) -> None:
+    def test_the_flag_separates_NAME_from_NAME_parens(self, source_macros) -> None:
         # Both have an empty params, thus the string alone cannot tell them
         # apart — which is why is_function_like stays a field of its own.
-        macros = _macros(SOURCE)
+        macros = source_macros
         assert macros["NOARGS"].params == macros["OBJ"].params == ""
         assert macros["NOARGS"].is_function_like is True
         assert macros["OBJ"].is_function_like is False

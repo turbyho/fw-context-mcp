@@ -22,6 +22,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 from ...utils import windows_words
+from .._driver_options import DRIVER_TAKES_NEXT
 from ..linker_script import strip_comments
 
 log = logging.getLogger(__name__)
@@ -512,17 +513,6 @@ def _specs_problem(raw: str, cwd: Path, *, unquote: bool = True) -> str:
     return ""
 
 
-# The compiler driver options that take the NEXT argument as their value.
-# The value is no input file, also when a file of that name is on disk: a
-# map file of an earlier build is a text file.  `--for-linker` is an alias
-# of `-Xlinker` and `--library-directory` of `-L`, measured with `gcc -###`.
-_DRIVER_TAKES_NEXT = frozenset({
-    "-T", "-L", "-l", "-Xlinker", "--for-linker", "--library-directory", "-u", "-e", "-z", "-o",
-    "-x", "-B", "-include", "-imacros", "-isystem", "-idirafter", "-iprefix", "-iwithprefix",
-    "-MF", "-MT", "-MQ", "--param", "-wrapper", "-Xassembler", "-Xpreprocessor", "-aux-info",
-    "-specs", "--specs",
-})
-
 # The ld options that take the next argument as their value, from `ld
 # --help` (GNU ld 2.47).  An argument of ld after one of them is its value,
 # and no input file.
@@ -576,7 +566,10 @@ def _ld_arguments(tokens: list[str | None]) -> list[str]:
         elif token.startswith("-l"):
             arguments.append(token)
         elif token.startswith("-"):
-            if token in _DRIVER_TAKES_NEXT:
+            # The value of such an option is no input file, also when a
+            # file of that name is on disk: a map file of an earlier build
+            # is a text file.
+            if token in DRIVER_TAKES_NEXT:
                 index += 1
         else:
             arguments.append(token)

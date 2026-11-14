@@ -15,8 +15,15 @@ urls = {Homepage = "https://github.com/turbyho/fw-context-mcp", Documentation = 
 
 dependencies = [
     # net.py uses private parts of these two versions (its docstring).
-    "httpx>=0.27.0,<1",
+    # >=0.28: net._ssl_context_for makes the SSL context with the rules of
+    # httpx.create_ssl_context of 0.28 (0.27 also set ciphers and
+    # SSLKEYLOGFILE).
+    "httpx>=0.28.0,<1",
     "httpcore>=1.0,<2",
+    # The CA bundle of the SSL context of net.py (net._ssl_context_for).
+    # httpx requires it too; the line names the direct use.  MPL-2.0.
+    # >=2024.7.4: the release that removed the GLOBALTRUST roots.
+    "certifi>=2024.7.4",
     # The API keys of the LLM profiles go to the keyring of the system
     # (llm/secrets.py): macOS Keychain, Windows Credential Manager, Secret
     # Service on Linux.  MIT; on Linux it adds SecretStorage (BSD-3) and
@@ -75,6 +82,17 @@ dev = [
     "bandit>=1.7",
     # tests/test_packaging.py asks the sdist builder which files it selects.
     "hatchling>=1.27",
+    # The tests of the optional parts run in each test session: the cache
+    # server (fastapi, uvicorn) and the embedder of sentence-transformers
+    # (numpy).  WHY in dev: a test that did not find them skipped itself,
+    # and the run did not verify these parts.
+    "fw-context-mcp[cache-server,st]",
+    # tests/test_pip_output_encoding.py runs pip of this environment, and a
+    # virtual environment of uv has no pip.
+    "pip>=24",
+    # python -m tests.sdk.provision unpacks the Zephyr SDK.  For Windows
+    # the SDK release has 7z archives, and the standard library reads no 7z.
+    "py7zr>=1.1; sys_platform == 'win32'",
 ]
 
 [tool.bandit]
@@ -189,15 +207,17 @@ warn_redundant_casts = true
 
 [tool.pytest.ini_options]
 addopts = [
-    "-m", "not system and not slow and not live",
-    "--ignore=tests/builds/mbed_os/mbed-os/tools",
+    "-m", "not system and not slow and not live and not litellm and not extra_platforms",
 ]
 testpaths = ["tests"]
 markers = [
     "slow: tests that run full indexing and take 30+ minutes — manual invocation only (make test-slow)",
-    "ollama: tests that require a running Ollama instance",
-    "libclang: tests that require libclang and a C compiler (gcc/clang)",
+    "ollama: tests that require a running Ollama instance; the pre-test stops the run when it does not answer",
+    "libclang: tests that parse with libclang (make test leaves them out because they are slow)",
+    "make: tests that run a real make, with CC from the test SDKs; the pre-test stops the run when make does not run a recipe",
+    "sdk_project: tests that build and index a native project of a test SDK (Zephyr, PlatformIO); minutes each, thus not in make test, and in one CI job",
+    "extra_platforms: tests over the extended set of the test SDKs (Xtensa, ARM newlib, AVR, ESP-IDF, Arduino CLI); they run only through make test-platforms, after make test-sdk-platforms",
     "system: tests that require real build tools (gcc/CMake/Make/PlatformIO) and run index on test fixtures",
     "live: functional tests over the indexes that the machine already holds — they depend on local state, thus they run only through make test-live",
-    "litellm: tests that require a running LiteLLM proxy at localhost:4000",
+    "litellm: tests that require a LiteLLM proxy at localhost:4000 with the models of tests/_environment.py — they run only with -m litellm",
 ]

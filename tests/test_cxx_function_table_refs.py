@@ -15,6 +15,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._toolchains import unit_of
+
 SOURCE = """\
 typedef void (*cb_t)(int);
 static void dev_cb(int v) { (void)v; }
@@ -30,8 +32,7 @@ static pair designated = { .first = dev_cb };
 
 @pytest.fixture(scope="module", params=[("cpp", "t.cpp", ["-std=c++20"]), ("c", "t.c", ["-std=gnu11"])],
                 ids=["c++", "c"])
-def refs(request, tmp_path_factory):
-    from fw_context_mcp.indexer.compile_commands import CompilationUnit
+def refs(request, tmp_path_factory, toolchain):
     from fw_context_mcp.indexer.symbols import extract_all
 
     language, name, args = request.param
@@ -41,7 +42,7 @@ def refs(request, tmp_path_factory):
         text = text.replace("hal::irq", "irq").replace("static pair", "static struct pair")
     src: Path = tmp_path_factory.mktemp("cxxtable") / name
     src.write_text(text, encoding="utf-8")
-    unit = CompilationUnit(file=src, directory=src.parent, language=language, clang_args=args)
+    unit = unit_of(src, toolchain, args, directory=src.parent, language=language)
     result = extract_all(unit, with_refs=True)
     return text, [r for r in result.references if r.ref_kind == "indirect"]
 

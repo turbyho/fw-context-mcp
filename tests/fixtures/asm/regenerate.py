@@ -1,18 +1,19 @@
 #!/usr/bin/env python
 """Regenerate expected.toml from the assembler.
 
-    python tests/fixtures/asm/regenerate.py
+    python -m tests.fixtures.asm.regenerate      (from the root of the repository)
 
 Run this after adding a corpus file or changing one.  The expectations
-are not written by hand: `arm-none-eabi-gcc` assembles each file and
-`arm-none-eabi-nm` reads the symbol table, which is the only authority on
-what a file really defines.  Relocations answer the same question for a
-vector table — `.word Sym` makes one, a reserved `.word 0` does not.
+are not written by hand: the ARM toolchain of the test SDKs
+(``arm-zephyr``, ``tests/sdk/versions.toml``) assembles each file, and its
+`nm` reads the symbol table, which is the only authority on what a file
+really defines.  Relocations answer the same question for a vector table
+— `.word Sym` makes one, a reserved `.word 0` does not.
 
-`tests/test_asm_corpus.py` re-derives the same answer whenever an ARM
-toolchain is installed and fails if it disagrees, so a stale file is
-caught rather than trusted.  This script exists so that regenerating is
-reproducible for anyone, rather than living in somebody's shell history.
+`tests/test_asm_corpus.py` re-derives the same answer in each run and
+fails if it disagrees, so a stale file is caught rather than trusted.
+This script exists so that regenerating is reproducible for anyone,
+rather than living in somebody's shell history.
 
 COMPLETE below says the reader is expected to reproduce `defined`
 exactly.  A file listed False still carries its true expectations; the
@@ -21,20 +22,49 @@ flag is what turns the equality assertion on once the construct lands.
 
 from __future__ import annotations
 
+import functools
 import re
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 
 CORPUS = Path(__file__).parent
-ARM_BIN = Path.home() / ".platformio/packages/toolchain-gccarmnoneeabi/bin"
-# gcc, not as: a `.S` is "assembly that must be preprocessed", and `as`
-# alone does not run cpp.  Driving it through gcc is what a build does.
-GCC = ARM_BIN / "arm-none-eabi-gcc"
-NM = ARM_BIN / "arm-none-eabi-nm"
-OBJDUMP = ARM_BIN / "arm-none-eabi-objdump"
-FLAGS = ["-mcpu=cortex-m4", "-mthumb", "-c"]
+def toolchain():
+    """Return the ARM toolchain of the test SDKs, which assembles the corpus (read one time).
+
+    The corpus is Cortex-M assembly (Thumb, the comments `@` of ARM).
+    """
+    return _toolchain()
+
+
+@functools.cache
+def _toolchain():
+    from tests._toolchains import ARM_TOOLCHAIN_ID, load_toolchain
+
+    return load_toolchain(ARM_TOOLCHAIN_ID)
+
+
+def tool(name: str, chain=None) -> str:
+    """Return the program *name* (``gcc``, ``nm``, ``objdump``) of *chain* (default: ``toolchain()``).
+
+    gcc, not as: a `.S` is "assembly that must be preprocessed", and `as`
+    alone does not run cpp.  Driving it through gcc is what a build does.
+    The test gives the toolchain of its fixture, thus the oracle and the
+    test read the objects with the programs of one toolchain.
+    """
+    from tests._toolchains import find_driver
+
+    chain = chain or toolchain()
+    found = find_driver(chain.bin_dir, chain.prefix, name)
+    if found is None:
+        raise SystemExit(f"no {chain.prefix}{name} in {chain.bin_dir}: run python -m tests.sdk.provision")
+    return str(found)
+
+
+def flags() -> list[str]:
+    """Return the flags of the board of the ARM toolchain, and ``-c``."""
+    return [*toolchain().flags, "-c"]
+
 
 COMPLETE = {
     "altmacro": False,
@@ -86,7 +116,7 @@ DESCRIPTIONS = {
 def assemble(path: Path, out_dir: Path) -> Path:
     obj = out_dir / f"{path.stem}.o"
     run = subprocess.run(
-        [str(GCC), *FLAGS, "-o", str(obj), str(path)],
+        [tool("gcc"), *flags(), "-o", str(obj), str(path)],
         capture_output=True, text=True, timeout=60,
     )
     if run.returncode:
@@ -96,7 +126,7 @@ def assemble(path: Path, out_dir: Path) -> Path:
 
 def symbols(obj: Path) -> tuple[set[str], set[str]]:
     """Return (defined, undefined) from the object's symbol table."""
-    out = subprocess.run([str(NM), str(obj)], capture_output=True,
+    out = subprocess.run([tool("nm"), str(obj)], capture_output=True,
                          text=True, timeout=60)
     defined, undefined = set(), set()
     for line in out.stdout.splitlines():
@@ -120,7 +150,7 @@ def vector_targets(obj: Path) -> set[str]:
     The section is what separates the two, for the oracle exactly as for
     the reader.
     """
-    out = subprocess.run([str(OBJDUMP), "-r", str(obj)], capture_output=True,
+    out = subprocess.run([tool("objdump"), "-r", str(obj)], capture_output=True,
                          text=True, timeout=60)
     ordinary = re.compile(
         r"^\.(?:text|data|bss|rodata|init|fini|note|comment|debug|ARM)\b")
@@ -146,21 +176,21 @@ CALL_RELOCATIONS = frozenset({
 })
 
 
-def call_edges(obj: Path) -> set[str]:
+def call_edges(obj: Path, chain=None) -> set[str]:
     """Return "caller>target" for each call or jump relocation of `.text`.
 
     The caller is the function whose symbol (address and size, from nm)
     holds the place of the relocation.  The value of a Thumb function has
     bit 0 set, which is not part of its address.
     """
-    listed = subprocess.run([str(NM), "-S", "--defined-only", str(obj)],
+    listed = subprocess.run([tool("nm", chain), "-S", "--defined-only", str(obj)],
                             capture_output=True, text=True, timeout=60)
     functions: list[tuple[int, int, str]] = []
     for line in listed.stdout.splitlines():
         parts = line.split()
         if len(parts) == 4 and parts[2] in ("T", "t"):
             functions.append((int(parts[0], 16) & ~1, int(parts[1], 16), parts[3]))
-    out = subprocess.run([str(OBJDUMP), "-r", str(obj)], capture_output=True,
+    out = subprocess.run([tool("objdump", chain), "-r", str(obj)], capture_output=True,
                          text=True, timeout=60)
     edges: set[str] = set()
     section = ""
@@ -184,14 +214,10 @@ def quoted(items: set[str]) -> str:
 
 
 def main() -> int:
-    if not (GCC.exists() and NM.exists() and OBJDUMP.exists()):
-        print(f"no ARM toolchain under {ARM_BIN}", file=sys.stderr)
-        return 1
-
     lines = [
         "# Generated by regenerate.py, not written by hand.",
         "#",
-        "# `defined` is what arm-none-eabi-nm reports for the object each",
+        "# `defined` is what the nm of the ARM toolchain reports for the object each",
         "# corpus file assembles to, which is the only authority on what a",
         "# file really defines.  `undefined` is what it names and does not",
         "# define — a vector slot pointing at a linker symbol looks like",

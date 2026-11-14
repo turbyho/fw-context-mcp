@@ -10,7 +10,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from fw_context_mcp.utils import run_build_command, venv_program
+from fw_context_mcp.utils import require_build_tool, run_build_command, venv_program
 
 from ..build_layout import COMPILE_COMMANDS_NAME, BuildLayout
 from . import _link_command, _platformio_link, registry
@@ -117,15 +117,21 @@ class PlatformIOBuildSystem:
     # ── Build ──
 
     @staticmethod
-    def _pio_prefix(cfg: BuildConfig) -> list[str]:
-        """Return the command that runs the PlatformIO CLI, or raise."""
+    def _pio_prefix(project_root: Path, cfg: BuildConfig) -> list[str]:
+        """Return the command that runs the PlatformIO CLI, or raise.
+
+        ``pio`` or ``platformio`` on the PATH of the build
+        (``require_build_tool``: ``activate``, ``extra_path``), not of this
+        process.  One lookup gives the first of the two, and the build runs
+        the program that it found.
+        """
         if cfg.python:
             return [cfg.python, "-m", "platformio"]
-        if shutil.which("pio"):
-            return ["pio"]
-        if shutil.which("platformio"):
-            return ["platformio"]
-        raise RuntimeError("PlatformIO CLI is required.  Install it:  pip install platformio")
+        return [require_build_tool(
+            ("pio", "platformio"), project_root, cfg,
+            "Install the PlatformIO CLI (pip install platformio), and put it on PATH or its directory "
+            "into [build] extra_path, or set [build] python.",
+        )]
 
     def environments(self, project_root: Path, cfg: BuildConfig) -> list[str]:
         """Return the environments that ``pio run`` builds, or raise RuntimeError.
@@ -135,7 +141,7 @@ class PlatformIOBuildSystem:
         ``default_envs`` decide the set, and only PlatformIO applies them as
         its build does.  See ``_platformio_link.run_environments``.
         """
-        cmd = self._pio_prefix(cfg) + ["project", "config", "--project-dir", str(project_root), "--json-output"]
+        cmd = self._pio_prefix(project_root, cfg) + ["project", "config", "--project-dir", str(project_root), "--json-output"]
         # strict: the JSON names the environments (see run_build_command).
         result = run_build_command(
             cmd, cwd=project_root, description="pio project config", build_cfg=cfg, errors="strict",
@@ -208,7 +214,7 @@ class PlatformIOBuildSystem:
         projects: the root file kept its mtime, and the database was in
         ``out/<env>/``.
         """
-        pio_prefix = self._pio_prefix(cfg)
+        pio_prefix = self._pio_prefix(project_root, cfg)
         env_name = self._environment(project_root, cfg)
         layout = BuildLayout(project_root)
         out_dir = layout.out_dir(cfg.variant_name)

@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from tests._toolchains import parse_unit, unit_of
 from tests._usr_keys import base_names
 
 pytestmark = pytest.mark.libclang
@@ -196,14 +197,15 @@ void fire(int i, Chain &ch) {
 """
 
 
-def _facts(tmp_path: Path, name: str, code: str):
+def _facts(tmp_path: Path, name: str, code: str, toolchain):
     from fw_context_mcp.indexer._slots import collect_slot_facts
-    from fw_context_mcp.indexer.symbols import _get_index
 
     src = tmp_path / name
-    src.write_text(code, encoding="utf-8")
-    language = ["-x", "c++", "-std=c++17"] if name.endswith(".cpp") else ["-x", "c"]
-    tu = _get_index().parse(str(src), args=language)
+    # newline="\n": the USR of a local variable holds its byte offset, and
+    # the text mode of Windows writes "\r\n", which moved each offset by
+    # one byte for each line before it.
+    src.write_text(code, encoding="utf-8", newline="\n")
+    tu = parse_unit(src, toolchain, ["-std=c++17"] if name.endswith(".cpp") else [])
     facts = base_names(collect_slot_facts(tu, None, lambda p: Path(p).resolve()), src)
     own = str(src)
     return {
@@ -219,33 +221,33 @@ def _facts(tmp_path: Path, name: str, code: str):
 
 
 @pytest.fixture(scope="module")
-def c_facts(tmp_path_factory):
-    return _facts(tmp_path_factory.mktemp("c"), "fp.c", _C)
+def c_facts(tmp_path_factory, toolchain):
+    return _facts(tmp_path_factory.mktemp("c"), "fp.c", _C, toolchain=toolchain)
 
 
 @pytest.fixture(scope="module")
-def cpp_facts(tmp_path_factory):
-    return _facts(tmp_path_factory.mktemp("cpp"), "fp.cpp", _CPP)
+def cpp_facts(tmp_path_factory, toolchain):
+    return _facts(tmp_path_factory.mktemp("cpp"), "fp.cpp", _CPP, toolchain=toolchain)
 
 
 @pytest.fixture(scope="module")
-def c_review(tmp_path_factory):
-    return _facts(tmp_path_factory.mktemp("c_review"), "review.c", _C_REVIEW)
+def c_review(tmp_path_factory, toolchain):
+    return _facts(tmp_path_factory.mktemp("c_review"), "review.c", _C_REVIEW, toolchain=toolchain)
 
 
 @pytest.fixture(scope="module")
-def cpp_review(tmp_path_factory):
-    return _facts(tmp_path_factory.mktemp("cpp_review"), "review.cpp", _CPP_REVIEW)
+def cpp_review(tmp_path_factory, toolchain):
+    return _facts(tmp_path_factory.mktemp("cpp_review"), "review.cpp", _CPP_REVIEW, toolchain=toolchain)
 
 
 @pytest.fixture(scope="module")
-def c_review2(tmp_path_factory):
-    return _facts(tmp_path_factory.mktemp("c_review2"), "review2.c", _C_REVIEW2)
+def c_review2(tmp_path_factory, toolchain):
+    return _facts(tmp_path_factory.mktemp("c_review2"), "review2.c", _C_REVIEW2, toolchain=toolchain)
 
 
 @pytest.fixture(scope="module")
-def cpp_review2(tmp_path_factory):
-    return _facts(tmp_path_factory.mktemp("cpp_review2"), "review2.cpp", _CPP_REVIEW2)
+def cpp_review2(tmp_path_factory, toolchain):
+    return _facts(tmp_path_factory.mktemp("cpp_review2"), "review2.cpp", _CPP_REVIEW2, toolchain=toolchain)
 
 
 class TestC:
@@ -433,7 +435,7 @@ class TestCppReview2:
         )
 
 
-def test_a_cast_of_the_callee_keeps_its_slot(tmp_path: Path):
+def test_a_cast_of_the_callee_keeps_its_slot(tmp_path: Path, toolchain):
     """The ESP32 Arduino core calls `((voidFuncPtrArg)handler->fn)(handler->arg)`."""
     code = (
         "typedef void (*fn_void_t)(void);\n"
@@ -441,14 +443,13 @@ def test_a_cast_of_the_callee_keeps_its_slot(tmp_path: Path):
         "struct handle { fn_void_t fn; void *arg; };\n"
         "void isr(struct handle *h) { ((fn_arg_t)h->fn)(h->arg); }\n"
     )
-    facts = _facts(tmp_path, "cast.c", code)
+    facts = _facts(tmp_path, "cast.c", code, toolchain=toolchain)
     assert ("c:@F@isr", "pointer", "F|c:@S@handle~cast.c:3:8@FI@fn", 4) in facts["sites"]
 
 
-def test_a_jump_to_an_address_is_a_site_with_the_text_of_the_address(tmp_path: Path):
+def test_a_jump_to_an_address_is_a_site_with_the_text_of_the_address(tmp_path: Path, toolchain):
     """A bootloader starts the application: the site stays, with where it goes."""
     from fw_context_mcp.indexer._slots import collect_slot_facts
-    from fw_context_mcp.indexer.symbols import _get_index
 
     src = tmp_path / "boot.c"
     src.write_text(
@@ -458,7 +459,7 @@ def test_a_jump_to_an_address_is_a_site_with_the_text_of_the_address(tmp_path: P
         "void jump2(void) { ((entry_t)(*(unsigned int *)0x08004004))(); }\n",
         encoding="utf-8",
     )
-    facts = collect_slot_facts(_get_index().parse(str(src), args=["-x", "c"]), None, lambda p: Path(p).resolve())
+    facts = collect_slot_facts(parse_unit(src, toolchain), None, lambda p: Path(p).resolve())
     sites = [(s.kind, s.slot, s.reason, s.line) for s in facts.sites if s.file == str(src)]
     assert sites == [("address", "", "APP_RESET", 3), ("address", "", "(*(unsigned int*)0x08004004)", 4)]
 
@@ -487,8 +488,7 @@ def test_a_purged_function_leaves_no_slot_fact(tmp_path: Path):
         conn.close()
 
 
-def test_the_index_holds_the_facts_and_a_reparse_replaces_them(tmp_path: Path):
-    from fw_context_mcp.indexer.compile_commands import CompilationUnit
+def test_the_index_holds_the_facts_and_a_reparse_replaces_them(tmp_path: Path, toolchain):
     from fw_context_mcp.indexer.db import (
         delete_slot_facts_for_files,
         open_db,
@@ -500,7 +500,7 @@ def test_the_index_holds_the_facts_and_a_reparse_replaces_them(tmp_path: Path):
 
     src = tmp_path / "fp.c"
     src.write_text(_C, encoding="utf-8")
-    unit = CompilationUnit(file=src, directory=tmp_path, language="c", clang_args=["-std=c11"])
+    unit = unit_of(src, toolchain, ["-std=c11"], directory=tmp_path, language="c")
     conn = open_db(tmp_path / "index.db")
     try:
         with transaction(conn):

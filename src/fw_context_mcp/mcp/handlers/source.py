@@ -72,6 +72,7 @@ from ...indexer.db._resolve import (
     count_candidates,
     resolve_candidates,
 )
+from ...indexer.macros import expanded_fields
 from ...indexer.models import origin_names
 from ...llm.client import call_llm_async
 from ...llm.errors import LLMError
@@ -701,9 +702,8 @@ def _try_macro_fallback(
         "source": f"#define {invocation} {m['value']}".rstrip(),
         "is_function_like": bool(m["is_function_like"]),
         "value": m["value"],
+        **expanded_fields(m),
     }
-    if m["expanded_value"]:
-        result["expanded_value"] = m["expanded_value"]
     if include_empty_refs:
         result["callers"] = []
         result["callees"] = []
@@ -750,7 +750,8 @@ async def explain_symbol(
         (disabled), the dict holds ``explain_prompt`` and no
         ``explanation``.  Macro fallback returns ``kind="macro"``, ``signature`` (as ``#define NAME``
         or ``#define NAME(a, b)``), ``is_function_like``, ``value`` (the
-        replacement text ALONE), and ``expanded_value``.
+        replacement text ALONE), and ``expanded_value`` or
+        ``expanded_values`` (the value in the build, see ``lookup_symbol``).
 
         A ``warning`` key means that the chat model of the LLM profile gave
         no explanation — the request timed out, or the model is not
@@ -965,7 +966,8 @@ def get_source(
     returns kind="macro" with ``signature``
     (``#define NAME`` or ``#define NAME(a, b)``), ``is_function_like``,
     ``value`` (the replacement text ALONE — the parameter list is not part
-    of it) and ``expanded_value`` (preprocessor-resolved).
+    of it) and ``expanded_value`` or ``expanded_values`` (the value in the
+    build, see ``lookup_symbol``).
 
     For rich context (who calls this, what does it call) use
     ``get_symbol_context`` instead — it returns body, callers, and callees
@@ -994,8 +996,8 @@ def get_source(
         May also include ``end_line`` (the last line of the extent),
         ``template_usr``, ``parent_usr``, ``enum_value``, ``constants``
         (list for enums), ``value`` (macro replacement text),
-        ``expanded_value`` (preprocessor-resolved macro value) when
-        applicable.  A declaration has no extent, thus it gets no
+        ``expanded_value`` or ``expanded_values`` (the value of a macro in
+        the build, see ``lookup_symbol``) when applicable.  A declaration has no extent, thus it gets no
         ``end_line``.
 
         ``line`` and ``end_line`` are the extent of the symbol, thus they
@@ -1615,8 +1617,8 @@ def get_symbol_context(
         when the list is cut, constants_hint; for an enum constant, enum_value.
         For macros returns ``kind="macro"``, ``signature`` (``#define NAME``
         or ``#define NAME(a, b)``), ``is_function_like``, ``value`` (the
-        replacement text ALONE) and ``expanded_value``
-        (preprocessor-resolved).
+        replacement text ALONE) and ``expanded_value`` or
+        ``expanded_values`` (the value in the build, see ``lookup_symbol``).
         When LLM analysis has been generated (``fw-context index --analyze``),
         includes ``llm_analysis``: {summary, inputs, outputs, model, analyzed_at}
         with a structured description of the symbol's purpose, parameters, and

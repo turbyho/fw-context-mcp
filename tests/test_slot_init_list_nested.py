@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 
+from tests._toolchains import unit_of
 from tests._usr_keys import base_names
 
 SOURCE = """\
@@ -56,13 +57,12 @@ static struct typed typedef_indexed = { .h[1] = dev_cb };
 
 
 @pytest.fixture(scope="module")
-def extracted(tmp_path_factory):
-    from fw_context_mcp.indexer.compile_commands import CompilationUnit
+def extracted(tmp_path_factory, toolchain):
     from fw_context_mcp.indexer.symbols import extract_all
 
     src: Path = tmp_path_factory.mktemp("initlist") / "init.c"
     src.write_text(SOURCE, encoding="utf-8")
-    unit = CompilationUnit(file=src, directory=src.parent, language="c", clang_args=["-std=gnu11"])
+    unit = unit_of(src, toolchain, ["-std=gnu11"], directory=src.parent, language="c")
     return base_names(extract_all(unit, with_refs=True), src)
 
 

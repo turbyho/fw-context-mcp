@@ -17,15 +17,16 @@ by reading the disk, which reports ``source_origin: "disk"`` and holds every
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
 
+from tests._toolchains import Toolchain, write_compile_commands, write_sources
+
 pytestmark = pytest.mark.libclang
 
 
-def _index(root: Path, db_path: Path, files: dict[str, str], main: str) -> list[dict]:
+def _index(toolchain: Toolchain, root: Path, db_path: Path, files: dict[str, str], main: str) -> list[dict]:
     """Index *files* through the real symbol pass and return the stored rows.
 
     *files* maps a project-relative path to its text; *main* names the entry
@@ -42,28 +43,19 @@ def _index(root: Path, db_path: Path, files: dict[str, str], main: str) -> list[
     )
     from fw_context_mcp.indexer.ops import store_symbols_for_unit
 
-    for rel, text in files.items():
-        target = root / rel
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(text, encoding="utf-8")
+    write_sources(root, files)
 
     # The standard must match the language of the entry file: `-std=c++17`
     # over a .c file makes libclang refuse the whole unit.
     is_cpp = Path(main).suffix in {".cpp", ".cc", ".cxx"}
-    driver = ["c++", "-std=c++17"] if is_cpp else ["cc", "-std=c11"]
-    cc = root / "compile_commands.json"
-    cc.write_text(
-        json.dumps(
-            [
-                {
-                    "directory": str(root),
-                    "file": str(root / main),
-                    "arguments": [*driver, "-c", str(root / main), "-I", str(root / "src")],
-                }
-            ]
-        ),
-        encoding="utf-8",
-    )
+    std = "-std=c++17" if is_cpp else "-std=c11"
+    cc = write_compile_commands(root / "compile_commands.json", [
+        {
+            "directory": str(root),
+            "file": str(root / main),
+            "arguments": [*toolchain.arguments(str(root / main), std), "-I", str(root / "src")],
+        }
+    ])
 
     conn = open_db(db_path)
     try:
@@ -94,7 +86,7 @@ def _definition(rows: list[dict], qualified_name: str) -> dict:
 
 
 class TestOneLineDefinitionKeepsItsText:
-    def test_inline_accessor_is_stored(self, tmp_path: Path) -> None:
+    def test_inline_accessor_is_stored(self, tmp_path: Path, toolchain: Toolchain) -> None:
         root = tmp_path / "proj"
         header = (
             "#pragma once\n"                                    # 1
@@ -110,6 +102,7 @@ class TestOneLineDefinitionKeepsItsText:
             "};\n"                                              # 11
         )
         rows = _index(
+            toolchain,
             root,
             tmp_path / "index.db",
             {
@@ -127,10 +120,11 @@ class TestOneLineDefinitionKeepsItsText:
         assert one_line["is_definition"] == 1
         assert one_line["source"] == "  bool ready() const { return ready_; }\n"
 
-    def test_multi_line_definition_is_unchanged(self, tmp_path: Path) -> None:
+    def test_multi_line_definition_is_unchanged(self, tmp_path: Path, toolchain: Toolchain) -> None:
         # The repair must not move the boundary of a body that already worked.
         root = tmp_path / "proj"
         rows = _index(
+            toolchain,
             root,
             tmp_path / "index.db",
             {
@@ -151,12 +145,13 @@ class TestOneLineDefinitionKeepsItsText:
             "  int slow() const {\n    return 1;\n  }\n"
         )
 
-    def test_declaration_still_stores_no_body(self, tmp_path: Path) -> None:
+    def test_declaration_still_stores_no_body(self, tmp_path: Path, toolchain: Toolchain) -> None:
         # Only a definition holds code.  A one-line DECLARATION must stay
         # empty: its line holds a prototype, and a body stored for it would
         # give search_bodies a hit in code that does not exist.
         root = tmp_path / "proj"
         rows = _index(
+            toolchain,
             root,
             tmp_path / "index.db",
             {
@@ -170,7 +165,7 @@ class TestOneLineDefinitionKeepsItsText:
         assert all(not r["is_definition"] for r in declaration)
         assert all(r["source"] == "" for r in declaration)
 
-    def test_one_line_body_obeys_the_ifdef_filter(self, tmp_path: Path) -> None:
+    def test_one_line_body_obeys_the_ifdef_filter(self, tmp_path: Path, toolchain: Toolchain) -> None:
         # A one-line body is filtered like any other.  The branch the build
         # does not take must reach the index blank, never as live code.
         root = tmp_path / "proj"
@@ -183,6 +178,7 @@ class TestOneLineDefinitionKeepsItsText:
             "#endif\n"                                # 6
         )
         rows = _index(
+            toolchain,
             root,
             tmp_path / "index.db",
             {

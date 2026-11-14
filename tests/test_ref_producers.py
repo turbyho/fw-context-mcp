@@ -24,6 +24,7 @@ from fw_context_mcp.indexer.db import (
     upsert_project,
 )
 from fw_context_mcp.indexer.models import RefOrigin
+from tests._toolchains import Toolchain, write_compile_commands, write_sources
 
 CH = "hash-producers"
 UNIT_A = ("a.cpp", "flags-a")
@@ -119,20 +120,16 @@ _USER = '#include "tmpl.h"\nint {name}(Sensor& s) {{ return read_twice(s); }}\n'
 _NOT_A_USER = '#include "tmpl.h"\nint {name}(Sensor& s) {{ return s.sample(); }}\n'
 
 
-def _project(tmp_path: Path, a: str, b: str) -> Path:
-    import json
+def _project(tmp_path: Path, a: str, b: str, toolchain: Toolchain) -> Path:
 
     project = tmp_path / "project"
     project.mkdir(exist_ok=True)
-    (project / "tmpl.h").write_text(_HEADER, encoding="utf-8")
-    (project / "a.cpp").write_text(a.format(name="use_a"), encoding="utf-8")
-    (project / "b.cpp").write_text(b.format(name="use_b"), encoding="utf-8")
+    write_sources(project, {"tmpl.h": _HEADER, "a.cpp": a.format(name="use_a"), "b.cpp": b.format(name="use_b")})
     entries = [
-        {"directory": str(project), "file": name,
-         "arguments": ["c++", "-std=c++17", "-c", name, "-o", f"{name}.o"]}
+        {"directory": str(project), "file": name, "arguments": toolchain.arguments(name, "-std=c++17", output=f"{name}.o")}
         for name in ("a.cpp", "b.cpp")
     ]
-    (project / "compile_commands.json").write_text(json.dumps(entries), encoding="utf-8")
+    write_compile_commands(project / "compile_commands.json", entries)
     return project
 
 
@@ -167,31 +164,31 @@ def _instance_edge(db_path: Path, config_hash: str) -> list[tuple]:
 
 @pytest.mark.libclang
 class TestAnIncrementalRunKeepsTheEdgesOfInstances:
-    def test_both_units_produce_the_edge(self, tmp_path):
-        db_path, ch = _run(tmp_path, _project(tmp_path, _USER, _USER))
+    def test_both_units_produce_the_edge(self, tmp_path, toolchain):
+        db_path, ch = _run(tmp_path, _project(tmp_path, _USER, _USER, toolchain))
         assert _instance_edge(db_path, ch) == [("tmpl.h", 3, INST, "a.cpp,b.cpp")]
 
-    def test_a_new_parse_of_the_owner_keeps_the_edge_of_the_other_unit(self, tmp_path):
+    def test_a_new_parse_of_the_owner_keeps_the_edge_of_the_other_unit(self, tmp_path, toolchain):
         """a.cpp owns tmpl.h (the first unit); it stops using the template."""
-        project = _project(tmp_path, _USER, _USER)
+        project = _project(tmp_path, _USER, _USER, toolchain)
         _run(tmp_path, project)
         (project / "a.cpp").write_text(_NOT_A_USER.format(name="use_a"), encoding="utf-8")
         db_path, ch = _run(tmp_path, project)
         assert _instance_edge(db_path, ch) == [("tmpl.h", 3, INST, "b.cpp")]
 
-    def test_the_edge_goes_with_its_last_producer(self, tmp_path):
-        project = _project(tmp_path, _NOT_A_USER, _USER)
+    def test_the_edge_goes_with_its_last_producer(self, tmp_path, toolchain):
+        project = _project(tmp_path, _NOT_A_USER, _USER, toolchain)
         _run(tmp_path, project)
         (project / "b.cpp").write_text(_NOT_A_USER.format(name="use_b"), encoding="utf-8")
         db_path, ch = _run(tmp_path, project)
         assert _instance_edge(db_path, ch) == []
 
-    def test_the_incremental_run_equals_a_full_run(self, tmp_path):
-        project = _project(tmp_path, _USER, _USER)
+    def test_the_incremental_run_equals_a_full_run(self, tmp_path, toolchain):
+        project = _project(tmp_path, _USER, _USER, toolchain)
         _run(tmp_path, project)
         (project / "a.cpp").write_text(_NOT_A_USER.format(name="use_a"), encoding="utf-8")
         incremental = _instance_edge(*_run(tmp_path, project))
         full_dir = tmp_path / "full"
         full_dir.mkdir()
-        full = _instance_edge(*_run(full_dir, _project(full_dir, _NOT_A_USER, _USER)))
+        full = _instance_edge(*_run(full_dir, _project(full_dir, _NOT_A_USER, _USER, toolchain)))
         assert incremental == full

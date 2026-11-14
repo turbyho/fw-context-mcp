@@ -69,6 +69,7 @@ from ...indexer.db import (
 )
 from ...indexer.db._resolve import ambiguity_notice, candidate_labels, count_candidates
 from ...indexer.intlist import read_isr_registrations
+from ...indexer.macros import expanded_fields
 from ...indexer.models import RefOrigin, origin_names
 from ...utils import abs_path
 from ...utils import escape_like as _escape_like
@@ -349,7 +350,7 @@ def _references_result(name: str, project_root: str | None, ref_kind: str | list
                     ),
                     "is_function_like": bool(macro["is_function_like"]),
                     "value": macro["value"],
-                    **({"expanded_value": macro["expanded_value"]} if macro["expanded_value"] else {}),
+                    **expanded_fields(macro),
                 }
                 if not _non_comment_refs:
                     extra: dict = {}
@@ -615,7 +616,8 @@ def find_callers(
         (vTaskStartScheduler)"``, ``"an interrupt"``). Macro fallback puts a dict with ``kind="macro"``,
         ``signature`` (``#define`` free: ``NAME`` or ``NAME(a, b)``),
         ``is_function_like``, ``value`` (the replacement text ALONE) and
-        ``expanded_value`` between the notice and the rows;
+        ``expanded_value`` or ``expanded_values`` (see ``lookup_symbol``)
+        between the notice and the rows;
         that answer pages too, and its ``total`` counts the uses in active
         code only — a use inside a comment is not one.
 
@@ -701,8 +703,9 @@ def find_references(
         name for the symbol), ``"macro_use"`` (macro usage
         in file). Macro fallback puts a dict with ``kind="macro"``,
         ``signature`` (``NAME`` or ``NAME(a, b)``), ``is_function_like``,
-        ``value`` (the replacement text ALONE) and ``expanded_value``
-        between the notice and the rows;
+        ``value`` (the replacement text ALONE) and ``expanded_value`` or
+        ``expanded_values`` (see ``lookup_symbol``) between the notice and
+        the rows;
         that answer pages too, and its ``total`` counts the uses in active
         code only — a use inside a comment is not one.
 

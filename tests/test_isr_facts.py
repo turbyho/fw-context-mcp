@@ -16,9 +16,9 @@ from pathlib import Path
 import pytest
 
 from tests._toml import toml_string
+from tests._toolchains import Toolchain, write_compile_commands, write_sources
 from tests.test_intlist import _elf
 
-pytest.importorskip("clang.cindex", reason="libclang not available")
 pytestmark = pytest.mark.libclang
 
 # The symbol types and bindings of ELF, in the `st_info` byte.
@@ -82,18 +82,16 @@ REGISTRATIONS = [
 ]
 
 
-def _project(root: Path, registrations=REGISTRATIONS, symbols=SYMBOLS) -> None:
+def _project(root: Path, toolchain: Toolchain, registrations=REGISTRATIONS, symbols=SYMBOLS) -> None:
     (root / ".fw-context").mkdir(parents=True, exist_ok=True)
     (root / ".fw-context" / "config.toml").write_text(
         f'[project]\nid = "proj-isr"\n\n[build]\n\n[index]\ndb_dir = {toml_string(root.parent / "db")}\n', encoding="utf-8",
     )
-    for name, text in SOURCES.items():
-        (root / name).parent.mkdir(parents=True, exist_ok=True)
-        (root / name).write_text(text, encoding="utf-8")
-    (root / "compile_commands.json").write_text(json.dumps([
-        {"directory": str(root), "file": name, "arguments": ["cc", "-std=gnu11", "-c", name]}
+    write_sources(root, SOURCES)
+    write_compile_commands(root / "compile_commands.json", [
+        {"directory": str(root), "file": name, "arguments": toolchain.arguments(name, "-std=gnu11")}
         for name in SOURCES if name.endswith((".c", ".S"))
-    ]), encoding="utf-8")
+    ])
     (root / "zephyr").mkdir(exist_ok=True)
     (root / "zephyr" / "zephyr_pre0.elf").write_bytes(_elf(_intlist(registrations), symbols))
 
@@ -159,8 +157,8 @@ def root(tmp_path: Path) -> Path:
     return path
 
 
-def test_the_dispatcher_calls_each_registered_handler(root):
-    _project(root)
+def test_the_dispatcher_calls_each_registered_handler(root, toolchain):
+    _project(root, toolchain)
     _run(root)
     calls = _calls(root)
     assert ("_isr_wrapper", "shim", "glue.c") in calls
@@ -170,21 +168,21 @@ def test_the_dispatcher_calls_each_registered_handler(root):
     assert ("_isr_wrapper", "strong_isr", "drv.c") in calls, "the strong definition, not the weak one"
 
 
-def test_a_handler_that_does_not_call_its_parameter_gives_its_argument_no_caller(root):
+def test_a_handler_that_does_not_call_its_parameter_gives_its_argument_no_caller(root, toolchain):
     """`strong_isr` gets `clock_handler` in parameter 0 and ignores it: a flow fact, not a call."""
-    _project(root)
+    _project(root, toolchain)
     _run(root)
     assert not {call for call in _calls(root) if call[:2] == ("strong_isr", "clock_handler")}
 
 
-def test_a_function_in_the_argument_goes_into_parameter_0_of_its_handler(root):
-    _project(root)
+def test_a_function_in_the_argument_goes_into_parameter_0_of_its_handler(root, toolchain):
+    _project(root, toolchain)
     _run(root)
     assert ("shim", "clock_handler", "drv.c") in _calls(root)
 
 
-def test_the_facts_name_the_artifact_and_a_run_writes_them_again(root):
-    _project(root)
+def test_the_facts_name_the_artifact_and_a_run_writes_them_again(root, toolchain):
+    _project(root, toolchain)
     _run(root)
     first = _facts(root)
     elf = "zephyr/zephyr_pre0.elf"
@@ -199,10 +197,10 @@ def test_the_facts_name_the_artifact_and_a_run_writes_them_again(root):
     assert _facts(root) == first
 
 
-def test_a_registration_that_leaves_the_build_leaves_the_index(root):
-    _project(root)
+def test_a_registration_that_leaves_the_build_leaves_the_index(root, toolchain):
+    _project(root, toolchain)
     _run(root)
-    _project(root, registrations=REGISTRATIONS[1:])
+    _project(root, toolchain, registrations=REGISTRATIONS[1:])
     (root / "glue.c").write_text(SOURCES["glue.c"] + "\n", encoding="utf-8")
     _run(root)
     calls = _calls(root)
@@ -211,45 +209,45 @@ def test_a_registration_that_leaves_the_build_leaves_the_index(root):
     assert ("_isr_wrapper", "local_isr", "drv.c") in calls
 
 
-def test_the_file_symbol_picks_the_static_handler(root):
+def test_the_file_symbol_picks_the_static_handler(root, toolchain):
     """The artifact puts `local_isr` after the file symbol of `other.c`: that one is the handler."""
-    _project(root, symbols=[("other.c", 0, _FILE) if s == ("drv.c", 0, _FILE) else s for s in SYMBOLS])
+    _project(root, toolchain, symbols=[("other.c", 0, _FILE) if s == ("drv.c", 0, _FILE) else s for s in SYMBOLS])
     _run(root)
     calls = _calls(root)
     assert ("_isr_wrapper", "local_isr", "other.c") in calls
     assert ("_isr_wrapper", "local_isr", "drv.c") not in calls
 
 
-def test_two_static_handlers_in_files_of_one_base_name_give_no_target(root):
+def test_two_static_handlers_in_files_of_one_base_name_give_no_target(root, toolchain):
     """`drv.c` and `sub/drv.c` both define `static local_isr`: the file symbol `drv.c` names neither one."""
-    _project(root)
-    (root / "sub").mkdir()
-    (root / "sub" / "drv.c").write_text(
-        "static void local_isr(const void *arg) { (void)arg; }\n"
-        "void take(void (*f)(const void *));\n"
-        "void use_sub(void) { take(local_isr); }\n",
-        encoding="utf-8",
-    )
+    _project(root, toolchain)
+    write_sources(root, {
+        "sub/drv.c": (
+            "static void local_isr(const void *arg) { (void)arg; }\n"
+            "void take(void (*f)(const void *));\n"
+            "void use_sub(void) { take(local_isr); }\n"
+        ),
+    })
     entries = json.loads((root / "compile_commands.json").read_text(encoding="utf-8"))
-    entries.append({"directory": str(root), "file": "sub/drv.c", "arguments": ["cc", "-std=gnu11", "-c", "sub/drv.c"]})
-    (root / "compile_commands.json").write_text(json.dumps(entries), encoding="utf-8")
+    entries.append({"directory": str(root), "file": "sub/drv.c", "arguments": toolchain.arguments("sub/drv.c", "-std=gnu11")})
+    write_compile_commands(root / "compile_commands.json", entries)
     _run(root)
     assert not {call for call in _calls(root) if call[:2] == ("_isr_wrapper", "local_isr")}
 
 
-def test_a_local_symbol_with_no_file_symbol_gives_no_target(root):
+def test_a_local_symbol_with_no_file_symbol_gives_no_target(root, toolchain):
     """Two `static local_isr`: without the file symbol of the artifact, no definition is the one."""
-    _project(root, symbols=[s for s in SYMBOLS if s[2] != _FILE])
+    _project(root, toolchain, symbols=[s for s in SYMBOLS if s[2] != _FILE])
     _run(root)
     assert not {call for call in _calls(root) if call[:2] == ("_isr_wrapper", "local_isr")}
 
 
-def test_a_fact_of_the_build_has_no_type(root):
+def test_a_fact_of_the_build_has_no_type(root, toolchain):
     """The artifact names a function, not its type: no such fact goes to the guesses by type."""
     from fw_context_mcp.indexer._slot_resolution import _load
     from fw_context_mcp.indexer.db import open_db
 
-    _project(root)
+    _project(root, toolchain)
     _run(root)
     conn = open_db(_db(root))
     try:
@@ -260,10 +258,10 @@ def test_a_fact_of_the_build_has_no_type(root):
     assert "" not in by_type
 
 
-def test_find_indirect_targets_names_the_registration_of_the_build(root):
+def test_find_indirect_targets_names_the_registration_of_the_build(root, toolchain):
     from fw_context_mcp.mcp.handlers.callgraph import find_indirect_targets
 
-    _project(root)
+    _project(root, toolchain)
     _run(root)
     rows = find_indirect_targets("clock_handler", project_root=str(root))
     stored = [row for row in rows if row.get("relation") == "stored" and row["file"].endswith("zephyr_pre0.elf")]
@@ -272,8 +270,8 @@ def test_find_indirect_targets_names_the_registration_of_the_build(root):
     assert {row["line"] for row in stored} == {0}
 
 
-def test_no_artifact_writes_no_fact(root):
-    _project(root)
+def test_no_artifact_writes_no_fact(root, toolchain):
+    _project(root, toolchain)
     (root / "zephyr" / "zephyr_pre0.elf").unlink()
     _run(root)
     assert _facts(root) == []

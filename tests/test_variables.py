@@ -25,6 +25,7 @@ from fw_context_mcp.indexer.db import (
     upsert_project,
 )
 from tests._paging import with_project
+from tests._toolchains import unit_of
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -328,30 +329,26 @@ class TestFetchReferencers:
 
 @pytest.mark.libclang
 class TestSignatureForVariables:
-    def test_global_variable_signature(self, tmp_path):
-        from fw_context_mcp.indexer.compile_commands import CompilationUnit
+    def test_global_variable_signature(self, tmp_path, toolchain):
         from fw_context_mcp.indexer.symbols import extract_all
 
         src = tmp_path / "test.c"
         src.write_text("int g_count = 0;\nvoid use(void) { g_count = 1; }\n", encoding="utf-8")
 
-        unit = CompilationUnit(file=src, directory=tmp_path, language="c",
-                               clang_args=["-std=c11"])
+        unit = unit_of(src, toolchain, ["-std=c11"], directory=tmp_path, language="c")
         r = extract_all(unit, with_refs=False)
         syms = r.symbols
 
         count = next(s for s in syms if s.name == "g_count")
         assert count.signature == "int g_count", f"got {count.signature!r}"
 
-    def test_local_variable_signature(self, tmp_path):
-        from fw_context_mcp.indexer.compile_commands import CompilationUnit
+    def test_local_variable_signature(self, tmp_path, toolchain):
         from fw_context_mcp.indexer.symbols import extract_all
 
         src = tmp_path / "test.c"
         src.write_text("void f(void) { int local; }\n", encoding="utf-8")
 
-        unit = CompilationUnit(file=src, directory=tmp_path, language="c",
-                               clang_args=["-std=c11"])
+        unit = unit_of(src, toolchain, ["-std=c11"], directory=tmp_path, language="c")
         r = extract_all(unit, with_refs=False)
         syms = r.symbols
 
@@ -360,15 +357,13 @@ class TestSignatureForVariables:
             f"got {local.signature!r}"
         )
 
-    def test_field_decl_signature(self, tmp_path):
-        from fw_context_mcp.indexer.compile_commands import CompilationUnit
+    def test_field_decl_signature(self, tmp_path, toolchain):
         from fw_context_mcp.indexer.symbols import extract_all
 
         src = tmp_path / "test.cpp"
         src.write_text("struct S { int x; char *name; };\n", encoding="utf-8")
 
-        unit = CompilationUnit(file=src, directory=tmp_path, language="c++",
-                               clang_args=["-std=c++17"])
+        unit = unit_of(src, toolchain, ["-std=c++17"], directory=tmp_path, language="cpp")
         r = extract_all(unit, with_refs=False)
         syms = r.symbols
 
@@ -383,31 +378,27 @@ class TestSignatureForVariables:
 
 @pytest.mark.libclang
 class TestKindSplit:
-    def test_global_variable_is_varglobal(self, tmp_path):
-        from fw_context_mcp.indexer.compile_commands import CompilationUnit
+    def test_global_variable_is_varglobal(self, tmp_path, toolchain):
         from fw_context_mcp.indexer.symbols import extract_all
 
         src = tmp_path / "test.c"
         src.write_text("int g_debug_level = 0;\nvoid init(void) { g_debug_level = 5; }\n",
                        encoding="utf-8")
 
-        unit = CompilationUnit(file=src, directory=tmp_path, language="c",
-                               clang_args=["-std=c11"])
+        unit = unit_of(src, toolchain, ["-std=c11"], directory=tmp_path, language="c")
         r = extract_all(unit, with_refs=False)
         syms = r.symbols
 
         g = next(s for s in syms if s.name == "g_debug_level")
         assert g.kind == "varglobal", f"got {g.kind}"
 
-    def test_local_variable_is_varlocal(self, tmp_path):
-        from fw_context_mcp.indexer.compile_commands import CompilationUnit
+    def test_local_variable_is_varlocal(self, tmp_path, toolchain):
         from fw_context_mcp.indexer.symbols import extract_all
 
         src = tmp_path / "test.c"
         src.write_text("void f(void) { int i; char *p; }\n", encoding="utf-8")
 
-        unit = CompilationUnit(file=src, directory=tmp_path, language="c",
-                               clang_args=["-std=c11"])
+        unit = unit_of(src, toolchain, ["-std=c11"], directory=tmp_path, language="c")
         r = extract_all(unit, with_refs=False)
         syms = r.symbols
 
@@ -416,15 +407,13 @@ class TestKindSplit:
         for v in varlocals:
             assert v.kind == "varlocal", f"{v.name} got kind={v.kind}"
 
-    def test_varlocal_has_parent_usr(self, tmp_path):
-        from fw_context_mcp.indexer.compile_commands import CompilationUnit
+    def test_varlocal_has_parent_usr(self, tmp_path, toolchain):
         from fw_context_mcp.indexer.symbols import extract_all
 
         src = tmp_path / "test.c"
         src.write_text("void my_func(void) { int local; }\n", encoding="utf-8")
 
-        unit = CompilationUnit(file=src, directory=tmp_path, language="c",
-                               clang_args=["-std=c11"])
+        unit = unit_of(src, toolchain, ["-std=c11"], directory=tmp_path, language="c")
         r = extract_all(unit, with_refs=False)
         syms = r.symbols
 
@@ -432,15 +421,13 @@ class TestKindSplit:
         assert local.kind == "varlocal"
         assert local.parent_usr != "", "varlocal should have parent_usr set"
 
-    def test_static_inside_function_is_varlocal(self, tmp_path):
-        from fw_context_mcp.indexer.compile_commands import CompilationUnit
+    def test_static_inside_function_is_varlocal(self, tmp_path, toolchain):
         from fw_context_mcp.indexer.symbols import extract_all
 
         src = tmp_path / "test.c"
         src.write_text("void f(void) { static int counter; }\n", encoding="utf-8")
 
-        unit = CompilationUnit(file=src, directory=tmp_path, language="c",
-                               clang_args=["-std=c11"])
+        unit = unit_of(src, toolchain, ["-std=c11"], directory=tmp_path, language="c")
         r = extract_all(unit, with_refs=False)
         syms = r.symbols
 
@@ -449,15 +436,13 @@ class TestKindSplit:
             f"static local should be varlocal, got {counter.kind}"
         )
 
-    def test_extern_c_variable_is_varglobal(self, tmp_path):
-        from fw_context_mcp.indexer.compile_commands import CompilationUnit
+    def test_extern_c_variable_is_varglobal(self, tmp_path, toolchain):
         from fw_context_mcp.indexer.symbols import extract_all
 
         src = tmp_path / "test.cpp"
         src.write_text('extern "C" { int ext_x; }\n', encoding="utf-8")
 
-        unit = CompilationUnit(file=src, directory=tmp_path, language="c++",
-                               clang_args=["-std=c++17"])
+        unit = unit_of(src, toolchain, ["-std=c++17"], directory=tmp_path, language="cpp")
         r = extract_all(unit, with_refs=False)
         syms = r.symbols
 
@@ -466,15 +451,13 @@ class TestKindSplit:
             f"extern \"C\" var should be varglobal, got {ext_x.kind}"
         )
 
-    def test_namespace_variable_is_varglobal(self, tmp_path):
-        from fw_context_mcp.indexer.compile_commands import CompilationUnit
+    def test_namespace_variable_is_varglobal(self, tmp_path, toolchain):
         from fw_context_mcp.indexer.symbols import extract_all
 
         src = tmp_path / "test.cpp"
         src.write_text("namespace ns { int count; }\n", encoding="utf-8")
 
-        unit = CompilationUnit(file=src, directory=tmp_path, language="c++",
-                               clang_args=["-std=c++17"])
+        unit = unit_of(src, toolchain, ["-std=c++17"], directory=tmp_path, language="cpp")
         r = extract_all(unit, with_refs=False)
         syms = r.symbols
 

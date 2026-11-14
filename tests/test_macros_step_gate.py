@@ -18,7 +18,7 @@ def _gate():
 
 
 def _ctx(**kw) -> dict:
-    return {"index_macros_expanded": True, "units": ["u"], "updated": 0, **kw}
+    return {"units": ["u"], "updated": 0, **kw}
 
 
 @pytest.mark.parametrize(
@@ -28,10 +28,9 @@ def _ctx(**kw) -> dict:
         (_ctx(updated=1), True),
         (_ctx(removed_files=2), True),
         (_ctx(updated=3, removed_files=1), True),
-        (_ctx(updated=1, index_macros_expanded=False), False),
         (_ctx(updated=1, units=[]), False),
     ],
-    ids=["nothing-changed", "a-unit-re-parsed", "a-file-left", "both", "disabled", "no-units"],
+    ids=["nothing-changed", "a-unit-re-parsed", "a-file-left", "both", "no-units"],
 )
 def test_the_gate_of_the_macros_step(ctx, expected):
     assert bool(_gate()(ctx)) is expected

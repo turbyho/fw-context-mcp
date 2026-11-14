@@ -1,3 +1,5 @@
 default_fqbn: arduino:avr:uno
-default_port: /dev/ttyACM0
+# A port that no host has: the build must not need the board (arduino-cli
+# looks for the port of default_port with default_protocol).
+default_port: /dev/ttyFWCTX-NOT-ATTACHED
 default_protocol: serial

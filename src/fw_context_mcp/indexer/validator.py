@@ -17,13 +17,13 @@ missing from the compilation database.
 
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 
 from ..utils import command_words
 from .build import BuildConfig
 from .builders.protocol import BuildIssue, BuildSystem
+from .compile_commands import load_entries
 
 log = logging.getLogger(__name__)
 
@@ -105,8 +105,8 @@ def validate_and_fix(
         return issues
 
     try:
-        cc_data = json.loads(compile_commands.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as exc:
+        cc_data = load_entries(compile_commands)
+    except (OSError, ValueError) as exc:
         issues.append(
             BuildIssue(
                 severity="error",
@@ -139,12 +139,10 @@ def validate_and_fix(
             file_path = entry.get("file", "")
             # The arguments as the compiler got them (utils.command_words).
             raw_args: list[str] = entry.get("arguments") or command_words(entry.get("command", ""))
+            # The first word is the compiler, and no flag.
             if raw_args and not raw_args[0].startswith("-"):
-                compiler = Path(raw_args[0])
                 raw_args = raw_args[1:]
-            else:
-                compiler = None
-            args = normalize_args(raw_args, cwd, file_path, compiler)
+            args = normalize_args(raw_args, cwd, file_path)
             validate_include_files(args)
         except RuntimeError as exc:
             missing_includes.add(str(exc))

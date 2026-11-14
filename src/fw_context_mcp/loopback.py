@@ -39,14 +39,6 @@ import typing
 
 log = logging.getLogger(__name__)
 
-#: Windows: ``_WSAIOW(IOC_VENDOR, 17)``, ``mstcpip.h``.
-_SIO_TCP_INITIAL_RTO = 0x98000011
-#: ``TCP_INITIAL_RTO_UNSPECIFIED_RTT``: the system keeps its initial RTT.
-_UNSPECIFIED_RTT = 0xFFFF
-#: ``TCP_INITIAL_RTO_NO_SYN_RETRANSMISSIONS``.
-_NO_SYN_RETRANSMISSIONS = 0xFE
-
-
 def _windows_ioctl() -> typing.Callable[[socket.socket], None] | None:
     """Return the function that stops the SYN retransmissions of a socket, or None outside of Windows."""
     if sys.platform != "win32":
@@ -54,24 +46,14 @@ def _windows_ioctl() -> typing.Callable[[socket.socket], None] | None:
     import ctypes
     from ctypes import wintypes
 
-    class _InitialRtoParameters(ctypes.Structure):
-        """``TCP_INITIAL_RTO_PARAMETERS`` of ``mstcpip.h``."""
-
-        _fields_ = [("Rtt", ctypes.c_ushort), ("MaxSynRetransmissions", ctypes.c_ubyte)]
-
-    ws2_32 = ctypes.WinDLL("ws2_32", use_last_error=True)
-    wsa_ioctl = ws2_32.WSAIoctl
-    wsa_ioctl.argtypes = [
-        ctypes.c_size_t, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
-        ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p, ctypes.c_void_p,
-    ]
-    wsa_ioctl.restype = ctypes.c_int
+    from . import _win32
 
     def no_syn_retransmissions(sock: socket.socket) -> None:
-        params = _InitialRtoParameters(_UNSPECIFIED_RTT, _NO_SYN_RETRANSMISSIONS)
+        params = _win32.InitialRtoParameters(_win32.TCP_INITIAL_RTO_UNSPECIFIED_RTT,
+                                             _win32.TCP_INITIAL_RTO_NO_SYN_RETRANSMISSIONS)
         returned = wintypes.DWORD()
-        if wsa_ioctl(sock.fileno(), _SIO_TCP_INITIAL_RTO, ctypes.byref(params), ctypes.sizeof(params),
-                     None, 0, ctypes.byref(returned), None, None) != 0:
+        if _win32.ws2_32.WSAIoctl(sock.fileno(), _win32.SIO_TCP_INITIAL_RTO, ctypes.byref(params),
+                                  ctypes.sizeof(params), None, 0, ctypes.byref(returned), None, None) != 0:
             raise ctypes.WinError(ctypes.get_last_error())
 
     return no_syn_retransmissions

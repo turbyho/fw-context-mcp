@@ -1,13 +1,18 @@
 /**
- * Zephyr RTOS hello-world test project for fw-context indexing tests.
+ * Zephyr test project for the fw-context indexing tests.
  *
- * Board: nrf52840dk_nrf52840
- * Build: west build -b nrf52840dk_nrf52840
- * Requires: ZEPHYR_BASE=~/ncs/v3.2.3/zephyr
- *           ZEPHYR_SDK_INSTALL_DIR=~/ncs/toolchains/2ac5840438/opt/zephyr-sdk
+ * Board: nrf52840dk/nrf52840
+ * Build: west build -b nrf52840dk/nrf52840 --sysbuild
+ *
+ * msg_irq_init connects swi_isr to interrupt 20 (SWI0_EGU0 of the
+ * nRF52840) with IRQ_CONNECT: the build places the handler in its
+ * interrupt table, and no call reaches it.
  */
 
+#include <zephyr/irq.h>
 #include <zephyr/kernel.h>
+
+#define MSG_IRQ 20
 
 typedef enum {
     MSG_IDLE = 0,
@@ -50,8 +55,20 @@ int msg_recv(uint8_t* buf, int max_len) {
     return n;
 }
 
+static void swi_isr(const void *arg) {
+    ARG_UNUSED(arg);
+    g_buffer.state = MSG_RECV;
+}
+
+int msg_irq_init(void) {
+    IRQ_CONNECT(MSG_IRQ, 1, swi_isr, NULL, 0);
+    irq_enable(MSG_IRQ);
+    return 0;
+}
+
 int main(void) {
     msg_init();
+    msg_irq_init();
     uint8_t data[64];
     msg_send((const uint8_t*)"hello", 5);
     msg_recv(data, 64);

@@ -233,23 +233,19 @@ def _hash_of(root: Path, variant: str) -> str:
         conn.close()
 
 
-def test_search_of_a_project_of_one_build_needs_no_option(tmp_path, capsys):
+def test_search_of_a_project_of_one_build_needs_no_option(tmp_path, capsys, toolchain):
     """The common case: one build without names, and the command names none."""
-    import json
-
     from fw_context_mcp.indexer.runner import run
+    from tests._toolchains import write_compile_commands, write_sources
     from tests.test_reindex_each_build import PROJECT_ID, SOURCES, _units
 
     root = tmp_path / "proj"
-    for name, text in SOURCES.items():
-        (root / name).parent.mkdir(parents=True, exist_ok=True)
-        (root / name).write_text(text, encoding="utf-8")
+    write_sources(root, SOURCES)
     index_dir = tmp_path / "index"
     (root / ".fw-context").mkdir()
     (root / ".fw-context" / "config.toml").write_text(f'[project]\nid = "{PROJECT_ID}"\n', encoding="utf-8")
     (root / ".fw-context" / "local.toml").write_text(f'[index]\ndb_dir = "{index_dir.as_posix()}"\n', encoding="utf-8")
-    cc = root / "compile_commands.json"
-    cc.write_text(json.dumps(_units(root, ["src/only_a.c"], "BOARD_A")), encoding="utf-8")
+    cc = write_compile_commands(root / "compile_commands.json", _units(root, ["src/only_a.c"], "BOARD_A", toolchain))
     run(
         compile_commands=cc, db_path=index_dir / PROJECT_ID / "index.db", project_root=root, project_id=PROJECT_ID,
         index_refs=False, index_embeddings=False, analyze_symbols=False,

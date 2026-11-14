@@ -12,22 +12,25 @@ triple from the compiler name.
 from __future__ import annotations
 
 import json
-import re
 import shlex
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, Literal
 
+from fw_context_mcp.indexer._driver_options import DRIVER_TAKES_NEXT
 from fw_context_mcp.indexer._driver_query import (
     DriverInfo,
+    is_cxx_driver_name,
     is_gcc_driver_name,
     known_compilers,
     libclang_args,
     predefine_flags,
     query_gcc_driver,
     resolve_compiler,
+    triple_of_driver_name,
 )
-from fw_context_mcp.path_key import canonical_path
+from fw_context_mcp.path_key import canonical_path, resolve_path
 from fw_context_mcp.utils import CPP_SOURCE_EXTENSIONS, TU_EXTENSIONS, command_words
 
 # Flags libclang does not support — drop silently
@@ -75,6 +78,12 @@ _DROP_FLAGS = frozenset({
     # Measured 2026-10-24: the parse goes on, but the error counts against
     # the health of the index and hides a real error among the others.
     "-fno-defer-pop",
+    # GCC 15: removal of a malloc and free pair.  ESP-IDF 6.1 gives
+    # -fno-malloc-dce to each unit, and clang 23 refused it: "unknown
+    # argument", thus the macros step failed in each of 968 units of an
+    # ESP32 build.  A sweep of all 47 options of that build with clang found
+    # no other one (measured 2026-11-14).  GCC defines no macro for it.
+    "-fmalloc-dce", "-fno-malloc-dce",
     # Xtensa GCC (ESP32): code generation flags that clang does not know.
     # libclang 22 parses an ESP32 build for the real Xtensa target, where
     # libclang 18 used an x86 proxy without the -m flags, thus the flags now
@@ -113,6 +122,13 @@ _DROP_PREFIXES = frozenset({
     # '--param=min-pagesize=0'" was an error in 33 units of three images
     # (measured 2026-10-24).  No parameter changes what the source means.
     "--param=",
+    # GCC 15: zero-initialization of the padding bits (=all, =unions,
+    # =standard).  ESP-IDF 6.1 gives it to each unit, and clang 23 refused
+    # it: "unknown argument", thus the macros step failed in each of 968
+    # units of an ESP32 build (measured 2026-11-14).  GCC defines no macro
+    # for it, and it changes no declaration: only the code that clears a
+    # padding.
+    "-fzero-init-padding-bits=",
 })
 
 # Two-token flags: drop both the flag and its next argument
@@ -173,96 +189,37 @@ _SUPPORTED_TARGET_PREFIXES = frozenset({
     "ve-",
 })
 
-# Known -mcpu prefix → GNU target triple mapping for architectures where
-# the flag alone is sufficient to identify the target.
-_MCPU_TO_TRIPLE: dict[str, str] = {
-    "cortex-m": "arm-none-eabi",
-    "cortex-r": "arm-none-eabi",
-    # 32-bit Cortex-A (ARMv7-A)
-    "cortex-a5": "arm-none-eabi",
-    "cortex-a7": "arm-none-eabi",
-    "cortex-a8": "arm-none-eabi",
-    "cortex-a9": "arm-none-eabi",
-    "cortex-a15": "arm-none-eabi",
-    "cortex-a17": "arm-none-eabi",
-    # 64-bit Cortex-A (AArch64)
-    "cortex-a53": "aarch64-none-elf",
-    "cortex-a57": "aarch64-none-elf",
-    "cortex-a72": "aarch64-none-elf",
-    "cortex-a": "aarch64-none-elf",
-}
 
-
-def _detect_target_triple(
-    compiler: Path | None, args: list[str]
-) -> str | None:
-    """Detect the GNU target triple for the cross-compiler.
+def _detect_target_triple(compiler: Path | None) -> str | None:
+    """Return the GNU target triple that the name of the cross-compiler names, or None.
 
     WHY: libclang needs ``--target=<triple>`` to correctly interpret
     architecture-specific flags like ``-mcpu=cortex-m4`` and ``-mfpu=fpv4-sp-d16``.
     Without it, libclang uses the host triple (e.g. ``x86_64-linux-gnu``)
     and rejects ARM/RISC-V flags as unknown, emitting hard errors.
 
-    1. Extract from compiler name: ``<triple>-gcc`` → ``<triple>``
-       (e.g. ``arm-none-eabi-g++`` → ``arm-none-eabi``,
-             ``riscv32-unknown-elf-gcc`` → ``riscv32-unknown-elf``,
-             ``xtensa-esp32-elf-g++`` → ``xtensa-esp32-elf``)
-    2. Fallback: infer from ``-mcpu=`` flags (Cortex-M → arm-none-eabi).
-    3. Fallback: infer from ``-march=`` flags (``-march=rv32*`` → riscv,
-       ``-march=armv*-m*`` → arm-none-eabi).
+    The name of a cross-compiler is ``<triple>-<driver>`` (the convention
+    of GNU): ``arm-none-eabi-g++`` → ``arm-none-eabi``,
+    ``riscv32-unknown-elf-gcc`` → ``riscv32-unknown-elf``.  The grammar of
+    the name is the one of the driver query (``triple_of_driver_name``):
+    the version suffix and ``.exe`` in each case (``arm-none-eabi-gcc.EXE``
+    of Windows) go first.
 
-    Returns None when the target cannot be determined or is not in
-    ``_SUPPORTED_TARGET_PREFIXES`` (e.g. xtensa).  Used when the GCC
-    driver does not answer; ``_driver_query`` probes libclang instead.
+    WHY no target from ``-mcpu=`` or ``-march=``: the flag does not name
+    the target.  ``arm-none-eabi-gcc -mcpu=cortex-a53`` compiles 32-bit
+    code, and a table of CPU names gave it ``aarch64-none-elf``; it also
+    gave ``cortex-a53`` the 32-bit triple, because ``cortex-a5`` is a
+    prefix of it, and ``-march=rv64*`` the triple ``riscv32-unknown-elf``.
+    Only the compiler knows its target: the driver query asks it
+    (``_driver_query``), and this function is for a driver that does not
+    answer.
+
+    Returns None when the name names no target, or when the target is not in
+    ``_SUPPORTED_TARGET_PREFIXES`` (e.g. xtensa).
     """
-    triple: str | None = None
-
-    # 1 — Compiler name: strip trailing -gcc/-g++/-clang suffix
-    if compiler is not None:
-        name = compiler.name
-        # Strip version suffix: arm-none-eabi-g++-12 → arm-none-eabi-g++
-        name = re.sub(r'-\d+(\.\d+)*$', '', name)
-        for suffix in ("-g++", "-gcc", "-clang", "-clang++"):
-            if name.endswith(suffix):
-                triple = name[: -len(suffix)]
-                break
-        if triple is None and "-" in name:
-            # Heuristic: any compiler with a hyphen likely has a target prefix
-            # like "arm-none-eabi-g++". Try stripping the last two components.
-            parts = name.rsplit("-", 2)
-            if len(parts) == 3 and parts[-1] in ("gcc", "g++", "clang", "clang++"):
-                triple = parts[0] + "-" + parts[1]
-            else:
-                # Single-hyphen: e.g. "riscv64-gcc" → "riscv64"
-                parts2 = name.rsplit("-", 1)
-                if len(parts2) == 2 and parts2[-1] in ("gcc", "g++", "clang", "clang++"):
-                    triple = parts2[0]
-
-    # 2 — -mcpu= flags
-    if triple is None:
-        for arg in args:
-            if arg.startswith("-mcpu="):
-                cpu = arg[6:].split("+")[0].lower()  # strip +extensions
-                for prefix, t in _MCPU_TO_TRIPLE.items():
-                    if cpu.startswith(prefix):
-                        triple = t
-                        break
-                break  # -mcpu without mapping → unknown, don't fall through
-
-    # 3 — -march= flags
-    if triple is None:
-        for arg in args:
-            if arg.startswith("-march="):
-                arch = arg[7:].lower()
-                if arch.startswith("rv"):
-                    triple = "riscv32-unknown-elf"
-                elif "armv" in arch and "-m" in arch:
-                    triple = "arm-none-eabi"
-                break
-
+    triple = triple_of_driver_name(compiler) if compiler is not None else None
     if triple is None:
         return None
-
     # Only inject --target for triples the installed libclang actually supports.
     # An unsupported target (xtensa) causes TranslationUnitLoadError.
     # A triple can be the bare architecture: `avr-g++` gives `avr`, which
@@ -299,36 +256,195 @@ def expand_response_file(token: str, cwd: Path | None = None) -> list[str]:
     return shlex.split(rsp.read_text(encoding="utf-8"))
 
 
+def _names_file(token: str, cwd: Path, source: Path) -> bool:
+    """Return True when the argument *token* (relative to *cwd*) names the file *source*.
+
+    *source* is a canonical path (``path_key.canonical_path``).  WHY the
+    identity of the file and not its base name: the entry can name the
+    file through a link or, on a case-insensitive file system, in a
+    different case.  The unit then has the canonical name, and a compare
+    of base names kept the token: libclang got two input files and refused
+    the unit.  WHY each positional token and not only a token with the
+    suffix of a source: a link can have a different suffix, and an
+    assembly source (``.S``) has no suffix of a C or C++ unit.
+
+    A token that cannot be resolved names no file, thus not *source*,
+    which was resolved: a name that the system refuses (OSError,
+    ValueError).  A loop of links gives a path and no error
+    (``path_key.resolve_path``), and that path is not *source*.
+    """
+    try:
+        return canonical_path(cwd / token) == source
+    except (OSError, ValueError):
+        return False
+
+
 def _is_source_file(token: str) -> bool:
     # No .lower(): the suffix table of gcc is case-sensitive, and `.C`
     # is a C++ source while `.c` is a C one.
     return Path(token).suffix in TU_EXTENSIONS
 
 
-def _detect_language(file: Path, clang_args: list[str]) -> str:
-    """Say whether the compiler reads this unit as C or as C++.
+#: The suffixes that a C++ driver compiles as C++ (``is_cxx_driver_name``).
+_CXX_DRIVER_C_SUFFIXES = frozenset({".c", ".h", ".i"})
 
-    The suffix decides when the compiler has a rule for it — see
-    CPP_SOURCE_EXTENSIONS, taken from the table in `man gcc`.  Case is part
-    of that rule: `.C` is C++ and `.c` is C, so this must not lowercase.
+XLanguage = Literal["c", "cpp", "none", "other"]
 
-    A suffix the table does not cover falls through to `-std=`, which is how
-    a project building `.S` or an unusual extension still gets an answer.
+
+def _x_language(value: str) -> XLanguage:
+    """Return what the value of ``-x`` makes of the unit: ``"cpp"``, ``"c"``, ``"none"`` or ``"other"``.
+
+    ``none`` gives the decision back to the suffix (GCC).  ``other`` is a
+    language that is not C or C++ (``assembler-with-cpp``, ``objective-c``,
+    ``objective-c++``): the unit then keeps its ``-x``, and no rule of C or
+    C++ applies to it.  WHY ``objective-c++`` is ``other``: an ``-x c++`` in
+    its place makes libclang parse Objective-C syntax as C++.
     """
+    if value == "none":
+        return "none"
+    if value.startswith("c++"):
+        return "cpp"
+    if value == "c" or value.startswith(("c-", "cpp-output")):
+        return "c"
+    return "other"
+
+
+def _x_values(args: Sequence[str]) -> Iterator[tuple[int, int, str]]:
+    """Yield ``(start, end, value)`` of each ``-x`` of *args*: ``-x c++`` (two tokens) and ``-xc++`` (one).
+
+    WHY the positions: GCC applies an ``-x`` to the input files after it,
+    thus the caller compares the position with the one of the source, and
+    removes the tokens from the libclang arguments.
+    """
+    i = 0
+    while i < len(args):
+        token = args[i]
+        if token == "-x" and i + 1 < len(args):
+            yield i, i + 2, args[i + 1]
+            i += 2
+            continue
+        if token.startswith("-x") and len(token) > 2:
+            yield i, i + 1, token[2:]
+        i += 1
+
+
+def _source_position(file: Path, args: Sequence[str], cwd: Path) -> int:
+    """Return the position of the token of *args* that names *file*, or ``len(args)`` when none names it.
+
+    Only a token that is no flag can be the source, as ``normalize_args``
+    reads it; each check resolves a path, thus the flags are left out.
+    """
+    for i, token in enumerate(args):
+        if not token.startswith("-") and _names_file(token, cwd, file):
+            return i
+    return len(args)
+
+
+def _language_of_unit(
+    file: Path, args: Sequence[str], compiler: Path | None, cwd: Path | None,
+) -> tuple[str, bool]:
+    """Return the language (``"c"`` or ``"cpp"``) that the compiler gives *file*, and True when no suffix rule decided it.
+
+    The rules of the compiler, in this order:
+
+    1. The last ``-x`` before the source file (GCC: ``-x`` applies to the
+       input files after it).  With *cwd*, the source token of *args* ends
+       the search; without it (the libclang arguments of a manifest, which
+       hold no source token) each ``-x`` counts.  An ``-x`` of a language
+       that is not C or C++ leaves the suffix to decide, and no driver rule
+       applies.
+    2. A C++ driver (``is_cxx_driver_name``) compiles a `.c`, `.h` or `.i`
+       file as C++.
+    3. The suffix: the C++ suffixes of ``man gcc`` (CPP_SOURCE_EXTENSIONS),
+       in their case (`.C` is C++, `.c` is C); else C.
+
+    WHY no ``-std=``: it does not select the language.  Measured
+    2026-11-13 with GCC 14 (arm-zephyr-eabi): ``gcc -std=gnu++17 -c f.c``
+    compiles C, with the warning "valid for C++/ObjC++ but not for C".  An
+    earlier rule took such a unit for C++, and libclang then refused the
+    unit (TranslationUnitLoadError).
+    """
+    chosen: XLanguage = "none"
+    found = list(_x_values(args))
+    if found:
+        end = _source_position(file, args, cwd) if cwd is not None else len(args)
+        for start, _end, value in found:
+            if start < end:
+                chosen = _x_language(value)
+    if chosen == "c" or chosen == "cpp":
+        return chosen, True
     if file.suffix in CPP_SOURCE_EXTENSIONS:
-        return "cpp"
-    std = next((a for a in clang_args if a.startswith("-std=")), "")
-    if "++" in std:
-        return "cpp"
-    return "c"
+        return "cpp", False
+    if chosen == "none" and compiler is not None and is_cxx_driver_name(compiler) and file.suffix in _CXX_DRIVER_C_SUFFIXES:
+        return "cpp", True
+    return "c", False
+
+
+def unit_language(file: Path, args: Sequence[str], compiler: Path | None = None, cwd: Path | None = None) -> str:
+    """Return the language (``"c"`` or ``"cpp"``) that the compiler gives the unit of *file* (``_language_of_unit``).
+
+    *args* are the arguments after the compiler: those of the entry (with
+    *compiler* and *cwd*), or the libclang arguments of a unit, which carry
+    an explicit ``-x`` when the suffix does not decide the language
+    (``_with_language``).  WHY one function: the run, the driver query and
+    ``reindex_file`` order the claims of the headers by this language.
+    """
+    return _language_of_unit(file, args, compiler, cwd)[0]
+
+
+def _with_language(clang_args: list[str], language: str, explicit: bool) -> list[str]:
+    """Return *clang_args* with the language of the unit as libclang must read it.
+
+    Each ``-x`` of C or C++ (or ``none``) leaves: in the libclang arguments
+    the source token is gone, thus an ``-x`` after the source file of the
+    entry would apply to it.  When a rule other than the suffix decided the
+    language (*explicit*), one ``-x`` goes first: libclang knows no driver,
+    and reads a `.c` file of ``g++`` as C.  An ``-x`` of an other language
+    (``assembler-with-cpp``) stays as it is.
+
+    A ``-std=`` of the other language leaves too.  GCC ignores it with a
+    warning ("valid for C++/ObjC++ but not for C"), and clang refuses the
+    unit ("invalid argument '-std=gnu++17' not allowed with 'C'"); measured
+    2026-11-13, both directions.  A C++ standard holds ``++`` in its name,
+    a standard of C never does.
+    """
+    drop: set[int] = set()
+    for start, end, value in _x_values(clang_args):
+        if _x_language(value) != "other":
+            drop.update(range(start, end))
+    for i, arg in enumerate(clang_args):
+        if arg.startswith(("-std=", "--std=")) and ("++" in arg) != (language == "cpp"):
+            drop.add(i)
+    kept = [arg for i, arg in enumerate(clang_args) if i not in drop]
+    if explicit:
+        return ["-x", "c++" if language == "cpp" else "c", *kept]
+    return kept
+
+
+# The attached forms of the path flags of `normalize_args`.  No flag of the
+# tuple starts with an other one (`-isysroot` is no `-isystem`), thus the
+# order does not matter.  `-iwithprefix*` is not here: its value is
+# relative to the prefix.
+_ATTACHED_PATH_FLAGS = ("-isystem", "-idirafter", "-iquote", "-imacros", "-include", "-iprefix", "-isysroot")
+
+
+def _absolute_flag_path(flag: str, value: str, cwd: Path) -> str:
+    """Return the relative *value* of the path flag *flag* as an absolute path of the directory *cwd*.
+
+    WHY ``-iprefix`` keeps its trailing separator: GCC joins the prefix and
+    the value of ``-iwithprefix*`` as text (``include/`` + ``newlib`` gives
+    ``include/newlib``), and ``resolve_path`` removes the separator.
+    """
+    absolute = str(resolve_path(cwd / value))
+    if flag == "-iprefix" and value.endswith(("/", "\\")):
+        absolute += value[-1]
+    return absolute
 
 
 def normalize_args(
-
     raw_args: list[str],
     cwd: Path,
     source_file: str | None = None,
-    compiler: Path | None = None,
 ) -> list[str]:
     """Expand response files and strip GCC-specific flags incompatible with libclang.
 
@@ -341,8 +457,17 @@ def normalize_args(
     the process CWD, not the compile_commands.json directory — ``-I.``
     would resolve to the wrong location otherwise.
 
-    If source_file is given, any token matching that filename (by basename)
-    is dropped — handles build systems where the source file is not the last arg.
+    If *source_file* is given, each positional token that names that file
+    (:func:`_names_file`) is dropped, also when it is not the last argument.
+    Each reader of the flags names the file once on its own: named twice,
+    libclang refuses the unit, and clang preprocesses it twice.
+
+    The result has no ``--target``: the caller adds the target
+    (``_clang_args_for_unit``).  WHY: the target of the GCC driver comes
+    from the driver (``libclang_args``).  A target that this function added
+    from ``-march=rv*`` gave the unit a second ``--target``
+    (``riscv32-unknown-elf`` after ``riscv32-esp-elf``), and the last one
+    won.
     """
     # Expand @response_files first
     expanded: list[str] = []
@@ -352,7 +477,7 @@ def normalize_args(
         else:
             expanded.append(token)
 
-    source_basename = Path(source_file).name if source_file else None
+    source = canonical_path(cwd / source_file) if source_file else None
 
     result: list[str] = []
     skip_next = False
@@ -378,46 +503,65 @@ def normalize_args(
             continue
 
         # Source file — libclang receives file path separately
-        if _is_source_file(token):
-            if source_basename and Path(token).name == source_basename:
-                continue
-            if source_basename is None and i == len(expanded) - 1:
-                continue
+        if source is not None and not token.startswith("-") and _names_file(token, cwd, source):
+            continue
+        if source is None and _is_source_file(token) and i == len(expanded) - 1:
+            continue
 
         result.append(token)
 
-    # Inject --target triple so clang understands -mcpu=/-mfpu=/-mfloat-abi= on the host
-    target = _detect_target_triple(compiler, result)
-    if target:
-        result = [f"--target={target}"] + result
-
     # Resolve relative -I paths to absolute (libclang uses process CWD, not
     # compile_commands.json directory, so -I. would resolve to wrong location).
-    _INC_FLAGS = frozenset({"-I", "-isystem", "-idirafter", "-iquote", "-imacros", "-include"})
+    # resolve_path: a loop of links in a directory of the flags stopped the
+    # parse of the whole build on Python 3.11 and 3.12 (RuntimeError).
+    # `-iprefix`, `--sysroot` and `-isysroot` name a directory relative to
+    # the directory of the compilation too.  The values of
+    # `-iwithprefix*` and `-imultilib` are relative to the prefix or the
+    # sysroot, thus they stay as they are.
+    _INC_FLAGS = frozenset({
+        "-I", "-isystem", "-idirafter", "-iquote", "-imacros", "-include",
+        "-iprefix", "--sysroot", "-isysroot",
+    })
     resolved: list[str] = []
-    skip_next = False
+    pending = ""
+    verbatim_next = False
     for token in result:
-        if skip_next:
-            skip_next = False
+        if pending:
             if not Path(token).is_absolute():
-                token = str((cwd / token).resolve())
+                token = _absolute_flag_path(pending, token, cwd)
             resolved.append(token)
+            pending = ""
+            continue
+        if verbatim_next:
+            resolved.append(token)
+            verbatim_next = False
             continue
         if token in _INC_FLAGS:
             resolved.append(token)
-            skip_next = True
+            pending = token
+        elif token in DRIVER_TAKES_NEXT:
+            # An other option with a value (`-include-pch x.pch`): the
+            # value stays as it is, and the option is no attached form of
+            # a path flag (`-include` + `-pch`).
+            resolved.append(token)
+            verbatim_next = True
+        elif token.startswith("--sysroot="):
+            path = token[len("--sysroot="):]
+            if path and not Path(path).is_absolute():
+                path = _absolute_flag_path("--sysroot", path, cwd)
+            resolved.append(f"--sysroot={path}")
         elif token.startswith("-I"):
             path = token[2:]
             if path and not Path(path).is_absolute():
-                path = str((cwd / path).resolve())
+                path = str(resolve_path(cwd / path))
             resolved.append(f"-I{path}")
-        elif any(token.startswith(f) for f in ("-isystem", "-idirafter", "-iquote", "-imacros", "-include")):
-            # Attached form: -isystem/path, -include/path
-            for f in ("-isystem", "-idirafter", "-iquote", "-imacros", "-include"):
+        elif token.startswith(_ATTACHED_PATH_FLAGS):
+            # Attached form: -isystem/path, -include/path, -iprefixdir/
+            for f in _ATTACHED_PATH_FLAGS:
                 if token.startswith(f):
                     path = token[len(f):]
                     if path and not Path(path).is_absolute():
-                        path = str((cwd / path).resolve())
+                        path = _absolute_flag_path(f, path, cwd)
                     resolved.append(f"{f}{path}")
                     break
         else:
@@ -543,11 +687,12 @@ def _gcc_system_includes(compiler: Path, triple: str) -> list[str]:
 
 
 def _clang_args_for_unit(
-    raw_args: list[str],
     cwd: Path,
     file: Path,
     compiler: Path | None,
     known: dict[str, Path],
+    language: str,
+    expanded: list[str],
 ) -> list[str]:
     """Build the libclang flags of one unit, from the GCC driver when it answers.
 
@@ -558,37 +703,86 @@ def _clang_args_for_unit(
 
     When the driver does not answer, the flags are the earlier ones: the
     flags of ``compile_commands.json``, a target from the compiler name, and
-    the guessed toolchain directories.
+    the guessed toolchain directories.  A unit that names its own target
+    (``--target=``, ``-target``: a clang build) keeps it alone: a second
+    target came after it and won, and the directories of a GCC toolchain
+    are no directories of a clang build.
+
+    *expanded* are the arguments with the response files replaced: each
+    reader of the flags reads them, thus a response file is read once.
     """
-    driver = _driver_for_unit(raw_args, cwd, file, compiler, known)
+    driver = _driver_for_unit(expanded, cwd, compiler, known, language)
+    clang_args = normalize_args(expanded, cwd, str(file))
     if driver is not None:
-        return libclang_args(driver, normalize_args(raw_args, cwd, str(file), None))
-    clang_args = normalize_args(raw_args, cwd, str(file), compiler)
-    if compiler is not None:
-        # Pass raw_args so -mcpu=/-march= heuristics can augment compiler-name detection.
-        triple = _detect_target_triple(compiler, raw_args)
-        if triple is not None:
-            clang_args = clang_args + _gcc_system_includes(compiler, triple)
+        return libclang_args(driver, clang_args)
+    if any(arg.startswith(("--target=", "-target=")) or arg == "-target" for arg in clang_args):
+        return clang_args
+    # The target, so that clang understands -mcpu=/-mfpu=/-mfloat-abi= on
+    # the host.
+    #
+    # A unit without a target is parsed for the host: a build for the host,
+    # or a compiler that did not answer, which _driver_query reported.
+    triple = _detect_target_triple(compiler)
+    if triple is None:
+        return clang_args
+    clang_args = [f"--target={triple}", *clang_args]
+    # The directories of a GCC toolchain are for a GCC driver alone, not
+    # for `<triple>-clang`.
+    if compiler is not None and is_gcc_driver_name(compiler):
+        clang_args += _gcc_system_includes(compiler, triple)
     return clang_args
 
 
 def _driver_for_unit(
-    raw_args: list[str],
+    expanded: list[str],
     cwd: Path,
-    file: Path,
     compiler: Path | None,
     known: dict[str, Path],
+    language: str,
 ) -> DriverInfo | None:
+    """Ask the GCC driver of the unit for its target, system directories and macros, in *language*.
+
+    *expanded* are the arguments of the entry with the response files
+    replaced (``_expanded``); *language* is ``unit_language`` of the unit.
+    WHY the caller gives both: ``parse`` needs them for the libclang
+    arguments too, and a response file is read once for each unit.
+    """
     if compiler is None or not is_gcc_driver_name(compiler):
         return None
     resolved = resolve_compiler(str(compiler), cwd, known)
     if resolved is None:
         return None
+    return query_gcc_driver(resolved, language, predefine_flags(expanded), cwd)
+
+
+def _expanded(raw_args: list[str], cwd: Path) -> list[str]:
+    """Return *raw_args* with each response file (``@file``) replaced by its arguments.
+
+    WHY: a build that gives its flags in a response file (``@flags.rsp``)
+    names its ``-x`` and the flags of the driver query there, and the rules
+    of the language and of the driver must read them.
+    """
     expanded: list[str] = []
     for token in raw_args:
         expanded.extend(expand_response_file(token, cwd) if token.startswith("@") else [token])
-    language = _detect_language(file, expanded)
-    return query_gcc_driver(resolved, language, predefine_flags(expanded), cwd)
+    return expanded
+
+
+def load_entries(path: Path) -> Any:
+    """Return the JSON of the compilation database *path*, as each reader of it must read it.
+
+    WHY ``utf-8-sig``: a tool on Windows can write the file with a byte
+    order mark.  ``json.loads`` refuses a text that starts with it, thus a
+    reader with ``utf-8`` reported a damaged file, or no defines, for a
+    file that ``parse`` indexed.  WHY one function: eight readers of the
+    file had two encodings.
+
+    Raise OSError when the file cannot be read, and ValueError when it is
+    not UTF-8 or not JSON (``UnicodeDecodeError`` and ``JSONDecodeError``
+    are ValueError).  The value is any JSON value, as ``json.loads`` gives
+    it: the caller checks the shape (a list of entries).
+    """
+    return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
 def parse(path: Path) -> Iterator[CompilationUnit]:
@@ -604,7 +798,7 @@ def parse(path: Path) -> Iterator[CompilationUnit]:
     and the project root as more arguments; a caller that still gives them
     fails at once with a TypeError.
     """
-    entries = json.loads(path.read_text(encoding="utf-8-sig"))
+    entries = load_entries(path)
     # One build can name a compiler with its directory in some entries and
     # without it in others; see known_compilers().
     known = known_compilers(entries)
@@ -629,8 +823,11 @@ def parse(path: Path) -> Iterator[CompilationUnit]:
             compiler = Path(raw_args[0])
             raw_args = raw_args[1:]
 
-        clang_args = _clang_args_for_unit(raw_args, cwd, file, compiler, known)
-        lang = _detect_language(file, clang_args)
+        expanded = _expanded(raw_args, cwd)
+        lang, explicit = _language_of_unit(file, expanded, compiler, cwd)
+        clang_args = _with_language(
+            _clang_args_for_unit(cwd, file, compiler, known, lang, expanded), lang, explicit,
+        )
 
         yield CompilationUnit(
             file=file,
@@ -703,8 +900,12 @@ def command_line_defines(cc_path: Path) -> tuple[dict[str, str], int]:
     of magnitude more, and almost all of it comes from the headers and the
     compiler rather than from the build.
 
-    Returns an empty dict and 0 when the file is unreadable.  A missing
-    answer is correct there; an invented one is not.
+    Returns an empty dict and 0 when the file is unreadable, also when the
+    ``command`` of an entry cannot be split (a quote that does not end):
+    ``parse`` refuses the same file.  A missing answer is correct there; an
+    invented one is not.  The file is read as ``parse`` reads it
+    (``utf-8-sig``): a file with a byte order mark gave no defines here
+    while ``parse`` indexed it.
 
     No log line on that path, and this module keeps no logger on purpose.
     An unreadable compile_commands.json is not a detail a caller could
@@ -712,8 +913,8 @@ def command_line_defines(cc_path: Path) -> tuple[dict[str, str], int]:
     that state on its own.
     """
     try:
-        entries = json.loads(cc_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, UnicodeDecodeError):
+        entries = load_entries(cc_path)
+    except (OSError, ValueError):  # ValueError: also UnicodeDecodeError
         return {}, 0
     if not isinstance(entries, list):
         return {}, 0
@@ -723,7 +924,11 @@ def command_line_defines(cc_path: Path) -> tuple[dict[str, str], int]:
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        one = _defines_of_entry(entry)
+        try:
+            one = _defines_of_entry(entry)
+        except ValueError:
+            # utils.command_words: a quote that does not end.
+            return {}, 0
         every_name |= set(one)
         if shared is None:
             shared = dict(one)
@@ -770,8 +975,8 @@ def compile_directory(cc_path: Path) -> Path | None:
     "not known" rather than a guess.
     """
     try:
-        entries = json.loads(cc_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, UnicodeDecodeError):
+        entries = load_entries(cc_path)
+    except (OSError, ValueError):  # ValueError: also UnicodeDecodeError
         return None
     if not isinstance(entries, list):
         return None

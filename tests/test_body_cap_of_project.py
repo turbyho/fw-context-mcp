@@ -8,19 +8,19 @@ got the cap of the global config.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
 
 import fw_context_mcp.config.settings as settings
+from tests._toolchains import write_compile_commands, write_sources
 
 PID = "0123456789abcdef0123456789abcdef"
 LONG = "int long_function(int x) {\n" + "".join(f"    x += {n};\n" for n in range(1, 9)) + "    return x;\n}\n"
 
 
 @pytest.fixture
-def project(request, tmp_path, monkeypatch) -> Path:
+def project(request, tmp_path, monkeypatch, toolchain) -> Path:
     """One build of one file; the project caps a body at 3 lines (or ``request.param``), the global config at 50.
 
     WHY a parameter and not a rewrite of the file in the test: the config
@@ -37,16 +37,17 @@ def project(request, tmp_path, monkeypatch) -> Path:
     monkeypatch.setattr(settings, "_GLOBAL_CONFIG_PATH", home)
     root = tmp_path / "proj"
     (root / ".git").mkdir(parents=True)
-    (root / "main.c").write_text(LONG, encoding="utf-8")
+    write_sources(root, {"main.c": LONG})
     index_dir = tmp_path / "index"
     (root / ".fw-context").mkdir()
     (root / ".fw-context" / "config.toml").write_text(
         f'[project]\nid = "{PID}"\n[index]\nmax_symbol_body_lines = {cap}\n', encoding="utf-8",
     )
     (root / ".fw-context" / "local.toml").write_text(f'[index]\ndb_dir = "{index_dir.as_posix()}"\n', encoding="utf-8")
-    cc = root / "compile_commands.json"
-    cc.write_text(json.dumps([{"directory": str(root), "file": "main.c", "arguments": ["cc", "-c", "main.c"]}]),
-                  encoding="utf-8")
+    cc = write_compile_commands(
+        root / "compile_commands.json",
+        [{"directory": str(root), "file": "main.c", "arguments": toolchain.arguments("main.c")}],
+    )
     run(compile_commands=cc, db_path=index_dir / PID / "index.db", project_root=root, project_id=PID,
         index_refs=False, index_embeddings=False, analyze_symbols=False)
     return root

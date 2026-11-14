@@ -43,7 +43,7 @@ _BACKENDS = [
     (ArduinoBuildSystem, True),     # arduino-cli --build-path
     (ESPIDFBuildSystem, True),      # idf.py -B <dir>
     (GenericCMakeBuildSystem, True),  # cmake -B <dir>
-    (MakefileBuildSystem, True),    # compiledb -n, no compilation by default
+    (MakefileBuildSystem, True),    # make -Bnkwp, no compilation by default
     (KeilBuildSystem, True),        # converts a .uvprojx, compiles nothing
     (IARBuildSystem, True),         # converts an .ewp, compiles nothing
     (ManualBuildSystem, True),      # -fsyntax-only, no object file
@@ -133,7 +133,6 @@ class TestManualDependencyFiles:
     @staticmethod
     def _run(tmp_path: Path, monkeypatch, cfg: BuildConfig, extra: str = "") -> list[list[str]]:
         """Build a tiny project and return the commands the backend issued."""
-        import shutil as _shutil
 
         src = tmp_path / "src"
         src.mkdir(parents=True)
@@ -152,7 +151,10 @@ class TestManualDependencyFiles:
             "fw_context_mcp.indexer.builders.manual.run_build_command", _fake_run
         )
         # The backend refuses to start without a compiler on PATH.
-        monkeypatch.setattr(_shutil, "which", lambda name: f"/usr/bin/{name}")
+        monkeypatch.setattr(
+            "fw_context_mcp.indexer.builders.manual.require_build_tool",
+            lambda names, cwd, cfg, hint: f"/usr/bin/{names}",
+        )
 
         ManualBuildSystem().generate(tmp_path, cfg)
         return commands
@@ -239,7 +241,7 @@ class TestPlatformIOIsolatesObjectFiles:
             return _Result()
 
         monkeypatch.setattr(mod, "run_build_command", fake_run)
-        monkeypatch.setattr(mod.shutil, "which", lambda n: f"/usr/bin/{n}")
+        monkeypatch.setattr(mod, "require_build_tool", lambda names, cwd, cfg, hint: "pio")
         mod.PlatformIOBuildSystem().build(root, cfg)
         return envs
 

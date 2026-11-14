@@ -110,6 +110,13 @@ class TestInputFiles:
         ["-Wl,-Map", "-Xlinker", "out.map"],
         ["-Wl,--defsym", "out.map"],
         ["-Wl,-L", "out.map"],
+        # Options of the compiler: the reader lacked them, and their value
+        # was an input of the link (indexer/_driver_options.py).
+        ["-I", "out.map"],
+        ["-D", "out.map"],
+        ["-iquote", "out.map"],
+        ["-iwithprefixbefore", "out.map"],
+        ["-isysroot", "out.map"],
     ])
     def test_the_value_of_an_option_is_no_input_file(self, tmp_path, flags):
         # A map file of an earlier build is a text file on disk.  As the

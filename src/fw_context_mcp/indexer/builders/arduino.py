@@ -7,7 +7,7 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from fw_context_mcp.utils import cc_output_path, run_build_command
+from fw_context_mcp.utils import cc_output_path, require_build_tool, run_build_command
 
 from ..build_layout import BuildLayout
 from . import registry
@@ -17,6 +17,10 @@ if TYPE_CHECKING:
     from ..build import BuildConfig
 
 log = logging.getLogger(__name__)
+
+#: The upload port that the build gives arduino-cli: a name that is no
+#: device, as the build uploads nothing (see the --port in build()).
+_NO_UPLOAD_PORT = "fw-context-no-upload"
 
 
 class ArduinoBuildSystem:
@@ -53,28 +57,41 @@ class ArduinoBuildSystem:
         2. Real compile (no special flags) — produces ``.d`` dependency
            files so the indexer can track header changes.
         """
-        if not shutil.which("arduino-cli"):
-            raise RuntimeError(
-                "arduino-cli is required for Arduino builds.  Install it:\n"
-                "  curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh"
-            )
-
-        if not cfg.fqbn:
-            raise RuntimeError(
-                "Arduino requires a board FQBN.  Set it in .fw-context/config.toml:\n"
-                '  [build]\n  fqbn = "arduino:avr:uno"'
-            )
+        # The PATH of the build (activate, extra_path), not of this process;
+        # the build runs the program that the lookup found.
+        arduino_cli = require_build_tool(
+            "arduino-cli", project_root, cfg,
+            "Install it, and put it on PATH or its directory into [build] extra_path:\n"
+            "  curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh",
+        )
 
         build_dir = BuildLayout(project_root).out_dir(cfg.variant_name)
         if cfg.clean and build_dir.exists():
             shutil.rmtree(build_dir)
 
+        # Without [build] fqbn, arduino-cli takes the board of sketch.yaml
+        # (default_fqbn, or the default profile), as a compile of the user
+        # does (measured with arduino-cli 1.6.0).  WHY not a copy in the
+        # config: the next index run then builds for the board that
+        # sketch.yaml names now.  Without a board, arduino-cli stops with
+        # "Missing FQBN".
+        fqbn_flag = ["--fqbn", cfg.fqbn] if cfg.fqbn else []
         build_path_flag = str(build_dir)
         base_cmd: list[str] = [
-            "arduino-cli",
+            arduino_cli,
             "compile",
-            "--fqbn",
-            cfg.fqbn,
+            *fqbn_flag,
+            # WHY --port: arduino-cli looks for the upload port of
+            # sketch.yaml (default_port) also for a compile without upload,
+            # and with default_protocol a port that is not attached is a
+            # fatal error ("port not found", CalculateFQBNAndPort in
+            # internal/cli/arguments of arduino-cli 1.6.0).  A user with the
+            # board not attached then could not index.  An explicit --port
+            # replaces the port of sketch.yaml, and without --protocol a
+            # port that discovery does not find is no error.  The compile
+            # uses the port only for an upload (-u), which the build never
+            # does.
+            "--port", _NO_UPLOAD_PORT,
             "--build-path",
             build_path_flag,
         ]
@@ -86,6 +103,11 @@ class ArduinoBuildSystem:
             cwd=project_root,
             description="arduino-cli compile --only-compilation-database",
             build_cfg=cfg,
+            failure_hint="" if cfg.fqbn else (
+                "The config sets no board, thus arduino-cli takes the board of sketch.yaml (default_fqbn). "
+                'When the error is "Missing FQBN", set default_fqbn there, or set [build] fqbn = '
+                '"arduino:avr:uno" in .fw-context/config.toml.'
+            ),
         )
 
         # The database stays in the build directory when arduino-cli writes

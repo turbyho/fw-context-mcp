@@ -1,0 +1,96 @@
+# The embedded SDKs of the test suite, and the toolchains that the tests
+# compile with.
+#
+# The version of each SDK is pinned here, or in the platformio.ini of a
+# project that this file names.  Each SDK uses its default toolchain.  A
+# change of this file, of tests/sdk/requirements.txt or of such a
+# platformio.ini makes the pre-test of the session stop the run until
+# `python -m tests.sdk.provision` (make test-sdk) installed the new set.
+
+[python]
+# The Python of the venv of the test SDKs (west and the build scripts of
+# Zephyr, PlatformIO, cmake, ninja): a CPython build of
+# python-build-standalone, in this version, for each host.  WHY not the
+# Python that runs the script: Zephyr needs the version of
+# PYTHON_MINIMUM_REQUIRED in cmake/modules/python.cmake of its tree (3.12
+# for v4.5.0), and recommends 3.12.  A host with Python 3.11 gave a venv
+# that west could not run (measured on Windows, 2026-11-13).  The script
+# checks the archive against SHA256SUMS of the release.
+version = "3.12.16"
+release = "20261110"
+releases = "https://github.com/astral-sh/python-build-standalone/releases/download"
+
+[zephyr]
+manifest = "https://github.com/zephyrproject-rtos/zephyr"
+revision = "v4.5.0"
+# The projects of the west manifest of Zephyr that nrf52840dk/nrf52840 and
+# a sysbuild with MCUboot need.  MCUboot gets its crypto from tf-psa-crypto
+# and mbedtls.
+modules = ["hal_nordic", "cmsis_6", "mcuboot", "tf-psa-crypto", "mbedtls"]
+# The GNU toolchains of the Zephyr SDK.  The version of the SDK is the one
+# that the Zephyr tree names in its file SDK_VERSION.
+gnu_toolchains = ["arm-zephyr-eabi"]
+# The Python packages that the build needs, relative to the workspace:
+# those of Zephyr and those of the image tool of MCUboot.
+python_requirements = [
+    "zephyr/scripts/requirements-base.txt",
+    "bootloader/mcuboot/scripts/requirements.txt",
+]
+sdk_releases = "https://github.com/zephyrproject-rtos/sdk-ng/releases/download"
+
+[platformio]
+# The projects whose packages the script installs: the platform in the
+# version of its platformio.ini, with the toolchain and the framework that
+# the platform selects for the board.
+projects = ["tests/builds/platformio_esp32c3"]
+
+# The extended set: the SDKs of the tests of the marker extra_platforms
+# (make test-platforms).  `python -m tests.sdk.provision --extra` (make
+# test-sdk-platforms) installs them in the same root.  The pre-test checks
+# them only for a run that selects such a test.
+
+[extra.platformio]
+# Xtensa (ESP32), ARM with the newlib of PlatformIO (Nucleo L476RG), and
+# AVR (Uno), each with the Arduino framework.
+projects = [
+    "tests/builds/platformio_esp32",
+    "tests/builds/platformio_nucleo_l476rg",
+    "tests/builds/platformio_uno",
+]
+
+[extra.esp_idf]
+# The release archive with the submodules, and its SHA-256 from the
+# release (GitHub API, field digest).  The tools of each target, and the
+# Python env of ESP-IDF, go into <root>/espressif (IDF_TOOLS_PATH).
+version = "v6.1"
+archive = "https://github.com/espressif/esp-idf/releases/download/v6.1/esp-idf-v6.1.zip"
+sha256 = "cdeea7db47b90064ef185b2a1f1b33d17bcb13469a9f8cc20e06c4c4cdb4cc16"
+targets = ["esp32"]
+
+[extra.arduino]
+# The script checks the archive against <version>-checksums.txt of the
+# release.  The cores go into <root>/arduino (ARDUINO_DIRECTORIES_DATA).
+cli_version = "1.6.0"
+cli_releases = "https://github.com/arduino/arduino-cli/releases/download"
+platforms = ["arduino:avr@1.8.8"]
+
+# The toolchains of the indexer tests.  Each test that takes the fixture
+# `toolchain` runs once with each of them.  The flags select the CPU that
+# the board of the SDK has.  They are the flags that the SDK gives the
+# compiler for that board (measured from compile_commands.json of a build).
+
+[[toolchain]]
+id = "arm-zephyr"
+sdk = "zephyr"
+package = "arm-zephyr-eabi"
+prefix = "arm-zephyr-eabi-"
+# nrf52840dk/nrf52840, C library picolibc (the default of Zephyr).
+flags = ["-mcpu=cortex-m4", "-mthumb", "-mabi=aapcs", "-specs=picolibc.specs"]
+
+[[toolchain]]
+id = "riscv-esp"
+sdk = "platformio"
+package = "toolchain-riscv32-esp"
+prefix = "riscv32-esp-elf-"
+# ESP32-C3 (esp32-c3-devkitm-1), C library newlib of Espressif.
+flags = ["-march=rv32imc_zicsr_zifencei", "-mabi=ilp32"]

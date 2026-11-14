@@ -123,10 +123,6 @@ class TestIgnoreRule:
         assert "untracked" in caplog.text
 
 
-_GIT_MISSING = subprocess.run(["git", "--version"], capture_output=True, check=False).returncode != 0
-
-
-@pytest.mark.skipif(_GIT_MISSING, reason="git is not available")
 def test_git_really_stops_reporting_the_build_tree(tmp_path: Path):
     """The point of the whole thing, checked against git itself.
 
@@ -178,7 +174,6 @@ def test_git_really_stops_reporting_the_build_tree(tmp_path: Path):
     )
 
 
-@pytest.mark.skipif(_GIT_MISSING, reason="git is not available")
 def test_init_covers_the_build_tree_for_a_new_project(tmp_path: Path):
     """A new project ignores the build output through its own .gitignore.
 
@@ -204,7 +199,6 @@ def test_init_covers_the_build_tree_for_a_new_project(tmp_path: Path):
     assert ignored(f"{BUILD_ROOT_REL}/default/out/app.elf")
     assert ignored(f"{BUILD_ROOT_REL}/default/out/compile_commands.json")
     assert not ignored(".fw-context/config.toml"), "the shared config must stay committable"
-
 
 
 def _removed_paths(root: Path, keep=()) -> list[Path]:

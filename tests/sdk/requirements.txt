@@ -1,0 +1,8 @@
+# The tools of the venv of the test SDKs (<root>/venv).  Pinned, so that
+# each host builds the projects of the tests with the same tools.  The
+# Python packages of Zephyr and MCUboot come from the requirement files
+# of the Zephyr workspace, which the revision in versions.toml pins.
+west==1.5.0
+platformio==6.2.0
+cmake==4.4.4
+ninja==1.13.2

@@ -6,7 +6,6 @@ thus two files of one base name in two directories gave one symbol for two.
 
 from __future__ import annotations
 
-import json
 import re
 import sqlite3
 from pathlib import Path
@@ -14,8 +13,8 @@ from pathlib import Path
 import pytest
 
 from tests._toml import toml_string
+from tests._toolchains import Toolchain, parse_unit, write_compile_commands, write_sources
 
-pytest.importorskip("clang.cindex", reason="libclang not available")
 pytestmark = pytest.mark.libclang
 
 SOURCES = {
@@ -91,21 +90,19 @@ SOURCES = {
 }
 
 
-def _project(root: Path) -> None:
+def _project(root: Path, toolchain: Toolchain) -> None:
     (root / ".fw-context").mkdir(parents=True, exist_ok=True)
     (root / ".fw-context" / "config.toml").write_text(
         f'[project]\nid = "proj-usr"\n\n[build]\n\n[index]\ndb_dir = {toml_string(root.parent / "db")}\n', encoding="utf-8",
     )
-    for name, text in SOURCES.items():
-        (root / name).parent.mkdir(parents=True, exist_ok=True)
-        (root / name).write_text(text, encoding="utf-8")
+    write_sources(root, SOURCES)
     entries = []
     for name in SOURCES:
         if name.endswith(".c"):
-            entries.append({"directory": str(root), "file": name, "arguments": ["cc", "-std=gnu11", "-c", name]})
+            entries.append({"directory": str(root), "file": name, "arguments": toolchain.arguments(name, "-std=gnu11")})
         elif name.endswith(".cpp"):
-            entries.append({"directory": str(root), "file": name, "arguments": ["c++", "-std=c++17", "-c", name]})
-    (root / "compile_commands.json").write_text(json.dumps(entries), encoding="utf-8")
+            entries.append({"directory": str(root), "file": name, "arguments": toolchain.arguments(name, "-std=c++17")})
+    write_compile_commands(root / "compile_commands.json", entries)
 
 
 def _db(root: Path) -> Path:
@@ -133,10 +130,10 @@ def _rows(root: Path, sql: str, *params) -> list[tuple]:
 
 
 @pytest.fixture(scope="module")
-def indexed(tmp_path_factory) -> Path:
+def indexed(tmp_path_factory, toolchain: Toolchain) -> Path:
     root = tmp_path_factory.mktemp("usrkey") / "proj"
     root.mkdir()
-    _project(root)
+    _project(root, toolchain)
     _run(root)
     return root
 
@@ -198,7 +195,7 @@ def test_a_specialization_for_a_typedef_named_type_gets_the_place_of_its_templat
     assert usrs["m"] == f"c:@SA@mb_t~{key}:1:9@FI@m", "the typedef-named type"
 
 
-def test_a_specialization_with_no_definition_keeps_the_usr_of_libclang(tmp_path):
+def test_a_specialization_with_no_definition_keeps_the_usr_of_libclang(tmp_path, toolchain):
     """A specialization is no anonymous type, thus its declaration gives no mark: the unit has no definition."""
     import clang.cindex as cx
 
@@ -210,13 +207,13 @@ def test_a_specialization_with_no_definition_keeps_the_usr_of_libclang(tmp_path)
         "cv<mb_t> *p;\n",
         encoding="utf-8",
     )
-    unit = cx.Index.create().parse(str(source), args=["-x", "c++", "-std=c++17"])
+    unit = parse_unit(source, toolchain, ["-std=c++17"])
     specialization = next(node for node in unit.cursor.walk_preorder()
                           if node.kind == cx.CursorKind.STRUCT_DECL and node.location.line == 3)
     assert cursor_usr(specialization) == "c:@S@cv>#$@SA@mb_t"
 
 
-def test_an_explicit_specialization_in_two_main_files_is_one_type(tmp_path):
+def test_an_explicit_specialization_in_two_main_files_is_one_type(tmp_path, toolchain):
     """`template <> struct T1<int>` of one template is one entity in C++ ([temp.expl.spec]): one USR."""
     from fw_context_mcp.indexer._usr import file_key
 
@@ -226,12 +223,12 @@ def test_an_explicit_specialization_in_two_main_files_is_one_type(tmp_path):
         source = tmp_path / directory / "s.cpp"
         source.parent.mkdir()
         source.write_text('#include "../t.h"\ntemplate <> struct T1<int> { int b; };\n', encoding="utf-8")
-        usrs += _usrs(source, "FIELD_DECL", "b")
+        usrs += _usrs(source, "FIELD_DECL", "b", toolchain=toolchain)
     key = file_key(str(tmp_path / "t.h"))
     assert usrs == [f"c:@S@T1>#I~{key}:1:27@FI@b"] * 2
 
 
-def test_a_partial_specialization_in_two_main_files_has_the_place_of_each(tmp_path):
+def test_a_partial_specialization_in_two_main_files_has_the_place_of_each(tmp_path, toolchain):
     """A partial specialization is a template of its own: its place is its definition, not the place of `T1`."""
     (tmp_path / "t.h").write_text("template <class T> struct T1 { int a; };\n", encoding="utf-8")
     usrs = []
@@ -239,37 +236,63 @@ def test_a_partial_specialization_in_two_main_files_has_the_place_of_each(tmp_pa
         source = tmp_path / directory / "p.cpp"
         source.parent.mkdir()
         source.write_text('#include "../t.h"\ntemplate <class T> struct T1<T *> { int p; };\n', encoding="utf-8")
-        usrs += _usrs(source, "FIELD_DECL", "p")
+        usrs += _usrs(source, "FIELD_DECL", "p", toolchain=toolchain)
     assert len(usrs) == 2 and usrs[0] != usrs[1], usrs
     assert all(re.search(r"~p\.cpp~[0-9a-f]{8}:2:", usr) for usr in usrs), usrs
 
 
-def test_a_specialization_of_a_template_with_no_definition_has_its_own_place(tmp_path):
+def test_a_specialization_of_a_template_with_no_definition_has_its_own_place(tmp_path, toolchain):
     """`template <class T> struct D;` has no place: the explicit specialization of each file is its own type."""
     usrs = []
     for directory in ("a", "b"):
         source = tmp_path / directory / "d.cpp"
         source.parent.mkdir()
         source.write_text("template <class T> struct D;\ntemplate <> struct D<int> { int c; };\n", encoding="utf-8")
-        usrs += _usrs(source, "FIELD_DECL", "c")
+        usrs += _usrs(source, "FIELD_DECL", "c", toolchain=toolchain)
     assert len(usrs) == 2 and usrs[0] != usrs[1], usrs
     assert all(re.fullmatch(r"c:@S@D>#I~d\.cpp~[0-9a-f]{8}:2:20@FI@c", usr) for usr in usrs), usrs
 
 
-def _usrs(source: Path, kind_name: str, name: str, *extra: str) -> list[str]:
+def _usrs(source: Path, kind_name: str, name: str, *extra: str, toolchain: Toolchain) -> list[str]:
     """``cursor_usr`` of each cursor of the kind *kind_name* and the spelling *name* that a parse of *source* holds.
 
-    The parse keeps the preprocessing record, as ``symbols.extract_all``
-    does: the key of a character type of C++ reads the predefined macros.
+    The unit has the driver of *toolchain* and its answer, as the indexer
+    parses it; *extra* comes after the flags of the board.  The parse keeps
+    the preprocessing record, as ``symbols.extract_all`` does: the key of a
+    character type of C++ reads the predefined macros.
     """
+    import clang.cindex as cx
+
+    std = ["-std=c++17"] if source.suffix == ".cpp" else ["-std=gnu11"]
+    unit = parse_unit(source, toolchain, [*std, *extra], options=cx.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD)
+    return _usrs_in(unit, kind_name, name)
+
+
+def _usrs_of_target(source: Path, kind_name: str, name: str, *extra: str) -> list[str]:
+    """As ``_usrs``, for a test that gives the target and the macros of a GCC driver itself (*extra*).
+
+    WHY no toolchain: the key of a character type differs by target, and a
+    test of it names targets that no toolchain of the tests has (msp430).
+    *extra* must give ``--target=``: without it libclang takes the target
+    of the host.
+    """
+    import clang.cindex as cx
+
+    assert any(arg.startswith("--target=") for arg in extra), "give the --target of the test"
+    std = ["-std=c++17"] if source.suffix == ".cpp" else ["-std=gnu11"]
+    language = ["-x", "c++" if source.suffix == ".cpp" else "c", *std]
+    unit = cx.Index.create().parse(
+        str(source), args=[*language, *extra], options=cx.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD,
+    )
+    return _usrs_in(unit, kind_name, name)
+
+
+def _usrs_in(unit, kind_name: str, name: str) -> list[str]:
+    """``cursor_usr`` of each cursor of the kind *kind_name* and the spelling *name* in the translation unit *unit*."""
     import clang.cindex as cx
 
     from fw_context_mcp.indexer._usr import cursor_usr
 
-    language = ["-x", "c++", "-std=c++17"] if source.suffix == ".cpp" else ["-x", "c", "-std=gnu11"]
-    unit = cx.Index.create().parse(
-        str(source), args=[*language, *extra], options=cx.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD
-    )
     kind = getattr(cx.CursorKind, kind_name)
     return [cursor_usr(node) for node in unit.cursor.walk_preorder() if node.kind == kind and node.spelling == name]
 
@@ -286,30 +309,30 @@ def test_two_types_of_one_name_in_two_files_are_two_symbols(indexed):
     assert reads == {("cfg1", "a/cfg1.c"), ("cfg2", "b/cfg2.c")}
 
 
-def test_one_definition_is_one_type_in_c_and_in_cpp(indexed):
+def test_one_definition_is_one_type_in_c_and_in_cpp(indexed, toolchain):
     """`struct regs` has other members in C and in C++ (as CMSIS `__I`): one place, one type."""
-    in_c = _usrs(indexed / "a" / "r1.c", "STRUCT_DECL", "regs")
-    in_cpp = _usrs(indexed / "a" / "r2.cpp", "STRUCT_DECL", "regs")
+    in_c = _usrs(indexed / "a" / "r1.c", "STRUCT_DECL", "regs", toolchain=toolchain)
+    in_cpp = _usrs(indexed / "a" / "r2.cpp", "STRUCT_DECL", "regs", toolchain=toolchain)
     assert len(set(in_c + in_cpp)) == 1, (in_c, in_cpp)
     assert _rows(indexed, "SELECT COUNT(*) FROM symbols WHERE name = 'regs'") == [(1,)]
 
 
-def test_a_forward_declaration_with_no_definition_keeps_the_usr_of_libclang(indexed):
+def test_a_forward_declaration_with_no_definition_keeps_the_usr_of_libclang(indexed, toolchain):
     """`tm_t *t` of `r1.c` sees `struct tm_s` opaque: no unit can tell its definition."""
-    assert _usrs(indexed / "a" / "r1.c", "STRUCT_DECL", "tm_s") == ["c:@S@tm_s"]
-    assert _usrs(indexed / "a" / "tm.c", "STRUCT_DECL", "tm_s")[-1].startswith("c:@S@tm_s~tm.c~")
+    assert _usrs(indexed / "a" / "r1.c", "STRUCT_DECL", "tm_s", toolchain=toolchain) == ["c:@S@tm_s"]
+    assert _usrs(indexed / "a" / "tm.c", "STRUCT_DECL", "tm_s", toolchain=toolchain)[-1].startswith("c:@S@tm_s~tm.c~")
 
 
-def test_a_typedef_that_two_headers_declare_is_one_usr_with_no_file(indexed):
+def test_a_typedef_that_two_headers_declare_is_one_usr_with_no_file(indexed, toolchain):
     """libclang writes the file of the first declaration: the order of the includes decided the USR."""
-    usrs = [*_usrs(indexed / "a" / "r1.c", "TYPEDEF_DECL", "word_t"),
-            *_usrs(indexed / "a" / "r2.cpp", "TYPEDEF_DECL", "word_t")]
+    usrs = [*_usrs(indexed / "a" / "r1.c", "TYPEDEF_DECL", "word_t", toolchain=toolchain),
+            *_usrs(indexed / "a" / "r2.cpp", "TYPEDEF_DECL", "word_t", toolchain=toolchain)]
     assert len(usrs) == 4 and len(set(usrs)) == 1 and usrs[0].startswith("c:@T@word_t~"), usrs
 
 
-def test_a_typedef_of_an_opaque_struct_has_one_usr_with_and_without_the_definition(indexed):
-    without = _usrs(indexed / "a" / "r1.c", "TYPEDEF_DECL", "tm_t")
-    with_definition = _usrs(indexed / "a" / "tm.c", "TYPEDEF_DECL", "tm_t")
+def test_a_typedef_of_an_opaque_struct_has_one_usr_with_and_without_the_definition(indexed, toolchain):
+    without = _usrs(indexed / "a" / "r1.c", "TYPEDEF_DECL", "tm_t", toolchain=toolchain)
+    with_definition = _usrs(indexed / "a" / "tm.c", "TYPEDEF_DECL", "tm_t", toolchain=toolchain)
     assert len(set(without + with_definition)) == 1, (without, with_definition)
 
 
@@ -320,7 +343,7 @@ def test_two_typedefs_of_one_name_and_two_targets_are_two_usrs(indexed):
     assert len({row[1] for row in rows}) == 2 and all(row[1].startswith("c:@T@cfg_t~") for row in rows)
 
 
-def test_two_typedefs_of_the_unnamed_types_of_two_fields_at_one_offset_are_two_usrs(tmp_path):
+def test_two_typedefs_of_the_unnamed_types_of_two_fields_at_one_offset_are_two_usrs(tmp_path, toolchain):
     """The key of the target names the unnamed type of a field by its USR with the places, not by the USR of libclang.
 
     libclang writes `c:@S@H@S@ft.c@11` in the two files: the place of `H`
@@ -331,17 +354,17 @@ def test_two_typedefs_of_the_unnamed_types_of_two_fields_at_one_offset_are_two_u
     for directory in ("a", "b"):
         (tmp_path / directory).mkdir()
         (tmp_path / directory / "ft.c").write_text(text, encoding="utf-8")
-        usrs += _usrs(tmp_path / directory / "ft.c", "TYPEDEF_DECL", "ft_t")
+        usrs += _usrs(tmp_path / directory / "ft.c", "TYPEDEF_DECL", "ft_t", toolchain=toolchain)
     assert len(usrs) == 2 and len(set(usrs)) == 2, usrs
 
 
-def test_a_local_of_a_method_of_the_unnamed_type_of_a_field_keeps_its_own_place(tmp_path):
+def test_a_local_of_a_method_of_the_unnamed_type_of_a_field_keeps_its_own_place(tmp_path, toolchain):
     """The USR of a local starts with its own place, not with the USR of the type: it gets the key of its file only."""
     from fw_context_mcp.indexer._usr import file_key
 
     source = tmp_path / "g.cpp"
     source.write_text("struct { int f() { int loc = 1; return loc; } } g;\n", encoding="utf-8")
-    usrs = _usrs(source, "VAR_DECL", "loc")
+    usrs = _usrs(source, "VAR_DECL", "loc", toolchain=toolchain)
     pattern = rf"c:{re.escape(file_key(str(source)))}@\d+@S@g\.cpp@\d+@F@f#@loc"
     assert usrs and all(re.fullmatch(pattern, usr) for usr in usrs), usrs
 
@@ -352,26 +375,26 @@ def test_a_typedef_in_an_anonymous_namespace_keeps_its_file(indexed):
     assert all("hid.cpp~" in row[1] for row in rows), rows
 
 
-def test_the_key_of_a_target_is_its_canonical_type(tmp_path):
+def test_the_key_of_a_target_is_its_canonical_type(tmp_path, toolchain):
     """`word_t` is `unsigned int` in one header and a second typedef of it in an other: one type, one USR."""
     (tmp_path / "w1.h").write_text("typedef unsigned int word_t;\n", encoding="utf-8")
     (tmp_path / "w2.h").write_text("typedef unsigned int base_t;\ntypedef base_t word_t;\n", encoding="utf-8")
     (tmp_path / "u1.c").write_text('#include "w1.h"\n', encoding="utf-8")
     (tmp_path / "u2.c").write_text('#include "w2.h"\n', encoding="utf-8")
-    usrs = [*_usrs(tmp_path / "u1.c", "TYPEDEF_DECL", "word_t"), *_usrs(tmp_path / "u2.c", "TYPEDEF_DECL", "word_t")]
+    usrs = [*_usrs(tmp_path / "u1.c", "TYPEDEF_DECL", "word_t", toolchain=toolchain), *_usrs(tmp_path / "u2.c", "TYPEDEF_DECL", "word_t", toolchain=toolchain)]
     assert len(usrs) == 2 and len(set(usrs)) == 1, usrs
 
 
-def test_the_qualifiers_of_a_target_are_in_its_key(tmp_path):
+def test_the_qualifiers_of_a_target_are_in_its_key(tmp_path, toolchain):
     """`const int`, `volatile int` and `int` are three types: three typedefs of one name give three USRs."""
     usrs = []
     for name, target in (("q1.c", "const int"), ("q2.c", "volatile int"), ("q3.c", "int")):
         (tmp_path / name).write_text(f"typedef {target} level_t;\n", encoding="utf-8")
-        usrs += _usrs(tmp_path / name, "TYPEDEF_DECL", "level_t")
+        usrs += _usrs(tmp_path / name, "TYPEDEF_DECL", "level_t", toolchain=toolchain)
     assert len(usrs) == 3 and len(set(usrs)) == 3, usrs
 
 
-def test_an_alias_template_and_its_pattern_have_one_usr(tmp_path):
+def test_an_alias_template_and_its_pattern_have_one_usr(tmp_path, toolchain):
     """libclang gives the template and its pattern one USR: the two get the key of the target of the pattern.
 
     The index keeps the pattern, and a reference names the template.  Two
@@ -384,14 +407,14 @@ def test_an_alias_template_and_its_pattern_have_one_usr(tmp_path):
         encoding="utf-8",
     )
     (tmp_path / "b.cpp").write_text("namespace ns {\ntemplate <class T> using rm_t = T *;\n}\n", encoding="utf-8")
-    first = [*_usrs(tmp_path / "a.cpp", "TYPE_ALIAS_TEMPLATE_DECL", "rm_t"),
-             *_usrs(tmp_path / "a.cpp", "TYPE_ALIAS_DECL", "rm_t")]
+    first = [*_usrs(tmp_path / "a.cpp", "TYPE_ALIAS_TEMPLATE_DECL", "rm_t", toolchain=toolchain),
+             *_usrs(tmp_path / "a.cpp", "TYPE_ALIAS_DECL", "rm_t", toolchain=toolchain)]
     assert len(first) == 2 and len(set(first)) == 1 and first[0].startswith("c:@N@ns@rm_t~"), first
-    second = _usrs(tmp_path / "b.cpp", "TYPE_ALIAS_TEMPLATE_DECL", "rm_t")
+    second = _usrs(tmp_path / "b.cpp", "TYPE_ALIAS_TEMPLATE_DECL", "rm_t", toolchain=toolchain)
     assert len(second) == 1 and second[0] != first[0], (first, second)
 
 
-def test_a_typedef_in_a_class_gets_no_key_of_its_target(tmp_path):
+def test_a_typedef_in_a_class_gets_no_key_of_its_target(tmp_path, toolchain):
     """C++ does not let a class declare a typedef again: the USR of the class (with its place) names it.
 
     libclang writes the file before it, and the file of each copy of a
@@ -401,7 +424,7 @@ def test_a_typedef_in_a_class_gets_no_key_of_its_target(tmp_path):
 
     source = tmp_path / "member.cpp"
     source.write_text("struct Uart { typedef int size_type; size_type n; };\n", encoding="utf-8")
-    assert _usrs(source, "TYPEDEF_DECL", "size_type") == [f"c:@S@Uart~{file_key(str(source))}:1:8@T@size_type"]
+    assert _usrs(source, "TYPEDEF_DECL", "size_type", toolchain=toolchain) == [f"c:@S@Uart~{file_key(str(source))}:1:8@T@size_type"]
 
 
 def test_a_type_of_the_compiler_and_an_empty_list_of_parameters_give_one_key_in_c_and_cpp(tmp_path):
@@ -416,8 +439,8 @@ def test_a_type_of_the_compiler_and_an_empty_list_of_parameters_give_one_key_in_
         (tmp_path / name).write_text('#include "va.h"\n', encoding="utf-8")
     target = "--target=thumbv7em-none-eabi"
     for typedef in ("va_t", "fn_t"):
-        in_c = _usrs(tmp_path / "u.c", "TYPEDEF_DECL", typedef, target)
-        in_cpp = _usrs(tmp_path / "u.cpp", "TYPEDEF_DECL", typedef, target)
+        in_c = _usrs_of_target(tmp_path / "u.c", "TYPEDEF_DECL", typedef, target)
+        in_cpp = _usrs_of_target(tmp_path / "u.cpp", "TYPEDEF_DECL", typedef, target)
         assert len(in_c) == 1 and in_c == in_cpp, (typedef, in_c, in_cpp)
 
 
@@ -457,8 +480,8 @@ def test_a_typedef_of_a_character_type_has_one_usr_in_c_and_cpp(tmp_path, target
         assert not [d.spelling for d in unit.diagnostics if d.severity >= cx.Diagnostic.Error], name
     keys = set()
     for typedef in ("wc_t", "c16_t", "c32_t", "c8_t", "pwc_t", "wcb_t"):
-        in_c = _usrs(tmp_path / "u.c", "TYPEDEF_DECL", typedef, target, "-ffreestanding")
-        in_cpp = _usrs(tmp_path / "u.cpp", "TYPEDEF_DECL", typedef, target, "-ffreestanding", "-std=c++20")
+        in_c = _usrs_of_target(tmp_path / "u.c", "TYPEDEF_DECL", typedef, target, "-ffreestanding")
+        in_cpp = _usrs_of_target(tmp_path / "u.cpp", "TYPEDEF_DECL", typedef, target, "-ffreestanding", "-std=c++20")
         assert len(in_c) == 1 and in_c == in_cpp, (typedef, in_c, in_cpp)
         keys.add(in_c[0])
     assert len(keys) == 6, keys
@@ -470,9 +493,9 @@ def test_a_definition_of_the_command_line_gives_the_key_of_a_character_type(tmp_
     for name in ("u.c", "u.cpp"):
         (tmp_path / name).write_text('#include "ch.h"\n', encoding="utf-8")
     flags = ("--target=x86_64-linux-gnu", "-U__WCHAR_TYPE__", "-D__WCHAR_TYPE__=short")
-    in_c = _usrs(tmp_path / "u.c", "TYPEDEF_DECL", "wc_t", *flags)
-    in_cpp = _usrs(tmp_path / "u.cpp", "TYPEDEF_DECL", "wc_t", *flags)
-    plain = _usrs(tmp_path / "u.c", "TYPEDEF_DECL", "wc_t", "--target=x86_64-linux-gnu")
+    in_c = _usrs_of_target(tmp_path / "u.c", "TYPEDEF_DECL", "wc_t", *flags)
+    in_cpp = _usrs_of_target(tmp_path / "u.cpp", "TYPEDEF_DECL", "wc_t", *flags)
+    plain = _usrs_of_target(tmp_path / "u.c", "TYPEDEF_DECL", "wc_t", "--target=x86_64-linux-gnu")
     assert len(in_c) == 1 and in_c == in_cpp and in_c != plain, (in_c, in_cpp, plain)
 
 
@@ -499,35 +522,34 @@ def test_the_key_of_a_character_type_takes_the_specifiers_in_any_order(tmp_path,
     for name, language in (("u.c", ["-x", "c", "-std=gnu11"]), ("u.cpp", ["-x", "c++", "-std=c++20"])):
         unit = cx.Index.create().parse(str(tmp_path / name), args=[*language, *flags(text)])
         assert not [d.spelling for d in unit.diagnostics if d.severity >= cx.Diagnostic.Error], name
-    in_c = _usrs(tmp_path / "u.c", "TYPEDEF_DECL", "c16_t", *flags(text))
-    in_cpp = _usrs(tmp_path / "u.cpp", "TYPEDEF_DECL", "c16_t", *flags(text), "-std=c++20")
-    of_clang = _usrs(tmp_path / "u.cpp", "TYPEDEF_DECL", "c16_t", *flags("unsigned short"), "-std=c++20")
+    in_c = _usrs_of_target(tmp_path / "u.c", "TYPEDEF_DECL", "c16_t", *flags(text))
+    in_cpp = _usrs_of_target(tmp_path / "u.cpp", "TYPEDEF_DECL", "c16_t", *flags(text), "-std=c++20")
+    of_clang = _usrs_of_target(tmp_path / "u.cpp", "TYPEDEF_DECL", "c16_t", *flags("unsigned short"), "-std=c++20")
     assert len(in_c) == 1 and in_c == in_cpp == of_clang, (in_c, in_cpp, of_clang)
 
 
-def test_a_character_type_of_no_integer_type_is_an_error(tmp_path):
+def test_a_character_type_of_no_integer_type_is_an_error(tmp_path, toolchain):
     """A text that is no integer type gives no key: an error, not a key that depends on the language."""
     source = tmp_path / "w.cpp"
     source.write_text("typedef wchar_t wc_t;\n", encoding="utf-8")
     with pytest.raises(ValueError, match="'float', which is not an integer type with a known sign"):
-        _usrs(source, "TYPEDEF_DECL", "wc_t", "-U__WCHAR_TYPE__", "-D__WCHAR_TYPE__=float")
+        _usrs(source, "TYPEDEF_DECL", "wc_t", "-U__WCHAR_TYPE__", "-D__WCHAR_TYPE__=float", toolchain=toolchain)
 
 
-def test_the_key_of_a_character_type_needs_the_preprocessing_record(tmp_path):
+def test_the_key_of_a_character_type_needs_the_preprocessing_record(tmp_path, toolchain):
     """With no predefined macro, the key would depend on the language of the unit: an error, not a guess."""
-    import clang.cindex as cx
 
     from fw_context_mcp.indexer._usr import cursor_usr
 
     source = tmp_path / "w.cpp"
     source.write_text("typedef wchar_t wc_t;\n", encoding="utf-8")
-    unit = cx.Index.create().parse(str(source), args=["-x", "c++", "-std=c++17"])
+    unit = parse_unit(source, toolchain, ["-std=c++17"])
     typedef = next(node for node in unit.cursor.get_children() if node.spelling == "wc_t")
     with pytest.raises(ValueError, match="has no predefined macro"):
         cursor_usr(typedef)
 
 
-def test_a_type_in_the_body_of_a_type_in_a_function_of_c_keeps_the_form_of_c(tmp_path):
+def test_a_type_in_the_body_of_a_type_in_a_function_of_c_keeps_the_form_of_c(tmp_path, toolchain):
     """C gives such a type the scope of the function, and C++ writes the function with its signature: no form of C++.
 
     The USR of a field is the USR of its type and its own component, and two
@@ -539,8 +561,8 @@ def test_a_type_in_the_body_of_a_type_in_a_function_of_c_keeps_the_form_of_c(tmp
         "int g(void) { struct A { struct B { int x; } b; } a; a.b.x = 2; return a.b.x; }\n",
         encoding="utf-8",
     )
-    types = sorted(set(_usrs(source, "STRUCT_DECL", "B")))
-    fields = sorted(set(_usrs(source, "FIELD_DECL", "x")))
+    types = sorted(set(_usrs(source, "STRUCT_DECL", "B", toolchain=toolchain)))
+    fields = sorted(set(_usrs(source, "FIELD_DECL", "x", toolchain=toolchain)))
     assert len(types) == 2, types
     assert fields == [f"{usr}@FI@x" for usr in types], (types, fields)
     assert all("@S@A" not in usr and usr.count("local.c~") == 2 for usr in types), types
@@ -602,7 +624,7 @@ def test_the_lambdas_of_two_files_of_one_base_name_are_two_symbols(indexed):
     assert sorted(row[0] for row in rows) == ["a/l.cpp", "b/l.cpp"]
 
 
-def test_two_lambdas_of_the_scope_of_one_file_have_two_call_operators(tmp_path):
+def test_two_lambdas_of_the_scope_of_one_file_have_two_call_operators(tmp_path, toolchain):
     """The closure of a lambda is an anonymous class (`@Sa`): the mark gives each `operator()` a USR of its own.
 
     libclang gives the two `operator()` of one file scope one USR.  The index
@@ -619,7 +641,7 @@ def test_two_lambdas_of_the_scope_of_one_file_have_two_call_operators(tmp_path):
         "int use() { return l1(1) + l2(2); }\n",
         encoding="utf-8",
     )
-    unit = cx.Index.create().parse(str(source), args=["-x", "c++", "-std=c++17"])
+    unit = parse_unit(source, toolchain, ["-std=c++17"])
     # The walk does not visit the implicit class of a closure: a call names its `operator()`.
     calls = [node.referenced for node in unit.cursor.walk_preorder()
              if node.kind == cx.CursorKind.CALL_EXPR and node.spelling == "operator()"]
@@ -627,7 +649,7 @@ def test_two_lambdas_of_the_scope_of_one_file_have_two_call_operators(tmp_path):
     assert cursor_usr(calls[0]) != cursor_usr(calls[1])
 
 
-def test_the_mark_of_an_anonymous_enum_walks_no_child(tmp_path, monkeypatch):
+def test_the_mark_of_an_anonymous_enum_walks_no_child(tmp_path, monkeypatch, toolchain):
     """The mark reads the end of the USR of the enum, not its first constant.
 
     ``get_children`` collects each constant, thus a walk to the first one
@@ -641,7 +663,7 @@ def test_the_mark_of_an_anonymous_enum_walks_no_child(tmp_path, monkeypatch):
     # The attribute is the first child of the enum and no constant: a walk
     # to the first constant must skip it.  The mark must not need the walk.
     source.write_text("enum __attribute__((packed)) { BIG_0, BIG_1 };\nenum {};\n", encoding="utf-8")
-    unit = cx.Index.create().parse(str(source), args=["-x", "c++", "-std=c++17"])
+    unit = parse_unit(source, toolchain, ["-std=c++17"])
     enums = [node for node in unit.cursor.walk_preorder() if node.kind == cx.CursorKind.ENUM_DECL]
     constants = [node for node in unit.cursor.walk_preorder() if node.kind == cx.CursorKind.ENUM_CONSTANT_DECL]
 

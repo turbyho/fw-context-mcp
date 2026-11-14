@@ -24,7 +24,7 @@ from types import SimpleNamespace
 import pytest
 
 from fw_context_mcp.exit_codes import EXIT_ALREADY_RUNNING, EXIT_SUPERSEDED
-from fw_context_mcp.file_lock import try_lock
+from fw_context_mcp.file_lock import ProbedLock, held_by_another
 from fw_context_mcp.mcp.background import PENDING_MARKER
 from fw_context_mcp.mcp.shared.pid_file import PidFile
 from tests._stubs import remove_tree
@@ -65,7 +65,7 @@ def _run_loop(daemon_mod, tmp_path: Path, pending, stop, *, max_polls: int = 200
     asyncio.run(
         daemon_mod._reindex_loop(
             tmp_path, tmp_path, pending=pending, shutdown=asyncio.Event(), dlog=DLOG,
-            ping_expired=_expired, on_index_proc=lambda proc: None, **kwargs,
+            ping_expired=_expired, on_index_run=lambda run: None, **kwargs,
         )
     )
 
@@ -293,7 +293,7 @@ class TestThePendingMarker:
             proc = await asyncio.create_subprocess_exec(sys.executable, "-I", "-c", child, str(pid_path), str(released))
             # The run writes it when it holds the index lock.
             PidFile(pid_path, pid=proc.pid).write()
-            return proc
+            return daemon_mod._IndexRun(proc, "token-of-the-test")
 
         async def _a_change_and_samples() -> None:
             await asyncio.sleep(0.1)
@@ -312,7 +312,7 @@ class TestThePendingMarker:
             with pytest.raises(_SecondTurn):
                 await daemon_mod._reindex_loop(
                     tmp_path, tmp_path, pending=pending, shutdown=asyncio.Event(), dlog=DLOG,
-                    ping_expired=lambda: False, on_index_proc=lambda proc: None,
+                    ping_expired=lambda: False, on_index_run=lambda run: None,
                 )
             await sampler
 
@@ -591,6 +591,44 @@ class TestTheStartOfTheDaemon:
         assert not dead.exists(), "the file of a dead writer stayed"
         assert live.exists(), "the file of a live writer went away"
 
+    def test_a_failed_stop_listener_cleans_up_the_daemon(self, monkeypatch, tmp_path):
+        """On Windows the stop listener raises OSError for a stop event that exists already.
+
+        The call was outside of the try of the cleanup: the daemon exited
+        with its port file and its PID file, and each ping of the MCP
+        servers then went to a closed port.
+        """
+        from fw_context_mcp.mcp import daemon as daemon_mod
+
+        closed: list[bool] = []
+
+        class _Server:
+            def close(self) -> None:
+                closed.append(True)
+
+            async def wait_closed(self) -> None:
+                pass
+
+        async def _socket(db_dir, on_ping):
+            port_file = db_dir / "daemon.port"
+            port_file.write_text("12345", encoding="utf-8")
+            return _Server(), port_file
+
+        def _refused(shutdown) -> None:
+            raise OSError(17, "the stop event exists already")
+
+        monkeypatch.setattr(daemon_mod, "_get_db_dir", lambda root: tmp_path)
+        monkeypatch.setattr(daemon_mod, "_setup_ping_server", _socket)
+        monkeypatch.setattr(daemon_mod, "_setup_signal_handlers", _refused)
+
+        with pytest.raises(OSError, match="exists already"):
+            asyncio.run(daemon_mod.daemon_main(tmp_path))
+
+        assert closed == [True]
+        assert not (tmp_path / "daemon.port").exists()
+        assert not (tmp_path / "watcher.pid").exists()
+        assert not held_by_another(tmp_path / "watcher.lock")
+
     def test_the_shutdown_removes_the_marker(self, tmp_path):
         from fw_context_mcp.mcp import daemon as daemon_mod
 
@@ -602,33 +640,41 @@ class TestTheStartOfTheDaemon:
                 pass
 
         PidFile(tmp_path / PENDING_MARKER).write()
-        lock_fd = os.open(tmp_path / "watcher.lock", os.O_CREAT | os.O_RDWR)
-        # The daemon holds the lock until its cleanup.  Windows refuses the
-        # unlock of a file descriptor that holds no lock (ERROR_NOT_LOCKED).
-        assert try_lock(lock_fd)
+        watcher_lock = ProbedLock(tmp_path / "watcher.lock")
+        # The daemon holds the lock until its cleanup.
+        assert watcher_lock.try_acquire()
         asyncio.run(daemon_mod._cleanup_daemon(
-            None, _Server(), tmp_path / "daemon.port", tmp_path / "watcher.pid", lock_fd, asyncio.Event(),
+            None, _Server(), tmp_path / "daemon.port", tmp_path / "watcher.pid", watcher_lock, asyncio.Event(),
         ))
 
         assert not (tmp_path / PENDING_MARKER).exists()
+        assert not held_by_another(tmp_path / "watcher.lock")
 
 
 class TestTheSpawnOfARun:
     @staticmethod
-    def _spawn(monkeypatch, tmp_path, returncode: int) -> tuple[dict, int | None]:
+    def _spawn(monkeypatch, tmp_path, returncode: int, claim_as: int | None = None) -> tuple[dict, int | None]:
         """Run `_run_index_async` and `_wait_index` with a subprocess that ends with *returncode*.
 
         The result holds the keyword arguments of the spawn, and under
         ``"pid_file_at_spawn"`` whether `reindex.pid` was there when the
-        subprocess started.
+        subprocess started.  *claim_as* is the PID of a run that claimed the
+        index and then got a kill: its run file and its markers stay.
         """
+        from fw_context_mcp.indexer._index_owner import run_pid_path
         from fw_context_mcp.mcp import daemon as daemon_mod
+        from fw_context_mcp.processes import STOP_TOKEN_ENV
 
         captured: dict = {}
 
         async def _fake_exec(*args, **kwargs):
             captured.update(kwargs)
             captured["pid_file_at_spawn"] = (tmp_path / "reindex.pid").exists()
+            if claim_as is not None:
+                run_file = run_pid_path(tmp_path, kwargs["env"][STOP_TOKEN_ENV])
+                captured["run_file"] = run_file
+                for path in (run_file, tmp_path / "reindex.pause", tmp_path / "reindex.pid"):
+                    PidFile(path, pid=claim_as).write()
             return SimpleNamespace(pid=_RUN_PID, returncode=returncode)
 
         async def _drive() -> int | None:
@@ -657,20 +703,45 @@ class TestTheSpawnOfARun:
 
         assert captured["pid_file_at_spawn"] is False
 
-    def test_the_files_of_a_killed_run_go(self, monkeypatch, tmp_path):
+    @pytest.mark.parametrize(
+        "run_pid", [_RUN_PID, _RUN_PID + 1], ids=["popen-is-the-run", "popen-is-a-launcher"],
+    )
+    def test_the_files_of_a_killed_run_go(self, monkeypatch, tmp_path, run_pid: int):
         """A kill stops the run before it releases the index, and its PID can come back.
 
         A `reindex.pause` of that PID then holds the loop, with no time
-        limit, for a process that has no relation to the index.
+        limit, for a process that has no relation to the index.  On Windows
+        the PID of the Popen is the launcher of the virtual environment, and
+        the markers hold the PID of its child: the daemon removed nothing.
+        The run file (``run.<token>.pid``) gives the daemon the PID of the run.
         """
-        for name in ("reindex.pid", "reindex.pause"):
-            PidFile(tmp_path / name, pid=_RUN_PID).write()
-
-        _, returncode = self._spawn(monkeypatch, tmp_path, -9)
+        captured, returncode = self._spawn(monkeypatch, tmp_path, -9, claim_as=run_pid)
 
         assert returncode == -9
         assert not (tmp_path / "reindex.pid").exists()
         assert not (tmp_path / "reindex.pause").exists()
+        assert not captured["run_file"].exists()
+
+    def test_the_files_of_a_run_that_runs_stay(self, tmp_path):
+        """A cancel of the wait while the run runs: its markers are live, and the run removes them itself."""
+        from fw_context_mcp.mcp import daemon as daemon_mod
+
+        for name in ("reindex.pid", "reindex.pause"):
+            PidFile(tmp_path / name, pid=_RUN_PID).write()
+        proc = SimpleNamespace(pid=_RUN_PID, returncode=None)
+        run = daemon_mod._IndexRun(proc, "a" * 32)
+        PidFile(tmp_path / f"run.{'a' * 32}.pid", pid=_RUN_PID).write()
+
+        async def _cancelled() -> None:
+            task = asyncio.ensure_future(daemon_mod._wait_index(run, asyncio.Event(), db_dir=tmp_path))
+            await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(_cancelled())
+        for name in ("reindex.pid", "reindex.pause", f"run.{'a' * 32}.pid"):
+            assert PidFile.read_pid(tmp_path / name) == _RUN_PID, f"the daemon removed {name} of a run that runs"
 
     def test_a_log_that_cannot_open_does_not_stop_the_run(self, monkeypatch, tmp_path):
         (tmp_path / "reindex.log").mkdir()  # the open fails
@@ -1109,3 +1180,20 @@ class TestTheMaintenanceAfterARun:
 
         warnings = [r for r in caplog.records if "PRAGMA optimize" in r.getMessage()]
         assert warnings and warnings[0].exc_info is not None, "the error must reach the log of the daemon"
+
+
+def test_the_start_removes_the_run_file_of_a_dead_run(tmp_path):
+    """A kill stopped the run and its daemon: the run file of the run stays, and a new daemon removes it."""
+    from fw_context_mcp.mcp import daemon as daemon_mod
+
+    proc = subprocess.Popen([sys.executable, "-c", ""])
+    proc.wait(timeout=30)
+    dead = tmp_path / f"run.{'c' * 32}.pid"
+    live = tmp_path / f"run.{'d' * 32}.pid"
+    PidFile(dead, pid=proc.pid).write()
+    _hold(live)
+
+    daemon_mod._remove_dead_run_files(tmp_path)
+
+    assert not dead.exists()
+    assert PidFile.read_pid(live) == os.getppid()

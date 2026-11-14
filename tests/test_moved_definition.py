@@ -10,32 +10,30 @@ file gives way to any new row, as a row that the run did not insert yet.
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from pathlib import Path
 
 import pytest
 
 from tests._toml import toml_string
+from tests._toolchains import Toolchain, write_compile_commands, write_sources
 
-pytest.importorskip("clang.cindex", reason="libclang not available")
 pytestmark = pytest.mark.libclang
 
 HEADER = "struct B { virtual void f(); virtual ~B() {} };\nstruct D : B { void f() override; };\n"
 
 
-def _write(root: Path, files: dict[str, str], units: list[str]) -> None:
+def _write(root: Path, toolchain: Toolchain, files: dict[str, str], units: list[str]) -> None:
     (root / ".fw-context").mkdir(parents=True, exist_ok=True)
     (root / ".fw-context" / "config.toml").write_text(
         f'[project]\nid = "proj-move"\n\n[build]\n\n[index]\ndb_dir = {toml_string(root.parent / "db")}\n', encoding="utf-8",
     )
-    for file, text in files.items():
-        (root / file).write_text(text, encoding="utf-8")
-    (root / "compile_commands.json").write_text(json.dumps([
+    write_sources(root, files)
+    write_compile_commands(root / "compile_commands.json", [
         {"directory": str(root), "file": file,
-         "arguments": (["cc", "-std=gnu11"] if file.endswith(".c") else ["c++", "-std=c++17"]) + ["-c", file]}
+         "arguments": toolchain.arguments(file, "-std=gnu11" if file.endswith(".c") else "-std=c++17")}
         for file in units
-    ]), encoding="utf-8")
+    ])
 
 
 def _db(root: Path) -> Path:
@@ -71,9 +69,9 @@ def root(tmp_path: Path) -> Path:
     return path
 
 
-def test_a_body_moved_inline_into_a_header_of_an_other_unit_stays(root):
+def test_a_body_moved_inline_into_a_header_of_an_other_unit_stays(root, toolchain):
     """`D::f` leaves `z_d.cpp` (deleted) for an inline body in `b.h`, which `a_main.cpp` owns."""
-    _write(root, {
+    _write(root, toolchain, {
         "b.h": HEADER,
         "a_main.cpp": '#include "b.h"\nvoid B::f() {}\nint main() { D d; B &b = d; b.f(); return 0; }\n',
         "z_d.cpp": '#include "b.h"\nvoid D::f() {}\n',
@@ -81,7 +79,7 @@ def test_a_body_moved_inline_into_a_header_of_an_other_unit_stays(root):
     assert _run(root, "D::f") == [("D::f", "z_d.cpp", 1)]
 
     (root / "z_d.cpp").unlink()
-    _write(root, {"b.h": HEADER.replace("void f() override;", "void f() override {}")}, ["a_main.cpp"])
+    _write(root, toolchain, {"b.h": HEADER.replace("void f() override;", "void f() override {}")}, ["a_main.cpp"])
 
     assert _run(root, "D::f") == [("D::f", "b.h", 1)]
     conn = sqlite3.connect(_db(root))
@@ -93,16 +91,16 @@ def test_a_body_moved_inline_into_a_header_of_an_other_unit_stays(root):
     assert ("D::f", "B::f") in overrides
 
 
-def test_a_definition_moved_to_a_unit_that_comes_first_stays(root):
+def test_a_definition_moved_to_a_unit_that_comes_first_stays(root, toolchain):
     """`helper` moves from `z.cpp` to `a.cpp`: the parse of `a.cpp` comes before the parse of `z.cpp`."""
-    _write(root, {
+    _write(root, toolchain, {
         "h.h": "int helper();\n",
         "a.cpp": '#include "h.h"\nint use() { return helper(); }\n',
         "z.cpp": '#include "h.h"\nint helper() { return 1; }\nint other() { return 2; }\n',
     }, ["a.cpp", "z.cpp"])
     assert _run(root, "helper") == [("helper", "z.cpp", 1)]
 
-    _write(root, {
+    _write(root, toolchain, {
         "a.cpp": '#include "h.h"\nint helper() { return 1; }\nint use() { return helper(); }\n',
         "z.cpp": '#include "h.h"\nint other() { return 2; }\n',
     }, ["a.cpp", "z.cpp"])
@@ -110,29 +108,29 @@ def test_a_definition_moved_to_a_unit_that_comes_first_stays(root):
     assert _run(root, "helper") == [("helper", "a.cpp", 1)]
 
 
-def test_a_definition_that_stays_keeps_its_row_in_an_incremental_run(root):
+def test_a_definition_that_stays_keeps_its_row_in_an_incremental_run(root, toolchain):
     """A changed unit that does not define the function gives a declaration: the definition stays."""
-    _write(root, {
+    _write(root, toolchain, {
         "h.h": "int helper();\n",
         "a.cpp": '#include "h.h"\nint use() { return helper(); }\n',
         "z.cpp": '#include "h.h"\nint helper() { return 1; }\n',
     }, ["a.cpp", "z.cpp"])
     assert _run(root, "helper") == [("helper", "z.cpp", 1)]
 
-    _write(root, {"a.cpp": '#include "h.h"\nint use() { return helper() + 1; }\n'}, ["a.cpp", "z.cpp"])
+    _write(root, toolchain, {"a.cpp": '#include "h.h"\nint use() { return helper() + 1; }\n'}, ["a.cpp", "z.cpp"])
 
     assert _run(root, "helper") == [("helper", "z.cpp", 1)]
 
 
-def test_a_new_row_of_a_unit_of_the_run_is_current_for_the_units_after_it(root):
+def test_a_new_row_of_a_unit_of_the_run_is_current_for_the_units_after_it(root, toolchain):
     """`a.cpp` and `z.cpp` change; the declaration of `z.cpp` must not replace the new definition of `a.cpp`."""
-    _write(root, {
+    _write(root, toolchain, {
         "a.cpp": "int helper() { return 1; }\n",
         "z.cpp": "int helper();\nint use() { return helper(); }\n",
     }, ["a.cpp", "z.cpp"])
     assert _run(root, "helper") == [("helper", "a.cpp", 1)]
 
-    _write(root, {
+    _write(root, toolchain, {
         "a.cpp": "int helper() { return 2; }\n",
         "z.cpp": "int helper();\nint use() { return helper() + 1; }\n",
     }, ["a.cpp", "z.cpp"])
@@ -166,19 +164,19 @@ def _fail_unit(monkeypatch, name: str, where: str) -> None:
 
 
 @pytest.mark.parametrize("where", ["parse", "store"])
-def test_a_unit_that_fails_keeps_its_definition(root, monkeypatch, where):
+def test_a_unit_that_fails_keeps_its_definition(root, monkeypatch, where, toolchain):
     """The parse or the store of `m.cpp` fails: its rows stay, and the declaration of `z.cpp` comes after.
 
     A failed store rolls back the rows and the end of the stale mark that
     the store did: the runner ends the mark again.
     """
-    _write(root, {
+    _write(root, toolchain, {
         "m.cpp": "int helper() { return 1; }\n",
         "z.cpp": "int helper();\nint use() { return helper(); }\n",
     }, ["m.cpp", "z.cpp"])
     assert _run(root, "helper") == [("helper", "m.cpp", 1)]
 
-    _write(root, {
+    _write(root, toolchain, {
         "m.cpp": "int helper() { return 2; }\n",
         "z.cpp": "int helper();\nint use() { return helper() + 1; }\n",
     }, ["m.cpp", "z.cpp"])
@@ -187,9 +185,9 @@ def test_a_unit_that_fails_keeps_its_definition(root, monkeypatch, where):
     assert _run(root, "helper") == [("helper", "m.cpp", 1)]
 
 
-def test_a_header_handed_to_a_unit_that_fails_keeps_its_definition(root, monkeypatch):
+def test_a_header_handed_to_a_unit_that_fails_keeps_its_definition(root, monkeypatch, toolchain):
     """`a.cpp` stops to include `h.h`; `m.cpp` gets it and fails; the declaration of `z.cpp` comes after."""
-    _write(root, {
+    _write(root, toolchain, {
         "h.h": "inline int helper() { return 1; }\n",
         "p.h": "int helper();\n",
         "a.cpp": '#include "h.h"\nint use_a() { return helper(); }\n',
@@ -198,7 +196,7 @@ def test_a_header_handed_to_a_unit_that_fails_keeps_its_definition(root, monkeyp
     }, ["a.cpp", "m.cpp", "z.cpp"])
     assert _run(root, "helper") == [("helper", "h.h", 1)]
 
-    _write(root, {
+    _write(root, toolchain, {
         "a.cpp": "int use_a() { return 0; }\n",
         "z.cpp": '#include "p.h"\nint use_z() { return helper() + 1; }\n',
     }, ["a.cpp", "m.cpp", "z.cpp"])
@@ -208,15 +206,15 @@ def test_a_header_handed_to_a_unit_that_fails_keeps_its_definition(root, monkeyp
 
 
 @pytest.mark.parametrize("where", ["parse", "store"])
-def test_a_weak_definition_does_not_replace_the_strong_one_of_a_failed_unit(root, monkeypatch, where):
+def test_a_weak_definition_does_not_replace_the_strong_one_of_a_failed_unit(root, monkeypatch, where, toolchain):
     """`a_strong.cpp` changes and fails; the weak `cb` of `b_weak.cpp` must not take its place."""
-    _write(root, {
+    _write(root, toolchain, {
         "a_strong.cpp": "int cb() { return 1; }\n",
         "b_weak.cpp": "__attribute__((weak)) int cb() { return 0; }\n",
     }, ["a_strong.cpp", "b_weak.cpp"])
     assert _run(root, "cb") == [("cb", "a_strong.cpp", 1)]
 
-    _write(root, {
+    _write(root, toolchain, {
         "a_strong.cpp": "int cb() { return 2; }\n",
         "b_weak.cpp": "__attribute__((weak)) int cb() { return 3; }\n",
     }, ["a_strong.cpp", "b_weak.cpp"])
@@ -225,25 +223,25 @@ def test_a_weak_definition_does_not_replace_the_strong_one_of_a_failed_unit(root
     assert _run(root, "cb") == [("cb", "a_strong.cpp", 1)]
 
 
-def test_a_tentative_definition_does_not_replace_the_one_of_a_failed_unit(root, monkeypatch):
+def test_a_tentative_definition_does_not_replace_the_one_of_a_failed_unit(root, monkeypatch, toolchain):
     """`int g_x = 5;` of `t1.c` changes and fails; `int g_x;` of `t2.c` must not take its place."""
-    _write(root, {"t1.c": "int g_x = 5;\n", "t2.c": "int g_x;\n"}, ["t1.c", "t2.c"])
+    _write(root, toolchain, {"t1.c": "int g_x = 5;\n", "t2.c": "int g_x;\n"}, ["t1.c", "t2.c"])
     assert _run(root, "g_x") == [("g_x", "t1.c", 1)]
 
-    _write(root, {"t1.c": "int g_x = 6;\n", "t2.c": "int g_x;\nint t2;\n"}, ["t1.c", "t2.c"])
+    _write(root, toolchain, {"t1.c": "int g_x = 6;\n", "t2.c": "int g_x;\nint t2;\n"}, ["t1.c", "t2.c"])
     _fail_unit(monkeypatch, "t1.c", "parse")
 
     assert _run(root, "g_x") == [("g_x", "t1.c", 1)]
 
 
-def test_a_header_that_an_earlier_unit_claimed_keeps_its_current_rows(root, monkeypatch):
+def test_a_header_that_an_earlier_unit_claimed_keeps_its_current_rows(root, monkeypatch, toolchain):
     """`a.cpp` now includes `x.h` and writes its current definition; `f.cpp`, the old owner, fails.
 
     The header changed, but its rows are the rows of `a.cpp` now: the
     definition of `z.cpp` after it must not replace them, as in a run
     with no failure.
     """
-    _write(root, {
+    _write(root, toolchain, {
         "x.h": "int foo();\n",
         "a.cpp": "int use_a() { return 0; }\n",
         "f.cpp": '#include "x.h"\nint use_f() { return foo(); }\n',
@@ -251,7 +249,7 @@ def test_a_header_that_an_earlier_unit_claimed_keeps_its_current_rows(root, monk
     }, ["a.cpp", "f.cpp", "z.cpp"])
     assert _run(root, "foo") == [("foo", "z.cpp", 1)]
 
-    _write(root, {
+    _write(root, toolchain, {
         "x.h": "inline int foo() { return 2; }\n",
         "a.cpp": '#include "x.h"\nint use_a() { return foo(); }\n',
         "z.cpp": "int foo() { return 1; }\n",
@@ -261,9 +259,9 @@ def test_a_header_that_an_earlier_unit_claimed_keeps_its_current_rows(root, monk
     assert _run(root, "foo") == [("foo", "x.h", 1)]
 
 
-def test_an_unchanged_header_that_a_failed_store_claims_keeps_its_definition(root, monkeypatch):
+def test_an_unchanged_header_that_a_failed_store_claims_keeps_its_definition(root, monkeypatch, toolchain):
     """`a.cpp` now includes the unchanged `h.h`, and its store fails: the declaration of `z.cpp` comes after."""
-    _write(root, {
+    _write(root, toolchain, {
         "h.h": "inline int foo() { return 1; }\n",
         "p.h": "int foo();\n",
         "a.cpp": "int use_a() { return 0; }\n",
@@ -272,7 +270,7 @@ def test_an_unchanged_header_that_a_failed_store_claims_keeps_its_definition(roo
     }, ["a.cpp", "f.cpp", "z.cpp"])
     assert _run(root, "foo") == [("foo", "h.h", 1)]
 
-    _write(root, {
+    _write(root, toolchain, {
         "a.cpp": '#include "h.h"\nint use_a() { return foo(); }\n',
         "f.cpp": '#include "h.h"\nint use_f() { return foo() + 1; }\n',
         "z.cpp": '#include "p.h"\nint use_z() { return foo() + 1; }\n',
@@ -282,9 +280,9 @@ def test_an_unchanged_header_that_a_failed_store_claims_keeps_its_definition(roo
     assert _run(root, "foo") == [("foo", "h.h", 1)]
 
 
-def test_a_file_with_rows_and_no_owner_is_stale_too(root):
+def test_a_file_with_rows_and_no_owner_is_stale_too(root, toolchain):
     """An index of a version without the claims: the move of the first test needs the mark all the same."""
-    _write(root, {
+    _write(root, toolchain, {
         "h.h": "int helper();\n",
         "a.cpp": '#include "h.h"\nint use() { return helper(); }\n',
         "z.cpp": '#include "h.h"\nint helper() { return 1; }\nint other() { return 2; }\n',
@@ -296,7 +294,7 @@ def test_a_file_with_rows_and_no_owner_is_stale_too(root):
         conn.execute("DELETE FROM owner_units")
     conn.close()
 
-    _write(root, {
+    _write(root, toolchain, {
         "a.cpp": '#include "h.h"\nint helper() { return 1; }\nint use() { return helper(); }\n',
         "z.cpp": '#include "h.h"\nint other() { return 2; }\n',
     }, ["a.cpp", "z.cpp"])
@@ -337,9 +335,9 @@ def _analysis_of(root: Path, name: str) -> tuple[int, list[tuple[str, str, str]]
         conn.close()
 
 
-def test_a_definition_that_becomes_a_declaration_loses_the_analysis_of_its_body(root):
+def test_a_definition_that_becomes_a_declaration_loses_the_analysis_of_its_body(root, toolchain):
     """The body of `helper` goes, its prototype stays: the analysis of the body must go with it."""
-    _write(root, {
+    _write(root, toolchain, {
         "h.h": "int helper();\n",
         "a.cpp": '#include "h.h"\nint use() { return 1; }\n',
         "z.cpp": '#include "h.h"\nint helper() { return 1; }\n',
@@ -348,7 +346,7 @@ def test_a_definition_that_becomes_a_declaration_loses_the_analysis_of_its_body(
     _give_analysis(root, "helper")
     assert _analysis_of(root, "helper") == (1, [("returns one", "nothing", "one")], 1)
 
-    _write(root, {
+    _write(root, toolchain, {
         "a.cpp": '#include "h.h"\nint use() { return 2; }\n',
         "z.cpp": '#include "h.h"\nint other() { return 2; }\n',
     }, ["a.cpp", "z.cpp"])
@@ -358,9 +356,9 @@ def test_a_definition_that_becomes_a_declaration_loses_the_analysis_of_its_body(
     assert _analysis_of(root, "helper") == (0, [("", "", "")], 0)
 
 
-def test_a_definition_that_replaces_a_stale_one_loses_the_old_analysis(root):
+def test_a_definition_that_replaces_a_stale_one_loses_the_old_analysis(root, toolchain):
     """`helper` moves from `z.cpp` to the earlier `a.cpp` with an other body: the analysis of the old body must go."""
-    _write(root, {
+    _write(root, toolchain, {
         "h.h": "int helper();\n",
         "a.cpp": '#include "h.h"\nint use() { return helper(); }\n',
         "z.cpp": '#include "h.h"\nint helper() { return 1; }\n',
@@ -368,7 +366,7 @@ def test_a_definition_that_replaces_a_stale_one_loses_the_old_analysis(root):
     assert _run(root, "helper") == [("helper", "z.cpp", 1)]
     _give_analysis(root, "helper")
 
-    _write(root, {
+    _write(root, toolchain, {
         "a.cpp": '#include "h.h"\nint helper() { return 2; }\nint use() { return helper(); }\n',
         "z.cpp": '#include "h.h"\nint other() { return 2; }\n',
     }, ["a.cpp", "z.cpp"])
@@ -377,12 +375,12 @@ def test_a_definition_that_replaces_a_stale_one_loses_the_old_analysis(root):
     assert _analysis_of(root, "helper") == (0, [("", "", "")], 0)
 
 
-def test_a_vector_table_without_its_module_stops_no_run(root):
+def test_a_vector_table_without_its_module_stops_no_run(root, toolchain):
     """An index can have `vec_symbols` while this connection did not load sqlite-vec."""
     from fw_context_mcp.indexer.db import mark_stale_files, open_db
     from fw_context_mcp.indexer.db._symbols import _drop_old_data_of_stale_rows
 
-    _write(root, {"z.cpp": "int helper() { return 1; }\n"}, ["z.cpp"])
+    _write(root, toolchain, {"z.cpp": "int helper() { return 1; }\n"}, ["z.cpp"])
     assert _run(root, "helper") == [("helper", "z.cpp", 1)]
 
     class NoVec:
@@ -412,14 +410,13 @@ def test_a_vector_table_without_its_module_stops_no_run(root):
         conn.close()
 
 
-def test_a_replaced_row_stashes_its_embedding_and_loses_its_vector(root):
+def test_a_replaced_row_stashes_its_embedding_and_loses_its_vector(root, toolchain):
     """The embedding step takes the vector of an unchanged text back from the stash; the vector of the row goes."""
-    pytest.importorskip("sqlite_vec", reason="sqlite-vec not available")
     from fw_context_mcp.indexer.db import mark_stale_files, open_db
     from fw_context_mcp.indexer.db._embeddings import init_vec_table, upsert_embeddings_vec
     from fw_context_mcp.indexer.db._symbols import _drop_old_data_of_stale_rows
 
-    _write(root, {"z.cpp": "int helper() { return 1; }\n"}, ["z.cpp"])
+    _write(root, toolchain, {"z.cpp": "int helper() { return 1; }\n"}, ["z.cpp"])
     assert _run(root, "helper") == [("helper", "z.cpp", 1)]
     _give_analysis(root, "helper")
 
@@ -443,9 +440,9 @@ def test_a_replaced_row_stashes_its_embedding_and_loses_its_vector(root):
         conn.close()
 
 
-def test_a_declaration_of_an_earlier_unit_then_the_changed_definition(root):
+def test_a_declaration_of_an_earlier_unit_then_the_changed_definition(root, toolchain):
     """`a.cpp` replaces the stale definition with its declaration, then `z.cpp` gives the new body."""
-    _write(root, {
+    _write(root, toolchain, {
         "h.h": "int helper();\n",
         "a.cpp": '#include "h.h"\nint use() { return helper(); }\n',
         "z.cpp": '#include "h.h"\nint helper() { return 1; }\n',
@@ -453,7 +450,7 @@ def test_a_declaration_of_an_earlier_unit_then_the_changed_definition(root):
     assert _run(root, "helper") == [("helper", "z.cpp", 1)]
     _give_analysis(root, "helper")
 
-    _write(root, {
+    _write(root, toolchain, {
         "a.cpp": '#include "h.h"\nint use() { return helper() + 1; }\n',
         "z.cpp": '#include "h.h"\nint helper() { return 2; }\n',
     }, ["a.cpp", "z.cpp"])
@@ -462,13 +459,13 @@ def test_a_declaration_of_an_earlier_unit_then_the_changed_definition(root):
     assert _analysis_of(root, "helper") == (0, [("", "", "")], 0)
 
 
-def test_a_moved_method_loses_the_override_of_its_old_base(root):
+def test_a_moved_method_loses_the_override_of_its_old_base(root, toolchain):
     """`D` loses its base `B`, and `D::f` moves from `z.cpp` to the earlier `a.cpp`.
 
     `insert_overrides_batch` replaces the overrides of a method that a unit
     gives again; `D::f` now overrides nothing, thus no unit gives a row.
     """
-    _write(root, {
+    _write(root, toolchain, {
         "h.h": "struct B { virtual void f(); };\nstruct D : B { void f() override; };\n",
         "a.cpp": '#include "h.h"\nint use(D &d) { d.f(); return 0; }\n',
         "z.cpp": '#include "h.h"\nvoid D::f() {}\n',
@@ -476,7 +473,7 @@ def test_a_moved_method_loses_the_override_of_its_old_base(root):
     assert _run(root, "D::f") == [("D::f", "z.cpp", 1)]
     assert _overrides_of(root, "D::f") == ["B::f"]
 
-    _write(root, {
+    _write(root, toolchain, {
         "h.h": "struct B { virtual void f(); };\nstruct D { void f(); };\n",
         "a.cpp": '#include "h.h"\nvoid D::f() {}\nint use(D &d) { d.f(); return 0; }\n',
         "z.cpp": '#include "h.h"\nint other() { return 0; }\n',
@@ -501,9 +498,9 @@ def _overrides_of(root: Path, name: str) -> list[str]:
         conn.close()
 
 
-def test_a_header_that_an_heir_claims_after_a_moved_definition(root):
+def test_a_header_that_an_heir_claims_after_a_moved_definition(root, toolchain):
     """`a.cpp` stops to include `h.h`, the body leaves `h.h` for `m.cpp`, and `z.cpp` claims `h.h` after `m.cpp`."""
-    _write(root, {
+    _write(root, toolchain, {
         "h.h": "inline int helper() { return 1; }\n",
         "a.cpp": '#include "h.h"\nint use_a() { return helper(); }\n',
         "m.cpp": "int other() { return 0; }\n",
@@ -511,7 +508,7 @@ def test_a_header_that_an_heir_claims_after_a_moved_definition(root):
     }, ["a.cpp", "m.cpp", "z.cpp"])
     assert _run(root, "helper") == [("helper", "h.h", 1)]
 
-    _write(root, {
+    _write(root, toolchain, {
         "h.h": "int helper();\n",
         "a.cpp": "int use_a() { return 0; }\n",
         "m.cpp": '#include "h.h"\nint helper() { return 1; }\n',
@@ -520,15 +517,15 @@ def test_a_header_that_an_heir_claims_after_a_moved_definition(root):
     assert _run(root, "helper") == [("helper", "m.cpp", 1)]
 
 
-def test_a_stale_strong_definition_still_wins_over_an_earlier_weak_one(root):
+def test_a_stale_strong_definition_still_wins_over_an_earlier_weak_one(root, toolchain):
     """`b_weak.cpp` comes first in the second run: the strong `cb` of `c_strong.cpp` must win again."""
-    _write(root, {
+    _write(root, toolchain, {
         "b_weak.cpp": "__attribute__((weak)) int cb() { return 0; }\n",
         "c_strong.cpp": "int cb() { return 1; }\n",
     }, ["b_weak.cpp", "c_strong.cpp"])
     assert _run(root, "cb") == [("cb", "c_strong.cpp", 1)]
 
-    _write(root, {
+    _write(root, toolchain, {
         "b_weak.cpp": "__attribute__((weak)) int cb() { return 10; }\n",
         "c_strong.cpp": "int cb() { return 11; }\n",
     }, ["b_weak.cpp", "c_strong.cpp"])
@@ -536,11 +533,11 @@ def test_a_stale_strong_definition_still_wins_over_an_earlier_weak_one(root):
     assert _run(root, "cb") == [("cb", "c_strong.cpp", 1)]
 
 
-def test_a_stale_definition_with_an_initializer_still_wins_over_an_earlier_tentative_one(root):
+def test_a_stale_definition_with_an_initializer_still_wins_over_an_earlier_tentative_one(root, toolchain):
     """`int g_x;` of `t1.c` comes first: `int g_x = 5;` of `t2.c` must win again, as the linker merges them."""
-    _write(root, {"t1.c": "int g_x;\n", "t2.c": "int g_x = 5;\n"}, ["t1.c", "t2.c"])
+    _write(root, toolchain, {"t1.c": "int g_x;\n", "t2.c": "int g_x = 5;\n"}, ["t1.c", "t2.c"])
     assert _run(root, "g_x") == [("g_x", "t2.c", 1)]
 
-    _write(root, {"t1.c": "int g_x;\nint t1;\n", "t2.c": "int g_x = 6;\n"}, ["t1.c", "t2.c"])
+    _write(root, toolchain, {"t1.c": "int g_x;\nint t1;\n", "t2.c": "int g_x = 6;\n"}, ["t1.c", "t2.c"])
 
     assert _run(root, "g_x") == [("g_x", "t2.c", 1)]

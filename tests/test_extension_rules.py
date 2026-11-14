@@ -82,16 +82,16 @@ class TestDetectLanguageFollowsTheTable:
          ("a.cc", "cpp"), ("a.cxx", "cpp"), ("a.c++", "cpp")],
     )
     def test_the_suffix_decides(self, name: str, expected: str):
-        from fw_context_mcp.indexer.compile_commands import _detect_language
+        from fw_context_mcp.indexer.compile_commands import unit_language
 
-        assert _detect_language(Path(name), []) == expected
+        assert unit_language(Path(name), []) == expected
 
-    def test_an_unknown_suffix_falls_through_to_std(self):
-        """A project building `.S` or something unusual still gets an answer."""
-        from fw_context_mcp.indexer.compile_commands import _detect_language
+    def test_std_does_not_select_the_language(self):
+        """`-std=` is no rule of the compiler: GCC compiles a `.c` or `.S` file with `-std=c++17` as C, with a warning."""
+        from fw_context_mcp.indexer.compile_commands import unit_language
 
-        assert _detect_language(Path("startup.S"), ["-std=c++17"]) == "cpp"
-        assert _detect_language(Path("startup.S"), ["-std=c11"]) == "c"
+        assert unit_language(Path("startup.S"), ["-std=c++17"]) == "c"
+        assert unit_language(Path("main.c"), ["-std=gnu++17"]) == "c"
 
 
 class TestIsSourceFileFollowsTheTable:

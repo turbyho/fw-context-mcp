@@ -11,23 +11,39 @@ must be preprocessed".  Running the preprocessor is what the build does.
 
 from __future__ import annotations
 
-import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from fw_context_mcp.indexer.asm import filtered_content, preprocess, read_unit_texts
-
-pytestmark = pytest.mark.skipif(
-    shutil.which("clang") is None, reason="the preprocessor is clang"
-)
+from tests._toolchains import Toolchain, unit_of, write_sources
 
 
-def _unit(tmp_path: Path, name: str, text: str, args: list[str] | None = None):
-    src = tmp_path / name
-    src.write_text(text, encoding="utf-8")
-    return SimpleNamespace(file=src, directory=tmp_path, clang_args=args or [])
+def _unit(tmp_path: Path, name: str, text: str, flags: list[str] | None = None, *, toolchain: Toolchain,
+          broken: str | None = None):
+    """Write *text* to *name*, and return its unit of *toolchain* (``tests/_toolchains.unit_of``).
+
+    The unit has the target that the driver of the toolchain gives, as the
+    unit of a build: the reader cuts the comments of that target.  *broken*
+    is the text of the error of the assembler for a file that must fail.
+    """
+    write_sources(tmp_path, {name: text})
+    return unit_of(tmp_path / name, toolchain, flags or [], broken=broken)
+
+
+def _foreign_unit(tmp_path: Path, name: str, text: str):
+    """Write *text* to *name*, and return a unit with no compiler and no target.
+
+    For the rules of the reader with no target, and for assembly of a
+    toolchain that the test SDKs do not have: armasm of
+    Keil (``DCD``), the assembler of IAR (``sfe()``), MIPS (``.set
+    noreorder``).  The GNU assembler refuses these files, thus no toolchain
+    of the tests can compile them; the reader must still read them right,
+    because a project of such a toolchain gives them.
+    """
+    write_sources(tmp_path, {name: text})
+    return SimpleNamespace(file=tmp_path / name, directory=tmp_path, clang_args=[])
 
 
 # A vector table lives in its own section, because a linker script places
@@ -47,15 +63,31 @@ def _table(body: str) -> str:
     return _VECTOR_SECTION + body
 
 
+#: A repetition count that the assembler knows and the reader does not:
+#: the difference of two labels of `.bss`, before the table writes a word.
+#: gas refuses an undefined symbol as the count ("bad or irreducible
+#: absolute expression"), thus the count must come from labels.
+_COUNT_LABELS = "  .pushsection .bss\ncount_a:\n  .space 8\ncount_b:\n  .popsection\n"
+
+
 class TestStatements:
     """How a preprocessed line becomes statements."""
 
     @staticmethod
-    def _statements(tmp_path: Path, text: str, args: list[str] | None = None):
+    def _statements(tmp_path: Path, text: str, toolchain: Toolchain | None = None):
+        """The statements of *text* as the unit of *toolchain* gives them.
+
+        No *toolchain*: a unit with no target, for the rules of the reader
+        when it does not know the comment character of the target.
+        """
         from fw_context_mcp.indexer._asm_macro import BARRIER, is_barrier
         from fw_context_mcp.indexer.asm import _statements
 
-        source = preprocess(_unit(tmp_path, "t.S", text, args))
+        if toolchain is None:
+            unit = _foreign_unit(tmp_path, "t.S", text)
+        else:
+            unit = _unit(tmp_path, "t.S", text, toolchain=toolchain)
+        source = preprocess(unit)
         assert source is not None
         # A barrier as BARRIER: these tests ask where one is.
         return [
@@ -84,25 +116,19 @@ class TestStatements:
 
         assert produced == ['.ascii "http://x"']
 
-    def test_an_arm_comment_hides_the_statements_after_a_semicolon(self, tmp_path: Path):
+    def test_an_arm_comment_hides_the_statements_after_a_semicolon(self, tmp_path: Path, arm_toolchain):
         """Measured: `nop @ note; lbl:` defines no `lbl` on ARM."""
-        produced = self._statements(
-            tmp_path, "  nop @ note; hidden:\n", ["--target=arm-none-eabi"]
-        )
+        produced = self._statements(tmp_path, "  nop @ note; hidden:\n", arm_toolchain)
 
         assert produced == ["nop"]
 
-    def test_an_arm_hash_mid_line_is_an_immediate(self, tmp_path: Path):
-        produced = self._statements(
-            tmp_path, "  ldr r0, [r1, #4]; after:\n", ["--target=arm-none-eabi"]
-        )
+    def test_an_arm_hash_mid_line_is_an_immediate(self, tmp_path: Path, arm_toolchain):
+        produced = self._statements(tmp_path, "  ldr r0, [r1, #4]; after:\n", arm_toolchain)
 
         assert produced == ["ldr r0, [r1, #4]", "after:"]
 
-    def test_a_hash_is_a_comment_on_risc_v(self, tmp_path: Path):
-        produced = self._statements(
-            tmp_path, "  nop # note; hidden:\n", ["--target=riscv32-unknown-elf"]
-        )
+    def test_a_hash_is_a_comment_on_risc_v(self, tmp_path: Path, sdk_toolchain):
+        produced = self._statements(tmp_path, "  nop # note; hidden:\n", sdk_toolchain("riscv-esp"))
 
         assert produced == ["nop"]
 
@@ -114,23 +140,22 @@ class TestStatements:
 
         assert produced == ["nop @ note", BARRIER]
 
-    def test_a_character_constant_opens_no_string(self, tmp_path: Path):
+    def test_a_character_constant_opens_no_string(self, tmp_path: Path, arm_toolchain):
         """Measured: `.byte '"; lbl:` and `.byte ';; lbl:` define `lbl`."""
         produced = self._statements(
-            tmp_path, "  .byte '\"; after_quote:\n  .byte ';; after_semi:\n",
-            ["--target=arm-none-eabi"],
+            tmp_path, "  .byte '\"; after_quote:\n  .byte ';; after_semi:\n", arm_toolchain,
         )
 
         assert produced == [".byte '\"", "after_quote:", ".byte ';", "after_semi:"]
 
-    def test_a_closing_quote_ends_a_character_constant(self, tmp_path: Path):
+    def test_a_closing_quote_ends_a_character_constant(self, tmp_path: Path, arm_toolchain):
         """Measured: `.byte 'a';.else` is a constant, then `.else`, and in
         `.byte 'a'@ x; lbl:` the comment holds `lbl`."""
         produced = self._statements(
             tmp_path,
             "  .if 1\n  .byte 'a';.else\ndead:\n  .endif\n  .byte 'a'@ x; hidden:\n"
             "  .byte 'O','K'; after_pair:\n",
-            ["--target=arm-none-eabi"],
+            arm_toolchain,
         )
 
         assert produced == [".byte 'a'", ".byte 'a'", ".byte 'O','K'", "after_pair:"]
@@ -155,12 +180,12 @@ class TestStatements:
 
         assert produced == ["mov x0, #1", BARRIER, BARRIER]
 
-    def test_defsym_makes_ifdef_unknown(self, tmp_path: Path):
+    def test_defsym_makes_ifdef_unknown(self, tmp_path: Path, arm_toolchain):
         """`--defsym X=1` defines X before the first statement."""
         from fw_context_mcp.indexer._asm_macro import is_barrier
         from fw_context_mcp.indexer.asm import _statements
 
-        unit = _unit(tmp_path, "t.S", "  .ifdef X\nmaybe:\n  .endif\n")
+        unit = _unit(tmp_path, "t.S", "  .ifdef X\nmaybe:\n  .endif\n", toolchain=arm_toolchain)
         unit.raw_entry = {"arguments": ["gcc", "-Wa,--defsym,X=1", "-c", "t.S"]}
         source = preprocess(unit)
         assert source is not None and source.defsym
@@ -169,10 +194,10 @@ class TestStatements:
 
 
 class TestPreprocess:
-    def test_an_inactive_branch_does_not_reach_the_output(self, tmp_path: Path):
+    def test_an_inactive_branch_does_not_reach_the_output(self, tmp_path: Path, arm_toolchain):
         """The first version of this plan called `#if` filtering impossible."""
         unit = _unit(tmp_path, "t.S",
-                     "  .long Taken\n#if 0\n  .long NeverTaken\n#endif\n")
+                     "  .long Taken\n#if 0\n  .long NeverTaken\n#endif\n", toolchain=arm_toolchain)
 
         src = preprocess(unit)
 
@@ -180,34 +205,34 @@ class TestPreprocess:
         assert "Taken" in src.text
         assert "NeverTaken" not in src.text
 
-    def test_a_macro_definition_is_expanded(self, tmp_path: Path):
+    def test_a_macro_definition_is_expanded(self, tmp_path: Path, arm_toolchain):
         """Zephyr writes GTEXT(sym), not `.globl sym`.
 
         A regex over the raw text finds nothing — measured, it returned
         zero on every real assembly file in the test projects.
         """
         unit = _unit(tmp_path, "t.S",
-                     "#define GTEXT(s) .global s\nGTEXT(HardFault_Handler)\n")
+                     "#define GTEXT(s) .global s\nGTEXT(HardFault_Handler)\n", toolchain=arm_toolchain)
 
         src = preprocess(unit)
 
         assert ".global HardFault_Handler" in src.text
 
-    def test_comments_survive(self, tmp_path: Path):
+    def test_comments_survive(self, tmp_path: Path, arm_toolchain):
         """Without -C the preprocessor strips them.
 
         Measured on irq_cm4f.S: 63 of 228 lines would have been blanked out
         of files.content, including the @brief block search_content is
         meant to find.
         """
-        unit = _unit(tmp_path, "t.S", "/* @brief Fault handlers */\n  .long X\n")
+        unit = _unit(tmp_path, "t.S", "/* @brief Fault handlers */\n  .long X\n", toolchain=arm_toolchain)
 
         src = preprocess(unit)
 
         assert "@brief Fault handlers" in src.text
 
-    def test_every_line_keeps_its_source_and_number(self, tmp_path: Path):
-        unit = _unit(tmp_path, "t.S", "  .long A\n  .long B\n  .long C\n")
+    def test_every_line_keeps_its_source_and_number(self, tmp_path: Path, arm_toolchain):
+        unit = _unit(tmp_path, "t.S", "  .long A\n  .long B\n  .long C\n", toolchain=arm_toolchain)
 
         src = preprocess(unit)
 
@@ -216,25 +241,25 @@ class TestPreprocess:
         assert (resolved, 1) in placed
         assert (resolved, 3) in placed
 
-    def test_an_included_file_is_attributed_to_itself(self, tmp_path: Path):
+    def test_an_included_file_is_attributed_to_itself(self, tmp_path: Path, arm_toolchain):
         """the STM32 project's startup unit is five lines of #include; the table is elsewhere."""
         (tmp_path / "table.inc").write_text("  .long HardFault_Handler\n",
                                             encoding="utf-8")
-        unit = _unit(tmp_path, "t.S", '#include "table.inc"\n')
+        unit = _unit(tmp_path, "t.S", '#include "table.inc"\n', toolchain=arm_toolchain)
 
         src = preprocess(unit)
 
         files = {m[0] for m in src.line_map if m is not None}
         assert str((tmp_path / "table.inc").resolve()) in files
 
-    def test_one_spelling_per_file(self, tmp_path: Path):
+    def test_one_spelling_per_file(self, tmp_path: Path, arm_toolchain):
         """cpp echoes paths as the command line gave them.
 
         Measured before this was fixed: the same file arrived both as
         `./mbed-os/…/except.S` and absolute, and landed in the map twice —
         once unreadable.
         """
-        unit = _unit(tmp_path, "t.S", "  .long A\n", args=["-I."])
+        unit = _unit(tmp_path, "t.S", "  .long A\n", ["-I."], toolchain=arm_toolchain)
 
         src = preprocess(unit)
 
@@ -242,7 +267,7 @@ class TestPreprocess:
         assert len(files) == len({Path(p).resolve() for p in files})
         assert all(Path(p).is_absolute() for p in files)
 
-    def test_a_file_in_a_directory_with_a_non_ascii_name_keeps_its_lines(self, tmp_path: Path):
+    def test_a_file_in_a_directory_with_a_non_ascii_name_keeps_its_lines(self, tmp_path: Path, arm_toolchain):
         """clang writes each byte above 127 of a linemarker as an octal escape.
 
         The name `m\\305\\231 \\305\\245/t.S` was used as it was, a file
@@ -250,7 +275,7 @@ class TestPreprocess:
         """
         directory = tmp_path / "mř ť"
         directory.mkdir()
-        unit = _unit(directory, "t.S", "  .long A\n")
+        unit = _unit(directory, "t.S", "  .long A\n", toolchain=arm_toolchain)
 
         src = preprocess(unit)
 
@@ -274,9 +299,9 @@ class TestPreprocess:
         assert "Gr\ufffd\ufffde" in src.text
         assert ".long A" in src.text
 
-    def test_a_form_feed_in_a_comment_is_no_line_end(self, tmp_path: Path):
+    def test_a_form_feed_in_a_comment_is_no_line_end(self, tmp_path: Path, arm_toolchain):
         """str.splitlines split there, thus each statement after it got the number of the next line."""
-        unit = _unit(tmp_path, "t.S", "/* a \f b */\n  .long A\n")
+        unit = _unit(tmp_path, "t.S", "/* a \f b */\n  .long A\n", toolchain=arm_toolchain)
 
         from fw_context_mcp.indexer.asm import _raw_statements
 
@@ -286,9 +311,9 @@ class TestPreprocess:
         resolved = str((tmp_path / "t.S").resolve())
         assert (resolved, 2, "  .long A") in list(_raw_statements(src))
 
-    def test_a_unit_that_cannot_be_preprocessed_returns_none(self, tmp_path: Path):
+    def test_a_unit_that_cannot_be_preprocessed_returns_none(self, tmp_path: Path, arm_toolchain):
         """Never guessed at: half a file read without its macros is worse."""
-        unit = _unit(tmp_path, "t.S", '#include "nowhere-at-all.h"\n')
+        unit = _unit(tmp_path, "t.S", '#include "nowhere-at-all.h"\n', toolchain=arm_toolchain, broken="nowhere-at-all.h")
 
         assert preprocess(unit) is None
 
@@ -345,12 +370,12 @@ class TestStoreUnits:
             upsert_build_config(conn, "ch", "pid", str(tmp_path / "cc.json"))
         return conn
 
-    def test_the_unit_gets_a_row_with_its_text(self, tmp_path: Path):
+    def test_the_unit_gets_a_row_with_its_text(self, tmp_path: Path, arm_toolchain):
         from fw_context_mcp.indexer.asm import store_units
         from fw_context_mcp.indexer.db import transaction
 
         unit = _unit(tmp_path, "startup.S",
-                     "/* @brief vector table */\n  .long HardFault_Handler\n")
+                     "/* @brief vector table */\n  .long HardFault_Handler\n", toolchain=arm_toolchain)
         conn = self._db(tmp_path)
         try:
             with transaction(conn):
@@ -366,14 +391,14 @@ class TestStoreUnits:
         assert "HardFault_Handler" in row["content"]
         assert "@brief vector table" in row["content"], "comments must survive"
 
-    def test_an_included_file_gets_its_own_row(self, tmp_path: Path):
+    def test_an_included_file_gets_its_own_row(self, tmp_path: Path, arm_toolchain):
         """the STM32 project's startup unit is five lines; the 194-entry table is included."""
         from fw_context_mcp.indexer.asm import store_units
         from fw_context_mcp.indexer.db import transaction
 
         (tmp_path / "table.inc").write_text("  .long HardFault_Handler\n",
                                             encoding="utf-8")
-        unit = _unit(tmp_path, "startup.S", '#include "table.inc"\n')
+        unit = _unit(tmp_path, "startup.S", '#include "table.inc"\n', toolchain=arm_toolchain)
         conn = self._db(tmp_path)
         try:
             with transaction(conn):
@@ -385,12 +410,12 @@ class TestStoreUnits:
 
         assert paths == {"startup.S", "table.inc"}
 
-    def test_an_inactive_branch_is_not_in_the_stored_text(self, tmp_path: Path):
+    def test_an_inactive_branch_is_not_in_the_stored_text(self, tmp_path: Path, arm_toolchain):
         from fw_context_mcp.indexer.asm import store_units
         from fw_context_mcp.indexer.db import transaction
 
         unit = _unit(tmp_path, "t.S",
-                     "  .long Taken\n#if 0\n  .long NeverTaken\n#endif\n")
+                     "  .long Taken\n#if 0\n  .long NeverTaken\n#endif\n", toolchain=arm_toolchain)
         conn = self._db(tmp_path)
         try:
             with transaction(conn):
@@ -404,12 +429,12 @@ class TestStoreUnits:
         assert "Taken" in content
         assert "NeverTaken" not in content
 
-    def test_a_failing_unit_is_counted_not_raised(self, tmp_path: Path):
+    def test_a_failing_unit_is_counted_not_raised(self, tmp_path: Path, arm_toolchain):
         from fw_context_mcp.indexer.asm import store_units
         from fw_context_mcp.indexer.db import transaction
 
-        good = _unit(tmp_path, "good.S", "  .long A\n")
-        bad = _unit(tmp_path, "bad.S", '#include "nowhere.h"\n')
+        good = _unit(tmp_path, "good.S", "  .long A\n", toolchain=arm_toolchain)
+        bad = _unit(tmp_path, "bad.S", '#include "nowhere.h"\n', toolchain=arm_toolchain, broken="nowhere.h")
         conn = self._db(tmp_path)
         try:
             with transaction(conn):
@@ -421,13 +446,13 @@ class TestStoreUnits:
             "one unit must not lose the other"
         )
 
-    def test_the_row_carries_mtime_and_hash_together(self, tmp_path: Path):
+    def test_the_row_carries_mtime_and_hash_together(self, tmp_path: Path, arm_toolchain):
         """The pair the staleness checks need; see db/_files.py upsert_file."""
         from fw_context_mcp.indexer.asm import store_units
         from fw_context_mcp.indexer.db import transaction
         from fw_context_mcp.utils import compute_source_hash
 
-        unit = _unit(tmp_path, "t.S", "  .long A\n")
+        unit = _unit(tmp_path, "t.S", "  .long A\n", toolchain=arm_toolchain)
         conn = self._db(tmp_path)
         try:
             with transaction(conn):
@@ -441,7 +466,7 @@ class TestStoreUnits:
         assert row["mtime"] > 0
         assert row["source_hash"] == compute_source_hash(tmp_path / "t.S")
 
-    def test_the_symbols_come_from_the_preprocessor_not_libclang(self, tmp_path: Path):
+    def test_the_symbols_come_from_the_preprocessor_not_libclang(self, tmp_path: Path, arm_toolchain):
         """libclang never saw this unit — it cannot read assembly.
 
         The symbols are real all the same, and their USR namespace says
@@ -450,7 +475,7 @@ class TestStoreUnits:
         from fw_context_mcp.indexer.asm import store_units
         from fw_context_mcp.indexer.db import transaction
 
-        unit = _unit(tmp_path, "t.S", "  .global Foo\nFoo:\n  b .\n")
+        unit = _unit(tmp_path, "t.S", "  .global Foo\nFoo:\n  b .\n", toolchain=arm_toolchain)
         conn = self._db(tmp_path)
         try:
             with transaction(conn):
@@ -469,27 +494,27 @@ class TestExtractSymbols:
     """A label defines; `.global` and `.weak` say how, `.type` says what."""
 
     @staticmethod
-    def _syms(tmp_path: Path, text: str):
+    def _syms(tmp_path: Path, text: str, arm_toolchain):
         from fw_context_mcp.indexer.asm import extract_symbols
 
-        src = preprocess(_unit(tmp_path, "t.S", text))
+        src = preprocess(_unit(tmp_path, "t.S", text, toolchain=arm_toolchain))
         assert src is not None
         return {s.name: s for s in extract_symbols(src)}
 
-    def test_a_label_defines_a_symbol(self, tmp_path: Path):
-        syms = self._syms(tmp_path, ".global Foo\nFoo:\n  b .\n")
+    def test_a_label_defines_a_symbol(self, tmp_path: Path, arm_toolchain):
+        syms = self._syms(tmp_path, ".global Foo\nFoo:\n  b .\n", arm_toolchain=arm_toolchain)
 
         assert syms["Foo"].is_global
         assert syms["Foo"].kind == "function"
         assert syms["Foo"].line == 2, "the label is the definition, not the .global"
 
-    def test_a_declaration_without_a_label_is_not_a_definition(self, tmp_path: Path):
+    def test_a_declaration_without_a_label_is_not_a_definition(self, tmp_path: Path, arm_toolchain):
         """`.global X` alone says X exists elsewhere."""
-        syms = self._syms(tmp_path, ".global Elsewhere\n")
+        syms = self._syms(tmp_path, ".global Elsewhere\n", arm_toolchain=arm_toolchain)
 
         assert "Elsewhere" not in syms
 
-    def test_statements_separated_by_semicolons_are_read(self, tmp_path: Path):
+    def test_statements_separated_by_semicolons_are_read(self, tmp_path: Path, arm_toolchain):
         """The regression that returned nothing at all on Zephyr assembly.
 
         SECTION_FUNC expands to
@@ -501,147 +526,147 @@ class TestExtractSymbols:
             '#define SECTION_FUNC(s, sym) .section .text.sym, "ax"; .thumb; sym :\n'
             ".global z_SysNmiOnReset\n"
             "SECTION_FUNC(TEXT, z_SysNmiOnReset)\n"
-            "  wfi\n",
+            "  wfi\n", arm_toolchain=arm_toolchain
         )
 
         assert "z_SysNmiOnReset" in syms
         assert syms["z_SysNmiOnReset"].is_global
 
-    def test_a_macro_defined_symbol_is_found(self, tmp_path: Path):
+    def test_a_macro_defined_symbol_is_found(self, tmp_path: Path, arm_toolchain):
         syms = self._syms(tmp_path,
-                          "#define GTEXT(s) .global s\nGTEXT(Foo)\nFoo:\n  b .\n")
+                          "#define GTEXT(s) .global s\nGTEXT(Foo)\nFoo:\n  b .\n", arm_toolchain=arm_toolchain)
 
         assert syms["Foo"].is_global
 
-    def test_type_object_is_a_variable(self, tmp_path: Path):
-        syms = self._syms(tmp_path, ".type table, %object\ntable:\n  .long 0\n")
+    def test_type_object_is_a_variable(self, tmp_path: Path, arm_toolchain):
+        syms = self._syms(tmp_path, ".type table, %object\ntable:\n  .long 0\n", arm_toolchain=arm_toolchain)
 
         assert syms["table"].kind == "variable"
 
-    def test_a_label_without_a_type_is_a_function(self, tmp_path: Path):
+    def test_a_label_without_a_type_is_a_function(self, tmp_path: Path, arm_toolchain):
         """GNU as does not require .type, and an exported label is code."""
-        syms = self._syms(tmp_path, ".global Bare\nBare:\n  b .\n")
+        syms = self._syms(tmp_path, ".global Bare\nBare:\n  b .\n", arm_toolchain=arm_toolchain)
 
         assert syms["Bare"].kind == "function"
 
-    def test_a_label_that_is_no_entry_is_a_label_of_its_entry(self, tmp_path: Path):
+    def test_a_label_that_is_no_entry_is_a_label_of_its_entry(self, tmp_path: Path, arm_toolchain):
         """The loop label of a copy loop is a place inside Reset_Handler."""
         syms = self._syms(
             tmp_path,
-            ".global Reset_Handler\nReset_Handler:\n  nop\nLoop:\n  b Loop\n",
+            ".global Reset_Handler\nReset_Handler:\n  nop\nLoop:\n  b Loop\n", arm_toolchain=arm_toolchain
         )
 
         assert syms["Loop"].kind == "label"
         assert syms["Loop"].parent == "Reset_Handler"
         assert syms["Reset_Handler"].parent is None
 
-    def test_size_alone_makes_an_entry(self, tmp_path: Path):
+    def test_size_alone_makes_an_entry(self, tmp_path: Path, arm_toolchain):
         """The STM32 startup gives Default_Handler only `.size`."""
         syms = self._syms(
             tmp_path,
             "Default_Handler:\nInfinite_Loop:\n  b Infinite_Loop\n"
-            "  .size Default_Handler, .-Default_Handler\n",
+            "  .size Default_Handler, .-Default_Handler\n", arm_toolchain=arm_toolchain
         )
 
         assert syms["Default_Handler"].kind == "function"
         assert syms["Infinite_Loop"].kind == "label"
         assert syms["Infinite_Loop"].parent == "Default_Handler"
 
-    def test_each_section_keeps_its_owner(self, tmp_path: Path):
+    def test_each_section_keeps_its_owner(self, tmp_path: Path, arm_toolchain):
         """A function that pushes another section and returns still owns
         the code after the return."""
         syms = self._syms(
             tmp_path,
             "  .text\n.global f\nf:\n  nop\n  .pushsection .rodata\n"
-            "  .word 1\n  .popsection\nafter:\n  nop\n",
+            "  .word 1\n  .popsection\nafter:\n  nop\n", arm_toolchain=arm_toolchain
         )
 
         assert syms["after"].parent == "f"
 
-    def test_a_label_of_a_struct_belongs_to_no_entry(self, tmp_path: Path):
+    def test_a_label_of_a_struct_belongs_to_no_entry(self, tmp_path: Path, arm_toolchain):
         """`.struct` switches to the absolute section: an offset, not code."""
         syms = self._syms(
             tmp_path,
             ".global f\nf:\n  nop\n  .pushsection .text\n  .struct 0\n"
-            "OFS_A:\n  .space 4\n  .popsection\nlater:\n  nop\n",
+            "OFS_A:\n  .space 4\n  .popsection\nlater:\n  nop\n", arm_toolchain=arm_toolchain
         )
 
         assert syms["OFS_A"].parent is None
         assert syms["later"].parent == "f"
 
-    def test_every_name_of_a_global_list_is_an_entry(self, tmp_path: Path):
+    def test_every_name_of_a_global_list_is_an_entry(self, tmp_path: Path, arm_toolchain):
         """gas: `.global a, b` makes `b` GLOBAL too."""
-        syms = self._syms(tmp_path, ".global a, b\na:\n  nop\nb:\n  nop\n")
+        syms = self._syms(tmp_path, ".global a, b\na:\n  nop\nb:\n  nop\n", arm_toolchain=arm_toolchain)
 
         assert syms["b"].kind == "function" and syms["b"].is_global
 
-    def test_the_last_type_counts(self, tmp_path: Path):
+    def test_the_last_type_counts(self, tmp_path: Path, arm_toolchain):
         """gas: `.type f,%object` then `.type f,%function` gives FUNC."""
         syms = self._syms(
-            tmp_path, ".type f, %object\n.type f, %function\nf:\n  nop\n"
+            tmp_path, ".type f, %object\n.type f, %function\nf:\n  nop\n", arm_toolchain=arm_toolchain
         )
 
         assert syms["f"].kind == "function"
 
-    def test_notype_makes_no_entry(self, tmp_path: Path):
+    def test_notype_makes_no_entry(self, tmp_path: Path, arm_toolchain):
         syms = self._syms(
-            tmp_path, ".global e\ne:\n  nop\n.type g, %notype\ng:\n  nop\n"
+            tmp_path, ".global e\ne:\n  nop\n.type g, %notype\ng:\n  nop\n", arm_toolchain=arm_toolchain
         )
 
         assert syms["g"].kind == "label" and syms["g"].parent == "e"
 
-    def test_thumb_func_skips_a_local_label(self, tmp_path: Path):
+    def test_thumb_func_skips_a_local_label(self, tmp_path: Path, arm_toolchain):
         """gas gives `.thumb_func` to the next label it keeps: not `.Lx`."""
-        syms = self._syms(tmp_path, ".thumb_func\n.Lx:\ng:\n  nop\n")
+        syms = self._syms(tmp_path, ".thumb_func\n.Lx:\ng:\n  nop\n", arm_toolchain=arm_toolchain)
 
         assert syms["g"].kind == "function"
 
-    def test_a_typed_object_owns_no_code(self, tmp_path: Path):
+    def test_a_typed_object_owns_no_code(self, tmp_path: Path, arm_toolchain):
         syms = self._syms(
             tmp_path,
-            "  .text\n.global tab\n.type tab, %object\ntab:\n  .word 1\nnext:\n  nop\n",
+            "  .text\n.global tab\n.type tab, %object\ntab:\n  .word 1\nnext:\n  nop\n", arm_toolchain=arm_toolchain
         )
 
         assert syms["tab"].kind == "variable"
         assert syms["next"].kind == "label"
         assert syms["next"].parent is None
 
-    def test_a_weak_symbol_is_marked(self, tmp_path: Path):
-        syms = self._syms(tmp_path, ".weak Maybe\nMaybe:\n  b .\n")
+    def test_a_weak_symbol_is_marked(self, tmp_path: Path, arm_toolchain):
+        syms = self._syms(tmp_path, ".weak Maybe\nMaybe:\n  b .\n", arm_toolchain=arm_toolchain)
 
         assert syms["Maybe"].is_weak
 
-    def test_an_alias_records_its_target(self, tmp_path: Path):
+    def test_an_alias_records_its_target(self, tmp_path: Path, arm_toolchain):
         """CMSIS points an unimplemented interrupt at the default handler."""
         syms = self._syms(
             tmp_path,
             ".weak TIM1_IRQHandler\n.thumb_set TIM1_IRQHandler, Default_Handler\n"
-            "Default_Handler:\n  b .\n",
+            "Default_Handler:\n  b .\n", arm_toolchain=arm_toolchain
         )
 
         assert syms["TIM1_IRQHandler"].alias_target == "Default_Handler"
         assert syms["TIM1_IRQHandler"].is_weak
         assert syms["Default_Handler"].alias_target is None
 
-    def test_a_real_label_wins_over_an_alias_of_the_same_name(self, tmp_path: Path):
-        syms = self._syms(tmp_path, ".set Both, Other\nBoth:\n  b .\n")
+    def test_a_real_label_wins_over_an_alias_of_the_same_name(self, tmp_path: Path, arm_toolchain):
+        syms = self._syms(tmp_path, ".set Both, Other\nBoth:\n  b .\n", arm_toolchain=arm_toolchain)
 
         assert syms["Both"].alias_target is None
 
-    def test_the_directives_may_come_after_the_label(self, tmp_path: Path):
+    def test_the_directives_may_come_after_the_label(self, tmp_path: Path, arm_toolchain):
         """irq_cm4f.S writes .type, then .global, then the label."""
         syms = self._syms(tmp_path,
-                          "Late:\n  b .\n.global Late\n.type Late, %function\n")
+                          "Late:\n  b .\n.global Late\n.type Late, %function\n", arm_toolchain=arm_toolchain)
 
         assert syms["Late"].is_global
 
 
 class TestStoredSymbols:
-    def test_an_assembly_symbol_lands_in_the_index(self, tmp_path: Path):
+    def test_an_assembly_symbol_lands_in_the_index(self, tmp_path: Path, arm_toolchain):
         from fw_context_mcp.indexer.asm import store_units
         from fw_context_mcp.indexer.db import transaction
 
-        unit = _unit(tmp_path, "startup.S", ".global Reset_Handler\nReset_Handler:\n  b .\n")
+        unit = _unit(tmp_path, "startup.S", ".global Reset_Handler\nReset_Handler:\n  b .\n", toolchain=arm_toolchain)
         conn = TestStoreUnits._db(tmp_path)
         try:
             with transaction(conn):
@@ -656,7 +681,7 @@ class TestStoredSymbols:
         assert row["kind"] == "function"
         assert row["line"] == 2
 
-    def test_the_usr_has_its_own_namespace(self, tmp_path: Path):
+    def test_the_usr_has_its_own_namespace(self, tmp_path: Path, arm_toolchain):
         """A handler defined in both C and assembly must not collide.
 
         except.S defines HardFault_Handler weakly and a project defines it
@@ -666,7 +691,7 @@ class TestStoredSymbols:
         from fw_context_mcp.indexer.asm import store_units
         from fw_context_mcp.indexer.db import transaction
 
-        unit = _unit(tmp_path, "t.S", "HardFault_Handler:\n  b .\n")
+        unit = _unit(tmp_path, "t.S", "HardFault_Handler:\n  b .\n", toolchain=arm_toolchain)
         conn = TestStoreUnits._db(tmp_path)
         try:
             with transaction(conn):
@@ -691,15 +716,20 @@ class TestVectorTable:
     """
 
     @staticmethod
-    def _vectors(tmp_path: Path, text: str):
+    def _vectors(tmp_path: Path, text: str, arm_toolchain):
+        return TestVectorTable._vectors_of(_unit(tmp_path, "t.S", _table(text), toolchain=arm_toolchain))
+
+    @staticmethod
+    def _vectors_of(unit):
+        """The vector slots that the reader finds in *unit*, by name."""
         from fw_context_mcp.indexer.asm import extract_vectors
 
-        src = preprocess(_unit(tmp_path, "t.S", _table(text)))
+        src = preprocess(unit)
         assert src is not None
         return {v.name: v for v in extract_vectors(src)}
 
-    def test_a_word_entry_names_a_handler(self, tmp_path: Path):
-        vec = self._vectors(tmp_path, "  .word HardFault_Handler\n")
+    def test_a_word_entry_names_a_handler(self, tmp_path: Path, arm_toolchain):
+        vec = self._vectors(tmp_path, "  .word HardFault_Handler\n", arm_toolchain=arm_toolchain)
 
         # Line 2: _table puts the `.section` directive on line 1, exactly
         # as a startup file does.
@@ -707,24 +737,24 @@ class TestVectorTable:
         assert vec["HardFault_Handler"].index == 0, "first slot of the table"
 
     def test_the_arm_dcd_spelling_is_read(self, tmp_path: Path):
-        """mbed's ARM-toolchain startup files write DCD, not .word."""
-        vec = self._vectors(tmp_path, "  DCD SVC_Handler\n")
+        """mbed's ARM-toolchain startup files write DCD, not .word (armasm of Keil)."""
+        vec = self._vectors_of(_foreign_unit(tmp_path, "t.S", _table("  DCD SVC_Handler\n")))
 
         assert "SVC_Handler" in vec
 
-    def test_a_reserved_slot_is_not_an_entry(self, tmp_path: Path):
+    def test_a_reserved_slot_is_not_an_entry(self, tmp_path: Path, arm_toolchain):
         """A startup table holds dozens: measured on the STM32 project, 12 of 206."""
-        vec = self._vectors(tmp_path, "  .word 0\n  .word 0x20000000\n")
+        vec = self._vectors(tmp_path, "  .word 0\n  .word 0x20000000\n", arm_toolchain=arm_toolchain)
 
         assert vec == {}
 
     def test_a_call_like_expression_is_not_an_entry(self, tmp_path: Path):
         """The IAR form names a function of the linker, not a symbol."""
-        vec = self._vectors(tmp_path, "  .word sfe(CSTACK)\n")
+        vec = self._vectors_of(_foreign_unit(tmp_path, "t.S", _table("  .word sfe(CSTACK)\n")))
 
         assert vec == {}
 
-    def test_an_address_built_from_a_symbol_is_a_data_slot(self, tmp_path: Path):
+    def test_an_address_built_from_a_symbol_is_a_data_slot(self, tmp_path: Path, arm_toolchain):
         """`.word sym + CONST` names the symbol, and is not a handler.
 
         This used to yield nothing, which dropped a slot the table really
@@ -736,35 +766,35 @@ class TestVectorTable:
         ``is_data`` is what keeps it from reading as code: the symbol is
         the base of an address, and nothing jumps to it.
         """
-        vec = self._vectors(tmp_path, "  .word z_main_stack + 4096\n")
+        vec = self._vectors(tmp_path, "  .word z_main_stack + 4096\n", arm_toolchain=arm_toolchain)
 
         assert vec["z_main_stack"].index == 0
         assert vec["z_main_stack"].is_data is True
 
-    def test_a_plain_name_is_not_a_data_slot(self, tmp_path: Path):
+    def test_a_plain_name_is_not_a_data_slot(self, tmp_path: Path, arm_toolchain):
         """A handler must keep being a handler."""
-        vec = self._vectors(tmp_path, "  .word HardFault_Handler\n")
+        vec = self._vectors(tmp_path, "  .word HardFault_Handler\n", arm_toolchain=arm_toolchain)
 
         assert vec["HardFault_Handler"].is_data is False
 
-    def test_a_taken_conditional_slot_keeps_the_positions(self, tmp_path: Path):
+    def test_a_taken_conditional_slot_keeps_the_positions(self, tmp_path: Path, arm_toolchain):
         """Only the branch the assembler takes is a slot."""
         vec = self._vectors(
             tmp_path,
             "  .word First\n  .if 1\n  .word Taken\n  .else\n"
-            "  .word Dead\n  .endif\n  .word Last\n",
+            "  .word Dead\n  .endif\n  .word Last\n", arm_toolchain=arm_toolchain
         )
 
         assert {name: entry.index for name, entry in vec.items()} == {
             "First": 0, "Taken": 1, "Last": 2,
         }
 
-    def test_the_position_follows_the_section_across_switches(self, tmp_path: Path):
+    def test_the_position_follows_the_section_across_switches(self, tmp_path: Path, arm_toolchain):
         """Measured with objdump -r on tests/fixtures/asm/sections.S."""
         from fw_context_mcp.indexer.asm import extract_vectors
 
         text = (Path(__file__).parent / "fixtures" / "asm" / "sections.S").read_text()
-        src = preprocess(_unit(tmp_path, "sections.S", text))
+        src = preprocess(_unit(tmp_path, "sections.S", text, toolchain=arm_toolchain))
         assert src is not None
 
         assert {v.name: v.index for v in extract_vectors(src)} == {
@@ -772,28 +802,28 @@ class TestVectorTable:
         }
 
     @staticmethod
-    def _positions(tmp_path: Path, text: str) -> dict[str, int | None]:
+    def _positions(tmp_path: Path, text: str, arm_toolchain) -> dict[str, int | None]:
         """The positions of the slots of *text*, which writes its own sections."""
         from fw_context_mcp.indexer.asm import extract_vectors
 
-        src = preprocess(_unit(tmp_path, "t.S", text))
+        src = preprocess(_unit(tmp_path, "t.S", text, toolchain=arm_toolchain))
         assert src is not None
         return {v.name: v.index for v in extract_vectors(src)}
 
-    def test_two_sections_with_a_dash_are_two_tables(self, tmp_path: Path):
+    def test_two_sections_with_a_dash_are_two_tables(self, tmp_path: Path, arm_toolchain):
         """Measured: b0 is at offset 0 of `.vec-b`."""
         positions = self._positions(
             tmp_path,
-            "  .section .vec-a, \"a\"\n  .word a0\n  .section .vec-b, \"a\"\n  .word b0\n",
+            "  .section .vec-a, \"a\"\n  .word a0\n  .section .vec-b, \"a\"\n  .word b0\n", arm_toolchain=arm_toolchain
         )
 
         assert positions == {"a0": 0, "b0": 0}
 
-    def test_word_sized_spellings_are_entries(self, tmp_path: Path):
+    def test_word_sized_spellings_are_entries(self, tmp_path: Path, arm_toolchain):
         """Measured: `.4byte` and `.int` make an R_ARM_ABS32 each."""
         positions = self._positions(
             tmp_path,
-            "  .section .isr_vector, \"a\"\n  .4byte h0\n  .4byte h1\n  .int h2\n",
+            "  .section .isr_vector, \"a\"\n  .4byte h0\n  .4byte h1\n  .int h2\n", arm_toolchain=arm_toolchain
         )
 
         assert positions == {"h0": 0, "h1": 1, "h2": None}
@@ -804,30 +834,30 @@ class TestVectorTable:
          "  .subsection 1\n"],
     )
     def test_a_statement_that_can_write_bytes_ends_the_known_positions(
-        self, tmp_path: Path, between: str
+        self, tmp_path: Path, between: str, arm_toolchain
     ):
         """Measured: after `.space 8` the next word is slot 3, not 1."""
         positions = self._positions(
             tmp_path,
-            "  .section .isr_vector, \"a\"\n  .word h0\n" + between + "  .word h1\n",
+            "  .section .isr_vector, \"a\"\n  .word h0\n" + between + "  .word h1\n", arm_toolchain=arm_toolchain
         )
 
         assert positions == {"h0": 0, "h1": None}
 
-    def test_an_alignment_before_the_first_entry_keeps_the_positions(self, tmp_path: Path):
+    def test_an_alignment_before_the_first_entry_keeps_the_positions(self, tmp_path: Path, arm_toolchain):
         positions = self._positions(
             tmp_path,
             "  .section .isr_vector, \"a\"\n  .align 2\n  .globl tab\ntab:\n"
-            "  .word h0\n  .word h1\n",
+            "  .word h0\n  .word h1\n", arm_toolchain=arm_toolchain
         )
 
         assert positions == {"h0": 0, "h1": 1}
 
-    def test_an_entry_of_another_size_ends_the_known_positions(self, tmp_path: Path):
+    def test_an_entry_of_another_size_ends_the_known_positions(self, tmp_path: Path, arm_toolchain):
         """Measured: after `.word h0; .short s1; .hword s2`, h2 is the third word."""
         positions = self._positions(
             tmp_path,
-            "  .section .isr_vector, \"a\"\n  .word h0\n  .short s1\n  .word h2\n",
+            "  .section .isr_vector, \"a\"\n  .word h0\n  .short s1\n  .word h2\n", arm_toolchain=arm_toolchain
         )
 
         assert positions == {"h0": 0, "s1": None, "h2": None}
@@ -838,80 +868,85 @@ class TestVectorTable:
          '.section .vec, "aG", %progbits, grp, comdat',
          ".pushsection .vec, 1"],
     )
-    def test_a_section_with_its_own_counter_has_no_positions(self, tmp_path: Path, flags: str):
+    def test_a_section_with_its_own_counter_has_no_positions(self, tmp_path: Path, flags: str, arm_toolchain):
         """`unique`, a group and a subsection make a counter this does not track."""
-        positions = self._positions(tmp_path, f"  {flags}\n  .word h0\n")
+        positions = self._positions(tmp_path, f"  {flags}\n  .word h0\n", arm_toolchain=arm_toolchain)
 
         assert positions == {"h0": None}
 
-    def test_previous_after_a_subsection_returns_to_the_table(self, tmp_path: Path):
+    def test_previous_after_a_subsection_returns_to_the_table(self, tmp_path: Path, arm_toolchain):
         """gas: `.previous` after `.subsection 1` goes back to subsection 0
         of the same section, not to the section before it."""
         positions = self._positions(
             tmp_path,
             "  .text\n  .section .vec, \"a\"\n  .word h0\n  .subsection 1\n  .word x\n"
-            "  .previous\n  .word h1\n",
+            "  .previous\n  .word h1\n", arm_toolchain=arm_toolchain
         )
 
         assert "h1" in positions
 
-    def test_a_barrier_that_can_switch_the_section_ends_the_table(self, tmp_path: Path):
+    def test_a_barrier_that_can_switch_the_section_ends_the_table(self, tmp_path: Path, arm_toolchain):
         """A refused repetition that switches to `.text` makes the next
         `.word` a constant there.  Taking it for a slot would be a wrong
         edge.  The skipped text can also write into any table: a later
         table has no positions."""
         vec = self._vectors(
             tmp_path,
-            "  .word First\n  .rept UNKNOWN_COUNT\n  .text\n  .endr\n"
-            "  .word Unsure\n  .section .vectors_b, \"a\"\n  .word Later\n",
+            _COUNT_LABELS + "  .word First\n  .rept (count_b - count_a) / 4\n  .text\n  .endr\n"
+            "  .word Unsure\n  .section .vectors_b, \"a\"\n  .word Later\n", arm_toolchain=arm_toolchain
         )
 
         assert vec["First"].index == 0
         assert "Unsure" not in vec
         assert vec["Later"].index is None
 
-    def test_a_barrier_that_only_writes_bytes_keeps_the_table(self, tmp_path: Path):
+    def test_a_barrier_that_only_writes_bytes_keeps_the_table(self, tmp_path: Path, arm_toolchain):
         """A refused repetition of `.word 0` stays in its table: the next
         word is a slot, at a position that is not known.  Another table
         keeps its positions."""
         vec = self._vectors(
             tmp_path,
-            "  .word First\n  .rept UNKNOWN_COUNT\n  .word 0\n  .endr\n"
-            "  .word After\n  .section .vectors_b, \"a\"\n  .word Other\n",
+            _COUNT_LABELS + "  .word First\n  .rept (count_b - count_a) / 4\n  .word 0\n  .endr\n"
+            "  .word After\n  .section .vectors_b, \"a\"\n  .word Other\n", arm_toolchain=arm_toolchain
         )
 
         assert vec["First"].index == 0
         assert vec["After"].index is None
         assert vec["Other"].index == 0
 
-    def test_moving_the_location_counter_ends_the_known_positions(self, tmp_path: Path):
+    def test_moving_the_location_counter_ends_the_known_positions(self, tmp_path: Path, arm_toolchain):
         """gas: after `. = . + 4` the next word is at offset 8, slot 2."""
-        vec = self._vectors(tmp_path, "  .word h0\n  . = . + 4\n  .word h2\n")
+        vec = self._vectors(tmp_path, "  .word h0\n  . = . + 4\n  .word h2\n", arm_toolchain=arm_toolchain)
 
         assert vec["h0"].index == 0
         assert vec["h2"].index is None
 
-    def test_a_word_of_a_struct_is_no_slot(self, tmp_path: Path):
+    def test_a_struct_writes_no_slot_of_the_table(self, tmp_path: Path, arm_toolchain):
+        """A `.struct` defines offsets and writes no byte.
+
+        gas refuses a `.word` in a struct ("attempt to store value in
+        absolute section"), thus the struct holds `.space` and labels.
+        """
         vec = self._vectors(
             tmp_path,
-            "  .word First\n  .pushsection .text\n  .struct 0\n  .word 4\n"
-            "  .word In_struct\n  .popsection\n  .word Second\n",
+            "  .word First\n  .pushsection .text\n  .struct 0\n  .space 4\n"
+            "In_struct:\n  .space 4\n  .popsection\n  .word Second\n", arm_toolchain=arm_toolchain
         )
 
-        assert "In_struct" not in vec
-        assert vec["Second"].index == 1
+        assert vec["First"].index == 0
+        assert vec["Second"].index == 1, "the struct writes no byte of the table"
 
-    def test_a_barrier_that_writes_nothing_keeps_the_positions(self, tmp_path: Path):
+    def test_a_barrier_that_writes_nothing_keeps_the_positions(self, tmp_path: Path, arm_toolchain):
         """A refused repetition of `.globl` writes no byte."""
         vec = self._vectors(
             tmp_path,
-            "  .word First\n  .rept UNKNOWN_COUNT\n  .globl x\n  .endr\n  .word Second\n",
+            _COUNT_LABELS + "  .word First\n  .rept (count_b - count_a) / 4\n  .globl x\n  .endr\n  .word Second\n", arm_toolchain=arm_toolchain
         )
 
         assert vec["First"].index == 0
         assert vec["Second"].index == 1
 
-    def test_a_repeated_line_yields_one_entry(self, tmp_path: Path):
+    def test_a_repeated_line_yields_one_entry(self, tmp_path: Path, arm_toolchain):
         """One source line is one slot, however often it reaches the reader.
 
         This used to be about cpp: the reader handed clang the source file
@@ -922,7 +957,7 @@ class TestVectorTable:
         """
         from fw_context_mcp.indexer.asm import extract_vectors
 
-        src = preprocess(_unit(tmp_path, "t.S", _table("  .word Foo\n")))
+        src = preprocess(_unit(tmp_path, "t.S", _table("  .word Foo\n"), toolchain=arm_toolchain))
         src.line_map = src.line_map + src.line_map
         src.text = src.text + "\n" + src.text
 
@@ -931,7 +966,7 @@ class TestVectorTable:
 
 class TestVectorEdges:
     @staticmethod
-    def _run(tmp_path: Path, asm: str, c_symbols: list[str] = ()):
+    def _run(tmp_path: Path, asm: str, c_symbols: list[str] = (), *, arm_toolchain):
         """Store *c_symbols* as C definitions, then index the assembly."""
         from fw_context_mcp.indexer.asm import store_units
         from fw_context_mcp.indexer.db import (
@@ -949,7 +984,7 @@ class TestVectorEdges:
                      10, 1, 12, 1, "", "", None, 0, 0, "", 0, "", 1, 0.0, "", 0, n)
                     for n in c_symbols
                 ])
-            result = store_units(conn, "ch", [_unit(tmp_path, "startup.S", _table(asm))],
+            result = store_units(conn, "ch", [_unit(tmp_path, "startup.S", _table(asm), toolchain=arm_toolchain)],
                                  tmp_path)
         rows = conn.execute(
             "SELECT s.name, r.to_usr, r.from_file, r.from_line, r.from_usr, "
@@ -960,10 +995,10 @@ class TestVectorEdges:
         conn.close()
         return result, {r["name"]: r for r in rows}
 
-    def test_a_handled_slot_becomes_a_reference(self, tmp_path: Path):
+    def test_a_handled_slot_becomes_a_reference(self, tmp_path: Path, arm_toolchain):
         """The regression this whole plan exists for."""
         result, edges = self._run(
-            tmp_path, "  .word HardFault_Handler\n", ["HardFault_Handler"]
+            tmp_path, "  .word HardFault_Handler\n", ["HardFault_Handler"], arm_toolchain=arm_toolchain
         )
 
         assert result.vectors == 1
@@ -975,7 +1010,7 @@ class TestVectorEdges:
         )
         assert edge["from_file"] == "startup.S"
 
-    def test_a_default_aliased_slot_links_to_the_alias(self, tmp_path: Path):
+    def test_a_default_aliased_slot_links_to_the_alias(self, tmp_path: Path, arm_toolchain):
         """An unserviced interrupt still has a slot, and the slot has a target.
 
         The slot exists, the hardware reaches it, and the alias it names is
@@ -992,7 +1027,7 @@ class TestVectorEdges:
             tmp_path,
             "Default_Handler:\n  b .\n"
             "  .word TIM1_IRQHandler\n"
-            ".weak TIM1_IRQHandler\n.thumb_set TIM1_IRQHandler, Default_Handler\n",
+            ".weak TIM1_IRQHandler\n.thumb_set TIM1_IRQHandler, Default_Handler\n", arm_toolchain=arm_toolchain
         )
 
         assert result.vectors == 1
@@ -1006,14 +1041,14 @@ class TestVectorEdges:
             "edge per interrupt"
         )
 
-    def test_a_name_nothing_defines_is_declared_and_linked(self, tmp_path: Path):
+    def test_a_name_nothing_defines_is_declared_and_linked(self, tmp_path: Path, arm_toolchain):
         """`_estack` comes from the linker script, so no unit defines it.
 
         The slot used to disappear.  Two things about it are true and
         worth keeping: the name exists in the program, and the table
         reaches it from a known line — which is what `nm` calls `U`.
         """
-        result, edges = self._run(tmp_path, "  .word _estack\n")
+        result, edges = self._run(tmp_path, "  .word _estack\n", arm_toolchain=arm_toolchain)
 
         assert result.vectors == 1
         assert result.unresolved == 0
@@ -1023,7 +1058,7 @@ class TestVectorEdges:
             "every reference is the truth"
         )
 
-    def test_the_declaration_is_not_a_definition(self, tmp_path: Path):
+    def test_the_declaration_is_not_a_definition(self, tmp_path: Path, arm_toolchain):
         """It says this file NAMES the symbol, not that it defines it."""
         from fw_context_mcp.indexer.asm import store_units
         from fw_context_mcp.indexer.db import transaction
@@ -1033,7 +1068,7 @@ class TestVectorEdges:
             with transaction(conn):
                 store_units(conn, "ch",
                             [_unit(tmp_path, "startup.S",
-                                   _table("  .word _estack\n"))], tmp_path)
+                                   _table("  .word _estack\n"), toolchain=arm_toolchain)], tmp_path)
             row = conn.execute(
                 "SELECT kind, is_definition FROM symbols WHERE name='_estack'"
             ).fetchone()
@@ -1047,7 +1082,7 @@ class TestVectorEdges:
             "prebuilt library is code"
         )
 
-    def test_an_ambiguous_name_is_still_left_unresolved(self, tmp_path: Path):
+    def test_an_ambiguous_name_is_still_left_unresolved(self, tmp_path: Path, arm_toolchain):
         """Not a missing symbol but one with two answers.
 
         Two units define the same name strongly, so the resolver cannot
@@ -1059,10 +1094,10 @@ class TestVectorEdges:
         from fw_context_mcp.indexer.asm import store_units
         from fw_context_mcp.indexer.db import transaction
 
-        first = _unit(tmp_path, "one.S", ".global Twice\nTwice:\n  b .\n")
+        first = _unit(tmp_path, "one.S", ".global Twice\nTwice:\n  b .\n", toolchain=arm_toolchain)
         (tmp_path / "sub").mkdir()
-        second = _unit(tmp_path / "sub", "two.S", ".global Twice\nTwice:\n  b .\n")
-        table = _unit(tmp_path, "table.S", _table("  .word Twice\n"))
+        second = _unit(tmp_path / "sub", "two.S", ".global Twice\nTwice:\n  b .\n", toolchain=arm_toolchain)
+        table = _unit(tmp_path, "table.S", _table("  .word Twice\n"), toolchain=arm_toolchain)
 
         conn = TestStoreUnits._db(tmp_path)
         try:
@@ -1078,7 +1113,7 @@ class TestVectorEdges:
         assert result.unresolved == 1
         assert rows == 2, "no third row was added for an ambiguous name"
 
-    def test_the_strong_definition_wins_over_the_weak_assembly_one(self, tmp_path: Path):
+    def test_the_strong_definition_wins_over_the_weak_assembly_one(self, tmp_path: Path, arm_toolchain):
         """except.S defines HardFault_Handler weakly; a project defines it in C.
 
         The linker takes the strong one, and so must the edge.
@@ -1087,18 +1122,18 @@ class TestVectorEdges:
             tmp_path,
             ".weak HardFault_Handler\nHardFault_Handler:\n  b .\n"
             "  .word HardFault_Handler\n",
-            ["HardFault_Handler"],
+            ["HardFault_Handler"], arm_toolchain=arm_toolchain
         )
 
         assert result.vectors == 1
         conn_usr = edges["HardFault_Handler"]
         assert conn_usr["name"] == "HardFault_Handler"
 
-    def test_a_slot_pointing_at_assembly_only_code_still_links(self, tmp_path: Path):
+    def test_a_slot_pointing_at_assembly_only_code_still_links(self, tmp_path: Path, arm_toolchain):
         """No C definition anywhere, but the assembly one is unambiguous."""
         result, edges = self._run(
             tmp_path, ".global Reset_Handler\nReset_Handler:\n  b .\n"
-                      "  .word Reset_Handler\n"
+                      "  .word Reset_Handler\n", arm_toolchain=arm_toolchain
         )
 
         assert result.vectors == 1
@@ -1257,13 +1292,13 @@ class TestIsProjectClassification:
             str(claimed), tmp_path, ["mbed-os/%"], ["mbed-os/targets_custom/%"]
         ) == 1
 
-    def test_the_stored_symbol_carries_the_verdict(self, tmp_path: Path):
+    def test_the_stored_symbol_carries_the_verdict(self, tmp_path: Path, arm_toolchain):
         from fw_context_mcp.indexer.asm import store_units
         from fw_context_mcp.indexer.db import transaction
 
         vendor_root = tmp_path / "vendor"
         vendor_root.mkdir()
-        unit = _unit(vendor_root, "startup.S", ".global Foo\nFoo:\n  b .\n")
+        unit = _unit(vendor_root, "startup.S", ".global Foo\nFoo:\n  b .\n", toolchain=arm_toolchain)
         project_root = tmp_path / "proj"
         project_root.mkdir()
 
@@ -1282,7 +1317,7 @@ class TestIsProjectClassification:
             "project_only must not report its symbols"
         )
 
-    def test_the_stored_file_carries_the_verdict_too(self, tmp_path: Path):
+    def test_the_stored_file_carries_the_verdict_too(self, tmp_path: Path, arm_toolchain):
         """files.is_project is a separate column and a separate filter.
 
         It defaults to 0 and `upsert_file` cannot set it, thus a project
@@ -1294,7 +1329,7 @@ class TestIsProjectClassification:
 
         project_root = tmp_path / "proj"
         project_root.mkdir()
-        unit = _unit(project_root, "startup.S", ".global Foo\nFoo:\n  b .\n")
+        unit = _unit(project_root, "startup.S", ".global Foo\nFoo:\n  b .\n", toolchain=arm_toolchain)
 
         conn = TestStoreUnits._db(tmp_path)
         try:
@@ -1308,7 +1343,7 @@ class TestIsProjectClassification:
 
         assert rows.get("startup.S") == 1, rows
 
-    def test_a_vendor_file_row_stays_vendor(self, tmp_path: Path):
+    def test_a_vendor_file_row_stays_vendor(self, tmp_path: Path, arm_toolchain):
         from fw_context_mcp.indexer.asm import store_units
         from fw_context_mcp.indexer.db import transaction
 
@@ -1316,7 +1351,7 @@ class TestIsProjectClassification:
         project_root.mkdir()
         (project_root / "mbed-os").mkdir()
         unit = _unit(project_root / "mbed-os", "startup.S",
-                     ".global Foo\nFoo:\n  b .\n")
+                     ".global Foo\nFoo:\n  b .\n", toolchain=arm_toolchain)
 
         conn = TestStoreUnits._db(tmp_path)
         try:
@@ -1348,22 +1383,22 @@ class TestReindexReplacesWhatItWrote:
     """
 
     @staticmethod
-    def _store(conn, tmp_path: Path, body: str, name: str = "startup.S", **kw):
+    def _store(conn, tmp_path: Path, body: str, name: str = "startup.S", *, arm_toolchain, **kw):
         from fw_context_mcp.indexer.asm import store_units
         from fw_context_mcp.indexer.db import transaction
 
-        unit = _unit(tmp_path, name, body)
+        unit = _unit(tmp_path, name, body, toolchain=arm_toolchain)
         with transaction(conn):
             return store_units(conn, "ch", [unit], tmp_path, **kw)
 
-    def test_a_moved_symbol_gets_its_new_line(self, tmp_path: Path):
+    def test_a_moved_symbol_gets_its_new_line(self, tmp_path: Path, arm_toolchain):
         conn = TestStoreUnits._db(tmp_path)
         try:
-            self._store(conn, tmp_path, ".global Foo\nFoo:\n  b .\n")
+            self._store(conn, tmp_path, ".global Foo\nFoo:\n  b .\n", arm_toolchain=arm_toolchain)
             first = conn.execute(
                 "SELECT line FROM symbols WHERE name='Foo'").fetchone()[0]
             # The same symbol, two lines further down.
-            self._store(conn, tmp_path, "  .text\n  .text\n.global Foo\nFoo:\n  b .\n")
+            self._store(conn, tmp_path, "  .text\n  .text\n.global Foo\nFoo:\n  b .\n", arm_toolchain=arm_toolchain)
             second = conn.execute(
                 "SELECT line FROM symbols WHERE name='Foo'").fetchone()[0]
         finally:
@@ -1374,12 +1409,12 @@ class TestReindexReplacesWhatItWrote:
             f"{first} then {second}"
         )
 
-    def test_a_removed_symbol_goes_away(self, tmp_path: Path):
+    def test_a_removed_symbol_goes_away(self, tmp_path: Path, arm_toolchain):
         conn = TestStoreUnits._db(tmp_path)
         try:
             self._store(conn, tmp_path,
-                        ".global Foo\nFoo:\n  b .\n.global Bar\nBar:\n  b .\n")
-            self._store(conn, tmp_path, ".global Foo\nFoo:\n  b .\n")
+                        ".global Foo\nFoo:\n  b .\n.global Bar\nBar:\n  b .\n", arm_toolchain=arm_toolchain)
+            self._store(conn, tmp_path, ".global Foo\nFoo:\n  b .\n", arm_toolchain=arm_toolchain)
             names = {r[0] for r in conn.execute(
                 "SELECT name FROM symbols WHERE config_hash='ch'")}
         finally:
@@ -1387,16 +1422,16 @@ class TestReindexReplacesWhatItWrote:
 
         assert names == {"Foo"}, f"Bar was deleted from the source: {names}"
 
-    def test_a_changed_verdict_reaches_the_row(self, tmp_path: Path):
+    def test_a_changed_verdict_reaches_the_row(self, tmp_path: Path, arm_toolchain):
         """The case that made the is_project fix look inert."""
         conn = TestStoreUnits._db(tmp_path)
         body = ".global Foo\nFoo:\n  b .\n"
         try:
-            self._store(conn, tmp_path, body)
+            self._store(conn, tmp_path, body, arm_toolchain=arm_toolchain)
             assert conn.execute(
                 "SELECT is_project FROM symbols WHERE name='Foo'").fetchone()[0] == 1
             # The same file, now covered by a vendor pattern.
-            self._store(conn, tmp_path, body, vendor_patterns=["startup.S"])
+            self._store(conn, tmp_path, body, vendor_patterns=["startup.S"], arm_toolchain=arm_toolchain)
             after = conn.execute(
                 "SELECT is_project FROM symbols WHERE name='Foo'").fetchone()[0]
         finally:
@@ -1404,13 +1439,13 @@ class TestReindexReplacesWhatItWrote:
 
         assert after == 0, "the second run must be able to reclassify the symbol"
 
-    def test_a_vector_edge_is_not_appended_twice(self, tmp_path: Path):
+    def test_a_vector_edge_is_not_appended_twice(self, tmp_path: Path, arm_toolchain):
         conn = TestStoreUnits._db(tmp_path)
         body = _table(".global Reset_Handler\nReset_Handler:\n  b .\n"
                       "  .word Reset_Handler\n")
         try:
-            self._store(conn, tmp_path, body)
-            self._store(conn, tmp_path, body)
+            self._store(conn, tmp_path, body, arm_toolchain=arm_toolchain)
+            self._store(conn, tmp_path, body, arm_toolchain=arm_toolchain)
             rows = conn.execute(
                 "SELECT COUNT(*) FROM refs WHERE ref_kind='vector'").fetchone()[0]
         finally:
@@ -1418,7 +1453,7 @@ class TestReindexReplacesWhatItWrote:
 
         assert rows == 1, f"refs has no unique constraint; got {rows} rows"
 
-    def test_c_symbols_are_left_alone(self, tmp_path: Path):
+    def test_c_symbols_are_left_alone(self, tmp_path: Path, arm_toolchain):
         """The clear keys on the USR namespace, never on the file.
 
         An assembly unit can include a header that C includes too.  Keying
@@ -1436,7 +1471,7 @@ class TestReindexReplacesWhatItWrote:
                     "c_thing", "function", 1, 1, 1, 1,
                     "", "", None, 0, 0, "", 0, "", 1, 0.0, "", 0,
                 )])
-            self._store(conn, tmp_path, ".global Foo\nFoo:\n  b .\n")
+            self._store(conn, tmp_path, ".global Foo\nFoo:\n  b .\n", arm_toolchain=arm_toolchain)
             names = {r[0] for r in conn.execute(
                 "SELECT name FROM symbols WHERE config_hash='ch'")}
         finally:
@@ -1444,7 +1479,7 @@ class TestReindexReplacesWhatItWrote:
 
         assert "c_thing" in names, f"the C symbol was collateral damage: {names}"
 
-    def test_a_run_that_preprocesses_nothing_keeps_the_old_index(self, tmp_path: Path):
+    def test_a_run_that_preprocesses_nothing_keeps_the_old_index(self, tmp_path: Path, arm_toolchain):
         """No clang on PATH must not empty what an earlier run stored.
 
         The clear happens once, on the first unit that preprocessed, for
@@ -1456,14 +1491,14 @@ class TestReindexReplacesWhatItWrote:
 
         conn = TestStoreUnits._db(tmp_path)
         try:
-            self._store(conn, tmp_path, ".global Foo\nFoo:\n  b .\n")
+            self._store(conn, tmp_path, ".global Foo\nFoo:\n  b .\n", arm_toolchain=arm_toolchain)
             before = conn.execute(
                 "SELECT COUNT(*) FROM symbols WHERE config_hash='ch'").fetchone()[0]
 
             original = asm_mod.preprocess
             asm_mod.preprocess = lambda unit: None
             try:
-                result = self._store(conn, tmp_path, ".global Foo\nFoo:\n  b .\n")
+                result = self._store(conn, tmp_path, ".global Foo\nFoo:\n  b .\n", arm_toolchain=arm_toolchain)
             finally:
                 asm_mod.preprocess = original
             after = conn.execute(
@@ -1487,61 +1522,61 @@ class TestCommentsAndLocalLabels:
     """
 
     @staticmethod
-    def _symbols(tmp_path: Path, body: str):
+    def _symbols(tmp_path: Path, body: str, arm_toolchain):
         from fw_context_mcp.indexer.asm import extract_symbols, preprocess
 
-        source = preprocess(_unit(tmp_path, "a.S", body))
+        source = preprocess(_unit(tmp_path, "a.S", body, toolchain=arm_toolchain))
         assert source is not None
         return {s.name for s in extract_symbols(source)}
 
-    def test_a_word_in_a_comment_is_not_a_label(self, tmp_path: Path):
+    def test_a_word_in_a_comment_is_not_a_label(self, tmp_path: Path, arm_toolchain):
         names = self._symbols(
             tmp_path,
             "/*\nNOTE: Template files are application specific\n*/\n"
-            ".global Real\nReal:\n  b .\n",
+            ".global Real\nReal:\n  b .\n", arm_toolchain=arm_toolchain
         )
 
         assert names == {"Real"}, names
 
-    def test_a_directive_in_a_comment_does_not_count(self, tmp_path: Path):
+    def test_a_directive_in_a_comment_does_not_count(self, tmp_path: Path, arm_toolchain):
         """The comment fix protects every pattern, not just the label one."""
         names = self._symbols(
             tmp_path,
-            "/* .global Ghost\nGhost:\n*/\n.global Real\nReal:\n  b .\n",
+            "/* .global Ghost\nGhost:\n*/\n.global Real\nReal:\n  b .\n", arm_toolchain=arm_toolchain
         )
 
         assert names == {"Real"}, names
 
-    def test_a_comment_that_opens_and_closes_on_one_line(self, tmp_path: Path):
+    def test_a_comment_that_opens_and_closes_on_one_line(self, tmp_path: Path, arm_toolchain):
         names = self._symbols(
-            tmp_path, ".global Real  /* Fake: not a label */\nReal:\n  b .\n"
+            tmp_path, ".global Real  /* Fake: not a label */\nReal:\n  b .\n", arm_toolchain=arm_toolchain
         )
 
         assert names == {"Real"}, names
 
-    def test_code_after_a_closing_comment_still_counts(self, tmp_path: Path):
+    def test_code_after_a_closing_comment_still_counts(self, tmp_path: Path, arm_toolchain):
         names = self._symbols(
-            tmp_path, "/* lead */ .global Real\nReal:\n  b .\n"
+            tmp_path, "/* lead */ .global Real\nReal:\n  b .\n", arm_toolchain=arm_toolchain
         )
 
         assert names == {"Real"}, names
 
-    def test_a_local_label_is_not_a_symbol(self, tmp_path: Path):
+    def test_a_local_label_is_not_a_symbol(self, tmp_path: Path, arm_toolchain):
         names = self._symbols(
             tmp_path,
-            ".global Real\nReal:\n.LC1:\n  subs r3, 4\n  bgt .LC1\n.LC0:\n  b .\n",
+            ".global Real\nReal:\n.LC1:\n  sub r3, #4\n  bgt .LC1\n.LC0:\n  b .\n", arm_toolchain=arm_toolchain
         )
 
         assert names == {"Real"}, names
 
-    def test_a_vector_slot_in_a_comment_is_not_a_slot(self, tmp_path: Path):
+    def test_a_vector_slot_in_a_comment_is_not_a_slot(self, tmp_path: Path, arm_toolchain):
         from fw_context_mcp.indexer.asm import extract_vectors, preprocess
 
         source = preprocess(_unit(
             tmp_path, "a.S",
             _VECTOR_SECTION
             + ".global Real\nReal:\n  b .\n"
-            "/*\n  .word Ghost\n*/\n  .word Real\n",
+            "/*\n  .word Ghost\n*/\n  .word Real\n", toolchain=arm_toolchain
         ))
         assert source is not None
         names = {v.name for v in extract_vectors(source)}
@@ -1659,7 +1694,7 @@ class TestCommentStrippingWidensTheVectorMatch:
     pointer, which no handler serves.
     """
 
-    def test_a_slot_with_a_trailing_comment_is_seen(self, tmp_path: Path):
+    def test_a_slot_with_a_trailing_comment_is_seen(self, tmp_path: Path, arm_toolchain):
         from fw_context_mcp.indexer.asm import extract_vectors, preprocess
 
         source = preprocess(_unit(
@@ -1667,14 +1702,14 @@ class TestCommentStrippingWidensTheVectorMatch:
             _VECTOR_SECTION
             + ".global Reset_Handler\nReset_Handler:\n  b .\n"
             "  .long   __StackTop   /* Top of Stack */\n"
-            "  .long   Reset_Handler\n",
+            "  .long   Reset_Handler\n", toolchain=arm_toolchain
         ))
         assert source is not None
         names = {v.name for v in extract_vectors(source)}
 
         assert names == {"__StackTop", "Reset_Handler"}, names
 
-    def test_a_linker_symbol_slot_is_linked_to_a_declaration(self, tmp_path: Path):
+    def test_a_linker_symbol_slot_is_linked_to_a_declaration(self, tmp_path: Path, arm_toolchain):
         """__StackTop is defined by the linker script, not by any unit.
 
         The slot is real all the same, and so is the name; both are now
@@ -1690,7 +1725,7 @@ class TestCommentStrippingWidensTheVectorMatch:
                 ".global Reset_Handler\nReset_Handler:\n  b .\n"
                 "  .long   __StackTop   /* Top of Stack */\n"
                 "  .long   Reset_Handler\n"
-            ),
+            ), toolchain=arm_toolchain
         )
         conn = TestStoreUnits._db(tmp_path)
         try:
@@ -1730,7 +1765,7 @@ class TestAWeakAliasDoesNotHideTheCOverride:
     )
 
     @staticmethod
-    def _run(tmp_path: Path, c_handlers: list[str]):
+    def _run(tmp_path: Path, c_handlers: list[str], arm_toolchain):
         """Index *c_handlers* as C definitions, then the startup file."""
         from fw_context_mcp.indexer.asm import store_units
         from fw_context_mcp.indexer.db import (
@@ -1749,7 +1784,7 @@ class TestAWeakAliasDoesNotHideTheCOverride:
                 for i, name in enumerate(c_handlers)
             ])
         unit = _unit(tmp_path, "startup.S",
-                     TestAWeakAliasDoesNotHideTheCOverride._STARTUP)
+                     TestAWeakAliasDoesNotHideTheCOverride._STARTUP, toolchain=arm_toolchain)
         with transaction(conn):
             result = store_units(conn, "ch", [unit], tmp_path)
         edges = {
@@ -1759,21 +1794,21 @@ class TestAWeakAliasDoesNotHideTheCOverride:
         conn.close()
         return result, edges
 
-    def test_an_overridden_alias_gets_an_edge_to_the_c_definition(self, tmp_path: Path):
-        result, edges = self._run(tmp_path, ["SysTick_Handler"])
+    def test_an_overridden_alias_gets_an_edge_to_the_c_definition(self, tmp_path: Path, arm_toolchain):
+        result, edges = self._run(tmp_path, ["SysTick_Handler"], arm_toolchain=arm_toolchain)
 
         assert "c:@F@SysTick_Handler" in edges, edges
         assert result.vectors == 3, "every slot is linked"
         assert result.unresolved == 0
 
-    def test_every_override_is_found_not_just_one(self, tmp_path: Path):
-        result, edges = self._run(tmp_path, ["SysTick_Handler", "TIM2_IRQHandler"])
+    def test_every_override_is_found_not_just_one(self, tmp_path: Path, arm_toolchain):
+        result, edges = self._run(tmp_path, ["SysTick_Handler", "TIM2_IRQHandler"], arm_toolchain=arm_toolchain)
 
         assert result.vectors == 3
         assert result.unresolved == 0
         assert "c:@F@TIM2_IRQHandler" in edges, edges
 
-    def test_the_edge_says_which_handler_actually_runs(self, tmp_path: Path):
+    def test_the_edge_says_which_handler_actually_runs(self, tmp_path: Path, arm_toolchain):
         """The discriminator, now that every slot is linked.
 
         An edge into C means the interrupt is serviced; an edge back into
@@ -1781,7 +1816,7 @@ class TestAWeakAliasDoesNotHideTheCOverride:
         loop.  This is what replaced the old counter, and it says which
         interrupt rather than how many.
         """
-        _, edges = self._run(tmp_path, ["SysTick_Handler"])
+        _, edges = self._run(tmp_path, ["SysTick_Handler"], arm_toolchain=arm_toolchain)
 
         assert "c:@F@SysTick_Handler" in edges, (
             f"overridden in C, thus serviced: {edges}"
@@ -1809,64 +1844,64 @@ class TestBodiesAreSkippedNotRead:
     """
 
     @staticmethod
-    def _names(tmp_path: Path, body: str) -> set[str]:
+    def _names(tmp_path: Path, body: str, arm_toolchain) -> set[str]:
         from fw_context_mcp.indexer.asm import extract_symbols, preprocess
 
-        source = preprocess(_unit(tmp_path, "a.S", body))
+        source = preprocess(_unit(tmp_path, "a.S", body, toolchain=arm_toolchain))
         assert source is not None
         return {s.name for s in extract_symbols(source)}
 
-    def test_a_macro_never_invoked_defines_nothing(self, tmp_path: Path):
+    def test_a_macro_never_invoked_defines_nothing(self, tmp_path: Path, arm_toolchain):
         names = self._names(
             tmp_path,
             ".global Real\nReal:\n  b .\n"
-            ".macro never_called\n.global Ghost\nGhost:\n  b .\n.endm\n",
+            ".macro never_called\n.global Ghost\nGhost:\n  b .\n.endm\n", arm_toolchain=arm_toolchain
         )
 
         assert names == {"Real"}, names
 
-    def test_a_rept_body_is_skipped(self, tmp_path: Path):
+    def test_a_rept_body_is_skipped(self, tmp_path: Path, arm_toolchain):
         """`.rept 0` assembles its body zero times."""
         names = self._names(
             tmp_path,
             ".global Real\nReal:\n  b .\n"
-            ".rept 0\n.global Ghost\nGhost:\n  .word 0\n.endr\n",
+            ".rept 0\n.global Ghost\nGhost:\n  .word 0\n.endr\n", arm_toolchain=arm_toolchain
         )
 
         assert names == {"Real"}, names
 
-    def test_an_irp_body_is_expanded_once_per_value(self, tmp_path: Path):
+    def test_an_irp_body_is_expanded_once_per_value(self, tmp_path: Path, arm_toolchain):
         """`.irp` runs its body once per value, so what it defines exists."""
         names = self._names(
             tmp_path,
             ".global Real\nReal:\n  b .\n"
             ".irp which, a, b\n.global from_\\which\nfrom_\\which:\n"
-            "  .word 0\n.endr\n",
+            "  .word 0\n.endr\n", arm_toolchain=arm_toolchain
         )
 
         assert names == {"Real", "from_a", "from_b"}, names
 
-    def test_an_irp_with_no_values_runs_once(self, tmp_path: Path):
+    def test_an_irp_with_no_values_runs_once(self, tmp_path: Path, arm_toolchain):
         """"If no VALUE is listed, the sequence is assembled once, with
         SYMBOL set to the null string.\""""
         names = self._names(
             tmp_path,
-            ".irp nothing\n.global ran_once\nran_once:\n  b .\n.endr\n",
+            ".irp nothing\n.global ran_once\nran_once:\n  b .\n.endr\n", arm_toolchain=arm_toolchain
         )
 
         assert names == {"ran_once"}, names
 
-    def test_code_after_a_body_is_read_again(self, tmp_path: Path):
+    def test_code_after_a_body_is_read_again(self, tmp_path: Path, arm_toolchain):
         """The skip must end where the body does."""
         names = self._names(
             tmp_path,
             ".macro m\n.global Ghost\nGhost:\n.endm\n"
-            ".global After\nAfter:\n  b .\n",
+            ".global After\nAfter:\n  b .\n", arm_toolchain=arm_toolchain
         )
 
         assert names == {"After"}, names
 
-    def test_a_nested_body_does_not_end_the_outer_one(self, tmp_path: Path):
+    def test_a_nested_body_does_not_end_the_outer_one(self, tmp_path: Path, arm_toolchain):
         """`.endr` must not close a `.macro`, which is why a stack is used."""
         names = self._names(
             tmp_path,
@@ -1874,12 +1909,12 @@ class TestBodiesAreSkippedNotRead:
             ".rept 2\n.global GhostInner\nGhostInner:\n.endr\n"
             ".global GhostOuter\nGhostOuter:\n"
             ".endm\n"
-            ".global After\nAfter:\n  b .\n",
+            ".global After\nAfter:\n  b .\n", arm_toolchain=arm_toolchain
         )
 
         assert names == {"After"}, names
 
-    def test_a_vector_slot_inside_a_body_is_skipped_too(self, tmp_path: Path):
+    def test_a_vector_slot_inside_a_body_is_skipped_too(self, tmp_path: Path, arm_toolchain):
         """The rule protects the table as well as the symbol list."""
         from fw_context_mcp.indexer.asm import extract_vectors, preprocess
 
@@ -1887,7 +1922,7 @@ class TestBodiesAreSkippedNotRead:
             tmp_path, "a.S",
             _VECTOR_SECTION
             + "  .word RealSlot\n"
-            ".macro m\n  .word GhostSlot\n.endm\n",
+            ".macro m\n  .word GhostSlot\n.endm\n", toolchain=arm_toolchain
         ))
         assert source is not None
         names = {v.name for v in extract_vectors(source)}
@@ -1907,54 +1942,59 @@ class TestConstantsDefinedByEqu:
     """
 
     @staticmethod
-    def _symbols(tmp_path: Path, body: str):
+    def _symbols(tmp_path: Path, body: str, arm_toolchain):
+        return TestConstantsDefinedByEqu._symbols_of(_unit(tmp_path, "a.S", body, toolchain=arm_toolchain))
+
+    @staticmethod
+    def _symbols_of(unit):
+        """The symbols that the reader finds in *unit*, by name."""
         from fw_context_mcp.indexer.asm import extract_symbols, preprocess
 
-        source = preprocess(_unit(tmp_path, "a.S", body))
+        source = preprocess(unit)
         assert source is not None
         return {s.name: s for s in extract_symbols(source)}
 
-    def test_a_numeric_constant_is_a_symbol(self, tmp_path: Path):
-        syms = self._symbols(tmp_path, "  .equ TCB_SP_OFS, 56\n")
+    def test_a_numeric_constant_is_a_symbol(self, tmp_path: Path, arm_toolchain):
+        syms = self._symbols(tmp_path, "  .equ TCB_SP_OFS, 56\n", arm_toolchain=arm_toolchain)
 
         assert "TCB_SP_OFS" in syms
 
-    def test_a_hex_constant_is_a_symbol(self, tmp_path: Path):
-        syms = self._symbols(tmp_path, "  .equ BootRAM, 0xF1E0F85F\n")
+    def test_a_hex_constant_is_a_symbol(self, tmp_path: Path, arm_toolchain):
+        syms = self._symbols(tmp_path, "  .equ BootRAM, 0xF1E0F85F\n", arm_toolchain=arm_toolchain)
 
         assert "BootRAM" in syms
 
-    def test_an_expression_is_a_symbol(self, tmp_path: Path):
-        syms = self._symbols(tmp_path, "  .set SIZE, 8 * 4 + 1\n")
+    def test_an_expression_is_a_symbol(self, tmp_path: Path, arm_toolchain):
+        syms = self._symbols(tmp_path, "  .set SIZE, 8 * 4 + 1\n", arm_toolchain=arm_toolchain)
 
         assert "SIZE" in syms
 
-    def test_a_constant_is_data_not_code(self, tmp_path: Path):
+    def test_a_constant_is_data_not_code(self, tmp_path: Path, arm_toolchain):
         """A structure offset must not answer "what does this firmware do"."""
-        syms = self._symbols(tmp_path, "  .equ TCB_SP_OFS, 56\n")
+        syms = self._symbols(tmp_path, "  .equ TCB_SP_OFS, 56\n", arm_toolchain=arm_toolchain)
 
         assert syms["TCB_SP_OFS"].kind == "variable"
         assert syms["TCB_SP_OFS"].alias_target is None, (
             "a number is not an alias of anything"
         )
 
-    def test_an_alias_of_a_symbol_stays_an_alias(self, tmp_path: Path):
+    def test_an_alias_of_a_symbol_stays_an_alias(self, tmp_path: Path, arm_toolchain):
         syms = self._symbols(
             tmp_path,
             "Default_Handler:\n  b .\n"
-            "  .thumb_set TIM2_IRQHandler, Default_Handler\n",
+            "  .thumb_set TIM2_IRQHandler, Default_Handler\n", arm_toolchain=arm_toolchain
         )
 
         assert syms["TIM2_IRQHandler"].alias_target == "Default_Handler"
         assert syms["TIM2_IRQHandler"].kind == "function"
 
     def test_a_mode_setting_set_defines_nothing(self, tmp_path: Path):
-        """`.set noreorder` takes one operand and is not a definition.
+        """`.set noreorder` takes one operand and is not a definition (MIPS).
 
         The comma is what separates the two, which is why the pattern
         requires it.
         """
-        syms = self._symbols(tmp_path, "  .set noreorder\n  .set nomacro\n")
+        syms = self._symbols_of(_foreign_unit(tmp_path, "a.S", "  .set noreorder\n  .set nomacro\n"))
 
         assert syms == {}
 
@@ -2096,7 +2136,7 @@ class TestWeakLosesToStrong:
         finally:
             conn.close()
 
-    def test_the_weak_flag_reaches_the_stored_symbol(self, tmp_path: Path):
+    def test_the_weak_flag_reaches_the_stored_symbol(self, tmp_path: Path, arm_toolchain):
         """The column is only useful if the assembly pass fills it."""
         from fw_context_mcp.indexer.asm import store_units
         from fw_context_mcp.indexer.db import transaction
@@ -2104,7 +2144,7 @@ class TestWeakLosesToStrong:
         unit = _unit(
             tmp_path, "startup.S",
             ".global Strong\nStrong:\n  b .\n"
-            ".weak Weak\nWeak:\n  b .\n",
+            ".weak Weak\nWeak:\n  b .\n", toolchain=arm_toolchain
         )
         conn = TestStoreUnits._db(tmp_path)
         try:
@@ -2133,31 +2173,31 @@ class TestSlotPositions:
     """
 
     @staticmethod
-    def _slots(tmp_path: Path, body: str):
+    def _slots(tmp_path: Path, body: str, arm_toolchain):
         from fw_context_mcp.indexer.asm import extract_vectors, preprocess
 
-        source = preprocess(_unit(tmp_path, "t.S", body))
+        source = preprocess(_unit(tmp_path, "t.S", body, toolchain=arm_toolchain))
         assert source is not None
         return {v.name: v.index for v in extract_vectors(source)}
 
-    def test_positions_count_from_zero(self, tmp_path: Path):
+    def test_positions_count_from_zero(self, tmp_path: Path, arm_toolchain):
         slots = self._slots(tmp_path, _table(
-            "  .word First\n  .word Second\n  .word Third\n"))
+            "  .word First\n  .word Second\n  .word Third\n"), arm_toolchain=arm_toolchain)
 
         assert slots == {"First": 0, "Second": 1, "Third": 2}
 
-    def test_a_reserved_slot_takes_its_position(self, tmp_path: Path):
+    def test_a_reserved_slot_takes_its_position(self, tmp_path: Path, arm_toolchain):
         """`.word 0` names nothing and still occupies a place.
 
         Skipping it would put SysTick at 10 instead of 15 on every
         Cortex-M table, because five reserved entries come before it.
         """
         slots = self._slots(tmp_path, _table(
-            "  .word First\n  .word 0\n  .word 0\n  .word Fourth\n"))
+            "  .word First\n  .word 0\n  .word 0\n  .word Fourth\n"), arm_toolchain=arm_toolchain)
 
         assert slots == {"First": 0, "Fourth": 3}
 
-    def test_the_cortex_m_layout_comes_out_right(self, tmp_path: Path):
+    def test_the_cortex_m_layout_comes_out_right(self, tmp_path: Path, arm_toolchain):
         """The arrangement every CMSIS startup writes, in miniature."""
         slots = self._slots(tmp_path, _table(
             "  .word _estack\n  .word Reset_Handler\n  .word NMI_Handler\n"
@@ -2166,17 +2206,17 @@ class TestSlotPositions:
             "  .word 0\n  .word 0\n  .word 0\n  .word 0\n"
             "  .word SVC_Handler\n  .word DebugMon_Handler\n  .word 0\n"
             "  .word PendSV_Handler\n  .word SysTick_Handler\n"
-            "  .word WWDG_IRQHandler\n"))
+            "  .word WWDG_IRQHandler\n"), arm_toolchain=arm_toolchain)
 
         assert slots["SysTick_Handler"] == 15
         assert slots["WWDG_IRQHandler"] == 16, "the first external interrupt"
 
-    def test_several_entries_on_one_line_each_take_a_position(self, tmp_path: Path):
-        slots = self._slots(tmp_path, _table("  .word One, Two, Three\n"))
+    def test_several_entries_on_one_line_each_take_a_position(self, tmp_path: Path, arm_toolchain):
+        slots = self._slots(tmp_path, _table("  .word One, Two, Three\n"), arm_toolchain=arm_toolchain)
 
         assert slots == {"One": 0, "Two": 1, "Three": 2}
 
-    def test_a_constant_outside_the_table_is_not_a_slot(self, tmp_path: Path):
+    def test_a_constant_outside_the_table_is_not_a_slot(self, tmp_path: Path, arm_toolchain):
         """The error this rule exists for.
 
         A real STM32 startup writes `.word _sidata` in the ordinary
@@ -2185,15 +2225,15 @@ class TestSlotPositions:
         """
         slots = self._slots(
             tmp_path,
-            "  .word _sidata\n  .word _sdata\n" + _table("  .word Real\n"),
+            "  .word _sidata\n  .word _sdata\n" + _table("  .word Real\n"), arm_toolchain=arm_toolchain
         )
 
         assert slots == {"Real": 0}, slots
 
-    def test_leaving_the_section_ends_the_table(self, tmp_path: Path):
+    def test_leaving_the_section_ends_the_table(self, tmp_path: Path, arm_toolchain):
         slots = self._slots(
             tmp_path,
-            _table("  .word InTable\n") + "  .text\n  .word AfterTable\n",
+            _table("  .word InTable\n") + "  .text\n  .word AfterTable\n", arm_toolchain=arm_toolchain
         )
 
         assert slots == {"InTable": 0}, slots
@@ -2202,15 +2242,49 @@ class TestSlotPositions:
 class TestPreprocessRunsOnce:
     """The source file is named once, not twice.
 
-    `clang_args` from compile_commands.json already holds the file, and
-    appending it again handed clang the same file twice: it preprocessed
-    the whole unit twice and concatenated the results.  Every assembly
-    unit cost twice what it should — the preprocessor is 89-95% of the
-    pass — and once the vector reader began carrying a section and a slot
-    counter, the second copy started at positions the first had used.
+    The entry of compile_commands.json names the file in its arguments, and
+    the preprocessor gets it once more at the end.  Named twice, clang
+    preprocessed the whole unit twice and concatenated the results.  Every
+    assembly unit cost twice what it should — the preprocessor is 89-95% of
+    the pass — and once the vector reader began carrying a section and a
+    slot counter, the second copy started at positions the first had used.
+
+    ``compile_commands.normalize_args`` drops each argument that names the
+    file, by the identity of the file: a compare of base names kept the
+    argument when the entry names the file through a link, or in a different
+    case on a case-insensitive file system.
     """
 
-    def test_the_file_is_preprocessed_once(self, tmp_path: Path):
+    @staticmethod
+    def _parsed_unit(tmp_path: Path, spelling: str):
+        """Give the unit of an entry that names ``real/t.S`` as *spelling* (relative to *tmp_path*)."""
+        import json
+
+        from fw_context_mcp.indexer.compile_commands import parse
+
+        real = tmp_path / "real"
+        real.mkdir()
+        (real / "t.S").write_text("  .globl Foo\nFoo:\n  b .\n", encoding="utf-8")
+        named = tmp_path / spelling
+        if spelling == "link/u.S":
+            named.parent.mkdir()
+            try:
+                named.symlink_to(real / "t.S")
+            except OSError as exc:
+                pytest.skip(f"this system makes no link for this user: {exc}")
+        elif spelling == "real/T.S" and not named.exists():
+            pytest.skip("the file system of the test directory is case-sensitive")
+        cc = tmp_path / "compile_commands.json"
+        cc.write_text(json.dumps([{
+            "directory": str(tmp_path), "file": str(named),
+            "arguments": ["clang", "-c", str(named), "-o", "t.o"],
+        }]), encoding="utf-8")
+        units = list(parse(cc))
+        assert len(units) == 1
+        return units[0]
+
+    @pytest.mark.parametrize("spelling", ["real/t.S", "link/u.S", "real/T.S"], ids=["plain", "link", "case"])
+    def test_the_file_is_preprocessed_once(self, tmp_path: Path, spelling: str):
         """One `<built-in>` ENTRY per invocation.
 
         A linemarker's trailing flag says what happened: 1 is entering a
@@ -2218,10 +2292,7 @@ class TestPreprocessRunsOnce:
         entered once per clang run, so counting the flag-1 markers counts
         the runs — the bare name appears several times in a single run.
         """
-        source = preprocess(_unit(
-            tmp_path, "t.S", "  .globl Foo\nFoo:\n  b .\n",
-            args=[str(tmp_path / "t.S")],
-        ))
+        source = preprocess(self._parsed_unit(tmp_path, spelling))
 
         assert source is not None
         assert source.text.count('"<built-in>" 1') == 1, (
@@ -2232,10 +2303,7 @@ class TestPreprocessRunsOnce:
         """Dropping the file from the flags must not drop the file."""
         from fw_context_mcp.indexer.asm import extract_symbols
 
-        source = preprocess(_unit(
-            tmp_path, "t.S", "  .globl Foo\nFoo:\n  b .\n",
-            args=[str(tmp_path / "t.S")],
-        ))
+        source = preprocess(self._parsed_unit(tmp_path, "real/t.S"))
 
         assert source is not None
         assert {s.name for s in extract_symbols(source)} == {"Foo"}
@@ -2250,13 +2318,13 @@ class TestTheSlotPositionReachesTheIndex:
     index; what is stored is the position.
     """
 
-    def test_the_edge_carries_the_position(self, tmp_path: Path):
+    def test_the_edge_carries_the_position(self, tmp_path: Path, arm_toolchain):
         from fw_context_mcp.indexer.asm import store_units
         from fw_context_mcp.indexer.db import transaction
 
         unit = _unit(tmp_path, "startup.S", _table(
             "  .word Slot0\n  .word 0\n  .word Slot2\n"
-            "Slot0:\n  b .\nSlot2:\n  b .\n"))
+            "Slot0:\n  b .\nSlot2:\n  b .\n"), toolchain=arm_toolchain)
         conn = TestStoreUnits._db(tmp_path)
         try:
             with transaction(conn):
@@ -2312,22 +2380,22 @@ class TestAliasEdges:
     """
 
     @staticmethod
-    def _store(tmp_path: Path, body: str):
+    def _store(tmp_path: Path, body: str, arm_toolchain):
         from fw_context_mcp.indexer.asm import store_units
         from fw_context_mcp.indexer.db import transaction
 
         conn = TestStoreUnits._db(tmp_path)
         with transaction(conn):
-            store_units(conn, "ch", [_unit(tmp_path, "startup.S", body)],
+            store_units(conn, "ch", [_unit(tmp_path, "startup.S", body, toolchain=arm_toolchain)],
                         tmp_path)
         return conn
 
-    def test_an_alias_becomes_an_edge(self, tmp_path: Path):
+    def test_an_alias_becomes_an_edge(self, tmp_path: Path, arm_toolchain):
         conn = self._store(tmp_path, _table(
             "  .word TIM2_IRQHandler\n"
             "Default_Handler:\n  b .\n"
             "  .weak TIM2_IRQHandler\n"
-            "  .thumb_set TIM2_IRQHandler, Default_Handler\n"))
+            "  .thumb_set TIM2_IRQHandler, Default_Handler\n"), arm_toolchain=arm_toolchain)
         try:
             rows = conn.execute(
                 "SELECT s.name FROM refs r JOIN symbols s ON s.usr = r.to_usr "
@@ -2338,11 +2406,11 @@ class TestAliasEdges:
 
         assert [r[0] for r in rows] == ["Default_Handler"]
 
-    def test_a_handler_with_a_body_gets_no_alias_edge(self, tmp_path: Path):
+    def test_a_handler_with_a_body_gets_no_alias_edge(self, tmp_path: Path, arm_toolchain):
         """`Reset_Handler` is weak AND real.  Weakness cannot say that."""
         conn = self._store(tmp_path, _table(
             "  .word Reset_Handler\n"
-            "  .weak Reset_Handler\nReset_Handler:\n  b .\n"))
+            "  .weak Reset_Handler\nReset_Handler:\n  b .\n"), arm_toolchain=arm_toolchain)
         try:
             count = conn.execute(
                 "SELECT COUNT(*) FROM refs WHERE ref_kind='alias'"
@@ -2356,11 +2424,11 @@ class TestAliasEdges:
         assert count == 0, "a label with a body is not an alias of anything"
         assert weak == 1, "and it is still weak, which is why weakness cannot tell"
 
-    def test_an_alias_to_an_unknown_name_writes_nothing(self, tmp_path: Path):
+    def test_an_alias_to_an_unknown_name_writes_nothing(self, tmp_path: Path, arm_toolchain):
         """An edge to the wrong symbol would be worse than no edge."""
         conn = self._store(tmp_path, _table(
             "  .word Handler\n"
-            "  .thumb_set Handler, NoSuchSymbol\n"))
+            "  .thumb_set Handler, NoSuchSymbol\n"), arm_toolchain=arm_toolchain)
         try:
             count = conn.execute(
                 "SELECT COUNT(*) FROM refs WHERE ref_kind='alias'"
@@ -2370,7 +2438,7 @@ class TestAliasEdges:
 
         assert count == 0
 
-    def test_the_alias_edges_go_on_a_reindex(self, tmp_path: Path):
+    def test_the_alias_edges_go_on_a_reindex(self, tmp_path: Path, arm_toolchain):
         """`_clear_previous_pass` owns them like the vector edges."""
         body = _table(
             "  .word TIM2_IRQHandler\n"
@@ -2384,7 +2452,7 @@ class TestAliasEdges:
             for _ in range(2):
                 with transaction(conn):
                     store_units(conn, "ch",
-                                [_unit(tmp_path, "startup.S", body)], tmp_path)
+                                [_unit(tmp_path, "startup.S", body, toolchain=arm_toolchain)], tmp_path)
             count = conn.execute(
                 "SELECT COUNT(*) FROM refs WHERE ref_kind='alias'"
             ).fetchone()[0]
@@ -2398,7 +2466,7 @@ class TestGetVectorTable:
     """The tool that answers "which interrupts does this firmware service"."""
 
     @staticmethod
-    def _table_of(tmp_path: Path, body: str, c_symbols: list[str] = ()):
+    def _table_of(tmp_path: Path, body: str, c_symbols: list[str] = (), *, arm_toolchain):
         from fw_context_mcp.indexer.asm import store_units
         from fw_context_mcp.indexer.db import (
             get_vector_table,
@@ -2418,7 +2486,7 @@ class TestGetVectorTable:
                          "", 1, 0.0, "", 0, n)
                         for n in c_symbols
                     ])
-                store_units(conn, "ch", [_unit(tmp_path, "startup.S", body)],
+                store_units(conn, "ch", [_unit(tmp_path, "startup.S", body, toolchain=arm_toolchain)],
                             tmp_path)
             return {r["slot"]: r for r in get_vector_table(conn, "ch")}
         finally:
@@ -2435,41 +2503,41 @@ class TestGetVectorTable:
         "  .weak SysTick_Handler\n  .thumb_set SysTick_Handler, Default_Handler\n"
     )
 
-    def test_a_linker_symbol_is_not_a_handler(self, tmp_path: Path):
+    def test_a_linker_symbol_is_not_a_handler(self, tmp_path: Path, arm_toolchain):
         """Slot 0 holds the initial stack pointer."""
-        table = self._table_of(tmp_path, self._STARTUP)
+        table = self._table_of(tmp_path, self._STARTUP, arm_toolchain=arm_toolchain)
 
         assert table[0]["name"] == "_estack"
         assert table[0]["status"] == "linker"
 
-    def test_a_handler_with_a_body_is_serviced_by_assembly(self, tmp_path: Path):
-        table = self._table_of(tmp_path, self._STARTUP)
+    def test_a_handler_with_a_body_is_serviced_by_assembly(self, tmp_path: Path, arm_toolchain):
+        table = self._table_of(tmp_path, self._STARTUP, arm_toolchain=arm_toolchain)
 
         assert table[1]["status"] == "assembly"
         assert table[1]["name"] == "Reset_Handler"
 
-    def test_an_unoverridden_alias_is_unhandled(self, tmp_path: Path):
-        table = self._table_of(tmp_path, self._STARTUP)
+    def test_an_unoverridden_alias_is_unhandled(self, tmp_path: Path, arm_toolchain):
+        table = self._table_of(tmp_path, self._STARTUP, arm_toolchain=arm_toolchain)
 
         assert table[2]["status"] == "unhandled"
         assert table[2]["aliases"]["name"] == "Default_Handler", (
             "the row says what the interrupt really reaches"
         )
 
-    def test_a_c_definition_services_the_interrupt(self, tmp_path: Path):
-        table = self._table_of(tmp_path, self._STARTUP, ["SysTick_Handler"])
+    def test_a_c_definition_services_the_interrupt(self, tmp_path: Path, arm_toolchain):
+        table = self._table_of(tmp_path, self._STARTUP, ["SysTick_Handler"], arm_toolchain=arm_toolchain)
 
         assert table[3]["status"] == "c"
         assert table[3]["file"] == "src/main.c"
 
-    def test_a_serviced_slot_names_the_stub_it_replaced(self, tmp_path: Path):
+    def test_a_serviced_slot_names_the_stub_it_replaced(self, tmp_path: Path, arm_toolchain):
         """The CMSIS pattern, which the reader asked to see."""
-        table = self._table_of(tmp_path, self._STARTUP, ["SysTick_Handler"])
+        table = self._table_of(tmp_path, self._STARTUP, ["SysTick_Handler"], arm_toolchain=arm_toolchain)
 
         assert "overridden" in table[3], table[3]
         assert table[3]["overridden"]["file"] == "startup.S"
 
-    def test_unhandled_only_keeps_just_those(self, tmp_path: Path):
+    def test_unhandled_only_keeps_just_those(self, tmp_path: Path, arm_toolchain):
         from fw_context_mcp.indexer.asm import store_units
         from fw_context_mcp.indexer.db import get_vector_table, transaction
 
@@ -2477,7 +2545,7 @@ class TestGetVectorTable:
         try:
             with transaction(conn):
                 store_units(conn, "ch",
-                            [_unit(tmp_path, "startup.S", self._STARTUP)],
+                            [_unit(tmp_path, "startup.S", self._STARTUP, toolchain=arm_toolchain)],
                             tmp_path)
             rows = get_vector_table(conn, "ch", unhandled_only=True)
         finally:
@@ -2500,24 +2568,24 @@ class TestATableResolvesAcrossUnits:
     """
 
     @staticmethod
-    def _two_units(tmp_path: Path):
+    def _two_units(tmp_path: Path, arm_toolchain):
         """A table unit FIRST, then the unit that defines the handler."""
         from fw_context_mcp.indexer.asm import store_units
         from fw_context_mcp.indexer.db import transaction
 
         table = _unit(tmp_path, "vector_table.S",
-                      _table("  .word Handler\n"))
+                      _table("  .word Handler\n"), toolchain=arm_toolchain)
         (tmp_path / "sub").mkdir(exist_ok=True)
         defines = _unit(tmp_path / "sub", "handler.S",
-                        ".global Handler\nHandler:\n  b .\n")
+                        ".global Handler\nHandler:\n  b .\n", toolchain=arm_toolchain)
 
         conn = TestStoreUnits._db(tmp_path)
         with transaction(conn):
             result = store_units(conn, "ch", [table, defines], tmp_path)
         return conn, result
 
-    def test_the_slot_reaches_the_other_unit(self, tmp_path: Path):
-        conn, result = self._two_units(tmp_path)
+    def test_the_slot_reaches_the_other_unit(self, tmp_path: Path, arm_toolchain):
+        conn, result = self._two_units(tmp_path, arm_toolchain=arm_toolchain)
         try:
             row = conn.execute(
                 "SELECT s.file_path, s.is_definition FROM refs r "
@@ -2531,9 +2599,9 @@ class TestATableResolvesAcrossUnits:
         assert row["is_definition"] == 1, "the edge must reach the definition"
         assert row["file_path"] == "sub/handler.S"
 
-    def test_no_placeholder_is_left_behind(self, tmp_path: Path):
+    def test_no_placeholder_is_left_behind(self, tmp_path: Path, arm_toolchain):
         """The declaration path must not fire for a name a later unit defines."""
-        conn, _ = self._two_units(tmp_path)
+        conn, _ = self._two_units(tmp_path, arm_toolchain=arm_toolchain)
         try:
             rows = conn.execute(
                 "SELECT file_path, kind FROM symbols WHERE name='Handler'"
@@ -2544,7 +2612,7 @@ class TestATableResolvesAcrossUnits:
         assert len(rows) == 1, f"the name appears {len(rows)} times: {rows}"
         assert rows[0]["kind"] == "function"
 
-    def test_a_name_nothing_defines_is_still_declared(self, tmp_path: Path):
+    def test_a_name_nothing_defines_is_still_declared(self, tmp_path: Path, arm_toolchain):
         """The second pass must not lose the linker-symbol case."""
         from fw_context_mcp.indexer.asm import store_units
         from fw_context_mcp.indexer.db import transaction
@@ -2554,7 +2622,7 @@ class TestATableResolvesAcrossUnits:
             with transaction(conn):
                 result = store_units(
                     conn, "ch",
-                    [_unit(tmp_path, "vector_table.S", _table("  .word _estack\n"))],
+                    [_unit(tmp_path, "vector_table.S", _table("  .word _estack\n"), toolchain=arm_toolchain)],
                     tmp_path,
                 )
             kind = conn.execute(
@@ -2643,11 +2711,11 @@ class TestOwnershipTraps:
 
 
 class TestLabelParent:
-    def test_the_parent_is_stored(self, tmp_path: Path):
+    def test_the_parent_is_stored(self, tmp_path: Path, arm_toolchain):
         from fw_context_mcp.indexer.asm import store_units
         from fw_context_mcp.indexer.db import transaction
 
-        unit = _unit(tmp_path, "s.S", ".global Entry\nEntry:\n  nop\nLoop:\n  b Loop\n")
+        unit = _unit(tmp_path, "s.S", ".global Entry\nEntry:\n  nop\nLoop:\n  b Loop\n", toolchain=arm_toolchain)
         conn = TestStoreUnits._db(tmp_path)
         try:
             with transaction(conn):
@@ -2666,10 +2734,8 @@ class TestLabelParent:
 class TestCallEdges:
     """The call edges of instructions, stored by the assembly pass."""
 
-    _ARM = ["--target=arm-none-eabi"]
-
     @staticmethod
-    def _store(tmp_path: Path, text: str, c_functions: list[str] = ()):
+    def _store(tmp_path: Path, text: str, c_functions: list[str] = (), *, arm_toolchain):
         from fw_context_mcp.indexer.asm import store_units
         from fw_context_mcp.indexer.db import insert_symbols_batch, transaction, upsert_file
 
@@ -2683,7 +2749,7 @@ class TestCallEdges:
                     for n in c_functions
                 ])
             result = store_units(
-                conn, "ch", [_unit(tmp_path, "s.S", text, TestCallEdges._ARM)], tmp_path,
+                conn, "ch", [_unit(tmp_path, "s.S", text, toolchain=arm_toolchain)], tmp_path,
             )
         return conn, result
 
@@ -2696,14 +2762,14 @@ class TestCallEdges:
             )
         }
 
-    def test_a_call_reaches_the_c_function(self, tmp_path: Path):
+    def test_a_call_reaches_the_c_function(self, tmp_path: Path, arm_toolchain):
         from fw_context_mcp.indexer.models import RefOrigin
 
         conn, result = self._store(
             tmp_path,
             "  .syntax unified\n  .thumb\n  .text\n  .global Reset_Handler\n"
             "Reset_Handler:\n  bl SystemInit\n  b .\n",
-            ["SystemInit"],
+            ["SystemInit"], arm_toolchain=arm_toolchain
         )
         try:
             rows = self._rows(conn)
@@ -2713,10 +2779,10 @@ class TestCallEdges:
         assert rows == {("asm:s.S@Reset_Handler", "c:@F@SystemInit", int(RefOrigin.ASM))}
         assert result.calls == 1
 
-    def test_a_target_that_nothing_defines_gets_a_placeholder(self, tmp_path: Path):
+    def test_a_target_that_nothing_defines_gets_a_placeholder(self, tmp_path: Path, arm_toolchain):
         conn, _ = self._store(
             tmp_path,
-            "  .syntax unified\n  .thumb\n  .text\n  .global f\nf:\n  bl __libc_init_array\n  b .\n",
+            "  .syntax unified\n  .thumb\n  .text\n  .global f\nf:\n  bl __libc_init_array\n  b .\n", arm_toolchain=arm_toolchain
         )
         try:
             rows = self._rows(conn)
@@ -2725,11 +2791,11 @@ class TestCallEdges:
 
         assert rows == {("asm:s.S@f", "asm:@__libc_init_array", 4)}
 
-    def test_a_fall_into_another_routine_is_an_edge(self, tmp_path: Path):
+    def test_a_fall_into_another_routine_is_an_edge(self, tmp_path: Path, arm_toolchain):
         conn, _ = self._store(
             tmp_path,
             "  .syntax unified\n  .thumb\n  .text\n  .global a\na:\n  nop\n"
-            "  .global b\nb:\n  bx lr\n",
+            "  .global b\nb:\n  bx lr\n", arm_toolchain=arm_toolchain
         )
         try:
             rows = self._rows(conn)
@@ -2738,13 +2804,13 @@ class TestCallEdges:
 
         assert rows == {("asm:s.S@a", "asm:s.S@b", 4)}
 
-    def test_a_fall_reaches_the_weak_label_of_the_unit(self, tmp_path: Path):
+    def test_a_fall_reaches_the_weak_label_of_the_unit(self, tmp_path: Path, arm_toolchain):
         """The linker gives a call of `b` to the strong C definition, not a fall."""
         conn, _ = self._store(
             tmp_path,
             "  .syntax unified\n  .thumb\n  .text\n  .global a\na:\n  nop\n"
             "  .weak b\nb:\n  bx lr\n",
-            ["b"],
+            ["b"], arm_toolchain=arm_toolchain
         )
         try:
             rows = self._rows(conn)
@@ -2753,7 +2819,7 @@ class TestCallEdges:
 
         assert rows == {("asm:s.S@a", "asm:s.S@b", 4)}
 
-    def test_a_new_run_removes_a_call_that_is_gone(self, tmp_path: Path):
+    def test_a_new_run_removes_a_call_that_is_gone(self, tmp_path: Path, arm_toolchain):
         """The pass writes its edges again on each run; C edges stay."""
         from fw_context_mcp.indexer.asm import store_units
         from fw_context_mcp.indexer.db import insert_refs_batch, transaction
@@ -2761,7 +2827,7 @@ class TestCallEdges:
         conn, _ = self._store(
             tmp_path,
             "  .syntax unified\n  .thumb\n  .text\n  .global f\nf:\n  bl SystemInit\n  b .\n",
-            ["SystemInit"],
+            ["SystemInit"], arm_toolchain=arm_toolchain
         )
         try:
             with transaction(conn):
@@ -2773,7 +2839,7 @@ class TestCallEdges:
             )
             with transaction(conn):
                 store_units(conn, "ch", [_unit(tmp_path, "s.S", (tmp_path / "s.S").read_text(),
-                                               self._ARM)], tmp_path)
+                                               toolchain=arm_toolchain)], tmp_path)
             rows = self._rows(conn)
         finally:
             conn.close()

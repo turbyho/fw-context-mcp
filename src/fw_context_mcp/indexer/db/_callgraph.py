@@ -1262,20 +1262,26 @@ def _user_irq_offset(conn: sqlite3.Connection, config_hash: str) -> int | None:
     None means no answer, and a caller reports no run-time slot at all.
     Adding an assumed 16 would place a handler in a slot no build
     confirmed.
+
+    The value is the one definition that each unit of the build has at
+    its end (``macros.agreed_value``).  WHY not the text of a ``#define``
+    row or the first row: two headers can define the name, and a unit can
+    define it again; the first of eight rows decided before, and the text
+    of a row is not the definition that the units compile with.
     """
+    from ..macros import agreed_value
+
     rows = conn.execute(
-        """SELECT expanded_value, value FROM macros
-           WHERE config_hash = ? AND name = 'NVIC_USER_IRQ_OFFSET'
-           LIMIT 8""",
+        "SELECT * FROM macros WHERE config_hash = ? AND name = 'NVIC_USER_IRQ_OFFSET'",
         (config_hash,),
     ).fetchall()
-    for row in rows:
-        for text in (row["expanded_value"], row["value"]):
-            try:
-                return int(str(text).strip(), 0)
-            except (TypeError, ValueError):
-                continue
-    return None
+    value = agreed_value(rows)
+    if value is None:
+        return None
+    try:
+        return int(value.strip(), 0)
+    except ValueError:
+        return None
 
 
 def _runtime_registrations(

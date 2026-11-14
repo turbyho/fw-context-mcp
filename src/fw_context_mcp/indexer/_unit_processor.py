@@ -512,13 +512,12 @@ def _handle_unchanged(
     Returns:
         dict with keys:
         - ``file_id`` (int | None): File record ID for use in Phase 2.
-        - ``headers`` (dict | None): Collected headers for manifest update.
+        - ``headers`` (list | None): Collected headers of this listing for
+          the manifest update.
         - ``status`` (str): ``"unchanged"``.
         - ``content_filled`` (int): 1 if ifdef content was filled, 0 otherwise.
     """
     file_path_str = _normalize_file_path(str(unit.file.resolve()), project_root)
-    # The key of the manifest entry is the key of files.path.
-    tu_key = file_path_str
 
     # An unchanged TU has nothing to contribute to the manifest: its stored
     # entry is still accurate, and decide_units found it, with real
@@ -556,7 +555,7 @@ def _handle_unchanged(
                 )
                 content_filled = fc
                 if hdrs:
-                    headers = {tu_key: hdrs}
+                    headers = hdrs
 
     return {
         "file_id": file_id,

@@ -10,11 +10,15 @@ assembler.
 
 ## The oracle
 
-Every file is assembled by `arm-none-eabi-as` and its symbol table read
-with `arm-none-eabi-nm`.  **What the assembler puts in the symbol table
-is the truth**; a hand-written expectation list can only claim.  The
-tests in `tests/test_asm_corpus.py` compare the reader against that
-truth, and skip when no ARM assembler is installed.
+Every file is assembled by the ARM toolchain of the test SDKs
+(`arm-zephyr`, `tests/sdk/versions.toml`) and its symbol table read with
+its `nm`.  **What the assembler puts in the symbol table is the truth**;
+a hand-written expectation list can only claim.  The tests in
+`tests/test_asm_corpus.py` compare the reader against that truth.  The
+pre-test of the session stops the run when the test SDKs are not
+installed (`python -m tests.sdk.provision`).  To write `expected.toml`
+again after a change of the corpus:
+`python -m tests.fixtures.asm.regenerate`.
 
 This catches the one risk a hand-written corpus really has: inventing
 syntax that no assembler accepts, then "passing" tests against it.

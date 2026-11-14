@@ -22,7 +22,6 @@ took then, and a join with it cannot remove a line.
 
 from __future__ import annotations
 
-import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -32,17 +31,16 @@ from fw_context_mcp.indexer import asm
 from fw_context_mcp.indexer.asm import store_units
 from fw_context_mcp.indexer.db import open_db, transaction, upsert_build_config, upsert_project
 from fw_context_mcp.indexer.runner import _files_read_by_c_units
-
-pytestmark = pytest.mark.skipif(shutil.which("clang") is None, reason="the preprocessor is clang")
+from tests._toolchains import Toolchain, unit_of, write_sources
 
 CH = "ch"
 
 
-def _unit(tmp_path: Path, name: str, text: str | None = None, args: list[str] | None = None):
-    src = tmp_path / name
+def _unit(tmp_path: Path, name: str, text: str | None = None, args: list[str] | None = None, *, toolchain: Toolchain):
+    """The unit of *name* of the ARM toolchain of the test SDKs; *text* None keeps the file on the disk."""
     if text is not None:
-        src.write_text(text, encoding="utf-8")
-    return SimpleNamespace(file=src, directory=tmp_path, clang_args=args or [])
+        write_sources(tmp_path, {name: text})
+    return unit_of(tmp_path / name, toolchain, args or [])
 
 
 @pytest.fixture
@@ -74,10 +72,10 @@ def _store_c_text(conn, path: str, content: str) -> None:
         )
 
 
-def test_a_directive_stays_in_the_text_of_the_unit_and_of_its_header(conn, tmp_path: Path):
+def test_a_directive_stays_in_the_text_of_the_unit_and_of_its_header(conn, tmp_path: Path, arm_toolchain):
     """A directive compiles: it is part of the answer, as on the C path."""
     (tmp_path / "defs.h").write_text("/* offsets */\n#define TCB_SP 56\n", encoding="utf-8")
-    unit = _unit(tmp_path, "t.S", '#include "defs.h"\n#define TWICE(x) x, x\n  .long TWICE(TCB_SP)\n')
+    unit = _unit(tmp_path, "t.S", '#include "defs.h"\n#define TWICE(x) x, x\n  .long TWICE(TCB_SP)\n', toolchain=arm_toolchain)
 
     _store(conn, tmp_path, unit)
 
@@ -85,32 +83,32 @@ def test_a_directive_stays_in_the_text_of_the_unit_and_of_its_header(conn, tmp_p
     assert _lines(conn, "defs.h")[:2] == ["/* offsets */", "#define TCB_SP 56"]
 
 
-def test_a_short_skipped_branch_is_blank(conn, tmp_path: Path):
+def test_a_short_skipped_branch_is_blank(conn, tmp_path: Path, arm_toolchain):
     """cpp emits blank lines for a short skipped block, not a linemarker.
 
     The -E path took those blank lines for emitted lines and stored the
     text of the skipped block as live code.
     """
-    unit = _unit(tmp_path, "t.S", "  .long Taken\n#if 0\n  .long NeverTaken\n#endif\n  .long After\n")
+    unit = _unit(tmp_path, "t.S", "  .long Taken\n#if 0\n  .long NeverTaken\n#endif\n  .long After\n", toolchain=arm_toolchain)
 
     _store(conn, tmp_path, unit)
 
     assert _lines(conn, "t.S")[:5] == ["  .long Taken", "", "", "", "  .long After"]
 
 
-def test_a_header_that_c_reads_keeps_the_text_of_the_c_path(conn, tmp_path: Path):
+def test_a_header_that_c_reads_keeps_the_text_of_the_c_path(conn, tmp_path: Path, arm_toolchain):
     header = tmp_path / "shared.h"
     header.write_text("#ifndef __ASSEMBLER__\nint c_side;\n#else\n.equ ASM_SIDE, 1\n#endif\n", encoding="utf-8")
     c_view = "#ifndef __ASSEMBLER__\nint c_side;\n\n\n\n"
     _store_c_text(conn, "shared.h", c_view)
-    unit = _unit(tmp_path, "t.S", '#include "shared.h"\n')
+    unit = _unit(tmp_path, "t.S", '#include "shared.h"\n', toolchain=arm_toolchain)
 
     _store(conn, tmp_path, unit, c_read=frozenset({header.resolve()}))
 
     assert "\n".join(_lines(conn, "shared.h")) == c_view
 
 
-def test_a_header_that_c_reads_gets_no_text_from_this_pass_even_when_c_left_it_empty(conn, tmp_path: Path):
+def test_a_header_that_c_reads_gets_no_text_from_this_pass_even_when_c_left_it_empty(conn, tmp_path: Path, arm_toolchain):
     """C keeps a header empty when it compiled no line of it.
 
     A rule "write when the row is empty" filled such a header with the
@@ -120,7 +118,7 @@ def test_a_header_that_c_reads_gets_no_text_from_this_pass_even_when_c_left_it_e
     header = tmp_path / "shared.h"
     header.write_text("#ifdef __ASSEMBLER__\n.equ X, 1\n#endif\n", encoding="utf-8")
     _store_c_text(conn, "shared.h", "")
-    unit = _unit(tmp_path, "t.S", '#include "shared.h"\n')
+    unit = _unit(tmp_path, "t.S", '#include "shared.h"\n', toolchain=arm_toolchain)
 
     result = _store(conn, tmp_path, unit, c_read=frozenset({header.resolve()}))
 
@@ -128,19 +126,19 @@ def test_a_header_that_c_reads_gets_no_text_from_this_pass_even_when_c_left_it_e
     assert "shared.h" in result.paths, "the row must stay covered"
 
 
-def test_a_header_that_only_assembly_reads_takes_the_view_of_this_run(conn, tmp_path: Path):
+def test_a_header_that_only_assembly_reads_takes_the_view_of_this_run(conn, tmp_path: Path, arm_toolchain):
     """A stored text of an earlier run must not add its lines."""
     header = tmp_path / "only_asm.h"
     header.write_text("#if 0\nold_live_line\n#endif\n", encoding="utf-8")
     _store_c_text(conn, "only_asm.h", "\nold_live_line\n\n")
-    unit = _unit(tmp_path, "t.S", '#include "only_asm.h"\n')
+    unit = _unit(tmp_path, "t.S", '#include "only_asm.h"\n', toolchain=arm_toolchain)
 
     _store(conn, tmp_path, unit)
 
     assert _lines(conn, "only_asm.h")[:3] == ["", "", ""]
 
 
-def test_a_branch_that_the_build_stops_to_take_goes_blank_in_the_next_run(conn, tmp_path: Path):
+def test_a_branch_that_the_build_stops_to_take_goes_blank_in_the_next_run(conn, tmp_path: Path, arm_toolchain):
     """The same text, other flags: the view of the earlier run must go.
 
     One config hash can cover this: a Kconfig change reaches the unit
@@ -148,55 +146,55 @@ def test_a_branch_that_the_build_stops_to_take_goes_blank_in_the_next_run(conn, 
     flags carry.
     """
     unit_text = "#ifdef CONFIG_FPU\n  .long FpuOnly\n#endif\n"
-    with_fpu = _unit(tmp_path, "t.S", unit_text, args=["-DCONFIG_FPU"])
+    with_fpu = _unit(tmp_path, "t.S", unit_text, args=["-DCONFIG_FPU"], toolchain=arm_toolchain)
     _store(conn, tmp_path, with_fpu)
     assert _lines(conn, "t.S")[1] == "  .long FpuOnly"
 
-    _store(conn, tmp_path, _unit(tmp_path, "t.S", args=[]))
+    _store(conn, tmp_path, _unit(tmp_path, "t.S", args=[], toolchain=arm_toolchain))
 
     assert _lines(conn, "t.S")[:3] == ["", "", ""]
 
 
-def test_an_edit_of_the_unit_between_two_runs_gives_the_view_of_the_new_text(conn, tmp_path: Path):
+def test_an_edit_of_the_unit_between_two_runs_gives_the_view_of_the_new_text(conn, tmp_path: Path, arm_toolchain):
     """The pass writes the hash of the file when it stores a symbol of it.
 
     A join guarded by that hash took the old text for the new one and kept
     the old live lines.
     """
-    _store(conn, tmp_path, _unit(tmp_path, "t.S", "  nop\n  nop\n  nop\n"))
+    _store(conn, tmp_path, _unit(tmp_path, "t.S", "  nop\n  nop\n  nop\n", toolchain=arm_toolchain))
 
-    _store(conn, tmp_path, _unit(tmp_path, "t.S", "#if 0\n  .long NeverTaken\n#endif\n"))
+    _store(conn, tmp_path, _unit(tmp_path, "t.S", "#if 0\n  .long NeverTaken\n#endif\n", toolchain=arm_toolchain))
 
     assert _lines(conn, "t.S")[:3] == ["", "", ""]
 
 
-def test_two_units_that_read_one_header_join_their_live_lines(conn, tmp_path: Path):
+def test_two_units_that_read_one_header_join_their_live_lines(conn, tmp_path: Path, arm_toolchain):
     """A line is live when one assembly unit of the run compiled it."""
     (tmp_path / "both.h").write_text("#ifdef SIDE_A\n.equ A, 1\n#else\n.equ B, 2\n#endif\n", encoding="utf-8")
-    first = _unit(tmp_path, "a.S", '#include "both.h"\n', args=["-DSIDE_A"])
-    second = _unit(tmp_path, "b.S", '#include "both.h"\n')
+    first = _unit(tmp_path, "a.S", '#include "both.h"\n', args=["-DSIDE_A"], toolchain=arm_toolchain)
+    second = _unit(tmp_path, "b.S", '#include "both.h"\n', toolchain=arm_toolchain)
 
     _store(conn, tmp_path, first, second)
 
     assert _lines(conn, "both.h")[:5] == ["#ifdef SIDE_A", ".equ A, 1", "", ".equ B, 2", "#endif"]
 
 
-def test_a_unit_that_libclang_cannot_load_keeps_its_files_covered(conn, tmp_path: Path, monkeypatch):
+def test_a_unit_that_libclang_cannot_load_keeps_its_files_covered(conn, tmp_path: Path, monkeypatch, arm_toolchain):
     """The coverage purge deletes each row that no unit covers.
 
     The symbols of the unit are stored, thus its files must stay covered.
     """
     monkeypatch.setattr(asm, "read_unit_texts", lambda unit: None)
-    unit = _unit(tmp_path, "t.S", "  .global Foo\nFoo:\n  b .\n")
+    unit = _unit(tmp_path, "t.S", "  .global Foo\nFoo:\n  b .\n", toolchain=arm_toolchain)
 
     result = _store(conn, tmp_path, unit)
 
     assert "t.S" in result.paths
 
 
-def test_a_second_run_gives_the_same_text(conn, tmp_path: Path):
+def test_a_second_run_gives_the_same_text(conn, tmp_path: Path, arm_toolchain):
     """The pass runs on each index run, thus its result must be stable."""
-    unit = _unit(tmp_path, "t.S", "  .long A\n#if 0\n  .long B\n#endif\n")
+    unit = _unit(tmp_path, "t.S", "  .long A\n#if 0\n  .long B\n#endif\n", toolchain=arm_toolchain)
 
     _store(conn, tmp_path, unit)
     first = _lines(conn, "t.S")

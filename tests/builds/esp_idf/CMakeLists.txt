@@ -1,10 +1,8 @@
-# ESP-IDF hello-world test project for fw-context indexing tests.
-#
-# Build: idf.py set-target esp32 && idf.py build
-# Requires: ESP-IDF installed and IDF_PATH set
-#
-# This is a DETECTION-ONLY fixture — idf.py is not installed on this system.
+# ESP-IDF project of the extended set of the test SDKs (tests/sdk/versions.toml,
+# marker extra_platforms): ESP32 with the version of ESP-IDF that
+# versions.toml pins.  `python -m tests.sdk.provision --extra` installs it.
+# idf.py builds the application and its bootloader.
 
-cmake_minimum_required(VERSION 3.16.0)
+cmake_minimum_required(VERSION 3.22)
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(fwctx_test_esp_idf)

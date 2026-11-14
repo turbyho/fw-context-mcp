@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from tests._toolchains import unit_of
 from tests._usr_keys import base_names
 
 SOURCE = """\
@@ -27,13 +28,12 @@ static cb_t chosen[] = { use_a ? dev_a : dev_b };
 
 
 @pytest.fixture(scope="module")
-def extracted(tmp_path_factory):
-    from fw_context_mcp.indexer.compile_commands import CompilationUnit
+def extracted(tmp_path_factory, toolchain):
     from fw_context_mcp.indexer.symbols import extract_all
 
     src: Path = tmp_path_factory.mktemp("valuefield") / "v.cpp"
     src.write_text(SOURCE, encoding="utf-8")
-    unit = CompilationUnit(file=src, directory=src.parent, language="cpp", clang_args=["-std=c++20"])
+    unit = unit_of(src, toolchain, ["-std=c++20"], directory=src.parent, language="cpp")
     return base_names(extract_all(unit, with_refs=True), src)
 
 

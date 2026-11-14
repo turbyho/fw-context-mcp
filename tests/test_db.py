@@ -37,6 +37,7 @@ from fw_context_mcp.indexer.db import (
     upsert_file,
     upsert_project,
 )
+from tests._toolchains import unit_of
 from tests._usr_keys import base_names
 
 
@@ -1771,9 +1772,8 @@ class TestFilesIsProject:
     """Tests for automatic files.is_project setting via store_symbols_for_unit."""
 
     @pytest.mark.libclang
-    def test_files_is_project_set_during_indexing(self, tmp_path):
+    def test_files_is_project_set_during_indexing(self, tmp_path, toolchain):
         """store_symbols_for_unit sets files.is_project based on vendor_patterns."""
-        from fw_context_mcp.indexer.compile_commands import CompilationUnit
         from fw_context_mcp.indexer.db import open_db, upsert_build_config, upsert_project
         from fw_context_mcp.indexer.ops import store_symbols_for_unit
         from fw_context_mcp.indexer.symbols import ExtractionResult, extract_all
@@ -1800,12 +1800,7 @@ class TestFilesIsProject:
         project_patterns: list[str] = []
 
         # Index project file
-        unit_proj = CompilationUnit(
-            file=proj_file,
-            directory=src,
-            language="cpp",
-            clang_args=["-std=c++17"],
-        )
+        unit_proj = unit_of(proj_file, toolchain, ["-std=c++17"], directory=src, language="cpp")
         r = extract_all(unit_proj, with_refs=False)
         syms, refs, inheritance, macros = r.symbols, r.references, r.inheritance, r.macros
         conn.execute("DELETE FROM symbols WHERE config_hash = ?", (config_hash,))
@@ -1828,12 +1823,7 @@ class TestFilesIsProject:
         assert proj_fid_row[1] == 1, f"Expected is_project=1, got {proj_fid_row[1]}"
 
         # Index vendor file
-        unit_vendor = CompilationUnit(
-            file=vendor_file,
-            directory=vendor,
-            language="cpp",
-            clang_args=["-std=c++17"],
-        )
+        unit_vendor = unit_of(vendor_file, toolchain, ["-std=c++17"], directory=vendor, language="cpp")
         r = extract_all(unit_vendor, with_refs=False)
         syms_v, refs_v, inh_v, mac_v = r.symbols, r.references, r.inheritance, r.macros
         store_symbols_for_unit(
@@ -1859,9 +1849,8 @@ class TestFilesIsProject:
         conn.close()
 
     @pytest.mark.libclang
-    def test_project_patterns_override_vendor(self, tmp_path):
+    def test_project_patterns_override_vendor(self, tmp_path, toolchain):
         """project_patterns take priority over vendor_patterns in is_project calc."""
-        from fw_context_mcp.indexer.compile_commands import CompilationUnit
         from fw_context_mcp.indexer.db import open_db, upsert_build_config, upsert_project
         from fw_context_mcp.indexer.ops import store_symbols_for_unit
         from fw_context_mcp.indexer.symbols import ExtractionResult, extract_all
@@ -1881,12 +1870,7 @@ class TestFilesIsProject:
         vendor_patterns = ["lib/%"]
         project_patterns = ["lib/muj_modul/%"]
 
-        unit = CompilationUnit(
-            file=proj_file,
-            directory=src,
-            language="cpp",
-            clang_args=["-std=c++17"],
-        )
+        unit = unit_of(proj_file, toolchain, ["-std=c++17"], directory=src, language="cpp")
         r = extract_all(unit, with_refs=False)
         syms, refs, inheritance, macros = r.symbols, r.references, r.inheritance, r.macros
         store_symbols_for_unit(
@@ -1920,19 +1904,18 @@ class TestIndirectCallSitesArraySubscript:
     """
 
     @staticmethod
-    def _sites(tmp_path, name: str, code: str):
-        from fw_context_mcp.indexer.compile_commands import CompilationUnit
+    def _sites(tmp_path, name: str, code: str, toolchain):
         from fw_context_mcp.indexer.symbols import extract_all
 
         src = tmp_path / "src"
         src.mkdir()
         source = src / name
         source.write_text(code, encoding="utf-8")
-        unit = CompilationUnit(file=source, directory=src, language="c", clang_args=["-std=c11"])
+        unit = unit_of(source, toolchain, ["-std=c11"], directory=src, language="c")
         return base_names(extract_all(unit, with_refs=True).slots.sites, source)
 
     @pytest.mark.libclang
-    def test_extract_all_detects_array_subscript_call(self, tmp_path):
+    def test_extract_all_detects_array_subscript_call(self, tmp_path, toolchain):
         """``handlers[irq](irq)`` is a site of the slot of ``handlers``."""
         sites = self._sites(tmp_path, "interrupt.c", """\
 typedef void (*isr_handler_t)(int irq);
@@ -1944,13 +1927,13 @@ void interrupt_dispatch(int irq) {
         handlers[irq](irq);
     }
 }
-""")
+""", toolchain=toolchain)
         assert [(s.line, s.caller, s.kind, s.slot) for s in sites] == [
             (7, "c:@F@interrupt_dispatch", "pointer", "V|c:interrupt.c@handlers"),
         ]
 
     @pytest.mark.libclang
-    def test_extract_all_detects_struct_array_subscript_call(self, tmp_path):
+    def test_extract_all_detects_struct_array_subscript_call(self, tmp_path, toolchain):
         """``d->callbacks[idx](args)`` is a site of the field ``callbacks``."""
         sites = self._sites(tmp_path, "dispatcher.c", """\
 typedef void (*event_handler_t)(int event_id);
@@ -1964,13 +1947,13 @@ void dispatch_event(struct Dispatcher* d, int event_id) {
         d->callbacks[event_id](event_id);
     }
 }
-""")
+""", toolchain=toolchain)
         assert [(s.line, s.caller, s.slot) for s in sites] == [
             (9, "c:@F@dispatch_event", "F|c:@S@Dispatcher~dispatcher.c:3:8@FI@callbacks"),
         ]
 
     @pytest.mark.libclang
-    def test_no_false_positive_on_regular_function_call(self, tmp_path):
+    def test_no_false_positive_on_regular_function_call(self, tmp_path, toolchain):
         """Regular function calls give no indirect call site."""
         sites = self._sites(tmp_path, "regular.c", """\
 void regular_func(int x) {
@@ -1980,11 +1963,11 @@ void regular_func(int x) {
 void caller(void) {
     regular_func(42);
 }
-""")
+""", toolchain=toolchain)
         assert sites == []
 
     @pytest.mark.libclang
-    def test_extract_all_detects_member_call_still_works(self, tmp_path):
+    def test_extract_all_detects_member_call_still_works(self, tmp_path, toolchain):
         """``driver->onData(args)`` (member access) is a site of the field."""
         sites = self._sites(tmp_path, "driver.c", """\
 typedef void (*data_handler_t)(const char* data, int len);
@@ -1998,7 +1981,7 @@ void process_data(struct Driver* driver, const char* data, int len) {
         driver->onData(data, len);
     }
 }
-""")
+""", toolchain=toolchain)
         assert [s.slot for s in sites] == ["F|c:@S@Driver~driver.c:3:8@FI@onData"]
 
 
@@ -2013,8 +1996,7 @@ class TestHeaderInlineCallableFnStack:
     """
 
     @pytest.mark.libclang
-    def test_inline_header_destructor_does_not_leak_from_usr(self, tmp_path):
-        from fw_context_mcp.indexer.compile_commands import CompilationUnit
+    def test_inline_header_destructor_does_not_leak_from_usr(self, tmp_path, toolchain):
         from fw_context_mcp.indexer.symbols import extract_all
 
         src = tmp_path / "src"
@@ -2041,12 +2023,7 @@ int Store::get() {
 }
 """, encoding="utf-8")
 
-        unit = CompilationUnit(
-            file=src / "store.cpp",
-            directory=src,
-            language="cpp",
-            clang_args=["-std=c++11"],
-        )
+        unit = unit_of(src / "store.cpp", toolchain, ["-std=c++11"], directory=src, language="cpp")
         r = extract_all(unit, with_refs=True)
         refs = r.references
 
@@ -2084,8 +2061,7 @@ class TestFnPtrTypeConsistency:
     """
 
     @pytest.mark.libclang
-    def test_init_list_type_matches_the_site(self, tmp_path):
-        from fw_context_mcp.indexer.compile_commands import CompilationUnit
+    def test_init_list_type_matches_the_site(self, tmp_path, toolchain):
         from fw_context_mcp.indexer.symbols import extract_all
 
         src = tmp_path / "src"
@@ -2122,7 +2098,7 @@ void init(void) {
 }
 """, encoding="utf-8")
 
-        unit = CompilationUnit(file=init_c, directory=src, language="c", clang_args=["-std=c11"])
+        unit = unit_of(init_c, toolchain, ["-std=c11"], directory=src, language="c")
         slots = base_names(extract_all(unit, with_refs=True).slots, init_c)
 
         assert [(s.function, s.slot, s.function_type) for s in slots.sources] == [

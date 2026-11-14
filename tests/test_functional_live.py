@@ -33,8 +33,14 @@ registry the same way.
 
 They are marked ``live`` and excluded from ``make test`` and
 ``make test-all``, because they depend on what one machine happens to
-hold.  Run them with ``make test-live``.  With no indexed project they
-skip, thus a checkout without one is not a failure.
+hold.  Run them with ``make test-live``.
+
+A test walks every indexed project, and every completed build of each one.
+A project or a build that holds nothing the test can check (no dead code,
+no reference) is passed by, and the test fails when NO index of the
+machine holds it: the run then verified nothing, and a skip would look
+like a pass.  For the same reason a machine with no indexed project, and
+a project with no completed build, fail.
 """
 
 from __future__ import annotations
@@ -42,6 +48,7 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 
@@ -120,12 +127,7 @@ def _live_projects() -> list[Path]:
 
 LIVE_PROJECTS = _live_projects()
 
-pytestmark = [
-    pytest.mark.live,
-    pytest.mark.skipif(
-        not LIVE_PROJECTS, reason="no indexed project on this machine"
-    ),
-]
+pytestmark = pytest.mark.live
 
 
 def _notice(rows: list[dict]) -> dict | None:
@@ -167,38 +169,89 @@ def _walk(call, key_fields: tuple[str, ...], page: int = 7):
     return seen, total
 
 
-@pytest.fixture(params=LIVE_PROJECTS, ids=lambda p: p.name)
-def project(request) -> Path:
-    return request.param
+class Build(NamedTuple):
+    """One completed build of a live project, with the arguments that select it in a tool."""
+
+    project: Path
+    config_hash: str
+    #: ``variant`` and ``image`` for a project of several builds, else empty:
+    #: a query names one build exactly when a project holds more than one.
+    selector: dict[str, str]
+
+    @property
+    def label(self) -> str:
+        build = "/".join(v for v in self.selector.values() if v)
+        return f"{self.project.name}{f' [{build}]' if build else ''}"
 
 
-@pytest.fixture
-def index(project: Path):
-    """A read-only connection to the index, and its newest completed build."""
+def _builds() -> list[Build]:
+    """Every completed build of every live project; fail when the machine holds none.
+
+    The newest row of each (variant, image): a config change leaves the
+    row of the older config of the same build.  A project with no
+    completed build fails: its index run never finished, and the tests
+    would verify nothing of it.
+    """
     from fw_context_mcp.config import derive_project_id
     from fw_context_mcp.mcp.shared.context import _db_path
 
-    conn = sqlite3.connect(f"file:{_db_path(project)}?mode=ro", uri=True)
+    if not LIVE_PROJECTS:
+        pytest.fail("no indexed project on this machine: index a project, then run make test-live")
+    builds: list[Build] = []
+    for project in LIVE_PROJECTS:
+        conn = sqlite3.connect(f"file:{_db_path(project)}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                """SELECT variant, image, config_hash FROM build_configs b
+                   WHERE project_id = ? AND manifest_verification != 'indexing'
+                     AND created_at = (SELECT MAX(created_at) FROM build_configs o
+                                       WHERE o.project_id = b.project_id
+                                         AND o.variant = b.variant AND o.image = b.image
+                                         AND o.manifest_verification != 'indexing')
+                   ORDER BY variant, image""",
+                (derive_project_id(project),),
+            ).fetchall()
+        finally:
+            conn.close()
+        if not rows:
+            pytest.fail(f"{project}: the index holds no completed build; run fw-context index there")
+        several = len(rows) > 1
+        builds += [
+            Build(project, row["config_hash"],
+                  {"variant": row["variant"], "image": row["image"]} if several else {})
+            for row in rows
+        ]
+    return builds
+
+
+def _open(build: Build) -> sqlite3.Connection:
+    """A read-only connection to the index of *build*."""
+    from fw_context_mcp.mcp.shared.context import _db_path
+
+    conn = sqlite3.connect(f"file:{_db_path(build.project)}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
-    row = conn.execute(
-        """SELECT config_hash FROM build_configs
-           WHERE project_id = ? AND (manifest_verification IS NULL
-              OR manifest_verification != 'indexing')
-           ORDER BY created_at DESC LIMIT 1""",
-        (derive_project_id(project),),
-    ).fetchone()
-    if row is None:
-        conn.close()
-        pytest.skip("the project has no completed build")
-    yield conn, row["config_hash"]
-    conn.close()
+    return conn
 
 
-def _hottest(project: Path) -> dict | None:
-    """The most-called function, which gives the longest walk to test."""
+def _no_error(build: Build, tool_name: str, rows: list[dict]) -> list[dict]:
+    """Return *rows*; fail when the tool answered with an error.
+
+    WHY: an error row has no answer row, and a test read it as a build
+    with nothing to check.  Measured: an index of an older version answered
+    ``schema_mismatch``, and the test passed by it.
+    """
+    error = next((r["error"] for r in rows if "error" in r), None)
+    assert error is None, f"{build.label}: {tool_name} refused the build: {error}"
+    return rows
+
+
+def _hottest(build: Build) -> dict | None:
+    """The most-called function of *build*, which gives the longest walk to test."""
     from fw_context_mcp.mcp.handlers.callgraph import find_hotspots
 
-    rows = find_hotspots(project_root=str(project), limit=1, project_only=False)
+    rows = _no_error(build, "find_hotspots", find_hotspots(
+        project_root=str(build.project), limit=1, project_only=False, **build.selector))
     body = [r for r in rows if "caller_count" in r]
     return body[0] if body else None
 
@@ -212,84 +265,95 @@ class TestTheIndexerNamesOnlyCallables:
     nothing, and so does a member initializer inside a class body.
     """
 
-    def test_no_non_callable_is_recorded_as_a_caller(self, index):
-        conn, config_hash = index
+    def test_no_non_callable_is_recorded_as_a_caller(self):
         placeholders = ", ".join("?" * len(CALLABLE))
-        bad = conn.execute(
-            f"""SELECT s.kind, COUNT(*) AS n
-                FROM refs r JOIN symbols s
-                  ON s.usr = r.from_usr AND s.config_hash = r.config_hash
-                WHERE r.config_hash = ? AND s.kind NOT IN ({placeholders})
-                GROUP BY s.kind ORDER BY n DESC""",
-            (config_hash, *CALLABLE),
-        ).fetchall()
-        assert not bad, (
-            "a non-callable reads as a caller: "
-            + ", ".join(f"{r['kind']}={r['n']}" for r in bad)
-        )
+        faults = []
+        for build in _builds():
+            conn = _open(build)
+            try:
+                bad = conn.execute(
+                    f"""SELECT s.kind, COUNT(*) AS n
+                        FROM refs r JOIN symbols s
+                          ON s.usr = r.from_usr AND s.config_hash = r.config_hash
+                        WHERE r.config_hash = ? AND s.kind NOT IN ({placeholders})
+                        GROUP BY s.kind ORDER BY n DESC""",
+                    (build.config_hash, *CALLABLE),
+                ).fetchall()
+            finally:
+                conn.close()
+            if bad:
+                faults.append(f"{build.label}: " + ", ".join(f"{r['kind']}={r['n']}" for r in bad))
+        assert not faults, "a non-callable reads as a caller: " + "; ".join(faults)
 
 
 class TestAPageBoundIsNotAFact:
     """A limit of zero must not turn into a statement about the codebase."""
 
     @pytest.mark.parametrize("tool_name", ["find_dead_code", "find_hotspots"])
-    def test_a_zero_limit_still_answers_with_a_row(self, project: Path, tool_name):
+    def test_a_zero_limit_still_answers_with_a_row(self, tool_name):
         from fw_context_mcp.mcp.handlers import callgraph
 
         tool = getattr(callgraph, tool_name)
-        answer = tool(project_root=str(project), limit=20)
-        error = next((r["error"] for r in answer if "error" in r), None)
-        if error:
-            # A project with several builds answers with the choice, which
-            # is the contract: one query about code answers for one build.
-            pytest.skip(f"{tool_name} needs a build named: {error[:60]}")
-        full = _notice(answer)
-        if full is None or full["total"] == 0:
-            pytest.skip(f"{tool_name} has nothing to report for this project")
-
-        zero = _notice(tool(project_root=str(project), limit=0))
-        assert zero is not None, f"{tool_name}(limit=0) answered with no page"
-        assert zero["shown"] >= 1, zero
-        assert zero["total"] == full["total"], "the page bound moved the count"
+        checked = 0
+        for build in _builds():
+            answer = _no_error(build, tool_name, tool(project_root=str(build.project), limit=20, **build.selector))
+            full = _notice(answer)
+            if full is None or full["total"] == 0:
+                continue  # this build has nothing to report; another one must
+            zero = _notice(tool(project_root=str(build.project), limit=0, **build.selector))
+            assert zero is not None, f"{build.label}: {tool_name}(limit=0) answered with no page"
+            assert zero["shown"] >= 1, (build.label, zero)
+            assert zero["total"] == full["total"], f"{build.label}: the page bound moved the count"
+            checked += 1
+        assert checked, f"no index of this machine has a row of {tool_name}: the run verified nothing"
 
 
 class TestAWalkStaysInsideOneAnswer:
     """Two pages of one walk never overlap, never skip, never switch."""
 
-    def test_the_busiest_symbol_walks_once_and_whole(self, project: Path):
+    def test_the_busiest_symbol_walks_once_and_whole(self):
         from fw_context_mcp.mcp.handlers.callgraph import find_callers
 
-        hot = _hottest(project)
-        if hot is None:
-            pytest.skip("no reference indexed for this project")
-        name = hot["qualified_name"]
+        checked = 0
+        for build in _builds():
+            hot = _hottest(build)
+            if hot is None:
+                continue  # no reference in this build; another one must have one
+            name = hot["qualified_name"]
+            keys, total = _walk(
+                lambda name=name, build=build, **kw: _no_error(build, "find_callers", find_callers(
+                    name, project_root=str(build.project), **build.selector, **kw)),
+                ("file", "line", "ref_kind", "caller", "target_qualified_name"),
+            )
+            assert len(keys) == len(set(keys)), (
+                f"{build.label} {name}: a row came back twice ({len(keys)} rows, "
+                f"{len(set(keys))} distinct)"
+            )
+            assert total is not None
+            assert len(keys) >= min(total, WALK_CAP), f"{build.label} {name}: walked {len(keys)} of {total}"
+            checked += 1
+        assert checked, "no index of this machine holds a reference: the run verified nothing"
 
-        keys, total = _walk(
-            lambda **kw: find_callers(name, project_root=str(project), **kw),
-            ("file", "line", "ref_kind", "caller", "target_qualified_name"),
-        )
-        assert len(keys) == len(set(keys)), (
-            f"{name}: a row came back twice ({len(keys)} rows, "
-            f"{len(set(keys))} distinct)"
-        )
-        assert total is not None
-        assert len(keys) >= min(total, WALK_CAP), f"walked {len(keys)} of {total}"
-
-    def test_a_page_past_the_end_starts_no_other_answer(self, project: Path):
+    def test_a_page_past_the_end_starts_no_other_answer(self):
         from fw_context_mcp.mcp.handlers.callgraph import find_callers
 
-        hot = _hottest(project)
-        if hot is None:
-            pytest.skip("no reference indexed for this project")
-        name = hot["qualified_name"]
-        first = _notice(find_callers(name, project_root=str(project), limit=5))
-        assert first is not None
+        checked = 0
+        for build in _builds():
+            hot = _hottest(build)
+            if hot is None:
+                continue  # no reference in this build; another one must have one
+            name = hot["qualified_name"]
+            first = _notice(_no_error(build, "find_callers", find_callers(
+                name, project_root=str(build.project), limit=5, **build.selector)))
+            assert first is not None, f"{build.label} {name}: no page notice"
 
-        past = find_callers(
-            name, project_root=str(project), limit=5, offset=first["total"] + 50,
-        )
-        assert _notice(past) is None, f"page past the end paged again: {past[:1]}"
-        assert any("info" in r for r in past), past[:1]
+            past = find_callers(
+                name, project_root=str(build.project), limit=5, offset=first["total"] + 50, **build.selector,
+            )
+            assert _notice(past) is None, f"{build.label}: page past the end paged again: {past[:1]}"
+            assert any("info" in r for r in past), (build.label, past[:1])
+            checked += 1
+        assert checked, "no index of this machine holds a reference: the run verified nothing"
 
 
 class TestVirtualDispatchSaysWhereItsRowsSit:
@@ -302,51 +366,54 @@ class TestVirtualDispatchSaysWhereItsRowsSit:
     facts, because the page notice counts them all.
     """
 
-    def test_a_dispatch_answer_names_what_each_row_is_recorded_against(
-        self, project: Path, index,
-    ):
+    def test_a_dispatch_answer_names_what_each_row_is_recorded_against(self):
         from fw_context_mcp.mcp.handlers.callgraph import find_callers
 
-        conn, config_hash = index
-        # The tool resolves a NAME, thus the whole name must carry no
-        # reference — not only this USR.  An overload shares the qualified
-        # name, and one overload with a call site sends the query down the
-        # direct path, which owes no provenance.  Measured: three projects
-        # failed this test on that alone.
-        #
-        # Several candidates, because most overrides without a reference
-        # have peers without one either.
-        candidates = conn.execute(
-            """SELECT DISTINCT s.qualified_name FROM symbols s
-               JOIN overrides o ON o.derived_usr = s.usr
-                                AND o.config_hash = s.config_hash
-               WHERE s.config_hash = ? AND s.qualified_name != ''
-                 AND s.qualified_name NOT IN (
-                     SELECT s2.qualified_name FROM symbols s2
-                     JOIN refs r ON r.to_usr = s2.usr
-                                AND r.config_hash = s2.config_hash
-                     WHERE s2.config_hash = ?)
-               LIMIT 40""",
-            (config_hash, config_hash),
-        ).fetchall()
-        if not candidates:
-            pytest.skip("no override whose whole name carries no reference")
-
-        for candidate in candidates:
-            name = candidate["qualified_name"]
-            rows = find_callers(name, project_root=str(project), limit=10)
-            body = _answers(rows)
-            if not body:
-                continue  # the peers hold no caller either
-            assert any("warning" in r for r in rows), (
-                f"{name}: peer call sites passed as its own"
-            )
-            assert all("recorded_against" in r for r in body), body[:1]
-            assert all("reaches_this_symbol" in r for r in body), body[:1]
-            assert any(r["recorded_against"] != name for r in body), (
-                f"{name}: a dispatch answer recorded against itself"
-            )
-            return
-        pytest.skip(
-            f"the peers of all {len(candidates)} such overrides hold no caller"
+        checked = 0
+        for build in _builds():
+            conn = _open(build)
+            try:
+                # The tool resolves a NAME, thus the whole name must carry no
+                # reference — not only this USR.  An overload shares the
+                # qualified name, and one overload with a call site sends the
+                # query down the direct path, which owes no provenance.
+                # Measured: three projects failed this test on that alone.
+                #
+                # Several candidates, because most overrides without a
+                # reference have peers without one either.
+                candidates = conn.execute(
+                    """SELECT DISTINCT s.qualified_name FROM symbols s
+                       JOIN overrides o ON o.derived_usr = s.usr
+                                        AND o.config_hash = s.config_hash
+                       WHERE s.config_hash = ? AND s.qualified_name != ''
+                         AND s.qualified_name NOT IN (
+                             SELECT s2.qualified_name FROM symbols s2
+                             JOIN refs r ON r.to_usr = s2.usr
+                                        AND r.config_hash = s2.config_hash
+                             WHERE s2.config_hash = ?)
+                       LIMIT 40""",
+                    (build.config_hash, build.config_hash),
+                ).fetchall()
+            finally:
+                conn.close()
+            for candidate in candidates:
+                name = candidate["qualified_name"]
+                rows = _no_error(build, "find_callers", find_callers(
+                    name, project_root=str(build.project), limit=10, **build.selector))
+                body = _answers(rows)
+                if not body:
+                    continue  # the peers hold no caller either
+                assert any("warning" in r for r in rows), (
+                    f"{build.label} {name}: peer call sites passed as its own"
+                )
+                assert all("recorded_against" in r for r in body), (build.label, body[:1])
+                assert all("reaches_this_symbol" in r for r in body), (build.label, body[:1])
+                assert any(r["recorded_against"] != name for r in body), (
+                    f"{build.label} {name}: a dispatch answer recorded against itself"
+                )
+                checked += 1
+                break
+        assert checked, (
+            "no index of this machine holds an override without a reference whose peers hold a caller: "
+            "the run verified nothing"
         )

@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -68,6 +69,27 @@ class TestIsActiveOther:
         path = tmp_path / "reindex.pause"
         path.write_text("not-a-pid", encoding="utf-8")
         assert PidFile.is_active_other(path) is False
+
+    @pytest.mark.parametrize("content", ["0", "-1", str(2**40), "²"], ids=["zero", "minus-one", "above-range", "superscript"])
+    def test_a_number_that_is_no_pid_is_a_dead_marker(self, tmp_path, monkeypatch, content):
+        """A marker with no PID in 1 .. MAX_PID is garbage: no check of life, and the file goes.
+
+        ``int()`` read "0" and "-1": a check of life sent ``kill(0)`` and
+        ``kill(-1)``, process groups, and on Windows ctypes cut 2**40 to 32
+        bits.  The fake check records each PID that reaches it.
+        """
+        from fw_context_mcp.mcp.shared import pid_file
+
+        checked: list[int] = []
+        monkeypatch.setattr(pid_file, "pid_exists", lambda pid: checked.append(pid) or True)
+        path = tmp_path / "reindex.pause"
+        path.write_text(content, encoding="utf-8")
+        assert PidFile.read_pid(path) is None
+        assert not path.exists()
+        path.write_text(content, encoding="utf-8")
+        assert PidFile.is_active(path) is False
+        assert not path.exists()
+        assert checked == []
 
     def test_unlink_if_ours_leaves_another_process_marker(self, tmp_path, live_other_pid):
         """Ownership check on removal — unchanged behaviour, guarded here."""
@@ -155,3 +177,27 @@ class TestDeadMarkerOnWindows:
 
         assert PidFile.is_active(marker) is False
         assert PidFile.read_pid(marker) is None
+
+
+def test_an_error_of_the_read_keeps_a_live_marker(tmp_path, monkeypatch):
+    """A read that fails (Windows: a different process replaces the marker just now) tells nothing about the content.
+
+    The marker was removed as damaged, and the pause of a different process
+    was gone: the daemon started a background run that the process wanted
+    paused.  Only a damaged content is a reason for a removal.
+    """
+    path = tmp_path / "reindex.pause"
+    path.write_text(str(os.getpid()), encoding="utf-8")
+    real_read_text = Path.read_text
+
+    def sharing_violation(self, *args, **kwargs):
+        if self == path:
+            raise PermissionError(13, "The process cannot access the file")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", sharing_violation)
+    assert PidFile.read_pid(path) is None
+    assert PidFile.is_active(path) is False
+    monkeypatch.undo()
+    assert path.exists(), "the live marker was removed"
+    assert PidFile.read_pid(path) == os.getpid()

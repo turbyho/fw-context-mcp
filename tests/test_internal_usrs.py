@@ -10,15 +10,14 @@ symbol with the same name at the same place (``indexer/_internal_usrs.py``).
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from pathlib import Path
 
 import pytest
 
 from tests._toml import toml_string
+from tests._toolchains import Toolchain, write_compile_commands, write_sources
 
-pytest.importorskip("clang.cindex", reason="libclang not available")
 pytestmark = pytest.mark.libclang
 
 HEADER = """\
@@ -70,19 +69,18 @@ ORDERS = {
 }
 
 
-def _write(root: Path, units: dict[str, str], headers: dict[str, str] | None = None) -> None:
+def _write(root: Path, toolchain: Toolchain, units: dict[str, str], headers: dict[str, str] | None = None) -> None:
     (root / ".fw-context").mkdir(parents=True, exist_ok=True)
     db_dir = root.parent / "db"
     (root / ".fw-context" / "config.toml").write_text(
         f'[project]\nid = "proj-internal"\n\n[build]\n\n[index]\ndb_dir = {toml_string(db_dir)}\n', encoding="utf-8",
     )
-    for file, text in {"hdr.h": HEADER, "tpl.hpp": TEMPLATE, **(headers or {}), **units}.items():
-        (root / file).write_text(text, encoding="utf-8")
-    (root / "compile_commands.json").write_text(json.dumps([
+    write_sources(root, {"hdr.h": HEADER, "tpl.hpp": TEMPLATE, **(headers or {}), **units})
+    write_compile_commands(root / "compile_commands.json", [
         {"directory": str(root), "file": file,
-         "arguments": ["c++", "-std=c++17", "-c", file] if file.endswith(".cpp") else ["cc", "-std=gnu11", "-c", file]}
+         "arguments": toolchain.arguments(file, "-std=c++17" if file.endswith(".cpp") else "-std=gnu11")}
         for file in units
-    ]), encoding="utf-8")
+    ])
 
 
 def _run(root: Path) -> sqlite3.Connection:
@@ -102,10 +100,10 @@ def _run(root: Path) -> sqlite3.Connection:
 
 
 @pytest.fixture(scope="module", params=sorted(ORDERS))
-def index(request, tmp_path_factory) -> tuple[str, sqlite3.Connection]:
+def index(request, tmp_path_factory, toolchain: Toolchain) -> tuple[str, sqlite3.Connection]:
     root = tmp_path_factory.mktemp(request.param) / "proj"
     root.mkdir()
-    _write(root, ORDERS[request.param])
+    _write(root, toolchain, ORDERS[request.param])
     conn = _run(root)
     yield request.param, conn
     conn.close()
@@ -195,7 +193,7 @@ PROTO_HEADER = "static inline int pf(int x) { return x - 1; }\n"
 
 
 @pytest.mark.parametrize("cxx", ["c.cpp", "0.cpp"])
-def test_a_prototype_in_an_other_header_gives_one_more_usr_of_the_same_function(tmp_path, cxx):
+def test_a_prototype_in_an_other_header_gives_one_more_usr_of_the_same_function(tmp_path, cxx, toolchain):
     """The USR names the file of the first declaration: `c:proto.h@F@pf` in a.c, `c:hdr2.h@F@pf` in b.c.
 
     The C++ unit owns `hdr2.h` and `a.c` owns `proto.h`, thus `a.c` stores a
@@ -209,7 +207,7 @@ def test_a_prototype_in_an_other_header_gives_one_more_usr_of_the_same_function(
         "b.c": '#include "hdr2.h"\nint use_b(void) { return pf(2); }\n',
         cxx: '#include "hdr2.h"\nint use_c() { return pf(3); }\n',
     }
-    _write(root, units, {"proto.h": PROTO, "hdr2.h": PROTO_HEADER})
+    _write(root, toolchain, units, {"proto.h": PROTO, "hdr2.h": PROTO_HEADER})
     conn = _run(root)
     assert _callers(conn, "pf") == ["use_a", "use_b", "use_c"]
     assert [tuple(row) for row in conn.execute("SELECT file_path, is_definition FROM symbols WHERE name = 'pf'")] == [
@@ -218,7 +216,7 @@ def test_a_prototype_in_an_other_header_gives_one_more_usr_of_the_same_function(
     conn.close()
 
 
-def test_an_unchanged_unit_keeps_its_call_when_an_other_unit_owns_the_header(tmp_path):
+def test_an_unchanged_unit_keeps_its_call_when_an_other_unit_owns_the_header(tmp_path, toolchain):
     """c.cpp owns hdr.h first, thus the symbol is of C++; then only C units include it.
 
     The call of the unchanged b.c holds the USR of C++ after the first run
@@ -232,7 +230,7 @@ def test_an_unchanged_unit_keeps_its_call_when_an_other_unit_owns_the_header(tmp
         "b.c": '#include "hdr.h"\nint use_b(void) { return twice(2); }\n',
         "c.cpp": '#include "hdr.h"\nint use_c() { return twice(3); }\n',
     }
-    _write(root, units)
+    _write(root, toolchain, units)
     conn = _run(root)
     [usr] = [row[0] for row in conn.execute("SELECT usr FROM symbols WHERE name = 'twice'")]
     assert "#" in usr, "the symbol is of C++"
@@ -246,7 +244,7 @@ def test_an_unchanged_unit_keeps_its_call_when_an_other_unit_owns_the_header(tmp
     conn.close()
 
 
-def test_the_resolution_step_of_reindex_file_renames_an_alias(tmp_path):
+def test_the_resolution_step_of_reindex_file_renames_an_alias(tmp_path, toolchain):
     """``reindex_file`` parses one unit again, and that parse writes the USR of its language.
 
     The test puts the alias back into the rows by hand and calls the step
@@ -257,7 +255,7 @@ def test_the_resolution_step_of_reindex_file_renames_an_alias(tmp_path):
 
     root = tmp_path / "proj"
     root.mkdir()
-    _write(root, ORDERS["c-first"])
+    _write(root, toolchain, ORDERS["c-first"])
     conn = _run(root)
     [config_hash] = [row[0] for row in conn.execute("SELECT DISTINCT config_hash FROM symbols")]
     # The C++ unit gives the symbol; the C unit recorded the USR of C.
@@ -273,7 +271,7 @@ def test_the_resolution_step_of_reindex_file_renames_an_alias(tmp_path):
     conn.close()
 
 
-def test_a_function_that_only_a_template_instance_names_gets_its_caller(tmp_path):
+def test_a_function_that_only_a_template_instance_names_gets_its_caller(tmp_path, toolchain):
     """No written code of a C++ unit names `twice`: only the instance of `g<int>` records its USR."""
     root = tmp_path / "proj"
     root.mkdir()
@@ -281,7 +279,7 @@ def test_a_function_that_only_a_template_instance_names_gets_its_caller(tmp_path
         "a.c": '#include "hdr.h"\ncb_t g_cb;\nint use_a(void) { return twice(1); }\n',
         "d.cpp": '#include "tpl.hpp"\nint use_d() { return g(5); }\n',
     }
-    _write(root, units)
+    _write(root, toolchain, units)
     conn = _run(root)
     assert _callers(conn, "twice") == ["g", "use_a"]
     conn.close()

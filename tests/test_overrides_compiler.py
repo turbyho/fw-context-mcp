@@ -10,22 +10,25 @@ the file replaces them, thus an incremental run follows the source.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
 
 from tests._toml import toml_string
+from tests._toolchains import Toolchain, unit_for, write_compile_commands, write_sources
 
-pytest.importorskip("clang.cindex", reason="libclang not available")
 pytestmark = pytest.mark.libclang
 
+# D writes both parameters with other spellings of the types of A: the
+# alias handler_t, and the type under uint32_t.  WHY __UINT32_TYPE__ and not
+# "unsigned int": uint32_t is unsigned long in newlib and picolibc of the
+# embedded toolchains, and unsigned int in glibc.
 SHAPES = """\
 #include <stdint.h>
 typedef void (*cb_t)(int);
 using handler_t = cb_t;
 struct A { virtual void post(uint32_t id, cb_t cb) = 0; virtual ~A() {} };
-struct D : A { void post(unsigned int id, handler_t cb) override { (void)id; (void)cb; } };
+struct D : A { void post(__UINT32_TYPE__ id, handler_t cb) override { (void)id; (void)cb; } };
 template <class T> struct Tq : A { void post(uint32_t, cb_t cb) override { (void)cb; } };
 struct B : A { void post(uint32_t, cb_t) override {} };
 struct C : B { void post(uint32_t, cb_t) override {} };
@@ -37,13 +40,12 @@ struct Impl : IQueue<cb_t> { void put(cb_t cb) override { (void)cb; } };
 
 
 @pytest.fixture(scope="module")
-def overrides(tmp_path_factory) -> set[tuple[str, str]]:
-    from fw_context_mcp.indexer.compile_commands import CompilationUnit
+def overrides(tmp_path_factory, toolchain: Toolchain) -> set[tuple[str, str]]:
     from fw_context_mcp.indexer.symbols import extract_all
 
-    src: Path = tmp_path_factory.mktemp("overrides") / "shapes.cpp"
-    src.write_text(SHAPES, encoding="utf-8")
-    unit = CompilationUnit(file=src, directory=src.parent, language="cpp", clang_args=["-std=c++17"])
+    root: Path = tmp_path_factory.mktemp("overrides")
+    write_sources(root, {"shapes.cpp": SHAPES})
+    unit = unit_for(root, "shapes.cpp", toolchain, ["-std=c++17"])
     result = extract_all(unit, with_refs=False)
     names = {symbol.usr: symbol.qualified_name for symbol in result.symbols}
     return {(names.get(derived, derived), names.get(base, base)) for derived, base in result.overrides}
@@ -71,15 +73,15 @@ def test_a_base_of_an_instance_of_a_template_is_the_member_of_the_template(overr
     assert ("Impl::put", "IQueue::put") in overrides
 
 
-def test_a_null_cursor_of_the_compiler_is_no_method(tmp_path: Path, monkeypatch):
+def test_a_null_cursor_of_the_compiler_is_no_method(tmp_path: Path, monkeypatch, toolchain: Toolchain):
     """`Cursor.from_result` gives None for a null cursor of the answer: it is left out, not given as a method."""
     from fw_context_mcp.indexer import _overrides
     from fw_context_mcp.indexer._libclang import cindex as cx
     from fw_context_mcp.indexer.symbols import _get_index
 
-    src = tmp_path / "one.cpp"
-    src.write_text("struct A { virtual void f(); };\n", encoding="utf-8")
-    unit = _get_index().parse(str(src), args=["-x", "c++", "-std=c++17"])
+    write_sources(tmp_path, {"one.cpp": "struct A { virtual void f(); };\n"})
+    one = unit_for(tmp_path, "one.cpp", toolchain, ["-std=c++17"])
+    unit = _get_index().parse(str(one.file), args=one.clang_args)
     method = next(c for c in unit.cursor.walk_preorder() if c.kind == cx.CursorKind.CXX_METHOD)
     answer = (cx.Cursor * 2)(cx.conf.lib.clang_getNullCursor(), method)
 
@@ -126,21 +128,20 @@ def _index(root: Path, db_path: Path) -> set[tuple[str, str]]:
         conn.close()
 
 
-def test_an_incremental_run_follows_a_changed_override(tmp_path: Path):
+def test_an_incremental_run_follows_a_changed_override(tmp_path: Path, toolchain):
     """`Derived::f -> Base::f` goes when the source drops it, and `Derived::g -> Base::g` comes."""
     root = tmp_path / "proj"
     (root / ".fw-context").mkdir(parents=True)
     (root / ".fw-context" / "config.toml").write_text(
         f'[project]\nid = "proj-overrides"\n\n[build]\n\n[index]\ndb_dir = {toml_string(tmp_path)}\n', encoding="utf-8",
     )
-    source = root / "main.cpp"
-    source.write_text(BEFORE, encoding="utf-8")
-    (root / "compile_commands.json").write_text(json.dumps([{
-        "directory": str(root), "file": "main.cpp", "arguments": ["c++", "-std=c++17", "-c", "main.cpp"],
-    }]), encoding="utf-8")
+    write_sources(root, {"main.cpp": BEFORE})
+    write_compile_commands(root / "compile_commands.json", [{
+        "directory": str(root), "file": "main.cpp", "arguments": toolchain.arguments("main.cpp", "-std=c++17"),
+    }])
     db_path = tmp_path / "proj-overrides" / "index.db"
     db_path.parent.mkdir(parents=True)
 
     assert _index(root, db_path) == {("Derived::f", "Base::f")}
-    source.write_text(AFTER, encoding="utf-8")
+    write_sources(root, {"main.cpp": AFTER})
     assert _index(root, db_path) == {("Derived::g", "Base::g")}

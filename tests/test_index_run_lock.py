@@ -948,3 +948,110 @@ class TestOperationsHoldTheIndex:
             self._stop(holder)
 
     _args = staticmethod(TestTakeover._args)
+
+
+class _RunSuperseded(Exception):
+    """The exception of a run that another run took over (IndexSuperseded in cli._index)."""
+
+
+@pytest.mark.parametrize("body_raises", [False, True], ids=["run-ends", "run-superseded"])
+def test_a_failed_truncate_releases_the_lock_and_keeps_the_result_of_the_run(
+    tmp_path: Path, monkeypatch, caplog, body_raises: bool,
+):
+    """The release clears the PID of the holder (information only), then closes the lock.
+
+    A truncate that failed (EIO on a network share) skipped the close: a
+    long-lived MCP server kept the index lock, and each later run failed
+    with IndexRunLocked.  Its OSError also replaced the exception of the
+    run (the daemon then did not retry a superseded run), or failed a run
+    that did its work.  Now it is a warning.
+    """
+    import logging
+
+    from fw_context_mcp.file_lock import held_by_another
+    from fw_context_mcp.indexer.db import _locking
+
+    real_ftruncate = os.ftruncate
+    calls: list[int] = []
+
+    def ftruncate_fails_at_the_release(fd: int, length: int) -> None:
+        calls.append(fd)
+        if len(calls) == 2:  # the first call clears the file for the PID
+            raise OSError(5, "Input/output error")
+        real_ftruncate(fd, length)
+
+    monkeypatch.setattr(_locking.os, "ftruncate", ftruncate_fails_at_the_release)
+    with caplog.at_level(logging.WARNING, logger=_locking.__name__):
+        if body_raises:
+            with pytest.raises(_RunSuperseded), index_run_lock(tmp_path):
+                raise _RunSuperseded
+        else:
+            with index_run_lock(tmp_path):
+                pass
+    monkeypatch.undo()
+    assert "Input/output error" in caplog.text
+    assert not held_by_another(tmp_path / "index.lock")
+    with index_run_lock(tmp_path):
+        pass
+
+
+def test_the_write_lock_keeps_its_time_limit_while_the_status_lock_stays_held(tmp_path: Path):
+    """A probe that is stopped while it holds the status lock of write.lock (Ctrl-Z, a debugger).
+
+    The try of the lock waited for the status lock for STATUS_WAIT_S (10 s),
+    and ``write_lock(timeout=5)`` raised its timeout after about 10 s.
+    """
+    import time
+
+    from fw_context_mcp.file_lock import status_path, try_lock, unlock
+    from fw_context_mcp.indexer.db._locking import WriteLockTimeout, write_lock
+
+    (tmp_path / "write.lock").touch()
+    stuck_probe = os.open(status_path(tmp_path / "write.lock"), os.O_CREAT | os.O_RDWR)
+    try:
+        assert try_lock(stuck_probe)
+        started = time.monotonic()
+        with pytest.raises(WriteLockTimeout), write_lock(tmp_path, timeout=0.5):
+            pass
+        assert time.monotonic() - started < 3.0
+        unlock(stuck_probe)
+    finally:
+        os.close(stuck_probe)
+
+
+def test_a_run_of_the_daemon_writes_its_pid_under_its_token(tmp_path, monkeypatch) -> None:
+    """The daemon knows its run by the PID of Popen: on Windows the PID of a launcher.
+
+    The markers hold the PID of the run, thus the daemon found no marker of
+    a run that it killed.  The run file gives the daemon that PID, and it
+    goes after the markers: until then the daemon needs it.
+    """
+    from fw_context_mcp.indexer import _index_owner
+    from fw_context_mcp.mcp.shared.pid_file import PidFile
+
+    token = "b" * 32
+    monkeypatch.setattr(_index_owner, "own_stop_token", lambda: token)
+    run_file = _index_owner.run_pid_path(tmp_path, token)
+    removed: list[str] = []
+    real_unlink = PidFile.unlink_if_ours
+
+    def record(self) -> None:
+        removed.append(self.path.name)
+        real_unlink(self)
+
+    monkeypatch.setattr(PidFile, "unlink_if_ours", record)
+
+    _index_owner.claim_index(tmp_path)
+    assert PidFile.read_pid(run_file) == os.getpid()
+    _index_owner.release_index(tmp_path)
+    assert not run_file.exists()
+    assert removed == ["reindex.pid", "reindex.pause", run_file.name]
+
+
+def test_a_run_without_a_token_writes_no_run_file(tmp_path, monkeypatch) -> None:
+    from fw_context_mcp.indexer import _index_owner
+
+    monkeypatch.setattr(_index_owner, "own_stop_token", lambda: None)
+    _index_owner.claim_index(tmp_path)
+    assert list(tmp_path.glob("run.*.pid")) == []
+    _index_owner.release_index(tmp_path)

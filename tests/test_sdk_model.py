@@ -18,15 +18,14 @@ model tells what runs it:
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from pathlib import Path
 
 import pytest
 
 from tests._toml import toml_string
+from tests._toolchains import Toolchain, write_compile_commands, write_sources
 
-pytest.importorskip("clang.cindex", reason="libclang not available")
 pytestmark = pytest.mark.libclang
 
 SDK_H = """\
@@ -350,7 +349,9 @@ void app(events::EventQueue &queue, int n)
 """
 
 
-def _index(root: Path, files: dict[str, str], name: str, config: str = "") -> tuple[sqlite3.Connection, str]:
+def _index(
+    root: Path, toolchain: Toolchain, files: dict[str, str], name: str, config: str = "",
+) -> tuple[sqlite3.Connection, str]:
     import fw_context_mcp  # noqa: F401  (pysqlite3 redirect first)
     from fw_context_mcp.indexer.runner import run
 
@@ -359,13 +360,12 @@ def _index(root: Path, files: dict[str, str], name: str, config: str = "") -> tu
     (root / ".fw-context" / "config.toml").write_text(
         f'[project]\nid = "{name}"\n\n[build]\n\n[index]\ndb_dir = {toml_string(db_dir)}\n' + config, encoding="utf-8",
     )
-    for file, text in files.items():
-        (root / file).write_text(text, encoding="utf-8")
-    (root / "compile_commands.json").write_text(json.dumps([
+    write_sources(root, files)
+    write_compile_commands(root / "compile_commands.json", [
         {"directory": str(root), "file": file,
-         "arguments": ["c++", "-std=c++17", "-c", file] if file.endswith(".cpp") else ["cc", "-std=gnu11", "-c", file]}
+         "arguments": toolchain.arguments(file, "-std=c++17" if file.endswith(".cpp") else "-std=gnu11")}
         for file in files if file.endswith((".c", ".cpp"))
-    ]), encoding="utf-8")
+    ])
     db_path = db_dir / name / "index.db"
     db_path.parent.mkdir(parents=True)
     run(
@@ -411,28 +411,28 @@ def _edge(conn: sqlite3.Connection, name: str) -> sqlite3.Row:
 
 
 @pytest.fixture(scope="module")
-def without_source(tmp_path_factory) -> tuple[sqlite3.Connection, str, Path]:
+def without_source(tmp_path_factory, toolchain: Toolchain) -> tuple[sqlite3.Connection, str, Path]:
     root = tmp_path_factory.mktemp("sdk") / "proj"
     root.mkdir()
-    conn, config_hash = _index(root, {"sdk.h": SDK_H, "kernel.c": KERNEL_C, "app.c": APP_C}, "proj-sdk")
+    conn, config_hash = _index(root, toolchain, {"sdk.h": SDK_H, "kernel.c": KERNEL_C, "app.c": APP_C}, "proj-sdk")
     yield conn, config_hash, root
     conn.close()
 
 
 @pytest.fixture(scope="module")
-def queue(tmp_path_factory) -> tuple[sqlite3.Connection, str]:
+def queue(tmp_path_factory, toolchain: Toolchain) -> tuple[sqlite3.Connection, str]:
     root = tmp_path_factory.mktemp("queue") / "proj"
     root.mkdir()
-    conn, config_hash = _index(root, {"queue.cpp": QUEUE_CPP}, "proj-queue")
+    conn, config_hash = _index(root, toolchain, {"queue.cpp": QUEUE_CPP}, "proj-queue")
     yield conn, config_hash
     conn.close()
 
 
 @pytest.fixture(scope="module")
-def with_source(tmp_path_factory) -> tuple[sqlite3.Connection, str]:
+def with_source(tmp_path_factory, toolchain: Toolchain) -> tuple[sqlite3.Connection, str]:
     root = tmp_path_factory.mktemp("lwip") / "proj"
     root.mkdir()
-    conn, config_hash = _index(root, {"lwip.c": LWIP_C}, "proj-lwip", OWN_RULES)
+    conn, config_hash = _index(root, toolchain, {"lwip.c": LWIP_C}, "proj-lwip", OWN_RULES)
     yield conn, config_hash
     conn.close()
 
@@ -759,3 +759,76 @@ def test_a_wrong_rule_of_the_project_is_left_out(with_source):
     entries = {row[0] for row in conn.execute("SELECT entry FROM sdk_links WHERE config_hash = ?", (config_hash,))}
     assert "a rule with no slot" not in entries
     assert {"the my-rtos scheduler", "the my-rtos thread start"} <= entries
+
+
+# ── CMSIS-RTX 5.8 and later: the frame of a thread starts osThreadEntry ──
+
+#: The shape of rtx_thread.c of CMSIS-RTX 5.8 (main, 2026-11-14): the frame
+#: starts the C function osThreadEntry with the argument in R0 and the
+#: function of the thread in R1.  osThreadNew goes to svcRtxThreadNew
+#: through an SVC in assembly, thus its body here calls nothing.
+RTX58_C = """\
+#include <stdint.h>
+typedef void (*osThreadFunc_t)(void *argument);
+struct frame { uintptr_t pc, r0, r1; } fr;
+static void osThreadEntry(void *argument, osThreadFunc_t func) { func(argument); }
+static void rtx_idle(void *argument) { (void) argument; }
+static void app_thread(void *argument) { (void) argument; }
+void *svcRtxThreadNew(osThreadFunc_t func, void *argument, const void *attr)
+{
+    (void) attr;
+    fr.pc = (uintptr_t) osThreadEntry;
+    fr.r0 = (uintptr_t) argument;
+    fr.r1 = (uintptr_t) func;
+    return 0;
+}
+void *osThreadNew(osThreadFunc_t func, void *argument, const void *attr)
+{
+    (void) func; (void) argument; (void) attr;
+    return 0;
+}
+void osRtxThreadStartup(void) { svcRtxThreadNew(rtx_idle, 0, 0); }
+void app_main(void) { osThreadNew(app_thread, 0, 0); }
+"""
+
+
+@pytest.fixture(scope="module")
+def rtx58(tmp_path_factory, toolchain: Toolchain) -> tuple[sqlite3.Connection, str]:
+    root = tmp_path_factory.mktemp("rtx58") / "proj"
+    root.mkdir()
+    conn, config_hash = _index(root, toolchain, {"rtx_thread.c": RTX58_C}, "proj-rtx58")
+    yield conn, config_hash
+    conn.close()
+
+
+def test_a_thread_of_rtx_58_gets_osthreadentry_as_its_caller(rtx58):
+    """osThreadEntry calls the function of the thread in C; the rules give it the function, and no edge of their own."""
+    conn, _ = rtx58
+    assert _callers(conn, "app_thread") == [("osThreadEntry", ["slot"])]
+    assert _callers(conn, "rtx_idle") == [("osThreadEntry", ["slot"])]
+
+
+#: CMSIS-RTX 5.8 as a library without its source: a header declares
+#: osThreadEntry, and no body of the build calls the function of a thread.
+RTX58_LIBRARY_C = """\
+typedef void (*osThreadFunc_t)(void *argument);
+void osThreadEntry(void *argument, osThreadFunc_t func);
+void *osThreadNew(osThreadFunc_t func, void *argument, const void *attr);
+static void lib_thread(void *argument) { (void) argument; }
+void app_main(void) { osThreadNew(lib_thread, 0, 0); }
+"""
+
+
+@pytest.fixture(scope="module")
+def rtx58_library(tmp_path_factory, toolchain: Toolchain) -> tuple[sqlite3.Connection, str]:
+    root = tmp_path_factory.mktemp("rtx58lib") / "proj"
+    root.mkdir()
+    conn, config_hash = _index(root, toolchain, {"app.c": RTX58_LIBRARY_C}, "proj-rtx58lib")
+    yield conn, config_hash
+    conn.close()
+
+
+def test_a_declaration_of_osthreadentry_keeps_the_rule_of_osthreadnew(rtx58_library):
+    """Without the body of osThreadEntry, no call in C gives the edge: the rule of osThreadNew still applies."""
+    conn, _ = rtx58_library
+    assert _callers(conn, "lib_thread") == [("osThreadNew", ["sdk"])]

@@ -283,7 +283,7 @@ from . import generic_cmake  # noqa: F401, E402, I001
 from . import stubs  # noqa: F401, E402, I001
 # Manual / bare mode (flags-driven compile_commands.json generation)
 from . import manual  # noqa: F401, E402, I001
-# Makefile via compiledb
+# Makefile via the log of make -Bnkwp
 from . import makefile  # noqa: F401, E402, I001
 # Keil MDK and IAR EWARM via keil2clangd
 from . import keil  # noqa: F401, E402, I001

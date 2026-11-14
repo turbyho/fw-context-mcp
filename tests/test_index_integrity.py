@@ -1,7 +1,8 @@
 """Index integrity tests — verify indexed data matches source files.
 
-Requires libclang and a C compiler (gcc). Uses a real C project fixture
-indexed via the CLI, then reads the DB and compares against source files.
+Requires libclang and the toolchains of the test SDKs (``tests/_toolchains.py``).
+Uses a real C project fixture, compiled with each toolchain and indexed
+via the CLI, then reads the DB and compares against source files.
 
 Fixtures are class-scoped to avoid repeated indexing.
 
@@ -23,6 +24,7 @@ import pytest
 
 from fw_context_mcp.indexer.db import open_db
 from tests._toml import toml_string
+from tests._toolchains import Toolchain, write_compile_commands
 
 pytestmark = pytest.mark.libclang
 
@@ -87,7 +89,7 @@ def _config_hash(conn):
 
 
 @pytest.fixture(scope="class")
-def c_project_extended(tmp_path_factory):
+def c_project_extended(tmp_path_factory, toolchain: Toolchain):
     """Create a C project with structs, enums, and complex types (once per class)."""
     proj = tmp_path_factory.mktemp("proj")
 
@@ -181,13 +183,11 @@ Response driver_get_status(void) {
 """)
 
     cc = [
-        {"directory": str(src), "file": "main.c",
-         "arguments": ["gcc", "-std=c11", "-O2", "-Isrc", "-c", "main.c", "-o", "build/main.o"]},
-        {"directory": str(src), "file": "driver.c",
-         "arguments": ["gcc", "-std=c11", "-O2", "-Isrc", "-c", "driver.c", "-o", "build/driver.o"]},
+        {"directory": str(src), "file": name,
+         "arguments": toolchain.arguments(name, "-std=c11", "-O2", "-Isrc", output=f"build/{name[:-2]}.o")}
+        for name in ("main.c", "driver.c")
     ]
-    cc_json = proj / "compile_commands.json"
-    cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+    write_compile_commands(proj / "compile_commands.json", cc)
 
     # Isolate index DB to tmp_path before init
     _isolate_index_db(proj, proj.parent)
@@ -765,7 +765,7 @@ class TestIndexingEdgeCases:
     Uses a separate project fixture since these tests modify compile_commands.json.
     """
 
-    def test_empty_source_file_indexed(self, c_project_extended: Path):
+    def test_empty_source_file_indexed(self, c_project_extended: Path, toolchain):
         """Indexing an empty source file should not crash."""
         empty_file = c_project_extended / "src" / "empty.c"
         empty_file.write_text("", encoding="utf-8")
@@ -775,9 +775,9 @@ class TestIndexingEdgeCases:
         cc.append({
             "directory": str(c_project_extended / "src"),
             "file": "empty.c",
-            "arguments": ["gcc", "-std=c11", "-c", "empty.c", "-o", "build/empty.o"],
+            "arguments": toolchain.arguments("empty.c", "-std=c11", output="build/empty.o"),
         })
-        cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+        write_compile_commands(cc_json, cc)
 
         try:
             result = _cli(["index", "--no-refs", "--no-analyze", "--no-embeddings", str(cc_json)],
@@ -786,7 +786,7 @@ class TestIndexingEdgeCases:
         finally:
             _cleanup_index_db(c_project_extended)
 
-    def test_file_with_only_preprocessor(self, c_project_extended: Path):
+    def test_file_with_only_preprocessor(self, c_project_extended: Path, toolchain):
         """A source file with only preprocessor directives should not crash indexing."""
         pp_file = c_project_extended / "src" / "config_defs.c"
         pp_file.write_text(
@@ -803,9 +803,9 @@ class TestIndexingEdgeCases:
         cc.append({
             "directory": str(c_project_extended / "src"),
             "file": "config_defs.c",
-             "arguments": ["gcc", "-std=c11", "-c", "config_defs.c", "-o", "build/config_defs.o"],
+            "arguments": toolchain.arguments("config_defs.c", "-std=c11", output="build/config_defs.o"),
         })
-        cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+        write_compile_commands(cc_json, cc)
 
         try:
             result = _cli(["index", "--no-refs", "--no-analyze", "--no-embeddings", str(cc_json)],
@@ -819,7 +819,7 @@ class TestIndexingEdgeCases:
 
 
 @pytest.fixture(scope="class")
-def c_project_anon(tmp_path_factory):
+def c_project_anon(tmp_path_factory, toolchain: Toolchain):
     """C project with anonymous structs and unions — tests field-name resolution."""
     proj = tmp_path_factory.mktemp("proj_anon")
 
@@ -870,13 +870,11 @@ void init_sensor(SensorData* s) {
 """)
 
     cc = [
-        {"directory": str(src), "file": "main.c",
-         "arguments": ["gcc", "-std=c11", "-O2", "-Isrc", "-c", "main.c", "-o", "build/main.o"]},
-        {"directory": str(src), "file": "data.c",
-         "arguments": ["gcc", "-std=c11", "-O2", "-Isrc", "-c", "data.c", "-o", "build/data.o"]},
+        {"directory": str(src), "file": name,
+         "arguments": toolchain.arguments(name, "-std=c11", "-O2", "-Isrc", output=f"build/{name[:-2]}.o")}
+        for name in ("main.c", "data.c")
     ]
-    cc_json = proj / "compile_commands.json"
-    cc_json.write_text(json.dumps(cc, indent=2), encoding="utf-8")
+    write_compile_commands(proj / "compile_commands.json", cc)
 
     # Isolate index DB to tmp_path before init
     _isolate_index_db(proj, proj.parent)

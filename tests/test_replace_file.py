@@ -129,3 +129,36 @@ def test_write_text_atomic_while_other_processes_read(tmp_path: Path):
 
     assert target.read_text(encoding="utf-8").startswith("199 ")
     assert during > 0, "no read came during the writes: the test showed nothing"
+
+
+@pytest.mark.parametrize("mode", [None, 0o600], ids=["default-mode", "mode-0600"])
+def test_two_threads_write_one_file_at_the_same_time(tmp_path: Path, mode: int | None):
+    """Two tools of one MCP server write one file (the takeover marker) at the same time.
+
+    The temporary name held only the owner token of the process, thus the
+    two threads shared it: the rename of the second one found no file and
+    raised FileNotFoundError.  Each call now has a name of its own.
+    """
+    import threading
+
+    target = tmp_path / "reindex.takeover"
+    barrier = threading.Barrier(8)
+    errors: list[BaseException] = []
+
+    def write(number: int) -> None:
+        barrier.wait()
+        try:
+            for _ in range(50):
+                utils.write_text_atomic(target, f"{number}\n", mode=mode)
+        except BaseException as exc:  # the test reports each error of a thread
+            errors.append(exc)
+
+    threads = [threading.Thread(target=write, args=(number,)) for number in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(60)
+
+    assert errors == []
+    assert target.read_text(encoding="utf-8").strip() in {str(number) for number in range(8)}
+    assert list(tmp_path.glob(".*.tmp")) == [], "a temporary file stayed"

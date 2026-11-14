@@ -12,8 +12,8 @@ Key design decisions:
   ``read_pid()`` and ``os.kill()``.  :mod:`fw_context_mcp.file_lock` is an
   atomic kernel lock that the kernel releases when its process ends.  The
   daemon holds ``watcher.lock`` for its whole life, and a second daemon
-  exits at its try of the lock.  ``_ensure_daemon_running`` releases its
-  try of the lock before it spawns the daemon.
+  exits at its try of the lock.  ``_ensure_daemon_running`` only probes the
+  lock (``file_lock.held_by_another``), thus it never makes that try fail.
 
 - **The check of the work that waits is in the daemon**: the daemon's
   ``_staleness_check`` runs one time at its start.  It finds the work of the
@@ -38,7 +38,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from ..file_lock import held_by_another, try_lock, unlock
+from ..file_lock import held_by_another
 from ..utils import O_NOFOLLOW
 from .shared.context import _db_path
 from .shared.pid_file import PidFile
@@ -244,23 +244,32 @@ def _ensure_daemon_running(root: Path) -> None:
 
     Uses *watcher.lock* (a kernel file lock) as the daemon-alive indicator.
     The daemon holds the lock for its whole life.  This function checks
-    the ping first (fast path), then tries the lock.
+    the ping first (fast path), then probes the lock.
 
-    WHY the lock is free when the daemon starts: the daemon takes the lock
-    with a try that does not wait, and it exits when a different file
-    descriptor holds it.  A wait in the daemon is not a solution, because
-    a second daemon would then wait for the end of the first one.  Before,
-    this function held the lock until after the spawn: a daemon that came
-    to its lock call first exited, and no daemon ran until the next ping
-    cycle.
+    WHY a probe (``file_lock.held_by_another``) and never the lock itself:
+    the daemon takes the lock with a try that does not wait, and it exits
+    when a different file descriptor holds it.  A wait in the daemon is not
+    a solution, because a second daemon would then wait for the end of the
+    first one.  Before, this function held the lock until after the spawn,
+    and later it held the lock during the second ping.  A daemon that came
+    to its lock call in that time exited, and no daemon ran until the next
+    ping cycle.  The probe tries only the status lock of the
+    ``ProbedLock``, thus the try of the daemon cannot fail because of it.
 
     Two MCP servers can spawn a daemon at the same time.  The daemon that
     gets the lock first runs, and the other one exits at its lock call
     before it writes a marker or its PID file (``daemon_main``).  Thus a
     second spawn costs one process start and one line in ``daemon.log``,
     and no second daemon runs.
+
+    WHY a check of ``daemon.sock`` too: a daemon of v0.36.0 or earlier
+    answers no ping, and it holds only the exclusion lock of
+    ``watcher.lock``, not the status lock that the probe tries.  Thus each
+    ping cycle spawned a daemon that exited at its lock call at once.  A
+    listener of a different user is no daemon of this user, and does not
+    stop the spawn.
     """
-    from .daemon import ping_daemon
+    from .daemon import legacy_listener, ping_daemon
 
     db_path = _db_path(root)
     if not db_path.exists():
@@ -272,26 +281,16 @@ def _ensure_daemon_running(root: Path) -> None:
         return
 
     # Slow path — daemon may be dead or starting up
-    lock_file = db_dir / "watcher.lock"
-    try:
-        lock_fd = os.open(lock_file, os.O_CREAT | os.O_RDWR)
-    except OSError:
+    if held_by_another(db_dir / "watcher.lock"):
+        # Lock held — a daemon runs, or a daemon starts.
         return
-    try:
-        if not try_lock(lock_fd):
-            # Lock held — a daemon runs, or a daemon starts.
-            return
-        try:
-            # We hold the lock — no daemon holds it.  A daemon that started
-            # between the ping and the try of the lock answers the ping now.
-            daemon_answers = ping_daemon(root)
-        finally:
-            unlock(lock_fd)
-    except OSError:
+    listener = legacy_listener(db_dir)
+    if listener is not None and listener.own:
+        log.debug("A daemon of v0.36.0 or earlier (pid %d) listens on daemon.sock of %s", listener.pid, db_dir)
         return
-    finally:
-        os.close(lock_fd)
-    if daemon_answers:
+    # No daemon held the lock at the probe.  A daemon that started between
+    # the ping and the probe answers the ping now.
+    if ping_daemon(root):
         return
 
     log.info("Spawning watcher daemon for %s", root)

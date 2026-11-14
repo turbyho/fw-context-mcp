@@ -15,7 +15,7 @@ When you run `fw-context index --build`, the system picks one of four paths:
 |------|--------|---------|
 | **Shell override** | `[build] command = "…"` | Any build system, highest priority |
 | **Convert** | Parses project file, no build | Keil MDK, IAR EWARM |
-| **Generate** | Generates `compile_commands.json` from flags | Makefile (compiledb), bare/manual |
+| **Generate** | Generates `compile_commands.json` from flags or from the log of the build | Makefile (log of `make -Bnkwp`), bare/manual |
 | **Build** | Full build via build system | PlatformIO, Zephyr, Mbed OS, ESP-IDF, CMake, Arduino |
 
 `fw-context` chooses the path automatically, based on the builder's
@@ -73,7 +73,7 @@ gives the files of the index their new paths, thus it indexes the
 project again.
 
 A tool that fw-context gives the output path to (the Mbed OS backend,
-compiledb, keil2clangd, the manual backend) does not write the file
+the Makefile backend, keil2clangd, the manual backend) does not write the file
 directly. It writes a staging file in the directory of the variant,
 `<variant>/.compile_commands.<pid>@<tag>.json`, and one rename then gives
 `out/compile_commands.json` the new content. Thus a reader never gets a
@@ -125,15 +125,15 @@ system automatically, from the markers in the project root. A marker is the
 name of a file or a directory. A marker with `*` is a pattern: `*.uvprojx`
 matches each `.uvprojx` file in the project root.
 
-Each builder gets one point for each of its markers that is in the project
-root. The builder with the most points wins. When two builders have the same
-number of points, the builder that is higher in this list wins:
+Detection asks each builder in this order. The first builder that finds its
+markers wins:
 
 1. Mbed OS (`.mbed`, `mbed-os`, `mbed_app.json`)
 2. PlatformIO (`platformio.ini`)
 3. Zephyr (`west.yml`, `zephyr`)
 4. Arduino (`sketch.yaml`)
-5. ESP-IDF (`sdkconfig`)
+5. ESP-IDF (`sdkconfig`, or a `CMakeLists.txt` that includes
+   `tools/cmake/project.cmake` of ESP-IDF)
 6. Generic CMake (`CMakeLists.txt`)
 7. STM32CubeIDE (`.cproject`, `.project`)
 8. TI CCS (`.projectspec`)
@@ -141,10 +141,9 @@ number of points, the builder that is higher in this list wins:
 10. Keil MDK (`*.uvprojx`)
 11. IAR EWARM (`*.ewp`, `*.eww`)
 
-For example, an ESP-IDF project has `sdkconfig` and `CMakeLists.txt`. ESP-IDF
-and Generic CMake get one point each, and ESP-IDF wins, because it is higher
-in the list. For an ESP-IDF project without `sdkconfig`, detection selects
-Generic CMake. A
+For example, an ESP-IDF project has `CMakeLists.txt`, and ESP-IDF wins over
+Generic CMake, because it is higher in the list. A PlatformIO project with
+`framework = espidf` has the same `CMakeLists.txt`, and PlatformIO wins. A
 `.ino` file is not a marker: a sketch without `sketch.yaml` needs
 `system = "arduino"`. Manual / bare mode has no marker, thus detection never
 selects it. When the project root holds no marker, detection finds no build
@@ -242,11 +241,11 @@ Exceptions:
 - PlatformIO: `pio run` installs the `lib_deps` into `.pio/libdeps`, as your
   build does. That directory holds the source of the libraries, not build
   output.
-- ESP-IDF: fw-context runs `idf.py set-target` only when the project has
-  no `sdkconfig` and the output directory does not exist. `set-target`
-  renames `<project>/sdkconfig`, and `-B` does not move that file. The
-  target is then `esp32`, and fw-context logs a warning. For another chip,
-  run `idf.py set-target <chip>` yourself.
+- ESP-IDF: fw-context runs no `idf.py set-target`. ESP-IDF selects the
+  target as for your build: `IDF_TARGET`, the `sdkconfig`, then
+  `CONFIG_IDF_TARGET` of `sdkconfig.defaults`, else `esp32`. A project
+  without `sdkconfig` gets one in its root, as `idf.py build` writes it for
+  you.
 - Makefile: a real `make` (`make_dry_run = false`) needs `out_dir_var`, the
   variable that names the output directory in your Makefile.
 
@@ -259,10 +258,11 @@ Exceptions:
 | `system` | `str` | (auto-detect) | all | Build system: `mbed-os`, `zephyr`, `platformio`, `esp-idf`, `arduino`, `cmake`, `keil-mdk`, `iar-ewarm`, `makefile`, `bare`, `stm32cubeide`, `ti-ccs` |
 | `clean` | `bool` | `true` | Mbed OS, PlatformIO, Zephyr, ESP-IDF, Arduino, CMake | Run a clean build before fw-context generates the file. **Recommended.** A clean build makes sure that `compile_commands.json` is complete. The other builders do not read this key. A Zephyr sysbuild variant does not read it either: it always builds with `--pristine=auto`. |
 | `command` | `str` | — | all | A command that replaces the build of the builder. Highest priority: fw-context ignores the settings of the builder. It runs `pre_build` first, and it applies `[build] env` to the command. The command must write `compile_commands.json` into the project root. `timeout` does not apply: the command has no time limit. The command runs without a shell, see [example 11](#11-shell-override--bear-wrapping-a-custom-build). |
-| `python` | `str` | (auto-detect) | all | The Python interpreter for pip-based CLI tools, such as `mbed-cli`, `platformio`, `keil2clangd`, or `compiledb`. `fw-context init` detects this automatically, from pyenv, venv, and common install paths. Set this parameter manually when automatic detection fails. Mbed OS requires it: without it, the build stops with an error. |
+| `python` | `str` | (auto-detect) | all | The Python interpreter for pip-based CLI tools, such as `mbed-cli`, `platformio`, or `keil2clangd`. `fw-context init` detects this automatically, from pyenv, venv, and common install paths. Set this parameter manually when automatic detection fails. Mbed OS requires it: without it, the build stops with an error. |
 | `activate` | `str` | (auto-detect) | all | A script that sets up the environment of the build, for example the toolchain environment of NCS, or `export.sh` for ESP-IDF. On Linux and macOS it is a shell script that fw-context sources before each build command. On Windows it is a `.bat`, `.cmd` or `.ps1` script (see [General](#general)). `fw-context init` detects this automatically. Set this parameter manually when automatic detection fails. |
 | `pre_build` | `str` | — | all | A command line that fw-context runs before the build, the convert step, or the generate step. It runs without a shell: fw-context splits it as the shell of the host does (POSIX shell words, or the rules of `CommandLineToArgvW` on Windows). For a shell, write `sh -c '…'` or `cmd /c …`. Put it in `config.toml` when the whole team uses it, or in `local.toml` when it is specific to your machine. |
 | `env` | `dict[str,str]` | `{}` | all | Environment variables for each command of the build: the builder commands, `pre_build` and `command`. |
+| `extra_path` | `list[str]` | `[]` | all | Directories that fw-context puts in front of the `PATH` of each command of the build, after `env`. A list in `local.toml` replaces the list of `config.toml`. |
 | `timeout` | `float` | `7200` | all | The maximum time in seconds of each build command and of `pre_build`. When a command runs longer, fw-context stops it, and the build fails. |
 
 The build process does not get an inherited `BASH_ENV`. fw-context removes
@@ -275,8 +275,14 @@ after the removal.
 commands, the `pre_build` hook, and the `command` override. `activate`
 applies to the builder commands only.
 
-fw-context looks for `west` (Zephyr) and `idf.py` (ESP-IDF) in the
-environment of the project. With `activate`, it runs `command -v <tool>`
+fw-context looks for the tool of each build system in the environment of
+the project: `west` (Zephyr), `idf.py` (ESP-IDF), `cmake` (CMake), `pio`
+or `platformio` (PlatformIO without `python`), `arduino-cli` (Arduino),
+`keil2clangd` (Keil MDK and IAR EWARM without `python`), `make`
+(Makefile) and the compiler of bare mode. The build runs the program that the
+lookup found. A relative directory of `extra_path` and a relative
+`compiler` are relative to the project root, as for the build.
+With `activate`, it runs `command -v <tool>`
 after `source <activate>`, as the build command does. Without `activate`,
 it looks in the `PATH` of the build, which includes `extra_path`. The
 `PATH` of the fw-context process does not count when you set `activate`:
@@ -389,7 +395,7 @@ application, because fw-context selects no image. Use `--image` or
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `fqbn` | `str` | — | **Required.** The Fully Qualified Board Name, for example `"arduino:avr:uno"` |
+| `fqbn` | `str` | — | The Fully Qualified Board Name, for example `"arduino:avr:uno"`. Without it, `arduino-cli` uses `default_fqbn` of `sketch.yaml` |
 
 ### Generic CMake
 
@@ -412,15 +418,15 @@ application, because fw-context selects no image. Use `--image` or
 | `iar_project` | `str` | (first `*.ewp`) | The path to the `.ewp` file |
 | `iar_target` | `str` | — | The target name within the project |
 
-### Makefile (generate via compiledb)
+### Makefile (generate from the log of make)
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `makefile` | `str` | `"Makefile"` | The path to the Makefile, relative to the project root |
 | `make_target` | `str` | `"all"` | The build target |
 | `make_vars` | `dict[str,str]` | `{}` | Extra variables, for example `{V: "1"}` |
-| `make_dry_run` | `bool` | `true` | Use `make -n`. This setting runs no real compilation. `false` runs a real `make`, and it needs `out_dir_var` |
-| `out_dir_var` | `str` | — | The variable of the Makefile that names its output directory, for example `"BUILD_DIR"`. A real build gets `<out_dir_var>=<project>/.fw-context/build/<variant>/out`, as an absolute path, thus a recursive `$(MAKE) -C` gets it too. fw-context does not guess the name: without it, `make_dry_run = false` stops the build with an error. Every output of the Makefile must come from this variable: a Makefile that sets it with `override`, or that writes nothing into it, stops the build with an error. A generated file that the Makefile writes elsewhere (for example into `src/`) still goes there. The project path must hold no space and no `$` |
+| `make_dry_run` | `bool` | `true` | Read only the log of `make -Bnkwp`. This setting runs no real compilation. `false` runs a real `make` first, and it needs `out_dir_var` |
+| `out_dir_var` | `str` | — | The variable of the Makefile that names its output directory, for example `"BUILD_DIR"`. fw-context makes that directory before the build. A real build gets `<out_dir_var>=<project>/.fw-context/build/<variant>/out`, as an absolute path, thus a recursive `$(MAKE) -C` gets it too. fw-context does not guess the name: without it, `make_dry_run = false` stops the build with an error. Every output of the Makefile must come from this variable: a Makefile that sets it with `override`, or that writes nothing into it, stops the build with an error. A generated file that the Makefile writes elsewhere (for example into `src/`) still goes there. The project path must hold no space and no `$` |
 
 ### Manual / bare mode (generate from flags)
 
@@ -655,7 +661,12 @@ fqbn = "arduino:avr:uno"
 clean = false
 ```
 
-`fqbn` is required. Find your board's `fqbn` with `arduino-cli board list`.
+Find your board's `fqbn` with `arduino-cli board list`. When the config sets
+no `fqbn`, fw-context gives no `--fqbn`, and `arduino-cli` uses
+`default_fqbn` of `sketch.yaml`. Without a board, the build stops with
+"Missing FQBN". The build gives `arduino-cli` a `--port` that names no
+device and uploads nothing, thus the `default_port` of `sketch.yaml` does
+not need an attached board.
 The build runs two commands:
 
 1. `arduino-cli compile --fqbn arduino:avr:uno --build-path <out> --only-compilation-database`
@@ -702,7 +713,7 @@ Before it writes the database, fw-context compiles each file with
 object file. The first file that does not compile stops the generation
 with an error, and fw-context writes no `compile_commands.json`.
 
-### 7. Makefile with compiledb (dry-run)
+### 7. Makefile (dry-run)
 
 ```toml
 [build]
@@ -713,11 +724,63 @@ make_vars = { V = "1", CROSS_COMPILE = "arm-none-eabi-" }
 make_dry_run = true
 ```
 
-This example runs `compiledb -n make -C <root> V=1 CROSS_COMPILE=arm-none-eabi- all`.
-Dry-run mode runs no real compilation. Set `make_dry_run = false` when the
-project needs generated headers first, and name the output variable of the
-Makefile in `out_dir_var`. This build system requires
-`pip install compiledb`.
+This example runs `make -Bnkwp -j1 -C <root> V=1 CROSS_COMPILE=arm-none-eabi- all`.
+`-Bnkwp` prints each command of the build and runs none, and the data base
+of each make. fw-context reads the compile commands from that log
+(`LC_ALL=C`, thus the lines `Entering directory` of a recursive make are in
+English). Dry-run mode runs no command of a goal. But make runs the recipe
+of each included makefile that has a rule, as each `make -n` does, and `-B`
+makes each such makefile out of date: a rule `%.d: %.c` writes its `.d`
+files. Set `make_dry_run = false`
+when the project needs generated headers first, and name the output
+variable of the Makefile in `out_dir_var`. fw-context then reads the log
+one time before the build: a compile or a link that writes outside the
+output directory stops the run before `make` runs. Then it runs `make`, and
+reads the log again. This build system needs GNU make and no other tool.
+
+fw-context reads each command by the rules of the shell that make uses for
+it. The data base of each make gives its `SHELL`:
+
+- POSIX: a POSIX shell (`sh`, `bash`, `dash`, `ash`, `ksh`, `mksh`, `zsh`,
+  `yash`, `posh`).
+- Windows: `sh.exe` when make finds it in the directory of the make or on
+  `PATH`, else `cmd.exe`. As GNU make does, fw-context reads a line without
+  a special character of that shell by the rules of make, because make
+  runs such a line without a shell.
+
+fw-context knows a compiler by its name: `gcc`, `g++`, `cc`, `c++`,
+`clang`, `clang++`, with a target prefix (`arm-none-eabi-gcc`), a version
+suffix and `.exe`. Before the compiler, these can come:
+
+- Variable assignments (`CCACHE_DIR=x`, POSIX shell).
+- The wrappers `env`, `exec`, `command`, `nice`, `nohup`, `time` and
+  `timeout`.
+- One launcher: `ccache`, `sccache`, `distcc`, `icecc` or `buildcache`.
+
+Each source of a command is an entry. A file that the build compiles more
+than once keeps the entry of its last compile. A source that does not exist
+is left out: a dry run can print the compile of a file that an earlier step
+would make. A recipe that `make -n` does not print gives no entry.
+
+The reader takes each command of a line as successful, as `make -n` takes
+each line of a recipe. Thus a compile after `&&` is in the database. These
+stop the run with an error, because the database would hold a guess:
+
+- A compile that the shell runs only under a condition: after `||`, in a
+  branch of `if`, or in a loop.
+- A compile in a directory that the shell computes (`cd $$dir`), or with a
+  word that the shell computes (`$$x`, `$$(...)`, a glob such as `*.c`).
+- A command whose program the shell computes (`$$CC`).
+- A line out of the grammar of the reader (`case`, a here-document, `if`
+  and `for` of `cmd.exe`) that names a compiler.
+- `.ONESHELL`, a target or a pattern that sets its own `SHELL`, and a
+  sub-make with `--no-print-directory`.
+- A make of MSYS2 or Cygwin: it prints paths of its own.
+
+Other programs that run a command (`xargs`, `sh -c`, `find -exec`) are not
+followed: their compiles are not in the database. The log does not tell
+the output of `$(info ...)` from a command: a line of `$(info ...)` that
+reads as a compile of an existing source gives an entry.
 
 ### 8. ESP-IDF with explicit path
 
@@ -860,17 +923,21 @@ setup script. fw-context must source this script before `west build`.
 
 1. An `activate` that the config already holds. A new run of
    `fw-context init` shows it and keeps it by default.
-2. The Zephyr SDK of the current environment: the `environment-setup-*`
+2. An upstream Zephyr workspace: a `ZEPHYR_BASE` in `[build] env`, or a
+   `ZEPHYR_BASE` of your shell that is a directory and that no nRF Connect
+   SDK of `nrfutil sdk-manager list` holds. See
+   [Upstream Zephyr without NCS](#upstream-zephyr-without-ncs).
+3. The Zephyr SDK of the current environment: the `environment-setup-*`
    script of `ZEPHYR_SDK_INSTALL_DIR`. Not on Windows: it is a shell script.
-3. The nRF Connect SDK versions that `nrfutil sdk-manager list` gives. You
+4. The nRF Connect SDK versions that `nrfutil sdk-manager list` gives. You
    select the version, and `fw-context init` writes
    `.fw-context/ncs-env.sh` from `nrfutil sdk-manager toolchain env` and
    `ZEPHYR_BASE`. On Windows it writes `.fw-context/ncs-env.cmd`, which runs
    `nrfutil sdk-manager toolchain env --as-script cmd` each time. The
    default version comes from `ZEPHYR_BASE` of your shell.
-4. `zephyr-env.sh` in the `ZEPHYR_BASE` of your shell (`zephyr-env.cmd` on
+5. `zephyr-env.sh` in the `ZEPHYR_BASE` of your shell (`zephyr-env.cmd` on
    Windows), or `~/zephyr-sdk-*/environment-setup-*` (not on Windows).
-5. When it finds nothing, `fw-context init` asks for the path of the
+6. When it finds nothing, `fw-context init` asks for the path of the
    script.
 
 The detection does not run `west`: it runs before the environment of the
@@ -909,6 +976,46 @@ bash -c "source /path/to/setup.sh && west build -b nrf52840dk ..."
 fw-context also looks for `west` after it sources the script, thus `west`
 must be on the `PATH` that the script gives (see [General](#general)).
 
+#### Upstream Zephyr without NCS
+
+Zephyr does not need the nRF Connect SDK. In an upstream workspace, your
+shell sets `ZEPHYR_BASE` (`zephyr-env.sh`), and the venv of the workspace
+puts `west` on `PATH`. The build needs no script: the CMake package of the
+Zephyr SDK finds its host tools through `ZEPHYR_SDK_INSTALL_DIR`. The
+Zephyr SDK 1.0 has no `environment-setup-*` script at all.
+
+`fw-context init` writes the environment of your shell into
+`.fw-context/local.toml`:
+
+- `[build] env` gets `ZEPHYR_BASE`, and `ZEPHYR_SDK_INSTALL_DIR` and
+  `ZEPHYR_TOOLCHAIN_VARIANT` when your shell sets them.
+- `[build] extra_path` gets the directory of the `west` of your shell.
+  Without a `west` on `PATH`, `init` writes no `extra_path` and tells you.
+  Activate the venv of the workspace, and run `fw-context init` again.
+
+`init` writes an absolute path, because a build runs in a different
+directory than your shell. A value that the config already holds stays:
+`init` tells you when your shell has a different value. When the
+`ZEPHYR_BASE` of your shell names a different workspace, `init` asks if it
+must use that workspace (No by default, and No without a terminal). Yes
+replaces the three variables in `local.toml`.
+
+```toml
+[build]
+extra_path = ["/home/user/zephyrproject/.venv/bin"]
+
+[build.env]
+ZEPHYR_BASE = "/home/user/zephyrproject/zephyr"
+ZEPHYR_SDK_INSTALL_DIR = "/home/user/zephyr-sdk-1.0.1"
+ZEPHYR_TOOLCHAIN_VARIANT = "zephyr"
+```
+
+The config, and not your shell, gives the build its environment: a build
+in the background (the daemon of an MCP client) does not have the
+environment of your shell. `env` and `extra_path` apply on Linux, macOS
+and Windows in the same way. For a sysbuild, also set `sysbuild = true`
+(see [Zephyr](#zephyr)).
+
 The vendor boundary of a Zephyr project comes from the build: the
 `-fmacro-prefix-map` flags in `compile_commands.json` name `ZEPHYR_BASE`
 and `WEST_TOPDIR`. `CONFIG_BUILD_OUTPUT_STRIP_PATHS` (default `y`) adds
@@ -926,11 +1033,16 @@ activate = "/home/user/esp/esp-idf/export.sh"
 
 `fw-context init` finds the script in this order:
 
-1. A `~/.espressif/tools/activate_idf_*.sh` of the Espressif Installation
-   Manager (EIM), the last one in name order (not on Windows)
-2. `export.sh` in `$IDF_PATH`
+1. The ESP-IDF of your shell (`$IDF_PATH`): the
+   `~/.espressif/tools/activate_idf_*.sh` script of the Espressif
+   Installation Manager (EIM) that sets up this ESP-IDF, else `export.sh`
+   in `$IDF_PATH`
+2. The EIM script of the newest ESP-IDF version (not on Windows)
 3. `~/esp/esp-idf/export.sh`
 4. `~/esp-idf/export.sh`.
+
+Thus the index uses the ESP-IDF that your shell uses. To use a different
+ESP-IDF, set `activate` in `local.toml`.
 
 On Windows it looks for `export.bat` in the same directories.
 
@@ -1052,23 +1164,14 @@ sudo pacman -S bear        # Arch / Manjaro
 sudo apt install bear      # Debian / Ubuntu
 ```
 
-### `compiledb: command not found`
+### `make -Bnkwp -j1 printed no compile command`
 
-fw-context looks for `compiledb` in this order:
-
-1. `<[build] python> -m compiledb`, when you set `[build] python`
-2. `<interpreter that runs fw-context> -m compiledb`, when that interpreter
-   can import `compiledb`
-3. `compiledb` on `PATH`
-
-When all three fail, the error names each of them. Install `compiledb`
-into the environment that runs fw-context:
-
-```bash
-python -m pip install compiledb
-```
-
-Or use `bear` with a custom command: `[build] command = "bear -- make"`.
+The log of `make -Bnkwp` held no compile command of an existing source.
+The target (`make_target`) compiles nothing, the Makefile names the
+compiler with a name that fw-context does not know as a compiler (see
+[example 7](#7-makefile-dry-run)), or the sources are generated: set
+`make_dry_run = false` and `out_dir_var`, thus a real build makes them
+first.
 
 ### A build fails or times out
 
@@ -1127,8 +1230,8 @@ With `activate`, the error names the script:
 the script that sets up the environment of the project.
 
 Without `activate`, the error is `west is required`. Set `activate` to the
-script that sets up the environment of the project, or put `west` on the
-`PATH` of the build. `fw-context init` finds the script in the order of
+script that sets up the environment of the project, or put the directory
+of `west` into `[build] extra_path`. `fw-context init` finds the script in the order of
 [example 13](#13-build-environment--activation-script-for-zephyrncs).
 
 To set the activation script manually, edit `.fw-context/local.toml`:

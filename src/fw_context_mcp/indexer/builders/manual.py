@@ -14,11 +14,10 @@ from __future__ import annotations
 
 import json
 import logging
-import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from fw_context_mcp.utils import TU_EXTENSIONS, cc_output_path, run_build_command
+from fw_context_mcp.utils import TU_EXTENSIONS, cc_output_path, require_build_tool, run_build_command
 
 from ..build_layout import BuildLayout
 from . import registry
@@ -76,8 +75,8 @@ class ManualBuildSystem:
     ``[build] system = "bare"`` in their config.
 
     WHY manual mode: some projects have no standard build system (e.g., a
-    handful of .c files with a handwritten Makefile that doesn't support
-    ``compiledb``).  Manual mode lets these projects still benefit from
+    handful of .c files and no Makefile, or a Makefile whose log of
+    ``make -n`` names no compile command).  Manual mode lets these projects still benefit from
     fw-context indexing by specifying source directories, include paths,
     and defines directly in config.toml.
 
@@ -133,13 +132,11 @@ class ManualBuildSystem:
 
         flags = _build_flags(cfg)
         compiler_name = cfg.compiler or "gcc"
-        compiler_path = shutil.which(compiler_name)
-        if compiler_path is None:
-            raise RuntimeError(
-                f"Compiler '{compiler_name}' not found in PATH. "
-                "Install gcc or set [build] compiler in .fw-context/config.toml"
-            )
-        compiler = str(compiler_path)
+        # The PATH of the build (activate, extra_path), not of this process.
+        compiler = require_build_tool(
+            compiler_name, root, cfg,
+            "Install gcc, or set [build] compiler (or [build] extra_path) in .fw-context/config.toml.",
+        )
 
         # Compile each source with -MD -MF -fsyntax-only to generate .d files.
         # -fsyntax-only: check syntax but produce no object file (fast).

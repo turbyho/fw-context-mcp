@@ -62,6 +62,7 @@ import time
 from collections.abc import Callable, Collection, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 
 from ..mcp.shared.pid_file import PidFile
@@ -445,14 +446,17 @@ def _step_update_manifest(conn: sqlite3.Connection, ctx: dict) -> None:
                 flagged,
             )
     # Each run, also a run that parsed nothing: the rows of an older index
-    # stay without a hash until something writes them.
-    _backfill_header_source_hashes(
-        conn,
-        config_hash,
-        ctx["project_root"],
-        ctx["effective_manifest"],
-        hash_cache=ctx.get("header_hash_cache"),
-    )
+    # stay without a hash until something writes them.  In a transaction of
+    # its own: the writes stayed open, and the first later step that rolled
+    # back its own transaction (macros, finalize_manifest) took them too.
+    with transaction(conn):
+        _backfill_header_source_hashes(
+            conn,
+            config_hash,
+            ctx["project_root"],
+            ctx["effective_manifest"],
+            hash_cache=ctx.get("header_hash_cache"),
+        )
 
 
 def _build_coverage_set(units: list, manifest: dict | None, project_root: Path) -> set[str] | None:
@@ -618,47 +622,66 @@ def _step_resolve_slots(conn: sqlite3.Connection, ctx: dict) -> None:
 
 
 def _needs_macros(ctx: dict) -> bool:
-    """Say if the expanded values of the macros can differ from the last run.
+    """Say if the values of the macros can differ from the last run.
 
-    They come from the units (``clang -dM -E`` of each one), and a value
-    goes to every row of its name, thus the last unit that defines a name
-    gives the value.  The values change only when a unit was re-parsed (its
-    source, its headers or its flags changed, or the build is new) or when
-    a file left the index.  Otherwise the step gives the stored values
-    again: measured on a Mbed project of 878 units, 104 s in each run that
-    changed nothing.  A partial step over the re-parsed units would give
-    another last unit, thus the step runs over all units or not at all.
+    They come from the units (``clang -dM -E`` of each one), and the value
+    of a row is the definition of its name at the end of each unit that
+    reads its file (``macros.store_values_of_build``).  The values change
+    only when a unit was re-parsed (its source, its headers or its flags
+    changed, or the build is new) or when a file left the index.  Otherwise
+    the step gives the stored values again: measured on a Mbed project of
+    878 units, 104 s in each run that changed nothing.  A partial step over
+    the re-parsed units cannot give the value of a row that an unchanged
+    unit reads too, thus the step runs over all units or not at all.
 
-    ``pending_run`` says that an earlier run of the build stored rows and
-    stopped before this step: its units now read as unchanged (the manifest
-    checkpoint), and their values are not in the index (see ``_run_marker``).
+    ``pending_run`` says that rows of the build exist that no macros step
+    saw (``_run_marker``): an earlier run stored rows and stopped before
+    this step, or its macros step failed, or ``reindex_file`` stored rows.
+    Their units now read as unchanged, and their values are not in the
+    index.
     """
     return bool(ctx.get("updated")) or bool(ctx.get("removed_files")) or bool(ctx.get("pending_run"))
 
 
-def _step_expand_macros(conn: sqlite3.Connection, ctx: dict) -> None:
-    """Resolve and store expanded macro values (libclang-powered)."""
-    from .macros import resolve_and_update
+@dataclass(frozen=True)
+class PostprocessOutcome:
+    """What the runner needs of the post-processing: the steps that failed, and the units with no macro answer."""
 
-    # Process all TUs — different TUs include different headers,
-    # so each contributes a different set of expanded macro values.
-    # Deduplicating by flags would miss macros only visible from
-    # TUs that include project config headers.
-    for unit in ctx["units"]:
-        try:
-            # The directory of the compilation (the "directory" of its entry
-            # in compile_commands.json): a relative path in the flags is
-            # relative to it, as for the compiler, and as the preprocessor of
-            # the assembly units runs it.  The project root is the directory
-            # only when the build ran there.
-            resolve_and_update(
-                conn, ctx["config_hash"], unit.clang_args,
-                unit.file.resolve(), cwd=unit.directory or ctx.get("project_root"),
-            )
-        except SAFE_EXCEPT as e:
-            if is_fatal(e):
-                raise
-            pass  # libclang/SQLite fallback
+    failed_steps: frozenset[str]
+    macro_no_answer: tuple[tuple[str, str], ...]
+
+
+def _step_expand_macros(conn: sqlite3.Connection, ctx: dict) -> None:
+    """Store the value of each macro row: the definition of its name at the end of each unit that reads its file.
+
+    Each unit of the build runs ``clang -dM -E`` once
+    (``macros.store_values_of_build``).  A unit with no answer is a
+    warning with its reason, its rows say ``no_answer``, and the step puts
+    the units in ``ctx["macros_no_answer"]``: the runner then writes them
+    into the marker of the run, thus the next run asks again and the state
+    of the index names them (``_run_postprocess``).  WHY no
+    silent ``pass``: an error of a unit or of SQLite left the values of the
+    run before, or none, and no line said so.  An error of SQLite goes to
+    the loop of the steps, which logs it.
+    """
+    from .macros import store_values_of_build
+
+    # The writes of the steps before (the backfill of the header hashes)
+    # are not committed yet: an error of this step must not roll them back.
+    conn.commit()
+    with transaction(conn):
+        report = store_values_of_build(
+            conn, ctx["config_hash"], ctx["units"], ctx["project_root"],
+            manifest=ctx.get("effective_manifest"), flags_hashes=ctx.get("flags_hashes"),
+        )
+    ctx["macros_no_answer"] = tuple(report.no_answer)
+    if report.no_answer:
+        shown = "; ".join(f"{key}: {reason}" for key, reason in report.no_answer[:3])
+        more = f" (and {len(report.no_answer) - 3} more)" if len(report.no_answer) > 3 else ""
+        log.warning(
+            "Macro values: %d of %d units gave no definitions, their macro rows say no_answer — %s%s",
+            len(report.no_answer), report.units, shown, more,
+        )
 
 
 def _step_build_embeddings(conn: sqlite3.Connection, ctx: dict) -> None:
@@ -1365,7 +1388,7 @@ _STEPS: list[tuple[str, Callable[..., None], Callable[..., bool] | None]] = [
     ("manifest",         _step_update_manifest,    None),
     ("generated_flag",   _step_reconcile_generated, None),
     ("coverage_purge",   _step_purge_files_outside_build, None),
-    ("macros",           _step_expand_macros,      lambda c: c["index_macros_expanded"] and c["units"] and _needs_macros(c)),
+    ("macros",           _step_expand_macros,      lambda c: c["units"] and _needs_macros(c)),
     ("internal_usrs",    _step_internal_usrs,       lambda c: c["index_refs"]),
     ("slot_edges",       _step_resolve_slots,       lambda c: c["index_refs"]),
     ("llm_analysis",     _step_llm_analysis,       lambda c: c["analyze_symbols"] and c["llm_config"] is not None and c["llm_config"].enabled),
@@ -1385,7 +1408,7 @@ def _run_postprocess(
     project_root: Path,
     db_dir: Path,
     units: list,
-    tu_headers: dict,
+    tu_headers: dict[int, list[dict]],
     manifest: dict | None,
     compile_commands: Path,
     updated: int,
@@ -1399,7 +1422,6 @@ def _run_postprocess(
     asm_paths: set[str] | None = None,
     index_refs: bool,
     index_embeddings: bool,
-    index_macros_expanded: bool,
     analyze_symbols: bool,
     analyze_vendor: bool,
     llm_config=None,
@@ -1415,14 +1437,14 @@ def _run_postprocess(
     defer_fts: bool = False,
     defer_cleanup: bool = False,
     header_hash_cache: dict[str, str] | None = None,
-    reparsed_tus: Mapping[str, str] | None = None,
+    reparsed_tus: Mapping[int, str] | None = None,
     transient_defines: Collection[str],
     pending_run: bool = False,
     flags_hashes: list[str] | None = None,
     odr_pending: frozenset[str] = frozenset(),
     failed_units: frozenset[str] = frozenset(),
-) -> None:
-    """Run all post-processing phases via a data-driven pipeline.
+) -> PostprocessOutcome:
+    """Run all post-processing phases via a data-driven pipeline, and return what the runner needs of it.
 
     Each step in ``_STEPS`` is executed in order.  Conditional steps
     are skipped when their guard returns ``False``.
@@ -1437,6 +1459,14 @@ def _run_postprocess(
       miss symbols.
     - *Non-critical*: the error is logged at WARNING level, and the stamp
       does not change.
+
+    The outcome (:class:`PostprocessOutcome`) holds the steps that failed
+    and the units to which the macros step had no answer.  WHY: the runner
+    keeps the marker of the run (``_run_marker``) when the ``macros`` step
+    failed, and writes the units into it when a unit gave no answer.  That
+    step runs only on a signal (``_needs_macros``), and the next run, which
+    parses nothing, had no signal: the values of the macros stayed empty,
+    or stayed ``no_answer``, also after the cause went away.
     """
     ctx = {
         "config_hash": config_hash,
@@ -1457,7 +1487,6 @@ def _run_postprocess(
         "git_head": git_head,
         "index_refs": index_refs,
         "index_embeddings": index_embeddings,
-        "index_macros_expanded": index_macros_expanded,
         "analyze_symbols": analyze_symbols,
         "analyze_vendor": analyze_vendor,
         "llm_config": llm_config,
@@ -1501,6 +1530,7 @@ def _run_postprocess(
     # after failed embeddings.
     failed_critical: set[str] = set()
     ctx["failed_critical"] = failed_critical
+    failed_steps: set[str] = set()
     critical_steps = {"embeddings"}
     # A failed full-text index stops the run: each text search of the build
     # then misses, and the integrity check does not see a table that the
@@ -1521,6 +1551,7 @@ def _run_postprocess(
         except SAFE_EXCEPT as e:
             if is_fatal(e) or step_name in fatal_steps:
                 raise
+            failed_steps.add(step_name)
             if step_name in critical_steps:
                 failed_critical.add(step_name)
                 log.error("Postprocess CRITICAL step %s failed: %s", step_name, e)
@@ -1538,4 +1569,5 @@ def _run_postprocess(
             clear_embedding_stash(conn)
     except WriteLockTimeout as e:
         log.warning("The embedding stash stays until the next index run: %s", e)
+    return PostprocessOutcome(frozenset(failed_steps), tuple(ctx.get("macros_no_answer", ())))
 

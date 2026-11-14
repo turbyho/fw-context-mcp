@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._toolchains import unit_of
+
 SOURCE = """\
 static int helper(int v) { return v + 1; }
 int caller(int v) { return helper(v); }
@@ -20,13 +22,12 @@ int caller(int v) { return helper(v); }
 
 
 @pytest.mark.libclang
-def test_a_source_gone_after_the_parse_does_not_stop_the_extraction(tmp_path: Path, monkeypatch):
-    from fw_context_mcp.indexer.compile_commands import CompilationUnit
+def test_a_source_gone_after_the_parse_does_not_stop_the_extraction(tmp_path: Path, monkeypatch, toolchain):
     from fw_context_mcp.indexer.symbols import extract_all
 
     src = tmp_path / "unit.c"
     src.write_text(SOURCE, encoding="utf-8")
-    unit = CompilationUnit(file=src, directory=tmp_path, language="c", clang_args=["-std=gnu11"])
+    unit = unit_of(src, toolchain, ["-std=gnu11"], directory=tmp_path, language="c")
     read_text = Path.read_text
 
     def gone(self: Path, *args, **kwargs) -> str:

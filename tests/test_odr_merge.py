@@ -12,14 +12,14 @@ rows change.
 from __future__ import annotations
 
 import functools
-import json
 import shutil
 import sqlite3
 from pathlib import Path
 
 import pytest
 
-pytest.importorskip("clang.cindex", reason="libclang not available")
+from tests._toolchains import Toolchain, write_compile_commands, write_sources
+
 pytestmark = pytest.mark.libclang
 
 PARSER = (
@@ -43,15 +43,13 @@ IMPL = (
 )
 
 
-def _write(root: Path, files: dict[str, str], units: list[str]) -> None:
-    for file, text in files.items():
-        (root / file).parent.mkdir(parents=True, exist_ok=True)
-        (root / file).write_text(text, encoding="utf-8")
-    (root / "compile_commands.json").write_text(json.dumps([
+def _write(root: Path, toolchain: Toolchain, files: dict[str, str], units: list[str]) -> None:
+    write_sources(root, files)
+    write_compile_commands(root / "compile_commands.json", [
         {"directory": str(root), "file": file,
-         "arguments": (["cc", "-std=gnu11"] if file.endswith(".c") else ["c++", "-std=c++17"]) + ["-c", file]}
+         "arguments": toolchain.arguments(file, "-std=gnu11" if file.endswith(".c") else "-std=c++17")}
         for file in units
-    ]), encoding="utf-8")
+    ])
 
 
 def _run(root: Path, db: str = "db") -> Path:
@@ -131,16 +129,16 @@ def root(tmp_path: Path) -> Path:
     return path
 
 
-def _copies(root: Path, impl_header: str = "proj/p.h") -> None:
-    _write(root, {
+def _copies(root: Path, toolchain: Toolchain, impl_header: str = "proj/p.h") -> None:
+    _write(root, toolchain, {
         "sdk/p.h": PARSER, "proj/p.h": PARSER,
         "user.cpp": USER.format(header="sdk/p.h"), "impl.cpp": IMPL.format(header=impl_header),
     }, ["impl.cpp", "user.cpp"])
 
 
-def test_a_copy_of_a_header_of_a_cpp_class_is_one_class(root):
+def test_a_copy_of_a_header_of_a_cpp_class_is_one_class(root, toolchain):
     """The caller of the copy of the SDK reaches the method that the unit of the copy in the project defines."""
-    _copies(root)
+    _copies(root, toolchain)
     db_path = _run(root)
     classes = _symbols(db_path, "drv::Parser")
     assert len(classes) == 1 and classes[0][0] == "c:@N@drv@S@Parser", classes
@@ -151,22 +149,22 @@ def test_a_copy_of_a_header_of_a_cpp_class_is_one_class(root):
     assert len(marks) == 2 and not pending, "two places of `Parser`"
 
 
-def test_the_merged_index_has_the_calls_and_the_slots_of_one_header(root, tmp_path):
+def test_the_merged_index_has_the_calls_and_the_slots_of_one_header(root, tmp_path, toolchain):
     """The copy gives the edges that one header gives, the slot of `oob::cb` too."""
-    _copies(root)
+    _copies(root, toolchain)
     merged = _calls(_run(root))
     one = tmp_path / "one"
     one.mkdir()
-    _write(one, {
+    _write(one, toolchain, {
         "sdk/p.h": PARSER, "user.cpp": USER.format(header="sdk/p.h"), "impl.cpp": IMPL.format(header="sdk/p.h"),
     }, ["impl.cpp", "user.cpp"])
     assert merged == _calls(_run(one, "db_one"))
     assert ("drv::Parser::poll", "handler", 1) in merged
 
 
-def test_two_c_structs_of_one_name_in_two_files_stay_two(root):
+def test_two_c_structs_of_one_name_in_two_files_stay_two(root, toolchain):
     """C: a tag has no linkage, thus the copies of a header that only C units read are two types."""
-    _write(root, {
+    _write(root, toolchain, {
         "sdk/q.h": "struct cfg { int x; };\n", "proj/q.h": "struct cfg { int x; };\n",
         "a.c": '#include "sdk/q.h"\nint a(struct cfg *c) { return c->x; }\n',
         "b.c": '#include "proj/q.h"\nint b(struct cfg *c) { return c->x; }\n',
@@ -176,9 +174,9 @@ def test_two_c_structs_of_one_name_in_two_files_stay_two(root):
     assert _odr(db_path) == (set(), set())
 
 
-def test_a_c_header_that_cpp_units_read_follows_the_odr(root):
+def test_a_c_header_that_cpp_units_read_follows_the_odr(root, toolchain):
     """The copies of a C header that C++ units read: C++ makes the two definitions one type."""
-    _write(root, {
+    _write(root, toolchain, {
         "sdk/q.h": "struct cfg { int x; };\n", "proj/q.h": "struct cfg { int x; };\n",
         "a.cpp": '#include "sdk/q.h"\nint a(cfg *c) { return c->x; }\n',
         "b.cpp": '#include "proj/q.h"\nint b(cfg *c) { return c->x; }\n',
@@ -187,9 +185,9 @@ def test_a_c_header_that_cpp_units_read_follows_the_odr(root):
     assert [row[0] for row in _symbols(db_path, "cfg")] == ["c:@S@cfg"]
 
 
-def test_one_header_of_c_and_cpp_units_is_one_type(root):
+def test_one_header_of_c_and_cpp_units_is_one_type(root, toolchain):
     """One place: one USR in the two languages, and no merge."""
-    _write(root, {
+    _write(root, toolchain, {
         "q.h": "struct cfg { int x; };\n",
         "a.c": '#include "q.h"\nint a(struct cfg *c) { return c->x; }\n',
         "b.cpp": '#include "q.h"\nint b(cfg *c) { return c->x; }\n',
@@ -201,7 +199,7 @@ def test_one_header_of_c_and_cpp_units_is_one_type(root):
 
 
 @pytest.mark.parametrize("c_unit", ["a.c", "z.c"])
-def test_a_struct_in_a_struct_follows_the_merge_of_its_struct_for_each_claim_order(root, c_unit):
+def test_a_struct_in_a_struct_follows_the_merge_of_its_struct_for_each_claim_order(root, c_unit, toolchain):
     """`A::B` of two copies is one type, also when a C unit claims a copy.
 
     libclang gives a struct in a struct the key `c:@S@B` in C and
@@ -211,7 +209,7 @@ def test_a_struct_in_a_struct_follows_the_merge_of_its_struct_for_each_claim_ord
     type, and the key of `A` is one text in C and in C++.
     """
     header = "#pragma once\nstruct A { struct B { int x; } b; int y; };\n"
-    _write(root, {
+    _write(root, toolchain, {
         "sdk/p.h": header, "proj/p.h": header,
         c_unit: '#include "sdk/p.h"\nint ca(struct A *a) { return a->b.x; }\n',
         "u.cpp": '#include "sdk/p.h"\nint cu(A &a) { return a.b.x + a.y; }\n',
@@ -225,14 +223,14 @@ def test_a_struct_in_a_struct_follows_the_merge_of_its_struct_for_each_claim_ord
     assert {key for key, _ in _odr(db_path)[0]} == {"c:@S@A"}, "only a type outside a type has places to merge"
 
 
-def test_partial_specializations_with_one_usr_stay_two(root):
+def test_partial_specializations_with_one_usr_stay_two(root, toolchain):
     """libclang gives two partial specializations that differ in the qualifier of a function type one USR."""
     header = (
         "template <class> struct is_fn;\n"
         "template <class R, class... A> struct is_fn<R(A...)> { static const int v = 1; };\n"
         "template <class R, class... A> struct is_fn<R(A...) const> { static const int v = 2; };\n"
     )
-    _write(root, {
+    _write(root, toolchain, {
         "t.h": header,
         "a.cpp": '#include "t.h"\nint a() { return is_fn<int()>::v; }\n',
         "b.cpp": '#include "t.h"\nint b() { return is_fn<int() const>::v; }\n',
@@ -245,9 +243,9 @@ def test_partial_specializations_with_one_usr_stay_two(root):
     assert _odr(db_path) == (set(), set())
 
 
-def test_a_copy_that_comes_and_goes_gives_the_index_of_a_full_run(root):
+def test_a_copy_that_comes_and_goes_gives_the_index_of_a_full_run(root, toolchain):
     """An incremental run merges and divides again, also the rows of a unit that it did not change."""
-    _copies(root, impl_header="sdk/p.h")
+    _copies(root, toolchain, impl_header="sdk/p.h")
     _run(root)
     assert _odr(root.parent / "db" / "index.db") == (set(), set())
 
@@ -262,13 +260,13 @@ def test_a_copy_that_comes_and_goes_gives_the_index_of_a_full_run(root):
     assert _state(incremental) == _state(_run(root, "db_full_2"))
 
 
-def test_the_copy_with_the_row_of_a_merged_class_leaves_and_the_others_store_it_again(root):
+def test_the_copy_with_the_row_of_a_merged_class_leaves_and_the_others_store_it_again(root, toolchain):
     """Three copies merge `Parser`, and the row of the class is the one of `x/p.h`: its unit leaves the build.
 
     The other two copies stay merged, thus their merge does not change, but
     their units lost the conflict of the row and must store the class.
     """
-    _write(root, {
+    _write(root, toolchain, {
         "sdk/p.h": PARSER, "proj/p.h": PARSER, "x/p.h": PARSER,
         "a_x.cpp": '#include "x/p.h"\nint ax(drv::Parser &p) { return p.send(2); }\n',
         "impl.cpp": IMPL.format(header="proj/p.h"), "user.cpp": USER.format(header="sdk/p.h"),
@@ -277,14 +275,14 @@ def test_the_copy_with_the_row_of_a_merged_class_leaves_and_the_others_store_it_
     assert len(_odr(db_path)[0]) == 3
     assert _symbols(db_path, "drv::Parser") == [("c:@N@drv@S@Parser", "x/p.h", 1)]
 
-    _write(root, {}, ["impl.cpp", "user.cpp"])
+    _write(root, toolchain, {}, ["impl.cpp", "user.cpp"])
     incremental = _run(root)
     assert [file for _, file, _ in _symbols(incremental, "drv::Parser")] in (["proj/p.h"], ["sdk/p.h"])
     assert _state(incremental) == _state(_run(root, "db_full"))
 
 
 @pytest.mark.parametrize("units", [["a.c", "ua.cpp", "ub.cpp"], ["ua.cpp", "ub.cpp", "a.c"]], ids=["c-first", "c-last"])
-def test_a_cpp_class_in_a_header_that_a_c_unit_reads_too_merges(root, units):
+def test_a_cpp_class_in_a_header_that_a_c_unit_reads_too_merges(root, units, toolchain):
     """The class of a copy is in `#ifdef __cplusplus`, and the C unit `a.c` sorts first by its path.
 
     The C++ units claim first (``db.claim_order``): `sdk/k.h` has the rows of
@@ -295,7 +293,7 @@ def test_a_cpp_class_in_a_header_that_a_c_unit_reads_too_merges(root, units):
         "#pragma once\nstruct cfg { int x; };\n"
         "#ifdef __cplusplus\nnamespace drv { class K { public: int f(); }; }\n#endif\n"
     )
-    _write(root, {
+    _write(root, toolchain, {
         "sdk/k.h": header, "proj/k.h": header,
         "a.c": '#include "sdk/k.h"\nint a(struct cfg *c) { return c->x; }\n',
         "ua.cpp": '#include "sdk/k.h"\nint ua(drv::K &k) { return k.f(); }\n',
@@ -312,7 +310,7 @@ def test_a_cpp_class_in_a_header_that_a_c_unit_reads_too_merges(root, units):
 
 
 @pytest.mark.parametrize("merged", [False, True], ids=["one-file", "merged"])
-def test_a_type_in_a_struct_has_one_usr_in_c_and_in_cpp(root, merged):
+def test_a_type_in_a_struct_has_one_usr_in_c_and_in_cpp(root, merged, toolchain):
     """A C unit and the C++ owner of the header give one USR to each type in a struct, its fields and its constants.
 
     In C a type in the body of a struct has the scope of the file, and
@@ -335,7 +333,7 @@ def test_a_type_in_a_struct_has_one_usr_in_c_and_in_cpp(root, merged):
     if merged:
         files |= {"copy/h.h": header, "y.cpp": '#include "copy/h.h"\nint y(outer &o) { return o.in.v; }\n'}
         units.append("y.cpp")
-    _write(root, files, units)
+    _write(root, toolchain, files, units)
     db_path = _run(root)
     assert _rows(db_path, "SELECT owner_path FROM header_owners WHERE path = 'h.h'") == [("z.cpp",)]
     assert {key for key, _ in _odr(db_path)[0]} == ({"c:@S@outer"} if merged else set())
@@ -356,11 +354,11 @@ def test_a_type_in_a_struct_has_one_usr_in_c_and_in_cpp(root, merged):
         ), name
 
 
-def test_a_definition_that_moves_in_its_file_gives_the_merge_of_a_full_run(root):
+def test_a_definition_that_moves_in_its_file_gives_the_merge_of_a_full_run(root, toolchain):
     """The merge names a file, not a line: a moved class changes no decision, and no unit is parsed two times."""
     from fw_context_mcp.indexer import runner
 
-    _copies(root)
+    _copies(root, toolchain)
     _run(root)
     before = _odr(root.parent / "db" / "index.db")
     (root / "proj" / "p.h").write_text("// The copy of the project.\n" + PARSER, encoding="utf-8")
@@ -383,10 +381,10 @@ def test_a_definition_that_moves_in_its_file_gives_the_merge_of_a_full_run(root)
     assert _state(incremental) == _state(full)
 
 
-def test_an_explicit_specialization_in_a_copy_of_a_header_is_one_type(root):
+def test_an_explicit_specialization_in_a_copy_of_a_header_is_one_type(root, toolchain):
     """The key of a specialization holds its canonical type: two copies of `H<int>` are one class."""
     header = "template <class T> struct H { int g(); };\ntemplate <> struct H<int> { int f(); };\n"
-    _write(root, {
+    _write(root, toolchain, {
         "sdk/h.h": header, "proj/h.h": header,
         "user.cpp": '#include "sdk/h.h"\nint use(H<int> &h) { return h.f(); }\n',
         "impl.cpp": '#include "proj/h.h"\nint H<int>::f() { return 1; }\n',
@@ -396,7 +394,7 @@ def test_an_explicit_specialization_in_a_copy_of_a_header_is_one_type(root):
     assert len({row[0] for row in _rows(db_path, "SELECT usr FROM symbols WHERE name = 'f'")}) == 1
 
 
-def test_two_partial_specializations_of_one_usr_in_copies_of_a_header_stay_two(root):
+def test_two_partial_specializations_of_one_usr_in_copies_of_a_header_stay_two(root, toolchain):
     """The two copies of each specialization merge, and the two specializations stay two types."""
     header = (
         "template <class> struct is_fn;\n"
@@ -404,7 +402,7 @@ def test_two_partial_specializations_of_one_usr_in_copies_of_a_header_stay_two(r
         "template <class R, class... A> struct is_fn<R(A...) const> { struct In { int y; }; };\n"
     )
     use = "int {name}() {{ is_fn<int()>::In a{{1}}; is_fn<int() const>::In b{{2}}; return a.x + b.y; }}\n"
-    _write(root, {
+    _write(root, toolchain, {
         "sdk/t.h": header, "proj/t.h": header,
         "a.cpp": '#include "sdk/t.h"\n' + use.format(name="a"), "b.cpp": '#include "proj/t.h"\n' + use.format(name="b"),
     }, ["a.cpp", "b.cpp"])
@@ -415,11 +413,11 @@ def test_two_partial_specializations_of_one_usr_in_copies_of_a_header_stay_two(r
     assert len(_odr(db_path)[0]) == 4, "two specializations, each in two files; each `In` follows its specialization"
 
 
-def test_an_instance_of_a_merged_template_is_one_type(root):
+def test_an_instance_of_a_merged_template_is_one_type(root, toolchain):
     """`Box<int>` has the place of its pattern: the merge of the template merges the instance too."""
     header = "template <class T> struct Box { int get() { return 1; } };\n"
     use = "int {name}() {{ Box<int> box; return box.get(); }}\n"
-    _write(root, {
+    _write(root, toolchain, {
         "sdk/b.h": header, "proj/b.h": header,
         "a.cpp": '#include "sdk/b.h"\n' + use.format(name="a"), "b.cpp": '#include "proj/b.h"\n' + use.format(name="b"),
     }, ["a.cpp", "b.cpp"])
@@ -433,7 +431,7 @@ def test_an_instance_of_a_merged_template_is_one_type(root):
     assert sorted(callees) == [("c:@S@Box>#I@F@Box#",), ("c:@ST>1#T@Box@F@get#",)], callees
 
 
-def test_an_instance_has_one_usr_in_each_form_of_its_instantiation(root):
+def test_an_instance_has_one_usr_in_each_form_of_its_instantiation(root, toolchain):
     """`Box<int>` of an implicit instance, of `extern template` and of `template struct` is one type.
 
     libclang gives the definition of an instance the place of the declaration
@@ -441,7 +439,7 @@ def test_an_instance_has_one_usr_in_each_form_of_its_instantiation(root):
     instantiation.  The place of the template is the same in each unit.
     """
     use = "int {name}() {{ Box<int> b; b.v = 1; return Box<int>::count; }}\n"
-    _write(root, {
+    _write(root, toolchain, {
         "box.h": "#pragma once\ntemplate <class T> struct Box { T v; static int count; };\n"
                  "template <class T> int Box<T>::count = 0;\n",
         "box_ext.h": '#pragma once\n#include "box.h"\nextern template struct Box<int>;\n',
@@ -472,10 +470,10 @@ def test_an_instance_has_one_usr_in_each_form_of_its_instantiation(root):
     assert places == [("box.h",)], "the template has one place"
 
 
-def test_the_anonymous_members_of_a_merged_class_keep_their_places(root):
+def test_the_anonymous_members_of_a_merged_class_keep_their_places(root, toolchain):
     """Two anonymous unions of one struct have one USR of libclang: each keeps its place (a limit of the merge)."""
     header = "struct W { union { int first; }; union { int second; }; int w; };\n"
-    _write(root, {
+    _write(root, toolchain, {
         "sdk/w.h": header, "proj/w.h": header,
         "a.cpp": '#include "sdk/w.h"\nint a(W &w) { return w.first + w.second + w.w; }\n',
         "b.cpp": '#include "proj/w.h"\nint b(W &w) { return w.first + w.second + w.w; }\n',
@@ -486,10 +484,10 @@ def test_the_anonymous_members_of_a_merged_class_keep_their_places(root):
     assert len(unions) == 2, unions
 
 
-def test_the_unnamed_type_of_a_field_of_a_merged_class_keeps_the_place_of_each_copy(root):
+def test_the_unnamed_type_of_a_field_of_a_merged_class_keeps_the_place_of_each_copy(root, toolchain):
     """libclang writes the base name of the file and an offset: two same copies give one such USR with no file key."""
     header = "struct M { enum { M_ON, M_OFF } mode; int m; };\n"
-    _write(root, {
+    _write(root, toolchain, {
         "sdk/m.h": header, "proj/m.h": header,
         "a.cpp": '#include "sdk/m.h"\nint a(M &x) { return x.mode == M::M_ON ? x.m : 0; }\n',
         "b.cpp": '#include "proj/m.h"\nint b(M &x) { return x.mode == M::M_OFF ? x.m : 1; }\n',
@@ -502,10 +500,10 @@ def test_the_unnamed_type_of_a_field_of_a_merged_class_keeps_the_place_of_each_c
     assert len({row[0] for row in enums}) == 2, enums
 
 
-def test_a_type_of_an_anonymous_namespace_in_copies_of_a_header_is_no_merge(root):
+def test_a_type_of_an_anonymous_namespace_in_copies_of_a_header_is_no_merge(root, toolchain):
     """The compiler gives such a type internal linkage: each copy is a type of its own."""
     header = "namespace { struct X { int v; }; }\ninline int read(X &x) { return x.v; }\n"
-    _write(root, {
+    _write(root, toolchain, {
         "sdk/n.h": header, "proj/n.h": header,
         "a.cpp": '#include "sdk/n.h"\nint a() { X x{1}; return read(x); }\n',
         "b.cpp": '#include "proj/n.h"\nint b() { X x{2}; return read(x); }\n',
@@ -516,10 +514,10 @@ def test_a_type_of_an_anonymous_namespace_in_copies_of_a_header_is_no_merge(root
     assert len(types) == 2 and all("~n.h~" in row[0] for row in types), types
 
 
-def test_a_typedef_of_a_merged_class_is_one_member(root):
+def test_a_typedef_of_a_merged_class_is_one_member(root, toolchain):
     """libclang writes the file of each copy before a typedef of a class: the USR of the class names it."""
     header = "namespace drv {\nclass P { public: typedef int size_type; size_type n; };\n}\n"
-    _write(root, {
+    _write(root, toolchain, {
         "sdk/p.h": header, "proj/p.h": header,
         "a.cpp": '#include "sdk/p.h"\nint a(drv::P &p) { drv::P::size_type s = p.n; return s; }\n',
         "b.cpp": '#include "proj/p.h"\nint b(drv::P &p) { drv::P::size_type s = p.n; return s; }\n',
@@ -528,21 +526,21 @@ def test_a_typedef_of_a_merged_class_is_one_member(root):
     assert [row[0] for row in _symbols(db_path, "drv::P::size_type")] == ["c:@N@drv@S@P@T@size_type"]
 
 
-def test_a_type_of_a_union_template_is_a_member_of_the_template(tmp_path):
+def test_a_type_of_a_union_template_is_a_member_of_the_template(tmp_path, toolchain):
     """`@UT>` is the component of a union template: its place is in the USR, and in the USR of its members."""
     from fw_context_mcp.indexer._usr import file_key
     from tests.test_usr_file_key import _usrs
 
     source = tmp_path / "u.cpp"
-    source.write_text("template <class T> union Var { struct N { int n; }; int i; };\n", encoding="utf-8")
+    write_sources(tmp_path, {"u.cpp": "template <class T> union Var { struct N { int n; }; int i; };\n"})
     key = file_key(str(source))
-    assert _usrs(source, "CLASS_TEMPLATE", "Var") == [f"c:@UT>1#T@Var~{key}:1:26"]
-    assert _usrs(source, "STRUCT_DECL", "N") == [f"c:@UT>1#T@Var~{key}:1:26@S@N~{key}:1:39"]
+    assert _usrs(source, "CLASS_TEMPLATE", "Var", toolchain=toolchain) == [f"c:@UT>1#T@Var~{key}:1:26"]
+    assert _usrs(source, "STRUCT_DECL", "N", toolchain=toolchain) == [f"c:@UT>1#T@Var~{key}:1:26@S@N~{key}:1:39"]
 
 
-def test_two_types_of_one_name_in_two_main_files_stay_two(root):
+def test_two_types_of_one_name_in_two_main_files_stay_two(root, toolchain):
     """Only copies of a header merge: a helper struct of two `.cpp` files breaks the ODR, and the index shows it."""
-    _write(root, {
+    _write(root, toolchain, {
         "a.cpp": "struct Ctx { int a; };\nint a(Ctx &c) { return c.a; }\n",
         "b.cpp": "struct Ctx { float b; };\nfloat b(Ctx &c) { return c.b; }\n",
     }, ["a.cpp", "b.cpp"])
@@ -551,11 +549,11 @@ def test_two_types_of_one_name_in_two_main_files_stay_two(root):
     assert _odr(db_path) == (set(), set())
 
 
-def test_a_file_that_changes_during_the_run_leaves_the_units_to_the_next_run(root, monkeypatch):
+def test_a_file_that_changes_during_the_run_leaves_the_units_to_the_next_run(root, monkeypatch, toolchain):
     """The copy loses the class after the parse of the loop: no error, the next run gives the index of a full run."""
     from fw_context_mcp.indexer import runner
 
-    _copies(root, impl_header="sdk/p.h")
+    _copies(root, toolchain, impl_header="sdk/p.h")
     _run(root)
     (root / "impl.cpp").write_text(IMPL.format(header="proj/p.h"), encoding="utf-8")
     parse = runner._parse_unit
@@ -578,11 +576,11 @@ def test_a_file_that_changes_during_the_run_leaves_the_units_to_the_next_run(roo
     assert _state(repaired) == _state(_run(root, "db_full"))
 
 
-def test_a_run_whose_loop_stores_nothing_reports_the_units_of_the_merge(root, monkeypatch):
+def test_a_run_whose_loop_stores_nothing_reports_the_units_of_the_merge(root, monkeypatch, toolchain):
     """A unit that only the merge stores again counts as updated: the post-processing sees the change."""
     from fw_context_mcp.indexer import runner
 
-    _copies(root)
+    _copies(root, toolchain)
     db_path = _run(root)
     conn = sqlite3.connect(db_path)
     with conn:
@@ -600,7 +598,7 @@ def test_a_run_whose_loop_stores_nothing_reports_the_units_of_the_merge(root, mo
     assert seen == [2] and len(_odr(db_path)[0]) == 2
 
 
-def test_a_unit_whose_rows_hold_no_place_of_the_merge_is_not_parsed_again(root, monkeypatch):
+def test_a_unit_whose_rows_hold_no_place_of_the_merge_is_not_parsed_again(root, monkeypatch, toolchain):
     """`z_other.cpp` reads a copy of the header and names no type of it: the merge does not change its rows.
 
     `user.cpp` sorts before it and claims `sdk/p.h`, thus `z_other.cpp`
@@ -608,7 +606,7 @@ def test_a_unit_whose_rows_hold_no_place_of_the_merge_is_not_parsed_again(root, 
     """
     from fw_context_mcp.indexer import runner
 
-    _write(root, {
+    _write(root, toolchain, {
         "sdk/p.h": PARSER, "proj/p.h": PARSER,
         "user.cpp": USER.format(header="sdk/p.h"), "impl.cpp": IMPL.format(header="proj/p.h"),
         "z_other.cpp": '#include "sdk/p.h"\nint other() { return 0; }\n',
@@ -638,12 +636,12 @@ def test_a_unit_whose_rows_hold_no_place_of_the_merge_is_not_parsed_again(root, 
     assert sorted(parsed) == ["impl.cpp", "user.cpp", "z_other.cpp"]
 
     # A unit that leaves the build leaves no record of its places.
-    _write(root, {}, ["impl.cpp", "user.cpp"])
+    _write(root, toolchain, {}, ["impl.cpp", "user.cpp"])
     _run(root)
     assert _rows(db_path, "SELECT unit_path FROM odr_unit_places ORDER BY unit_path") == [("impl.cpp",), ("user.cpp",)]
 
 
-def test_a_unit_of_a_struct_in_a_struct_is_parsed_again_when_the_struct_around_it_merges(root):
+def test_a_unit_of_a_struct_in_a_struct_is_parsed_again_when_the_struct_around_it_merges(root, toolchain):
     """A body of `A` in an other file (`#include` in the body): the unit of `B` reads the merge of `A`.
 
     `u.cpp` claims `sdk/p.h`, and `z.c` names `B` and not `A`.  In C `B`
@@ -653,7 +651,7 @@ def test_a_unit_of_a_struct_in_a_struct_is_parsed_again_when_the_struct_around_i
     """
     header = '#pragma once\nstruct A {\n#include "body.inc"\n int y; };\n'
     body = "struct B { int x; } b;\n"
-    _write(root, {
+    _write(root, toolchain, {
         "sdk/p.h": header, "proj/p.h": header, "sdk/body.inc": body, "proj/body.inc": body,
         "u.cpp": '#include "sdk/p.h"\nint cu(A &a) { return a.y; }\n',
         "v.cpp": '#include "proj/p.h"\nint cv(A &a) { return a.y; }\n',
@@ -666,11 +664,11 @@ def test_a_unit_of_a_struct_in_a_struct_is_parsed_again_when_the_struct_around_i
     ], "`B` follows the merge of `A`: no place, and the USR of C++"
 
 
-def test_a_pending_unit_whose_second_parse_fails_again_stays_pending(root, monkeypatch):
+def test_a_pending_unit_whose_second_parse_fails_again_stays_pending(root, monkeypatch, toolchain):
     """The loop parses the pending unit, the merge changes again, and its second parse fails: it stays pending."""
     from fw_context_mcp.indexer import runner
 
-    _copies(root, impl_header="sdk/p.h")
+    _copies(root, toolchain, impl_header="sdk/p.h")
     _run(root)
     parse = runner._parse_unit
     calls: list[str] = []
@@ -707,11 +705,11 @@ def test_a_pending_unit_whose_second_parse_fails_again_stays_pending(root, monke
     assert _state(repaired) == _state(_run(root, "db_full"))
 
 
-def test_a_unit_that_failed_in_the_loop_is_not_parsed_by_the_merge(root, monkeypatch):
+def test_a_unit_that_failed_in_the_loop_is_not_parsed_by_the_merge(root, monkeypatch, toolchain):
     """Its claims of the run went to a later listing: it stays pending, and the next run parses it."""
     from fw_context_mcp.indexer import runner
 
-    _copies(root, impl_header="sdk/p.h")
+    _copies(root, toolchain, impl_header="sdk/p.h")
     _run(root)
     (root / "impl.cpp").write_text(IMPL.format(header="proj/p.h"), encoding="utf-8")
     (root / "user.cpp").write_text(USER.format(header="sdk/p.h") + "int more() { return 1; }\n", encoding="utf-8")
@@ -743,12 +741,12 @@ def _cli_project(cli_build, impl_header: str):
 
 
 @pytest.fixture
-def cli_build(tmp_path: Path):
+def cli_build(tmp_path: Path, toolchain: Toolchain):
     """Give a call that makes a project of the CLI (see `_cli_build`)."""
-    return functools.partial(_cli_build, tmp_path)
+    return functools.partial(_cli_build, tmp_path, toolchain)
 
 
-def _cli_build(tmp_path: Path, files: dict[str, str], units: list[str]):
+def _cli_build(tmp_path: Path, toolchain: Toolchain, files: dict[str, str], units: list[str]):
     """A project of the CLI with *files* and *units*, indexed once: the project, its database, and a call that indexes it.
 
     `fw-context index` starts no watcher daemon (only an MCP server starts
@@ -758,7 +756,7 @@ def _cli_build(tmp_path: Path, files: dict[str, str], units: list[str]):
 
     proj = tmp_path / "proj"
     proj.mkdir()
-    _write(proj, files, units)
+    _write(proj, toolchain, files, units)
     _isolate_index_db(proj, tmp_path)
     assert _cli(["init", "--project", str(proj)], cwd=proj, timeout=60).returncode == 0
     db_path = _db_path_for_project(proj)
@@ -772,8 +770,17 @@ def _cli_build(tmp_path: Path, files: dict[str, str], units: list[str]):
 
 
 def _same_as_a_full_run(db_path: Path, index) -> None:
-    """Index again from an empty index directory: the index must be the same as before."""
+    """Index again from an empty index directory: the index must be the same as before.
+
+    The connections of the query executors of this process close first, as
+    ``reset_index`` closes them before it deletes an index: ``reindex_file``
+    ran in this process, and its executor holds ``index.db`` open.  POSIX
+    deletes an open file; Windows refuses it (WinError 32).
+    """
+    from fw_context_mcp.mcp.shared.context import invalidate_executor
+
     incremental = _state(db_path)
+    invalidate_executor()
     for entry in db_path.parent.iterdir():
         if entry.is_dir() and not entry.is_symlink():
             shutil.rmtree(entry)
@@ -885,12 +892,12 @@ def test_reindex_file_that_changes_the_place_of_a_template_sends_the_unit_to_the
     _same_as_a_full_run(db_path, index)
 
 
-def test_the_delete_of_a_build_removes_the_rows_of_each_table_of_the_places(root, monkeypatch):
+def test_the_delete_of_a_build_removes_the_rows_of_each_table_of_the_places(root, monkeypatch, toolchain):
     """`delete_build_data` removes the definitions, the decisions, the pending units and the rows of the units."""
     from fw_context_mcp.indexer import runner
     from fw_context_mcp.indexer.db import delete_build_data, open_db
 
-    _write(root, {
+    _write(root, toolchain, {
         "fwd.h": FWD, "spec.h": SPEC, "sdk/p.h": PARSER, "proj/p.h": PARSER, "prim.h": PRIM,
         "impl.cpp": IMPL.format(header="proj/p.h"), "user.cpp": USER.format(header="sdk/p.h"),
         "x.cpp": SPEC_USER.format(name="x"), "y.cpp": PRIM_USER.format(name="y"),
@@ -916,11 +923,11 @@ def test_the_delete_of_a_build_removes_the_rows_of_each_table_of_the_places(root
     assert [_rows(db_path, f"SELECT COUNT(*) FROM {table}")[0][0] for table in tables] == [0] * 5
 
 
-def test_a_file_with_a_definition_and_no_row_is_no_orphan(root):
+def test_a_file_with_a_definition_and_no_row_is_no_orphan(root, toolchain):
     """All rows of a copy can lose to the rows of the other copy: the place of its definition stays a fact."""
     from fw_context_mcp.indexer.db import delete_orphan_files, open_db
 
-    _copies(root)
+    _copies(root, toolchain)
     db_path = _run(root)
     conn = open_db(db_path)
     try:
@@ -1013,7 +1020,7 @@ def test_reindex_file_of_a_merged_build_writes_merged_rows(cli_build):
     assert ("use", "drv::Parser::send", 1) in _calls(db_path)
 
 
-def test_a_run_that_stops_after_the_decisions_leaves_the_units_pending(root, monkeypatch):
+def test_a_run_that_stops_after_the_decisions_leaves_the_units_pending(root, monkeypatch, toolchain):
     """The run stops after it wrote the new decisions and before the second parse: the next run parses the units.
 
     The new merge and the pending units are one transaction: the stop
@@ -1025,7 +1032,7 @@ def test_a_run_that_stops_after_the_decisions_leaves_the_units_pending(root, mon
     class Stop(Exception):
         pass
 
-    _copies(root, impl_header="sdk/p.h")
+    _copies(root, toolchain, impl_header="sdk/p.h")
     _run(root)
     (root / "impl.cpp").write_text(IMPL.format(header="proj/p.h"), encoding="utf-8")
     parse = runner._parse_unit
@@ -1068,14 +1075,14 @@ def _callers_of(db_path: Path, usr: str) -> set[str]:
 
 
 @pytest.mark.parametrize("user_of_prim", ["y.cpp", "a_y.cpp"])
-def test_an_explicit_specialization_has_the_place_of_the_template_of_the_build(root, user_of_prim):
+def test_an_explicit_specialization_has_the_place_of_the_template_of_the_build(root, user_of_prim, toolchain):
     """A unit that declares `Tr` and does not define it gives `Tr<int>` the place that the other units give.
 
     `x.cpp` sees `template <class T> struct Tr;` only, `y.cpp` sees the
     definition in `prim.h`.  `a_y.cpp` claims `spec.h` before `impl.cpp`:
     the claim order does not change the USR.
     """
-    _write(root, {
+    _write(root, toolchain, {
         "fwd.h": FWD, "spec.h": SPEC, "prim.h": PRIM, "impl.cpp": SPEC_IMPL,
         "x.cpp": SPEC_USER.format(name="x"), user_of_prim: PRIM_USER.format(name="y"),
     }, ["impl.cpp", "x.cpp", user_of_prim])
@@ -1087,26 +1094,26 @@ def test_an_explicit_specialization_has_the_place_of_the_template_of_the_build(r
     assert _state(db_path) == _state(_run(root, "db_full"))
 
 
-def test_the_place_of_a_template_follows_its_definition_in_the_build(root):
+def test_the_place_of_a_template_follows_its_definition_in_the_build(root, toolchain):
     """The definition of the template comes, moves and goes: each run gives the index of a full run.
 
     `x.cpp` and `impl.cpp` do not read `prim.h`, thus only the place of the
     template in the build sends them to the second parse.
     """
     files = {"fwd.h": FWD, "spec.h": SPEC, "prim.h": PRIM, "impl.cpp": SPEC_IMPL, "x.cpp": SPEC_USER.format(name="x")}
-    _write(root, files, ["impl.cpp", "x.cpp"])
+    _write(root, toolchain, files, ["impl.cpp", "x.cpp"])
     db_path = _run(root)
     own = "c:@S@Tr>#I~{}:3:20@F@f#"
     from fw_context_mcp.indexer._usr import file_key
 
     assert _callers_of(db_path, own.format(file_key(str(root / "spec.h")))) == {"x.cpp"}
 
-    _write(root, {"y.cpp": PRIM_USER.format(name="y")}, ["impl.cpp", "x.cpp", "y.cpp"])
+    _write(root, toolchain, {"y.cpp": PRIM_USER.format(name="y")}, ["impl.cpp", "x.cpp", "y.cpp"])
     _run(root)
     assert _callers_of(db_path, _f_usr(root, "prim.h", 3, 27)) == {"x.cpp", "y.cpp"}
     assert _state(db_path) == _state(_run(root, "db_came"))
 
-    _write(root, {"prim.h": PRIM.replace("#pragma once\n", "#pragma once\n// moved\n")}, ["impl.cpp", "x.cpp", "y.cpp"])
+    _write(root, toolchain, {"prim.h": PRIM.replace("#pragma once\n", "#pragma once\n// moved\n")}, ["impl.cpp", "x.cpp", "y.cpp"])
     _run(root)
     assert _callers_of(db_path, _f_usr(root, "prim.h", 4, 27)) == {"x.cpp", "y.cpp"}
     assert _state(db_path) == _state(_run(root, "db_moved"))
@@ -1117,19 +1124,19 @@ def test_the_place_of_a_template_follows_its_definition_in_the_build(root):
     with conn:
         conn.execute("DELETE FROM odr_unit_places WHERE unit_path = 'x.cpp'")
     conn.close()
-    _write(root, {"prim.h": PRIM.replace("#pragma once\n", "#pragma once\n// moved\n\n")}, ["impl.cpp", "x.cpp", "y.cpp"])
+    _write(root, toolchain, {"prim.h": PRIM.replace("#pragma once\n", "#pragma once\n// moved\n\n")}, ["impl.cpp", "x.cpp", "y.cpp"])
     _run(root)
     assert _callers_of(db_path, _f_usr(root, "prim.h", 5, 27)) == {"x.cpp", "y.cpp"}
 
-    _write(root, {}, ["impl.cpp", "x.cpp"])
+    _write(root, toolchain, {}, ["impl.cpp", "x.cpp"])
     _run(root)
     assert _callers_of(db_path, own.format(file_key(str(root / "spec.h")))) == {"x.cpp"}
     assert _state(db_path) == _state(_run(root, "db_went"))
 
 
-def test_a_merged_template_gives_its_specializations_no_place(root):
+def test_a_merged_template_gives_its_specializations_no_place(root, toolchain):
     """Two copies of `prim.h` merge `Tr`: the unit that only declares `Tr` gives `Tr<int>` the USR of libclang."""
-    _write(root, {
+    _write(root, toolchain, {
         "fwd.h": FWD, "spec.h": SPEC, "sdk/prim.h": PRIM.replace('"fwd.h"', '"../fwd.h"'),
         "proj/prim.h": PRIM.replace('"fwd.h"', '"../fwd.h"'), "impl.cpp": SPEC_IMPL,
         "x.cpp": SPEC_USER.format(name="x"),
@@ -1141,12 +1148,12 @@ def test_a_merged_template_gives_its_specializations_no_place(root):
     assert _state(db_path) == _state(_run(root, "db_full"))
 
 
-def test_a_template_with_two_definitions_in_main_files_has_no_place_in_the_build(root):
+def test_a_template_with_two_definitions_in_main_files_has_no_place_in_the_build(root, toolchain):
     """Two `.cpp` files define `Tr`: the ODR is broken, and `x.cpp` keeps the place of its specialization."""
     from fw_context_mcp.indexer._usr import file_key
 
     defining = '#include "fwd.h"\ntemplate <class T> struct Tr {{ int g(); }};\n#include "spec.h"\nint {name}() {{ return 0; }}\n'
-    _write(root, {
+    _write(root, toolchain, {
         "fwd.h": FWD, "spec.h": SPEC, "a.cpp": defining.format(name="a"), "b.cpp": defining.format(name="b"),
         "x.cpp": SPEC_USER.format(name="x"),
     }, ["a.cpp", "b.cpp", "x.cpp"])
@@ -1161,11 +1168,11 @@ def test_a_template_with_two_definitions_in_main_files_has_no_place_in_the_build
     ]
 
 
-def test_two_structs_of_one_name_in_two_merged_structs_stay_two_in_c(root):
+def test_two_structs_of_one_name_in_two_merged_structs_stay_two_in_c(root, toolchain):
     """`A::B` and `C::B`: in C each `B` has the scope of the file, and the merged `B` gets the USR of C++."""
     a = "#pragma once\nstruct A { struct B { int x; } b; };\n"
     c = "#pragma once\nstruct C { struct B { int y; } b; };\n"
-    _write(root, {
+    _write(root, toolchain, {
         "sdk/a.h": a, "proj/a.h": a, "sdk/c.h": c, "proj/c.h": c,
         "a1.c": '#include "sdk/a.h"\nint f1(struct B *p) { return p->x; }\n',
         "a2.c": '#include "sdk/c.h"\nint f2(struct B *p) { return p->y; }\n',
@@ -1181,10 +1188,10 @@ def test_two_structs_of_one_name_in_two_merged_structs_stay_two_in_c(root):
     assert _state(db_path) == _state(_run(root, "db_full"))
 
 
-def test_a_struct_in_a_struct_in_a_merged_struct_has_the_usr_of_cxx_in_c(root):
+def test_a_struct_in_a_struct_in_a_merged_struct_has_the_usr_of_cxx_in_c(root, toolchain):
     """`A::B::D` in C: each type around `D` is in the USR, as C++ writes it."""
     header = "#pragma once\nstruct A { struct B { struct D { int z; } d; } b; };\n"
-    _write(root, {
+    _write(root, toolchain, {
         "sdk/a.h": header, "proj/a.h": header,
         "a1.c": '#include "sdk/a.h"\nint f1(struct D *p) { return p->z; }\n',
         "u.cpp": '#include "sdk/a.h"\nint u(A &a) { return a.b.d.z; }\n',

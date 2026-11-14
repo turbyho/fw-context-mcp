@@ -22,6 +22,33 @@ class TestESPIDFDetection:
         (tmp_path / "CMakeLists.txt").write_text("cmake_minimum_required(VERSION 3.16)\n")
         assert ESPIDFBuildSystem.detect(tmp_path) is False
 
+    def test_detected_by_project_cmake_without_sdkconfig(self, tmp_path):
+        """A clone of a project that keeps only sdkconfig.defaults in git: the include of project.cmake marks it."""
+        (tmp_path / "sdkconfig.defaults").write_text("CONFIG_FREERTOS_HZ=1000\n")
+        (tmp_path / "CMakeLists.txt").write_text(
+            "cmake_minimum_required(VERSION 3.22)\ninclude($ENV{IDF_PATH}/tools/cmake/project.cmake)\nproject(app)\n"
+        )
+        assert ESPIDFBuildSystem.detect(tmp_path) is True
+
+    def test_generic_cmake_leaves_out_a_project_without_sdkconfig(self, tmp_path):
+        """Generic CMake asks the rule of ESP-IDF, thus the two rules never differ."""
+        from fw_context_mcp.indexer.builders.generic_cmake import GenericCMakeBuildSystem
+
+        (tmp_path / "CMakeLists.txt").write_text(
+            "cmake_minimum_required(VERSION 3.22)\ninclude($ENV{IDF_PATH}/tools/cmake/project.cmake)\nproject(app)\n"
+        )
+        assert GenericCMakeBuildSystem.detect(tmp_path) is False
+
+    def test_a_platformio_espidf_project_stays_platformio(self, tmp_path):
+        """The registry asks PlatformIO first: its espidf projects have the same CMakeLists.txt."""
+        from fw_context_mcp.indexer.builders import registry
+
+        (tmp_path / "platformio.ini").write_text("[env:esp32]\nplatform = espressif32\nframework = espidf\n")
+        (tmp_path / "CMakeLists.txt").write_text(
+            "cmake_minimum_required(VERSION 3.16)\ninclude($ENV{IDF_PATH}/tools/cmake/project.cmake)\nproject(app)\n"
+        )
+        assert registry.detect(tmp_path) == "platformio"
+
 
 class TestESPIDFValidation:
     def test_missing_build_dir_warns(self, tmp_path):

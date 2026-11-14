@@ -10,7 +10,7 @@ assembly units ran the same command line.
 
 from __future__ import annotations
 
-import shutil
+import dataclasses
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,8 +20,7 @@ import pytest
 from fw_context_mcp import utils
 from fw_context_mcp.indexer import _clang_cli, asm, macros
 from fw_context_mcp.utils import CLANG_POSIX_RESPONSE_FILE, response_file, response_file_text
-
-_HAS_CLANG = shutil.which("clang") is not None
+from tests._toolchains import unit_of
 
 # More than 32767 characters of flags, as the include paths of a large unit.
 _LONG_FLAGS = [f"-I{'d' * 200}/include_{index}" for index in range(200)]
@@ -70,7 +69,6 @@ def test_a_file_that_cannot_be_removed_keeps_the_result(monkeypatch, caplog):
     path.unlink()
 
 
-@pytest.mark.skipif(not _HAS_CLANG, reason="the reader of the response file is clang")
 def test_clang_reads_each_argument_back(tmp_path: Path):
     """The contract on each host: clang with --rsp-quoting=posix reads the file as written."""
     include = tmp_path / "dir with space"
@@ -81,7 +79,7 @@ def test_clang_reads_each_argument_back(tmp_path: Path):
 
     with response_file(["-dM", "-E", f"-I{include}", '-DQ="a b"', r"-DBS=C:\x\y", str(source)]) as args_file:
         result = subprocess.run(
-            ["clang", CLANG_POSIX_RESPONSE_FILE, f"@{args_file}"],
+            [_clang_cli.clang_binary(), CLANG_POSIX_RESPONSE_FILE, f"@{args_file}"],
             stdin=subprocess.DEVNULL, capture_output=True, text=True, check=True,
         )
 
@@ -95,12 +93,18 @@ def test_the_macro_expansion_gives_clang_a_short_command_line(tmp_path: Path, mo
     seen: list[tuple[list[str], str]] = []
 
     def run(cmd, **kwargs):
-        seen.append((cmd, Path(cmd[-1][1:]).read_text(encoding="utf-8")))
+        text = Path(cmd[-1][1:]).read_text(encoding="utf-8")
+        seen.append((cmd, text))
+        # The dependency file that clang writes for -MD -MF <file>.
+        lines = text.splitlines()
+        Path(lines[lines.index("-MF") + 1]).write_text(f"unit: {source}\n", encoding="utf-8")
         return subprocess.CompletedProcess(cmd, 0, b"#define A 1\n", b"")
 
     monkeypatch.setattr(_clang_cli.subprocess, "run", run)
 
-    assert macros.resolve_macros_via_preprocessor(_LONG_FLAGS, source, "clang", cwd=tmp_path) == {"A": "1"}
+    answer = macros.definitions_at_end_of_unit(_LONG_FLAGS, source, clang_binary="clang", cwd=tmp_path)
+    assert answer.definitions == {"A": macros.MacroDefinition("1", "", False)}
+    assert answer.files == frozenset({macros.canonical_path(source)})
     [(cmd, text)] = seen
     assert cmd[:2] == ["clang", CLANG_POSIX_RESPONSE_FILE]
     assert len(cmd) == 3
@@ -127,24 +131,28 @@ def test_the_assembly_preprocessor_gives_clang_a_short_command_line(tmp_path: Pa
     assert len(cmd) == 3
 
 
-@pytest.mark.skipif(not _HAS_CLANG, reason="the preprocessor is clang")
-def test_a_unit_with_flags_longer_than_a_windows_command_line_gets_its_macros(tmp_path: Path):
+def test_a_unit_with_flags_longer_than_a_windows_command_line_gets_its_macros(tmp_path: Path, toolchain):
+    """The unit of the toolchain, with the long flags added after its compile.
+
+    WHY after: the compile of the check runs gcc with the flags on its
+    command line, which Windows limits; the subject here is clang.
+    """
     source = tmp_path / "a.c"
     source.write_text("#define TEMP_HYSTERESIS 0.5f\n", encoding="utf-8")
-    flags = [*_LONG_FLAGS, "-DFROM_FLAGS=3"]
+    flags = [*unit_of(source, toolchain).clang_args, *_LONG_FLAGS, "-DFROM_FLAGS=3"]
     assert sum(len(flag) + 1 for flag in flags) > 32767
 
-    expanded = macros.resolve_macros_via_preprocessor(flags, source, cwd=tmp_path)
+    expanded = macros.definitions_at_end_of_unit(flags, source, cwd=tmp_path).definitions
 
-    assert expanded["TEMP_HYSTERESIS"] == "0.5f"
-    assert expanded["FROM_FLAGS"] == "3"
+    assert expanded["TEMP_HYSTERESIS"].value == "0.5f"
+    assert expanded["FROM_FLAGS"].value == "3"
 
 
-@pytest.mark.skipif(not _HAS_CLANG, reason="the preprocessor is clang")
-def test_an_assembly_unit_with_flags_longer_than_a_windows_command_line_is_read(tmp_path: Path):
+def test_an_assembly_unit_with_flags_longer_than_a_windows_command_line_is_read(tmp_path: Path, toolchain):
     source = tmp_path / "start.S"
     source.write_text("#define ANSWER 42\n    .word ANSWER\n", encoding="utf-8")
-    unit = SimpleNamespace(file=source, directory=tmp_path, clang_args=list(_LONG_FLAGS))
+    unit = unit_of(source, toolchain)
+    unit = dataclasses.replace(unit, clang_args=[*unit.clang_args, *_LONG_FLAGS])
 
     result = asm.preprocess(unit)
 

@@ -9,11 +9,10 @@ extracted from the project file.
 from __future__ import annotations
 
 import logging
-import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from fw_context_mcp.utils import cc_output_path, run_build_command
+from fw_context_mcp.utils import cc_output_path, require_build_tool, run_build_command
 
 from . import registry
 from .protocol import BuildIssue
@@ -60,16 +59,17 @@ class KeilBuildSystem:
 
         if cfg.python:
             keil_prefix: list[str] = [cfg.python, "-m", "keil2clangd"]
-        elif not shutil.which("keil2clangd"):
-            raise RuntimeError(
-                "keil2clangd is required for Keil MDK projects.\n"
-                "Install it:\n"
-                "  pip install keil2clangd\n"
-                "Or generate compile_commands.json manually and run:\n"
-                "  fw-context index compile_commands.json"
-            )
         else:
-            keil_prefix = ["keil2clangd"]
+            # The PATH of the build (activate, extra_path), not of this
+            # process; the build runs the program that the lookup found.
+            keil_prefix = [require_build_tool(
+                "keil2clangd", root, cfg,
+                "Keil MDK projects need it.  Install it:\n"
+                "  pip install keil2clangd\n"
+                "and put it on PATH or its directory into [build] extra_path, or set [build] python.\n"
+                "Or generate compile_commands.json manually and run:\n"
+                "  fw-context index compile_commands.json",
+            )]
 
         # Find the .uvprojx file
         if cfg.keil_project:
