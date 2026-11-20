@@ -122,20 +122,25 @@ class ESPIDFBuildSystem:
         # they came apart — `-B` moved and neither of the other two
         # followed, so a build either failed outright or read the stale
         # compile_commands.json of the build of the user.
-        build_dir = BuildLayout(project_root).out_dir(cfg.variant_name)
+        layout = BuildLayout(project_root)
+        build_dir = layout.out_dir(cfg.variant_name)
         # -B is a global flag of idf.py, thus it comes before the command.
         build_dir_flag: list[str] = ["-B", str(build_dir)]
 
         cmd: list[str] = [idf_py, *build_dir_flag, "build"]
 
+        # A clean build removes out/, and does not run `idf.py fullclean`.
+        # WHY: fullclean removes the content of the build directory
+        # (ESP-IDF 5.2.5 and 6.1, core_ext.py), and it refuses a directory
+        # without CMakeCache.txt, for example after a configure that
+        # stopped.  A failed clean then left the old out/ for the build.
+        # remove_out_dir removes the same build files, and it gives a
+        # RuntimeError when it cannot.  fullclean also removes
+        # managed_components/ of the project (the component manager adds
+        # that step).  That directory stays: it is in the tree of the
+        # user, and the component manager checks it at each configure.
         if cfg.clean:
-            # idf.py fullclean removes all build artifacts
-            clean_cmd = [idf_py, *build_dir_flag, "fullclean"]
-            log.info("esp-idf clean: %s", " ".join(clean_cmd))
-            try:
-                run_build_command(clean_cmd, cwd=project_root, description="idf.py fullclean", build_cfg=cfg)
-            except RuntimeError:
-                pass  # clean is best-effort — build dir may not exist yet
+            layout.remove_out_dir(cfg.variant_name)
 
         # The build asks for no .d dependency files: the manifest of the
         # index records the headers of each unit, and no part of fw-context

@@ -98,9 +98,8 @@ class PlatformIOBuildSystem:
     happens, producing .d dependency files needed for header-change
     detection.
 
-    WHY clean is best-effort: the build directory may not exist on a fresh
-    checkout, so ``pio run --target clean`` may fail.  We catch the error
-    and continue — if the build dir exists, it's cleaned; if not, we skip.
+    A clean build removes ``out/`` of the variant (see ``build``).  A
+    removal that fails stops the build of the variant with a RuntimeError.
     """
 
     name: str = "PlatformIO"
@@ -221,16 +220,16 @@ class PlatformIOBuildSystem:
         cfg, build_env = self._build_environment(
             cfg, out_dir, self._compiledb_script(layout.variant_dir(cfg.variant_name)),
         )
+        # A clean build removes out/, and does not run `pio run --target
+        # clean`.  WHY: out/ holds only the build directory
+        # (PLATFORMIO_BUILD_DIR), which is what that target removes; the
+        # libraries stay in .pio/libdeps.  A failed clean target left the
+        # old out/ for the build, and remove_out_dir gives a RuntimeError
+        # when it cannot remove it.
+        if cfg.clean:
+            layout.remove_out_dir(cfg.variant_name)
         self._remove_other_environments(out_dir, env_name)
         run = pio_prefix + ["run", "--project-dir", str(project_root), "--environment", env_name]
-
-        if cfg.clean:
-            clean_cmd = run + ["--target", "clean"]
-            log.info("platformio clean: %s", " ".join(clean_cmd))
-            try:
-                run_build_command(clean_cmd, cwd=project_root, description="pio run --target clean", build_cfg=cfg, env=build_env)
-            except RuntimeError:
-                pass  # clean is best-effort — build dir may not exist yet
 
         # The database of an earlier build goes first: a compiledb that
         # writes elsewhere (a script of the user that sets
@@ -346,7 +345,12 @@ class PlatformIOBuildSystem:
             if child.is_dir() and not child.is_symlink() and child.name != env_name \
                     and (child / COMPILE_COMMANDS_NAME).is_file():
                 log.info("Removing the build of environment %s from %s", child.name, out_dir)
-                shutil.rmtree(child)
+                try:
+                    shutil.rmtree(child)
+                except OSError as exc:
+                    # Each caller of a build catches RuntimeError only (see
+                    # BuildLayout.remove_out_dir).
+                    raise RuntimeError(f"cannot remove the build of environment {child.name} in {out_dir}: {exc}") from exc
 
     def output_compile_commands(self, out_dir: Path, cfg: BuildConfig) -> dict[str, Path]:
         """Return the database of the environment that the build in *out_dir* built.

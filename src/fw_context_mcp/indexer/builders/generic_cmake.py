@@ -88,7 +88,8 @@ class GenericCMakeBuildSystem:
             "and put it on PATH, or its directory into [build] extra_path.",
         )
 
-        build_dir = BuildLayout(project_root).out_dir(cfg.variant_name)
+        layout = BuildLayout(project_root)
+        build_dir = layout.out_dir(cfg.variant_name)
 
         # Configure
         configure_cmd: list[str] = [
@@ -100,8 +101,10 @@ class GenericCMakeBuildSystem:
         if cfg.cmake_generator:
             configure_cmd += ["-G", cfg.cmake_generator]
 
-        if cfg.clean and build_dir.exists():
-            shutil.rmtree(build_dir)
+        if cfg.clean:
+            # RuntimeError when out/ cannot go: the error of one failed
+            # build, thus the other variants still build.
+            layout.remove_out_dir(cfg.variant_name)
 
         log.info("cmake configure: %s", " ".join(configure_cmd))
         run_build_command(configure_cmd, cwd=project_root, description="cmake configure", build_cfg=cfg)

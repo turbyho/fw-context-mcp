@@ -14,8 +14,10 @@ the user replaces.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -343,20 +345,24 @@ class TestEveryBackendBuildsIntoTheOutputDirectory:
         assert "CCACHE_DEPEND" not in env
         assert not (tmp_path / ".fw-context" / "ninja").exists()
 
-    def _zephyr_with_old_build(self, tmp_path: Path, monkeypatch, variant: str):
+    def _zephyr_with_old_build(self, tmp_path: Path, monkeypatch, variant: str, cache_dir: Path | None = None):
         """Return (module, calls, seen) for a Zephyr build over an output directory of an earlier build.
 
-        The earlier build left ``CMakeCache.txt`` in ``out/``.  After a move
-        of the project, that cache names the old path, and only a removal of
-        ``out/`` repairs it: ``west build --pristine`` cleans the directory
-        that the cache names.  *seen* records, for each west call, if the
-        old cache was still there when west started.
+        The earlier build left ``CMakeCache.txt`` in ``out/``.  The cache
+        names *cache_dir*, or ``out/`` itself when it is None.  After a move
+        or a copy of the project, the cache names the old directory, and
+        only a removal of ``out/`` repairs it: ``west build --pristine``
+        cleans the directory that the cache names.  *seen* records, for each
+        west call, if the old cache was still there when west started.
         """
         import fw_context_mcp.indexer.builders.zephyr as mod
 
         old_cache = _out(tmp_path, variant) / "CMakeCache.txt"
         old_cache.parent.mkdir(parents=True)
-        old_cache.write_text("CMAKE_CACHEFILE_DIR:INTERNAL=/old/path/out\n", encoding="utf-8")
+        named = cache_dir or old_cache.parent
+        old_cache.write_text(
+            f"CMAKE_CACHEFILE_DIR:INTERNAL={named}\nAPPLICATION_BINARY_DIR:PATH={named}\n", encoding="utf-8",
+        )
         seen: list[bool] = []
 
         def on_call(cmd, env, cwd):
@@ -374,8 +380,10 @@ class TestEveryBackendBuildsIntoTheOutputDirectory:
 
         assert seen == [not clean]
         # The removal replaces --pristine: west cleans the directory of the
-        # cache, which is the old path after a move.
-        assert not any(arg.startswith("--pristine") for arg in calls[0][0])
+        # cache, which is the old path after a move.  --pristine=auto stays,
+        # because an incremental build after a change of the board fails
+        # without it (west build.pristine = never).
+        assert [arg for arg in calls[0][0] if arg.startswith("--pristine")] == ["--pristine=auto"]
 
     @pytest.mark.parametrize("clean", [True, False])
     def test_zephyr_variant_obeys_clean(self, tmp_path: Path, monkeypatch, clean: bool):
@@ -396,7 +404,7 @@ class TestEveryBackendBuildsIntoTheOutputDirectory:
         assert built == [("dev", "", _out(tmp_path, "dev") / "compile_commands.json")]
         # The clean build of one variant leaves the build of each other variant.
         assert other.exists()
-        assert "--pristine=auto" in calls[0][0]
+        assert [arg for arg in calls[0][0] if arg.startswith("--pristine")] == ["--pristine=auto"]
 
     def test_zephyr_variant_whose_output_cannot_go_fails_without_west(self, tmp_path: Path, monkeypatch):
         """A failed removal is a RuntimeError, the error of one failed variant build (``_build_variants``)."""
@@ -641,3 +649,231 @@ class TestPlatformIO:
             (_out(tmp_path) / env_name / "compile_commands.json").write_text("[]", encoding="utf-8")
 
         assert PlatformIOBuildSystem().output_compile_commands(_out(tmp_path), BuildConfig()) == {}
+
+
+def _fake_backend(monkeypatch, backend: str, root: Path, marker: Path):
+    """Return (builder, calls) for *backend*, with a fake build tool.
+
+    Each entry of *calls* is ``(command, marker_was_there)``: the command
+    and if *marker*, a file of an earlier build in ``out/``, was still
+    there when the command started.  The fake writes the database where
+    the real tool writes it.
+    """
+    import importlib
+    import json
+
+    module_name, class_name = {
+        "cmake": ("generic_cmake", "GenericCMakeBuildSystem"),
+        "arduino": ("arduino", "ArduinoBuildSystem"),
+        "esp_idf": ("esp_idf", "ESPIDFBuildSystem"),
+        "platformio": ("platformio", "PlatformIOBuildSystem"),
+    }[backend]
+    mod = importlib.import_module(f"fw_context_mcp.indexer.builders.{module_name}")
+    calls: list[tuple[list[str], bool]] = []
+
+    def write_cc(directory: Path) -> None:
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "compile_commands.json").write_text("[]", encoding="utf-8")
+
+    def fake_run(cmd, cwd=None, description="", env=None, build_cfg=None, timeout=None, **kw):
+        command = [str(c) for c in cmd]
+        calls.append((command, marker.exists()))
+        result = _Result()
+        if backend == "cmake" and "-B" in command:
+            write_cc(Path(command[command.index("-B") + 1]))
+        elif backend == "arduino" and "--only-compilation-database" in command:
+            write_cc(Path(command[command.index("--build-path") + 1]))
+        elif backend == "esp_idf" and "build" in command:
+            write_cc(Path(command[command.index("-B") + 1]))
+        elif backend == "platformio" and "config" in command:
+            result.stdout = json.dumps([["env:dev", []]])
+        elif backend == "platformio" and "compiledb" in command:
+            write_cc(Path(env["PLATFORMIO_BUILD_DIR"]) / command[command.index("--environment") + 1])
+        return result
+
+    monkeypatch.setattr(mod, "run_build_command", fake_run)
+    monkeypatch.setattr(shutil, "which", lambda n, path=None: f"/usr/bin/{n}")
+    monkeypatch.setattr(mod, "build_tool_available", lambda *a, **kw: True, raising=False)
+    # The lookup of the builders (require_build_tool): Windows looks with
+    # _find_program, and a stub of shutil.which does not reach it.
+    monkeypatch.setattr(
+        mod, "require_build_tool",
+        lambda names, cwd, cfg, hint: names if isinstance(names, str) else names[0], raising=False,
+    )
+    return getattr(mod, class_name)(), calls
+
+
+_CLEAN_BACKENDS = ["cmake", "arduino", "esp_idf", "platformio"]
+
+
+class TestCleanBuildRemovesTheOutput:
+    """A clean build removes ``out/`` of the variant before the first build command.
+
+    The build tools have their own clean step (``idf.py fullclean``,
+    ``pio run --target clean``), but a failure of that step was ignored,
+    and the build then ran over the old ``out/``.  A removal that fails is
+    a RuntimeError: each caller of a build catches only that error, and it
+    then reports the failed build of one variant (``cli._index``).
+    """
+
+    @staticmethod
+    def _old_build(root: Path) -> Path:
+        marker = _out(root, "dev") / "old-build-file"
+        marker.parent.mkdir(parents=True)
+        marker.write_text("x\n", encoding="utf-8")
+        return marker
+
+    @pytest.mark.parametrize("backend", _CLEAN_BACKENDS)
+    @pytest.mark.parametrize("clean", [True, False])
+    def test_the_old_output_goes_only_for_a_clean_build(self, tmp_path: Path, monkeypatch, backend: str, clean: bool):
+        marker = self._old_build(tmp_path)
+        builder, calls = _fake_backend(monkeypatch, backend, tmp_path, marker)
+
+        builder.build(tmp_path, BuildConfig(variant_name="dev", fqbn="arduino:avr:uno", clean=clean))
+
+        assert calls, "the build ran no command"
+        assert {was_there for _, was_there in calls} == {not clean}
+        # The clean step of the build tool is gone: the removal replaces it.
+        assert not any("fullclean" in cmd or "clean" in cmd for cmd, _ in calls), calls
+
+    @pytest.mark.parametrize("backend", _CLEAN_BACKENDS)
+    def test_an_output_that_cannot_go_fails_before_the_build(self, tmp_path: Path, monkeypatch, backend: str):
+        import fw_context_mcp.indexer.build_layout as layout_mod
+
+        marker = self._old_build(tmp_path)
+        builder, calls = _fake_backend(monkeypatch, backend, tmp_path, marker)
+
+        def refuse(path, *args, **kwargs):
+            raise PermissionError(13, "in use", str(path))
+
+        monkeypatch.setattr(layout_mod.shutil, "rmtree", refuse)
+
+        with pytest.raises(RuntimeError, match="cannot remove the build output"):
+            builder.build(tmp_path, BuildConfig(variant_name="dev", fqbn="arduino:avr:uno", clean=True))
+        assert calls == []
+        assert marker.exists()
+
+    def test_a_platformio_environment_that_cannot_go_is_a_runtime_error(self, tmp_path: Path, monkeypatch):
+        """The build of an other environment in ``out/`` goes also in an incremental build."""
+        import fw_context_mcp.indexer.builders.platformio as mod
+
+        old = _out(tmp_path, "dev") / "old_name"
+        old.mkdir(parents=True)
+        (old / "compile_commands.json").write_text("[]", encoding="utf-8")
+        builder, calls = _fake_backend(monkeypatch, "platformio", tmp_path, old)
+
+        def refuse(path, *args, **kwargs):
+            raise PermissionError(13, "in use", str(path))
+
+        monkeypatch.setattr(mod.shutil, "rmtree", refuse)
+
+        with pytest.raises(RuntimeError, match="cannot remove the build of environment old_name"):
+            builder.build(tmp_path, BuildConfig(variant_name="dev", clean=False))
+        assert calls == []
+
+
+class TestZephyrBuildOfOtherDirectory:
+    """An ``out/`` whose CMake cache names an other directory goes, also with ``--no-clean``.
+
+    A moved project, or a copy that took ``.fw-context/build`` with it,
+    leaves such a cache.  CMake refuses it, and the pristine step of
+    ``west build --pristine=auto`` removes the content of the directory
+    that the cache names: in a copy, the output of the original project.
+    """
+
+    _helper = TestEveryBackendBuildsIntoTheOutputDirectory()
+
+    @staticmethod
+    def _original_output(tmp_path: Path) -> Path:
+        """Return the ``out/`` of the original project, with a file in it."""
+        original = tmp_path / "original" / "out"
+        original.mkdir(parents=True)
+        (original / "build.ninja").write_text("x\n", encoding="utf-8")
+        return original
+
+    @pytest.mark.parametrize("moved", [True, False], ids=["moved", "copied"])
+    def test_build_removes_the_output_of_other_directory(self, tmp_path: Path, monkeypatch, moved: bool):
+        root = tmp_path / "copy"
+        root.mkdir()
+        original = tmp_path / "gone" / "out" if moved else self._original_output(tmp_path)
+        mod, calls, seen = self._helper._zephyr_with_old_build(root, monkeypatch, "", original)
+
+        mod.ZephyrBuildSystem().build(root, BuildConfig(board="nrf52840dk/nrf52840", clean=False))
+
+        assert seen == [False]
+        assert [arg for arg in calls[0][0] if arg.startswith("--pristine")] == ["--pristine=auto"]
+        if not moved:
+            assert (original / "build.ninja").exists(), "the output of the original project stays"
+
+    def test_variant_removes_the_output_of_other_directory(self, tmp_path: Path, monkeypatch):
+        from fw_context_mcp.indexer.build import BuildVariant
+
+        root = tmp_path / "copy"
+        root.mkdir()
+        original = self._original_output(tmp_path)
+        mod, _calls, seen = self._helper._zephyr_with_old_build(root, monkeypatch, "dev", original)
+        cfg = BuildConfig(clean=False, variants=[BuildVariant(name="dev", board="nrf52840dk/nrf52840")])
+
+        mod.ZephyrBuildSystem().build_multi(root, cfg)
+
+        assert seen == [False]
+        assert (original / "build.ninja").exists()
+
+    def test_a_cache_without_the_keys_stays(self, tmp_path: Path, monkeypatch):
+        """No directory in the cache proves nothing, thus ``out/`` stays for west to judge."""
+        import fw_context_mcp.indexer.builders.zephyr as mod
+
+        cache = _out(tmp_path) / "CMakeCache.txt"
+        cache.parent.mkdir(parents=True)
+        cache.write_text("CMAKE_PROJECT_NAME:STATIC=app\n", encoding="utf-8")
+        seen: list[bool] = []
+
+        def on_call(cmd, env, cwd):
+            seen.append(cache.exists())
+            self._helper._write_cc(Path(cmd[cmd.index("-d") + 1]))
+
+        self._helper._record(monkeypatch, mod, on_call)
+
+        mod.ZephyrBuildSystem().build(tmp_path, BuildConfig(board="nrf52840dk/nrf52840", clean=False))
+
+        assert seen == [True]
+
+    def test_the_cache_parser_reads_crlf_and_windows_paths(self, tmp_path: Path):
+        from fw_context_mcp.indexer.builders.zephyr import _cache_directories
+
+        cache = tmp_path / "CMakeCache.txt"
+        cache.write_bytes(
+            b"CMAKE_PROJECT_NAME:STATIC=app\r\n"
+            b"CMAKE_CACHEFILE_DIR:INTERNAL=C:/work/proj/out\r\n"
+            b"APPLICATION_BINARY_DIR:PATH=C:/work/proj/out\r\n"
+        )
+
+        assert _cache_directories(cache) == ["C:/work/proj/out", "C:/work/proj/out"]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="a symbolic link on Windows needs a privilege of the user")
+    def test_own_output_through_a_linked_root_stays(self, tmp_path: Path, monkeypatch):
+        """The cache can name the same ``out/`` through a symbolic link: that is no other directory."""
+        root = tmp_path / "proj"
+        root.mkdir()
+        link = tmp_path / "link"
+        link.symlink_to(root, target_is_directory=True)
+        mod, _calls, seen = self._helper._zephyr_with_old_build(root, monkeypatch, "", _out(link))
+
+        mod.ZephyrBuildSystem().build(root, BuildConfig(board="nrf52840dk/nrf52840", clean=False))
+
+        assert seen == [True]
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="only Linux accepts a file name that is not UTF-8")
+    def test_own_output_with_a_name_that_is_not_utf8_stays(self, tmp_path: Path, monkeypatch):
+        """CMake writes the bytes of the path: a Latin-1 name must come back as the same path."""
+        root = tmp_path / os.fsdecode(b"proj\xe9")
+        root.mkdir()
+        mod, _calls, seen = self._helper._zephyr_with_old_build(root, monkeypatch, "", Path("/placeholder"))
+        out = os.fsencode(_out(root))
+        (_out(root) / "CMakeCache.txt").write_bytes(
+            b"CMAKE_CACHEFILE_DIR:INTERNAL=" + out + b"\nAPPLICATION_BINARY_DIR:PATH=" + out + b"\n"
+        )
+
+        mod.ZephyrBuildSystem().build(root, BuildConfig(board="nrf52840dk/nrf52840", clean=False))
+
+        assert seen == [True]

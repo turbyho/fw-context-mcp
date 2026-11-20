@@ -65,9 +65,12 @@ class ArduinoBuildSystem:
             "  curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh",
         )
 
-        build_dir = BuildLayout(project_root).out_dir(cfg.variant_name)
-        if cfg.clean and build_dir.exists():
-            shutil.rmtree(build_dir)
+        layout = BuildLayout(project_root)
+        build_dir = layout.out_dir(cfg.variant_name)
+        if cfg.clean:
+            # RuntimeError when out/ cannot go: the error of one failed
+            # build, thus the other variants still build.
+            layout.remove_out_dir(cfg.variant_name)
 
         # Without [build] fqbn, arduino-cli takes the board of sketch.yaml
         # (default_fqbn, or the default profile), as a compile of the user

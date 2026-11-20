@@ -275,6 +275,78 @@ class UpstreamZephyr:
 # first, so `get_linker_scripts` moves this name to the front.
 _FINAL_LINKER_SCRIPT = "linker.cmd"
 
+# The keys of CMakeCache.txt that name the directory of the build.  CMake
+# refuses a cache whose CMAKE_CACHEFILE_DIR is an other directory, and the
+# pristine step of west removes the content of APPLICATION_BINARY_DIR.
+_CACHE_DIRECTORY_KEYS: tuple[str, ...] = ("CMAKE_CACHEFILE_DIR", "APPLICATION_BINARY_DIR")
+
+
+def _cache_directories(cache: Path) -> list[str]:
+    """Return the values of ``_CACHE_DIRECTORY_KEYS`` in the CMake cache *cache*.
+
+    A line of the cache is ``KEY:TYPE=VALUE``.  An empty list means that
+    the file is not there, cannot be read, or holds none of the keys.
+
+    WHY ``surrogateescape``: on Linux, CMake writes a path as the bytes of
+    the file system, and a byte that is not UTF-8 (a directory name in
+    Latin-1) then comes back as the same byte in ``os.stat``.  With
+    ``replace``, that path became an other path, and each incremental
+    build removed its own ``out/``.
+    """
+    try:
+        lines = cache.read_text(encoding="utf-8", errors="surrogateescape").splitlines()
+    except OSError:
+        return []
+    values: list[str] = []
+    for line in lines:
+        key, sep, rest = line.partition(":")
+        if sep and key in _CACHE_DIRECTORY_KEYS:
+            _type, eq, value = rest.partition("=")
+            if eq and value:
+                values.append(value)
+    return values
+
+
+def _same_directory(value: str, directory: Path) -> bool:
+    """Say if the path *value* is *directory*.
+
+    ``os.path.samefile`` compares the directories on the disk, thus a
+    file system that ignores the case of a name gives one directory for
+    two spellings.  A path that is not there (the old path after a move)
+    is not *directory*.
+    """
+    try:
+        return os.path.samefile(value, directory)
+    except (OSError, ValueError):
+        # ValueError: a NUL character, or a surrogate that the file system
+        # encoding cannot give (Windows).  Such a path is not *directory*.
+        return False
+
+
+def _remove_build_of_other_directory(layout: BuildLayout, variant: str) -> None:
+    """Remove ``out/`` of *variant* when its CMake cache names an other directory.
+
+    The project moved, or a copy of the project took ``.fw-context/build``
+    with it.  The cache then names the old directory, and the build in
+    ``out/`` cannot continue: CMake refuses the cache ("CMakeCache.txt
+    directory ... is different").  With ``--pristine=auto``, west also
+    removes the content of the directory that the cache names, thus the
+    build of a copy removed the output of the original project.  The
+    removal gives this variant a clean build, also with ``--no-clean``
+    (decision of the user, 2026-11-20).
+
+    Raises ``RuntimeError`` when ``out/`` cannot go (see
+    ``BuildLayout.remove_out_dir``).
+    """
+    out = layout.out_dir(variant)
+    names = _cache_directories(out / "CMakeCache.txt")
+    other = next((value for value in names if not _same_directory(value, out)), None)
+    if other is None:
+        return
+    log.info("zephyr build: the CMake cache in %s names %s, thus the build output goes", out, other)
+    layout.remove_out_dir(variant)
+
+
 # The text for a build without activate that finds no west.
 _WEST_INSTALL_HINT = (
     "Install the Zephyr SDK and west, or set [build] activate to the script "
@@ -421,8 +493,9 @@ class ZephyrBuildSystem:
         if cfg.source_dir:
             cmd.append(cfg.source_dir)
 
-        # A clean build removes out/ and does not give `west build --pristine`.
-        # WHY: west runs pristine.cmake on the directory that the CMake cache
+        # A clean build removes out/ itself, and not with `west build
+        # --pristine` (the option --pristine=auto below is for an incremental
+        # build).  WHY: west runs pristine.cmake on the directory that the CMake cache
         # names (APPLICATION_BINARY_DIR), not on -d.  After a move of the
         # project, the cache names the old path.  Thus the pristine step
         # removes nothing, and CMake then stops on the cache of the old path
@@ -432,6 +505,20 @@ class ZephyrBuildSystem:
         # after the removal of the directory passed.
         if cfg.clean:
             layout.remove_out_dir(cfg.variant_name)
+        else:
+            _remove_build_of_other_directory(layout, cfg.variant_name)
+        # --pristine=auto, as in build_multi: in an incremental build
+        # (--no-clean), west makes the directory pristine when the board or
+        # the application changed.  WHY: the default of west is
+        # build.pristine = never, and west then stops ("Build directory ...
+        # targets board ..., but board ... was specified").  Measured with
+        # NCS v3.4.0 on hello_world: a change from nrf52840dk/nrf52840 to
+        # nrf5340dk/nrf5340/cpuapp failed without the option and passed
+        # with it.  After the removal above, the option has no effect.
+        # The pristine step of west removes the directory that the cache
+        # names; _remove_build_of_other_directory makes sure that this is
+        # out/ of this project.
+        cmd.append("--pristine=auto")
         # NCS builds with sysbuild without this flag; upstream Zephyr needs it.
         if cfg.sysbuild:
             cmd.append("--sysbuild")
@@ -547,10 +634,9 @@ class ZephyrBuildSystem:
         ``build()`` for why not ``--pristine``).  West always gets
         ``--pristine=auto``: in an incremental build (``--no-clean``), west
         then makes the directory pristine when the board or the application
-        changed.
-        WHY no incremental default: an output directory that a moved project
-        left has the old path in its CMake cache, and only a removal repairs
-        it.
+        changed.  An ``out/`` whose CMake cache names an other directory (a
+        moved or copied project) goes also in an incremental build, see
+        ``_remove_build_of_other_directory``.
         """
         from ..build import build_variant_config
 
@@ -577,6 +663,10 @@ class ZephyrBuildSystem:
             build_dir = layout.out_dir(variant.name)
             if vcfg.clean:
                 layout.remove_out_dir(variant.name)
+            else:
+                # The pristine step of --pristine=auto removes the directory
+                # that the cache names, thus that must be this out/.
+                _remove_build_of_other_directory(layout, variant.name)
 
             cmd: list[str] = [
                 "west", "build", "--sysbuild",

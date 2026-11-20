@@ -256,7 +256,7 @@ Exceptions:
 | Parameter | Type | Default | Systems | Description |
 |-----------|------|---------|---------|-------------|
 | `system` | `str` | (auto-detect) | all | Build system: `mbed-os`, `zephyr`, `platformio`, `esp-idf`, `arduino`, `cmake`, `keil-mdk`, `iar-ewarm`, `makefile`, `bare`, `stm32cubeide`, `ti-ccs` |
-| `clean` | `bool` | `true` | Mbed OS, PlatformIO, Zephyr, ESP-IDF, Arduino, CMake | Run a clean build before fw-context generates the file. **Recommended.** A clean build makes sure that `compile_commands.json` is complete. The other builders do not read this key. Zephyr removes `out/` itself, also for a sysbuild variant (see [Zephyr](#zephyr)). |
+| `clean` | `bool` | `true` | Mbed OS, PlatformIO, Zephyr, ESP-IDF, Arduino, CMake | Run a clean build before fw-context generates the file. **Recommended.** A clean build makes sure that `compile_commands.json` is complete. The other builders do not read this key. PlatformIO, Zephyr, ESP-IDF, Arduino and CMake remove `out/` before the build, also for a sysbuild variant of Zephyr (see [Zephyr](#zephyr)). Mbed OS gives `mbed compile --clean`. When fw-context cannot remove `out/`, the build of the variant fails. |
 | `command` | `str` | — | all | A command that replaces the build of the builder. Highest priority: fw-context ignores the settings of the builder. It runs `pre_build` first, and it applies `[build] env` to the command. The command must write `compile_commands.json` into the project root. `timeout` does not apply: the command has no time limit. The command runs without a shell, see [example 11](#11-shell-override--bear-wrapping-a-custom-build). |
 | `python` | `str` | (auto-detect) | all | The Python interpreter for pip-based CLI tools, such as `mbed-cli`, `platformio`, or `keil2clangd`. `fw-context init` detects this automatically, from pyenv, venv, and common install paths. Set this parameter manually when automatic detection fails. Mbed OS requires it: without it, the build stops with an error. |
 | `activate` | `str` | (auto-detect) | all | A script that sets up the environment of the build, for example the toolchain environment of NCS, or `export.sh` for ESP-IDF. On Linux and macOS it is a shell script that fw-context sources before each build command. On Windows it is a `.bat`, `.cmd` or `.ps1` script (see [General](#general)). `fw-context init` detects this automatically. Set this parameter manually when automatic detection fails. |
@@ -334,8 +334,13 @@ A clean build (`clean = true`, the default) removes `out/` before
 `west build`. fw-context does not use `west build --pristine` for this:
 west cleans the directory that the CMake cache names. After you move the
 project, the cache names the old directory, and the build fails. With
-`--no-clean`, fw-context keeps `out/`, thus the build of a moved project
-fails. After a move, run `fw-context index --build` without `--no-clean`.
+`--no-clean`, fw-context keeps `out/` and gives `west build
+--pristine=auto`: west makes `out/` pristine when the board or the
+application changed. When the CMake cache in `out/` names an other
+directory, fw-context removes `out/` also with `--no-clean`. This occurs
+after you move the project, or when you copy it together with
+`.fw-context/build`. CMake cannot use such a cache, and the pristine step of
+west would remove the content of the directory that the cache names.
 
 Each image is a build of its own. A query on a build of several images
 must name the `image`, also for the application. It names the `variant`
