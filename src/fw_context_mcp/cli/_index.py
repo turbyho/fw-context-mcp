@@ -31,6 +31,7 @@ import signal
 import sys
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -530,7 +531,9 @@ def _resolve_compile_commands(
 
         build_cfg = cfg.build
         if args.no_clean:
-            build_cfg.clean = False
+            # A copy, as `_without_clean` makes for the variants: the config
+            # of the project stays as it is for each other reader.
+            build_cfg = replace(build_cfg, clean=False)
         try:
             return generate_compile_commands(project_root, build_cfg), False
         except RuntimeError as exc:
@@ -1056,6 +1059,26 @@ def _discover_existing_cc(project_root, variants: list, build_cfg, builder) -> l
     return found
 
 
+def _without_clean(build_cfg: BuildConfig, variants: list) -> tuple[BuildConfig, list]:
+    """Return copies of *build_cfg* and of the selected *variants* for an incremental build (``--no-clean``).
+
+    The option of the command line wins over the config, as it does in the
+    build without variants (``_resolve_compile_commands``).  A variant can
+    set ``clean`` in its own table (``build_variant_config``), and that
+    value wins over [build].  Thus the copies remove it from each variant
+    too.  WHY copies: the config of the project stays as it is for each
+    other reader in this process.
+    """
+    copies = {
+        v.name: replace(v, overrides={key: value for key, value in v.overrides.items() if key != "clean"})
+        for v in build_cfg.variants
+    }
+    return (
+        replace(build_cfg, clean=False, variants=list(copies.values())),
+        [copies[v.name] for v in variants],
+    )
+
+
 def _build_variants(project_root: Path, build_cfg, builder, variants: list) -> list:
     """Build *variants* and return ``(variant, image, database, board)`` of each build.
 
@@ -1159,6 +1182,8 @@ def _run_multi(
         return 1
 
     if args.build:
+        if getattr(args, "no_clean", False):
+            build_cfg, variants = _without_clean(build_cfg, variants)
         cc_list = _build_variants(project_root, build_cfg, builder, variants)
     else:
         # A variant without a build is built here, as the build without
@@ -1787,8 +1812,6 @@ def _cache_server_config(args: argparse.Namespace, cfg):
     """
     cs_config = cfg.cache_server
     if cs_config is not None and getattr(args, "force_llm", False):
-        from dataclasses import replace
-
         cs_config = replace(cs_config, force=True)
     return cs_config
 

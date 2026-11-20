@@ -343,6 +343,78 @@ class TestEveryBackendBuildsIntoTheOutputDirectory:
         assert "CCACHE_DEPEND" not in env
         assert not (tmp_path / ".fw-context" / "ninja").exists()
 
+    def _zephyr_with_old_build(self, tmp_path: Path, monkeypatch, variant: str):
+        """Return (module, calls, seen) for a Zephyr build over an output directory of an earlier build.
+
+        The earlier build left ``CMakeCache.txt`` in ``out/``.  After a move
+        of the project, that cache names the old path, and only a removal of
+        ``out/`` repairs it: ``west build --pristine`` cleans the directory
+        that the cache names.  *seen* records, for each west call, if the
+        old cache was still there when west started.
+        """
+        import fw_context_mcp.indexer.builders.zephyr as mod
+
+        old_cache = _out(tmp_path, variant) / "CMakeCache.txt"
+        old_cache.parent.mkdir(parents=True)
+        old_cache.write_text("CMAKE_CACHEFILE_DIR:INTERNAL=/old/path/out\n", encoding="utf-8")
+        seen: list[bool] = []
+
+        def on_call(cmd, env, cwd):
+            seen.append(old_cache.exists())
+            self._write_cc(Path(cmd[cmd.index("-d") + 1]))
+
+        calls = self._record(monkeypatch, mod, on_call)
+        return mod, calls, seen
+
+    @pytest.mark.parametrize("clean", [True, False])
+    def test_zephyr_clean_build_removes_the_old_output(self, tmp_path: Path, monkeypatch, clean: bool):
+        mod, calls, seen = self._zephyr_with_old_build(tmp_path, monkeypatch, "")
+
+        mod.ZephyrBuildSystem().build(tmp_path, BuildConfig(board="nrf52840dk/nrf52840", clean=clean))
+
+        assert seen == [not clean]
+        # The removal replaces --pristine: west cleans the directory of the
+        # cache, which is the old path after a move.
+        assert not any(arg.startswith("--pristine") for arg in calls[0][0])
+
+    @pytest.mark.parametrize("clean", [True, False])
+    def test_zephyr_variant_obeys_clean(self, tmp_path: Path, monkeypatch, clean: bool):
+        from fw_context_mcp.indexer.build import BuildVariant
+
+        mod, calls, seen = self._zephyr_with_old_build(tmp_path, monkeypatch, "dev")
+        other = _out(tmp_path, "other") / "CMakeCache.txt"
+        other.parent.mkdir(parents=True)
+        other.write_text("x\n", encoding="utf-8")
+        cfg = BuildConfig(
+            clean=clean,
+            variants=[BuildVariant(name="dev", board="nrf52840dk/nrf52840"), BuildVariant(name="other", board="b")],
+        )
+
+        built = mod.ZephyrBuildSystem().build_multi(tmp_path, cfg, [cfg.variants[0]])
+
+        assert seen == [not clean]
+        assert built == [("dev", "", _out(tmp_path, "dev") / "compile_commands.json")]
+        # The clean build of one variant leaves the build of each other variant.
+        assert other.exists()
+        assert "--pristine=auto" in calls[0][0]
+
+    def test_zephyr_variant_whose_output_cannot_go_fails_without_west(self, tmp_path: Path, monkeypatch):
+        """A failed removal is a RuntimeError, the error of one failed variant build (``_build_variants``)."""
+        import fw_context_mcp.indexer.build_layout as layout_mod
+        from fw_context_mcp.indexer.build import BuildVariant
+
+        mod, calls, _seen = self._zephyr_with_old_build(tmp_path, monkeypatch, "dev")
+
+        def refuse(path, *args, **kwargs):
+            raise PermissionError(13, "in use", str(path))
+
+        monkeypatch.setattr(layout_mod.shutil, "rmtree", refuse)
+        cfg = BuildConfig(variants=[BuildVariant(name="dev", board="nrf52840dk/nrf52840")])
+
+        with pytest.raises(RuntimeError, match="cannot remove the build output"):
+            mod.ZephyrBuildSystem().build_multi(tmp_path, cfg)
+        assert calls == []
+
     def test_mbed(self, tmp_path: Path, monkeypatch):
         import fw_context_mcp.indexer.builders.mbed_os as mod
 

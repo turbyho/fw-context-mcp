@@ -405,7 +405,8 @@ class ZephyrBuildSystem:
                 'Zephyr requires a board name.  Set it in .fw-context/config.toml:\n  [build]\n  board = "your_board"'
             )
 
-        build_dir = BuildLayout(project_root).out_dir(cfg.variant_name)
+        layout = BuildLayout(project_root)
+        build_dir = layout.out_dir(cfg.variant_name)
 
         cmd: list[str] = [
             "west",
@@ -420,8 +421,17 @@ class ZephyrBuildSystem:
         if cfg.source_dir:
             cmd.append(cfg.source_dir)
 
+        # A clean build removes out/ and does not give `west build --pristine`.
+        # WHY: west runs pristine.cmake on the directory that the CMake cache
+        # names (APPLICATION_BINARY_DIR), not on -d.  After a move of the
+        # project, the cache names the old path.  Thus the pristine step
+        # removes nothing, and CMake then stops on the cache of the old path
+        # ("CMakeCache.txt directory ... is different").  Measured with NCS
+        # v3.4.0 (west build.py, _run_pristine) on hello_world with sysbuild:
+        # --pristine and --pristine=auto failed after a move, and the build
+        # after the removal of the directory passed.
         if cfg.clean:
-            cmd.append("--pristine")
+            layout.remove_out_dir(cfg.variant_name)
         # NCS builds with sysbuild without this flag; upstream Zephyr needs it.
         if cfg.sysbuild:
             cmd.append("--sysbuild")
@@ -531,9 +541,16 @@ class ZephyrBuildSystem:
         None builds each of them.  ``fw-context index --variant`` gives the
         list, and a variant that the user did not ask for must not build.
 
-        Clean is deliberately suppressed — indexing only needs
-        ``compile_commands.json``, so ``--pristine=auto`` (incremental) is used
-        instead of ``--pristine`` (always), keeping re-builds fast.
+        Each variant obeys ``clean`` of its config, as ``build()`` does: a
+        clean build (the default, and ``--build``) removes the output
+        directory first (``BuildLayout.remove_out_dir``, see the comment in
+        ``build()`` for why not ``--pristine``).  West always gets
+        ``--pristine=auto``: in an incremental build (``--no-clean``), west
+        then makes the directory pristine when the board or the application
+        changed.
+        WHY no incremental default: an output directory that a moved project
+        left has the old path in its CMake cache, and only a removal repairs
+        it.
         """
         from ..build import build_variant_config
 
@@ -558,6 +575,8 @@ class ZephyrBuildSystem:
             board = self._normalize_board(vcfg.board)
             source_dir = vcfg.source_dir or "."
             build_dir = layout.out_dir(variant.name)
+            if vcfg.clean:
+                layout.remove_out_dir(variant.name)
 
             cmd: list[str] = [
                 "west", "build", "--sysbuild",

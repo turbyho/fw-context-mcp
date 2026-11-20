@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -125,9 +126,10 @@ def check_variant_names(names: Iterable[str]) -> None:
 class BuildLayout:
     """The build directories of the project at *project_root*.
 
-    The methods only compute paths.  ``out_dir`` and ``variant_dir`` create
-    nothing, because a reader asks for them too, and a reader must not make
-    a directory that says "a build was here".
+    ``out_dir`` and ``variant_dir`` only compute paths and create nothing,
+    because a reader asks for them too, and a reader must not make a
+    directory that says "a build was here".  ``ensure_ignored`` and
+    ``remove_out_dir`` are for a build only.
     """
 
     project_root: Path
@@ -149,6 +151,33 @@ class BuildLayout:
     def out_dir(self, variant: str) -> Path:
         """Return the output directory that the build system of *variant* writes."""
         return self.variant_dir(variant) / OUT_DIR_NAME
+
+    def remove_out_dir(self, variant: str) -> None:
+        """Remove the output directory of *variant* before a clean build.
+
+        The directory is ``out_dir(variant)``, the output directory that only
+        the build of fw-context writes.  The files beside ``out/`` stay.
+        WHY no check of a symbolic link above ``out/``: fw-context makes no
+        link in this tree.  A link that the user makes there (for example,
+        to put the builds on an other disk) sends the builds to its target,
+        and the clean build removes their output there.  ``shutil.rmtree``
+        refuses ``out/`` itself as a symbolic link, thus the target of
+        such a link stays.
+
+        Raises ``RuntimeError`` when the removal fails: a file that an other
+        process keeps open (Windows), or ``out/`` as a symbolic link, which
+        ``shutil.rmtree`` refuses.  WHY ``RuntimeError``: each caller of a
+        build catches it and reports the failed build of one variant, and
+        the other variants then build (``cli._index._build_variants``).
+        """
+        out = self.out_dir(variant)
+        if not out.exists() and not out.is_symlink():
+            return
+        log.info("clean build: removing %s", out)
+        try:
+            shutil.rmtree(out)
+        except OSError as exc:
+            raise RuntimeError(f"cannot remove the build output {out} for a clean build: {exc}") from exc
 
     def ensure_ignored(self) -> None:
         """Keep the build output out of the git status of the project.

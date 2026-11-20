@@ -12,6 +12,7 @@ and works for a project that will never run ``init`` again, and the entry
 ``init`` adds for new projects.
 """
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -51,6 +52,60 @@ class TestPaths:
     def test_a_bad_name_is_refused_before_it_becomes_a_path(self, tmp_path: Path):
         with pytest.raises(InvalidVariantName):
             BuildLayout(tmp_path).out_dir("../escape")
+
+
+class TestRemoveOutDir:
+    """A clean build removes ``out/`` of one variant, and a failure is a failed build."""
+
+    def test_only_out_of_the_variant_goes(self, tmp_path: Path):
+        layout = BuildLayout(tmp_path)
+        (layout.out_dir("dev") / "app").mkdir(parents=True)
+        (layout.out_dir("dev") / "app" / "CMakeCache.txt").write_text("x\n", encoding="utf-8")
+        sidecar = layout.variant_dir("dev") / "platformio_link.json"
+        sidecar.write_text("{}", encoding="utf-8")
+        (layout.out_dir("other")).mkdir(parents=True)
+
+        layout.remove_out_dir("dev")
+
+        assert not layout.out_dir("dev").exists()
+        assert sidecar.exists()
+        assert layout.out_dir("other").exists()
+
+    def test_a_missing_directory_is_no_error(self, tmp_path: Path):
+        BuildLayout(tmp_path).remove_out_dir("dev")
+
+    def test_a_failed_removal_is_a_runtime_error(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """Each caller of a build catches RuntimeError, and the other variants then build.
+
+        An OSError (a file that an other process keeps open on Windows)
+        stopped the whole run with a traceback.
+        """
+        import fw_context_mcp.indexer.build_layout as layout_mod
+
+        layout = BuildLayout(tmp_path)
+        layout.out_dir("dev").mkdir(parents=True)
+
+        def refuse(path, *args, **kwargs):
+            raise PermissionError(13, "in use", str(path))
+
+        monkeypatch.setattr(layout_mod.shutil, "rmtree", refuse)
+
+        with pytest.raises(RuntimeError, match="cannot remove the build output") as info:
+            layout.remove_out_dir("dev")
+        assert isinstance(info.value.__cause__, PermissionError)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="a symbolic link needs a privilege on Windows")
+    def test_a_symbolic_link_is_a_runtime_error_and_its_target_stays(self, tmp_path: Path):
+        layout = BuildLayout(tmp_path)
+        target = tmp_path / "elsewhere"
+        target.mkdir()
+        (target / "keep.txt").write_text("x\n", encoding="utf-8")
+        layout.variant_dir("dev").mkdir(parents=True)
+        layout.out_dir("dev").symlink_to(target, target_is_directory=True)
+
+        with pytest.raises(RuntimeError, match="cannot remove the build output"):
+            layout.remove_out_dir("dev")
+        assert (target / "keep.txt").exists()
 
 
 class TestVariantNames:

@@ -136,6 +136,60 @@ def test_sysbuild_is_chosen_for_each_variant(monkeypatch, tmp_path: Path, board_
     assert sorted(seen) == [("multi", "app"), ("single", "")]
 
 
+@pytest.mark.parametrize("no_clean", [False, True])
+def test_no_clean_reaches_each_variant_build(monkeypatch, tmp_path: Path, no_clean: bool):
+    """``--build --no-clean`` gives an incremental build to each variant, ``--build`` a clean one.
+
+    ``_run_multi`` did not read ``--no-clean``, thus a variant built clean
+    also with the option.  The option of the command line wins over
+    ``clean`` in the table of a variant, and the config of the project
+    stays as it is.
+    """
+    import fw_context_mcp.indexer.build as build_mod
+    import fw_context_mcp.indexer.builders as builders_pkg
+    import fw_context_mcp.indexer.runner as runner_mod
+    from fw_context_mcp.cli import _index as index_mod
+
+    cleans: dict[str, bool] = {}
+
+    class _CleanRecorder(_BoardBuilder):
+        def build(self, project_root, cfg):
+            cleans[cfg.variant_name] = cfg.clean
+            return super().build(project_root, cfg)
+
+        def build_multi(self, project_root, cfg, variants):
+            for v in variants:
+                cleans[v.name] = build_mod.build_variant_config(cfg, v).clean
+            return [(v.name, "app", tmp_path / f"{v.name}.json") for v in variants]
+
+    registry = SimpleNamespace(get=lambda name: _CleanRecorder if name == "fake" else None, keys=lambda: ["fake"])
+    monkeypatch.setattr(build_mod, "_builder_registry", registry)
+    monkeypatch.setattr(builders_pkg, "registry", registry)
+    monkeypatch.setattr(runner_mod, "run", lambda **kw: "0" * 64)
+
+    build = BuildConfig(
+        system="fake",
+        variants=[
+            BuildVariant(name="multi", board="a", overrides={"sysbuild": True}),
+            BuildVariant(name="single", board="b"),
+            BuildVariant(name="pinned", board="c", overrides={"sysbuild": True, "clean": True}),
+        ],
+    )
+    index_mod._run_multi(
+        SimpleNamespace(build=True, no_clean=no_clean),
+        SimpleNamespace(build=build),
+        tmp_path,
+        "pid",
+        tmp_path / "index.db",
+        "fake",
+        {"vendor_paths": [], "project_paths": []},
+    )
+
+    assert cleans == {"multi": not no_clean, "single": not no_clean, "pinned": not no_clean}
+    assert build.clean is True
+    assert build.variants[2].overrides == {"sysbuild": True, "clean": True}
+
+
 def test_a_failed_sysbuild_variant_does_not_stop_the_others(monkeypatch, tmp_path: Path, capsys):
     """A failed sysbuild build of one variant must not stop the next variant.
 
